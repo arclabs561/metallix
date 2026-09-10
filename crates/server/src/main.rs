@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
-use qwen::Qwen3TextContract;
+use qwen::{Qwen3TextContract, preflight::Qwen3ExecutionPreflight};
 
 #[derive(Debug, Parser)]
 #[command(about = "Apple-Silicon model-serving runtime")]
@@ -86,11 +86,27 @@ fn inspect_qwen(config: &PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let preflight = match Qwen3ExecutionPreflight::from_contract(&contract) {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            eprintln!(
+                "{} cannot form a Qwen3 execution plan: {error}",
+                config.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     println!("Qwen3 text execution contract");
     println!("layers: {} transformer", contract.total_layers());
     println!("hidden size: {}", contract.hidden_size());
     println!("attention heads: {}", contract.attention_heads());
+    println!("key/value heads: {}", preflight.key_value_heads());
+    println!("head dimension: {}", preflight.head_dim());
+    println!(
+        "BF16 KV bytes per token: {}",
+        preflight.kv_bytes_per_token_bf16()
+    );
     println!("maximum positions: {}", contract.max_position_embeddings());
     println!("required backend: dense attention, paged KV, continuous batching");
     ExitCode::SUCCESS

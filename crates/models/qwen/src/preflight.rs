@@ -8,6 +8,8 @@ use crate::Qwen3TextContract;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3ExecutionPreflight {
     head_dim: u32,
+    key_value_heads: u32,
+    kv_bytes_per_token_bf16: u64,
     position_capacity: u32,
 }
 
@@ -35,8 +37,25 @@ impl Qwen3ExecutionPreflight {
             return Err(Qwen3PreflightError::MissingPositionCapacity);
         }
 
+        let key_value_heads = contract.key_value_heads();
+        if attention_heads % key_value_heads != 0 {
+            return Err(
+                Qwen3PreflightError::AttentionHeadsNotDivisibleByKeyValueHeads {
+                    attention_heads,
+                    key_value_heads,
+                },
+            );
+        }
+        let kv_bytes_per_token_bf16 = (contract.total_layers() as u64)
+            * (key_value_heads as u64)
+            * ((hidden_size / attention_heads) as u64)
+            * 2
+            * 2;
+
         Ok(Self {
             head_dim: hidden_size / attention_heads,
+            key_value_heads,
+            kv_bytes_per_token_bf16,
             position_capacity,
         })
     }
@@ -45,6 +64,21 @@ impl Qwen3ExecutionPreflight {
     #[must_use]
     pub const fn head_dim(self) -> u32 {
         self.head_dim
+    }
+
+    /// Returns the number of key/value heads per layer.
+    #[must_use]
+    pub const fn key_value_heads(self) -> u32 {
+        self.key_value_heads
+    }
+
+    /// Returns the physical BF16 key/value cache footprint for one token.
+    ///
+    /// This covers keys and values across all decoder layers, but excludes
+    /// allocator alignment and any prefix-cache bookkeeping.
+    #[must_use]
+    pub const fn kv_bytes_per_token_bf16(self) -> u64 {
+        self.kv_bytes_per_token_bf16
     }
 
     /// Returns the maximum number of positions available to execution.
@@ -68,6 +102,16 @@ pub enum Qwen3PreflightError {
         /// Number of attention heads.
         attention_heads: u32,
     },
+    /// Grouped-query key/value heads must evenly partition attention heads.
+    #[error(
+        "Qwen3 attention heads {attention_heads} are not divisible by {key_value_heads} key/value heads"
+    )]
+    AttentionHeadsNotDivisibleByKeyValueHeads {
+        /// Number of query heads.
+        attention_heads: u32,
+        /// Number of key/value heads.
+        key_value_heads: u32,
+    },
     /// The model does not allow any token positions.
     #[error("Qwen3 configuration has no usable position capacity")]
     MissingPositionCapacity,
@@ -86,6 +130,7 @@ mod tests {
                 "num_hidden_layers":28,
                 "hidden_size":1024,
                 "num_attention_heads":16,
+                "num_key_value_heads":8,
                 "max_position_embeddings":40960
             }"#,
         )
@@ -94,6 +139,8 @@ mod tests {
         let preflight = Qwen3ExecutionPreflight::from_contract(&contract)
             .expect("divisible attention dimensions");
         assert_eq!(preflight.head_dim(), 64);
+        assert_eq!(preflight.key_value_heads(), 8);
+        assert_eq!(preflight.kv_bytes_per_token_bf16(), 57_344);
         assert_eq!(preflight.position_capacity(), 40_960);
     }
 
@@ -105,6 +152,7 @@ mod tests {
                 "num_hidden_layers":28,
                 "hidden_size":1025,
                 "num_attention_heads":16,
+                "num_key_value_heads":8,
                 "max_position_embeddings":40960
             }"#,
         )
@@ -117,6 +165,31 @@ mod tests {
             Qwen3PreflightError::HiddenSizeNotDivisibleByAttentionHeads {
                 hidden_size: 1025,
                 attention_heads: 16,
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_groupable_key_value_heads() {
+        let contract = Qwen3TextContract::parse(
+            r#"{
+                "model_type":"qwen3",
+                "num_hidden_layers":28,
+                "hidden_size":1024,
+                "num_attention_heads":16,
+                "num_key_value_heads":3,
+                "max_position_embeddings":40960
+            }"#,
+        )
+        .expect("config dimensions are syntactically valid");
+
+        let error = Qwen3ExecutionPreflight::from_contract(&contract)
+            .expect_err("GQA heads must divide query heads");
+        assert!(matches!(
+            error,
+            Qwen3PreflightError::AttentionHeadsNotDivisibleByKeyValueHeads {
+                attention_heads: 16,
+                key_value_heads: 3,
             }
         ));
     }

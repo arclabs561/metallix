@@ -11,6 +11,7 @@ pub struct Qwen3TextContract {
     hidden_layers: u32,
     hidden_size: u32,
     attention_heads: u32,
+    key_value_heads: u32,
     max_position_embeddings: u32,
 }
 
@@ -35,6 +36,9 @@ impl Qwen3TextContract {
         if config.num_attention_heads == 0 {
             return Err(Qwen3ConfigError::MissingAttentionHeads);
         }
+        if config.num_key_value_heads == 0 {
+            return Err(Qwen3ConfigError::MissingKeyValueHeads);
+        }
         if config.max_position_embeddings == 0 {
             return Err(Qwen3ConfigError::MissingMaxPositionEmbeddings);
         }
@@ -43,6 +47,7 @@ impl Qwen3TextContract {
             hidden_layers: config.num_hidden_layers,
             hidden_size: config.hidden_size,
             attention_heads: config.num_attention_heads,
+            key_value_heads: config.num_key_value_heads,
             max_position_embeddings: config.max_position_embeddings,
         })
     }
@@ -65,6 +70,12 @@ impl Qwen3TextContract {
         self.attention_heads
     }
 
+    /// Returns the number of grouped-query key/value heads.
+    #[must_use]
+    pub const fn key_value_heads(&self) -> u32 {
+        self.key_value_heads
+    }
+
     /// Returns the maximum supported sequence length.
     #[must_use]
     pub const fn max_position_embeddings(&self) -> u32 {
@@ -82,6 +93,8 @@ struct RawConfig {
     hidden_size: u32,
     #[serde(default)]
     num_attention_heads: u32,
+    #[serde(default)]
+    num_key_value_heads: u32,
     #[serde(default)]
     max_position_embeddings: u32,
 }
@@ -105,6 +118,9 @@ pub enum Qwen3ConfigError {
     /// The configuration does not expose attention heads.
     #[error("Qwen3 configuration has no usable attention heads")]
     MissingAttentionHeads,
+    /// The configuration does not expose grouped-query key/value heads.
+    #[error("Qwen3 configuration has no usable key/value attention heads")]
+    MissingKeyValueHeads,
     /// The configuration does not expose a maximum sequence length.
     #[error("Qwen3 configuration has no usable maximum position embeddings")]
     MissingMaxPositionEmbeddings,
@@ -119,6 +135,7 @@ mod tests {
       "num_hidden_layers":28,
       "hidden_size":1024,
       "num_attention_heads":16,
+      "num_key_value_heads":8,
       "max_position_embeddings":40960
     }"#;
 
@@ -128,6 +145,7 @@ mod tests {
         assert_eq!(contract.total_layers(), 28);
         assert_eq!(contract.hidden_size(), 1024);
         assert_eq!(contract.attention_heads(), 16);
+        assert_eq!(contract.key_value_heads(), 8);
         assert_eq!(contract.max_position_embeddings(), 40_960);
     }
 
@@ -142,5 +160,12 @@ mod tests {
         let config = CONFIG.replace("\"num_attention_heads\":16", "\"num_attention_heads\":0");
         let error = Qwen3TextContract::parse(&config).expect_err("missing attention heads");
         assert!(matches!(error, Qwen3ConfigError::MissingAttentionHeads));
+    }
+
+    #[test]
+    fn rejects_missing_key_value_heads() {
+        let config = CONFIG.replace("\"num_key_value_heads\":8", "\"num_key_value_heads\":0");
+        let error = Qwen3TextContract::parse(&config).expect_err("missing key/value heads");
+        assert!(matches!(error, Qwen3ConfigError::MissingKeyValueHeads));
     }
 }
