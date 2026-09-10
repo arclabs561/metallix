@@ -47,7 +47,7 @@ fn inspect_v41(config: &PathBuf) -> ExitCode {
     };
 
     println!("V4.1 text execution contract");
-    println!("layers: {} CED", contract.total_layers());
+    println!("layers: {} transformer", contract.total_layers());
     println!(
         "routing: {} experts, top-{}",
         contract.local_experts(),
@@ -56,6 +56,12 @@ fn inspect_v41(config: &PathBuf) -> ExitCode {
     println!(
         "engram: n-grams through {}",
         contract.engram_max_ngram_size()
+    );
+    let quantization = contract.quantization();
+    println!(
+        "checkpoint quantization: dynamic FP8, FP4 experts, {}x{} blocks",
+        quantization.weight_block_rows(),
+        quantization.weight_block_columns()
     );
     println!("required backend: CED, sparse MoE, Engram, paged weights, tiered cache");
     ExitCode::SUCCESS
