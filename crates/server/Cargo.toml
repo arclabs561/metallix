@@ -1,0 +1,18 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "metallix"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+deepseek = { path = "../models/deepseek" }
+
+[lints]
+workspace = true

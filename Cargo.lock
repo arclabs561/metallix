@@ -99,6 +99,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "deepseek"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "engine"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,30 +137,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "metallix-core"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "metallix-deepseek"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "metallix-server"
-version = "0.1.0"
-dependencies = [
- "clap",
- "metallix-deepseek",
-]
 
 [[package]]
 name = "once_cell_polyfill"
@@ -211,6 +203,14 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "deepseek",
 ]
 
 [[package]]

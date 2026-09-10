@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/metallix-core",
-    "crates/metallix-server",
-    "crates/metallix-deepseek",
+    "crates/engine",
+    "crates/models/deepseek",
+    "crates/server",
 ]
 resolver = "2"
 

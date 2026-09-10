@@ -2,10 +2,11 @@
 
 ## Product boundary
 
-Metallix is a single-Mac, Apple-Silicon serving runtime with a portable
-control plane and model-specific Metal execution plug-ins. V4.1 Flash is the
-first plug-in because its CED, sparse-MoE, Engram, and cache layout are not a
-drop-in fit for existing local runtimes.
+Metallix v1 is a single-Mac, macOS / Apple-Silicon / Metal serving runtime. It
+has portable service contracts and model-specific Metal execution plug-ins; it
+does not have a generic tensor or compute-backend abstraction. V4.1 Flash is
+the first plug-in because its CED, sparse-MoE, Engram, and cache layout are not
+a drop-in fit for existing local runtimes.
 
 The target is not a generic HTTP wrapper and not a claim of immediate feature
 parity with vLLM or SGLang. The target is their useful serving semantics for
@@ -16,9 +17,11 @@ coverage per model.
 ## Control plane
 
 The control plane owns request parsing, tokenization and chat templates,
-admission, continuous batching, paged KV allocation, prefix-cache identity,
-sampling, streaming, cancellation, metrics, and model lifecycle. It must not
-contain architecture-specific tensor code.
+admission, continuous batching, sampling, streaming, cancellation, metrics,
+and model lifecycle. It talks to each execution backend through coarse load,
+generate, embed, health, capability, metric, and unload operations. It must
+not contain architecture-specific tensor code or prescribe tensor, allocator,
+KV-page, graph, or kernel traits.
 
 Cache identity includes the model revision, tokenizer and template revisions,
 adapter identity, media hashes when applicable, and a trust-domain salt.
@@ -26,10 +29,11 @@ Prompt content is not logged by default.
 
 ## Execution plug-ins
 
-Each plug-in owns validated configuration, checkpoint loading, quantization
-manifest validation, prefill and decode graphs, KV layout, and kernel
-capabilities. A plug-in reports exactly which server capabilities it supports:
-`supported`, `experimental`, or `unavailable`.
+Each adapter under `crates/models/` owns validated configuration, checkpoint
+loading, quantization-manifest validation, prefill and decode graphs, KV and
+prefix-cache layout, batch formation, and kernel capabilities. A plug-in
+reports exactly which server capabilities it supports: `supported`,
+`experimental`, or `unavailable`.
 
 The V4.1 plug-in will own CED execution, CSA2 sparse attention, sparse-MoE
 routing, Engram lookup, DSpark-compatible lookahead state, and tiered expert /
