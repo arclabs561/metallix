@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use deepseek::V41TextContract;
+use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
 use qwen::Qwen3TextContract;
 
 #[derive(Debug, Parser)]
@@ -25,6 +25,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Validate a DeepSeek-V4.1 safetensors index without downloading weights.
+    InspectV41Index {
+        /// Path to the upstream safetensors index.
+        #[arg(long)]
+        index: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -32,7 +38,34 @@ fn main() -> ExitCode {
     match cli.command {
         Command::InspectV41 { config } => inspect_v41(&config),
         Command::InspectQwen { config } => inspect_qwen(&config),
+        Command::InspectV41Index { index } => inspect_v41_index(&index),
     }
+}
+
+fn inspect_v41_index(index: &PathBuf) -> ExitCode {
+    let json = match fs::read_to_string(index) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("could not read {}: {error}", index.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let index = match V41SafetensorsIndex::parse(&json) {
+        Ok(index) => index,
+        Err(error) => {
+            eprintln!(
+                "{} is not a valid V4.1 safetensors index: {error}",
+                index.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("V4.1 safetensors index");
+    println!("tensors: {}", index.tensor_count());
+    println!("shards: {}", index.shard_paths().len());
+    println!("declared total bytes: {}", index.total_bytes());
+    println!("next gate: resolve individual shard sizes before download planning");
+    ExitCode::SUCCESS
 }
 
 fn inspect_qwen(config: &PathBuf) -> ExitCode {
