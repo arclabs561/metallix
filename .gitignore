@@ -3,3 +3,13 @@
 /models/
 /artifacts/
 /docs/design/
+/.env
+/.env.*
+!/.env.example
+/*.local.*
+/.localrc
+/*.pem
+/*_rsa
+/credentials/
+/.aws/
+/*-service-account.json
