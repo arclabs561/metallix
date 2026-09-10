@@ -1,5 +1,7 @@
 //! Shared serving contracts independent of a model architecture or GPU backend.
 
+pub mod kv;
+
 use std::num::NonZeroU32;
 
 use thiserror::Error;

@@ -18,10 +18,11 @@ coverage per model.
 
 The control plane owns request parsing, tokenization and chat templates,
 admission, continuous batching, sampling, streaming, cancellation, metrics,
-and model lifecycle. It talks to each execution backend through coarse load,
-generate, embed, health, capability, metric, and unload operations. It must
-not contain architecture-specific tensor code or prescribe tensor, allocator,
-KV-page, graph, or kernel traits.
+and model lifecycle. It owns logical KV allocation, reference counts,
+prefix-hash identity, eviction policy, and queue fairness. It talks to each
+execution backend through coarse load, generate, embed, health, capability,
+metric, and unload operations. It must not contain architecture-specific tensor
+code or prescribe tensor, allocator, graph, or kernel traits.
 
 Cache identity includes the model revision, tokenizer and template revisions,
 adapter identity, media hashes when applicable, and a trust-domain salt.
@@ -30,10 +31,11 @@ Prompt content is not logged by default.
 ## Execution plug-ins
 
 Each adapter under `crates/models/` owns validated configuration, checkpoint
-loading, quantization-manifest validation, prefill and decode graphs, KV and
-prefix-cache layout, batch formation, and kernel capabilities. A plug-in
-reports exactly which server capabilities it supports: `supported`,
-`experimental`, or `unavailable`.
+loading, quantization-manifest validation, prefill and decode graphs, the
+physical KV page representation, and kernel capabilities. The control plane
+asks the adapter for a capacity estimate and page handle; it never assumes a
+uniform KV tensor. An adapter reports exactly which server capabilities it
+supports: `supported`, `experimental`, or `unavailable`.
 
 The V4.1 plug-in will own CED execution, CSA2 sparse attention, sparse-MoE
 routing, Engram lookup, DSpark-compatible lookahead state, and tiered expert /
@@ -61,6 +63,26 @@ serving are feature-gated follow-ons. Metallix v1 is intentionally one Mac:
 no remote KV transport, replicas, pipeline parallelism, tensor parallelism, or
 expert parallelism. Cluster cache tiers and prefill/decode disaggregation are
 not single-Mac v1 work.
+
+## Pivot conditions
+
+Metallix is not committed to rebuilding commodity serving work. vLLM-Metal,
+SGLang's MLX backend, llama.cpp, and oMLX are behavioral and performance
+oracles throughout development.
+
+| Evidence observed | Pivot | Work retained |
+| --- | --- | --- |
+| V4.1 executes correctly and meets the single-Mac memory/latency target in an existing runtime | Stop building a standalone serving plane; contribute or maintain a narrow V4.1 backend and qualification suite there. | V4.1 config parser, parity fixtures, quant manifest, benchmark corpus. |
+| V4.1 parity passes but SSD-tiered expert/Engram traffic makes interactive decode unacceptable | Make expert residency, prefetch, and byte-per-token admission the project focus; do not add API compatibility features. | Engine contracts, Metal graph, trace and benchmark harness. |
+| Metallix serves V4.1 but a second architecture requires unrelated scheduler or cache semantics | Keep it model-specific. Do not generalize the executor from one adapter. | Stable HTTP/request contracts and the first adapter. |
+| Three independently-used adapters need identical service behavior | Extract only the proven service seam into a backend-neutral interface. | Existing adapter APIs become conformance tests. |
+| A concrete second accelerator and model have a measured acceptance case | Add a separate backend crate with its own executor and page representation; keep Metal internals private. | Control-plane protocol, capability matrix, benchmark schema. |
+
+The immediate competing hypothesis is that upstream Apple support catches up
+before a native runtime is useful. The decision gate is practical, not
+ideological: compare V4.1 parity, 512/8k/32k TTFT and inter-token latency,
+shared-prefix behavior, peak resident memory, and SSD bytes per generated
+token against the best available upstream path before expanding Metallix.
 
 ## Gates
 
