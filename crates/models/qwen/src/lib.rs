@@ -1,5 +1,7 @@
 //! Qwen3 text-model execution-contract parsing and validation.
 
+pub mod preflight;
+
 use serde::Deserialize;
 use thiserror::Error;
 
