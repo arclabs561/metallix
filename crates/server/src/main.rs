@@ -2,7 +2,9 @@ use std::{fs, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
-use qwen::{Qwen3TextContract, preflight::Qwen3ExecutionPreflight};
+use qwen::{
+    Qwen3TextContract, checkpoint::Qwen3CheckpointInspection, preflight::Qwen3ExecutionPreflight,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Apple-Silicon model-serving runtime")]
@@ -25,6 +27,22 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Validate a local Qwen3 checkpoint's safetensors headers without loading payloads.
+    InspectQwenCheckpoint {
+        /// Directory containing config.json and safetensors shard files.
+        #[arg(long)]
+        model: PathBuf,
+    },
+    /// Prove the optional Qwen MLX substrate can execute one graph on Metal.
+    #[cfg(feature = "metal")]
+    SmokeQwenMetal,
+    /// Load a validated Qwen3 checkpoint as MLX arrays and evaluate its embedding on Metal.
+    #[cfg(feature = "metal")]
+    LoadQwenMetal {
+        /// Directory containing config.json and safetensors shard files.
+        #[arg(long)]
+        model: PathBuf,
+    },
     /// Validate a DeepSeek-V4.1 safetensors index without downloading weights.
     InspectV41Index {
         /// Path to the upstream safetensors index.
@@ -38,7 +56,68 @@ fn main() -> ExitCode {
     match cli.command {
         Command::InspectV41 { config } => inspect_v41(&config),
         Command::InspectQwen { config } => inspect_qwen(&config),
+        Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
+        #[cfg(feature = "metal")]
+        Command::SmokeQwenMetal => smoke_qwen_metal(),
+        #[cfg(feature = "metal")]
+        Command::LoadQwenMetal { model } => load_qwen_metal(&model),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn load_qwen_metal(model: &PathBuf) -> ExitCode {
+    match qwen::metal::Qwen3MlxWeights::load(model) {
+        Ok(weights) => {
+            println!("Qwen MLX Metal checkpoint load qualified");
+            println!("tensors loaded: {}", weights.tensor_count());
+            println!("embedding shape: {:?}", weights.embedding_shape());
+            println!(
+                "declared checkpoint bytes: {}",
+                weights.inspection().tensor_bytes()
+            );
+            println!("next gate: fixed-token decoder logits parity");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Qwen MLX Metal checkpoint load failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn smoke_qwen_metal() -> ExitCode {
+    match qwen::metal::run_metal_smoke() {
+        Ok(smoke) => {
+            println!("Qwen MLX Metal substrate qualified");
+            println!("1x1 GPU matrix product: {}", smoke.product());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Qwen MLX Metal substrate failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn inspect_qwen_checkpoint(model: &PathBuf) -> ExitCode {
+    match Qwen3CheckpointInspection::inspect(model) {
+        Ok(checkpoint) => {
+            println!("Qwen3 checkpoint contract");
+            println!("tensors: {}", checkpoint.tensor_count());
+            println!("shards: {}", checkpoint.shards().len());
+            println!("declared tensor bytes: {}", checkpoint.tensor_bytes());
+            println!("next gate: load a fixed tensor slice for numerical parity");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!(
+                "{} is not a valid Qwen3 checkpoint: {error}",
+                model.display()
+            );
+            ExitCode::FAILURE
+        }
     }
 }
 

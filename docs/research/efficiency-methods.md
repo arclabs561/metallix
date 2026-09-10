@@ -48,7 +48,8 @@ is the intended contract.
 ## Near-term experiments
 
 1. Implement dense Qwen3 BF16 loading and single-request prefill/decode via
-   the selected native Metal substrate; compare logits on a short fixed prompt.
+   the selected native Metal substrate; compare logits on the checked-in fixed
+   raw-token reference at `fixtures/qwen3-0.6b/forward-reference.json`.
 2. Run `scripts/benchmark-openai.mjs` against both the reference server and
    Metallix using 512, 8k, and 32k cold/shared-prefix profiles once Metallix
    streams tokens.

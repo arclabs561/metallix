@@ -1,0 +1,14 @@
+{
+  "model_id": "Qwen/Qwen3-0.6B",
+  "input_ids": [1, 2, 3],
+  "reference": {
+    "framework": "transformers 5.12.1",
+    "runtime": "torch 2.13.0 CPU float32 eager",
+    "config_sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+    "weights_sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b"
+  },
+  "last_token_top8": {
+    "ids": [16, 2, 17, 12, 18, 4, 19, 25046],
+    "logits": [12.3244848, 11.9673395, 11.5986233, 11.3552551, 11.3340902, 11.2026815, 11.1062412, 10.869091]
+  }
+}

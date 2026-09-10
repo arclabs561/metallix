@@ -10,6 +10,9 @@ publish.workspace = true
 name = "metallix"
 path = "src/main.rs"
 
+[features]
+metal = ["qwen/metal"]
+
 [dependencies]
 clap.workspace = true
 deepseek = { path = "../models/deepseek" }

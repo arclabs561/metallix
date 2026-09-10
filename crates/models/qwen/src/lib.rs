@@ -1,5 +1,8 @@
 //! Qwen3 text-model execution-contract parsing and validation.
 
+pub mod checkpoint;
+#[cfg(feature = "metal")]
+pub mod metal;
 pub mod preflight;
 
 use serde::Deserialize;
@@ -10,8 +13,10 @@ use thiserror::Error;
 pub struct Qwen3TextContract {
     hidden_layers: u32,
     hidden_size: u32,
+    vocab_size: u32,
     attention_heads: u32,
     key_value_heads: u32,
+    head_dim: u32,
     max_position_embeddings: u32,
 }
 
@@ -33,11 +38,17 @@ impl Qwen3TextContract {
         if config.hidden_size == 0 {
             return Err(Qwen3ConfigError::MissingHiddenSize);
         }
+        if config.vocab_size == 0 {
+            return Err(Qwen3ConfigError::MissingVocabSize);
+        }
         if config.num_attention_heads == 0 {
             return Err(Qwen3ConfigError::MissingAttentionHeads);
         }
         if config.num_key_value_heads == 0 {
             return Err(Qwen3ConfigError::MissingKeyValueHeads);
+        }
+        if config.head_dim == 0 {
+            return Err(Qwen3ConfigError::MissingHeadDimension);
         }
         if config.max_position_embeddings == 0 {
             return Err(Qwen3ConfigError::MissingMaxPositionEmbeddings);
@@ -46,8 +57,10 @@ impl Qwen3TextContract {
         Ok(Self {
             hidden_layers: config.num_hidden_layers,
             hidden_size: config.hidden_size,
+            vocab_size: config.vocab_size,
             attention_heads: config.num_attention_heads,
             key_value_heads: config.num_key_value_heads,
+            head_dim: config.head_dim,
             max_position_embeddings: config.max_position_embeddings,
         })
     }
@@ -64,6 +77,12 @@ impl Qwen3TextContract {
         self.hidden_size
     }
 
+    /// Returns the tokenizer vocabulary size used by the tied embeddings.
+    #[must_use]
+    pub const fn vocab_size(&self) -> u32 {
+        self.vocab_size
+    }
+
     /// Returns the number of attention heads.
     #[must_use]
     pub const fn attention_heads(&self) -> u32 {
@@ -74,6 +93,12 @@ impl Qwen3TextContract {
     #[must_use]
     pub const fn key_value_heads(&self) -> u32 {
         self.key_value_heads
+    }
+
+    /// Returns the configured attention-head representation width.
+    #[must_use]
+    pub const fn head_dim(&self) -> u32 {
+        self.head_dim
     }
 
     /// Returns the maximum supported sequence length.
@@ -92,9 +117,13 @@ struct RawConfig {
     #[serde(default)]
     hidden_size: u32,
     #[serde(default)]
+    vocab_size: u32,
+    #[serde(default)]
     num_attention_heads: u32,
     #[serde(default)]
     num_key_value_heads: u32,
+    #[serde(default)]
+    head_dim: u32,
     #[serde(default)]
     max_position_embeddings: u32,
 }
@@ -115,12 +144,18 @@ pub enum Qwen3ConfigError {
     /// The configuration does not expose a token representation width.
     #[error("Qwen3 configuration has no usable hidden size")]
     MissingHiddenSize,
+    /// The configuration does not expose a token vocabulary size.
+    #[error("Qwen3 configuration has no usable vocabulary size")]
+    MissingVocabSize,
     /// The configuration does not expose attention heads.
     #[error("Qwen3 configuration has no usable attention heads")]
     MissingAttentionHeads,
     /// The configuration does not expose grouped-query key/value heads.
     #[error("Qwen3 configuration has no usable key/value attention heads")]
     MissingKeyValueHeads,
+    /// The configuration does not expose an attention-head representation width.
+    #[error("Qwen3 configuration has no usable attention head dimension")]
+    MissingHeadDimension,
     /// The configuration does not expose a maximum sequence length.
     #[error("Qwen3 configuration has no usable maximum position embeddings")]
     MissingMaxPositionEmbeddings,
@@ -134,8 +169,10 @@ mod tests {
       "model_type":"qwen3",
       "num_hidden_layers":28,
       "hidden_size":1024,
+      "vocab_size":151936,
       "num_attention_heads":16,
       "num_key_value_heads":8,
+      "head_dim":128,
       "max_position_embeddings":40960
     }"#;
 
@@ -144,8 +181,10 @@ mod tests {
         let contract = Qwen3TextContract::parse(CONFIG).expect("valid Qwen3 config");
         assert_eq!(contract.total_layers(), 28);
         assert_eq!(contract.hidden_size(), 1024);
+        assert_eq!(contract.vocab_size(), 151_936);
         assert_eq!(contract.attention_heads(), 16);
         assert_eq!(contract.key_value_heads(), 8);
+        assert_eq!(contract.head_dim(), 128);
         assert_eq!(contract.max_position_embeddings(), 40_960);
     }
 
@@ -167,5 +206,12 @@ mod tests {
         let config = CONFIG.replace("\"num_key_value_heads\":8", "\"num_key_value_heads\":0");
         let error = Qwen3TextContract::parse(&config).expect_err("missing key/value heads");
         assert!(matches!(error, Qwen3ConfigError::MissingKeyValueHeads));
+    }
+
+    #[test]
+    fn rejects_missing_head_dimension() {
+        let config = CONFIG.replace("\"head_dim\":128", "\"head_dim\":0");
+        let error = Qwen3TextContract::parse(&config).expect_err("missing head dimension");
+        assert!(matches!(error, Qwen3ConfigError::MissingHeadDimension));
     }
 }

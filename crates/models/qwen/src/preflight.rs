@@ -21,16 +21,7 @@ impl Qwen3ExecutionPreflight {
     /// Returns [`Qwen3PreflightError`] when the attention heads cannot evenly
     /// partition the hidden representation or no positions are available.
     pub const fn from_contract(contract: &Qwen3TextContract) -> Result<Self, Qwen3PreflightError> {
-        let hidden_size = contract.hidden_size();
         let attention_heads = contract.attention_heads();
-        if attention_heads == 0 || hidden_size % attention_heads != 0 {
-            return Err(
-                Qwen3PreflightError::HiddenSizeNotDivisibleByAttentionHeads {
-                    hidden_size,
-                    attention_heads,
-                },
-            );
-        }
 
         let position_capacity = contract.max_position_embeddings();
         if position_capacity == 0 {
@@ -48,12 +39,12 @@ impl Qwen3ExecutionPreflight {
         }
         let kv_bytes_per_token_bf16 = (contract.total_layers() as u64)
             * (key_value_heads as u64)
-            * ((hidden_size / attention_heads) as u64)
+            * (contract.head_dim() as u64)
             * 2
             * 2;
 
         Ok(Self {
-            head_dim: hidden_size / attention_heads,
+            head_dim: contract.head_dim(),
             key_value_heads,
             kv_bytes_per_token_bf16,
             position_capacity,
@@ -92,16 +83,6 @@ impl Qwen3ExecutionPreflight {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Qwen3PreflightError {
-    /// The hidden representation cannot be divided into equal attention heads.
-    #[error(
-        "Qwen3 hidden size {hidden_size} is not divisible by {attention_heads} attention heads"
-    )]
-    HiddenSizeNotDivisibleByAttentionHeads {
-        /// Width of the hidden representation.
-        hidden_size: u32,
-        /// Number of attention heads.
-        attention_heads: u32,
-    },
     /// Grouped-query key/value heads must evenly partition attention heads.
     #[error(
         "Qwen3 attention heads {attention_heads} are not divisible by {key_value_heads} key/value heads"
@@ -129,8 +110,10 @@ mod tests {
                 "model_type":"qwen3",
                 "num_hidden_layers":28,
                 "hidden_size":1024,
+                "vocab_size":151936,
                 "num_attention_heads":16,
                 "num_key_value_heads":8,
+                "head_dim":128,
                 "max_position_embeddings":40960
             }"#,
         )
@@ -138,35 +121,10 @@ mod tests {
 
         let preflight = Qwen3ExecutionPreflight::from_contract(&contract)
             .expect("divisible attention dimensions");
-        assert_eq!(preflight.head_dim(), 64);
+        assert_eq!(preflight.head_dim(), 128);
         assert_eq!(preflight.key_value_heads(), 8);
-        assert_eq!(preflight.kv_bytes_per_token_bf16(), 57_344);
+        assert_eq!(preflight.kv_bytes_per_token_bf16(), 114_688);
         assert_eq!(preflight.position_capacity(), 40_960);
-    }
-
-    #[test]
-    fn rejects_uneven_attention_dimensions() {
-        let contract = Qwen3TextContract::parse(
-            r#"{
-                "model_type":"qwen3",
-                "num_hidden_layers":28,
-                "hidden_size":1025,
-                "num_attention_heads":16,
-                "num_key_value_heads":8,
-                "max_position_embeddings":40960
-            }"#,
-        )
-        .expect("config dimensions are syntactically valid");
-
-        let error = Qwen3ExecutionPreflight::from_contract(&contract)
-            .expect_err("uneven attention dimensions must be rejected");
-        assert!(matches!(
-            error,
-            Qwen3PreflightError::HiddenSizeNotDivisibleByAttentionHeads {
-                hidden_size: 1025,
-                attention_heads: 16,
-            }
-        ));
     }
 
     #[test]
@@ -176,8 +134,10 @@ mod tests {
                 "model_type":"qwen3",
                 "num_hidden_layers":28,
                 "hidden_size":1024,
+                "vocab_size":151936,
                 "num_attention_heads":16,
                 "num_key_value_heads":3,
+                "head_dim":128,
                 "max_position_embeddings":40960
             }"#,
         )
