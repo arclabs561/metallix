@@ -43,6 +43,13 @@ enum Command {
         #[arg(long)]
         model: PathBuf,
     },
+    /// Execute the fixed [1, 2, 3] Qwen3 embedding lookup on Metal.
+    #[cfg(feature = "metal")]
+    EmbedQwenMetal {
+        /// Directory containing config.json and safetensors shard files.
+        #[arg(long)]
+        model: PathBuf,
+    },
     /// Validate a DeepSeek-V4.1 safetensors index without downloading weights.
     InspectV41Index {
         /// Path to the upstream safetensors index.
@@ -62,6 +69,27 @@ fn main() -> ExitCode {
         Command::SmokeQwenMetal => smoke_qwen_metal(),
         #[cfg(feature = "metal")]
         Command::LoadQwenMetal { model } => load_qwen_metal(&model),
+        #[cfg(feature = "metal")]
+        Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn embed_qwen_metal(model: &PathBuf) -> ExitCode {
+    match qwen::metal::Qwen3MlxWeights::load(model)
+        .and_then(|weights| weights.embed_token_ids(&[1, 2, 3]))
+    {
+        Ok(shape) => {
+            println!("Qwen MLX Metal embedding lookup qualified");
+            println!("input IDs: 3 fixed raw tokens");
+            println!("embedding output shape: {shape:?}");
+            println!("next gate: RMSNorm and first-layer attention parity");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Qwen MLX Metal embedding lookup failed: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 

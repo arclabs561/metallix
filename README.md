@@ -56,6 +56,13 @@ This is a checkpoint-payload compatibility gate, not text generation. It holds
 the loaded tensors only for the process lifetime and the next gate is
 fixed-token decoder-logit parity.
 
+The same gate can execute the fixed raw IDs `[1, 2, 3]` from the checked-in
+reference fixture through the token embedding on the GPU stream:
+
+```sh
+cargo run -p server --features metal -- embed-qwen-metal --model /path/to/Qwen3-0.6B
+```
+
 See [the architecture](docs/architecture.md) for the serving contract and
 delivery gates, and [the efficiency requirements](docs/research/efficiency-methods.md)
 for the paper-derived implementation checks.
@@ -106,8 +113,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Limitations
 
 There is no Qwen decoder forward path or HTTP server yet. The optional Metal
-commands qualify a 1×1 graph and the Qwen checkpoint payload; neither is model
-inference. The repository includes an HTTP benchmark client and a
+commands qualify a 1×1 graph, checkpoint payload, and token embedding; none is
+model inference. The repository includes an HTTP benchmark client and a
 checkpoint-index parsing microbenchmark, neither of which is an inference
 result. V4.1 weight download remains blocked on a small text-forward parity
 fixture.

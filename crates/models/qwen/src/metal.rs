@@ -128,6 +128,33 @@ impl Qwen3MlxWeights {
     pub const fn inspection(&self) -> &Qwen3CheckpointInspection {
         &self.inspection
     }
+
+    /// Evaluates an embedding lookup for raw token IDs on the GPU stream.
+    ///
+    /// This is the first numerical-forward building block. It intentionally
+    /// stops before normalization, attention, or tied-logit projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen3MetalLoadError`] when no IDs are supplied or MLX cannot
+    /// construct or evaluate the lookup graph.
+    pub fn embed_token_ids(&self, input_ids: &[i32]) -> Result<Vec<i32>, Qwen3MetalLoadError> {
+        if input_ids.is_empty() {
+            return Err(Qwen3MetalLoadError::EmptyInputIds);
+        }
+        let token_ids = Array::from_slice(
+            input_ids,
+            &[i32::try_from(input_ids.len())
+                .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("input_ids"))?],
+        );
+        let embedding = self
+            .tensors
+            .get("model.embed_tokens.weight")
+            .ok_or(Qwen3MetalLoadError::MissingEmbedding)?;
+        let vectors = embedding.take_axis_device(&token_ids, 0, StreamOrDevice::gpu())?;
+        vectors.eval()?;
+        Ok(vectors.shape().to_vec())
+    }
 }
 
 /// A failed Metal substrate qualification.
@@ -170,6 +197,9 @@ pub enum Qwen3MetalLoadError {
         expected: Vec<i32>,
         actual: Vec<i32>,
     },
+    /// A forward lookup needs at least one token ID.
+    #[error("Qwen3 embedding lookup requires at least one token ID")]
+    EmptyInputIds,
 }
 
 #[cfg(test)]
