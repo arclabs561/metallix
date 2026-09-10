@@ -63,6 +63,12 @@ impl KvPagePlan {
     pub const fn token_capacity(self) -> u32 {
         self.page_tokens.get().saturating_mul(self.page_count.get())
     }
+
+    /// Returns the fixed number of logical pages in this pool.
+    #[must_use]
+    pub const fn page_count(self) -> u32 {
+        self.page_count.get()
+    }
 }
 
 /// Invalid logical KV page-pool configuration.

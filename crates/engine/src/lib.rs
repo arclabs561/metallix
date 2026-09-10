@@ -1,5 +1,7 @@
 //! Shared serving contracts independent of a model architecture or GPU backend.
 
+pub mod admission;
+pub mod benchmark;
 pub mod kv;
 pub mod lifecycle;
 

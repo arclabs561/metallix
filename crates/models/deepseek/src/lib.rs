@@ -1,5 +1,7 @@
 //! DeepSeek-V4.1 execution-contract parsing and validation.
 
+pub mod manifest;
+
 use serde::Deserialize;
 use thiserror::Error;
 
