@@ -6,6 +6,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU64,
+    path::{Component, Path},
 };
 
 use serde::Deserialize;
@@ -107,6 +108,9 @@ impl V41SafetensorsIndex {
             if shard_path.trim().is_empty() {
                 return Err(CheckpointManifestError::BlankPath);
             }
+            if !is_safe_artifact_path(shard_path) {
+                return Err(CheckpointManifestError::UnsafePath(shard_path.clone()));
+            }
             shard_paths.insert(shard_path.clone());
         }
         Ok(Self {
@@ -154,6 +158,9 @@ impl CheckpointFile {
         if path.trim().is_empty() {
             return Err(CheckpointManifestError::BlankPath);
         }
+        if !is_safe_artifact_path(&path) {
+            return Err(CheckpointManifestError::UnsafePath(path));
+        }
         let byte_length =
             NonZeroU64::new(byte_length).ok_or(CheckpointManifestError::ZeroByteFile)?;
         Ok(Self { path, byte_length })
@@ -170,6 +177,14 @@ impl CheckpointFile {
     pub const fn byte_length(&self) -> NonZeroU64 {
         self.byte_length
     }
+}
+
+fn is_safe_artifact_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +211,9 @@ pub enum CheckpointManifestError {
     /// An artifact path was empty or only whitespace.
     #[error("checkpoint artifact path must not be blank")]
     BlankPath,
+    /// An artifact path was absolute or escaped the checkpoint root.
+    #[error("checkpoint artifact path must be a relative normal path: {0:?}")]
+    UnsafePath(String),
     /// An artifact declared no bytes.
     #[error("checkpoint artifact byte length must be nonzero")]
     ZeroByteFile,
@@ -250,6 +268,10 @@ mod tests {
         assert!(matches!(
             CheckpointFile::new("", 1),
             Err(CheckpointManifestError::BlankPath)
+        ));
+        assert!(matches!(
+            CheckpointFile::new("../weights.safetensors", 1),
+            Err(CheckpointManifestError::UnsafePath(_))
         ));
         assert!(matches!(
             CheckpointFile::new("weights.safetensors", 0),
