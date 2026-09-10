@@ -1,6 +1,7 @@
 //! Shared serving contracts independent of a model architecture or GPU backend.
 
 pub mod kv;
+pub mod lifecycle;
 
 use std::num::NonZeroU32;
 

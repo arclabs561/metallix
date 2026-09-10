@@ -28,6 +28,11 @@ Cache identity includes the model revision, tokenizer and template revisions,
 adapter identity, media hashes when applicable, and a trust-domain salt.
 Prompt content is not logged by default.
 
+Model lifecycle is explicit: `unloaded`, `loading`, `warming`, `ready`, or
+`failed`. Only `ready` admits inference. Readiness is therefore not inferred
+from process startup, a listening port, or model discovery; it includes the
+adapter's required plan compilation and warmup.
+
 ## Execution plug-ins
 
 Each adapter under `crates/models/` owns validated configuration, checkpoint
