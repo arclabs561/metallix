@@ -49,6 +49,9 @@ impl V41CheckpointManifest {
                 .ok_or(CheckpointManifestError::TotalSizeOverflow)?;
             validated_files.push(file);
         }
+        if validated_files.is_empty() {
+            return Err(CheckpointManifestError::EmptyManifest);
+        }
 
         Ok(Self {
             revision,
@@ -208,6 +211,9 @@ pub enum CheckpointManifestError {
     /// The checkpoint revision was empty or only whitespace.
     #[error("checkpoint revision must not be blank")]
     BlankRevision,
+    /// The checkpoint did not declare any required artifacts.
+    #[error("checkpoint manifest must contain at least one artifact")]
+    EmptyManifest,
     /// An artifact path was empty or only whitespace.
     #[error("checkpoint artifact path must not be blank")]
     BlankPath,
@@ -264,6 +270,10 @@ mod tests {
         assert!(matches!(
             V41CheckpointManifest::new(" \t", [file]),
             Err(CheckpointManifestError::BlankRevision)
+        ));
+        assert!(matches!(
+            V41CheckpointManifest::new("main", std::iter::empty::<CheckpointFile>()),
+            Err(CheckpointManifestError::EmptyManifest)
         ));
         assert!(matches!(
             CheckpointFile::new("", 1),
