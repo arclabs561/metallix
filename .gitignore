@@ -3,6 +3,7 @@
 /models/
 /artifacts/
 /docs/design/
+/.agents/
 /.env
 /.env.*
 !/.env.example
