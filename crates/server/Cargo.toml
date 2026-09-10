@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 deepseek = { path = "../models/deepseek" }
+qwen = { path = "../models/qwen" }
 
 [lints]
 workspace = true
