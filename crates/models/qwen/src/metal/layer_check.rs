@@ -7,7 +7,7 @@ use mlx_rs::Array;
 use super::{Qwen3MetalLoadError, Qwen3MlxWeights, compare_tensor_values, decode_bf16};
 use crate::{checkpoint::Qwen3CheckpointInspection, forward::Qwen3ForwardConfig};
 
-const LAYER_SUFFIXES: [&str; 11] = [
+pub(super) const LAYER_SUFFIXES: [&str; 11] = [
     "input_layernorm.weight",
     "self_attn.q_norm.weight",
     "self_attn.k_norm.weight",
@@ -160,7 +160,7 @@ pub fn qualify_layer(
     })
 }
 
-fn load_layer(
+pub(super) fn load_layer(
     inspection: &Qwen3CheckpointInspection,
     names: &[String],
     lengths: &[u64],
@@ -185,7 +185,7 @@ fn load_layer(
     Ok(weights)
 }
 
-fn plan_weight_bytes(lengths: &[u64]) -> Result<(u64, u64, u64), Qwen3MetalLoadError> {
+pub(super) fn plan_weight_bytes(lengths: &[u64]) -> Result<(u64, u64, u64), Qwen3MetalLoadError> {
     let mut raw_total = 0_u64;
     let mut resident = 0_u64;
     let mut peak = 0_u64;

@@ -205,6 +205,18 @@ pub(crate) fn forward_layer<S: BuildHasher>(
     residual.add_device(&mlp, &stream).map_err(Into::into)
 }
 
+/// Applies Qwen3's final RMS normalization to a selected hidden state.
+///
+/// The streamed qualification owns only the final norm vector at this point,
+/// so it uses this narrow helper instead of retaining a decoder weight map.
+pub(crate) fn final_rms_norm(
+    config: &Qwen3ForwardConfig,
+    hidden_state: &Array,
+    scale: &Array,
+) -> Result<Array, Qwen3ForwardError> {
+    rms_norm(hidden_state, scale, config.rms_norm_eps)
+}
+
 /// A dense Qwen3 forward executor with KV state bound to one weights map.
 ///
 /// The executor borrows its model tensors, while retaining its own per-layer

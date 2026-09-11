@@ -85,17 +85,17 @@ pub fn qualify_embedding(
     })
 }
 
-struct EmbeddingPlan {
-    rows: BTreeSet<i32>,
-    tokens: i32,
-    hidden: i32,
-    elements: usize,
-    row_bytes: u64,
-    raw_bytes: u64,
+pub(super) struct EmbeddingPlan {
+    pub(super) rows: BTreeSet<i32>,
+    pub(super) tokens: i32,
+    pub(super) hidden: i32,
+    pub(super) elements: usize,
+    pub(super) row_bytes: u64,
+    pub(super) raw_bytes: u64,
 }
 
 impl EmbeddingPlan {
-    fn new(
+    pub(super) fn new(
         ids: &[i32],
         vocab: u32,
         hidden: u32,
@@ -136,7 +136,7 @@ impl EmbeddingPlan {
     }
 }
 
-fn load_embedding(
+pub(super) fn load_embedding(
     inspection: &Qwen3CheckpointInspection,
     input_ids: &[i32],
     plan: &EmbeddingPlan,

@@ -17,6 +17,8 @@ mod embedding_check;
 pub use embedding_check::{Qwen3EmbeddingCheck, qualify_embedding};
 mod projection_check;
 pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
+mod stream_check;
+pub use stream_check::{Qwen3StreamCheck, qualify_streamed_forward};
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
 #[derive(Debug, serde::Serialize)]

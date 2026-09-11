@@ -79,41 +79,7 @@ pub fn qualify_projection(
     let input = Array::from_slice(&input_values, &[1, plan.hidden_i32]);
     input.eval()?;
 
-    let mut candidate_logits = Vec::with_capacity(plan.vocabulary);
-    let mut tile_load_ms = 0.0;
-    let mut tile_execution_ms = 0.0;
-    for rows in &plan.ranges {
-        let tile_raw_bytes = plan.raw_bytes_for(rows)?;
-        // Keep this check before `read_bf16_rows`, which also independently
-        // enforces its caller-supplied bound before I/O and allocation.
-        if tile_raw_bytes > max_bytes {
-            return Err(Qwen3CheckpointError::TensorExceedsReadBudget {
-                tensor: EMBEDDING.to_owned(),
-                tensor_bytes: tile_raw_bytes,
-                max_bytes,
-            }
-            .into());
-        }
-        let load_started = Instant::now();
-        let payload = inspection.read_bf16_rows(EMBEDDING, rows.clone(), max_bytes)?;
-        let values = decode_bf16(payload.bytes())?;
-        let shape = [
-            i32::try_from(rows.len())
-                .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("tile rows"))?,
-            plan.hidden_i32,
-        ];
-        let tile = Array::from_slice(&values, &shape);
-        tile_load_ms += load_started.elapsed().as_secs_f64() * 1000.0;
-
-        let execute_started = Instant::now();
-        let stream = StreamOrDevice::gpu();
-        let logits = input.matmul_device(&tile.transpose_device(&stream)?, &stream)?;
-        logits.eval()?;
-        candidate_logits.extend_from_slice(logits.as_slice::<f32>());
-        tile_execution_ms += execute_started.elapsed().as_secs_f64() * 1000.0;
-        // `logits`, `tile`, `values`, and `payload` leave scope before the
-        // next tile; allocator retention is intentionally not claimed away.
-    }
+    let candidate = project_tiled(&inspection, &input, &plan, max_bytes)?;
 
     let reference_started = Instant::now();
     let reference_weights = Qwen3MlxWeights::load(model)?;
@@ -128,7 +94,12 @@ pub fn qualify_projection(
     reference_logits.eval()?;
     let reference_values = reference_logits.as_slice::<f32>();
     let reference_ms = reference_started.elapsed().as_secs_f64() * 1000.0;
-    let maximum_absolute_error = compare_projection_logits(&candidate_logits, reference_values)?;
+    let maximum_absolute_error = compare_projection_logits(
+        &candidate.logits,
+        reference_values,
+        ABSOLUTE_TOLERANCE,
+        RELATIVE_TOLERANCE,
+    )?;
 
     Ok(Qwen3ProjectionCheck {
         schema_version: 1,
@@ -142,10 +113,10 @@ pub fn qualify_projection(
         max_tile_raw_payload_bytes: plan.max_tile_raw_bytes,
         max_decoded_tile_bytes: plan.max_decoded_tile_bytes,
         max_raw_payload_bytes_per_tile: max_bytes,
-        tile_load_ms,
-        tile_execution_ms,
+        tile_load_ms: candidate.load_ms,
+        tile_execution_ms: candidate.execute_ms,
         reference_ms,
-        compared_logits: candidate_logits.len(),
+        compared_logits: candidate.logits.len(),
         absolute_tolerance: ABSOLUTE_TOLERANCE,
         relative_tolerance: RELATIVE_TOLERANCE,
         maximum_absolute_error,
@@ -155,19 +126,19 @@ pub fn qualify_projection(
     })
 }
 
-struct ProjectionPlan {
-    vocabulary: usize,
-    hidden: usize,
+pub(super) struct ProjectionPlan {
+    pub(super) vocabulary: usize,
+    pub(super) hidden: usize,
     hidden_i32: i32,
     bytes_per_row: u64,
-    raw_payload_bytes: u64,
-    max_tile_raw_bytes: u64,
-    max_decoded_tile_bytes: u64,
-    ranges: Vec<Range<usize>>,
+    pub(super) raw_payload_bytes: u64,
+    pub(super) max_tile_raw_bytes: u64,
+    pub(super) max_decoded_tile_bytes: u64,
+    pub(super) ranges: Vec<Range<usize>>,
 }
 
 impl ProjectionPlan {
-    fn new(
+    pub(super) fn new(
         hidden: usize,
         vocabulary: usize,
         tile_rows: usize,
@@ -255,9 +226,11 @@ fn synthetic_hidden_row(hidden: usize) -> Vec<f32> {
         .collect()
 }
 
-fn compare_projection_logits(
+pub(super) fn compare_projection_logits(
     candidate: &[f32],
     reference: &[f32],
+    absolute_tolerance: f32,
+    relative_tolerance: f32,
 ) -> Result<f32, Qwen3MetalLoadError> {
     if candidate.len() != reference.len() {
         return Err(Qwen3MetalLoadError::RangeCheckShape);
@@ -269,12 +242,61 @@ fn compare_projection_logits(
         }
         let absolute_error = (candidate - reference).abs();
         maximum_absolute_error = maximum_absolute_error.max(absolute_error);
-        let tolerance = ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * reference.abs();
+        let tolerance = absolute_tolerance + relative_tolerance * reference.abs();
         if absolute_error > tolerance {
             return Err(Qwen3MetalLoadError::RangeCheckMismatch { index });
         }
     }
     Ok(maximum_absolute_error)
+}
+
+pub(super) struct TiledProjection {
+    pub(super) logits: Vec<f32>,
+    pub(super) load_ms: f64,
+    pub(super) execute_ms: f64,
+}
+
+pub(super) fn project_tiled(
+    inspection: &Qwen3CheckpointInspection,
+    input: &Array,
+    plan: &ProjectionPlan,
+    max_bytes: u64,
+) -> Result<TiledProjection, Qwen3MetalLoadError> {
+    let mut logits = Vec::with_capacity(plan.vocabulary);
+    let mut load_ms = 0.0;
+    let mut execute_ms = 0.0;
+    for rows in &plan.ranges {
+        let tile_raw_bytes = plan.raw_bytes_for(rows)?;
+        if tile_raw_bytes > max_bytes {
+            return Err(Qwen3CheckpointError::TensorExceedsReadBudget {
+                tensor: EMBEDDING.to_owned(),
+                tensor_bytes: tile_raw_bytes,
+                max_bytes,
+            }
+            .into());
+        }
+        let load_started = Instant::now();
+        let payload = inspection.read_bf16_rows(EMBEDDING, rows.clone(), max_bytes)?;
+        let values = decode_bf16(payload.bytes())?;
+        let shape = [
+            i32::try_from(rows.len())
+                .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("tile rows"))?,
+            plan.hidden_i32,
+        ];
+        let tile = Array::from_slice(&values, &shape);
+        load_ms += load_started.elapsed().as_secs_f64() * 1000.0;
+        let execute_started = Instant::now();
+        let stream = StreamOrDevice::gpu();
+        let output = input.matmul_device(&tile.transpose_device(&stream)?, &stream)?;
+        output.eval()?;
+        logits.extend_from_slice(output.as_slice::<f32>());
+        execute_ms += execute_started.elapsed().as_secs_f64() * 1000.0;
+    }
+    Ok(TiledProjection {
+        logits,
+        load_ms,
+        execute_ms,
+    })
 }
 
 #[cfg(test)]
@@ -299,9 +321,9 @@ mod tests {
     #[test]
     fn comparator_catches_nonleading_mismatch_and_nonfinite_values() {
         assert!(matches!(
-            compare_projection_logits(&[1.0, 2.0, 3.1], &[1.0, 2.0, 3.0]),
+            compare_projection_logits(&[1.0, 2.0, 3.1], &[1.0, 2.0, 3.0], 5e-5, 1e-4),
             Err(super::Qwen3MetalLoadError::RangeCheckMismatch { index: 2 })
         ));
-        assert!(compare_projection_logits(&[1.0, f32::NAN], &[1.0, 2.0]).is_err());
+        assert!(compare_projection_logits(&[1.0, f32::NAN], &[1.0, 2.0], 5e-5, 1e-4).is_err());
     }
 }
