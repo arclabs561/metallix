@@ -2,11 +2,12 @@
 
 ## Product boundary
 
-Metallix v1 is a single-Mac, macOS / Apple-Silicon / Metal serving runtime. It
-has portable service contracts and model-specific Metal execution plug-ins; it
-does not have a generic tensor or compute-backend abstraction. V4.1 Flash is
-the first plug-in because its CED, sparse-MoE, Engram, and cache layout are not
-a drop-in fit for existing local runtimes.
+Metallix v1 targets a single-Mac, macOS / Apple-Silicon / Metal serving runtime.
+It is designed around portable service contracts and model-specific Metal
+execution plug-ins, without a generic tensor or compute-backend abstraction.
+V4.1 Flash is the primary target because its CED, sparse-MoE, Engram, and cache layout are not
+a drop-in fit for existing local runtimes. Qwen is the first running
+qualification adapter; V4.1 remains the primary target.
 
 The target is not a generic HTTP wrapper and not a claim of immediate feature
 parity with vLLM or SGLang. The target is their useful serving semantics for
@@ -14,7 +15,7 @@ the models Metallix supports: bounded concurrent requests, safe KV reuse,
 streaming, cancellation, measurable scheduling, and explicit capability
 coverage per model.
 
-## Control plane
+## Planned control plane
 
 The control plane owns request parsing, tokenization and chat templates,
 admission, continuous batching, sampling, streaming, cancellation, metrics,
@@ -33,7 +34,7 @@ Model lifecycle is explicit: `unloaded`, `loading`, `warming`, `ready`, or
 from process startup, a listening port, or model discovery; it includes the
 adapter's required plan compilation and warmup.
 
-## Execution plug-ins
+## Planned execution plug-ins
 
 Each adapter under `crates/models/` owns validated configuration, checkpoint
 loading, quantization-manifest validation, prefill and decode graphs, the
@@ -48,6 +49,12 @@ Engram weights. It must use an SSD tier on this machine; active parameter
 counts do not make the full checkpoint resident.
 
 ## Delivery order
+
+Qwen3-0.6B is the resident control model used to qualify MLX loading, numerical
+forward agreement, and single-sequence cached-decode agreement before attempting
+V4.1's larger sparse execution path. Passing Qwen tests does not qualify CED,
+CSA2, Engram, or V4.1 quantization. The current Qwen diagnostic uses float32 weights and raw
+token IDs; its prompt limit is deliberately smaller than the model context.
 
 1. Parse and validate V4.1 configuration; establish reference-parity tests
    for a small text-only forward pass.
@@ -91,7 +98,9 @@ token against the best available upstream path before expanding Metallix.
 
 ## Gates
 
-- No full checkpoint download before a text-only reference-parity test passes.
+- No full V4.1 checkpoint download before a V4.1 text-only reference-parity
+  test passes. The small resident Qwen comparison checkpoint is used to
+  establish and exercise the numerical test harness.
 - No serving claim before bounded request, cancellation, and memory-admission
   tests pass.
 - No default-model recommendation before 512, 8k, and 32k cold/shared-prefix

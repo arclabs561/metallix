@@ -8,9 +8,10 @@ concurrency, reusable context, and measured memory behavior.
 
 ## Status
 
-The current milestone validates model configuration, checkpoint layout, Qwen
-grouped-query KV sizing, and an optional Rust-to-MLX Metal checkpoint load. It
-does not run a Qwen decoder or serve requests yet.
+The current milestone runs a complete dense Qwen3 decoder through MLX on
+Metal, with a reproducible CPU comparison and single-sequence KV reuse. DeepSeek-V4.1
+configuration and checkpoint-index inspection are available; V4.1 execution
+and HTTP serving remain unfinished.
 
 ```sh
 cargo run -p server -- inspect-v41 --config /path/to/deepseek-v41-config.json
@@ -42,7 +43,7 @@ cargo run -p server --features metal -- smoke-qwen-metal
 ```
 
 Metallix does not currently convert quantizations. V4.1 support begins by
-validating the official FP8/FP4 artifact layout; conversion or lower-bit
+validating the expected FP8/FP4 layout of supplied artifacts; conversion or lower-bit
 formats need separate parity and quality gates.
 
 On Apple Silicon, load an inspected Qwen3 safetensors checkpoint as MLX Metal
@@ -52,22 +53,71 @@ arrays and force evaluation of its token embedding:
 cargo run -p server --features metal -- load-qwen-metal --model /path/to/Qwen3-0.6B
 ```
 
-This is a checkpoint-payload compatibility gate, not text generation. It holds
-the loaded tensors only for the process lifetime and the next gate is
-fixed-token decoder-logit parity.
+This checks checkpoint-payload compatibility without running the decoder.
+The loaded tensors live only for the process lifetime.
 
-The same gate can execute the fixed raw IDs `[1, 2, 3]` from the checked-in
-reference fixture through the token embedding on the GPU stream:
+The embedding command runs the same fixed raw IDs `[1, 2, 3]` recorded in the
+reference fixture and reports the output shape:
 
 ```sh
 cargo run -p server --features metal -- embed-qwen-metal --model /path/to/Qwen3-0.6B
 ```
+
+Run one excluded warmup and three measured uncached forwards:
+
+```sh
+cargo run -p server --features metal -- forward-qwen-metal \
+  --model /path/to/Qwen3-0.6B --input-ids 1,2,3 --repeats 3
+```
+
+The command emits JSON with timings and top logits. `--reference PATH` plus
+`--reference-manifest JSON` compare every vocabulary logit against a local
+float32 reference, checking input IDs and checkpoint/reference hashes first.
+Disagreement exits nonzero. Float32 weights are prepared once before
+warmup. This diagnostic path accepts at most 512 raw tokens per sequence.
+An absent reference is reported as `"parity": null`.
+
+Generate greedy token IDs with contiguous KV reuse:
+
+```sh
+cargo run -p server --release --features metal -- generate-qwen-metal \
+  --model /path/to/Qwen3-0.6B --input-ids 785,6722,315,9625,374 \
+  --max-tokens 12 --verify-cache
+```
+
+Those input IDs encode “The capital of France is”. The output begins
+`12095,13,576` (“ Paris. The” with the Qwen tokenizer). `--verify-cache`
+compares each cached result with a full Metal recomputation outside the timed
+regions. This diagnostic uses greedy sampling, one sequence, and at most 512
+input plus generated tokens. KV byte counts describe live arrays, excluding
+allocator overhead and temporary copies.
+
+For independent CPU parity, install [uv](https://docs.astral.sh/uv/) and run
+the four-case suite. The scripts declare pinned Torch/Transformers dependencies
+and use an already-downloaded local Qwen3-0.6B checkpoint:
+
+```sh
+cargo build -p server --release --features metal
+uv run scripts/qwen-parity-suite.py --binary target/release/metallix \
+  --model /path/to/Qwen3-0.6B
+```
+
+This compares all logits for prompts of 1, 3, 17, and 64 tokens. Temporary
+reference files are cleaned up by the harness. See
+[the local experiment](docs/experiments/qwen-metal.md) for measured results.
+Removing layer-by-layer GPU waits reduced warm cached decode from 20.3 to
+8.74 ms per step on an M3 Max (three 32-token runs, 90 measured decode steps).
+This is a single-sequence diagnostic, not a serving-throughput comparison.
 
 See [the architecture](docs/architecture.md) for the serving contract and
 delivery gates, and [the efficiency requirements](docs/research/efficiency-methods.md)
 for the paper-derived implementation checks.
 
 ## Build
+
+Build from source with Rust. The default build provides checkpoint inspection;
+`--features metal` enables Qwen execution on Apple Silicon and builds native
+MLX, requiring CMake and a working Xcode Metal toolchain.
 
 ```sh
 cargo build --workspace
@@ -102,22 +152,33 @@ or clear a server cache. Keep the same model revision, cache condition, request
 shape, and prompt digest when comparing runs. It does not claim a model
 benchmark for the metadata-inspection commands.
 
+Requests have a 120-second deadline, configurable with `--timeout-ms`.
+Truncated streams, SSE errors, and invalid token usage fail the run; `[DONE]`
+ends measurement even if the server keeps the connection open.
+
 ## Development
 
 ```sh
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+node --test scripts/benchmark-openai.test.mjs
+```
+
+On Apple Silicon, also test the optional execution path:
+
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ## Limitations
 
-There is no Qwen decoder forward path or HTTP server yet. The optional Metal
-commands qualify a 1×1 graph, checkpoint payload, and token embedding; none is
-model inference. The repository includes an HTTP benchmark client and a
-checkpoint-index parsing microbenchmark, neither of which is an inference
-result. V4.1 weight download remains blocked on a small text-forward parity
-fixture.
+There is no HTTP server or V4.1 decoder yet. Qwen's diagnostic forward works
+on raw IDs; tokenizer/chat templates, paged KV, continuous batching, and
+quantization conversion are unfinished. The HTTP benchmark client measures
+an independently running compatible server. V4.1 weight download remains
+gated on its own small text-forward parity fixture.
 
 ## License
 

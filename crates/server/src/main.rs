@@ -139,7 +139,7 @@ fn embed_qwen_metal(model: &PathBuf) -> ExitCode {
             println!("Qwen MLX Metal embedding lookup qualified");
             println!("input IDs: 3 fixed raw tokens");
             println!("embedding output shape: {shape:?}");
-            println!("next gate: RMSNorm and first-layer attention parity");
+            println!("scope: fixed embedding lookup; no decoder logits");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -160,7 +160,7 @@ fn load_qwen_metal(model: &PathBuf) -> ExitCode {
                 "declared checkpoint bytes: {}",
                 weights.inspection().tensor_bytes()
             );
-            println!("next gate: fixed-token decoder logits parity");
+            println!("scope: tensors loaded; decoder not evaluated");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -192,7 +192,7 @@ fn inspect_qwen_checkpoint(model: &PathBuf) -> ExitCode {
             println!("tensors: {}", checkpoint.tensor_count());
             println!("shards: {}", checkpoint.shards().len());
             println!("declared tensor bytes: {}", checkpoint.tensor_bytes());
-            println!("next gate: load a fixed tensor slice for numerical parity");
+            println!("scope: checkpoint metadata and byte ranges; no tensor evaluation");
             ExitCode::SUCCESS
         }
         Err(error) => {
