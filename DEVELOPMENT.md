@@ -5,6 +5,15 @@ loader, numerical, and single-sequence decode experiments. A new model earns
 an adapter through a verified checkpoint contract and numerical reference, not
 through a model-name entry alone.
 
+## Keep findings traceable
+
+Use the [research index](docs/research/README.md) to connect sources, code,
+fixtures, and measurements. Record a new optimization's source and limitations
+in its topic note when implementing it, then link the result from the experiment
+ledger. Distinguish copied/adapted code, conceptual inspiration, and changes
+derived from our own profiles. Keep failed experiments and rejected approaches
+with the evidence that would justify revisiting them.
+
 ## Check first
 
 Run from the repository root. Install Rust, uv, Node.js, and Ruff; Metal builds

@@ -163,6 +163,9 @@ ends measurement even if the server keeps the connection open.
 
 ## Development
 
+See the [developer guide](DEVELOPMENT.md) for measurement workflows and the
+[research index](docs/research/README.md) for source-to-code provenance.
+
 Checks require Node.js and Ruff on `PATH`, in addition to Rust and uv.
 
 ```sh
