@@ -80,10 +80,17 @@ pub fn select_indices(
     }
 
     let mut ranked: Vec<usize> = (0..logits.len()).collect();
-    ranked.sort_by(|&left, &right| logits[right].total_cmp(&logits[left]));
     if select < logits.len() {
-        let cutoff = logits[ranked[select - 1]];
-        let next = logits[ranked[select]];
+        // Partition at the first excluded score; only the selected positions
+        // need sorting later. Neither partition has an internal score order.
+        let (selected, next, _) = ranked.select_nth_unstable_by(select, |&left, &right| {
+            logits[right].total_cmp(&logits[left])
+        });
+        let cutoff = selected
+            .iter()
+            .map(|&position| logits[position])
+            .fold(f32::INFINITY, f32::min);
+        let next = logits[*next];
         if scores_equal(cutoff, next)
             && logits
                 .iter()
@@ -230,5 +237,135 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{}: {error}", case.name));
             assert_eq!(actual, case.expected_indices, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn exhaustively_matches_an_independent_small_row_oracle() {
+        const SCORES: [f32; 5] = [f32::NEG_INFINITY, -1.0, 0.0, -0.0, 1.0];
+        for width in 0..=5 {
+            for compress_len in 0..=width {
+                let mut logits = vec![f32::NEG_INFINITY; width];
+                for_each_reachable_row(&mut logits, compress_len, 0, &SCORES, &mut |row| {
+                    for index_topk in 0..=width + 1 {
+                        let expected = oracle_select(row, compress_len, index_topk, 17);
+                        let actual = select_indices(row, compress_len, index_topk, 17);
+                        assert_eq!(
+                            actual, expected,
+                            "width={width} compress_len={compress_len} topk={index_topk} logits={row:?}"
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    fn for_each_reachable_row(
+        row: &mut [f32],
+        reachable: usize,
+        position: usize,
+        values: &[f32],
+        visit: &mut impl FnMut(&[f32]),
+    ) {
+        if position == reachable {
+            visit(row);
+            return;
+        }
+        for &value in values {
+            row[position] = value;
+            for_each_reachable_row(row, reachable, position + 1, values, visit);
+        }
+    }
+
+    fn oracle_select(
+        logits: &[f32],
+        compress_len: usize,
+        index_topk: usize,
+        offset: usize,
+    ) -> Result<Vec<i32>, SelectionError> {
+        let select = index_topk.min(logits.len());
+        if select == 0 {
+            return Ok(Vec::new());
+        }
+        let mut subsets = Vec::new();
+        enumerate_subsets(logits.len(), select, 0, &mut Vec::new(), &mut subsets);
+        let mut best_scores: Option<Vec<f32>> = None;
+        let mut observed = Vec::new();
+        for subset in subsets {
+            let mut scores: Vec<f32> = subset.iter().map(|&position| logits[position]).collect();
+            scores.sort_by(|left, right| score_desc_cmp(*left, *right));
+            match &best_scores {
+                None => {
+                    best_scores = Some(scores);
+                    observed = vec![subset_to_output(&subset, compress_len, offset)];
+                }
+                Some(best) => match score_sequence_cmp(&scores, best) {
+                    std::cmp::Ordering::Less => {
+                        best_scores = Some(scores);
+                        observed = vec![subset_to_output(&subset, compress_len, offset)];
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let output = subset_to_output(&subset, compress_len, offset);
+                        if !observed.contains(&output) {
+                            observed.push(output);
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {}
+                },
+            }
+        }
+        if observed.len() == 1 {
+            Ok(observed.pop().expect("one observed output"))
+        } else {
+            Err(SelectionError::AmbiguousCutoffTie)
+        }
+    }
+
+    fn enumerate_subsets(
+        width: usize,
+        select: usize,
+        next: usize,
+        current: &mut Vec<usize>,
+        output: &mut Vec<Vec<usize>>,
+    ) {
+        if current.len() == select {
+            output.push(current.clone());
+            return;
+        }
+        for position in next..width {
+            current.push(position);
+            enumerate_subsets(width, select, position + 1, current, output);
+            current.pop();
+        }
+    }
+
+    fn score_sequence_cmp(left: &[f32], right: &[f32]) -> std::cmp::Ordering {
+        left.iter()
+            .zip(right)
+            .map(|(&left, &right)| score_desc_cmp(left, right))
+            .find(|&order| order != std::cmp::Ordering::Equal)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+
+    fn score_desc_cmp(left: f32, right: f32) -> std::cmp::Ordering {
+        if left.to_bits() == right.to_bits()
+            || (left.abs().to_bits() == 0 && right.abs().to_bits() == 0)
+        {
+            std::cmp::Ordering::Equal
+        } else {
+            right.total_cmp(&left)
+        }
+    }
+
+    fn subset_to_output(subset: &[usize], compress_len: usize, offset: usize) -> Vec<i32> {
+        subset
+            .iter()
+            .map(|&position| {
+                if position < compress_len {
+                    i32::try_from(offset + position).expect("small oracle offset fits")
+                } else {
+                    -1
+                }
+            })
+            .collect()
     }
 }
