@@ -76,7 +76,27 @@ uv run scripts/v41-candidate-reference.py --kind index-scores \
   --source artifacts/v41-reference-model.py > artifacts/v41-index-score-reference.json
 ```
 
-These are operator-level parity gates. They do not satisfy the text-forward
+## Final selection reference
+
+The capture script also records ten synthetic cases for the final three
+statements in the pinned `Indexer.forward`: clamp Top-K to row width, select by
+score and re-sort by position, then apply the offset or causal `-1` sentinel.
+
+```sh
+uv run scripts/v41-candidate-reference.py --kind selection \
+  --source artifacts/v41-reference-model.py > artifacts/v41-selection-reference.json
+cmp fixtures/deepseek-v41/selection-reference.json artifacts/v41-selection-reference.json
+```
+
+This is reference evidence, not a Rust or Metal selection implementation.
+Inputs are already masked. A selected negative-infinity score does **not**
+automatically produce `-1`: that conversion checks only causal reachability.
+For example, `[8, -inf, -inf]` with three reachable positions, Top-K 3, and
+offset 10 produces `[10, 11, 12]`. Fewer finite scores than requested positions
+can therefore select candidate-masked but reachable entries. The fixture avoids
+cutoff ties; sorting selected positions does not settle ambiguous Top-K membership.
+
+These are operator-level parity gates and reference captures. They do not satisfy the text-forward
 gate for downloading the full V4.1 checkpoint, and they are not a performance or
 model-quality result. Next are BF16/FP4 score qualification, second-stage
 selection, and sparse attention with the same numerical and masking checks.

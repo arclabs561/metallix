@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "source": {
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py",
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "symbol": "Indexer.forward:selection",
+    "license": "MIT"
+  },
+  "reference": {
+    "torch_version": "2.13.0",
+    "device": "cpu",
+    "dtype": "float32"
+  },
+  "scope": "Synthetic one-query final selection from already-masked scores. No cutoff ties, candidate mask computation, quantization, attention, model weights, or Metal execution. Negative infinity at a reachable position does not imply a -1 output.",
+  "cases": [
+    {
+      "name": "position_order_not_score_order",
+      "logits": [
+        3,
+        9,
+        1,
+        7
+      ],
+      "compress_len": 4,
+      "index_topk": 2,
+      "offset": 10,
+      "expected_indices": [
+        11,
+        13
+      ]
+    },
+    {
+      "name": "width_clamps_topk",
+      "logits": [
+        3,
+        1,
+        2
+      ],
+      "compress_len": 3,
+      "index_topk": 99,
+      "offset": 4,
+      "expected_indices": [
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "name": "zero_topk",
+      "logits": [
+        3,
+        2,
+        1
+      ],
+      "compress_len": 3,
+      "index_topk": 0,
+      "offset": 4,
+      "expected_indices": []
+    },
+    {
+      "name": "zero_width",
+      "logits": [],
+      "compress_len": 0,
+      "index_topk": 512,
+      "offset": 4,
+      "expected_indices": []
+    },
+    {
+      "name": "future_positions_become_sentinels",
+      "logits": [
+        9,
+        2,
+        null,
+        null
+      ],
+      "compress_len": 2,
+      "index_topk": 4,
+      "offset": 10,
+      "expected_indices": [
+        10,
+        11,
+        -1,
+        -1
+      ]
+    },
+    {
+      "name": "no_visible_positions",
+      "logits": [
+        null,
+        null,
+        null
+      ],
+      "compress_len": 0,
+      "index_topk": 3,
+      "offset": 10,
+      "expected_indices": [
+        -1,
+        -1,
+        -1
+      ]
+    },
+    {
+      "name": "masked_reachable_positions_are_not_sentinels",
+      "logits": [
+        8,
+        null,
+        null
+      ],
+      "compress_len": 3,
+      "index_topk": 3,
+      "offset": 10,
+      "expected_indices": [
+        10,
+        11,
+        12
+      ]
+    },
+    {
+      "name": "ties_wholly_selected",
+      "logits": [
+        5,
+        5,
+        1
+      ],
+      "compress_len": 3,
+      "index_topk": 2,
+      "offset": 0,
+      "expected_indices": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "signed_zero_wholly_selected",
+      "logits": [
+        0.0,
+        -0.0,
+        -1
+      ],
+      "compress_len": 3,
+      "index_topk": 2,
+      "offset": 0,
+      "expected_indices": [
+        0,
+        1
+      ]
+    },
+    {
+      "name": "negative_scores",
+      "logits": [
+        -9,
+        -2,
+        -5,
+        -1
+      ],
+      "compress_len": 4,
+      "index_topk": 2,
+      "offset": 100,
+      "expected_indices": [
+        101,
+        103
+      ]
+    }
+  ]
+}
