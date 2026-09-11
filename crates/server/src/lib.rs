@@ -42,8 +42,9 @@ enum Command {
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeats: u32,
     },
-    /// Generate greedy raw token IDs with per-sequence KV reuse on Metal.
+    /// Generate greedy Qwen3 raw token IDs with per-sequence KV reuse on Metal.
     #[cfg(feature = "metal")]
+    #[command(visible_alias = "gen")]
     GenerateQwenMetal {
         #[arg(long)]
         model: PathBuf,
@@ -54,6 +55,9 @@ enum Command {
         /// Compare each cached result with a full forward outside timed regions.
         #[arg(long)]
         verify_cache: bool,
+        /// Emit phase timing and logical-memory diagnostics on stderr.
+        #[arg(short, long, visible_alias = "debug")]
+        verbose: bool,
     },
     /// Run and time the complete uncached Qwen3 decoder on raw token IDs.
     #[cfg(feature = "metal")]
@@ -169,6 +173,26 @@ enum Command {
         #[arg(long)]
         candidate_only: bool,
     },
+    /// Check streamed KV appends against resident cached and full forwards.
+    #[cfg(feature = "metal")]
+    CheckQwenStreamCacheMetal {
+        #[arg(long)]
+        model: PathBuf,
+        /// Prefill raw token IDs; prompt plus appends must fit 32 tokens.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+        input_ids: Vec<i32>,
+        /// Known token IDs to append one at a time; these are not generated tokens.
+        #[arg(long, value_delimiter = ',', default_value = "4,5,6")]
+        decode_ids: Vec<i32>,
+        #[arg(long, default_value_t = 1_024, value_parser = clap::value_parser!(u32).range(1..=4_096))]
+        tile_rows: u32,
+        /// Logical weights/loading staging only; excludes KV, scratch and oracles.
+        #[arg(long, default_value_t = 134_217_728, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+        max_weight_bytes: u64,
+        /// Logical retained KV only; excludes transient copies and process overhead.
+        #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+        max_kv_bytes: u64,
+    },
     /// Evaluate one selected-weight Qwen block and compare with resident weights.
     #[cfg(feature = "metal")]
     CheckQwenLayerMetal {
@@ -205,6 +229,10 @@ enum Command {
 
 /// Runs the shared CLI, preserving the invoked executable name in help output.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive CLI dispatch; handlers stay separate"
+)]
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -216,7 +244,8 @@ pub fn run() -> ExitCode {
             input_ids,
             max_tokens,
             verify_cache,
-        } => qwen_forward::generate(&model, &input_ids, max_tokens, verify_cache),
+            verbose,
+        } => qwen_forward::generate(&model, &input_ids, max_tokens, verify_cache, verbose),
         #[cfg(feature = "metal")]
         Command::ForwardQwenMetal {
             model,
@@ -280,6 +309,22 @@ pub fn run() -> ExitCode {
             tile_rows,
             max_weight_bytes,
             candidate_only,
+        ),
+        #[cfg(feature = "metal")]
+        Command::CheckQwenStreamCacheMetal {
+            model,
+            input_ids,
+            decode_ids,
+            tile_rows,
+            max_weight_bytes,
+            max_kv_bytes,
+        } => check_qwen_stream_cache_metal(
+            &model,
+            &input_ids,
+            &decode_ids,
+            tile_rows,
+            max_weight_bytes,
+            max_kv_bytes,
         ),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
@@ -520,6 +565,35 @@ fn print_stream_report(report: impl serde::Serialize) -> ExitCode {
         }
         Err(error) => {
             eprintln!("could not serialize stream report: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn check_qwen_stream_cache_metal(
+    model: &std::path::Path,
+    input_ids: &[i32],
+    decode_ids: &[i32],
+    tile_rows: u32,
+    max_weight_bytes: u64,
+    max_kv_bytes: u64,
+) -> ExitCode {
+    let Ok(tile_rows) = usize::try_from(tile_rows) else {
+        eprintln!("Qwen streamed cache check failed: tile rows do not fit usize");
+        return ExitCode::FAILURE;
+    };
+    match qwen::metal::qualify_streamed_cached_forward(
+        model,
+        input_ids,
+        decode_ids,
+        max_weight_bytes,
+        max_kv_bytes,
+        tile_rows,
+    ) {
+        Ok(report) => print_stream_report(report),
+        Err(error) => {
+            eprintln!("Qwen streamed cache check failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -775,6 +849,32 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    fn qwen_generation_alias_preserves_the_existing_raw_id_diagnostic() {
+        let default = Cli::try_parse_from(["mx", "gen", "--model", "model"])
+            .expect("generation alias with defaults");
+        assert!(matches!(
+            default.command,
+            super::Command::GenerateQwenMetal {
+                input_ids,
+                max_tokens: 32,
+                verify_cache: false,
+                verbose: false,
+                ..
+            } if input_ids == [1, 2, 3]
+        ));
+
+        for flag in ["--verbose", "--debug", "-v"] {
+            let cli = Cli::try_parse_from(["mx", "gen", "--model", "model", flag])
+                .expect("generation diagnostic verbosity spelling");
+            assert!(matches!(
+                cli.command,
+                super::Command::GenerateQwenMetal { verbose: true, .. }
+            ));
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
     fn tensor_check_has_a_finite_explicit_payload_budget() {
         let cli = Cli::try_parse_from(["metallix", "check-qwen-tensor-metal", "--model", "model"])
             .expect("default tensor diagnostic");
@@ -870,6 +970,52 @@ mod tests {
                     "model",
                     "--max-bytes",
                     limit,
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn stream_cache_check_keeps_append_ids_and_budgets_distinct() {
+        let cli = Cli::try_parse_from([
+            "mx",
+            "check-qwen-stream-cache-metal",
+            "--model",
+            "model",
+            "--input-ids",
+            "9707,11",
+            "--decode-ids",
+            "1879,151935",
+            "--max-weight-bytes",
+            "81798144",
+            "--max-kv-bytes",
+            "1048576",
+        ])
+        .expect("known appends and independent budgets");
+        assert!(
+            matches!(cli.command, super::Command::CheckQwenStreamCacheMetal {
+            input_ids, decode_ids, max_weight_bytes: 81_798_144,
+            max_kv_bytes: 1_048_576, tile_rows: 1024, ..
+        } if input_ids == [9707, 11] && decode_ids == [1879, 151_935])
+        );
+        assert!(Cli::try_parse_from(["mx", "check-qwen-stream-cache-metal"]).is_err());
+        for (flag, value) in [
+            ("--tile-rows", "0"),
+            ("--tile-rows", "4097"),
+            ("--max-weight-bytes", "0"),
+            ("--max-kv-bytes", "0"),
+            ("--max-kv-bytes", "1073741825"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "mx",
+                    "check-qwen-stream-cache-metal",
+                    "--model",
+                    "model",
+                    flag,
+                    value,
                 ])
                 .is_err()
             );
@@ -1065,6 +1211,7 @@ mod tests {
         assert!(!help.contains("generate-qwen-metal"));
         assert!(!help.contains("forward-qwen-metal"));
         assert!(!help.contains("check-v41-indexer-metal"));
+        assert!(!help.contains("check-qwen-stream-cache-metal"));
     }
 
     #[cfg(feature = "metal")]
@@ -1075,5 +1222,6 @@ mod tests {
         assert!(help.contains("generate-qwen-metal"));
         assert!(help.contains("forward-qwen-metal"));
         assert!(help.contains("check-v41-indexer-metal"));
+        assert!(help.contains("check-qwen-stream-cache-metal"));
     }
 }

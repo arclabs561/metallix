@@ -17,8 +17,9 @@ pub(crate) fn generate(
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
+    verbose: bool,
 ) -> ExitCode {
-    match generate_inner(model, input_ids, max_tokens, verify_cache) {
+    match generate_inner(model, input_ids, max_tokens, verify_cache, verbose) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Qwen generation failed: {error}");
@@ -32,9 +33,14 @@ fn generate_inner(
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if input_ids.len().saturating_add(max_tokens as usize) > qwen::forward::MAX_DENSE_DEBUG_TOKENS {
         return Err("prompt plus generation budget exceeds diagnostic context limit".into());
+    }
+    if verbose {
+        let diagnostic = verbose_preflight(input_ids.len(), max_tokens, verify_cache);
+        eprintln!("{diagnostic}");
     }
     let raw = fs::read_to_string(model.join("config.json"))?;
     let generation: GenerationConfig = serde_json::from_str(&raw)?;
@@ -42,10 +48,23 @@ fn generate_inner(
     let mut weights = Qwen3MlxWeights::load(model)?;
     weights.prepare_float32()?;
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if verbose {
+        let logical_weight_bytes = weights.logical_weight_bytes();
+        eprintln!(
+            "qwen generation diagnostic: phase=load load_ms={load_ms:.3} logical_weight_bytes={logical_weight_bytes}",
+        );
+    }
     let mut executor = weights.executor();
     let started = Instant::now();
     let mut logits = executor.prefill_last_logits(input_ids)?;
     let prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if verbose {
+        let cached_tokens = executor.cached_tokens();
+        let logical_kv_bytes = executor.kv_bytes();
+        eprintln!(
+            "qwen generation diagnostic: phase=prefill prefill_ms={prefill_ms:.3} cached_tokens={cached_tokens} logical_kv_bytes={logical_kv_bytes}",
+        );
+    }
     let mut prefix = input_ids.to_vec();
     let mut generated = Vec::new();
     let mut decode_ms = Vec::new();
@@ -76,6 +95,15 @@ fn generate_inner(
             decode_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         }
     }
+    if verbose {
+        let decode_total_ms = decode_ms.iter().sum::<f64>();
+        let decode_steps = decode_ms.len();
+        let cached_tokens = executor.cached_tokens();
+        let logical_kv_bytes = executor.kv_bytes();
+        eprintln!(
+            "qwen generation diagnostic: phase=decode decode_steps={decode_steps} decode_total_ms={decode_total_ms:.3} cached_tokens={cached_tokens} logical_kv_bytes={logical_kv_bytes}",
+        );
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -96,6 +124,13 @@ fn generate_inner(
         }))?
     );
     Ok(())
+}
+
+fn verbose_preflight(prompt_tokens: usize, max_tokens: u32, verify_cache: bool) -> String {
+    let context_limit = qwen::forward::MAX_DENSE_DEBUG_TOKENS;
+    format!(
+        "qwen generation diagnostic: phase=preflight prompt_tokens={prompt_tokens} max_tokens={max_tokens} context_limit={context_limit} verify_cache={verify_cache}",
+    )
 }
 
 fn greedy_token(logits: &[f32]) -> Result<i32, String> {
@@ -195,4 +230,22 @@ fn measure(
         }))?
     );
     Ok(passed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verbose_preflight;
+
+    #[test]
+    fn verbose_preflight_is_deterministic_and_excludes_sensitive_arguments() {
+        let diagnostic = verbose_preflight(3, 32, false);
+
+        assert_eq!(
+            diagnostic,
+            "qwen generation diagnostic: phase=preflight prompt_tokens=3 max_tokens=32 context_limit=512 verify_cache=false"
+        );
+        assert!(!diagnostic.contains("model"));
+        assert!(!diagnostic.contains("input_ids"));
+        assert!(!diagnostic.contains("generated_ids"));
+    }
 }
