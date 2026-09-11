@@ -94,8 +94,11 @@ through concatenation. These are useful parity diagnostics, not an offload
 implementation. The DeepSeek index parser inventories shards but does not yet
 expose validated per-expert byte ranges.
 
-The next loader experiment needs validated tensor ranges, immutable packed
-source bytes, and a bounded per-layer or per-expert resident set. An allocation
+The [selected-tensor diagnostic](../experiments/loader-qualification.md) now
+qualifies Qwen's adapter-private range reader against the resident loader.
+It bounds one raw payload, not the entire process. The next loader experiment
+needs immutable packed source bytes and a bounded per-layer or per-expert
+resident set wired into execution. An allocation
 must remain leased until every dependent GPU operation completes; dropping a
 Rust handle is not itself proof of GPU completion.
 

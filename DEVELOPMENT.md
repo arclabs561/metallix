@@ -70,6 +70,11 @@ is performed. See [host-memory constraints](docs/research/host-memory.md).
 
 ## Profile before optimizing
 
+For the first selected-tensor loader gate and V4.1 shape checks, follow
+[loader qualification](docs/experiments/loader-qualification.md). The tensor
+diagnostic's byte limit applies to its selected raw payload, not the resident
+reference loader or the process's total memory.
+
 Use an optimized executable and a sustained workload. With Divan, directly
 invoking a benchmark executable needs `--bench`; otherwise it only runs tests.
 Confirm the output includes timed samples. Use headless `samply record
