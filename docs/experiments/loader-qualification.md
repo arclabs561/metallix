@@ -91,6 +91,37 @@ does not implement either in the decoder. The raw budget excludes decoded
 FP32 buffers, headers, allocator overhead and the full resident reference.
 Single read timings do not establish SSD throughput or a performance gain.
 
+## Token-ordered selected embedding
+
+[`qualify_embedding`](../../crates/models/qwen/src/metal/embedding_check.rs)
+uses the row reader for actual raw token IDs. It reads each distinct row once,
+then assembles an FP32 array in input order, preserving repeated IDs. The
+aggregate raw budget is checked before payload reads. A separate resident MLX
+`take_axis` lookup supplies the oracle; this is not the decoder's embedding
+path yet.
+
+```sh
+target/release/mx check-qwen-embedding-metal --model /path/to/Qwen3-0.6B \
+  --input-ids 151935,0,151935,3 --max-bytes 6144
+```
+
+With the Qwen checkpoint identified above, this exited 0 and compared all
+4,096 values bit-for-bit. Output shape was `[4,1024]`, with three distinct
+rows and 6,144 selected raw bytes, versus the full embedding tensor's
+311,164,928 bytes. The candidate output was 16,384 FP32 bytes. These are
+logical payload counts, not measured physical I/O or a peak-memory claim;
+the resident oracle still loads the checkpoint. A budget of 6,143 exited 1.
+
+The API caps inputs at 512 tokens and 1,048,576 output elements. Unit tests
+cover duplicate-aware budgeting, invalid IDs and oversized output. Both
+canonical checks passed. Receipts: `artifacts/qwen-selected-embedding.json`,
+its `.stderr`, `artifacts/qwen-selected-embedding-budget.stderr`, and
+`artifacts/check-embedding-{default,metal}.log`. Executable SHA-256:
+`d7586bfc773184f4bfcf4337f11f0172f41457167d594d1f30004f0ba99da385`.
+
+Next: qualify tiled tied-output projection before composing a complete
+streamed forward. No speedup follows from this single lookup measurement.
+
 ## One-block selected-weight execution
 
 At `51f61d0`, [`qualify_layer`](../../crates/models/qwen/src/metal/layer_check.rs) reads the
