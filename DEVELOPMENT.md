@@ -222,6 +222,14 @@ covers logical weights/loading staging; the separate KV budget covers retained
 FP32 K/V only, not transient copies, scratch, or process memory. This is a
 cache-correctness diagnostic, not generated text or a beyond-RAM serving claim.
 
+Add `--candidate-only` to this cached command to omit both resident controls.
+It emits per-step logits and `verification: "candidate_only"`, not parity
+fields. This permits isolated process-memory measurement; retained output
+vectors and serialization still contribute to process peak. Compare the
+emitted vectors with separately captured CPU references and keep the default
+resident qualification as a separate run. See the
+[cached process measurements](docs/experiments/loader-qualification.md#candidate-only-cached-process-footprint).
+
 `check-qwen-layer-metal` extends this to one real block on synthetic hidden
 states. Its `--max-weight-bytes` bounds logical weights and loading staging,
 not scratch or process memory. Use `--candidate-only` when measuring process

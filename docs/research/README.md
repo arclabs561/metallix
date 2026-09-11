@@ -51,8 +51,9 @@ now composes bounded embedding, layer and projection reads against the resident
 oracle. [Candidate-only process measurements](../experiments/loader-qualification.md#candidate-only-process-footprint)
 now isolate that execution and directly compare its emitted logits with CPU.
 Teacher-forced cached streaming is also qualified against resident controls;
-sampled streamed generation and candidate-only cached process measurements
-remain next gates, alongside repeated/variable-shape lifetimes.
+[cached candidate-only measurements](../experiments/loader-qualification.md#candidate-only-cached-process-footprint)
+now isolate its process footprint and directly compare each step with CPU.
+Sampled streamed generation and repeated/variable-shape lifetimes remain next gates.
 DeepSeek-V4.1 still needs its own text-forward numerical fixture;
 Qwen correctness does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.

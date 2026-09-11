@@ -232,8 +232,8 @@ generation throughput. Receipts: `artifacts/stream-oracle-{0,1,2}.json` and
 `artifacts/stream-repeat-{1,2,3}.json`, with corresponding stderr. Executable:
 `3507f68f2a1647a94fa81ed44bac13809e74f4dbfa385cd836f2b57a29f74205`.
 
-The candidate-only measurement below advances the memory gate. Cached streaming
-and DeepSeek-V4.1's own numerical fixtures/operators remain unfinished; this
+The candidate-only measurement below advances the memory gate. Sampled cached
+streaming and DeepSeek-V4.1 text-forward parity remain unfinished; this
 Qwen result does not establish V4.1 support.
 
 ### Candidate-only process footprint
@@ -364,9 +364,67 @@ logits for lengths 1, 3, 17 and 64, with zero mismatches
 (`artifacts/cached-stream-cpu-regression.log`). This is a separate reference
 check, not a direct Torch cached-stream measurement.
 
-Next: join this path to sampling, isolate candidate-only cached process-memory
-measurement, and measure repeated variable-length lifetimes. Keep the
+Next: join this path to sampling and measure repeated variable-length
+lifetimes. Candidate-only measurement is recorded below. Keep the
 DeepSeek compressed/sparse state layout separate from Qwen GQA K/V.
+
+### Candidate-only cached process footprint
+
+At `6036110` (Qwen) and `de7be36` (CLI), the cached command accepts
+`--candidate-only`. It shares the exact preflight and candidate executor with
+the qualification path but never loads resident controls. Its distinct report
+retains per-step logits, timings and K/V sizes, with `verification: "candidate_only"`
+and no comparison/tolerance fields. Finite-logit validation remains mandatory.
+
+```sh
+/usr/bin/time -l target/release/mx check-qwen-stream-cache-metal \
+  --model /path/to/Qwen3-0.6B --input-ids 9707,11,1879 --decode-ids 4,5,6 \
+  --max-weight-bytes 81798144 --max-kv-bytes 1376256 --candidate-only
+```
+
+Three serialized fresh release processes on the same M3 Max/checkpoint:
+
+| Trial | Maximum RSS, bytes | Peak footprint, bytes | Sum of four candidate steps, ms |
+|---|---:|---:|---:|
+| 1 | 132,431,872 | 308,806,304 | 1,500.292 |
+| 2 | 130,220,032 | 306,578,056 | 1,311.260 |
+| 3 | 134,496,256 | 310,887,096 | 1,358.580 |
+
+Median footprint was 308,806,304 bytes, with a 4,309,040-byte min–max span.
+Process peaks include inspection, allocator retention, all four host output
+vectors and JSON serialization. Candidate timings exclude planning and report
+serialization. File/compilation caches and unrelated host activity were not
+controlled; the timing spread is not a latency improvement claim.
+Final retained K/V was 1,376,256 bytes, separate from the 81,798,144-byte
+logical weight/staging plan. Neither budget bounds process memory.
+
+Three prior oracle-inclusive runs peaked at 3,789,735,544–4,166,207,288 bytes.
+Omitting resident controls isolates the measurement; it is not a model-memory
+optimization or proof that a checkpoint larger than host RAM can run.
+
+Separately captured Torch CPU FP32 full-prefix references checked every
+151,936-element emitted vector for prefixes of 3, 4, 5 and 6 tokens in all
+three runs. All were finite and had zero mismatches under
+`5e-4 + 1e-4 * abs(reference)`; maximum absolute error was about `5.857e-5`.
+Reference sidecar SHA-256 and input IDs were checked before comparison.
+Fresh checkpoint/config hashes matched the identities recorded above.
+The default resident-qualified command also passed after rebuilding.
+Reducing the candidate-only K/V budget by one byte failed with empty stdout.
+
+Receipts: `artifacts/cached-memory-{oracle,candidate}-{1,2,3}.{json,time}`,
+`artifacts/cached-memory-cpu-<comma-separated-prefix>.{json,f32,stderr}`,
+`artifacts/cached-memory-direct-parity.json`, and
+`artifacts/cached-memory-{qualified-after,under-kv}.{json,stderr}`.
+The retained comparison recipe is `artifacts/compare-cached-memory.mjs`;
+CPU capture uses the existing `scripts/qwen-reference.py --input-ids ...`
+with `--logits-output` outside the measured process.
+Candidate executable SHA-256:
+`e7e8b7f6ec74923763652af32191d0253ab68a85e48fff078bda5ebe948a0bb6`.
+Prior oracle-inclusive executable SHA-256:
+`106b8497cb020c04dc1d96737bb42275c8473b10bad2aba9bd65cebf6ecd312c`.
+Default/Metal canonical checks, Rust 1.87 all-feature locked checking, and
+release build passed (`artifacts/check-cached-rope-{default,metal-final}.log`,
+`artifacts/msrv-cached-rope.log`, `artifacts/build-cached-rope.log`).
 
 ## One-block selected-weight execution
 
