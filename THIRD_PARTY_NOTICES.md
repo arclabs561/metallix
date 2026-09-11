@@ -10,6 +10,13 @@ Top-K selection expressions from `Indexer.forward` on synthetic data.
 The rotary-tail diagnostic in `crates/models/deepseek/src/rotary.rs` and its
 synthetic fixture follow `apply_rotary_emb` from that same revision;
 `scripts/v41-rotary-reference.py` executes only that hash-pinned helper.
+The frequency generator in the same Rust module follows `precompute_freqs_cis`;
+`scripts/v41-rope-reference.py` captures frequencies and composed rotations
+from those pinned helpers. The mathematical sparse-attention reference in
+`crates/models/deepseek/src/attention.rs` follows the gather, duplicate-slot,
+and denominator-only sink semantics of `inference/kernel.py:sparse_attn_kernel`
+at the same revision. Its independent fixture generator does not execute the
+upstream kernel or reproduce its BF16 intermediate rounding.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 

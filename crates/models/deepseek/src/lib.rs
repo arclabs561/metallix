@@ -1,5 +1,6 @@
 //! DeepSeek-V4.1 execution-contract parsing and bounded operator qualifications.
 
+pub mod attention;
 pub mod csa2;
 #[cfg(feature = "metal")]
 pub mod indexer;
@@ -7,6 +8,7 @@ pub mod manifest;
 pub mod rotary;
 pub mod selection;
 
+pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]
 pub use indexer::{IndexScoreError, index_scores_f32};
