@@ -33,13 +33,36 @@ def generation_run(decode_ms: list[float]) -> dict[str, object]:
     }
 
 
-def receipt(*, binary: str, offset: float = 0.0) -> dict[str, object]:
+def streamed_generation_run(decode_ms: list[float]) -> dict[str, object]:
+    result = generation_run(decode_ms)
+    result.pop("logical_weight_bytes")
+    result.update(
+        memory_mode="streamed",
+        streamed={
+            "maximum_total_tokens": 6,
+            "max_weight_bytes": 2_048,
+            "max_kv_bytes": 160,
+            "tile_rows": 64,
+            "planned_weight_and_staging_bytes": 1_024,
+            "verification": "not_requested",
+            "oracle_memory_excluded": False,
+            "oracle_load_ms_excluded": None,
+            "scope": "bounded stream test",
+        },
+    )
+    return result
+
+
+def receipt(
+    *, binary: str, offset: float = 0.0, memory_mode: str = "resident"
+) -> dict[str, object]:
     # This is the serialized schema emitted by benchmark-qwen.py, including its
     # generated Run dataclass form rather than a hand-waved comparison format.
+    make_run = generation_run if memory_mode == "resident" else streamed_generation_run
     runs = [
-        generation_run([100.0, 2.0 + offset, 4.0 + offset]),
-        generation_run([100.0, 4.0 + offset, 6.0 + offset]),
-        generation_run([100.0, 6.0 + offset, 8.0 + offset]),
+        make_run([100.0, 2.0 + offset, 4.0 + offset]),
+        make_run([100.0, 4.0 + offset, 6.0 + offset]),
+        make_run([100.0, 6.0 + offset, 8.0 + offset]),
     ]
     per_run = [3.0 + offset, 5.0 + offset, 7.0 + offset]
     return {
@@ -52,6 +75,18 @@ def receipt(*, binary: str, offset: float = 0.0) -> dict[str, object]:
             "max_tokens": 4,
             "runs": 3,
             "discard_decode": 1,
+            "memory_mode": memory_mode,
+            **(
+                {
+                    "streamed": {
+                        "max_weight_bytes": 2_048,
+                        "max_kv_bytes": 160,
+                        "tile_rows": 64,
+                    }
+                }
+                if memory_mode == "streamed"
+                else {}
+            ),
         },
         "scope": "fixed workload",
         "sha256": {"binary": binary, "config": HASH_B, "weights": HASH_C},
@@ -161,6 +196,68 @@ class ComparisonCliTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("median_ms is inconsistent", result.stderr)
+
+    def test_streamed_receipts_round_trip_and_cannot_mix_modes_or_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            baseline = self.write(
+                directory,
+                "stream-baseline.json",
+                receipt(binary=HASH_A, memory_mode="streamed"),
+            )
+            candidate = self.write(
+                directory,
+                "stream-candidate.json",
+                receipt(binary=HASH_A, offset=1.0, memory_mode="streamed"),
+            )
+
+            result = invoke(baseline, candidate)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["workload"]["memory_mode"], "streamed")
+            self.assertEqual(output["workload"]["streamed"]["tile_rows"], 64)
+
+            resident = self.write(directory, "resident.json", receipt(binary=HASH_A))
+            mixed = invoke(baseline, resident)
+            self.assertEqual(mixed.returncode, 2)
+            self.assertIn("receipts differ in workload", mixed.stderr)
+
+            changed = receipt(binary=HASH_A, memory_mode="streamed")
+            changed_workload = changed["workload"]
+            assert isinstance(changed_workload, dict)
+            changed["workload"] = {
+                **changed_workload,
+                "streamed": {
+                    "max_weight_bytes": 4_096,
+                    "max_kv_bytes": 160,
+                    "tile_rows": 64,
+                },
+            }
+            for run in changed["runs"]:  # type: ignore[union-attr]
+                assert isinstance(run, dict)
+                streamed = run["streamed"]
+                assert isinstance(streamed, dict)
+                streamed["max_weight_bytes"] = 4_096
+            changed_budget = self.write(directory, "changed-budget.json", changed)
+            mismatched = invoke(baseline, changed_budget)
+            self.assertEqual(mismatched.returncode, 2)
+            self.assertIn("receipts differ in workload", mismatched.stderr)
+
+    def test_old_receipt_without_memory_mode_is_normalized_to_resident(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            old = receipt(binary=HASH_A)
+            del old["workload"]["memory_mode"]  # type: ignore[index]
+            baseline = self.write(directory, "old.json", old)
+            candidate = self.write(directory, "new.json", receipt(binary=HASH_A))
+
+            result = invoke(baseline, candidate)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout)["workload"]["memory_mode"], "resident"
+            )
 
 
 if __name__ == "__main__":

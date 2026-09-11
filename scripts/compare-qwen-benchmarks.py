@@ -116,6 +116,42 @@ def validate_receipt(receipt: dict[str, Any], label: str) -> dict[str, Any]:
         or workload["discard_decode"] < 0
     ):
         raise ValueError(f"{label}.workload.discard_decode is invalid")
+    # Receipts written before streamed generation existed have no mode. They
+    # are resident receipts, rather than an ambiguous third format.
+    memory_mode = workload.get("memory_mode", "resident")
+    if memory_mode not in benchmark_qwen.MEMORY_MODES:
+        raise ValueError(f"{label}.workload.memory_mode is invalid")
+    streamed_budget: tuple[int, int, int] | None = None
+    normalized_workload = {
+        "input_ids": input_ids,
+        "max_tokens": workload["max_tokens"],
+        "runs": workload["runs"],
+        "discard_decode": workload["discard_decode"],
+        "memory_mode": memory_mode,
+    }
+    if memory_mode == "resident":
+        if "streamed" in workload:
+            raise ValueError(f"{label}.workload.streamed is invalid for resident mode")
+    else:
+        streamed = workload.get("streamed")
+        if not isinstance(streamed, dict):
+            raise ValueError(f"{label}.workload.streamed must be an object")
+        try:
+            streamed_budget = tuple(
+                benchmark_qwen.positive_integer(
+                    streamed.get(field), f"streamed.{field}"
+                )
+                for field in ("max_weight_bytes", "max_kv_bytes", "tile_rows")
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"{label}.workload.streamed is invalid: {error}"
+            ) from error
+        normalized_workload["streamed"] = {
+            "max_weight_bytes": streamed_budget[0],
+            "max_kv_bytes": streamed_budget[1],
+            "tile_rows": streamed_budget[2],
+        }
     host = receipt.get("host")
     if not isinstance(host, dict) or any(
         not isinstance(host.get(field), str) or not host[field]
@@ -159,13 +195,19 @@ def validate_receipt(receipt: dict[str, Any], label: str) -> dict[str, Any]:
                 {
                     **run,
                     "schema_version": 1,
-                    "operation": "qwen3_greedy_cached_generation",
+                    "operation": (
+                        "qwen3_greedy_cached_generation"
+                        if memory_mode == "resident"
+                        else "qwen3_greedy_streamed_generation"
+                    ),
                     "input_ids": input_ids,
                     "finish_reason": "length",
                     "cache_comparisons": [],
                 },
                 input_ids,
                 workload["max_tokens"],
+                memory_mode=memory_mode,
+                streamed_budget=streamed_budget,
             )
             for run in raw_runs
         ]
@@ -173,7 +215,13 @@ def validate_receipt(receipt: dict[str, Any], label: str) -> dict[str, Any]:
     except ValueError as error:
         raise ValueError(f"{label}.runs are invalid: {error}") from error
     validate_reported_summary(receipt.get("warm_decode"), recomputed, label)
-    return {"workload": workload, "runs": runs, "warm_decode": recomputed}
+    if recomputed["memory_mode"] != memory_mode:
+        raise ValueError(f"{label}.warm_decode.memory_mode is inconsistent")
+    return {
+        "workload": normalized_workload,
+        "runs": runs,
+        "warm_decode": recomputed,
+    }
 
 
 def ratio_and_change(baseline: float, candidate: float) -> dict[str, float]:

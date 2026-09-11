@@ -45,6 +45,24 @@ def fixture() -> dict[object, object]:
     }
 
 
+def streamed_fixture() -> dict[object, object]:
+    result = fixture()
+    result.pop("logical_weight_bytes")
+    result["operation"] = "qwen3_greedy_streamed_generation"
+    result["streamed"] = {
+        "maximum_total_tokens": 6,
+        "max_weight_bytes": 2_048,
+        "max_kv_bytes": 160,
+        "tile_rows": 64,
+        "planned_weight_and_staging_bytes": 1_024,
+        "verification": "not_requested",
+        "oracle_memory_excluded": False,
+        "oracle_load_ms_excluded": None,
+        "scope": "bounded stream test",
+    }
+    return result
+
+
 def run(
     decode_ms: tuple[float, ...],
     *,
@@ -59,7 +77,9 @@ def run(
         backend=backend,
         cached_tokens=5,
         logical_kv_bytes=160,
+        memory_mode="resident",
         logical_weight_bytes=1024,
+        streamed=None,
     )
 
 
@@ -111,6 +131,23 @@ class ParseRunTests(unittest.TestCase):
         self.assertEqual(parsed.cached_tokens, 5)
         self.assertEqual(parsed.logical_kv_bytes, 160)
         self.assertEqual(parsed.logical_weight_bytes, 1024)
+        self.assertEqual(parsed.memory_mode, "resident")
+        self.assertIsNone(parsed.streamed)
+
+    def test_parses_streamed_contract_without_resident_weight_claim(self) -> None:
+        parsed = benchmark_qwen.parse_run(
+            streamed_fixture(),
+            [1, 2],
+            4,
+            memory_mode="streamed",
+            streamed_budget=(2_048, 160, 64),
+        )
+
+        self.assertEqual(parsed.memory_mode, "streamed")
+        self.assertIsNone(parsed.logical_weight_bytes)
+        self.assertIsNotNone(parsed.streamed)
+        assert parsed.streamed is not None
+        self.assertEqual(parsed.streamed.planned_weight_and_staging_bytes, 1_024)
 
     def test_rejects_wrong_prompt(self) -> None:
         with self.assertRaises(ValueError):
@@ -143,6 +180,31 @@ class ParseRunTests(unittest.TestCase):
                 payload[key] = value
                 with self.assertRaises(ValueError):
                     benchmark_qwen.parse_run(payload, [1, 2], 4)
+
+    def test_rejects_cross_mode_operations_and_streamed_memory_drift(self) -> None:
+        with self.assertRaises(ValueError):
+            benchmark_qwen.parse_run(streamed_fixture(), [1, 2], 4)
+        with self.assertRaises(ValueError):
+            benchmark_qwen.parse_run(fixture(), [1, 2], 4, memory_mode="streamed")
+        for path, value in (
+            (("streamed", "planned_weight_and_staging_bytes"), 2_049),
+            (("streamed", "verification"), "resident_full_prefix_oracle"),
+            (("logical_weight_bytes",), 1),
+        ):
+            with self.subTest(path=path):
+                payload = streamed_fixture()
+                target: dict[object, object] = payload
+                for key in path[:-1]:
+                    target = target[key]  # type: ignore[assignment,index]
+                target[path[-1]] = value
+                with self.assertRaises(ValueError):
+                    benchmark_qwen.parse_run(
+                        payload,
+                        [1, 2],
+                        4,
+                        memory_mode="streamed",
+                        streamed_budget=(2_048, 160, 64),
+                    )
 
     def test_rejects_bad_numbers_and_truncated_decode(self) -> None:
         for value in (math.nan, math.inf, True, -1.0, 10**10_000):
@@ -233,8 +295,6 @@ class ReceiptCliTests(unittest.TestCase):
                 str(output),
                 "--input-ids",
                 "1,2",
-                "--max-tokens",
-                "4",
                 "--runs",
                 "3",
             )
@@ -292,6 +352,133 @@ class ReceiptCliTests(unittest.TestCase):
                 receipt["sha256"]["weights"],
                 hashlib.sha256((model / "model.safetensors").read_bytes()).hexdigest(),
             )
+
+    def test_streamed_runs_forward_explicit_budgets_and_record_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            model = make_model(root)
+            payload = json.dumps(streamed_fixture())
+            arguments = root / "arguments.json"
+            binary = make_binary(
+                root,
+                f"""
+                import json
+                import pathlib
+                import sys
+
+                pathlib.Path({str(arguments)!r}).write_text(json.dumps(sys.argv[1:]))
+                print({payload!r})
+                """,
+            )
+            output = root / "streamed.json"
+
+            result = run_benchmark(
+                "--binary",
+                str(binary),
+                "--model",
+                str(model),
+                "--output",
+                str(output),
+                "--input-ids",
+                "1,2",
+                "--max-tokens",
+                "4",
+                "--runs",
+                "3",
+                "--memory-mode",
+                "streamed",
+                "--max-weight-bytes",
+                "2048",
+                "--max-kv-bytes",
+                "160",
+                "--tile-rows",
+                "64",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            forwarded = json.loads(arguments.read_text(encoding="utf-8"))
+            self.assertEqual(forwarded[0], "generate-qwen-metal")
+            self.assertEqual(forwarded[forwarded.index("--max-tokens") + 1], "4")
+            self.assertIn("--memory-mode", forwarded)
+            self.assertEqual(
+                forwarded[forwarded.index("--memory-mode") + 1], "streamed"
+            )
+            self.assertEqual(
+                forwarded[forwarded.index("--max-weight-bytes") + 1], "2048"
+            )
+            self.assertEqual(forwarded[forwarded.index("--max-kv-bytes") + 1], "160")
+            self.assertEqual(forwarded[forwarded.index("--tile-rows") + 1], "64")
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["workload"]["memory_mode"], "streamed")
+            self.assertEqual(receipt["workload"]["streamed"]["tile_rows"], 64)
+            self.assertNotIn("logical_weight_bytes", receipt["runs"][0])
+
+    def test_rejects_resident_stream_flags_and_overlength_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            model = make_model(root)
+            binary = make_binary(root, "import sys\nsys.exit(7)\n")
+            common = (
+                "--binary",
+                str(binary),
+                "--model",
+                str(model),
+                "--output",
+            )
+            resident = run_benchmark(
+                *common,
+                str(root / "resident.json"),
+                "--max-weight-bytes",
+                "1",
+            )
+            self.assertEqual(resident.returncode, 2)
+            self.assertIn("require --memory-mode streamed", resident.stderr)
+            overlength = run_benchmark(
+                *common,
+                str(root / "overlength.json"),
+                "--memory-mode",
+                "streamed",
+                "--max-tokens",
+                "31",
+            )
+            self.assertEqual(overlength.returncode, 2)
+            self.assertIn("at most 32 for streamed mode", overlength.stderr)
+
+    def test_rejects_explicit_zero_stream_budgets_before_binary_or_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            model = make_model(root)
+            marker = root / "binary-ran"
+            binary = make_binary(
+                root,
+                f"""
+                import pathlib
+
+                pathlib.Path({str(marker)!r}).touch()
+                """,
+            )
+            for flag in ("--max-weight-bytes", "--max-kv-bytes", "--tile-rows"):
+                with self.subTest(flag=flag):
+                    output = root / f"{flag[2:]}.json"
+                    result = run_benchmark(
+                        "--binary",
+                        str(binary),
+                        "--model",
+                        str(model),
+                        "--output",
+                        str(output),
+                        "--memory-mode",
+                        "streamed",
+                        flag,
+                        "0",
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("streamed budgets must be positive", result.stderr)
+                    self.assertFalse(output.exists())
+                    self.assertFalse(marker.exists())
 
     def test_refuses_to_overwrite_existing_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
