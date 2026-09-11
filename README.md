@@ -12,8 +12,9 @@ The current milestone runs a complete dense Qwen3 decoder through MLX on
 Metal, with a reproducible CPU comparison and single-sequence KV reuse. DeepSeek-V4.1
 configuration and checkpoint-index inspection are available; V4.1 execution
 and HTTP serving remain unfinished.
-An initial [V4.1 candidate-block diagnostic](docs/experiments/v41-candidates.md)
-checks CPU masks against the pinned official helper on synthetic inputs.
+[V4.1 operator diagnostics](docs/experiments/v41-candidates.md) compare CPU
+candidate masks and Metal FP32 index scores with pinned official expressions
+on synthetic inputs. They do not qualify the BF16/FP4 execution path.
 
 ```sh
 cargo run -p server -- inspect-v41 --config /path/to/deepseek-v41-config.json
@@ -120,8 +121,8 @@ for the paper-derived implementation checks.
 ## Build
 
 Build from source with Rust. The default build provides checkpoint inspection;
-`--features metal` enables Qwen execution on Apple Silicon and builds native
-MLX, requiring CMake and a working Xcode Metal toolchain.
+`--features metal` enables Qwen execution and V4.1 operator checks on Apple
+Silicon. It builds native MLX, requiring CMake and a working Xcode Metal toolchain.
 
 ```sh
 cargo build --workspace
@@ -162,20 +163,20 @@ ends measurement even if the server keeps the connection open.
 
 ## Development
 
-```sh
-cargo fmt --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-node --test scripts/benchmark-openai.test.mjs
-uv run scripts/test_benchmark_qwen.py
-```
-
-On Apple Silicon, also test the optional execution path:
+Checks require Node.js and Ruff on `PATH`, in addition to Rust and uv.
 
 ```sh
-cargo test --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+uv run scripts/check.py
 ```
+
+On Apple Silicon, include the optional Metal execution path:
+
+```sh
+uv run scripts/check.py --metal
+```
+
+The runner checks formatting, tests, strict Clippy, rustdoc, and the Python/Node
+harness tests. It stops at the first failure and does not download model weights.
 
 ## Limitations
 
