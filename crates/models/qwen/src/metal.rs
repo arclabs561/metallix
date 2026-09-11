@@ -9,6 +9,115 @@ use thiserror::Error;
 
 use crate::checkpoint::{Qwen3CheckpointError, Qwen3CheckpointInspection};
 
+/// A selected-tensor loader comparison, not a bounded-residency inference result.
+#[derive(Debug, serde::Serialize)]
+pub struct Qwen3TensorRangeCheck {
+    schema_version: u32,
+    operation: &'static str,
+    tensor: String,
+    shape: Vec<u64>,
+    raw_payload_bytes: u64,
+    max_payload_bytes: u64,
+    decoded_host_bytes: usize,
+    candidate_array_bytes: usize,
+    read_ms: f64,
+    compared_values: usize,
+    bit_exact: bool,
+    scope: &'static str,
+}
+
+/// Compares one exact BF16 payload read with MLX's resident safetensors loader.
+///
+/// `max_bytes` bounds only the selected raw payload allocation, not headers,
+/// FP32 conversion, GPU allocations or the whole-checkpoint reference load.
+/// Checkpoint files must remain immutable for the complete comparison.
+/// The read timing includes file/metadata checks, excludes inspection and is
+/// neither a repeated benchmark nor evidence of physical SSD traffic.
+pub fn qualify_tensor_range(
+    model_dir: impl AsRef<Path>,
+    tensor: &str,
+    max_bytes: u64,
+) -> Result<Qwen3TensorRangeCheck, Qwen3MetalLoadError> {
+    let inspection = Qwen3CheckpointInspection::inspect(model_dir.as_ref())?;
+    let started = std::time::Instant::now();
+    let payload = inspection.read_tensor(tensor, max_bytes)?;
+    let read_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if payload.dtype() != "BF16" {
+        return Err(Qwen3MetalLoadError::RangeCheckDtype(
+            payload.dtype().to_owned(),
+        ));
+    }
+    let values = decode_bf16(payload.bytes())?;
+    let shape: Vec<i32> = payload
+        .shape()
+        .iter()
+        .map(|&dimension| {
+            i32::try_from(dimension)
+                .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("tensor shape"))
+        })
+        .collect::<Result<_, _>>()?;
+    let candidate = Array::from_slice(&values, &shape);
+    candidate.eval()?;
+
+    // Keep the established reader independent. It intentionally loads the
+    // resident checkpoint and must never be counted as bounded-reader memory.
+    let reference_weights = Qwen3MlxWeights::load(model_dir.as_ref())?;
+    let reference = reference_weights
+        .tensors
+        .get(tensor)
+        .ok_or_else(|| Qwen3MetalLoadError::RangeCheckMissingTensor(tensor.to_owned()))?
+        .as_type_device::<f32>(StreamOrDevice::gpu())?;
+    reference.eval()?;
+    if reference.shape() != candidate.shape() {
+        return Err(Qwen3MetalLoadError::RangeCheckShape);
+    }
+    compare_tensor_values(candidate.as_slice::<f32>(), reference.as_slice::<f32>())?;
+    Ok(Qwen3TensorRangeCheck {
+        schema_version: 1,
+        operation: "qwen3_bf16_tensor_range_check",
+        tensor: tensor.to_owned(),
+        shape: payload.shape().to_vec(),
+        raw_payload_bytes: payload.bytes().len() as u64,
+        max_payload_bytes: max_bytes,
+        decoded_host_bytes: values.len() * size_of::<f32>(),
+        candidate_array_bytes: candidate.nbytes(),
+        read_ms,
+        compared_values: values.len(),
+        bit_exact: true,
+        scope: "selected raw payload bounded; FP32 buffers and resident MLX reference excluded from that budget; no decoder execution or physical SSD measurement",
+    })
+}
+
+fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, Qwen3MetalLoadError> {
+    if bytes.len() % 2 != 0 {
+        return Err(Qwen3MetalLoadError::RangeCheckOddBytes);
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let bits = u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16;
+            let value = f32::from_bits(bits);
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(Qwen3MetalLoadError::RangeCheckNonFinite)
+            }
+        })
+        .collect()
+}
+
+fn compare_tensor_values(left: &[f32], right: &[f32]) -> Result<(), Qwen3MetalLoadError> {
+    if left.len() != right.len() {
+        return Err(Qwen3MetalLoadError::RangeCheckShape);
+    }
+    for (index, (&left, &right)) in left.iter().zip(right).enumerate() {
+        if !left.is_finite() || !right.is_finite() || left.to_bits() != right.to_bits() {
+            return Err(Qwen3MetalLoadError::RangeCheckMismatch { index });
+        }
+    }
+    Ok(())
+}
+
 /// Evidence that MLX evaluated a small graph on Metal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen3MetalSmoke {
@@ -225,6 +334,27 @@ pub enum Qwen3MetalSmokeError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Qwen3MetalLoadError {
+    /// The diagnostic currently qualifies only BF16 checkpoint payloads.
+    #[error("tensor-range comparison requires BF16, got {0}")]
+    RangeCheckDtype(String),
+    /// The independently loaded tensor was missing.
+    #[error("resident reference did not contain tensor {0:?}")]
+    RangeCheckMissingTensor(String),
+    /// Candidate and independently loaded tensor dimensions differed.
+    #[error("tensor-range comparison shape mismatch")]
+    RangeCheckShape,
+    /// A BF16 payload did not contain complete elements.
+    #[error("BF16 payload has an odd byte count")]
+    RangeCheckOddBytes,
+    /// The diagnostic does not qualify non-finite weight values.
+    #[error("tensor-range comparison encountered a non-finite BF16 value")]
+    RangeCheckNonFinite,
+    /// Exact widening disagreed with the independent resident reader.
+    #[error("tensor-range comparison differs at value {index}")]
+    RangeCheckMismatch {
+        /// Flattened value position, not a byte offset.
+        index: usize,
+    },
     /// The checkpoint requests unsupported decoder semantics.
     #[error(transparent)]
     ForwardConfig(#[from] crate::forward::Qwen3ForwardError),
@@ -263,6 +393,29 @@ pub enum Qwen3MetalLoadError {
 #[cfg(test)]
 mod tests {
     use super::{Qwen3MetalLoadError, run_metal_smoke, validate_token_ids};
+
+    #[test]
+    fn widens_known_bf16_bits_without_changing_signed_zero() {
+        let values =
+            super::decode_bf16(&[0, 0, 0, 128, 128, 63, 32, 192]).expect("finite BF16 values");
+        let bits: Vec<_> = values.iter().map(|value| value.to_bits()).collect();
+        assert_eq!(bits, [0, 0x8000_0000, 0x3f80_0000, 0xc020_0000]);
+        assert!(super::decode_bf16(&[0]).is_err());
+        assert!(super::decode_bf16(&[128, 127]).is_err());
+        assert!(super::decode_bf16(&[192, 127]).is_err());
+    }
+
+    #[test]
+    fn comparison_rejects_single_value_mutation_and_shape_drift() {
+        assert!(super::compare_tensor_values(&[1.0, -2.5], &[1.0, -2.5]).is_ok());
+        assert!(matches!(
+            super::compare_tensor_values(&[1.0, -2.5], &[1.0, -2.0]),
+            Err(Qwen3MetalLoadError::RangeCheckMismatch { index: 1 })
+        ));
+        assert!(super::compare_tensor_values(&[0.0], &[-0.0]).is_err());
+        assert!(super::compare_tensor_values(&[1.0], &[]).is_err());
+        assert!(super::compare_tensor_values(&[f32::NAN], &[f32::NAN]).is_err());
+    }
 
     #[test]
     fn rejects_invalid_token_ids_before_gpu_indexing() {
