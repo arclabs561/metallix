@@ -152,6 +152,20 @@ enum Command {
         #[arg(long, default_value_t = 8_388_608, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
         max_bytes: u64,
     },
+    /// Compare a complete uncached streamed Qwen forward with resident weights.
+    #[cfg(feature = "metal")]
+    CheckQwenStreamMetal {
+        #[arg(long)]
+        model: PathBuf,
+        /// Raw token IDs; at most 32 tokens in this qualification path.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+        input_ids: Vec<i32>,
+        #[arg(long, default_value_t = 1_024, value_parser = clap::value_parser!(u32).range(1..=4_096))]
+        tile_rows: u32,
+        /// Logical weights and loading staging; excludes scratch and resident reference.
+        #[arg(long, default_value_t = 134_217_728, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+        max_weight_bytes: u64,
+    },
     /// Evaluate one selected-weight Qwen block and compare with resident weights.
     #[cfg(feature = "metal")]
     CheckQwenLayerMetal {
@@ -250,6 +264,13 @@ pub fn run() -> ExitCode {
             tile_rows,
             max_bytes,
         } => check_qwen_projection_metal(&model, tile_rows, max_bytes),
+        #[cfg(feature = "metal")]
+        Command::CheckQwenStreamMetal {
+            model,
+            input_ids,
+            tile_rows,
+            max_weight_bytes,
+        } => check_qwen_stream_metal(&model, &input_ids, tile_rows, max_weight_bytes),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
         #[cfg(feature = "metal")]
@@ -439,6 +460,35 @@ fn check_qwen_projection_metal(
         },
         Err(error) => {
             eprintln!("Qwen projection check failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn check_qwen_stream_metal(
+    model: &std::path::Path,
+    input_ids: &[i32],
+    tile_rows: u32,
+    max_weight_bytes: u64,
+) -> ExitCode {
+    let Ok(tile_rows) = usize::try_from(tile_rows) else {
+        eprintln!("Qwen stream check failed: tile row count does not fit usize");
+        return ExitCode::FAILURE;
+    };
+    match qwen::metal::qualify_streamed_forward(model, input_ids, max_weight_bytes, tile_rows) {
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("could not serialize stream comparison: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("Qwen stream check failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -789,6 +839,35 @@ mod tests {
                     "model",
                     "--max-bytes",
                     limit,
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn stream_check_requires_a_model_and_bounds_its_working_weights() {
+        let cli = Cli::try_parse_from(["mx", "check-qwen-stream-metal", "--model", "model"])
+            .expect("default streamed diagnostic");
+        assert!(matches!(cli.command, super::Command::CheckQwenStreamMetal {
+            input_ids, tile_rows: 1024, max_weight_bytes: 134_217_728, ..
+        } if input_ids == [1, 2, 3]));
+        assert!(Cli::try_parse_from(["mx", "check-qwen-stream-metal"]).is_err());
+        for (flag, value) in [
+            ("--tile-rows", "0"),
+            ("--tile-rows", "4097"),
+            ("--max-weight-bytes", "0"),
+            ("--max-weight-bytes", "1073741825"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "mx",
+                    "check-qwen-stream-metal",
+                    "--model",
+                    "model",
+                    flag,
+                    value,
                 ])
                 .is_err()
             );
