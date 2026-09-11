@@ -7,6 +7,9 @@ The candidate-block selection and FP32 index-score diagnostics in
 revision `dba1be0a40aa45a94ad051997016db3960a90277`.
 The fixture capture script executes those hash-pinned operations and the final
 Top-K selection expressions from `Indexer.forward` on synthetic data.
+The rotary-tail diagnostic in `crates/models/deepseek/src/rotary.rs` and its
+synthetic fixture follow `apply_rotary_emb` from that same revision;
+`scripts/v41-rotary-reference.py` executes only that hash-pinned helper.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 

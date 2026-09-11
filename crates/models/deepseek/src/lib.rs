@@ -4,11 +4,13 @@ pub mod csa2;
 #[cfg(feature = "metal")]
 pub mod indexer;
 pub mod manifest;
+pub mod rotary;
 pub mod selection;
 
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]
 pub use indexer::{IndexScoreError, index_scores_f32};
+pub use rotary::{RotaryDirection, RotaryError, RotaryFrequency, RotaryTailLayout, rotate_tail};
 pub use selection::{SelectionError, select_indices};
 
 // MLX's native test operations share process-global device initialization.
@@ -157,7 +159,7 @@ impl V41ExecutionShape {
         }
         // The same rotary tail is applied to attention and indexer vectors;
         // apply_rotary_emb interprets adjacent values as complex pairs.
-        if raw.qk_rope_head_dim % 2 != 0 || raw.qk_rope_head_dim > raw.index_head_dim {
+        if !raw.qk_rope_head_dim.is_multiple_of(2) || raw.qk_rope_head_dim > raw.index_head_dim {
             return Err(V41ConfigError::UnsupportedAttentionLayout);
         }
         if raw.n_shared_experts != 1

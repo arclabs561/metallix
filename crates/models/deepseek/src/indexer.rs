@@ -83,13 +83,13 @@ pub fn index_scores_f32(
             field: "head_weights",
         });
     }
-    if query.len() % dim != 0 {
+    if !query.len().is_multiple_of(dim) {
         return Err(IndexScoreError::QueryShape {
             actual: query.len(),
             head_dim: dim,
         });
     }
-    if keys.len() % dim != 0 {
+    if !keys.len().is_multiple_of(dim) {
         return Err(IndexScoreError::KeyShape {
             actual: keys.len(),
             head_dim: dim,
