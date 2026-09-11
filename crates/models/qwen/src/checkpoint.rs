@@ -205,7 +205,7 @@ fn read_header(path: &Path) -> Result<Vec<(String, TensorRange)>, Qwen3Checkpoin
             path: path.to_path_buf(),
             source,
         })?;
-    let header: BTreeMap<String, serde_json::Value> =
+    let header: UniqueHeader =
         serde_json::from_slice(&json).map_err(|source| Qwen3CheckpointError::HeaderJson {
             path: path.to_path_buf(),
             source,
@@ -214,8 +214,42 @@ fn read_header(path: &Path) -> Result<Vec<(String, TensorRange)>, Qwen3Checkpoin
     validate_header_tensors(
         path,
         file_bytes - SAFETENSORS_PREFIX_BYTES - header_bytes,
-        header,
+        header.0,
     )
+}
+
+// Reject repeated tensor/metadata names before map insertion can discard them.
+// Compare decoded keys so JSON escape spelling cannot bypass uniqueness.
+struct UniqueHeader(BTreeMap<String, serde_json::Value>);
+
+impl<'de> Deserialize<'de> for UniqueHeader {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct HeaderVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HeaderVisitor {
+            type Value = UniqueHeader;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a safetensors header with unique keys")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut header = BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if header.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate safetensors header key"));
+                    }
+                    header.insert(key, map.next_value()?);
+                }
+                Ok(UniqueHeader(header))
+            }
+        }
+
+        deserializer.deserialize_map(HeaderVisitor)
+    }
 }
 
 fn validate_header_tensors(
@@ -810,6 +844,31 @@ mod tests {
             error,
             Qwen3CheckpointError::NonContiguousPayload(_)
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_top_level_header_keys_including_escaped_names() {
+        // Raw JSON is essential: serializing a map would erase the duplicate.
+        // The safetensors format explicitly disallows duplicate keys.
+        // Provenance: docs/research/README.md#checkpoint-header-key-uniqueness.
+        for header in [
+            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
+            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"\u0077eight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
+            r#"{"__metadata__":{},"__metadata__":{},"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.path.join("duplicate.safetensors");
+            let mut bytes = u64::try_from(header.len())
+                .expect("small header")
+                .to_le_bytes()
+                .to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0, 0]);
+            fs::write(&path, bytes).expect("write duplicate-key header");
+
+            let error = read_header(&path).expect_err("duplicate keys must not be collapsed");
+            assert!(matches!(error, Qwen3CheckpointError::HeaderJson { .. }));
+        }
     }
 
     #[test]
