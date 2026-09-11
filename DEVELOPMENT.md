@@ -14,6 +14,14 @@ Track fit and speed separately: SSD-backed execution can enable a model without
 meeting a useful latency target. Constrained generation needs sampler-level
 token validity and completion/error semantics, not post-hoc JSON repair.
 
+Metallix should also make new inference methods easy to try as they appear.
+An experimental path needs a runnable command, pinned source provenance, a
+correctness or quality oracle, explicit resource bounds and comparable baseline
+measurements. Experimental availability and reliable serving support are
+different statuses. Keep negative results; promote a fast path only for the
+shapes and conditions its evidence covers. Research may propose new experiments,
+but it must not indefinitely displace executable DeepSeek-V4.1-Flash progress.
+
 ## Keep model assumptions local
 
 The first two adapters are test cases, not a universal model architecture.
@@ -61,9 +69,18 @@ ledger. Distinguish copied/adapted code, conceptual inspiration, and changes
 derived from our own profiles. Keep failed experiments and rejected approaches
 with the evidence that would justify revisiting them.
 
+Original methods are welcome, not just reproductions. For each proposed method,
+record: the source or observation that inspired it; what is newly proposed;
+the expected mechanism; baseline and falsifying test; exact reproduction command
+and artifact identities; correctness/quality, memory and timing results; and
+the decision to retain, revise or reject it. Label untested ideas as hypotheses.
+Do not call an idea a breakthrough or claim novelty beyond the prior art that
+was actually checked. Keep this record in the existing topic note and experiment
+ledger rather than creating a second disconnected tracking system.
+
 ## Check first
 
-Run from the repository root. Install Rust, uv, Node.js, and Ruff; Metal builds
+Run from the repository root. Install Rust 1.87 or newer, uv, Node.js, and Ruff; Metal builds
 also require Apple Silicon, CMake, and the Xcode Metal toolchain.
 
 ```sh
@@ -130,6 +147,26 @@ not the output array or resident oracle. See the
 [selected embedding result](docs/experiments/loader-qualification.md#token-ordered-selected-embedding)
 for the exact command and checkpoint identity.
 
+For resident Qwen generation, `gen` is a short alias for `generate-qwen-metal`:
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 4 --verify-cache --debug
+```
+
+This generates raw token IDs, not decoded text; it does not run V4.1 yet.
+`--debug`, `--verbose` and `-v` are equivalent opt-in generation diagnostics.
+They emit phase timings, token counts and logical memory sizes to stderr,
+without adding model paths, token values or logits. Stdout remains the existing
+JSON diagnostic report, which intentionally includes input/generated IDs.
+Timing regions exclude the stderr writes, but logging can perturb a benchmark;
+leave verbosity off for comparisons. Resident generation has a 512-token
+diagnostic context limit, distinct from the streamed check's 32-token limit.
+The local four-output-token smoke passed cache verification with and without
+verbosity; generated IDs and JSON field sets matched, and quiet stderr was
+empty. Receipts: `artifacts/gen-{debug,quiet}.{json,stderr}`. This verifies CLI
+behavior, not a generation-quality or speed improvement.
+
 `check-qwen-stream-metal` composes a complete uncached forward for at most 32
 raw tokens. `--max-weight-bytes` limits the planned maximum sequential
 weight/loading stage, not process memory; the resident oracle runs afterward
@@ -140,6 +177,20 @@ Treat those logits as explicit diagnostic output, not general telemetry.
 Run the normal comparison separately; candidate timing excludes report
 serialization, while an external process measurement includes it. See the
 [complete stream ledger](docs/experiments/loader-qualification.md#complete-synchronous-streamed-forward).
+
+`check-qwen-stream-cache-metal` adds teacher-forced cached prefill and appends:
+
+```sh
+target/release/mx check-qwen-stream-cache-metal --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --decode-ids 4,5,6 \
+  --max-weight-bytes 81798144 --max-kv-bytes 1376256
+```
+
+It compares every vocabulary logit at each step with both resident cached and
+full-prefix controls. Prompt plus appends must fit 32 tokens. The weight budget
+covers logical weights/loading staging; the separate KV budget covers retained
+FP32 K/V only, not transient copies, scratch, or process memory. This is a
+cache-correctness diagnostic, not generated text or a beyond-RAM serving claim.
 
 `check-qwen-layer-metal` extends this to one real block on synthetic hidden
 states. Its `--max-weight-bytes` bounds logical weights and loading staging,

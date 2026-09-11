@@ -32,6 +32,7 @@ is still pending where the ledger says excerpts or selected sections.
 | Kernels and profiling | [Metal kernels](metal-kernels.md) | Threadgroups, specialization, matrix APIs and counter-driven experiments |
 | Training | [Training efficiency](training-efficiency.md) | Rematerialization, precision, microbatching and adapters |
 | Serving | [Serving efficiency](serving-efficiency.md) | Attention, batching, KV reuse, speculation and offload |
+| Structured generation | [Constraints and tokenizers](constrained-generation.md) | Grammar masks, exact token bytes, EOS and independently checked output |
 | Quantization | [Quantization and precision](quantization-precision.md) | Exact format decoding versus quality-changing conversion |
 
 Version lookup: consult the Metal chapters' macOS and GPU-family gates before

@@ -303,6 +303,71 @@ Next: measure repeated complete forwards and varying shapes before making an
 allocator-stability claim, then qualify cached streamed generation and growing
 state. Keep Qwen's sequential weight schedule adapter-local.
 
+## Cached streamed prefill and appends
+
+`check-qwen-stream-cache-metal` now checks a supplied prompt followed by known
+append IDs, keeping detached FP32 K/V between layer-streamed steps. It compares
+all 151,936 final-position logits at each step against both resident cached
+and resident full-prefix execution. This is teacher-forced qualification, not
+text generation or an independent CPU oracle by itself.
+
+```sh
+target/release/mx check-qwen-stream-cache-metal --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --decode-ids 4,5,6 \
+  --max-weight-bytes 81798144 --max-kv-bytes 1376256
+```
+
+On the same M3 Max and Qwen checkpoint identified above, three sequential
+release processes passed. Every cached-reference error was zero; the largest
+full-prefix error was `0.000018119812`, within `5e-4 + 1e-4 * abs(reference)`.
+Final retained KV was 1,376,256 bytes. Reducing that budget by one byte failed
+before candidate execution with empty stdout. A second case using repeated
+vocabulary-edge IDs (`151935,1,151935`, then `0,151935`) and 127-row projection
+tiles also passed both controls. ID 151936 was rejected.
+A 31-token prefill plus one append passed at the exact 32-token qualification
+limit and 7,340,032-byte KV budget (largest full-prefix error `0.00005555153`);
+a total of 33 tokens was rejected. This 32-token limit belongs to streamed
+qualification; resident Qwen execution has a separate 512-token diagnostic cap.
+
+Candidate timings in milliseconds (resident controls excluded):
+
+| Run | Prefill 3 tokens | Append 4 | Append 5 | Append 6 |
+|---|---:|---:|---:|---:|
+| 1 | 572.28 | 352.60 | 341.59 | 340.71 |
+| 2 | 376.65 | 342.74 | 340.42 | 353.85 |
+| 3 | 547.31 | 346.04 | 434.97 | 377.80 |
+
+These include loading, execution, host detachment and finite-logit validation.
+File/compilation caches were not controlled. This establishes a baseline, not
+a speedup: each step still reloads layer weights and the output projection.
+The weight/staging budget and retained-KV budget exclude scratch, transient
+copies, allocator retention, output vectors and resident controls. No total
+process-memory or beyond-RAM conclusion follows from this command.
+
+The first multi-token run failed despite a one-token prompt passing. Root cause:
+MLX's Rust `as_slice` reads underlying storage without reordering a transposed
+view. Rebuilding `[batch, heads, sequence, dim]` K/V from those bytes scrambled
+sequence/head order. The fix materializes logical flattened order through MLX
+before copying and rebuilding. The focused regression compares a nontrivial
+transpose against an explicit scalar-order oracle, not another strided read.
+All stream-detachment helpers now use that same copy path.
+
+Receipts: `artifacts/cached-stream-1.{json,stderr}` (failed baseline),
+`artifacts/cached-stream-short.{json,stderr}` (one-token control),
+`artifacts/cached-stream-fixed-{1,2,3}.{json,stderr}`,
+`artifacts/cached-stream-{under-kv,varied,invalid-id}.{json,stderr}`.
+Context-boundary receipts are `artifacts/cached-stream-{context-limit,over-context}.{json,stderr}`.
+Passing release executable SHA-256:
+`2c26b556fe9e585b5d6dbaca4808cd4198fbcc0a4d7035a06f397933dadacfef`.
+The independent Torch resident-forward regression also passed all vocabulary
+logits for lengths 1, 3, 17 and 64, with zero mismatches
+(`artifacts/cached-stream-cpu-regression.log`). This is a separate reference
+check, not a direct Torch cached-stream measurement.
+
+Next: join this path to sampling, isolate candidate-only cached process-memory
+measurement, and measure repeated variable-length lifetimes. Keep the
+DeepSeek compressed/sparse state layout separate from Qwen GQA K/V.
+
 ## One-block selected-weight execution
 
 At `51f61d0`, [`qualify_layer`](../../crates/models/qwen/src/metal/layer_check.rs) reads the
