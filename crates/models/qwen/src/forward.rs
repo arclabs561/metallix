@@ -386,10 +386,9 @@ fn cached_attention<S: BuildHasher>(
     } else {
         (key, value, true)
     };
-    // Materialize the complete KV state before replacing the prior arrays so
-    // a later decode does not retain a lazy graph into an older request.
-    keys.eval()?;
-    values.eval()?;
+    // Keep KV as dependencies of attention. The final-logits readback evaluates
+    // the complete graph, including these retained arrays, in one submission
+    // instead of blocking twice per layer. Reset drops all request-owned KV.
     let output = if causal {
         fast::scaled_dot_product_attention_device(
             &query,
