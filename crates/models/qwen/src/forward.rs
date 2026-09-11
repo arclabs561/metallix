@@ -69,13 +69,16 @@ impl Qwen3ForwardConfig {
                 return Err(Qwen3ForwardError::MissingDimension(name));
             }
         }
-        if raw.head_dim % 2 != 0 {
+        if !raw.head_dim.is_multiple_of(2) {
             return Err(Qwen3ForwardError::OddHeadDimension(raw.head_dim));
         }
         if raw.head_dim > usize::from(u16::MAX) {
             return Err(Qwen3ForwardError::HeadDimensionTooLarge(raw.head_dim));
         }
-        if raw.num_attention_heads % raw.num_key_value_heads != 0 {
+        if !raw
+            .num_attention_heads
+            .is_multiple_of(raw.num_key_value_heads)
+        {
             return Err(Qwen3ForwardError::InvalidGroupedQueryLayout {
                 attention_heads: raw.num_attention_heads,
                 key_value_heads: raw.num_key_value_heads,
@@ -112,6 +115,24 @@ impl Qwen3ForwardConfig {
     #[must_use]
     pub(crate) const fn hidden_layers(&self) -> usize {
         self.hidden_layers
+    }
+
+    /// Logical f32 bytes for all layer K/V arrays at `tokens` positions.
+    ///
+    /// The streamed checker stores detached f32 arrays, so this is deliberately
+    /// not a checkpoint-byte estimate or a generic cache-layout abstraction.
+    pub(crate) fn cached_kv_bytes(&self, tokens: usize) -> Result<u64, Qwen3ForwardError> {
+        let values = self
+            .hidden_layers
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(self.key_value_heads))
+            .and_then(|value| value.checked_mul(tokens))
+            .and_then(|value| value.checked_mul(self.head_dim))
+            .ok_or(Qwen3ForwardError::ShapeOverflow)?;
+        u64::try_from(values)
+            .ok()
+            .and_then(|value| value.checked_mul(u64::try_from(size_of::<f32>()).ok()?))
+            .ok_or(Qwen3ForwardError::ShapeOverflow)
     }
 }
 
@@ -225,13 +246,17 @@ pub(crate) fn final_rms_norm(
 pub struct Qwen3ForwardExecutor<'a, S: BuildHasher> {
     config: &'a Qwen3ForwardConfig,
     weights: &'a HashMap<String, Array, S>,
-    cache: Vec<Option<LayerKv>>,
+    cache: Vec<Option<Qwen3LayerKv>>,
     cached_tokens: usize,
 }
 
-struct LayerKv {
-    keys: Array,
-    values: Array,
+/// Adapter-local Qwen3 KV state.
+///
+/// This stays crate-visible: the bounded streamed checker needs to rebuild it
+/// after each layer so no cache graph retains that layer's transient weights.
+pub(crate) struct Qwen3LayerKv {
+    pub(crate) keys: Array,
+    pub(crate) values: Array,
 }
 
 impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
@@ -306,7 +331,6 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         let seq_len =
             i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
         let hidden = as_i32(self.config.hidden_size)?;
-        let intermediate = as_i32(self.config.intermediate_size)?;
         let ids = Array::from_slice(input_ids, &[seq_len]);
         let embedding = weight(self.weights, "model.embed_tokens.weight")?;
         let mut hidden_states = embedding
@@ -316,49 +340,17 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         let rope_offset =
             i32::try_from(self.cached_tokens).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
         for layer in 0..self.config.hidden_layers {
-            let base = format!("model.layers.{layer}");
-            let attention_input = rms_norm(
-                &hidden_states,
-                weight(self.weights, &format!("{base}.input_layernorm.weight"))?,
-                self.config.rms_norm_eps,
-            )?;
-            let attention = cached_attention(
+            hidden_states = forward_cached_layer(
                 self.config,
                 self.weights,
+                layer,
                 self.cache
                     .get_mut(layer)
                     .ok_or(Qwen3ForwardError::CacheInconsistent)?,
-                &base,
-                &attention_input,
+                &hidden_states,
                 seq_len,
                 rope_offset,
             )?;
-            let residual = hidden_states.add_device(&attention, &stream)?;
-            let mlp_input = rms_norm(
-                &residual,
-                weight(
-                    self.weights,
-                    &format!("{base}.post_attention_layernorm.weight"),
-                )?,
-                self.config.rms_norm_eps,
-            )?;
-            let gate = linear(
-                &mlp_input,
-                weight(self.weights, &format!("{base}.mlp.gate_proj.weight"))?,
-            )?
-            .reshape_device(&[1, seq_len, intermediate], &stream)?;
-            let up = linear(
-                &mlp_input,
-                weight(self.weights, &format!("{base}.mlp.up_proj.weight"))?,
-            )?
-            .reshape_device(&[1, seq_len, intermediate], &stream)?;
-            let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
-            let mlp = linear(
-                &activated.multiply_device(&up, &stream)?,
-                weight(self.weights, &format!("{base}.mlp.down_proj.weight"))?,
-            )?
-            .reshape_device(&[1, seq_len, hidden], &stream)?;
-            hidden_states = residual.add_device(&mlp, &stream)?;
         }
 
         self.cached_tokens += input_ids.len();
@@ -374,10 +366,67 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 }
 
+/// Executes one cached Qwen3 decoder layer and updates its adapter-local KV.
+///
+/// The cache is intentionally not a cross-model engine interface. It carries
+/// Qwen3's GQA layout and `RoPE` contract, while allowing the streamed checker
+/// to detach the cache immediately after the layer evaluates.
+pub(crate) fn forward_cached_layer<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    layer: usize,
+    cache: &mut Option<Qwen3LayerKv>,
+    hidden_states: &Array,
+    seq_len: i32,
+    rope_offset: i32,
+) -> Result<Array, Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let hidden = as_i32(config.hidden_size)?;
+    let intermediate = as_i32(config.intermediate_size)?;
+    let base = format!("model.layers.{layer}");
+    let attention_input = rms_norm(
+        hidden_states,
+        weight(weights, &format!("{base}.input_layernorm.weight"))?,
+        config.rms_norm_eps,
+    )?;
+    let attention = cached_attention(
+        config,
+        weights,
+        cache,
+        &base,
+        &attention_input,
+        seq_len,
+        rope_offset,
+    )?;
+    let residual = hidden_states.add_device(&attention, &stream)?;
+    let mlp_input = rms_norm(
+        &residual,
+        weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
+        config.rms_norm_eps,
+    )?;
+    let gate = linear(
+        &mlp_input,
+        weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
+    )?
+    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    let up = linear(
+        &mlp_input,
+        weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
+    )?
+    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
+    let mlp = linear(
+        &activated.multiply_device(&up, &stream)?,
+        weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
+    )?
+    .reshape_device(&[1, seq_len, hidden], &stream)?;
+    residual.add_device(&mlp, &stream).map_err(Into::into)
+}
+
 fn cached_attention<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
-    cache: &mut Option<LayerKv>,
+    cache: &mut Option<Qwen3LayerKv>,
     base: &str,
     input: &Array,
     seq_len: i32,
@@ -456,7 +505,7 @@ fn cached_attention<S: BuildHasher>(
             &stream,
         )?
     };
-    *cache = Some(LayerKv { keys, values });
+    *cache = Some(Qwen3LayerKv { keys, values });
     let output = output
         .transpose_axes_device(&[0, 2, 1, 3], &stream)?
         .reshape_device(
@@ -858,6 +907,13 @@ mod tests {
         // Qwen3-0.6B deliberately has 16 * 128 = 2048 query features while
         // its residual stream is only 1024 wide; `o_proj` maps it back.
         Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
+    }
+
+    #[test]
+    fn detached_kv_plan_uses_gqa_not_query_head_width() {
+        let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
+        // 28 layers * (K + V) * 8 KV heads * 3 positions * 128 values * f32.
+        assert_eq!(config.cached_kv_bytes(3).unwrap(), 688_128);
     }
 
     #[test]

@@ -19,8 +19,8 @@ mod projection_check;
 pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
 mod stream_check;
 pub use stream_check::{
-    Qwen3StreamCandidateReport, Qwen3StreamCheck, qualify_streamed_forward,
-    run_streamed_forward_candidate,
+    Qwen3StreamCachedCheck, Qwen3StreamCandidateReport, Qwen3StreamCheck,
+    qualify_streamed_cached_forward, qualify_streamed_forward, run_streamed_forward_candidate,
 };
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
@@ -103,7 +103,7 @@ pub fn qualify_tensor_range(
 }
 
 fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, Qwen3MetalLoadError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(Qwen3MetalLoadError::RangeCheckOddBytes);
     }
     let mut values = vec![0.0_f32; bytes.len() / 2];
@@ -348,6 +348,24 @@ pub enum Qwen3MetalSmokeError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Qwen3MetalLoadError {
+    /// A cached streamed step differed from a named resident control.
+    #[error("cached stream step {step} differs from {reference} at logit {index}")]
+    CachedStreamParity {
+        /// Zero-based prefill/decode step.
+        step: usize,
+        /// Independent control that rejected the candidate.
+        reference: &'static str,
+        /// Vocabulary-logit position.
+        index: usize,
+    },
+    /// Retained detached KV arrays exceed the independent caller-selected cap.
+    #[error("cached KV plan requires {required} bytes, above budget {maximum}")]
+    CachedStateBudget {
+        /// Logical f32 bytes for all retained layer K/V arrays.
+        required: u64,
+        /// Caller-selected ceiling; excludes activations and allocator overhead.
+        maximum: u64,
+    },
     /// The candidate layer's live weight/staging plan exceeds its budget.
     #[error("layer weight/staging plan requires {required} bytes, above budget {maximum}")]
     LayerWeightBudget {

@@ -29,7 +29,7 @@ impl Qwen3ExecutionPreflight {
         }
 
         let key_value_heads = contract.key_value_heads();
-        if attention_heads % key_value_heads != 0 {
+        if !attention_heads.is_multiple_of(key_value_heads) {
             return Err(
                 Qwen3PreflightError::AttentionHeadsNotDivisibleByKeyValueHeads {
                     attention_heads,
