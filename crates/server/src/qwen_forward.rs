@@ -10,6 +10,41 @@ use crate::parity::{compare_logits, read_reference};
 #[derive(serde::Deserialize)]
 struct GenerationConfig {
     eos_token_id: i32,
+    vocab_size: usize,
+    max_position_embeddings: usize,
+}
+
+impl GenerationConfig {
+    fn validate(&self, input_ids: &[i32], max_tokens: u32) -> Result<(), &'static str> {
+        let maximum = self
+            .max_position_embeddings
+            .min(qwen::forward::MAX_DENSE_DEBUG_TOKENS);
+        if input_ids.is_empty() || max_tokens == 0 {
+            return Err("prompt and generation budget must be nonempty");
+        }
+        if input_ids.len().saturating_add(max_tokens as usize) > maximum {
+            return Err("prompt plus generation budget exceeds model diagnostic context limit");
+        }
+        if input_ids
+            .iter()
+            .chain(std::iter::once(&self.eos_token_id))
+            .any(|&id| {
+                usize::try_from(id)
+                    .ok()
+                    .is_none_or(|id| id >= self.vocab_size)
+            })
+        {
+            return Err("prompt or EOS token ID is outside model vocabulary");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GenerationDiagnostics {
+    pub(crate) verbose: bool,
+    pub(crate) logprobs: bool,
+    pub(crate) preview: bool,
 }
 
 pub(crate) fn generate(
@@ -17,9 +52,18 @@ pub(crate) fn generate(
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
-    verbose: bool,
+    diagnostics: GenerationDiagnostics,
+    #[cfg(feature = "structured-output")] json_schema: Option<&Path>,
 ) -> ExitCode {
-    match generate_inner(model, input_ids, max_tokens, verify_cache, verbose) {
+    match generate_inner(
+        model,
+        input_ids,
+        max_tokens,
+        verify_cache,
+        diagnostics,
+        #[cfg(feature = "structured-output")]
+        json_schema,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Qwen generation failed: {error}");
@@ -28,13 +72,23 @@ pub(crate) fn generate(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear diagnostic driver keeps model, verification and optional sampling timing boundaries explicit"
+)]
 fn generate_inner(
     model: &Path,
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
-    verbose: bool,
+    diagnostics: GenerationDiagnostics,
+    #[cfg(feature = "structured-output")] json_schema: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let GenerationDiagnostics {
+        verbose,
+        logprobs,
+        preview,
+    } = diagnostics;
     if input_ids.len().saturating_add(max_tokens as usize) > qwen::forward::MAX_DENSE_DEBUG_TOKENS {
         return Err("prompt plus generation budget exceeds diagnostic context limit".into());
     }
@@ -44,6 +98,11 @@ fn generate_inner(
     }
     let raw = fs::read_to_string(model.join("config.json"))?;
     let generation: GenerationConfig = serde_json::from_str(&raw)?;
+    generation.validate(input_ids, max_tokens)?;
+    #[cfg(feature = "structured-output")]
+    let mut constraint = json_schema
+        .map(|path| crate::qwen_constraints::ConstraintRun::load(model, path))
+        .transpose()?;
     let started = Instant::now();
     let mut weights = Qwen3MlxWeights::load(model)?;
     weights.prepare_float32()?;
@@ -69,6 +128,7 @@ fn generate_inner(
     let mut generated = Vec::new();
     let mut decode_ms = Vec::new();
     let mut comparisons = Vec::new();
+    let mut token_scores = Vec::new();
     let mut finish_reason = "length";
     for step in 0..max_tokens {
         if verify_cache {
@@ -82,8 +142,26 @@ fn generate_inner(
             }
             comparisons.push(result);
         }
-        let token = greedy_token(&logits)?;
+        #[cfg(feature = "structured-output")]
+        let (token, scores) = match constraint.as_mut() {
+            Some(constraint) => constraint.sample(&logits, logprobs)?,
+            None => greedy_sample(&logits, logprobs)?,
+        };
+        #[cfg(not(feature = "structured-output"))]
+        let (token, scores) = greedy_sample(&logits, logprobs)?;
+        if let Some(mut scores) = scores {
+            scores["token_id"] = json!(token);
+            token_scores.push(scores);
+        }
         generated.push(token);
+        #[cfg(feature = "structured-output")]
+        if constraint
+            .as_ref()
+            .is_some_and(crate::qwen_constraints::ConstraintRun::is_complete)
+        {
+            finish_reason = "grammar_complete";
+            break;
+        }
         if token == generation.eos_token_id {
             finish_reason = "eos";
             break;
@@ -104,25 +182,51 @@ fn generate_inner(
             "qwen generation diagnostic: phase=decode decode_steps={decode_steps} decode_total_ms={decode_total_ms:.3} cached_tokens={cached_tokens} logical_kv_bytes={logical_kv_bytes}",
         );
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "schema_version": 1,
-            "operation": "qwen3_greedy_cached_generation",
-            "backend": "mlx-rs 0.25.3 Metal float32",
-            "input_ids": input_ids,
-            "generated_ids": generated,
-            "finish_reason": finish_reason,
-            "load_ms": load_ms,
-            "prefill_ms": prefill_ms,
-            "decode_ms": decode_ms,
-            "cached_tokens": executor.cached_tokens(),
-            "logical_kv_bytes": executor.kv_bytes(),
-            "logical_weight_bytes": weights.logical_weight_bytes(),
-            "cache_comparisons": comparisons,
-            "scope": "single sequence; contiguous KV; first prefill not warmed; verification excluded from timed regions but may warm execution"
-        }))?
-    );
+    let mut report = json!({
+    "schema_version": 1,
+    "operation": "qwen3_greedy_cached_generation",
+    "backend": "mlx-rs 0.25.3 Metal float32",
+    "input_ids": input_ids,
+    "generated_ids": generated,
+    "finish_reason": finish_reason,
+    "load_ms": load_ms,
+    "prefill_ms": prefill_ms,
+    "decode_ms": decode_ms,
+    "cached_tokens": executor.cached_tokens(),
+    "logical_kv_bytes": executor.kv_bytes(),
+    "logical_weight_bytes": weights.logical_weight_bytes(),
+    "cache_comparisons": comparisons,
+    "scope": "single sequence; contiguous KV; first prefill not warmed; verification excluded from timed regions but may warm execution"
+    });
+    if logprobs {
+        report["logprobs"] = json!({
+            "log_base": "e",
+            "tokens": token_scores,
+            "scope": "selected-token probabilities under temperature-one model logits; constrained scores renormalize the current allowed set; not the probability of a complete valid sequence or of the deterministic greedy policy"
+        });
+    }
+    #[cfg(feature = "structured-output")]
+    let report = {
+        let mut report = report;
+        if let Some(constraint) = constraint.as_ref() {
+            report["operation"] = json!("qwen3_constrained_cached_generation");
+            report["constraint"] = constraint.report(verbose)?;
+        }
+        report
+    };
+    if preview {
+        crate::generation_preview::emit(&report);
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    #[cfg(feature = "structured-output")]
+    if constraint
+        .as_ref()
+        .is_some_and(|constraint| !constraint.is_complete())
+    {
+        return Err(
+            "generation budget ended before grammar completion; output is incomplete".into(),
+        );
+    }
     Ok(())
 }
 
@@ -144,6 +248,25 @@ fn greedy_token(logits: &[f32]) -> Result<i32, String> {
         }
     }
     i32::try_from(best).map_err(|error| error.to_string())
+}
+
+fn greedy_sample(
+    logits: &[f32],
+    logprobs: bool,
+) -> Result<(i32, Option<serde_json::Value>), String> {
+    let token = greedy_token(logits)?;
+    let scores = if logprobs {
+        let selected =
+            f64::from(logits[usize::try_from(token).map_err(|error| error.to_string())?]);
+        let shifted_sum = logits
+            .iter()
+            .map(|&value| (f64::from(value) - selected).exp())
+            .sum::<f64>();
+        Some(json!({ "model_logprob": -shifted_sum.ln() }))
+    } else {
+        None
+    };
+    Ok((token, scores))
 }
 
 pub(crate) fn run(
@@ -235,6 +358,44 @@ fn measure(
 #[cfg(test)]
 mod tests {
     use super::verbose_preflight;
+
+    #[test]
+    fn logprobs_are_opt_in_stable_and_do_not_change_greedy_ties() {
+        let (token, scores) = super::greedy_sample(&[3.0, 3.0], true).expect("finite logits");
+        assert_eq!(token, 0);
+        let score = scores.expect("requested scores")["model_logprob"]
+            .as_f64()
+            .expect("numeric");
+        assert!((score + 2.0_f64.ln()).abs() < 1e-12);
+        assert_eq!(
+            super::greedy_sample(&[3.0, 3.0], false).expect("finite logits"),
+            (0, None)
+        );
+        let (_, extreme) =
+            super::greedy_sample(&[-f32::MAX, f32::MAX], true).expect("finite extremes");
+        assert!(
+            extreme.expect("scores")["model_logprob"]
+                .as_f64()
+                .expect("finite number")
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn generation_preflight_enforces_the_model_limit_before_loading_weights() {
+        let config = super::GenerationConfig {
+            eos_token_id: 7,
+            vocab_size: 8,
+            max_position_embeddings: 16,
+        };
+        assert!(config.validate(&[1, 2], 14).is_ok());
+        assert!(config.validate(&[1, 2], 15).is_err());
+        assert!(config.validate(&[], 1).is_err());
+        assert!(config.validate(&[-1], 1).is_err());
+        assert!(config.validate(&[8], 1).is_err());
+        assert!(config.validate(&[1], 0).is_err());
+    }
 
     #[test]
     fn verbose_preflight_is_deterministic_and_excludes_sensitive_arguments() {

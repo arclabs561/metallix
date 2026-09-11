@@ -17,6 +17,7 @@ path = "src/bin/mx.rs"
 
 [features]
 metal = ["qwen/metal", "deepseek/metal"]
+structured-output = ["dep:engine", "engine/structured-output"]
 
 [dependencies]
 clap.workspace = true
@@ -25,6 +26,7 @@ serde_json.workspace = true
 sha2.workspace = true
 deepseek = { path = "../models/deepseek" }
 qwen = { path = "../models/qwen" }
+engine = { path = "../engine", optional = true }
 
 [lints]
 workspace = true

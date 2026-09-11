@@ -1,11 +1,17 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 #[cfg(feature = "metal")]
+mod generation_preview;
+#[cfg(feature = "metal")]
 mod parity;
+#[cfg(all(feature = "metal", feature = "structured-output"))]
+mod qwen_constraints;
 #[cfg(feature = "metal")]
 mod qwen_forward;
 #[cfg(feature = "metal")]
 mod v41_indexer;
+#[cfg(feature = "metal")]
+mod v41_rotary;
 
 use clap::{Parser, Subcommand};
 use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
@@ -30,6 +36,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
+    #[cfg(feature = "metal")]
+    CheckV41RotaryMetal {
+        #[arg(long, default_value = "fixtures/deepseek-v41/rotary-reference.json")]
+        fixture: PathBuf,
+        /// Repeats after one excluded warmup; diagnostic round-trip timing only.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeats: u32,
+    },
     /// Compare V4.1 FP32 index-score arithmetic on Metal with a pinned CPU fixture.
     #[cfg(feature = "metal")]
     CheckV41IndexerMetal {
@@ -58,6 +73,16 @@ enum Command {
         /// Emit phase timing and logical-memory diagnostics on stderr.
         #[arg(short, long, visible_alias = "debug")]
         verbose: bool,
+        /// Include selected-token natural-log probabilities in the JSON report.
+        #[arg(long)]
+        logprobs: bool,
+        /// Show generated content and diagnostics on stderr; color only on a terminal.
+        #[arg(long)]
+        preview: bool,
+        /// Constrain generated JSON using a local schema (32 KiB maximum).
+        #[cfg(feature = "structured-output")]
+        #[arg(long)]
+        json_schema: Option<PathBuf>,
     },
     /// Run and time the complete uncached Qwen3 decoder on raw token IDs.
     #[cfg(feature = "metal")]
@@ -237,6 +262,8 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         #[cfg(feature = "metal")]
+        Command::CheckV41RotaryMetal { fixture, repeats } => v41_rotary::run(&fixture, repeats),
+        #[cfg(feature = "metal")]
         Command::CheckV41IndexerMetal { fixture, repeats } => v41_indexer::run(&fixture, repeats),
         #[cfg(feature = "metal")]
         Command::GenerateQwenMetal {
@@ -245,7 +272,23 @@ pub fn run() -> ExitCode {
             max_tokens,
             verify_cache,
             verbose,
-        } => qwen_forward::generate(&model, &input_ids, max_tokens, verify_cache, verbose),
+            logprobs,
+            preview,
+            #[cfg(feature = "structured-output")]
+            json_schema,
+        } => qwen_forward::generate(
+            &model,
+            &input_ids,
+            max_tokens,
+            verify_cache,
+            qwen_forward::GenerationDiagnostics {
+                verbose,
+                logprobs,
+                preview,
+            },
+            #[cfg(feature = "structured-output")]
+            json_schema.as_deref(),
+        ),
         #[cfg(feature = "metal")]
         Command::ForwardQwenMetal {
             model,
@@ -859,10 +902,18 @@ mod tests {
                 max_tokens: 32,
                 verify_cache: false,
                 verbose: false,
+                logprobs: false,
+                preview: false,
                 ..
             } if input_ids == [1, 2, 3]
         ));
 
+        let scores = Cli::try_parse_from(["mx", "gen", "--model", "model", "--logprobs"])
+            .expect("opt-in log probabilities");
+        assert!(matches!(
+            scores.command,
+            super::Command::GenerateQwenMetal { logprobs: true, .. }
+        ));
         for flag in ["--verbose", "--debug", "-v"] {
             let cli = Cli::try_parse_from(["mx", "gen", "--model", "model", flag])
                 .expect("generation diagnostic verbosity spelling");
@@ -871,6 +922,26 @@ mod tests {
                 super::Command::GenerateQwenMetal { verbose: true, .. }
             ));
         }
+    }
+
+    #[cfg(all(feature = "metal", feature = "structured-output"))]
+    #[test]
+    fn generation_accepts_an_explicit_local_json_schema() {
+        let cli = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--json-schema",
+            "schema.json",
+            "--debug",
+            "--preview",
+        ])
+        .expect("constrained generation arguments");
+        assert!(matches!(cli.command,
+            super::Command::GenerateQwenMetal { json_schema: Some(path), verbose: true, preview: true, .. }
+            if path == std::path::Path::new("schema.json")
+        ));
     }
 
     #[cfg(feature = "metal")]

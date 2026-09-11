@@ -9,10 +9,11 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 llguidance = { version = "=1.8.0", default-features = false, optional = true }
+jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [features]
-structured-output = ["dep:llguidance", "dep:serde_json"]
+structured-output = ["dep:llguidance", "dep:jsonschema", "dep:serde_json"]
 
 [lints]
 workspace = true
