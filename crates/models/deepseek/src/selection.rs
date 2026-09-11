@@ -1,0 +1,234 @@
+//! CPU-only qualification of V4.1 final index selection.
+//!
+//! This mirrors the final `topk`, position sort, causal sentinel, and offset
+//! statements in pinned
+//! [`Indexer.forward`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L578).
+//! It is neither candidate-mask computation nor a Metal or full-indexer claim.
+
+use thiserror::Error;
+
+/// Maximum score-row width accepted by this bounded CPU qualification helper.
+pub const MAX_SELECTION_WIDTH: usize = 1 << 20;
+
+/// Errors from final V4.1 index selection qualification.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SelectionError {
+    /// The score row exceeds the helper's explicit work bound.
+    #[error("selection width {width} exceeds maximum {max_width}")]
+    WidthTooLarge { width: usize, max_width: usize },
+    /// The reachable compressed length exceeded the supplied score row.
+    #[error("reachable length {len} exceeds selection width {width}")]
+    LengthExceedsWidth { len: usize, width: usize },
+    /// A score was not finite or negative infinity.
+    #[error("selection logit at position {position} is neither finite nor negative infinity")]
+    InvalidLogit { position: usize },
+    /// A position outside the reachable prefix was not already masked.
+    #[error("unreachable selection position {position} must be negative infinity")]
+    UnmaskedFuturePosition { position: usize },
+    /// A score tie across the cutoff would require inventing a `PyTorch` tie order.
+    #[error("equal scores straddle the final Top-K cutoff")]
+    AmbiguousCutoffTie,
+    /// A reachable selected position cannot be offset into the `i32` API result.
+    #[error("offset {offset} plus reachable position {position} does not fit i32")]
+    OffsetOutOfRange { offset: usize, position: usize },
+}
+
+/// Selects one final V4.1 index-score row into position-sorted API indices.
+///
+/// Inputs are already causally masked scores. The result has `min(index_topk,
+/// logits.len())` values, sorted by position after score selection. Reachable
+/// `-∞` scores remain valid selected positions; selected future positions map
+/// to `-1`. Cutoff ties are rejected unless every position in the tied group
+/// is causally unreachable, since their observable result is then identical.
+pub fn select_indices(
+    logits: &[f32],
+    compress_len: usize,
+    index_topk: usize,
+    offset: usize,
+) -> Result<Vec<i32>, SelectionError> {
+    if logits.len() > MAX_SELECTION_WIDTH {
+        return Err(SelectionError::WidthTooLarge {
+            width: logits.len(),
+            max_width: MAX_SELECTION_WIDTH,
+        });
+    }
+    if compress_len > logits.len() {
+        return Err(SelectionError::LengthExceedsWidth {
+            len: compress_len,
+            width: logits.len(),
+        });
+    }
+    for (position, &logit) in logits.iter().enumerate() {
+        if !(logit.is_finite() || logit == f32::NEG_INFINITY) {
+            return Err(SelectionError::InvalidLogit { position });
+        }
+        if position >= compress_len && logit != f32::NEG_INFINITY {
+            return Err(SelectionError::UnmaskedFuturePosition { position });
+        }
+    }
+
+    let select = index_topk.min(logits.len());
+    if select == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(position) = compress_len.checked_sub(1) {
+        let index = offset
+            .checked_add(position)
+            .ok_or(SelectionError::OffsetOutOfRange { offset, position })?;
+        i32::try_from(index).map_err(|_| SelectionError::OffsetOutOfRange { offset, position })?;
+    }
+
+    let mut ranked: Vec<usize> = (0..logits.len()).collect();
+    ranked.sort_by(|&left, &right| logits[right].total_cmp(&logits[left]));
+    if select < logits.len() {
+        let cutoff = logits[ranked[select - 1]];
+        let next = logits[ranked[select]];
+        if scores_equal(cutoff, next)
+            && logits
+                .iter()
+                .enumerate()
+                .any(|(position, &score)| position < compress_len && scores_equal(score, cutoff))
+        {
+            return Err(SelectionError::AmbiguousCutoffTie);
+        }
+    }
+
+    ranked.truncate(select);
+    ranked.sort_unstable();
+    ranked
+        .into_iter()
+        .map(|position| {
+            if position >= compress_len {
+                Ok(-1)
+            } else {
+                let index = offset
+                    .checked_add(position)
+                    .ok_or(SelectionError::OffsetOutOfRange { offset, position })?;
+                i32::try_from(index)
+                    .map_err(|_| SelectionError::OffsetOutOfRange { offset, position })
+            }
+        })
+        .collect()
+}
+
+fn scores_equal(left: f32, right: f32) -> bool {
+    left.to_bits() == right.to_bits() || (left.abs().to_bits() == 0 && right.abs().to_bits() == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_SELECTION_WIDTH, SelectionError, select_indices};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Fixture {
+        schema_version: u8,
+        source: FixtureSource,
+        cases: Vec<FixtureCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureSource {
+        revision: String,
+        sha256: String,
+        symbol: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureCase {
+        name: String,
+        logits: Vec<Option<f32>>,
+        compress_len: usize,
+        index_topk: usize,
+        offset: usize,
+        expected_indices: Vec<i32>,
+    }
+
+    #[test]
+    fn rejects_invalid_inputs_and_validates_offset_boundaries() {
+        assert!(matches!(
+            select_indices(&[f32::NAN], 1, 1, 0),
+            Err(SelectionError::InvalidLogit { position: 0 })
+        ));
+        assert!(matches!(
+            select_indices(&[1.0], 2, 1, 0),
+            Err(SelectionError::LengthExceedsWidth { .. })
+        ));
+        assert!(matches!(
+            select_indices(&[1.0, 0.0], 1, 1, 0),
+            Err(SelectionError::UnmaskedFuturePosition { position: 1 })
+        ));
+        assert!(matches!(
+            select_indices(&[1.0, 0.0], 2, 1, i32::MAX as usize),
+            Err(SelectionError::OffsetOutOfRange { .. })
+        ));
+        assert_eq!(
+            select_indices(&[1.0], 1, 1, i32::MAX as usize).unwrap(),
+            [i32::MAX]
+        );
+        assert!(matches!(
+            select_indices(&[1.0, 0.0], 2, 1, usize::MAX),
+            Err(SelectionError::OffsetOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_reachable_cutoff_ties_but_allows_unreachable_ones() {
+        assert_eq!(
+            select_indices(&[2.0, 1.0, 1.0], 3, 2, 0),
+            Err(SelectionError::AmbiguousCutoffTie)
+        );
+        assert_eq!(
+            select_indices(&[1.0, f32::NEG_INFINITY, f32::NEG_INFINITY], 1, 2, 0).unwrap(),
+            [0, -1]
+        );
+        assert_eq!(
+            select_indices(&[1.0, f32::NEG_INFINITY, f32::NEG_INFINITY], 2, 2, 0),
+            Err(SelectionError::AmbiguousCutoffTie)
+        );
+        assert_eq!(
+            select_indices(&[1.0, 0.0, -0.0], 3, 2, 0),
+            Err(SelectionError::AmbiguousCutoffTie)
+        );
+    }
+
+    #[test]
+    fn rejects_rows_larger_than_the_explicit_bound() {
+        let logits = vec![f32::NEG_INFINITY; MAX_SELECTION_WIDTH + 1];
+        assert!(matches!(
+            select_indices(&logits, 0, 0, 0),
+            Err(SelectionError::WidthTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn matches_pinned_official_cpu_selection_fixture() {
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../../../fixtures/deepseek-v41/selection-reference.json"
+        ))
+        .expect("fixture JSON is valid");
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(
+            fixture.source.revision,
+            "dba1be0a40aa45a94ad051997016db3960a90277"
+        );
+        assert_eq!(
+            fixture.source.sha256,
+            "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+        );
+        assert_eq!(fixture.source.symbol, "Indexer.forward:selection");
+        assert_eq!(fixture.cases.len(), 10);
+
+        for case in fixture.cases {
+            let logits: Vec<f32> = case
+                .logits
+                .into_iter()
+                .map(|value| value.unwrap_or(f32::NEG_INFINITY))
+                .collect();
+            let actual = select_indices(&logits, case.compress_len, case.index_topk, case.offset)
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            assert_eq!(actual, case.expected_indices, "{}", case.name);
+        }
+    }
+}

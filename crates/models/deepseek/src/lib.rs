@@ -4,10 +4,12 @@ pub mod csa2;
 #[cfg(feature = "metal")]
 pub mod indexer;
 pub mod manifest;
+pub mod selection;
 
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]
 pub use indexer::{IndexScoreError, index_scores_f32};
+pub use selection::{SelectionError, select_indices};
 
 // MLX's native test operations share process-global device initialization.
 #[cfg(all(test, feature = "metal"))]

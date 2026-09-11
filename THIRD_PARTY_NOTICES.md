@@ -1,7 +1,7 @@
 # Third-party notices
 
 The candidate-block selection and FP32 index-score diagnostics in
-`crates/models/deepseek/src/csa2.rs` and `indexer.rs` follow
+`crates/models/deepseek/src/csa2.rs`, `indexer.rs`, and `selection.rs` follow
 `select_candidate_blocks` and the score-reduction expressions in
 `Indexer.forward` from DeepSeek's official V4.1 Flash inference implementation,
 revision `dba1be0a40aa45a94ad051997016db3960a90277`.
