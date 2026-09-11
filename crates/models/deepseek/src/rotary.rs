@@ -717,6 +717,109 @@ mod tests {
     }
 
     #[test]
+    fn frequency_parameters_validate_the_selected_yarn_branch_only() {
+        for base in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0] {
+            assert_eq!(
+                RotaryFrequencyParameters::new(nonzero(4), 0, base, 1.0, 1.0, 1.0),
+                Err(RotaryFrequencyError::InvalidBase),
+                "base {base:?}"
+            );
+        }
+
+        for (factor, beta_fast, beta_slow) in [
+            (f32::NAN, 1.0, 1.0),
+            (f32::INFINITY, 1.0, 1.0),
+            (f32::NEG_INFINITY, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+            (1.0, f32::NAN, 1.0),
+            (1.0, f32::INFINITY, 1.0),
+            (1.0, f32::NEG_INFINITY, 1.0),
+            (1.0, 0.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, f32::NAN),
+            (1.0, 1.0, f32::INFINITY),
+            (1.0, 1.0, f32::NEG_INFINITY),
+            (1.0, 1.0, 0.0),
+            (1.0, 1.0, -1.0),
+        ] {
+            assert_eq!(
+                RotaryFrequencyParameters::new(
+                    nonzero(4),
+                    1,
+                    10_000.0,
+                    factor,
+                    beta_fast,
+                    beta_slow
+                ),
+                Err(RotaryFrequencyError::InvalidYarnParameters),
+                "YaRN ({factor:?}, {beta_fast:?}, {beta_slow:?})"
+            );
+            RotaryFrequencyParameters::new(nonzero(4), 0, 10_000.0, factor, beta_fast, beta_slow)
+                .expect("non-YaRN does not interpret YaRN-only parameters");
+        }
+    }
+
+    #[test]
+    fn frequency_requests_fail_before_large_allocation() {
+        let small = RotaryFrequencyParameters::new(nonzero(2), 0, 10_000.0, 1.0, 1.0, 1.0)
+            .expect("valid parameters");
+        assert_eq!(
+            small.frequencies(usize::MAX, nonzero(1)),
+            Err(RotaryFrequencyError::PositionRangeOverflow)
+        );
+
+        let wide =
+            RotaryFrequencyParameters::new(nonzero(usize::MAX - 1), 0, 10_000.0, 1.0, 1.0, 1.0)
+                .expect("even width is syntactically valid");
+        assert_eq!(
+            wide.frequencies(0, nonzero(3)),
+            Err(RotaryFrequencyError::OutputLengthOverflow)
+        );
+
+        assert_eq!(
+            wide.frequencies(0, nonzero(1)),
+            Err(RotaryFrequencyError::AllocationFailed {
+                elements: (usize::MAX - 1) / 2,
+            })
+        );
+    }
+
+    #[test]
+    fn frequency_ranges_are_slices_of_the_same_position_prefix() {
+        let cases = [
+            (4, 0, 10_000.0, 0.0, f32::NAN, f32::NEG_INFINITY),
+            (6, 8, 10_000.0, 2.0, 16.0, 1.0),
+            (8, 16, 1_000_000.0, 4.0, 32.0, 1.0),
+        ];
+        for (width, original, base, factor, beta_fast, beta_slow) in cases {
+            let parameters = RotaryFrequencyParameters::new(
+                nonzero(width),
+                original,
+                base,
+                factor,
+                beta_fast,
+                beta_slow,
+            )
+            .expect("test parameters are valid for their selected path");
+            let pairs = width / 2;
+            for (start, count) in [(0, 1), (1, 2), (3, 3), (7, 2)] {
+                let prefix = parameters
+                    .frequencies(0, nonzero(start + count))
+                    .expect("small prefix");
+                let range = parameters
+                    .frequencies(start, nonzero(count))
+                    .expect("small range");
+                assert_eq!(
+                    range,
+                    prefix[start * pairs..(start + count) * pairs],
+                    "width {width}, original {original}, start {start}, count {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn matches_pinned_official_cpu_reference_fixture() {
         let fixture: Fixture = serde_json::from_str(include_str!(
             "../../../../fixtures/deepseek-v41/rotary-reference.json"

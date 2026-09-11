@@ -152,6 +152,15 @@ Receipts: `artifacts/v41-rope-captured.json`,
 `artifacts/check-cached-rope-metal-final.log`.
 Fixture SHA-256: `9b4b06c131fbde15faba57a44d245e21a029313d4d6682797ed5bd0c8efa456c`.
 
+The completion audit also tests interval composition: generating a requested
+position range exactly equals slicing a generated prefix across small widths,
+offsets and both scaling branches. The pinned Torch fixture remains the
+independent numerical oracle. A separate rejection matrix covers non-finite
+and nonpositive required parameters, ignored parameters in the no-YaRN path,
+position/output overflow, and capacity overflow without a large allocation.
+Canonical default and Metal checks passed afterward; receipts:
+`artifacts/check-boundary-{default,metal}.log`.
+
 ## CPU final selection
 
 The capture script also records ten synthetic cases for the final three
