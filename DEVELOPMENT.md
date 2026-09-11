@@ -75,6 +75,14 @@ For the first selected-tensor loader gate and V4.1 shape checks, follow
 diagnostic's byte limit applies to its selected raw payload, not the resident
 reference loader or the process's total memory.
 
+Both release binaries expose the same commands: use `target/release/mx` or
+`target/release/metallix`. `check-qwen-rows-metal` checks contiguous BF16 rows;
+`check-qwen-embedding-metal` gathers raw token IDs in input order and reads
+repeated IDs once. Its byte budget is the aggregate selected raw payload,
+not the output array or resident oracle. See the
+[selected embedding result](docs/experiments/loader-qualification.md#token-ordered-selected-embedding)
+for the exact command and checkpoint identity.
+
 `check-qwen-layer-metal` extends this to one real block on synthetic hidden
 states. Its `--max-weight-bytes` bounds logical weights and loading staging,
 not scratch or process memory. Use `--candidate-only` when measuring process

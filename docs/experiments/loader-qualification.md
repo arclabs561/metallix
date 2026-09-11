@@ -119,8 +119,60 @@ its `.stderr`, `artifacts/qwen-selected-embedding-budget.stderr`, and
 `artifacts/check-embedding-{default,metal}.log`. Executable SHA-256:
 `d7586bfc773184f4bfcf4337f11f0172f41457167d594d1f30004f0ba99da385`.
 
-Next: qualify tiled tied-output projection before composing a complete
-streamed forward. No speedup follows from this single lookup measurement.
+The tiled projection experiment below advances the next qualification gate.
+No speedup follows from this single lookup measurement.
+
+## Tiled tied-output projection
+
+[`qualify_projection`](../../crates/models/qwen/src/metal/projection_check.rs)
+parses the forward configuration before accepting tied output weights. For
+one deterministic synthetic hidden row, it reads each BF16 embedding tile,
+widens to FP32, computes its logits, evaluates and copies those logits to the
+CPU before releasing the tile and advancing. A separately loaded resident
+MLX embedding supplies a complete-vocabulary reference.
+
+```sh
+target/release/mx check-qwen-projection-metal --model /path/to/Qwen3-0.6B \
+  --tile-rows 1024 --max-bytes 8388608
+```
+
+On M3 Max, 128 GiB, macOS 26.6.2, three fresh processes per tile size were
+run in repeating order 256, 1024, 4096, following one excluded 1024-row run.
+All nine compared 151,936 logits with zero observed absolute error. The
+acceptance criterion remains `5e-5 + 1e-4 * abs(reference)`, not a general
+promise of bit-exact matrix arithmetic. Inputs are synthetic, not final
+decoder hidden states. Every size exercises a partial final tile.
+
+| Tile rows | Maximum raw tile | Candidate load + execute median | Observed range |
+|---|---:|---:|---:|
+| 256 | 512 KiB | 247.06 ms | 231.90–510.43 ms |
+| 1,024 | 2 MiB | 125.18 ms | 119.06–171.47 ms |
+| 4,096 | 8 MiB | 111.83 ms | 109.37–176.71 ms |
+
+These are exploratory fresh-process timings, including per-tile evaluation
+and readback. Only one shape received an excluded warmup; compilation,
+allocator and OS cache state are not controlled. Variance is substantial.
+Keep the default at 1,024 rows pending a controlled sweep; this is neither
+an optimal-size claim nor a comparison against resident decode throughput.
+`reference_ms` includes resident loading and casting, so it is not a
+steady-state kernel baseline.
+
+Every candidate still reads 311,164,928 raw bytes cumulatively. Tiling bounds
+the selected raw slab, not total I/O or process memory. FP32 staging, array
+copies, operator scratch, allocator retention, accumulated logits, headers
+and the resident oracle are outside the raw budget. With 1,024 rows, the
+exact 2,097,152-byte budget passed; 2,097,151 exited 1 before payload reading.
+
+Both canonical checks passed. Receipts:
+`artifacts/projection-{256,1024,4096}-{1,2,3}.json`, corresponding stderr,
+`artifacts/projection-warmup.json`, `artifacts/projection-budget.stderr`,
+`artifacts/projection-host.txt`, and `artifacts/check-projection-{default,metal}.log`.
+Executable SHA-256:
+`d0b297637a806394ab4824938b3fdaaa0e931f274e7fe76e76ac6555a63acae2`.
+The checkpoint/config identities are the Qwen identities recorded above.
+
+Next: compose selected embeddings, real layer outputs, final normalization
+and tiled projection; compare complete streamed logits before adding KV reuse.
 
 ## One-block selected-weight execution
 
