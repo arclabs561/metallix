@@ -129,6 +129,22 @@ enum GenerationExecutor<'a> {
 }
 
 impl GenerationExecutor<'_> {
+    fn enable_profiling(&mut self, enabled: bool) {
+        if let Self::Streamed(executor) = self {
+            executor.enable_profiling(enabled);
+        }
+    }
+
+    fn take_last_profile(&mut self) -> Result<Option<serde_json::Value>, serde_json::Error> {
+        match self {
+            Self::Resident(_) => Ok(None),
+            Self::Streamed(executor) => executor
+                .take_last_profile()
+                .map(serde_json::to_value)
+                .transpose(),
+        }
+    }
+
     fn prefill_last_logits(
         &mut self,
         input_ids: &[i32],
@@ -258,6 +274,9 @@ fn generate_inner(
         ),
     };
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Stream profiles are opt-in diagnostics. Enable before prefill so each
+    // cache-mutating candidate phase records exactly one consumed sample.
+    executor.enable_profiling(verbose);
     if verbose {
         if let Some(plan) = streamed {
             eprintln!(
@@ -277,6 +296,10 @@ fn generate_inner(
     let started = Instant::now();
     let mut logits = executor.prefill_last_logits(input_ids)?;
     let prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut phase_profiles = Vec::new();
+    if verbose {
+        record_stream_profile(&mut executor, &mut phase_profiles, "prefill", 0)?;
+    }
     if verbose {
         let cached_tokens = executor.cached_tokens();
         let logical_kv_bytes = executor.kv_bytes();
@@ -347,6 +370,9 @@ fn generate_inner(
             let started = Instant::now();
             logits = executor.decode_last_logits(token)?;
             decode_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            if verbose {
+                record_stream_profile(&mut executor, &mut phase_profiles, "decode", step + 1)?;
+            }
         }
     }
     if verbose {
@@ -357,6 +383,7 @@ fn generate_inner(
         eprintln!(
             "qwen generation diagnostic: phase=decode decode_steps={decode_steps} decode_total_ms={decode_total_ms:.3} cached_tokens={cached_tokens} logical_kv_bytes={logical_kv_bytes}",
         );
+        emit_stream_profile_summary(&phase_profiles);
     }
     let mut report = json!({
     "schema_version": 1,
@@ -386,6 +413,7 @@ fn generate_inner(
             "oracle_load_ms_excluded": oracle_load_ms,
             "scope": "layer-streamed Qwen adapter path; promised context and separate planned weight/KV budgets are checked before candidate payload reads; planned budgets exclude activations, operator scratch, allocator retention, headers, projection output, and any opt-in resident oracle"
         });
+        attach_verbose_phase_profiles(&mut report["streamed"], verbose, &phase_profiles);
         report["scope"] = json!(
             "single sequence; streamed Qwen layers with detached contiguous KV; first prefill not warmed; candidate timing excludes opt-in resident full-prefix verification and its memory"
         );
@@ -444,6 +472,70 @@ fn verbose_preflight(
     format!(
         "qwen generation diagnostic: phase=preflight prompt_tokens={prompt_tokens} max_tokens={max_tokens} context_limit={context_limit} verify_cache={verify_cache}",
     )
+}
+
+/// Moves the one retained streamed profile into the verbose report immediately
+/// after its cache-mutating operation. Resident execution intentionally has no
+/// profile surface.
+fn record_stream_profile(
+    executor: &mut GenerationExecutor<'_>,
+    phase_profiles: &mut Vec<serde_json::Value>,
+    phase: &'static str,
+    generation_step: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(profile) = executor.take_last_profile()? {
+        phase_profiles.push(json!({
+            "phase": phase,
+            "generation_step": generation_step,
+            "cached_tokens": executor.cached_tokens(),
+            "profile": profile,
+        }));
+    }
+    Ok(())
+}
+
+/// Prints only aggregate profile metadata; individual samples remain in the
+/// verbose JSON report. These host wall-clock values are not GPU-kernel timing.
+fn emit_stream_profile_summary(phase_profiles: &[serde_json::Value]) {
+    if phase_profiles.is_empty() {
+        return;
+    }
+    let total_ms = phase_profiles
+        .iter()
+        .filter_map(|entry| entry["profile"]["total_ms"].as_f64())
+        .sum::<f64>();
+    let layer_execute_readback_ms = phase_profiles
+        .iter()
+        .filter_map(|entry| entry["profile"]["layer_execute_readback_ms"].as_f64())
+        .sum::<f64>();
+    let layer_load_conversion_ms = phase_profiles
+        .iter()
+        .filter_map(|entry| entry["profile"]["layer_load_conversion_ms"].as_f64())
+        .sum::<f64>();
+    let tiled_projection_load_ms = phase_profiles
+        .iter()
+        .filter_map(|entry| entry["profile"]["tiled_projection_load_ms"].as_f64())
+        .sum::<f64>();
+    let tiled_projection_execute_ms = phase_profiles
+        .iter()
+        .filter_map(|entry| entry["profile"]["tiled_projection_execute_ms"].as_f64())
+        .sum::<f64>();
+    eprintln!(
+        "qwen generation diagnostic: phase=stream_profile samples={} total_ms={total_ms:.3} layer_load_conversion_ms={layer_load_conversion_ms:.3} layer_execute_readback_ms={layer_execute_readback_ms:.3} tiled_projection_load_ms={tiled_projection_load_ms:.3} tiled_projection_execute_ms={tiled_projection_execute_ms:.3} scope=host_wall_clock_not_gpu_kernel_timing",
+        phase_profiles.len(),
+    );
+}
+
+/// The profile list is opt-in and stream-only: keeping this mutation in one
+/// place prevents verbose diagnostics from quietly changing normal JSON.
+fn attach_verbose_phase_profiles(
+    streamed: &mut serde_json::Value,
+    verbose: bool,
+    phase_profiles: &[serde_json::Value],
+) {
+    if verbose {
+        streamed["phase_profiles"] = json!(phase_profiles);
+    }
 }
 
 fn greedy_token(logits: &[f32]) -> Result<i32, String> {
@@ -662,5 +754,22 @@ mod tests {
             .streamed_plan(1, 1)
             .is_err()
         );
+    }
+
+    #[test]
+    fn phase_profiles_are_present_only_for_verbose_streamed_reports() {
+        let profiles = vec![serde_json::json!({
+            "phase": "prefill",
+            "generation_step": 0,
+            "cached_tokens": 3,
+            "profile": { "total_ms": 1.0 },
+        })];
+        let mut quiet = serde_json::json!({ "max_kv_bytes": 7_340_032 });
+        super::attach_verbose_phase_profiles(&mut quiet, false, &profiles);
+        assert!(quiet.get("phase_profiles").is_none());
+
+        let mut verbose = serde_json::json!({ "max_kv_bytes": 7_340_032 });
+        super::attach_verbose_phase_profiles(&mut verbose, true, &profiles);
+        assert_eq!(verbose["phase_profiles"], serde_json::json!(profiles));
     }
 }
