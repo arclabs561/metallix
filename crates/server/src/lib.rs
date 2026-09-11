@@ -141,6 +141,17 @@ enum Command {
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
         max_bytes: u64,
     },
+    /// Compare tiled Qwen projection output with the resident MLX loader.
+    #[cfg(feature = "metal")]
+    CheckQwenProjectionMetal {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value_t = 1_024, value_parser = clap::value_parser!(u32).range(1..=4_096))]
+        tile_rows: u32,
+        /// Bound one tile's raw payload only; not aggregate or process peak memory.
+        #[arg(long, default_value_t = 8_388_608, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
+        max_bytes: u64,
+    },
     /// Evaluate one selected-weight Qwen block and compare with resident weights.
     #[cfg(feature = "metal")]
     CheckQwenLayerMetal {
@@ -233,6 +244,12 @@ pub fn run() -> ExitCode {
             input_ids,
             max_bytes,
         } => check_qwen_embedding_metal(&model, &input_ids, max_bytes),
+        #[cfg(feature = "metal")]
+        Command::CheckQwenProjectionMetal {
+            model,
+            tile_rows,
+            max_bytes,
+        } => check_qwen_projection_metal(&model, tile_rows, max_bytes),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
         #[cfg(feature = "metal")]
@@ -394,6 +411,34 @@ fn check_qwen_embedding_metal(
         },
         Err(error) => {
             eprintln!("Qwen embedding check failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn check_qwen_projection_metal(
+    model: &std::path::Path,
+    tile_rows: u32,
+    max_bytes: u64,
+) -> ExitCode {
+    let Ok(tile_rows) = usize::try_from(tile_rows) else {
+        eprintln!("Qwen projection check failed: tile row count does not fit usize");
+        return ExitCode::FAILURE;
+    };
+    match qwen::metal::qualify_projection(model, tile_rows, max_bytes) {
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("could not serialize projection comparison: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("Qwen projection check failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -744,6 +789,45 @@ mod tests {
                     "model",
                     "--max-bytes",
                     limit,
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn projection_check_requires_a_model_and_bounds_each_tile() {
+        let cli = Cli::try_parse_from([
+            "metallix",
+            "check-qwen-projection-metal",
+            "--model",
+            "model",
+        ])
+        .expect("default projection diagnostic");
+        assert!(matches!(
+            cli.command,
+            super::Command::CheckQwenProjectionMetal {
+                tile_rows: 1_024,
+                max_bytes: 8_388_608,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["metallix", "check-qwen-projection-metal"]).is_err());
+        for (flag, value) in [
+            ("--tile-rows", "0"),
+            ("--tile-rows", "4097"),
+            ("--max-bytes", "0"),
+            ("--max-bytes", "67108865"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "metallix",
+                    "check-qwen-projection-metal",
+                    "--model",
+                    "model",
+                    flag,
+                    value,
                 ])
                 .is_err()
             );
