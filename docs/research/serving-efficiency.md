@@ -34,16 +34,40 @@ models, runtimes, and hardware. They are not forecasts for Metallix.
 
 ## IO-aware attention, fusion, and graphs
 
-FlashAttention is an exact attention primitive that tiles Q/K/V, performs
-online softmax, and avoids materializing the quadratic score matrix in HBM.
-It spends additional arithmetic on recomputation to avoid more expensive
-memory traffic. The paper reports up to 7.6x attention-kernel speedup on GPT-2
-and 3x faster GPT-2 training at sequence length 1K; its implementation and
-measurements are CUDA/GPU-specific. The transferable lesson is to make data
-movement explicit: fuse operations only where doing so removes intermediate
-allocations or synchronization without breaking numerics or cache layout.
-FlashAttention can improve prefill where an equivalent MLX/Metal kernel exists;
-it does not remove decode's parameter-streaming cost.
+FlashAttention is an **exact algorithm** for attention: tiling Q/K/V plus
+online softmax returns the dense `softmax(QKᵀ)V` result while avoiding the
+quadratic score matrix in HBM. It is not a promise of bitwise identity with an
+unfused baseline: tile order, reductions, and floating-point rounding differ.
+The paper instead establishes correctness algebraically and reports matching
+GPT-2 training/validation curves, so a port needs tolerance-based forward and
+gradient checks against a reference. During training it saves output plus
+row-wise softmax max/normalizer (and RNG state when dropout is used), then
+recomputes score/probability blocks in backward. That extra arithmetic can beat
+reading saved quadratic intermediates; it is a training memory/speed technique,
+not an inference requirement.
+
+For `d ≤ M ≤ Nd`, where `N` is sequence length, `d` head dimension, and `M`
+on-chip SRAM, the paper gives standard attention Θ(`Nd + N²`) HBM accesses and
+FlashAttention Θ(`N²d²/M`). Its lower-bound statement is that no exact
+algorithm asymptotically beats that expression **over all SRAM sizes**; it is
+not a hardware-independent latency lower bound. The paper reports up to 7.6x
+attention-kernel speedup on GPT-2 and 3x faster GPT-2 training at length 1K,
+but all implementation/measurements are CUDA on then-supported Turing/Ampere
+GPUs. Its appendix also shows speedup varying with SRAM and bandwidth (smaller
+SRAM on T4 reduces it). Thus the transferable lesson is IO-aware fusion, not a
+numeric prediction for M3: an MLX/Metal implementation must demonstrate the
+same tile/layout/numerical behavior and be benchmarked separately. It can
+improve prefill where such a kernel exists; it does not remove decode's
+parameter-streaming cost.
+
+The companion block-sparse FlashAttention skips zero blocks and is approximate
+with respect to dense attention because its fixed sparsity mask changes what
+tokens attend. Its I/O bound is Θ(`Nd + N²d²s/M`), where `s` is the fraction
+of nonzero blocks: a fixed nonzero density therefore remains quadratic in `N`.
+The paper notes subquadratic examples only when density itself falls with
+length (for example `s = N⁻¹/²` or `s = N⁻¹ log N`). Its reported speed and
+density-dependent I/O reduction are not grounds to change a checkpoint's
+specified attention mask without a separate model-quality decision.
 
 Graph capture and compilation instead reduce dispatcher, launch, and Python
 overhead. Current vLLM V1 documentation describes optimization levels,
@@ -207,11 +231,13 @@ set; sparse active parameters alone do not imply usable 128GB V4.1 latency.
 
 ## Sources and read coverage
 
-Primary sources were read selectively: abstract, introduction, relevant method
-and reported evaluation material; this is not a claim of exhaustive appendix
-review.
+Primary sources other than FlashAttention were read selectively: abstract,
+introduction, relevant method and reported evaluation material; this is not a
+claim of exhaustive appendix review. FlashAttention is the exception: the full
+HTML main body and appendices A--E of its pinned v2 were retrieved and read;
+the claims above remain scoped to the paper's CUDA-era evidence.
 
-- [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/html/2205.14135), 2022: IO-aware exact attention and reported evaluation.
+- [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness, arXiv:2205.14135v2 (23 Jun 2022)](https://arxiv.org/html/2205.14135v2), full main body and appendices A--E: IO analysis, forward/backward algorithms and proofs, sparse extension, limitations, and experimental details.
 - [Efficient Memory Management for LLM Serving with PagedAttention](https://arxiv.org/html/2309.06180v1), SOSP 2023: allocation, sharing, scheduling, and evaluation claims.
 - [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/html/2312.07104), 2023: RadixAttention, compressed FSM, and evaluation claims.
 - [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/html/2302.01318), 2023: correction method and reported speedup.
