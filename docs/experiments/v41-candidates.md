@@ -2,8 +2,10 @@
 
 The first executable V4.1-specific diagnostic is a CPU implementation of
 `select_candidate_blocks` from the [official inference source](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L583).
-It checks the first-stage candidate mask, not index-score generation, the
-second-stage Top-K, sparse attention, or a V4.1 decoder.
+That diagnostic checks the first-stage candidate mask, not index-score
+generation, the second-stage Top-K, sparse attention, or a V4.1 decoder.
+Separate [sparse-attention checks](v41-attention.md) now cover the mathematical
+reference and bounded FP32 Metal path; they are not part of this mask check.
 
 For each query, the reference takes each block's maximum score, pins the block
 containing the newest reachable compressed position, selects the highest

@@ -100,9 +100,42 @@ finite products hidden by a tiny scale or cancellation. Receipt:
 Metal checks passed; receipts are `artifacts/check-v41-attention-default.log`
 and `artifacts/check-v41-attention-metal-clean.log`.
 
-Next, independently compose forward RoPE on the query tail, sparse attention,
-then inverse RoPE on the output tail, as in the pinned
+## Small rotary/attention composition gate
+
+The test-only composition now calls forward RoPE on the query tail, sparse
+attention, then conjugate RoPE on the output tail, as in the pinned
 [`Attention.forward`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L763).
+KV is supplied already prepared and is not rotated a second time. Frequencies
+index query positions and broadcast across batch/head; they do not index the
+sparse key positions. The non-rotary prefix stays bit-exact across each rotary
+operation. `Inverse` means frequency conjugation, which is a mathematical
+inverse only for unit-magnitude frequencies; the fixtures use unit rotations
+up to FP32 representation.
+
+The independent two-position hand case uses raw query `[0,1,0]`, prepared KV
+`[3,2,0]`, one key, zero sink and scale one. With identity frequency, the output
+is `[3*sigmoid(2), 2*sigmoid(2), 0]`; with frequency `i`, it is `[1.5,0,-1]`.
+This checks the order without deriving expectations from either backend.
+A second case checks all intermediate boundaries across two batches, three
+query positions, two heads, two complex pairs, duplicate indices and masked
+rows against the CPU composition. Both use `1e-4 + 1e-5*abs(reference)` and
+assert finite results; all-masked output remains zero.
+
+```sh
+cargo test -p deepseek --features metal composition
+```
+
+This exercises existing application operators; it adds no public executor or
+cache abstraction. Implementation:
+[`composition_tests.rs`](../../crates/models/deepseek/src/attention/composition_tests.rs).
+Both composition tests passed on Metal; the full default/Metal quality gates
+also passed. Receipts: `artifacts/v41-composition-tests-pass.log`,
+`artifacts/check-v41-composition-default.log` and
+`artifacts/check-v41-composition-metal-pass.log`.
+The Rust 1.87 all-feature/all-target check also passed
+(`artifacts/msrv-v41-composition.log`).
 Projections, compressed-cache/index ownership, grouped output projection,
 BF16 probability rounding and production kernel scheduling remain separate
-gates. No sparse-attention performance claim follows from this diagnostic.
+gates. Checkpoint representation and exact supplied-format decoding are the
+next feasibility checks, before extending the graph. No sparse-attention
+performance claim follows from these tests.
