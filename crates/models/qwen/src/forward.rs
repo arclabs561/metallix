@@ -162,13 +162,17 @@ pub fn forward_last_logits<S: BuildHasher>(
         hidden_states = residual.add_device(&mlp, &stream)?;
     }
 
+    // Only the final position is requested; normalization and the tied output
+    // projection are position-independent after the decoder layers.
+    let last_hidden =
+        hidden_states.take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?;
     let normalized = rms_norm(
-        &hidden_states,
+        &last_hidden,
         weight(weights, "model.norm.weight")?,
         config.rms_norm_eps,
     )?;
     let logits = linear(&normalized, embedding)?;
-    read_last_logits(&logits, seq_len, config.vocab_size)
+    read_last_logits(&logits, 1, config.vocab_size)
 }
 
 /// A dense Qwen3 forward executor with KV state bound to one weights map.
@@ -316,13 +320,15 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         }
 
         self.cached_tokens += input_ids.len();
+        let last_hidden =
+            hidden_states.take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?;
         let normalized = rms_norm(
-            &hidden_states,
+            &last_hidden,
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
         let logits = linear(&normalized, embedding)?;
-        read_last_logits(&logits, seq_len, self.config.vocab_size)
+        read_last_logits(&logits, 1, self.config.vocab_size)
     }
 }
 
@@ -803,14 +809,57 @@ mod tests {
         )
         .expect("small dense Qwen3 config");
         let weights = deterministic_weights();
-        let full = forward_last_logits(&weights, &config, &[1, 2, 3]).expect("full forward");
-
         let mut executor = Qwen3ForwardExecutor::new(&config, &weights);
         let _ = executor.prefill_last_logits(&[1, 2]).expect("prefill");
         assert_eq!(executor.cached_tokens(), 2);
         assert!(executor.kv_bytes() > 0);
-        let cached = executor.decode_last_logits(3).expect("decode");
+        for (next, prefix) in [
+            (3, &[1, 2, 3][..]),
+            (4, &[1, 2, 3, 4][..]),
+            (5, &[1, 2, 3, 4, 5][..]),
+        ] {
+            let cached = executor.decode_last_logits(next).expect("cached decode");
+            assert_eq!(executor.cached_tokens(), prefix.len());
+            assert_logits_match(
+                forward_last_logits(&weights, &config, prefix).expect("full forward"),
+                cached,
+            );
+        }
+
+        // A new prefill must discard all prior request-owned KV, including
+        // arrays retained through a previous lazy cached-decode graph.
+        let _ = executor
+            .prefill_last_logits(&[5, 6])
+            .expect("second prefill");
+        assert_eq!(executor.cached_tokens(), 2);
+        let cached = executor
+            .decode_last_logits(7)
+            .expect("second cached decode");
         assert_eq!(executor.cached_tokens(), 3);
+        assert_logits_match(
+            forward_last_logits(&weights, &config, &[5, 6, 7]).expect("second full forward"),
+            cached,
+        );
+
+        // An invalid append fails closed rather than leaving the first layers'
+        // KV available for a later request.
+        assert!(matches!(
+            executor.decode_last_logits(8),
+            Err(Qwen3ForwardError::InvalidTokenId { .. })
+        ));
+        assert_eq!(executor.cached_tokens(), 0);
+        assert_eq!(executor.kv_bytes(), 0);
+        assert!(matches!(
+            executor.decode_last_logits(1),
+            Err(Qwen3ForwardError::DecodeWithoutPrefill)
+        ));
+
+        executor.reset();
+        assert_eq!(executor.cached_tokens(), 0);
+        assert_eq!(executor.kv_bytes(), 0);
+    }
+
+    fn assert_logits_match(full: Vec<f32>, cached: Vec<f32>) {
         assert_eq!(full.len(), cached.len());
         for (full, cached) in full.into_iter().zip(cached) {
             assert!(
@@ -818,9 +867,6 @@ mod tests {
                 "cached logit {cached} differs from full logit {full}"
             );
         }
-        executor.reset();
-        assert_eq!(executor.cached_tokens(), 0);
-        assert_eq!(executor.kv_bytes(), 0);
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {
