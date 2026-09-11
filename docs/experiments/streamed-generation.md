@@ -104,9 +104,9 @@ resident weight bytes.
 
 ## Next gates
 
-1. Profile weight reads, BF16→FP32 conversion, projection tiles and layer
-   readbacks separately. Reduce the measured dominant cost while preserving
-   all-logit parity and the explicit staging budget.
+1. Re-profile after the retained CPU BF16 widening change below. Separate
+   remaining weight-read/staging cost from conversion before trying device
+   conversion or read-ahead; preserve all-logit parity and the staging budget.
 2. Measure repeated request lifetimes and allocator retention in one long-lived
    process, then qualify growing contexts before raising the 32-token ceiling.
 3. Keep the V4.1 sparse-attention precision/composition gate independent:
@@ -215,3 +215,71 @@ The before captures used binary
 after/repeat captures used
 `038bfe232e77fa7f2e8dffa7a750afdefe10bde26c7820d172bf89ef9c741214`.
 This is a comparison across builds, not a same-binary instrumentation toggle.
+
+## CPU BF16 widening experiment
+
+Retained change: `2628a71`. Instead of constructing a two-byte array from
+separate indexed bytes, `decode_bf16` copies each exact two-byte chunk into
+an array and calls `u16::from_le_bytes`. This stays safe Rust, accepts unaligned
+slices, keeps the finite-value checks and allocates the same output vector.
+Disassembly of the measured Apple-Silicon builds changed from interleaved byte
+loads and table shuffles to paired vector loads and widening shifts, with
+halfword loads in the scalar tail. This is compiler-specific evidence, not an
+instruction-selection guarantee. Receipts: `artifacts/bf16-before.asm` and
+`artifacts/bf16-candidate.asm`.
+
+On an M3 Max with 128 GiB memory and Darwin 25.6.0, release binaries
+built with Rust 1.98.0 / LLVM 22.1.8 ran serially in before-A, after-A, after-B,
+before-B order. Each block used
+three fresh processes, the same checkpoint hashes above, prompt
+`9707,11,1879`, eight output tokens, tile rows 1024 and unchanged streamed
+budgets. The command is the speed-baseline command above with the corresponding
+`--binary` and `--output`; no verification, constraints or profiling was enabled.
+Hashing warms the filesystem cache. Each block discards the first decode per
+process and retains 18 observations; observations within a process are not
+independent repetitions.
+
+| Block | Before median ms | After median ms | Change | Before / after sample SD ms |
+|---|---:|---:|---:|---:|
+| A | 333.53 | 287.47 | −13.81% | 4.45 / 12.89 |
+| B | 333.71 | 283.95 | −14.91% | 4.08 / 12.89 |
+
+All generated IDs matched. Every run retained 10 cached tokens / 2,293,760
+logical K/V bytes and planned 81,798,144 weight/staging bytes. This supports
+lower warm-decode wall time for this workload, not end-to-end request latency,
+HTTP throughput, cold-storage performance or larger-than-memory execution.
+
+The resident negative control used the same prompt/output and ABBA order.
+Before/after medians were 9.2865/9.4153 ms and 9.2721/9.4136 ms (1.39% and
+1.53% slower); sample SDs were 0.2540/0.3868 and 0.4152/0.3394 ms. An additional
+after-then-before block measured 9.0674/9.0783 ms before/after (0.12% slower),
+with SDs 0.1298/0.4074 ms. The small differences are retained, not relabeled
+as zero regression. The repeated streamed benefit justifies keeping the
+bounded change; the controls do not establish statistical equivalence.
+
+Timing receipts: `artifacts/bf16-streamed-{before,after}-{a,b}.json` and
+`artifacts/bf16-resident-{before,after}-{a,b,c}.json`; comparator receipts:
+`artifacts/bf16-{streamed,resident}-comparison-*.json`. The preserved before
+binary is `artifacts/mx-bf16-before`, from `b10037e`, SHA-256
+`038bfe232e77fa7f2e8dffa7a750afdefe10bde26c7820d172bf89ef9c741214`.
+The measured candidate SHA-256 is
+`1bd4b4d24bcd86c99711f8f50b7f4a3d77c5fa2b01429b0c8f53a90b1caa3c86`.
+Both receipts record the checkout at measurement time (`2628a71`); the preserved
+binary's provenance, not that checkout field, identifies the baseline source.
+
+Correctness is separate: exhaustive BF16 bit-pattern tests, unaligned slices
+at offsets 0–15, vector-tail lengths 0–65 and nonfinite rejection pass the
+Metal quality gate. A real constrained record run with `--verify-cache`
+validated the JSON and all 12 comparisons of 151,936 vocabulary logits, with
+maximum absolute error `2.09808349609375e-5` against resident recomputation.
+Receipt: `artifacts/bf16-parity.json`. This shared-Metal oracle is not an
+independent CPU reference. The default and Metal quality-gate logs are
+`artifacts/check-bf16-default.log` and `artifacts/check-bf16-metal-confirm.log`.
+The Rust 1.87 all-feature/all-target check also passed (`artifacts/msrv-bf16.log`);
+this checks compatibility, not that compiler's performance. The final release
+rebuild reproduced the measured candidate binary hash.
+
+Device-side BF16 conversion remains a separate experiment: a dtype view may
+allocate rather than alias, so its live-memory budget and exactness must be
+proved before adopting it. No new allocation, quantization or numerical
+precision policy is introduced by the retained CPU change.
