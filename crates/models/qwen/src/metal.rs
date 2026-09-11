@@ -19,8 +19,9 @@ mod projection_check;
 pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
 mod stream_check;
 pub use stream_check::{
-    Qwen3StreamCachedCheck, Qwen3StreamCandidateReport, Qwen3StreamCheck,
-    qualify_streamed_cached_forward, qualify_streamed_forward, run_streamed_forward_candidate,
+    Qwen3StreamCachedCandidateReport, Qwen3StreamCachedCheck, Qwen3StreamCandidateReport,
+    Qwen3StreamCheck, qualify_streamed_cached_forward, qualify_streamed_forward,
+    run_streamed_cached_candidate, run_streamed_forward_candidate,
 };
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.

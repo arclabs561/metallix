@@ -152,6 +152,42 @@ pub struct Qwen3StreamCachedCheck {
     scope: &'static str,
 }
 
+/// Candidate-only evidence from bounded, teacher-forced cached layer streaming.
+///
+/// Unlike [`Qwen3StreamCachedCheck`], this report has no resident cached or
+/// full-prefix oracle. Per-step logits are diagnostic output only and must not
+/// be read as a parity result.
+#[derive(Debug, serde::Serialize)]
+pub struct Qwen3StreamCachedCandidateReport {
+    schema_version: u32,
+    operation: &'static str,
+    prompt_ids: Vec<i32>,
+    decode_ids: Vec<i32>,
+    maximum_total_tokens: usize,
+    max_weight_bytes: u64,
+    planned_peak_weight_and_staging_bytes: u64,
+    max_kv_bytes: u64,
+    planned_final_kv_bytes: u64,
+    steps: Vec<Qwen3StreamCachedCandidateStep>,
+    verification: Qwen3StreamVerification,
+    scope: &'static str,
+}
+
+/// Candidate-only evidence for one teacher-forced cache transition.
+#[derive(Debug, serde::Serialize)]
+pub struct Qwen3StreamCachedCandidateStep {
+    /// Total tokens in the cache after this append.
+    total_tokens: usize,
+    /// The known input IDs consumed at this step.
+    appended_ids: Vec<i32>,
+    /// Full vocabulary logits from the bounded candidate only.
+    candidate_logits: Vec<f32>,
+    /// Candidate execution only; no resident oracle is included.
+    candidate_ms: f64,
+    /// Logical bytes in detached candidate K/V after this step.
+    retained_kv_bytes: u64,
+}
+
 /// Qualifies bounded Qwen3 cached layer streaming using teacher-forced appends.
 ///
 /// Every candidate layer loads its BF16 weights, executes one cached prefill or
@@ -168,15 +204,14 @@ pub fn qualify_streamed_cached_forward(
     max_kv_bytes: u64,
     tile_rows: usize,
 ) -> Result<Qwen3StreamCachedCheck, Qwen3MetalLoadError> {
-    let all_ids = checked_cached_ids(prompt_ids, decode_ids)?;
-    let plan = StreamForwardPlan::new(model, &all_ids, max_weight_bytes, tile_rows)?;
-    let planned_final_kv_bytes = plan.config.cached_kv_bytes(all_ids.len())?;
-    if planned_final_kv_bytes > max_kv_bytes {
-        return Err(Qwen3MetalLoadError::CachedStateBudget {
-            required: planned_final_kv_bytes,
-            maximum: max_kv_bytes,
-        });
-    }
+    let (plan, planned_final_kv_bytes) = prepare_cached_stream(
+        model,
+        prompt_ids,
+        decode_ids,
+        max_weight_bytes,
+        max_kv_bytes,
+        tile_rows,
+    )?;
 
     let candidate = run_cached_candidate(&plan, prompt_ids, decode_ids)?;
 
@@ -185,7 +220,7 @@ pub fn qualify_streamed_cached_forward(
     let mut resident = Qwen3MlxWeights::load(model)?;
     resident.prepare_float32()?;
     let mut cached = resident.executor();
-    let mut prefix = Vec::with_capacity(all_ids.len());
+    let mut prefix = Vec::with_capacity(prompt_ids.len() + decode_ids.len());
     let mut steps = Vec::with_capacity(candidate.len());
     for (index, candidate_step) in candidate.into_iter().enumerate() {
         let appended = if index == 0 {
@@ -241,6 +276,84 @@ pub fn qualify_streamed_cached_forward(
         relative_tolerance: RELATIVE_TOLERANCE,
         scope: "bounded teacher-forced cached qualification only: each candidate layer evaluates and rebuilds its residual output plus K/V before its layer weights drop; every step compares all logits with independent resident cached and full-prefix controls; weight/staging and retained-KV budgets are separate and both exclude activations, operator scratch, allocator retention, headers, projection output, and resident controls; no sampling, server, process-peak, or beyond-RAM claim",
     })
+}
+
+/// Runs bounded Qwen3 cached layer streaming without resident controls.
+///
+/// It accepts the same preflight and memory budgets as
+/// [`qualify_streamed_cached_forward`], but performs only the candidate run.
+/// Its per-step logits are intentionally retained for an external comparison;
+/// this function itself establishes no parity claim.
+pub fn run_streamed_cached_candidate(
+    model: &Path,
+    prompt_ids: &[i32],
+    decode_ids: &[i32],
+    max_weight_bytes: u64,
+    max_kv_bytes: u64,
+    tile_rows: usize,
+) -> Result<Qwen3StreamCachedCandidateReport, Qwen3MetalLoadError> {
+    let (plan, planned_final_kv_bytes) = prepare_cached_stream(
+        model,
+        prompt_ids,
+        decode_ids,
+        max_weight_bytes,
+        max_kv_bytes,
+        tile_rows,
+    )?;
+    let candidate = run_cached_candidate(&plan, prompt_ids, decode_ids)?;
+    let mut total_tokens = 0_usize;
+    let mut steps = Vec::with_capacity(candidate.len());
+    for (index, candidate_step) in candidate.into_iter().enumerate() {
+        let appended = if index == 0 {
+            prompt_ids
+        } else {
+            &decode_ids[index - 1..index]
+        };
+        total_tokens = total_tokens.checked_add(appended.len()).ok_or(
+            Qwen3MetalLoadError::DimensionOutOfRange("cached token count"),
+        )?;
+        steps.push(Qwen3StreamCachedCandidateStep {
+            total_tokens,
+            appended_ids: appended.to_vec(),
+            candidate_logits: candidate_step.logits,
+            candidate_ms: candidate_step.candidate_ms,
+            retained_kv_bytes: candidate_step.retained_kv_bytes,
+        });
+    }
+    Ok(Qwen3StreamCachedCandidateReport {
+        schema_version: 1,
+        operation: "qwen3_synchronous_streamed_cached_candidate",
+        prompt_ids: prompt_ids.to_vec(),
+        decode_ids: decode_ids.to_vec(),
+        maximum_total_tokens: 32,
+        max_weight_bytes,
+        planned_peak_weight_and_staging_bytes: plan.memory.peak,
+        max_kv_bytes,
+        planned_final_kv_bytes,
+        steps,
+        verification: Qwen3StreamVerification::CandidateOnly,
+        scope: "bounded teacher-forced cached candidate only: each candidate layer evaluates and rebuilds its residual output plus K/V before its layer weights drop; per-step logits are retained and serialized for external comparison without resident cached or full-prefix controls, so no parity comparison is performed; that host output storage is outside the planned weight/staging and retained-KV budgets, which also exclude activations, operator scratch, allocator retention, headers, and projection output; this is not a streaming sampler and makes no server, process-peak, or beyond-RAM claim",
+    })
+}
+
+fn prepare_cached_stream(
+    model: &Path,
+    prompt_ids: &[i32],
+    decode_ids: &[i32],
+    max_weight_bytes: u64,
+    max_kv_bytes: u64,
+    tile_rows: usize,
+) -> Result<(StreamForwardPlan, u64), Qwen3MetalLoadError> {
+    let all_ids = checked_cached_ids(prompt_ids, decode_ids)?;
+    let plan = StreamForwardPlan::new(model, &all_ids, max_weight_bytes, tile_rows)?;
+    let planned_final_kv_bytes = plan.config.cached_kv_bytes(all_ids.len())?;
+    if planned_final_kv_bytes > max_kv_bytes {
+        return Err(Qwen3MetalLoadError::CachedStateBudget {
+            required: planned_final_kv_bytes,
+            maximum: max_kv_bytes,
+        });
+    }
+    Ok((plan, planned_final_kv_bytes))
 }
 
 struct CachedCandidateStep {
@@ -864,7 +977,8 @@ mod tests {
     use crate::GPU_TEST_LOCK;
 
     use super::{
-        EmbeddingPlan, LayerPlan, ProjectionPlan, Qwen3StreamCandidateReport, Qwen3StreamLayer,
+        EmbeddingPlan, LayerPlan, ProjectionPlan, Qwen3StreamCachedCandidateReport,
+        Qwen3StreamCachedCandidateStep, Qwen3StreamCandidateReport, Qwen3StreamLayer,
         Qwen3StreamVerification, StreamMemoryPlan,
     };
 
@@ -896,6 +1010,13 @@ mod tests {
                     actual: 33,
                     maximum: 32
                 }
+            ))
+        ));
+        assert_eq!(super::checked_cached_ids(&[1; 31], &[2]).unwrap().len(), 32);
+        assert!(matches!(
+            super::checked_cached_ids(&[], &[1]),
+            Err(super::Qwen3MetalLoadError::ForwardConfig(
+                crate::forward::Qwen3ForwardError::EmptyInput
             ))
         ));
     }
@@ -961,6 +1082,50 @@ mod tests {
             "resident_reference_ms",
         ] {
             assert!(json.get(absent).is_none(), "unexpected {absent}");
+        }
+    }
+
+    #[test]
+    fn cached_candidate_report_serializes_per_step_logits_without_parity_fields() {
+        let report = Qwen3StreamCachedCandidateReport {
+            schema_version: 1,
+            operation: "qwen3_synchronous_streamed_cached_candidate",
+            prompt_ids: vec![1, 2],
+            decode_ids: vec![3],
+            maximum_total_tokens: 32,
+            max_weight_bytes: 64,
+            planned_peak_weight_and_staging_bytes: 32,
+            max_kv_bytes: 48,
+            planned_final_kv_bytes: 24,
+            steps: vec![Qwen3StreamCachedCandidateStep {
+                total_tokens: 2,
+                appended_ids: vec![1, 2],
+                candidate_logits: vec![0.25, -0.5],
+                candidate_ms: 7.0,
+                retained_kv_bytes: 16,
+            }],
+            verification: Qwen3StreamVerification::CandidateOnly,
+            scope: "fixture",
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["verification"], "candidate_only");
+        assert_eq!(
+            json["steps"][0]["candidate_logits"],
+            serde_json::json!([0.25, -0.5])
+        );
+        for absent in [
+            "absolute_tolerance",
+            "relative_tolerance",
+            "compared_logits",
+            "cached_reference_maximum_absolute_error",
+            "full_reference_maximum_absolute_error",
+            "resident_reference_ms",
+        ] {
+            assert!(json.get(absent).is_none(), "unexpected top-level {absent}");
+            assert!(
+                json["steps"][0].get(absent).is_none(),
+                "unexpected step {absent}"
+            );
         }
     }
 
