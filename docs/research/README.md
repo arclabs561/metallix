@@ -11,11 +11,39 @@ explicit gaps, not retrospectively pinned evidence.
 |---|---|
 | What does V4.1 require, and what do its optimizations actually mean? | [Efficiency requirements](efficiency-methods.md) |
 | What might let a model exceed a Mac's RAM? | [Host-memory investigation](host-memory.md) |
+| Which precision and quantization ideas are faithful formats versus new quality experiments? | [Quantization and precision](quantization-precision.md) |
 | Which other runtimes offer ideas worth testing? | [Runtime patterns](reusable-runtime-patterns.md) |
 | What have we reproduced for V4.1? | [Sparse-indexer qualification](../experiments/v41-candidates.md) |
 | What runs on Metal, and what improved? | [Qwen qualification ledger](../experiments/qwen-metal.md) |
 | Can selected weights execute a block, and what checks precede V4.1 loading? | [Loader qualification](../experiments/loader-qualification.md) |
 | How are experiments run? | [Developer guide](../../DEVELOPMENT.md) |
+
+## Technical reference guide
+
+Read these as engineering references, not a list of implemented features.
+Each chapter records source coverage and applicability; full-paper reading
+is still pending where the ledger says excerpts or selected sections.
+
+| Topic | Reference | Primary decision |
+|---|---|---|
+| Memory and file I/O | [Metal memory](metal-memory.md) | Storage modes, allocation ownership, residency and measured working sets |
+| GPU execution | [Metal execution](metal-execution.md) | Queue ordering, synchronization and resource lifetime |
+| Kernels and profiling | [Metal kernels](metal-kernels.md) | Threadgroups, specialization, matrix APIs and counter-driven experiments |
+| Training | [Training efficiency](training-efficiency.md) | Rematerialization, precision, microbatching and adapters |
+| Serving | [Serving efficiency](serving-efficiency.md) | Attention, batching, KV reuse, speculation and offload |
+| Quantization | [Quantization and precision](quantization-precision.md) | Exact format decoding versus quality-changing conversion |
+
+Version lookup: consult the Metal chapters' macOS and GPU-family gates before
+using an API. Metal 4 availability does not establish MLX backend support;
+legacy SIMD-group matrix operations must not be assigned the newer Metal 4
+tensor feature's availability floor. CUDA paper results are hypotheses for a
+Mac experiment, not portable performance guarantees.
+
+The next runtime gate is to consume bounded row reads in embedding/output
+projection and qualify complete streamed Qwen forward against the resident
+oracle. DeepSeek-V4.1 still needs its own text-forward numerical fixture;
+Qwen correctness does not establish DeepSeek support. Training techniques
+remain reference material, not an implemented training subsystem.
 
 ## What each new finding records
 
@@ -72,7 +100,7 @@ This establishes its identity, not successful inference.
 | Partitioning avoids a full score sort. | [Benchmark](../../crates/models/deepseek/benches/selection.rs) → [before/after ledger](../experiments/v41-candidates.md#cpu-final-selection) | Local optimization at `8b88312`; synthetic operator timings, not model throughput. |
 | Removing per-layer waits improved the Qwen diagnostic. | [`forward.rs`](../../crates/models/qwen/src/forward.rs) → [measurement and parity ledger](../experiments/qwen-metal.md#wait-removal-result) | Local profile-derived change at `0abe5bf`, not a paper speedup. |
 | Read size affects observed file-read cost. | [I/O probe](../../scripts/benchmark-checkpoint-io.py) → [initial curve](host-memory.md#initial-local-read-size-probe) | Actual reads; no proof of physical SSD traffic or model latency. |
-| Selected BF16 reads can match the resident loader without reading every payload through the candidate path. | [`read_tensor`](../../crates/models/qwen/src/checkpoint.rs) → [`qualify_tensor_range`](../../crates/models/qwen/src/metal.rs) → [real-checkpoint results](../experiments/loader-qualification.md) | Selected raw-byte budget only; the independent reference still loads the whole checkpoint. |
+| Selected BF16 reads can match the resident loader without reading every payload through the candidate path. | [`read_tensor`](../../crates/models/qwen/src/checkpoint/read.rs) → [`qualify_tensor_range`](../../crates/models/qwen/src/metal.rs) → [real-checkpoint results](../experiments/loader-qualification.md) | Selected raw-byte budget only; the independent reference still loads the whole checkpoint. |
 | One Qwen block can execute using only its selected tensors. | Private `forward_layer` → [`qualify_layer`](../../crates/models/qwen/src/metal/layer_check.rs) → [comparison and process measurements](../experiments/loader-qualification.md#one-block-selected-weight-execution) | Bit-exact resident-loader comparison on synthetic hidden states; independent full-logit regression gate. Not a streamed decoder or process-memory ceiling. |
 | Filling a fixed-size FP32 destination reduced selected-layer load time. | Main-thread profile → [`decode_bf16`](../../crates/models/qwen/src/metal.rs) → [kept/rejected measurements](../experiments/loader-qualification.md#profile-and-measured-change) | Exhaustive BF16 bit tests and real-checkpoint parity; about 49% lower warm layer-load time, not model throughput. |
 | CSA2 consumers need the latest shared publisher, not any earlier matching publisher. | Pinned `Attention._compress_kv` / `_compress_topk_idxs` → [`V41Csa2Schedule`](../../crates/models/deepseek/src/lib.rs) → [red/green findings](../experiments/loader-qualification.md#v41-initial-dimensions-and-live-cache-sources) | Configuration relationship check, not V4.1 numerical parity. |
