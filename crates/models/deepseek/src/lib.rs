@@ -10,7 +10,10 @@ pub mod selection;
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]
 pub use indexer::{IndexScoreError, index_scores_f32};
-pub use rotary::{RotaryDirection, RotaryError, RotaryFrequency, RotaryTailLayout, rotate_tail};
+pub use rotary::{
+    RotaryDirection, RotaryError, RotaryFrequency, RotaryFrequencyError, RotaryFrequencyParameters,
+    RotaryTailLayout, rotate_tail,
+};
 #[cfg(feature = "metal")]
 pub use rotary::{RotaryMetalError, rotate_tail_metal};
 pub use selection::{SelectionError, select_indices};

@@ -34,6 +34,217 @@ impl RotaryFrequency {
         }
         Ok(Self { real, imaginary })
     }
+
+    /// Returns the real component of this frequency.
+    #[must_use]
+    pub const fn real(self) -> f32 {
+        self.real
+    }
+
+    /// Returns the imaginary component of this frequency.
+    #[must_use]
+    pub const fn imaginary(self) -> f32 {
+        self.imaginary
+    }
+}
+
+/// Validated parameters for V4.1's RoPE-frequency generator.
+///
+/// This represents the numerical arguments to the pinned
+/// `precompute_freqs_cis` helper. It deliberately does not model the source
+/// function's process-local cache; callers ask for only the position range
+/// they need. Mapping a checkpoint configuration's nested `rope_scaling`
+/// object into this type remains adapter wiring, not an inference claim.
+/// Scalar parameters are FP32; arbitrary Python FP64 parameters must not be
+/// silently narrowed to this API near a `YaRN` correction boundary. The pinned
+/// V4.1 parameter values are exactly representable in FP32.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RotaryFrequencyParameters {
+    rotary_width: NonZeroUsize,
+    original_sequence_length: usize,
+    base: f32,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+}
+
+impl RotaryFrequencyParameters {
+    /// Validates parameters for source-compatible frequency generation.
+    ///
+    /// `original_sequence_length == 0` selects the source's non-YaRN path, so
+    /// `factor` and the beta values are deliberately not interpreted there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RotaryFrequencyError`] if the rotary width cannot be split
+    /// into adjacent complex pairs or if an input required by the selected
+    /// source path is not finite and usable.
+    #[allow(
+        clippy::float_cmp,
+        reason = "base exactly one makes the YaRN logarithmic denominator zero"
+    )]
+    pub fn new(
+        rotary_width: NonZeroUsize,
+        original_sequence_length: usize,
+        base: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+    ) -> Result<Self, RotaryFrequencyError> {
+        if !rotary_width.get().is_multiple_of(2) {
+            return Err(RotaryFrequencyError::OddRotaryWidth {
+                width: rotary_width.get(),
+            });
+        }
+        if !base.is_finite() || base <= 0.0 {
+            return Err(RotaryFrequencyError::InvalidBase);
+        }
+        if original_sequence_length > 0
+            && (base == 1.0
+                || !factor.is_finite()
+                || factor <= 0.0
+                || !beta_fast.is_finite()
+                || beta_fast <= 0.0
+                || !beta_slow.is_finite()
+                || beta_slow <= 0.0)
+        {
+            return Err(RotaryFrequencyError::InvalidYarnParameters);
+        }
+        Ok(Self {
+            rotary_width,
+            original_sequence_length,
+            base,
+            factor,
+            beta_fast,
+            beta_slow,
+        })
+    }
+
+    /// Returns the source rotary-tail width in scalar values.
+    #[must_use]
+    pub const fn rotary_width(self) -> NonZeroUsize {
+        self.rotary_width
+    }
+
+    /// Generates one contiguous, bounded position range of complex frequencies.
+    ///
+    /// This is numerically equivalent to slicing the rows
+    /// `[start_position..start_position + positions]` from the source helper's
+    /// output, while avoiding allocation for earlier positions. Results are in
+    /// row-major `(position, adjacent-complex-pair)` order accepted by the
+    /// CPU rotary-tail helper and, when enabled, its optional Metal path.
+    ///
+    /// Like the source's FP32 outer product, absolute positions are converted
+    /// to `f32`; this does not promise exact integer-position distinction above
+    /// the FP32 integer range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RotaryFrequencyError`] if the requested position range or
+    /// output size overflows, allocation fails, or source-equivalent FP32 math
+    /// produces a non-finite frequency.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "match the pinned source's explicit FP32 index and position arithmetic"
+    )]
+    pub fn frequencies(
+        self,
+        start_position: usize,
+        positions: NonZeroUsize,
+    ) -> Result<Vec<RotaryFrequency>, RotaryFrequencyError> {
+        let pairs = self.rotary_width.get() / 2;
+        let end_position = start_position
+            .checked_add(positions.get())
+            .ok_or(RotaryFrequencyError::PositionRangeOverflow)?;
+        let output_len = positions
+            .get()
+            .checked_mul(pairs)
+            .ok_or(RotaryFrequencyError::OutputLengthOverflow)?;
+        let mut output = Vec::new();
+        output.try_reserve_exact(output_len).map_err(|_| {
+            RotaryFrequencyError::AllocationFailed {
+                elements: output_len,
+            }
+        })?;
+
+        let yarn = self.yarn_bounds()?;
+        let mut pair_frequencies = Vec::new();
+        pair_frequencies
+            .try_reserve_exact(pairs)
+            .map_err(|_| RotaryFrequencyError::AllocationFailed { elements: pairs })?;
+        for pair in 0..pairs {
+            let exponent = (pair * 2) as f32 / self.rotary_width.get() as f32;
+            let mut frequency = self.base.powf(exponent).recip();
+            if let Some((low, high)) = yarn {
+                let ramp = ((pair as f32 - low) / (high - low).max(1e-3)).clamp(0.0, 1.0);
+                let smooth = 1.0 - ramp;
+                frequency = frequency / self.factor * (1.0 - smooth) + frequency * smooth;
+            }
+            pair_frequencies.push(frequency);
+        }
+        for position in start_position..end_position {
+            for (pair, frequency) in pair_frequencies.iter().copied().enumerate() {
+                let angle = position as f32 * frequency;
+                let (imaginary, real) = angle.sin_cos();
+                if !real.is_finite() || !imaginary.is_finite() {
+                    return Err(RotaryFrequencyError::NonFiniteOutput { position, pair });
+                }
+                output.push(RotaryFrequency { real, imaginary });
+            }
+        }
+        Ok(output)
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "source computes scalar correction bounds in FP64 then applies them to an FP32 ramp"
+    )]
+    fn yarn_bounds(self) -> Result<Option<(f32, f32)>, RotaryFrequencyError> {
+        if self.original_sequence_length == 0 {
+            return Ok(None);
+        }
+        let width = self.rotary_width.get() as f64;
+        let base = f64::from(self.base);
+        let original = self.original_sequence_length as f64;
+        let corrected_dimension = |rotations: f32| {
+            width * (original / (f64::from(rotations) * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = corrected_dimension(self.beta_fast).floor().max(0.0);
+        let high = corrected_dimension(self.beta_slow).ceil().min(width - 1.0);
+        if !low.is_finite() || !high.is_finite() || low > f64::from(f32::MAX) {
+            return Err(RotaryFrequencyError::InvalidYarnParameters);
+        }
+        Ok(Some((low as f32, high as f32)))
+    }
+}
+
+/// Errors from bounded V4.1 RoPE-frequency generation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RotaryFrequencyError {
+    /// The source's adjacent-complex layout requires an even scalar width.
+    #[error("rotary width {width} must be even")]
+    OddRotaryWidth { width: usize },
+    /// The source base must be finite and strictly positive.
+    #[error("rotary base must be finite and strictly positive")]
+    InvalidBase,
+    /// The `YaRN` branch would be undefined or non-finite.
+    #[error("YaRN parameters must be finite and strictly positive, with base other than one")]
+    InvalidYarnParameters,
+    /// The requested exclusive end position could not be represented.
+    #[error("rotary frequency position range overflows usize")]
+    PositionRangeOverflow,
+    /// The requested result element count could not be represented.
+    #[error("rotary frequency output element count overflows usize")]
+    OutputLengthOverflow,
+    /// The allocator could not reserve the bounded result buffer.
+    #[error("could not allocate {elements} rotary frequencies")]
+    AllocationFailed { elements: usize },
+    /// Source-equivalent FP32 arithmetic produced a non-finite frequency.
+    #[error("rotary frequency at position {position}, pair {pair} is not finite")]
+    NonFiniteOutput { position: usize, pair: usize },
 }
 
 /// Validated shape of a contiguous V4.1 rotary tail.
@@ -283,6 +494,7 @@ fn as_i32(value: usize, field: &'static str) -> Result<i32, RotaryMetalError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{RotaryFrequencyError, RotaryFrequencyParameters};
     use std::num::NonZeroUsize;
 
     use serde::Deserialize;
@@ -318,6 +530,32 @@ mod tests {
         expected_values: Vec<f32>,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct FrequencyFixture {
+        schema_version: u8,
+        source: FixtureSource,
+        cases: Vec<FrequencyFixtureCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FrequencyFixtureCase {
+        name: String,
+        rotary_width: usize,
+        original_sequence_length: usize,
+        base: f32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        start_position: usize,
+        positions: usize,
+        batches: usize,
+        heads: usize,
+        direction: String,
+        expected_frequencies: Vec<[f32; 2]>,
+        values: Vec<f32>,
+        expected_rotated_values: Vec<f32>,
+    }
+
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("fixture dimensions are nonzero")
     }
@@ -341,6 +579,141 @@ mod tests {
                 "scalar {index} changed from {expected:?} to {actual:?}",
             );
         }
+    }
+
+    fn pinned_frequency_fixture() -> FrequencyFixture {
+        let fixture: FrequencyFixture = serde_json::from_str(include_str!(
+            "../../../../fixtures/deepseek-v41/rope-frequency-reference.json"
+        ))
+        .expect("fixture JSON is valid");
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(
+            fixture.source.revision,
+            "dba1be0a40aa45a94ad051997016db3960a90277"
+        );
+        assert_eq!(
+            fixture.source.sha256,
+            "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+        );
+        assert_eq!(fixture.source.symbol, "precompute_freqs_cis");
+        fixture
+    }
+
+    #[test]
+    fn generates_and_applies_pinned_rope_frequency_fixture() {
+        #[cfg(feature = "metal")]
+        let _guard = crate::GPU_TEST_LOCK.lock().unwrap();
+        let fixture = pinned_frequency_fixture();
+        for case in fixture.cases {
+            let parameters = RotaryFrequencyParameters::new(
+                nonzero(case.rotary_width),
+                case.original_sequence_length,
+                case.base,
+                case.factor,
+                case.beta_fast,
+                case.beta_slow,
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            let frequencies = parameters
+                .frequencies(case.start_position, nonzero(case.positions))
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            assert_eq!(
+                frequencies.len(),
+                case.expected_frequencies.len(),
+                "{} frequency length",
+                case.name
+            );
+            for (index, (actual, [expected_real, expected_imaginary])) in frequencies
+                .iter()
+                .zip(&case.expected_frequencies)
+                .enumerate()
+            {
+                assert!(
+                    (actual.real() - expected_real).abs() <= 0.000_001
+                        && (actual.imaginary() - expected_imaginary).abs() <= 0.000_001,
+                    "{} frequency {index}: actual ({}, {}), expected ({expected_real}, {expected_imaginary})",
+                    case.name,
+                    actual.real(),
+                    actual.imaginary(),
+                );
+            }
+
+            let direction = match case.direction.as_str() {
+                "forward" => RotaryDirection::Forward,
+                "inverse" => RotaryDirection::Inverse,
+                _ => panic!("{}: invalid fixture direction", case.name),
+            };
+            #[cfg(feature = "metal")]
+            let metal_values = rotate_tail_metal(
+                &case.values,
+                layout(
+                    case.batches,
+                    case.positions,
+                    case.heads,
+                    case.rotary_width / 2,
+                ),
+                &frequencies,
+                direction,
+            )
+            .unwrap_or_else(|error| panic!("{} Metal: {error}", case.name));
+            let mut values = case.values;
+            rotate_tail(
+                &mut values,
+                layout(
+                    case.batches,
+                    case.positions,
+                    case.heads,
+                    case.rotary_width / 2,
+                ),
+                &frequencies,
+                direction,
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            assert_eq!(
+                values.len(),
+                case.expected_rotated_values.len(),
+                "{} rotation length",
+                case.name
+            );
+            for (index, (actual, expected)) in
+                values.iter().zip(&case.expected_rotated_values).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.000_001,
+                    "{} rotated scalar {index}: actual {actual}, expected {expected}",
+                    case.name
+                );
+                #[cfg(feature = "metal")]
+                assert!(
+                    (metal_values[index] - expected).abs() <= 0.000_001,
+                    "{} Metal rotated scalar {index}: actual {}, expected {expected}",
+                    case.name,
+                    metal_values[index],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frequency_parameters_reject_invalid_selected_path_inputs() {
+        assert_eq!(
+            RotaryFrequencyParameters::new(nonzero(3), 0, 10_000.0, 0.0, 0.0, 0.0),
+            Err(RotaryFrequencyError::OddRotaryWidth { width: 3 })
+        );
+        assert_eq!(
+            RotaryFrequencyParameters::new(nonzero(4), 0, 0.0, 0.0, 0.0, 0.0),
+            Err(RotaryFrequencyError::InvalidBase)
+        );
+        assert_eq!(
+            RotaryFrequencyParameters::new(nonzero(4), 1, 1.0, 16.0, 32.0, 1.0),
+            Err(RotaryFrequencyError::InvalidYarnParameters)
+        );
+        let parameters = RotaryFrequencyParameters::new(nonzero(4), 0, 10_000.0, 0.0, 0.0, 0.0)
+            .expect("non-YaRN ignores unused YaRN inputs like the source");
+        assert!(matches!(
+            parameters.frequencies(usize::MAX, nonzero(1)),
+            Err(RotaryFrequencyError::PositionRangeOverflow)
+        ));
     }
 
     #[test]

@@ -98,7 +98,7 @@ Three cases cover rank-three, multi-batch/multi-head rank-four, and inverse
 rotation. Rust compares each scalar within absolute tolerance `1e-6` and tests
 length, shape-overflow and non-finite-input rejection without buffer mutation.
 Finite inputs retain upstream IEEE FP32 overflow behavior; finite output is not
-promised. This does not generate frequencies, rotate BF16/FP4,
+promised. This supplied-frequency operation does not itself generate frequencies or rotate BF16/FP4,
 or implement an attention block. CPU receipts:
 `artifacts/v41-rotary-regenerated.{json,stderr}`.
 
@@ -121,6 +121,36 @@ cases measure graph/dispatch/readback costs, not useful model throughput or a
 speedup over CPU. Receipts: `artifacts/rotary-metal-test.log` and
 `artifacts/v41-rotary-metal.{json,stderr}`. The next integration gate remains
 device-resident attention/cache use with a complete upstream numerical oracle.
+
+### Generated RoPE and YaRN frequencies
+
+`RotaryFrequencyParameters` now validates explicit FP32 parameters and generates
+only a requested contiguous position range. It mirrors the pinned
+`precompute_freqs_cis` expression: double-precision correction boundaries,
+FP32 inverse frequencies and YaRN interpolation, then FP32 position/angle
+arithmetic. It does not allocate the entire preceding context for a late range.
+Configuration-to-parameter wiring remains separate; arbitrary FP64 parameters
+must not be silently narrowed near a YaRN boundary.
+
+[The capture script](../../scripts/v41-rope-reference.py) checks the source hash
+before extracting `precompute_freqs_cis` and `apply_rotary_emb`. It removes only
+the former's cache decorator and executes the expressions with pinned Torch
+2.13.0 and NumPy 2.4.3. The
+[fixture](../../fixtures/deepseek-v41/rope-frequency-reference.json) contains
+three synthetic cases: local no-YaRN, compressed mixed-ramp YaRN, and inverse
+rotation at absolute positions 65,533 through 65,536. The compressed parameters
+are base 160,000, original length 65,536, factor 16, and beta values 32/1.
+
+Both frequency components and the composed CPU/Metal rotations pass absolute
+tolerance `1e-6`, without relaxing the gate for high positions. The Rust test
+also checks invalid parameters and position overflow. Reproduce with
+`cargo test -p deepseek --features metal rotary`.
+This closes a small composed operator gate, not attention, frequency-cache
+ownership, full-model inference or BF16/FP4 parity. There is no speed claim.
+Receipts: `artifacts/v41-rope-captured.json`,
+`artifacts/check-v41-frequencies-fixed.log`, and
+`artifacts/check-cached-rope-metal-final.log`.
+Fixture SHA-256: `9b4b06c131fbde15faba57a44d245e21a029313d4d6682797ed5bd0c8efa456c`.
 
 ## CPU final selection
 
