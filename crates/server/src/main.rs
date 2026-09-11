@@ -78,6 +78,9 @@ enum Command {
         /// Path to the upstream model configuration.
         #[arg(long)]
         config: PathBuf,
+        /// Also validate dimensions and mode relationships needed for execution planning.
+        #[arg(long)]
+        execution_shape: bool,
     },
     /// Validate a Qwen3 configuration without loading weights.
     InspectQwen {
@@ -100,6 +103,17 @@ enum Command {
         /// Directory containing config.json and safetensors shard files.
         #[arg(long)]
         model: PathBuf,
+    },
+    /// Compare one bounded BF16 tensor read with the resident MLX loader.
+    #[cfg(feature = "metal")]
+    CheckQwenTensorMetal {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "model.layers.0.input_layernorm.weight")]
+        tensor: String,
+        /// Bound only the selected raw payload; the comparison loads the resident checkpoint.
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
+        max_bytes: u64,
     },
     /// Execute the fixed [1, 2, 3] Qwen3 embedding lookup on Metal.
     #[cfg(feature = "metal")]
@@ -141,7 +155,10 @@ fn main() -> ExitCode {
             reference.as_deref().zip(reference_manifest.as_deref()),
             repeats,
         ),
-        Command::InspectV41 { config } => inspect_v41(&config),
+        Command::InspectV41 {
+            config,
+            execution_shape,
+        } => inspect_v41(&config, execution_shape),
         Command::InspectQwen { config } => inspect_qwen(&config),
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
@@ -150,7 +167,33 @@ fn main() -> ExitCode {
         #[cfg(feature = "metal")]
         Command::LoadQwenMetal { model } => load_qwen_metal(&model),
         #[cfg(feature = "metal")]
+        Command::CheckQwenTensorMetal {
+            model,
+            tensor,
+            max_bytes,
+        } => check_qwen_tensor_metal(&model, &tensor, max_bytes),
+        #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
+    }
+}
+
+#[cfg(feature = "metal")]
+fn check_qwen_tensor_metal(model: &std::path::Path, tensor: &str, max_bytes: u64) -> ExitCode {
+    match qwen::metal::qualify_tensor_range(model, tensor, max_bytes) {
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("could not serialize tensor comparison: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("Qwen tensor comparison failed: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -299,7 +342,7 @@ fn inspect_qwen(config: &PathBuf) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn inspect_v41(config: &PathBuf) -> ExitCode {
+fn inspect_v41(config: &PathBuf, execution_shape: bool) -> ExitCode {
     let json = match fs::read_to_string(config) {
         Ok(json) => json,
         Err(error) => {
@@ -317,6 +360,38 @@ fn inspect_v41(config: &PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // The stronger execution gate is opt-in; metadata inspection remains useful
+    // for configuration documents that are not yet executable load plans.
+    if execution_shape {
+        match deepseek::V41ExecutionShape::parse(&json) {
+            Ok(shape) => {
+                println!(
+                    "execution dimensions: hidden {}, vocabulary {}, head width {}",
+                    shape.hidden_size(),
+                    shape.vocab_size(),
+                    shape.head_dim()
+                );
+                println!(
+                    "attention heads: {} query, {} KV; output groups: {}",
+                    shape.attention_heads(),
+                    shape.key_value_heads(),
+                    shape.output_groups()
+                );
+                println!(
+                    "CSA2 schedule: {} entries, {} KV sources, {} index sources",
+                    shape.csa2().compress_ratios().len(),
+                    shape.csa2().kv_source_layers().len(),
+                    shape.csa2().index_source_layers().len()
+                );
+            }
+            Err(error) => {
+                eprintln!("V4.1 execution-shape qualification failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        println!("scope: configuration dimensions only; no tensor loading or inference");
+    }
 
     println!("V4.1 text execution contract");
     println!("layers: {} transformer", contract.total_layers());
@@ -341,9 +416,61 @@ fn inspect_v41(config: &PathBuf) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     use super::Cli;
+
+    #[test]
+    fn execution_shape_inspection_is_explicitly_opt_in() {
+        for (args, expected) in [
+            (
+                vec!["metallix", "inspect-v41", "--config", "config.json"],
+                false,
+            ),
+            (
+                vec![
+                    "metallix",
+                    "inspect-v41",
+                    "--config",
+                    "config.json",
+                    "--execution-shape",
+                ],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("valid inspection command");
+            assert!(
+                matches!(cli.command, super::Command::InspectV41 { execution_shape, .. } if execution_shape == expected)
+            );
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn tensor_check_has_a_finite_explicit_payload_budget() {
+        let cli = Cli::try_parse_from(["metallix", "check-qwen-tensor-metal", "--model", "model"])
+            .expect("default tensor diagnostic");
+        assert!(matches!(
+            cli.command,
+            super::Command::CheckQwenTensorMetal {
+                max_bytes: 1_048_576,
+                ..
+            }
+        ));
+        for limit in ["0", "67108865"] {
+            assert!(
+                Cli::try_parse_from([
+                    "metallix",
+                    "check-qwen-tensor-metal",
+                    "--model",
+                    "model",
+                    "--max-bytes",
+                    limit,
+                ])
+                .is_err()
+            );
+        }
+    }
 
     fn root_help() -> String {
         Cli::command().render_long_help().to_string()
