@@ -95,7 +95,25 @@ spellings of the same name. `cargo test -p qwen` exited 0 afterward.
 The fix is commit `68c1b85`; full default/Metal check logs are retained locally
 as `artifacts/check-header-uniqueness-{default,metal}.log`.
 This is a parser fix, not tensor-range loading; it does not establish uniqueness
-inside nested JSON objects. That remains a separate parser follow-up.
+inside nested JSON objects. The later completion pass below closes that gap.
+
+### Nested header uniqueness
+
+The same pinned safetensors format requirement also applies within tensor and
+metadata objects. At `6a60644` with the new raw-JSON regression added,
+`cargo test -p qwen rejects_duplicate_nested -- --nocapture` exited 101:
+`dtype: F32` followed by `dtype: BF16` was accepted as a single BF16 declaration.
+`UniqueJsonValue` now routes every object through the uniqueness check before
+constructing a `serde_json::Value`. The same regression then passed, covering
+dtype, shape, offsets, escaped metadata keys, and nested objects in arrays.
+
+Positive tests compare valid JSON value types with the ordinary parser and
+confirm the JSON recursion limit remains enforced. This closes header
+ambiguity, not concurrent-file integrity or streamed execution. Validation
+receipts are `artifacts/check-nested-header-{default,metal}.log`.
+The real 4 MiB Qwen projection was checked again after rebuilding; all
+2,097,152 values remained bit-exact against MLX. Receipt:
+`artifacts/qwen-nested-header-qproj.json`.
 
 ## Research that has not become runtime support
 

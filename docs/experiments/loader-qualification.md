@@ -48,7 +48,9 @@ Checkpoint SHA-256: `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f4299
 
 Next gate: one-layer streamed execution, then full-logit and cached-forward
 parity with a measured total working set. Passing selected reads does not
-satisfy that gate. Nested JSON duplicate-key handling remains a parser follow-up.
+satisfy that gate. The subsequent
+[nested-header fix](../research/README.md#nested-header-uniqueness) closes the
+duplicate-key parser follow-up without changing the streamed-execution gate.
 
 ## V4.1 initial dimensions and live cache sources
 
