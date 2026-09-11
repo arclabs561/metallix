@@ -240,6 +240,28 @@ mod tests {
     }
 
     #[test]
+    fn composes_source_candidates_with_distinct_consumer_scores() {
+        let mask = crate::candidate_mask(
+            &[9.0, 8.0, 7.0, 6.0, 1.0, f32::NEG_INFINITY],
+            5,
+            2,
+            std::num::NonZeroUsize::new(2).unwrap(),
+        )
+        .unwrap();
+        // Source selects its best block plus the pinned partial newest block.
+        assert_eq!(mask, [true, true, false, false, true, true]);
+        // Consumer has its own scores. Its highest scores are outside the
+        // source candidates, and the last position remains causally masked.
+        let scores = [1.0, 9.0, 100.0, 99.0, 3.0, f32::NEG_INFINITY];
+        let masked: Vec<f32> = scores
+            .iter()
+            .zip(mask)
+            .map(|(&score, keep)| if keep { score } else { f32::NEG_INFINITY })
+            .collect();
+        assert_eq!(select_indices(&masked, 5, 2, 128).unwrap(), [129, 132]);
+    }
+
+    #[test]
     fn exhaustively_matches_an_independent_small_row_oracle() {
         const SCORES: [f32; 5] = [f32::NEG_INFINITY, -1.0, 0.0, -0.0, 1.0];
         for width in 0..=5 {

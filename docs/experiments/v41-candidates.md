@@ -125,9 +125,32 @@ in microseconds were:
 | 4,096 | 51.74 | 52.58 | 51.24 |
 | 16,384 | 215.7 | 213.5 | 213.4 |
 
-The implementation fully sorts scores before sorting selected positions. These
-measurements establish a baseline, not a speedup or a representative workload
-distribution; real score ties and masking patterns need separate measurements.
+That baseline fully sorted scores before sorting selected positions. A sampled
+profile of the 16,384-position workload placed 2,497 of 3,001 leaf samples in
+four score-sort routines. This motivated partitioning at the first excluded
+score, checking the selected partition's minimum for cutoff ambiguity, and
+sorting only selected positions. Selecting the entire row skips score ordering.
+
+At `8b88312`, the same three-run benchmark produced these median microseconds:
+
+| Score positions | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| 512 | 1.249 | 1.229 | 1.229 |
+| 4,096 | 10.24 | 10.66 | 10.20 |
+| 16,384 | 33.12 | 32.83 | 32.83 |
+
+The median of run medians improved about 6.4×, 5.1×, and 6.5× respectively.
+Divan retained 100 samples per shape, automatically batching two iterations per
+sample for the faster 512-position case. These are short synthetic measurements,
+not model speedups or a representative score distribution. Real score ties and
+masking patterns need separate measurements.
+
+An independent exhaustive oracle enumerates every Top-K subset for rows up to
+five positions with scores drawn from `[-inf, -1, +0, -0, 1]`, across reachable
+prefixes and K values. It compares all score-optimal subsets' observable outputs:
+one distinct output is accepted, multiple outputs require tie rejection. Both
+the full-sort baseline and partitioned implementation pass this oracle, as well
+as the ten pinned upstream reference cases.
 
 These are operator-level parity gates and reference captures. They do not satisfy the text-forward
 gate for downloading the full V4.1 checkpoint, and they are not a performance or
