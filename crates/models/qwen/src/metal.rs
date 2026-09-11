@@ -20,7 +20,7 @@ pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
 mod stream_check;
 pub use stream_check::{
     Qwen3StreamCachedCandidateReport, Qwen3StreamCachedCheck, Qwen3StreamCandidateReport,
-    Qwen3StreamCheck, Qwen3StreamExecutor, qualify_streamed_cached_forward,
+    Qwen3StreamCheck, Qwen3StreamExecutor, Qwen3StreamProfile, qualify_streamed_cached_forward,
     qualify_streamed_forward, run_streamed_cached_candidate, run_streamed_forward_candidate,
 };
 
