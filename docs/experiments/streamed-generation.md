@@ -283,3 +283,63 @@ Device-side BF16 conversion remains a separate experiment: a dtype view may
 allocate rather than alias, so its live-memory budget and exactness must be
 proved before adopting it. No new allocation, quantization or numerical
 precision policy is introduced by the retained CPU change.
+
+## Post-widening profile and projection tuning
+
+Three eight-output-token runs with `--verbose`, using the same binary and
+checkpoint identities as the BF16 candidate above, measured 21 decode profiles.
+Mean tracked host-wall times were 280.31 ms total, 150.31 ms layer loading and
+conversion, 47.69 ms projection loading, 39.97 ms projection execution/readback,
+and 41.65 ms layer execution/readback. These diagnostic runs include the first
+decode, unlike the quiet benchmark. Receipts: `artifacts/bf16-reprofile-{1,2,3}`
+with `.json`/`.stderr` suffixes and `artifacts/bf16-reprofile-summary.json`.
+The raw phase reports do not embed model/binary hashes; the surrounding sweep
+receipts and post-run `artifacts/post-widening-identities.sha256` record those
+identities separately.
+
+This motivated revisiting the earlier synthetic projection-size experiment
+with actual decoder hidden states. The existing `--tile-rows` option requires
+no implementation change. At checkout `90229e1`, serial blocks used 1024-A,
+4096-A, 4096-B, 1024-B order, three fresh processes per block, the same
+eight-output-token prompt and budgets as above, and no diagnostics or oracle.
+
+| Block | 1024-row median ms | 4096-row median ms | Change | 1024 / 4096 sample SD ms |
+|---|---:|---:|---:|---:|
+| A | 269.31 | 253.92 | −5.71% | 11.66 / 11.46 |
+| B | 270.32 | 254.70 | −5.78% | 7.77 / 11.27 |
+
+Each block has 18 post-discard observations, not 18 independent runs. All token
+IDs, checkpoint/binary hashes, backend, host, remaining workload settings and
+logical memory counts matched: 10 cached tokens, 2,293,760 K/V bytes and
+81,798,144 planned weight/staging bytes. The raw projection tile grows from
+2 MiB to 8 MiB, but the planned layer-loading peak still dominates this
+checkpoint's staging budget. Receipts: `artifacts/tile-sweep-{1024,4096}-{a,b}.json`.
+These intentionally differ in tile rows; the strict same-workload comparator
+is not bypassed or weakened to compare them. The controlled difference was
+checked explicitly against the receipts. Do not multiply this improvement by
+the earlier BF16 percentage: those captures occurred at different times.
+
+A candidate-only constrained record run per size observed maximum RSS of
+264,339,456 / 282,034,176 bytes and peak footprint of 386,270,024 / 403,129,136
+bytes for 1024 / 4096 rows. These are single-run observations, not repeated
+memory benchmarks or enforced caps. The larger tile's measured process memory
+increased even though its planned staging peak did not. Receipts:
+`artifacts/tile-memory-{1024,4096}.{json,time}`.
+
+A separate 4096-row `--verify-cache` constrained run passed all 12 comparisons
+of 151,936 vocabulary logits and JSON validation, with maximum absolute error
+`2.09808349609375e-5` (`artifacts/tile4096-parity.json`). The oracle is excluded
+from timing and candidate memory observations.
+
+Keep 1024 as the conservative default. For this qualified checkpoint, 4096 is
+an opt-in latency/memory tradeoff:
+
+```sh
+mx gen --model /path/to/Qwen3-0.6B --input-ids 9707,11,1879 \
+  --memory-mode streamed --max-tokens 8 --tile-rows 4096 \
+  --max-weight-bytes 81798144 --max-kv-bytes 7340032
+```
+
+This is a warm-cache single-sequence result. Longer contexts, other model
+shapes, sustained request lifetimes and tighter process-memory limits still
+need qualification before automatic tile selection or a default change.
