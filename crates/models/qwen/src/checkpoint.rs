@@ -456,13 +456,85 @@ impl<'de> Deserialize<'de> for UniqueHeader {
                     if header.contains_key(&key) {
                         return Err(serde::de::Error::custom("duplicate safetensors header key"));
                     }
-                    header.insert(key, map.next_value()?);
+                    header.insert(key, map.next_value::<UniqueJsonValue>()?.0);
                 }
                 Ok(UniqueHeader(header))
             }
         }
 
         deserializer.deserialize_map(HeaderVisitor)
+    }
+}
+
+// Preserve normal JSON value semantics while applying the same uniqueness
+// rule recursively, before serde_json::Value can collapse nested map entries.
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ValueVisitor {
+            type Value = UniqueJsonValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value with unique object keys")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(value.into()))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(value.into()))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(value.into()))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(|number| UniqueJsonValue(number.into()))
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                self.visit_string(value.to_owned())
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(value.into()))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(UniqueJsonValue(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+                    values.push(value.0);
+                }
+                Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let object =
+                    UniqueHeader::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(UniqueJsonValue(serde_json::Value::Object(
+                    object.0.into_iter().collect(),
+                )))
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor)
     }
 }
 
@@ -1295,6 +1367,48 @@ mod tests {
             let error = read_header(&path).expect_err("duplicate keys must not be collapsed");
             assert!(matches!(error, Qwen3CheckpointError::HeaderJson { .. }));
         }
+    }
+
+    #[test]
+    fn rejects_duplicate_nested_tensor_and_metadata_fields() {
+        for header in [
+            r#"{"weight":{"dtype":"F32","dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
+            r#"{"weight":{"dtype":"BF16","shape":[2],"shape":[1],"data_offsets":[0,2]}}"#,
+            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,1],"data_offsets":[0,2]}}"#,
+            r#"{"__metadata__":{"format":"bad","\u0066ormat":"pt"},"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
+            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2],"extra":[{"x":1,"x":2}]}}"#,
+        ] {
+            let fixture = Fixture::new();
+            let path = fixture.path.join("duplicate-nested.safetensors");
+            let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0, 0]);
+            fs::write(&path, bytes).expect("write ambiguous raw header");
+            assert!(
+                matches!(
+                    read_header(&path),
+                    Err(Qwen3CheckpointError::HeaderJson { .. })
+                ),
+                "must reject {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn unique_header_preserves_valid_json_value_types() {
+        let json = r#"{"array":[true,false,null,-7,18446744073709551615,1.25,"escaped\ntext",{"key":"value"}],"empty":{}}"#;
+        let actual = serde_json::from_str::<super::UniqueHeader>(json)
+            .expect("valid unique JSON")
+            .0;
+        let expected: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(json).expect("independent JSON value parser");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn unique_header_keeps_the_json_recursion_limit() {
+        let json = format!("{{\"x\":{}0{}}}", "[".repeat(150), "]".repeat(150));
+        assert!(serde_json::from_str::<super::UniqueHeader>(&json).is_err());
     }
 
     #[test]
