@@ -18,7 +18,10 @@ pub use embedding_check::{Qwen3EmbeddingCheck, qualify_embedding};
 mod projection_check;
 pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
 mod stream_check;
-pub use stream_check::{Qwen3StreamCheck, qualify_streamed_forward};
+pub use stream_check::{
+    Qwen3StreamCandidateReport, Qwen3StreamCheck, qualify_streamed_forward,
+    run_streamed_forward_candidate,
+};
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
 #[derive(Debug, serde::Serialize)]
@@ -372,6 +375,12 @@ pub enum Qwen3MetalLoadError {
     #[error("tensor-range comparison differs at value {index}")]
     RangeCheckMismatch {
         /// Flattened value position, not a byte offset.
+        index: usize,
+    },
+    /// A candidate-only streamed forward produced a value JSON cannot represent faithfully.
+    #[error("candidate-only streamed forward produced a non-finite logit at index {index}")]
+    CandidateNonFiniteLogit {
+        /// Flattened vocabulary-logit position.
         index: usize,
     },
     /// The checkpoint requests unsupported decoder semantics.

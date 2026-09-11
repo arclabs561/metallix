@@ -63,6 +63,52 @@ pub struct Qwen3StreamCheck {
     scope: &'static str,
 }
 
+/// Candidate-only evidence from a complete synchronous Qwen3 stream.
+///
+/// Unlike [`Qwen3StreamCheck`], this report deliberately does not construct a
+/// resident checkpoint oracle. Its logits are observable diagnostic output,
+/// not a parity result.
+#[derive(Debug, serde::Serialize)]
+pub struct Qwen3StreamCandidateReport {
+    schema_version: u32,
+    operation: &'static str,
+    input_ids: Vec<i32>,
+    input_recipe: &'static str,
+    hidden_shape: [usize; 3],
+    embedding_raw_payload_bytes: u64,
+    embedding_planned_weight_and_staging_bytes: u64,
+    embedding_load_and_readback_ms: f64,
+    layers: Vec<Qwen3StreamLayer>,
+    final_norm_raw_payload_bytes: u64,
+    final_norm_planned_weight_and_staging_bytes: u64,
+    final_norm_execute_and_readback_ms: f64,
+    projection_raw_payload_bytes: u64,
+    projection_max_tile_raw_payload_bytes: u64,
+    projection_planned_weight_and_staging_bytes: u64,
+    projection_tile_count: usize,
+    projection_load_ms: f64,
+    projection_execute_and_readback_ms: f64,
+    total_raw_payload_bytes: u64,
+    planned_peak_weight_and_staging_bytes: u64,
+    max_weight_bytes: u64,
+    /// Actual candidate final-token logits in vocabulary order.
+    candidate_logits: Vec<f32>,
+    verification: Qwen3StreamVerification,
+    candidate_total_ms: f64,
+    scope: &'static str,
+}
+
+/// Whether a streamed report performed a resident-reference verification.
+///
+/// Candidate-only reports cannot represent comparison counts, tolerances, or
+/// mismatch values because no comparison occurred.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Qwen3StreamVerification {
+    /// The candidate ran without a resident checkpoint oracle.
+    CandidateOnly,
+}
+
 /// Qualifies a complete, synchronous layer-streamed Qwen3 forward pass.
 ///
 /// Each decoder layer is read, evaluated, copied to host, and rebuilt into a
@@ -75,55 +121,16 @@ pub fn qualify_streamed_forward(
     max_weight_bytes: u64,
     tile_rows: usize,
 ) -> Result<Qwen3StreamCheck, Qwen3MetalLoadError> {
-    let config_path = model.join("config.json");
-    let config_json = std::fs::read_to_string(&config_path).map_err(|source| {
-        Qwen3CheckpointError::ReadConfig {
-            path: config_path,
-            source,
-        }
-    })?;
-    let config = Qwen3ForwardConfig::parse(&config_json)?;
-    validate_stream_length(input_ids)?;
-    let inspection = Qwen3CheckpointInspection::inspect(model)?;
-    let hidden = config.hidden_size();
-    input_ids
-        .len()
-        .checked_mul(hidden)
-        .filter(|&count| count <= 1_048_576)
-        .ok_or(Qwen3MetalLoadError::DimensionOutOfRange(
-            "stream hidden states",
-        ))?;
-    let embedding_plan = EmbeddingPlan::new(
-        input_ids,
-        inspection.contract().vocab_size(),
-        inspection.contract().hidden_size(),
-        u64::MAX,
-    )?;
-    let projection_plan = ProjectionPlan::new(
-        hidden,
-        usize::try_from(inspection.contract().vocab_size())
-            .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("vocab_size"))?,
-        tile_rows,
-        u64::MAX,
-    )?;
-    let layers = layer_plans(&inspection, &config)?;
-    let final_norm_raw = inspection.bf16_tensor_bytes(FINAL_NORM)?;
-    let memory = StreamMemoryPlan::new(&embedding_plan, &layers, final_norm_raw, &projection_plan)?;
-    if memory.peak > max_weight_bytes {
-        return Err(Qwen3MetalLoadError::LayerWeightBudget {
-            required: memory.peak,
-            maximum: max_weight_bytes,
-        });
-    }
+    let plan = StreamForwardPlan::new(model, input_ids, max_weight_bytes, tile_rows)?;
 
     let candidate = run_candidate(
-        &inspection,
-        &config,
+        &plan.inspection,
+        &plan.config,
         input_ids,
-        &embedding_plan,
-        &layers,
-        final_norm_raw,
-        &projection_plan,
+        &plan.embedding,
+        &plan.layers,
+        plan.final_norm_raw,
+        &plan.projection,
     )?;
 
     let reference_started = Instant::now();
@@ -143,22 +150,22 @@ pub fn qualify_streamed_forward(
         operation: "qwen3_synchronous_streamed_forward_check",
         input_ids: input_ids.to_vec(),
         input_recipe: "checkpoint BF16 token-embedding rows in caller order",
-        hidden_shape: [1, input_ids.len(), hidden],
-        embedding_raw_payload_bytes: embedding_plan.raw_bytes,
-        embedding_planned_weight_and_staging_bytes: memory.embedding_peak,
+        hidden_shape: [1, input_ids.len(), plan.hidden],
+        embedding_raw_payload_bytes: plan.embedding.raw_bytes,
+        embedding_planned_weight_and_staging_bytes: plan.memory.embedding_peak,
         embedding_load_and_readback_ms: candidate.embedding_ms,
         layers: candidate.layers,
-        final_norm_raw_payload_bytes: final_norm_raw,
-        final_norm_planned_weight_and_staging_bytes: memory.final_norm_peak,
+        final_norm_raw_payload_bytes: plan.final_norm_raw,
+        final_norm_planned_weight_and_staging_bytes: plan.memory.final_norm_peak,
         final_norm_execute_and_readback_ms: candidate.norm_ms,
-        projection_raw_payload_bytes: projection_plan.raw_payload_bytes,
-        projection_max_tile_raw_payload_bytes: projection_plan.max_tile_raw_bytes,
-        projection_planned_weight_and_staging_bytes: memory.projection_peak,
-        projection_tile_count: projection_plan.ranges.len(),
+        projection_raw_payload_bytes: plan.projection.raw_payload_bytes,
+        projection_max_tile_raw_payload_bytes: plan.projection.max_tile_raw_bytes,
+        projection_planned_weight_and_staging_bytes: plan.memory.projection_peak,
+        projection_tile_count: plan.projection.ranges.len(),
         projection_load_ms: candidate.projection.load_ms,
         projection_execute_and_readback_ms: candidate.projection.execute_ms,
-        total_raw_payload_bytes: memory.total_raw_payload_bytes,
-        planned_peak_weight_and_staging_bytes: memory.peak,
+        total_raw_payload_bytes: plan.memory.total_raw_payload_bytes,
+        planned_peak_weight_and_staging_bytes: plan.memory.peak,
         max_weight_bytes,
         compared_logits: candidate.projection.logits.len(),
         absolute_tolerance: ABSOLUTE_TOLERANCE,
@@ -169,6 +176,138 @@ pub fn qualify_streamed_forward(
         resident_reference_ms,
         scope: "synchronous candidate qualification only: each layer output is evaluated, copied to host, and reconstructed before its layer weights drop; planned budget covers candidate weights plus explicit loading/conversion staging, but excludes activations, attention/MLP scratch, allocator retention, headers, and the separate resident oracle; cumulative raw payload includes selected input embedding rows, every layer, final norm, and the full tiled output embedding; this is correctness evidence, not a model-performance or process-peak claim",
     })
+}
+
+/// Runs a complete synchronous Qwen3 stream without a resident reference.
+///
+/// This isolates the candidate process footprint. The report includes all
+/// candidate logits for an external comparison, but that output serialization
+/// itself is part of the measured process and the result is not parity
+/// qualified.
+pub fn run_streamed_forward_candidate(
+    model: &Path,
+    input_ids: &[i32],
+    max_weight_bytes: u64,
+    tile_rows: usize,
+) -> Result<Qwen3StreamCandidateReport, Qwen3MetalLoadError> {
+    let plan = StreamForwardPlan::new(model, input_ids, max_weight_bytes, tile_rows)?;
+    let candidate = run_candidate(
+        &plan.inspection,
+        &plan.config,
+        input_ids,
+        &plan.embedding,
+        &plan.layers,
+        plan.final_norm_raw,
+        &plan.projection,
+    )?;
+    validate_candidate_logits(&candidate.projection.logits)?;
+    Ok(Qwen3StreamCandidateReport {
+        schema_version: 1,
+        operation: "qwen3_synchronous_streamed_forward_candidate",
+        input_ids: input_ids.to_vec(),
+        input_recipe: "checkpoint BF16 token-embedding rows in caller order",
+        hidden_shape: [1, input_ids.len(), plan.hidden],
+        embedding_raw_payload_bytes: plan.embedding.raw_bytes,
+        embedding_planned_weight_and_staging_bytes: plan.memory.embedding_peak,
+        embedding_load_and_readback_ms: candidate.embedding_ms,
+        layers: candidate.layers,
+        final_norm_raw_payload_bytes: plan.final_norm_raw,
+        final_norm_planned_weight_and_staging_bytes: plan.memory.final_norm_peak,
+        final_norm_execute_and_readback_ms: candidate.norm_ms,
+        projection_raw_payload_bytes: plan.projection.raw_payload_bytes,
+        projection_max_tile_raw_payload_bytes: plan.projection.max_tile_raw_bytes,
+        projection_planned_weight_and_staging_bytes: plan.memory.projection_peak,
+        projection_tile_count: plan.projection.ranges.len(),
+        projection_load_ms: candidate.projection.load_ms,
+        projection_execute_and_readback_ms: candidate.projection.execute_ms,
+        total_raw_payload_bytes: plan.memory.total_raw_payload_bytes,
+        planned_peak_weight_and_staging_bytes: plan.memory.peak,
+        max_weight_bytes,
+        candidate_logits: candidate.projection.logits,
+        verification: Qwen3StreamVerification::CandidateOnly,
+        candidate_total_ms: candidate.total_ms,
+        scope: "candidate-only synchronous stream: no resident reference checkpoint is loaded and no parity comparison is performed; candidate logits are emitted for external comparison; output serialization is part of this process measurement; planned budget covers candidate weights plus explicit loading/conversion staging, but excludes activations, attention/MLP scratch, allocator retention, and headers; this is neither a parity qualification nor a model-performance or process-peak claim",
+    })
+}
+
+fn validate_candidate_logits(logits: &[f32]) -> Result<(), Qwen3MetalLoadError> {
+    logits
+        .iter()
+        .position(|logit| !logit.is_finite())
+        .map_or(Ok(()), |index| {
+            Err(Qwen3MetalLoadError::CandidateNonFiniteLogit { index })
+        })
+}
+
+struct StreamForwardPlan {
+    config: Qwen3ForwardConfig,
+    inspection: Qwen3CheckpointInspection,
+    hidden: usize,
+    embedding: EmbeddingPlan,
+    layers: Vec<LayerPlan>,
+    final_norm_raw: u64,
+    projection: ProjectionPlan,
+    memory: StreamMemoryPlan,
+}
+
+impl StreamForwardPlan {
+    fn new(
+        model: &Path,
+        input_ids: &[i32],
+        max_weight_bytes: u64,
+        tile_rows: usize,
+    ) -> Result<Self, Qwen3MetalLoadError> {
+        let config_path = model.join("config.json");
+        let config_json = std::fs::read_to_string(&config_path).map_err(|source| {
+            Qwen3CheckpointError::ReadConfig {
+                path: config_path,
+                source,
+            }
+        })?;
+        let config = Qwen3ForwardConfig::parse(&config_json)?;
+        validate_stream_length(input_ids)?;
+        let inspection = Qwen3CheckpointInspection::inspect(model)?;
+        let hidden = config.hidden_size();
+        input_ids
+            .len()
+            .checked_mul(hidden)
+            .filter(|&count| count <= 1_048_576)
+            .ok_or(Qwen3MetalLoadError::DimensionOutOfRange(
+                "stream hidden states",
+            ))?;
+        let embedding = EmbeddingPlan::new(
+            input_ids,
+            inspection.contract().vocab_size(),
+            inspection.contract().hidden_size(),
+            u64::MAX,
+        )?;
+        let projection = ProjectionPlan::new(
+            hidden,
+            usize::try_from(inspection.contract().vocab_size())
+                .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("vocab_size"))?,
+            tile_rows,
+            u64::MAX,
+        )?;
+        let layers = layer_plans(&inspection, &config)?;
+        let final_norm_raw = inspection.bf16_tensor_bytes(FINAL_NORM)?;
+        let memory = StreamMemoryPlan::new(&embedding, &layers, final_norm_raw, &projection)?;
+        if memory.peak > max_weight_bytes {
+            return Err(Qwen3MetalLoadError::LayerWeightBudget {
+                required: memory.peak,
+                maximum: max_weight_bytes,
+            });
+        }
+        Ok(Self {
+            config,
+            inspection,
+            hidden,
+            embedding,
+            layers,
+            final_norm_raw,
+            projection,
+            memory,
+        })
+    }
 }
 
 fn validate_stream_length(input_ids: &[i32]) -> Result<(), Qwen3MetalLoadError> {
@@ -417,7 +556,10 @@ fn load_bf16_tensor(
 
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddingPlan, LayerPlan, ProjectionPlan, StreamMemoryPlan};
+    use super::{
+        EmbeddingPlan, LayerPlan, ProjectionPlan, Qwen3StreamCandidateReport, Qwen3StreamLayer,
+        Qwen3StreamVerification, StreamMemoryPlan,
+    };
 
     #[test]
     fn input_length_errors_describe_the_actual_limit() {
@@ -448,5 +590,68 @@ mod tests {
         let plan = StreamMemoryPlan::new(&embedding, &layers, 8, &projection).unwrap();
         assert_eq!(plan.peak, 500);
         assert_eq!(plan.total_raw_payload_bytes, 16 + 100 + 8 + 64);
+    }
+
+    #[test]
+    fn candidate_only_report_serializes_logits_without_parity_fields() {
+        let report = Qwen3StreamCandidateReport {
+            schema_version: 1,
+            operation: "qwen3_synchronous_streamed_forward_candidate",
+            input_ids: vec![1],
+            input_recipe: "fixture",
+            hidden_shape: [1, 1, 2],
+            embedding_raw_payload_bytes: 4,
+            embedding_planned_weight_and_staging_bytes: 8,
+            embedding_load_and_readback_ms: 1.0,
+            layers: vec![Qwen3StreamLayer {
+                layer: 0,
+                raw_payload_bytes: 2,
+                planned_weight_and_staging_bytes: 10,
+                load_ms: 2.0,
+                execute_and_readback_ms: 3.0,
+            }],
+            final_norm_raw_payload_bytes: 2,
+            final_norm_planned_weight_and_staging_bytes: 10,
+            final_norm_execute_and_readback_ms: 4.0,
+            projection_raw_payload_bytes: 8,
+            projection_max_tile_raw_payload_bytes: 4,
+            projection_planned_weight_and_staging_bytes: 20,
+            projection_tile_count: 2,
+            projection_load_ms: 5.0,
+            projection_execute_and_readback_ms: 6.0,
+            total_raw_payload_bytes: 16,
+            planned_peak_weight_and_staging_bytes: 20,
+            max_weight_bytes: 32,
+            candidate_logits: vec![0.25, -0.5],
+            verification: Qwen3StreamVerification::CandidateOnly,
+            candidate_total_ms: 7.0,
+            scope: "fixture",
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["verification"], "candidate_only");
+        assert_eq!(json["candidate_logits"], serde_json::json!([0.25, -0.5]));
+        for absent in [
+            "compared_logits",
+            "mismatches",
+            "maximum_absolute_error",
+            "resident_reference_ms",
+        ] {
+            assert!(json.get(absent).is_none(), "unexpected {absent}");
+        }
+    }
+
+    #[test]
+    fn candidate_logit_boundary_rejects_every_nonfinite_kind_and_keeps_finite_values() {
+        assert!(super::validate_candidate_logits(&[-0.0, 1.0, f32::MIN, f32::MAX]).is_ok());
+        for (logits, expected_index) in [
+            (&[1.0, f32::NAN, 3.0][..], 1),
+            (&[1.0, 2.0, f32::INFINITY][..], 2),
+            (&[1.0, 2.0, 3.0, f32::NEG_INFINITY][..], 3),
+        ] {
+            assert!(matches!(
+                super::validate_candidate_logits(logits),
+                Err(super::Qwen3MetalLoadError::CandidateNonFiniteLogit { index }) if index == expected_index
+            ));
+        }
     }
 }
