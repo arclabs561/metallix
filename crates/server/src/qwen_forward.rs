@@ -47,11 +47,136 @@ pub(crate) struct GenerationDiagnostics {
     pub(crate) preview: bool,
 }
 
+/// Qwen-specific residency selection for the diagnostic generator.
+///
+/// This is deliberately not an engine-level execution policy: its streamed
+/// form depends on this adapter's safetensors names, BF16 reader, and detached
+/// Qwen KV layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GenerationMemoryMode {
+    Resident,
+    Streamed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GenerationMemoryConfig {
+    pub(crate) mode: GenerationMemoryMode,
+    pub(crate) max_weight_bytes: Option<u64>,
+    pub(crate) max_kv_bytes: Option<u64>,
+    pub(crate) tile_rows: Option<usize>,
+}
+
+const DEFAULT_STREAMED_WEIGHT_BYTES: u64 = 81_798_144;
+// The full qualified 32-token Qwen control allocation. This is a logical
+// cap, not a claim that the executor allocates all of it up front.
+const DEFAULT_STREAMED_KV_BYTES: u64 = 7_340_032;
+const DEFAULT_STREAMED_TILE_ROWS: usize = 1_024;
+const STREAMED_MAX_TOKENS: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+struct StreamedGenerationPlan {
+    max_weight_bytes: u64,
+    max_kv_bytes: u64,
+    tile_rows: usize,
+    maximum_total_tokens: usize,
+}
+
+impl GenerationMemoryConfig {
+    fn streamed_plan(
+        self,
+        prompt_tokens: usize,
+        max_tokens: u32,
+    ) -> Result<Option<StreamedGenerationPlan>, &'static str> {
+        match self.mode {
+            GenerationMemoryMode::Resident => {
+                if self.max_weight_bytes.is_some()
+                    || self.max_kv_bytes.is_some()
+                    || self.tile_rows.is_some()
+                {
+                    return Err("streamed tuning flags require --memory-mode streamed");
+                }
+                Ok(None)
+            }
+            GenerationMemoryMode::Streamed => {
+                let maximum_total_tokens = prompt_tokens
+                    .checked_add(max_tokens as usize)
+                    .ok_or("prompt plus generation budget overflows")?;
+                if maximum_total_tokens > STREAMED_MAX_TOKENS {
+                    return Err(
+                        "streamed prompt plus generation budget exceeds its 32-token qualification limit",
+                    );
+                }
+                Ok(Some(StreamedGenerationPlan {
+                    max_weight_bytes: self
+                        .max_weight_bytes
+                        .unwrap_or(DEFAULT_STREAMED_WEIGHT_BYTES),
+                    max_kv_bytes: self.max_kv_bytes.unwrap_or(DEFAULT_STREAMED_KV_BYTES),
+                    tile_rows: self.tile_rows.unwrap_or(DEFAULT_STREAMED_TILE_ROWS),
+                    maximum_total_tokens,
+                }))
+            }
+        }
+    }
+}
+
+/// A private adapter-local dispatch over the two Qwen cache implementations.
+///
+/// It is intentionally not a generic engine trait: a caller cannot move this
+/// cache to a different checkpoint or model architecture.
+enum GenerationExecutor<'a> {
+    Resident(qwen::forward::Qwen3ForwardExecutor<'a, std::collections::hash_map::RandomState>),
+    Streamed(Box<qwen::metal::Qwen3StreamExecutor>),
+}
+
+impl GenerationExecutor<'_> {
+    fn prefill_last_logits(
+        &mut self,
+        input_ids: &[i32],
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Resident(executor) => Ok(executor.prefill_last_logits(input_ids)?),
+            Self::Streamed(executor) => Ok(executor.prefill_last_logits()?),
+        }
+    }
+
+    fn decode_last_logits(
+        &mut self,
+        input_id: i32,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Resident(executor) => Ok(executor.decode_last_logits(input_id)?),
+            Self::Streamed(executor) => Ok(executor.decode_last_logits(input_id)?),
+        }
+    }
+
+    fn cached_tokens(&self) -> usize {
+        match self {
+            Self::Resident(executor) => executor.cached_tokens(),
+            Self::Streamed(executor) => executor.cached_tokens(),
+        }
+    }
+
+    fn kv_bytes(&self) -> u64 {
+        match self {
+            Self::Resident(executor) => executor.kv_bytes() as u64,
+            Self::Streamed(executor) => executor.kv_bytes(),
+        }
+    }
+
+    fn planned_weight_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Resident(_) => None,
+            Self::Streamed(executor) => Some(executor.planned_weight_bytes()),
+        }
+    }
+}
+
 pub(crate) fn generate(
     model: &Path,
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
+    memory: GenerationMemoryConfig,
     diagnostics: GenerationDiagnostics,
     #[cfg(feature = "structured-output")] json_schema: Option<&Path>,
 ) -> ExitCode {
@@ -60,6 +185,7 @@ pub(crate) fn generate(
         input_ids,
         max_tokens,
         verify_cache,
+        memory,
         diagnostics,
         #[cfg(feature = "structured-output")]
         json_schema,
@@ -81,6 +207,7 @@ fn generate_inner(
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
+    memory: GenerationMemoryConfig,
     diagnostics: GenerationDiagnostics,
     #[cfg(feature = "structured-output")] json_schema: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -92,8 +219,9 @@ fn generate_inner(
     if input_ids.len().saturating_add(max_tokens as usize) > qwen::forward::MAX_DENSE_DEBUG_TOKENS {
         return Err("prompt plus generation budget exceeds diagnostic context limit".into());
     }
+    let streamed = memory.streamed_plan(input_ids.len(), max_tokens)?;
     if verbose {
-        let diagnostic = verbose_preflight(input_ids.len(), max_tokens, verify_cache);
+        let diagnostic = verbose_preflight(input_ids.len(), max_tokens, verify_cache, streamed);
         eprintln!("{diagnostic}");
     }
     let raw = fs::read_to_string(model.join("config.json"))?;
@@ -104,16 +232,48 @@ fn generate_inner(
         .map(|path| crate::qwen_constraints::ConstraintRun::load(model, path))
         .transpose()?;
     let started = Instant::now();
-    let mut weights = Qwen3MlxWeights::load(model)?;
-    weights.prepare_float32()?;
+    let resident_weights = if streamed.is_none() {
+        let mut weights = Qwen3MlxWeights::load(model)?;
+        weights.prepare_float32()?;
+        Some(weights)
+    } else {
+        None
+    };
+    let mut executor = match streamed {
+        Some(plan) => {
+            GenerationExecutor::Streamed(Box::new(qwen::metal::Qwen3StreamExecutor::new(
+                model,
+                input_ids,
+                plan.maximum_total_tokens,
+                plan.max_weight_bytes,
+                plan.max_kv_bytes,
+                plan.tile_rows,
+            )?))
+        }
+        None => GenerationExecutor::Resident(
+            resident_weights
+                .as_ref()
+                .ok_or("resident generation weights are unavailable")?
+                .executor(),
+        ),
+    };
     let load_ms = started.elapsed().as_secs_f64() * 1000.0;
     if verbose {
-        let logical_weight_bytes = weights.logical_weight_bytes();
-        eprintln!(
-            "qwen generation diagnostic: phase=load load_ms={load_ms:.3} logical_weight_bytes={logical_weight_bytes}",
-        );
+        if let Some(plan) = streamed {
+            eprintln!(
+                "qwen generation diagnostic: phase=stream_setup setup_ms={load_ms:.3} max_weight_bytes={} max_kv_bytes={} tile_rows={} promised_total_tokens={}",
+                plan.max_weight_bytes, plan.max_kv_bytes, plan.tile_rows, plan.maximum_total_tokens,
+            );
+        } else {
+            let logical_weight_bytes = resident_weights
+                .as_ref()
+                .ok_or("resident generation weights are unavailable")?
+                .logical_weight_bytes();
+            eprintln!(
+                "qwen generation diagnostic: phase=load load_ms={load_ms:.3} logical_weight_bytes={logical_weight_bytes}",
+            );
+        }
     }
-    let mut executor = weights.executor();
     let started = Instant::now();
     let mut logits = executor.prefill_last_logits(input_ids)?;
     let prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -130,9 +290,25 @@ fn generate_inner(
     let mut comparisons = Vec::new();
     let mut token_scores = Vec::new();
     let mut finish_reason = "length";
+    let mut streamed_oracle: Option<Qwen3MlxWeights> = None;
+    let mut oracle_load_ms = None;
     for step in 0..max_tokens {
         if verify_cache {
-            let full = weights.forward_last_logits(&prefix)?;
+            let full = if let Some(weights) = resident_weights.as_ref() {
+                weights.forward_last_logits(&prefix)?
+            } else {
+                if streamed_oracle.is_none() {
+                    let started = Instant::now();
+                    let mut oracle = Qwen3MlxWeights::load(model)?;
+                    oracle.prepare_float32()?;
+                    oracle_load_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                    streamed_oracle = Some(oracle);
+                }
+                streamed_oracle
+                    .as_ref()
+                    .ok_or("streamed verification oracle is unavailable")?
+                    .forward_last_logits(&prefix)?
+            };
             let result = compare_logits(&logits, &full)?;
             if !result.passed() {
                 return Err(format!(
@@ -194,10 +370,32 @@ fn generate_inner(
     "decode_ms": decode_ms,
     "cached_tokens": executor.cached_tokens(),
     "logical_kv_bytes": executor.kv_bytes(),
-    "logical_weight_bytes": weights.logical_weight_bytes(),
     "cache_comparisons": comparisons,
     "scope": "single sequence; contiguous KV; first prefill not warmed; verification excluded from timed regions but may warm execution"
     });
+    if let Some(plan) = streamed {
+        report["operation"] = json!("qwen3_greedy_streamed_generation");
+        report["streamed"] = json!({
+            "maximum_total_tokens": plan.maximum_total_tokens,
+            "max_weight_bytes": plan.max_weight_bytes,
+            "max_kv_bytes": plan.max_kv_bytes,
+            "tile_rows": plan.tile_rows,
+            "planned_weight_and_staging_bytes": executor.planned_weight_bytes(),
+            "verification": if verify_cache { "resident_full_prefix_oracle" } else { "not_requested" },
+            "oracle_memory_excluded": verify_cache,
+            "oracle_load_ms_excluded": oracle_load_ms,
+            "scope": "layer-streamed Qwen adapter path; promised context and separate planned weight/KV budgets are checked before candidate payload reads; planned budgets exclude activations, operator scratch, allocator retention, headers, projection output, and any opt-in resident oracle"
+        });
+        report["scope"] = json!(
+            "single sequence; streamed Qwen layers with detached contiguous KV; first prefill not warmed; candidate timing excludes opt-in resident full-prefix verification and its memory"
+        );
+    } else {
+        let logical_weight_bytes = resident_weights
+            .as_ref()
+            .ok_or("resident generation weights are unavailable")?
+            .logical_weight_bytes();
+        report["logical_weight_bytes"] = json!(logical_weight_bytes);
+    }
     if logprobs {
         report["logprobs"] = json!({
             "log_base": "e",
@@ -209,7 +407,11 @@ fn generate_inner(
     let report = {
         let mut report = report;
         if let Some(constraint) = constraint.as_ref() {
-            report["operation"] = json!("qwen3_constrained_cached_generation");
+            report["operation"] = json!(if streamed.is_some() {
+                "qwen3_constrained_streamed_generation"
+            } else {
+                "qwen3_constrained_cached_generation"
+            });
             report["constraint"] = constraint.report(verbose)?;
         }
         report
@@ -230,8 +432,15 @@ fn generate_inner(
     Ok(())
 }
 
-fn verbose_preflight(prompt_tokens: usize, max_tokens: u32, verify_cache: bool) -> String {
-    let context_limit = qwen::forward::MAX_DENSE_DEBUG_TOKENS;
+fn verbose_preflight(
+    prompt_tokens: usize,
+    max_tokens: u32,
+    verify_cache: bool,
+    streamed: Option<StreamedGenerationPlan>,
+) -> String {
+    let context_limit = streamed.map_or(qwen::forward::MAX_DENSE_DEBUG_TOKENS, |_| {
+        STREAMED_MAX_TOKENS
+    });
     format!(
         "qwen generation diagnostic: phase=preflight prompt_tokens={prompt_tokens} max_tokens={max_tokens} context_limit={context_limit} verify_cache={verify_cache}",
     )
@@ -357,7 +566,7 @@ fn measure(
 
 #[cfg(test)]
 mod tests {
-    use super::verbose_preflight;
+    use super::{GenerationMemoryConfig, GenerationMemoryMode, verbose_preflight};
 
     #[test]
     fn logprobs_are_opt_in_stable_and_do_not_change_greedy_ties() {
@@ -399,7 +608,7 @@ mod tests {
 
     #[test]
     fn verbose_preflight_is_deterministic_and_excludes_sensitive_arguments() {
-        let diagnostic = verbose_preflight(3, 32, false);
+        let diagnostic = verbose_preflight(3, 32, false, None);
 
         assert_eq!(
             diagnostic,
@@ -408,5 +617,50 @@ mod tests {
         assert!(!diagnostic.contains("model"));
         assert!(!diagnostic.contains("input_ids"));
         assert!(!diagnostic.contains("generated_ids"));
+    }
+
+    #[test]
+    fn streamed_generation_budgets_the_promised_context_and_rejects_resident_tuning() {
+        let streamed = GenerationMemoryConfig {
+            mode: GenerationMemoryMode::Streamed,
+            max_weight_bytes: Some(81_798_144),
+            max_kv_bytes: Some(1_376_256),
+            tile_rows: Some(1_024),
+        }
+        .streamed_plan(3, 29)
+        .expect("qualified streamed bound")
+        .expect("streamed plan");
+        assert_eq!(streamed.maximum_total_tokens, 32);
+        assert_eq!(streamed.max_weight_bytes, 81_798_144);
+        let defaults = GenerationMemoryConfig {
+            mode: GenerationMemoryMode::Streamed,
+            max_weight_bytes: None,
+            max_kv_bytes: None,
+            tile_rows: None,
+        }
+        .streamed_plan(3, 4)
+        .expect("default streamed plan")
+        .expect("streamed plan");
+        assert_eq!(defaults.max_kv_bytes, 7_340_032);
+        assert!(
+            GenerationMemoryConfig {
+                mode: GenerationMemoryMode::Streamed,
+                max_weight_bytes: None,
+                max_kv_bytes: None,
+                tile_rows: None,
+            }
+            .streamed_plan(3, 30)
+            .is_err()
+        );
+        assert!(
+            GenerationMemoryConfig {
+                mode: GenerationMemoryMode::Resident,
+                max_weight_bytes: Some(1),
+                max_kv_bytes: None,
+                tile_rows: None,
+            }
+            .streamed_plan(1, 1)
+            .is_err()
+        );
     }
 }

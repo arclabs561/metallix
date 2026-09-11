@@ -34,6 +34,32 @@ struct Cli {
     command: Command,
 }
 
+/// Which Qwen weight residency contract a generation run uses.
+///
+/// This belongs to the Qwen diagnostic command rather than the engine: the
+/// streamed executor has adapter-specific layout and cache semantics.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum GenerationMemoryMode {
+    /// Load the complete checkpoint once and retain its MLX arrays.
+    Resident,
+    /// Read one layer at a time under explicit weight and KV budgets.
+    Streamed,
+}
+
+#[cfg(feature = "metal")]
+const fn generation_max_tokens(mode: GenerationMemoryMode, requested: Option<u32>) -> u32 {
+    match requested {
+        Some(tokens) => tokens,
+        None => match mode {
+            GenerationMemoryMode::Resident => 32,
+            // Keep the bare streamed command inside the qualified 32-token
+            // total-context envelope for its default three-token prompt.
+            GenerationMemoryMode::Streamed => 4,
+        },
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
@@ -65,8 +91,21 @@ enum Command {
         model: PathBuf,
         #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
         input_ids: Vec<i32>,
-        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=256))]
-        max_tokens: u32,
+        /// Generated-token limit; default is 32 resident or 4 streamed. Streamed prompt plus limit must fit 32.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
+        max_tokens: Option<u32>,
+        /// Keep the complete checkpoint resident (default) or stream one layer at a time.
+        #[arg(long, value_enum, default_value_t = GenerationMemoryMode::Resident)]
+        memory_mode: GenerationMemoryMode,
+        /// Streamed mode only: maximum planned layer weights plus loading/conversion staging.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+        max_weight_bytes: Option<u64>,
+        /// Streamed mode only: maximum planned detached KV bytes at the promised context length.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+        max_kv_bytes: Option<u64>,
+        /// Streamed mode only: projection rows loaded per tile.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4_096))]
+        tile_rows: Option<u32>,
         /// Compare each cached result with a full forward outside timed regions.
         #[arg(long)]
         verify_cache: bool,
@@ -273,25 +312,47 @@ pub fn run() -> ExitCode {
             model,
             input_ids,
             max_tokens,
+            memory_mode,
+            max_weight_bytes,
+            max_kv_bytes,
+            tile_rows,
             verify_cache,
             verbose,
             logprobs,
             preview,
             #[cfg(feature = "structured-output")]
             json_schema,
-        } => qwen_forward::generate(
-            &model,
-            &input_ids,
-            max_tokens,
-            verify_cache,
-            qwen_forward::GenerationDiagnostics {
-                verbose,
-                logprobs,
-                preview,
-            },
-            #[cfg(feature = "structured-output")]
-            json_schema.as_deref(),
-        ),
+        } => {
+            let max_tokens = generation_max_tokens(memory_mode, max_tokens);
+            qwen_forward::generate(
+                &model,
+                &input_ids,
+                max_tokens,
+                verify_cache,
+                qwen_forward::GenerationMemoryConfig {
+                    mode: match memory_mode {
+                        GenerationMemoryMode::Resident => {
+                            qwen_forward::GenerationMemoryMode::Resident
+                        }
+                        GenerationMemoryMode::Streamed => {
+                            qwen_forward::GenerationMemoryMode::Streamed
+                        }
+                    },
+                    max_weight_bytes,
+                    max_kv_bytes,
+                    // Metal generation is Apple-Silicon only; the CLI parser has
+                    // already bounded this `u32` to 1..=4096.
+                    tile_rows: tile_rows.map(|rows| rows as usize),
+                },
+                qwen_forward::GenerationDiagnostics {
+                    verbose,
+                    logprobs,
+                    preview,
+                },
+                #[cfg(feature = "structured-output")]
+                json_schema.as_deref(),
+            )
+        }
         #[cfg(feature = "metal")]
         Command::ForwardQwenMetal {
             model,
@@ -921,7 +982,11 @@ mod tests {
             default.command,
             super::Command::GenerateQwenMetal {
                 input_ids,
-                max_tokens: 32,
+                max_tokens: None,
+                memory_mode: super::GenerationMemoryMode::Resident,
+                max_weight_bytes: None,
+                max_kv_bytes: None,
+                tile_rows: None,
                 verify_cache: false,
                 verbose: false,
                 logprobs: false,
@@ -929,6 +994,44 @@ mod tests {
                 ..
             } if input_ids == [1, 2, 3]
         ));
+
+        let streamed = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--memory-mode",
+            "streamed",
+            "--max-weight-bytes",
+            "81798144",
+            "--max-kv-bytes",
+            "1376256",
+            "--tile-rows",
+            "1024",
+        ])
+        .expect("explicit streamed generation limits");
+        assert!(matches!(
+            streamed.command,
+            super::Command::GenerateQwenMetal {
+                memory_mode: super::GenerationMemoryMode::Streamed,
+                max_weight_bytes: Some(81_798_144),
+                max_kv_bytes: Some(1_376_256),
+                tile_rows: Some(1_024),
+                ..
+            }
+        ));
+        assert_eq!(
+            super::generation_max_tokens(super::GenerationMemoryMode::Resident, None),
+            32
+        );
+        assert_eq!(
+            super::generation_max_tokens(super::GenerationMemoryMode::Streamed, None),
+            4
+        );
+        assert_eq!(
+            super::generation_max_tokens(super::GenerationMemoryMode::Streamed, Some(29)),
+            29
+        );
 
         let scores = Cli::try_parse_from(["mx", "gen", "--model", "model", "--logprobs"])
             .expect("opt-in log probabilities");
