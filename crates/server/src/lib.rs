@@ -165,6 +165,9 @@ enum Command {
         /// Logical weights and loading staging; excludes scratch and resident reference.
         #[arg(long, default_value_t = 134_217_728, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
         max_weight_bytes: u64,
+        /// Run only the streamed candidate for process-memory measurement; emits logits but no parity result.
+        #[arg(long)]
+        candidate_only: bool,
     },
     /// Evaluate one selected-weight Qwen block and compare with resident weights.
     #[cfg(feature = "metal")]
@@ -270,7 +273,14 @@ pub fn run() -> ExitCode {
             input_ids,
             tile_rows,
             max_weight_bytes,
-        } => check_qwen_stream_metal(&model, &input_ids, tile_rows, max_weight_bytes),
+            candidate_only,
+        } => check_qwen_stream_metal(
+            &model,
+            &input_ids,
+            tile_rows,
+            max_weight_bytes,
+            candidate_only,
+        ),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
         #[cfg(feature = "metal")]
@@ -471,24 +481,45 @@ fn check_qwen_stream_metal(
     input_ids: &[i32],
     tile_rows: u32,
     max_weight_bytes: u64,
+    candidate_only: bool,
 ) -> ExitCode {
     let Ok(tile_rows) = usize::try_from(tile_rows) else {
         eprintln!("Qwen stream check failed: tile row count does not fit usize");
         return ExitCode::FAILURE;
     };
-    match qwen::metal::qualify_streamed_forward(model, input_ids, max_weight_bytes, tile_rows) {
-        Ok(result) => match serde_json::to_string_pretty(&result) {
-            Ok(json) => {
-                println!("{json}");
-                ExitCode::SUCCESS
-            }
+    if candidate_only {
+        match qwen::metal::run_streamed_forward_candidate(
+            model,
+            input_ids,
+            max_weight_bytes,
+            tile_rows,
+        ) {
+            Ok(report) => print_stream_report(report),
             Err(error) => {
-                eprintln!("could not serialize stream comparison: {error}");
+                eprintln!("Qwen stream check failed: {error}");
                 ExitCode::FAILURE
             }
-        },
+        }
+    } else {
+        match qwen::metal::qualify_streamed_forward(model, input_ids, max_weight_bytes, tile_rows) {
+            Ok(report) => print_stream_report(report),
+            Err(error) => {
+                eprintln!("Qwen stream check failed: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn print_stream_report(report: impl serde::Serialize) -> ExitCode {
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
         Err(error) => {
-            eprintln!("Qwen stream check failed: {error}");
+            eprintln!("could not serialize stream report: {error}");
             ExitCode::FAILURE
         }
     }
@@ -851,8 +882,23 @@ mod tests {
         let cli = Cli::try_parse_from(["mx", "check-qwen-stream-metal", "--model", "model"])
             .expect("default streamed diagnostic");
         assert!(matches!(cli.command, super::Command::CheckQwenStreamMetal {
-            input_ids, tile_rows: 1024, max_weight_bytes: 134_217_728, ..
+            input_ids, tile_rows: 1024, max_weight_bytes: 134_217_728, candidate_only: false, ..
         } if input_ids == [1, 2, 3]));
+        let candidate = Cli::try_parse_from([
+            "mx",
+            "check-qwen-stream-metal",
+            "--model",
+            "model",
+            "--candidate-only",
+        ])
+        .expect("candidate-only streamed diagnostic");
+        assert!(matches!(
+            candidate.command,
+            super::Command::CheckQwenStreamMetal {
+                candidate_only: true,
+                ..
+            }
+        ));
         assert!(Cli::try_parse_from(["mx", "check-qwen-stream-metal"]).is_err());
         for (flag, value) in [
             ("--tile-rows", "0"),
