@@ -121,6 +121,95 @@ weights and KV separately, and measure repeated load/evaluate/release cycles.
 This result does not prove allocator reuse over a long generation or inference
 for a model exceeding RAM. V4.1 still needs its own layout and numerical gates.
 
+## Repeated lifetimes and BF16 conversion
+
+At `aa99484`, `check-qwen-layer-metal --repeats N` runs 1–64 complete diagnostic
+cycles in one process. Each cycle reinspects the checkpoint, creates fresh
+synthetic input, loads and executes the same layer, and releases its arrays.
+Only small reports survive between cycles. One cycle preserves the original
+JSON shape; multiple cycles emit a `qwen3_selected_layer_cycles` envelope with
+one report per completed cycle. A failure exits before emitting success JSON.
+This is not a sequence of distinct model layers or an inner compute-only loop.
+
+```sh
+/usr/bin/time -l target/release/metallix check-qwen-layer-metal \
+  --model /path/to/Qwen3-0.6B --layer 0 --tokens 3 \
+  --max-weight-bytes 81798144 --candidate-only --repeats 64
+```
+
+Before optimizing, three fresh processes per cycle count gave these process
+peak ranges on the same checkpoint and M3 Max:
+
+| Cycles per process | Maximum RSS bytes, min–max | Peak footprint bytes, min–max |
+|---|---:|---:|
+| 1 | 111,017,984–111,214,592 | 288,391,792–288,588,400 |
+| 8 | 113,836,032–114,606,080 | 291,160,736–291,914,376 |
+| 64 | 114,835,456–115,064,832 | 292,143,752–292,389,536 |
+
+The observed peak did not grow by one retained layer per cycle. This supports
+bounded reuse for this fixed-shape diagnostic, not a universal allocator bound.
+Different layers/shapes, growing KV and long generations remain unmeasured.
+Each 64-cycle process requested 2,013,560,832 payload bytes in total; this is
+not evidence of physical SSD traffic. Cache state was uncontrolled. The
+candidate-only reports all say `not_run`; a separate two-cycle resident
+comparison matched all 3,072 output values on each cycle. A 64-cycle command
+with a budget one byte below the plan exited 1 and produced empty stdout.
+
+### Profile and measured change
+
+A headless `samply record --save-only --unstable-presymbolicate --duration 10`
+capture around that 64-cycle command identified `decode_bf16` as 56.8% of
+main-thread weighted self samples, `read` as 16.8%, and `_platform_memmove` as
+8.2%. Symbols were resolved using the captured sidecar's exact address map.
+Some system frames remain unresolved. These are sampled main-thread stacks,
+not GPU timings or exact CPU-time accounting.
+
+Two safe-Rust hypotheses were measured with three processes each. Discarding
+cycle 1 leaves 63 warm observations per process; the table reports per-process
+load medians, then their mean and sample standard deviation. Load timing covers
+selected reads, conversion and array creation/evaluation, not header inspection
+or block execution. No profiled run contributes to these timing results.
+
+| Implementation | Process load medians, ms | Mean ± sample SD, ms | Decision |
+|---|---|---|---|
+| Early finite rejection + capacity/`push` | 12.689, 12.725, 12.608 | 12.674 ± 0.060 | Baseline |
+| Accumulated finite check + capacity/`push` | 13.593, 13.519, 13.628 | 13.580 ± 0.056 | Rejected: slower |
+| Accumulated finite check + fixed-size destination | 6.588, 6.412, 6.356 | 6.452 ± 0.121 | Kept at `49575cd` |
+
+The kept change fills a pre-sized FP32 slice and accumulates the finite check
+without early exit. It preserves little-endian bits, signed zero and rejection
+of every NaN/infinity. It retains one FP32 destination, so the logical staging
+plan is unchanged. This reduced measured warm layer-load time by about 49%;
+it is not a 49% model-throughput result. Adjacent block-execution medians were
+1.250–1.297 ms before and 1.266–1.297 ms afterward. Optimized process peak
+footprints were 292,258,488–292,340,408 bytes, within the earlier range.
+
+A second profile lowered conversion's weighted self-sample share to 26.4%;
+reads were then 26.6% and memory copying 14.9%. Sampling proportions do not
+prove vectorization or predict a further end-to-end speedup. The next loading
+optimization needs its own profile and parity gate, not a speculative rewrite.
+
+Validation: all 65,536 BF16 bit patterns checked individually, all finite
+patterns also checked in a batch, and nonfinite values rejected at the start,
+middle and end of batches. Real norm/Q-projection tensor comparisons and
+layer 0 (twice)/layer 27 comparisons remained bit-exact. Both canonical
+default and Metal checks passed after the change.
+
+Receipts: `artifacts/qwen-cycles-{1,8,64}-{1,2,3}.{json,time}`,
+`artifacts/qwen-cycles-{compare,budget}.{json,stderr}`,
+`artifacts/qwen-bf16-{branchless,fixed}-{1,2,3}.{json,time}`,
+`artifacts/qwen-bf16-timing-summary.json`,
+`artifacts/qwen-bf16-fixed-{compare,layer27,norm,qproj}.{json,stderr}`,
+`artifacts/check-bf16-fixed-{default,metal}.log`.
+Profiles and symbol sidecars are under `artifacts/qwen-cycles-profile*` and
+`artifacts/qwen-bf16-fixed-profile*`; their weighted sample summary is
+`artifacts/qwen-bf16-profile-comparison.jsonl`.
+Executable SHA-256 identities (same input hashes as above):
+
+- Baseline: `3470c648a66c6bd6b018f1fcc040462edff5061683ebcd3ce60552ae4bccb881`.
+- Rejected: `8c4191b9d69676aa69c7ec70acd21f878c24f0302a271b8649271524a394b078`.
+- Kept: `213d1f4a6fbe50b892f1de90efa994e8eba22d5e9fe80f2e02f3205b5717436a`.
+
 ## V4.1 initial dimensions and live cache sources
 
 At `e7fbd92`, [`V41ExecutionShape`](../../crates/models/deepseek/src/lib.rs)

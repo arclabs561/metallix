@@ -80,6 +80,9 @@ states. Its `--max-weight-bytes` bounds logical weights and loading staging,
 not scratch or process memory. Use `--candidate-only` when measuring process
 memory; it skips the resident comparison and explicitly reports no verification.
 Run the normal comparison separately. The qualification ledger records both.
+Use `--repeats N` (1–64) to measure repeated diagnostic lifetimes in one process.
+The default is one cycle. Multiple cycles return a typed envelope containing
+each report; they repeat the same layer/input shape, not sequential model layers.
 
 Use an optimized executable and a sustained workload. With Divan, directly
 invoking a benchmark executable needs `--bench`; otherwise it only runs tests.

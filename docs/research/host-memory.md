@@ -100,7 +100,10 @@ It bounds one raw payload, not the entire process. A subsequent
 [one-block experiment](../experiments/loader-qualification.md#one-block-selected-weight-execution)
 executes selected weights with a logical weight/staging plan and separately
 measures candidate-only process memory. It uses synthetic hidden states;
-full streamed forward and repeated allocation lifetimes remain unqualified.
+full streamed forward remains unqualified. A later
+[repeated-lifetime probe](../experiments/loader-qualification.md#repeated-lifetimes-and-bf16-conversion)
+measured 1, 8 and 64 same-shape cycles; peak memory stayed near the one-cycle
+working set, without establishing a bound for changing shapes or growing KV.
 An allocation
 must remain leased until every dependent GPU operation completes; dropping a
 Rust handle is not itself proof of GPU completion.
