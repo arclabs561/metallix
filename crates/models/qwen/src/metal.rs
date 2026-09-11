@@ -9,6 +9,9 @@ use thiserror::Error;
 
 use crate::checkpoint::{Qwen3CheckpointError, Qwen3CheckpointInspection};
 
+mod layer_check;
+pub use layer_check::{LayerCheckMode, Qwen3LayerCheck, qualify_layer};
+
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
 #[derive(Debug, serde::Serialize)]
 pub struct Qwen3TensorRangeCheck {
@@ -92,18 +95,16 @@ fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, Qwen3MetalLoadError> {
     if bytes.len() % 2 != 0 {
         return Err(Qwen3MetalLoadError::RangeCheckOddBytes);
     }
-    bytes
-        .chunks_exact(2)
-        .map(|pair| {
-            let bits = u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16;
-            let value = f32::from_bits(bits);
-            if value.is_finite() {
-                Ok(value)
-            } else {
-                Err(Qwen3MetalLoadError::RangeCheckNonFinite)
-            }
-        })
-        .collect()
+    let mut values = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let bits = u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16;
+        let value = f32::from_bits(bits);
+        if !value.is_finite() {
+            return Err(Qwen3MetalLoadError::RangeCheckNonFinite);
+        }
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn compare_tensor_values(left: &[f32], right: &[f32]) -> Result<(), Qwen3MetalLoadError> {
@@ -334,6 +335,14 @@ pub enum Qwen3MetalSmokeError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Qwen3MetalLoadError {
+    /// The candidate layer's live weight/staging plan exceeds its budget.
+    #[error("layer weight/staging plan requires {required} bytes, above budget {maximum}")]
+    LayerWeightBudget {
+        /// Peak planned logical bytes during weight loading.
+        required: u64,
+        /// Caller-selected ceiling; excludes operator scratch and the reference.
+        maximum: u64,
+    },
     /// The diagnostic currently qualifies only BF16 checkpoint payloads.
     #[error("tensor-range comparison requires BF16, got {0}")]
     RangeCheckDtype(String),

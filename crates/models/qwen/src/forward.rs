@@ -101,6 +101,18 @@ impl Qwen3ForwardConfig {
             rope_theta: raw.rope_theta,
         })
     }
+
+    /// Returns the residual-stream width used by every decoder layer.
+    #[must_use]
+    pub(crate) const fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Returns the number of decoder layers in the qualified dense layout.
+    #[must_use]
+    pub(crate) const fn hidden_layers(&self) -> usize {
+        self.hidden_layers
+    }
 }
 
 /// Runs a complete uncached Qwen3 forward pass and reads back the last-token
@@ -120,7 +132,6 @@ pub fn forward_last_logits<S: BuildHasher>(
     let stream = StreamOrDevice::gpu();
     let seq_len = i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
     let hidden = as_i32(config.hidden_size)?;
-    let intermediate = as_i32(config.intermediate_size)?;
 
     let ids = Array::from_slice(input_ids, &[seq_len]);
     let embedding = weight(weights, "model.embed_tokens.weight")?;
@@ -129,37 +140,7 @@ pub fn forward_last_logits<S: BuildHasher>(
         .reshape_device(&[1, seq_len, hidden], &stream)?;
 
     for layer in 0..config.hidden_layers {
-        let base = format!("model.layers.{layer}");
-        let attention_input = rms_norm(
-            &hidden_states,
-            weight(weights, &format!("{base}.input_layernorm.weight"))?,
-            config.rms_norm_eps,
-        )?;
-        let attention = attention(config, weights, &base, &attention_input, seq_len)?;
-        let residual = hidden_states.add_device(&attention, &stream)?;
-
-        let mlp_input = rms_norm(
-            &residual,
-            weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
-            config.rms_norm_eps,
-        )?;
-        let gate = linear(
-            &mlp_input,
-            weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
-        )?
-        .reshape_device(&[1, seq_len, intermediate], &stream)?;
-        let up = linear(
-            &mlp_input,
-            weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
-        )?
-        .reshape_device(&[1, seq_len, intermediate], &stream)?;
-        let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
-        let mlp = linear(
-            &activated.multiply_device(&up, &stream)?,
-            weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
-        )?
-        .reshape_device(&[1, seq_len, hidden], &stream)?;
-        hidden_states = residual.add_device(&mlp, &stream)?;
+        hidden_states = forward_layer(config, weights, layer, &hidden_states)?;
     }
 
     // Only the final position is requested; normalization and the tied output
@@ -173,6 +154,55 @@ pub fn forward_last_logits<S: BuildHasher>(
     )?;
     let logits = linear(&normalized, embedding)?;
     read_last_logits(&logits, 1, config.vocab_size)
+}
+
+/// Executes one uncached dense Qwen3 decoder layer.
+///
+/// This is intentionally crate-private: selected-layer diagnostics borrow it
+/// while retaining the same bounded, uncached attention contract as
+/// [`forward_last_logits`]. Callers must provide a residual stream with shape
+/// `[1, sequence, hidden_size]`; it is not a general batched-layer API.
+pub(crate) fn forward_layer<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    layer: usize,
+    hidden_states: &Array,
+) -> Result<Array, Qwen3ForwardError> {
+    let seq_len = validate_layer_input(config, layer, hidden_states)?;
+    let stream = StreamOrDevice::gpu();
+    let hidden = as_i32(config.hidden_size)?;
+    let intermediate = as_i32(config.intermediate_size)?;
+    let base = format!("model.layers.{layer}");
+    let attention_input = rms_norm(
+        hidden_states,
+        weight(weights, &format!("{base}.input_layernorm.weight"))?,
+        config.rms_norm_eps,
+    )?;
+    let attention = attention(config, weights, &base, &attention_input, seq_len)?;
+    let residual = hidden_states.add_device(&attention, &stream)?;
+
+    let mlp_input = rms_norm(
+        &residual,
+        weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
+        config.rms_norm_eps,
+    )?;
+    let gate = linear(
+        &mlp_input,
+        weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
+    )?
+    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    let up = linear(
+        &mlp_input,
+        weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
+    )?
+    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
+    let mlp = linear(
+        &activated.multiply_device(&up, &stream)?,
+        weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
+    )?
+    .reshape_device(&[1, seq_len, hidden], &stream)?;
+    residual.add_device(&mlp, &stream).map_err(Into::into)
 }
 
 /// A dense Qwen3 forward executor with KV state bound to one weights map.
@@ -463,6 +493,43 @@ fn validate_input_ids(
     Ok(())
 }
 
+fn validate_layer_input(
+    config: &Qwen3ForwardConfig,
+    layer: usize,
+    hidden_states: &Array,
+) -> Result<i32, Qwen3ForwardError> {
+    if layer >= config.hidden_layers {
+        return Err(Qwen3ForwardError::LayerOutOfRange {
+            layer,
+            hidden_layers: config.hidden_layers,
+        });
+    }
+
+    let shape = hidden_states.shape();
+    let expected_hidden = as_i32(config.hidden_size)?;
+    let Some(&seq_len) = shape.get(1) else {
+        return Err(Qwen3ForwardError::InvalidLayerInputShape {
+            actual: shape.to_vec(),
+            hidden_size: config.hidden_size,
+        });
+    };
+    if shape.len() != 3 || shape[0] != 1 || shape[2] != expected_hidden || seq_len <= 0 {
+        return Err(Qwen3ForwardError::InvalidLayerInputShape {
+            actual: shape.to_vec(),
+            hidden_size: config.hidden_size,
+        });
+    }
+    let sequence = usize::try_from(seq_len).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    let maximum = MAX_DENSE_DEBUG_TOKENS.min(config.max_position_embeddings);
+    if sequence > maximum {
+        return Err(Qwen3ForwardError::PromptTooLong {
+            actual: sequence,
+            maximum,
+        });
+    }
+    Ok(seq_len)
+}
+
 fn attention_scale(config: &Qwen3ForwardConfig) -> Result<f32, Qwen3ForwardError> {
     Ok(
         f32::from(u16::try_from(config.head_dim).map_err(|_| Qwen3ForwardError::ShapeOverflow)?)
@@ -695,6 +762,24 @@ pub enum Qwen3ForwardError {
         /// Supported token count.
         maximum: usize,
     },
+    /// A selected decoder layer is outside this model's configured range.
+    #[error("Qwen3 layer {layer} is outside {hidden_layers} configured layers")]
+    LayerOutOfRange {
+        /// Requested zero-based layer index.
+        layer: usize,
+        /// Number of configured decoder layers.
+        hidden_layers: usize,
+    },
+    /// A selected-layer diagnostic did not receive one residual stream.
+    #[error(
+        "Qwen3 layer input shape {actual:?} must be [1, sequence, {hidden_size}] with positive sequence"
+    )]
+    InvalidLayerInputShape {
+        /// Actual MLX array shape.
+        actual: Vec<i32>,
+        /// Required residual-stream width.
+        hidden_size: usize,
+    },
     /// Decode needs a preceding prefill on this executor.
     #[error("Qwen3 decode requires a populated KV cache")]
     DecodeWithoutPrefill,
@@ -731,7 +816,10 @@ mod tests {
 
     use crate::GPU_TEST_LOCK;
 
-    use super::{Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, forward_last_logits};
+    use super::{
+        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, forward_last_logits,
+        forward_layer, linear, read_last_logits, rms_norm, weight,
+    };
 
     const QWEN3_06B: &str = r#"{
       "model_type":"qwen3",
@@ -859,6 +947,99 @@ mod tests {
         assert_eq!(executor.kv_bytes(), 0);
     }
 
+    #[test]
+    fn composed_nonzero_layer_matches_independent_cached_prefill() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen3",
+              "num_hidden_layers":2,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "head_dim":4,
+              "max_position_embeddings":16,
+              "rms_norm_eps":0.000001,
+              "rope_theta":1000000,
+              "hidden_act":"silu",
+              "tie_word_embeddings":true,
+              "attention_bias":false,
+              "mlp_bias":false
+            }"#,
+        )
+        .expect("two-layer dense Qwen3 config");
+        let weights = deterministic_weights_for_layers(2);
+        let input_ids = [1_i32, 2, 3];
+        let stream = mlx_rs::StreamOrDevice::gpu();
+        let embedding = weight(&weights, "model.embed_tokens.weight").expect("embedding");
+        let ids = Array::from_slice(&input_ids, &[3]);
+        let hidden = embedding
+            .take_axis_device(&ids, 0, &stream)
+            .expect("embedding lookup")
+            .reshape_device(&[1, 3, 4], &stream)
+            .expect("residual shape");
+
+        // The cached executor has its own attention and MLP implementation.
+        // Its prefill result therefore checks the extracted nonzero layer's
+        // contribution instead of comparing this helper to itself.
+        let after_layer_zero = forward_layer(&config, &weights, 0, &hidden).expect("layer zero");
+        let after_layer_one =
+            forward_layer(&config, &weights, 1, &after_layer_zero).expect("nonzero layer");
+        let last = after_layer_one
+            .take_axis_device(Array::from_slice(&[2_i32], &[1]), 1, &stream)
+            .expect("last hidden state");
+        let normalized = rms_norm(
+            &last,
+            weight(&weights, "model.norm.weight").expect("final norm"),
+            config.rms_norm_eps,
+        )
+        .expect("final norm graph");
+        let composed = read_last_logits(
+            &linear(&normalized, embedding).expect("tied output projection"),
+            1,
+            8,
+        )
+        .expect("composed logits");
+
+        let cached = Qwen3ForwardExecutor::new(&config, &weights)
+            .prefill_last_logits(&input_ids)
+            .expect("independent cached prefill");
+        assert_logits_match(composed, cached);
+    }
+
+    #[test]
+    fn selected_layer_rejects_out_of_range_and_invalid_residual_shape() {
+        let config = Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen3", "num_hidden_layers":1, "hidden_size":4,
+              "intermediate_size":8, "vocab_size":8, "num_attention_heads":2,
+              "num_key_value_heads":1, "head_dim":4, "max_position_embeddings":16,
+              "hidden_act":"silu", "tie_word_embeddings":true
+            }"#,
+        )
+        .expect("small config");
+        let weights = deterministic_weights();
+        let bad_shape = Array::from_slice(&[1.0_f32; 8], &[2, 4]);
+        assert!(matches!(
+            forward_layer(&config, &weights, 1, &bad_shape),
+            Err(Qwen3ForwardError::LayerOutOfRange { .. })
+        ));
+        assert!(matches!(
+            forward_layer(&config, &weights, 0, &bad_shape),
+            Err(Qwen3ForwardError::InvalidLayerInputShape { .. })
+        ));
+        let overlong = Array::from_slice(&[1.0_f32; 68], &[1, 17, 4]);
+        assert!(matches!(
+            forward_layer(&config, &weights, 0, &overlong),
+            Err(Qwen3ForwardError::PromptTooLong {
+                actual: 17,
+                maximum: 16
+            })
+        ));
+    }
+
     fn assert_logits_match(full: Vec<f32>, cached: Vec<f32>) {
         assert_eq!(full.len(), cached.len());
         for (full, cached) in full.into_iter().zip(cached) {
@@ -870,27 +1051,33 @@ mod tests {
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {
+        deterministic_weights_for_layers(1)
+    }
+
+    fn deterministic_weights_for_layers(layers: usize) -> HashMap<String, Array> {
         let mut weights = HashMap::new();
         insert_matrix(&mut weights, "model.embed_tokens.weight", 8, 4);
         insert_vector(&mut weights, "model.norm.weight", 4);
-        let base = "model.layers.0";
-        insert_vector(&mut weights, &format!("{base}.input_layernorm.weight"), 4);
-        insert_vector(
-            &mut weights,
-            &format!("{base}.post_attention_layernorm.weight"),
-            4,
-        );
-        let attn = format!("{base}.self_attn");
-        insert_matrix(&mut weights, &format!("{attn}.q_proj.weight"), 8, 4);
-        insert_matrix(&mut weights, &format!("{attn}.k_proj.weight"), 4, 4);
-        insert_matrix(&mut weights, &format!("{attn}.v_proj.weight"), 4, 4);
-        insert_matrix(&mut weights, &format!("{attn}.o_proj.weight"), 4, 8);
-        insert_vector(&mut weights, &format!("{attn}.q_norm.weight"), 4);
-        insert_vector(&mut weights, &format!("{attn}.k_norm.weight"), 4);
-        let mlp = format!("{base}.mlp");
-        insert_matrix(&mut weights, &format!("{mlp}.gate_proj.weight"), 8, 4);
-        insert_matrix(&mut weights, &format!("{mlp}.up_proj.weight"), 8, 4);
-        insert_matrix(&mut weights, &format!("{mlp}.down_proj.weight"), 4, 8);
+        for layer in 0..layers {
+            let base = format!("model.layers.{layer}");
+            insert_vector(&mut weights, &format!("{base}.input_layernorm.weight"), 4);
+            insert_vector(
+                &mut weights,
+                &format!("{base}.post_attention_layernorm.weight"),
+                4,
+            );
+            let attn = format!("{base}.self_attn");
+            insert_matrix(&mut weights, &format!("{attn}.q_proj.weight"), 8, 4);
+            insert_matrix(&mut weights, &format!("{attn}.k_proj.weight"), 4, 4);
+            insert_matrix(&mut weights, &format!("{attn}.v_proj.weight"), 4, 4);
+            insert_matrix(&mut weights, &format!("{attn}.o_proj.weight"), 4, 8);
+            insert_vector(&mut weights, &format!("{attn}.q_norm.weight"), 4);
+            insert_vector(&mut weights, &format!("{attn}.k_norm.weight"), 4);
+            let mlp = format!("{base}.mlp");
+            insert_matrix(&mut weights, &format!("{mlp}.gate_proj.weight"), 8, 4);
+            insert_matrix(&mut weights, &format!("{mlp}.up_proj.weight"), 8, 4);
+            insert_matrix(&mut weights, &format!("{mlp}.down_proj.weight"), 4, 8);
+        }
         weights
     }
 

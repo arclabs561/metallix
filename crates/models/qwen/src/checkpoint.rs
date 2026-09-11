@@ -152,6 +152,23 @@ impl Qwen3CheckpointInspection {
         &self.shards
     }
 
+    /// Plans a BF16 read without allocating its payload.
+    #[cfg(feature = "metal")]
+    pub(crate) fn bf16_tensor_bytes(&self, name: &str) -> Result<u64, Qwen3CheckpointError> {
+        let location = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| Qwen3CheckpointError::UnknownTensor(name.to_owned()))?;
+        if location.range.dtype != "BF16" {
+            return Err(Qwen3CheckpointError::UnsupportedTensorDtype {
+                path: location.shard.clone(),
+                tensor: name.to_owned(),
+                dtype: location.range.dtype.clone(),
+            });
+        }
+        Ok(location.range.byte_length)
+    }
+
     /// Reads one validated tensor without loading a whole shard.
     ///
     /// This is adapter-private plumbing for a future Qwen streaming loader;
