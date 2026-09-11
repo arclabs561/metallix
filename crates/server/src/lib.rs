@@ -217,6 +217,9 @@ enum Command {
         /// Logical retained KV only; excludes transient copies and process overhead.
         #[arg(long, default_value_t = 67_108_864, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
         max_kv_bytes: u64,
+        /// Omit resident controls for process-memory measurement; emits per-step logits, not parity.
+        #[arg(long)]
+        candidate_only: bool,
     },
     /// Evaluate one selected-weight Qwen block and compare with resident weights.
     #[cfg(feature = "metal")]
@@ -361,6 +364,7 @@ pub fn run() -> ExitCode {
             tile_rows,
             max_weight_bytes,
             max_kv_bytes,
+            candidate_only,
         } => check_qwen_stream_cache_metal(
             &model,
             &input_ids,
@@ -368,6 +372,7 @@ pub fn run() -> ExitCode {
             tile_rows,
             max_weight_bytes,
             max_kv_bytes,
+            candidate_only,
         ),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
@@ -621,11 +626,28 @@ fn check_qwen_stream_cache_metal(
     tile_rows: u32,
     max_weight_bytes: u64,
     max_kv_bytes: u64,
+    candidate_only: bool,
 ) -> ExitCode {
     let Ok(tile_rows) = usize::try_from(tile_rows) else {
         eprintln!("Qwen streamed cache check failed: tile rows do not fit usize");
         return ExitCode::FAILURE;
     };
+    if candidate_only {
+        return match qwen::metal::run_streamed_cached_candidate(
+            model,
+            input_ids,
+            decode_ids,
+            max_weight_bytes,
+            max_kv_bytes,
+            tile_rows,
+        ) {
+            Ok(report) => print_stream_report(report),
+            Err(error) => {
+                eprintln!("Qwen streamed cache candidate failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match qwen::metal::qualify_streamed_cached_forward(
         model,
         input_ids,
@@ -1068,10 +1090,25 @@ mod tests {
         assert!(
             matches!(cli.command, super::Command::CheckQwenStreamCacheMetal {
             input_ids, decode_ids, max_weight_bytes: 81_798_144,
-            max_kv_bytes: 1_048_576, tile_rows: 1024, ..
+            max_kv_bytes: 1_048_576, tile_rows: 1024, candidate_only: false, ..
         } if input_ids == [9707, 11] && decode_ids == [1879, 151_935])
         );
         assert!(Cli::try_parse_from(["mx", "check-qwen-stream-cache-metal"]).is_err());
+        let candidate = Cli::try_parse_from([
+            "mx",
+            "check-qwen-stream-cache-metal",
+            "--model",
+            "model",
+            "--candidate-only",
+        ])
+        .expect("explicit candidate-only cached stream");
+        assert!(matches!(
+            candidate.command,
+            super::Command::CheckQwenStreamCacheMetal {
+                candidate_only: true,
+                ..
+            }
+        ));
         for (flag, value) in [
             ("--tile-rows", "0"),
             ("--tile-rows", "4097"),
