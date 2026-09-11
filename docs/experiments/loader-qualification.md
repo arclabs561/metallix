@@ -1,7 +1,8 @@
-# Bounded tensor and V4.1 shape qualification
+# Bounded Qwen loading and V4.1 shape qualification
 
 This pass qualifies selected Qwen tensor reads and initial V4.1 configuration
-relationships. It does not implement streamed layers, a weight pager, V4.1
+relationships. The later one-block experiment below executes selected weights.
+Neither experiment implements a full streamed decoder, a weight pager, V4.1
 text inference, or a process-wide memory ceiling.
 
 ## Qwen selected-tensor reads
@@ -46,11 +47,79 @@ Receipts: `artifacts/qwen-bounded-{norm,qproj}.json`. Executable SHA-256:
 Config SHA-256: `660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd`.
 Checkpoint SHA-256: `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`.
 
-Next gate: one-layer streamed execution, then full-logit and cached-forward
-parity with a measured total working set. Passing selected reads does not
-satisfy that gate. The subsequent
+The one-block experiment below advances the execution gate; full streamed
+forward and cached-forward parity with a measured total working set remain.
+Passing selected reads alone does not satisfy those gates. The subsequent
 [nested-header fix](../research/README.md#nested-header-uniqueness) closes the
 duplicate-key parser follow-up without changing the streamed-execution gate.
+
+## One-block selected-weight execution
+
+At `51f61d0`, [`qualify_layer`](../../crates/models/qwen/src/metal/layer_check.rs) reads the
+11 BF16 tensors required by one Qwen transformer block, widens them to FP32,
+and executes the same private block kernel used by uncached resident forward.
+It evaluates and reads back the output before releasing candidate weights.
+Inputs are deterministic nonzero hidden states, not outputs from preceding
+layers. Keep checkpoint files immutable throughout inspection and execution.
+The CLI is available at `1da7a18`.
+
+```sh
+target/release/metallix check-qwen-layer-metal --model /path/to/Qwen3-0.6B \
+  --layer 0 --tokens 3
+target/release/metallix check-qwen-layer-metal --model /path/to/Qwen3-0.6B \
+  --layer 27 --tokens 17
+/usr/bin/time -l target/release/metallix check-qwen-layer-metal \
+  --model /path/to/Qwen3-0.6B --layer 0 --tokens 3 \
+  --max-weight-bytes 81798144 --candidate-only
+```
+
+On the same M3 Max and checkpoint, 2026-09-11, both comparisons exited 0:
+layer 0 matched all 3,072 hidden-state values bit-for-bit; layer 27 matched
+all 17,408. The resident comparison qualifies the selected loader, not an
+independent block implementation. Separately, the existing CPU-reference
+suite passed full-vocabulary logits for prompt lengths 1, 3, 17 and 64 after
+the block extraction: zero mismatches under its tolerances, maximum absolute
+error `4.208087921142578e-5`. A small nonzero two-layer unit test also compares
+the extracted blocks with the independent cached-prefill implementation.
+
+Each layer reads 31,461,888 raw bytes and retains 62,923,776 logical FP32 bytes.
+The peak loading plan is 81,798,144 bytes: previously retained arrays plus the
+current raw tensor, host FP32 conversion and copied FP32 array. A budget of
+81,798,143 exited 1 with the planned-versus-allowed error before payload loading.
+The byte plan excludes hidden states, execution scratch, headers, allocator
+retention and the resident comparison. It is not a process-memory limit.
+
+Three serial, fresh-process candidate-only runs used the exact budget above:
+
+| Run | Load ms | Block execution ms | Maximum RSS bytes | Peak footprint bytes |
+|---|---:|---:|---:|---:|
+| 1 | 17.963 | 9.853 | 111,017,984 | 288,424,584 |
+| 2 | 18.516 | 9.662 | 111,001,600 | 288,408,200 |
+| 3 | 18.138 | 9.430 | 111,001,600 | 288,391,792 |
+
+Memory fields are the macOS `/usr/bin/time -l` process observations, including
+startup and inspection, not isolated GPU allocation counters. RSS and footprint
+are different OS accounting measures; neither is the logical weight plan.
+Each process performs one block execution with no warmup; timings are diagnostic,
+not steady-state decode throughput or a speedup. OS file-cache state was
+uncontrolled. No global cache flush or host memory-limit change was used.
+`--candidate-only` deliberately reports verification `not_run`; parity comes
+from the separate comparison commands, not the memory runs.
+
+Receipts: `artifacts/qwen-layer-{0,27}-compare.{json,stderr}`,
+`artifacts/qwen-layer-candidate-{1,2,3}.{json,time}`,
+`artifacts/qwen-layer-under-budget.{json,stderr}` and
+`artifacts/qwen-layer-parity.log`. Executable SHA-256:
+`3042adc141aba7b07c2ee4efd3f66a6e37eb49ad92e7236a79371446b1e99e6f`.
+Input hashes were rechecked and are unchanged from the selected-tensor section;
+the local hash receipt is `artifacts/qwen-layer-identities.txt`.
+Both canonical checks passed; receipts are
+`artifacts/check-layer-default.log` and `artifacts/check-layer-metal-r2.log`.
+
+Next: carry real hidden states through all layers, bound embeddings/output
+weights and KV separately, and measure repeated load/evaluate/release cycles.
+This result does not prove allocator reuse over a long generation or inference
+for a model exceeding RAM. V4.1 still needs its own layout and numerical gates.
 
 ## V4.1 initial dimensions and live cache sources
 

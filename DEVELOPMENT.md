@@ -75,6 +75,12 @@ For the first selected-tensor loader gate and V4.1 shape checks, follow
 diagnostic's byte limit applies to its selected raw payload, not the resident
 reference loader or the process's total memory.
 
+`check-qwen-layer-metal` extends this to one real block on synthetic hidden
+states. Its `--max-weight-bytes` bounds logical weights and loading staging,
+not scratch or process memory. Use `--candidate-only` when measuring process
+memory; it skips the resident comparison and explicitly reports no verification.
+Run the normal comparison separately. The qualification ledger records both.
+
 Use an optimized executable and a sustained workload. With Divan, directly
 invoking a benchmark executable needs `--bench`; otherwise it only runs tests.
 Confirm the output includes timed samples. Use headless `samply record
