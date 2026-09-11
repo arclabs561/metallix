@@ -108,6 +108,8 @@ reference files are cleaned up by the harness. See
 Removing layer-by-layer GPU waits reduced warm cached decode from 20.3 to
 8.74 ms per step on an M3 Max (three 32-token runs, 90 measured decode steps).
 This is a single-sequence diagnostic, not a serving-throughput comparison.
+The experiment page also documents a repeatable local benchmark harness with
+checkpoint hashes and per-run statistics.
 
 See [the architecture](docs/architecture.md) for the serving contract and
 delivery gates, and [the efficiency requirements](docs/research/efficiency-methods.md)
@@ -163,6 +165,7 @@ cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 node --test scripts/benchmark-openai.test.mjs
+uv run scripts/test_benchmark_qwen.py
 ```
 
 On Apple Silicon, also test the optional execution path:

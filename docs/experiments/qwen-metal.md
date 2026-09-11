@@ -52,6 +52,32 @@ uv run scripts/qwen-parity-suite.py \
 
 ## Decode measurements
 
+For new measurements, build the release executable and use the local harness:
+
+```sh
+cargo build -p server --release --features metal
+mkdir -p artifacts
+uv run scripts/benchmark-qwen.py --model /path/to/Qwen3-0.6B \
+  --output artifacts/qwen-benchmark.json
+```
+
+The output must be a new file: the harness refuses to overwrite prior evidence. Its defaults are
+three runs, 32 generated tokens, and one discarded decode observation per run.
+It records all timings, per-run medians, pooled statistics, hardware metadata,
+and binary/config/weight SHA-256 hashes. The checkout revision is an observation,
+not proof of which source built an arbitrary executable.
+
+Hashing warms the filesystem cache. Load and first-prefill times are retained
+separately, not folded into warm decode. A 300-second total deadline covers the
+run; the receipt records running, completed, failed, or interrupted state.
+Early EOS, differing generated IDs, enabled cache verification, invalid timings,
+or changed checkpoint/executable bytes fail the measurement. Run the independent
+parity suite separately before comparing performance.
+
+The first harness run on the same M3 Max measured 90 retained observations:
+median 8.812625 ms, mean 8.8707791 ms, sample standard deviation 0.2694133 ms.
+This reproduces the optimized single-sequence range, not a new optimization.
+
 The release baseline used greedy generation from raw IDs
 `785,6722,315,9625,374`, generated 32 tokens, and ran three times. Each run
 records 31 decode calls because the first generated token comes from prefill.
