@@ -1,0 +1,12 @@
+# Managed by repository-settings/app
+# https://github.com/repository-settings/app
+
+repository:
+  description: "Metallix qualifies model layouts and builds Metal execution paths for one Apple-Silicon Mac."
+  default_branch: main
+
+  topics:
+    - apple-silicon
+    - inference
+    - metal
+    - mlx
