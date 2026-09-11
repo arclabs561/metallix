@@ -3,7 +3,7 @@
 Metallix qualifies model layouts and builds Metal execution paths for one
 Apple-Silicon Mac. Its first target is DeepSeek-V4.1-Flash.
 
-Qwen3-0.6B is the working control: resident greedy generation, KV reuse, and
+Qwen3-0.6B is the working control: resident or streamed generation, KV reuse, and
 JSON Schema constraints run on Metal through MLX. DeepSeek-V4.1 currently has
 layout inspection and synthetic operator qualification, not a decoder.
 An OpenAI-compatible local service is intended; there is no HTTP server yet.
@@ -45,14 +45,18 @@ nonzero; only completed, independently validated JSON counts as success.
 
 `--preview` adds a readable stderr view without changing stdout. Score colors
 describe token likelihood, not answer correctness; non-TTY output and
-`NO_COLOR=1` disable color. `--logprobs` includes both original-model and
-grammar-conditioned token log probabilities. `--debug` / `--verbose` add
+`NO_COLOR=1` disable color. `--logprobs` includes original-model probabilities
+and, with a schema, grammar-conditioned scores. `--debug` / `--verbose` add
 metadata-only phase diagnostics. These options are off by default.
 See [the generation guide](DEVELOPMENT.md) for limits and score semantics.
 
 `--verify-cache` compares each cached result with a full-prefix Metal
 recomputation outside the measured decode regions. It is a correctness check,
 not an independent CPU reference or a serving benchmark.
+
+For layer-streamed generation, use `--max-tokens 16 --memory-mode streamed
+--max-weight-bytes 81798144 --max-kv-bytes 7340032` in the example above.
+Omit `--verify-cache` to avoid loading the resident verification model.
 
 | Feature | Enables |
 |---|---|
@@ -71,8 +75,8 @@ execution parity.
 logit comparisons and measured decode changes.
 [Streamed loading checks](docs/experiments/loader-qualification.md) include
 teacher-forced cached prefill and appends compared with resident controls.
-Streamed greedy generation remains unfinished. A logical weight-loading
-budget is not a process-memory ceiling or proof of larger-than-RAM serving.
+Streamed generation reuses the same constraints and sampling path. Its logical
+budgets are not process-memory ceilings or proof of larger-than-RAM serving.
 
 ## Development
 
@@ -93,8 +97,9 @@ checks without downloading model weights. Run them sequentially.
 
 ## Limitations
 
-Generation is currently a single resident FP32 Qwen sequence, using greedy
-selection and at most `min(model context, 512)` input plus generated tokens.
+Generation is a single FP32 Qwen sequence with greedy selection. Resident mode
+allows `min(model context, 512)` input plus generated tokens; streamed mode
+allows at most 32 and separately checks weight/staging and retained-KV budgets.
 There is no canonical text-prompt/chat-template pipeline, V4.1 decoder,
 HTTP serving, continuous batching, execution-backed paged KV, quantization
 conversion, or tuning workflow yet. Beyond-RAM execution remains a goal,

@@ -162,11 +162,32 @@ JSON diagnostic report, which intentionally includes input/generated IDs.
 Timing regions exclude the stderr writes, but logging can perturb a benchmark;
 leave verbosity off for comparisons. Resident generation has a 512-token
 diagnostic context cap (or the model's smaller configured limit), distinct from
-the streamed check's 32-token limit. Prompt and EOS IDs are checked before loading weights.
+the streamed path's 32-token limit. Prompt and EOS IDs are checked before loading weights.
 The local four-output-token smoke passed cache verification with and without
 verbosity; generated IDs and JSON field sets matched, and quiet stderr was
 empty. Receipts: `artifacts/gen-{debug,quiet}.{json,stderr}`. This verifies CLI
 behavior, not a generation-quality or speed improvement.
+
+For bounded layer-streamed generation, use:
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 16 --memory-mode streamed \
+  --max-weight-bytes 81798144 --max-kv-bytes 7340032 \
+  --json-schema fixtures/constraints/record.json --logprobs --preview
+```
+
+Resident mode remains the default. Streamed mode supports the same grammar,
+logprob and preview options, but reserves the full prompt-plus-output budget
+before reading candidate weights, even if generation later stops early.
+Its default K/V budget is 7,340,032 bytes and default output budget is four
+tokens (resident: 32). `--tile-rows` defaults to 1024. Stream-specific budget/tile
+flags are rejected in resident mode. These are logical weight/staging and
+retained-KV budgets, not process-memory caps: scratch, activations, headers,
+projection output and allocator retention are excluded. `--verify-cache`
+additionally loads a resident full-prefix oracle and excludes that verification
+from candidate timings; omit it when measuring candidate memory or speed.
+See [streamed generation measurements](docs/experiments/streamed-generation.md).
 
 For constrained JSON generation, build with `--all-features`, then add
 `--json-schema fixtures/constraints/record.json`. This optional path masks real

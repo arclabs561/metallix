@@ -53,7 +53,11 @@ now isolate that execution and directly compare its emitted logits with CPU.
 Teacher-forced cached streaming is also qualified against resident controls;
 [cached candidate-only measurements](../experiments/loader-qualification.md#candidate-only-cached-process-footprint)
 now isolate its process footprint and directly compare each step with CPU.
-Sampled streamed generation and repeated/variable-shape lifetimes remain next gates.
+The [streamed generation path](../experiments/streamed-generation.md) now reuses
+greedy sampling and grammar constraints with explicit weight/KV budgets.
+Long-running allocator behavior and larger contexts remain separate gates.
+The [V4.1 sparse-attention reference](../experiments/v41-attention.md) supplies
+a small CPU semantic oracle, not native BF16 or Metal-kernel parity.
 DeepSeek-V4.1 still needs its own text-forward numerical fixture;
 Qwen correctness does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.
