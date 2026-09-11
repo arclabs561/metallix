@@ -124,6 +124,9 @@ enum Command {
         layer: usize,
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=32))]
         tokens: u32,
+        /// Repeat this same synthetic-input layer diagnostic in one process.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        repeats: u32,
         /// Logical weights plus read/conversion staging; excludes scratch and reference.
         #[arg(long, default_value_t = 268_435_456, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
         max_weight_bytes: u64,
@@ -195,31 +198,79 @@ fn main() -> ExitCode {
             model,
             layer,
             tokens,
+            repeats,
             max_weight_bytes,
             candidate_only,
-        } => {
-            let mode = if candidate_only {
-                qwen::metal::LayerCheckMode::CandidateOnly
-            } else {
-                qwen::metal::LayerCheckMode::CompareResident
-            };
-            match qwen::metal::qualify_layer(&model, layer, tokens as usize, max_weight_bytes, mode)
-            {
-                Ok(result) => match serde_json::to_string_pretty(&result) {
-                    Ok(json) => {
-                        println!("{json}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(error) => {
-                        eprintln!("could not serialize layer check: {error}");
-                        ExitCode::FAILURE
-                    }
-                },
-                Err(error) => {
-                    eprintln!("Qwen layer check failed: {error}");
-                    ExitCode::FAILURE
-                }
+        } => check_qwen_layer_metal(
+            &model,
+            layer,
+            tokens as usize,
+            repeats,
+            max_weight_bytes,
+            candidate_only,
+        ),
+    }
+}
+
+#[cfg(feature = "metal")]
+#[derive(serde::Serialize)]
+struct LayerCheckCycles<T> {
+    schema_version: u32,
+    operation: &'static str,
+    repeats: usize,
+    runs: Vec<T>,
+    scope: &'static str,
+}
+
+#[cfg(feature = "metal")]
+fn layer_check_cycles<T>(runs: Vec<T>) -> LayerCheckCycles<T> {
+    let repeats = runs.len();
+    LayerCheckCycles {
+        schema_version: 1,
+        operation: "qwen3_selected_layer_cycles",
+        repeats,
+        runs,
+        scope: "repeated same-layer synthetic-input diagnostic, not sequential model layers or model inference; every cycle reinspects config and headers and creates fresh synthetic input, so this measures a whole diagnostic lifecycle rather than an inner hot loop",
+    }
+}
+
+#[cfg(feature = "metal")]
+fn check_qwen_layer_metal(
+    model: &std::path::Path,
+    layer: usize,
+    tokens: usize,
+    repeats: u32,
+    max_weight_bytes: u64,
+    candidate_only: bool,
+) -> ExitCode {
+    let mode = if candidate_only {
+        qwen::metal::LayerCheckMode::CandidateOnly
+    } else {
+        qwen::metal::LayerCheckMode::CompareResident
+    };
+    let mut reports = Vec::new();
+    for _ in 0..repeats {
+        match qwen::metal::qualify_layer(model, layer, tokens, max_weight_bytes, mode) {
+            Ok(report) => reports.push(report),
+            Err(error) => {
+                eprintln!("Qwen layer check failed: {error}");
+                return ExitCode::FAILURE;
             }
+        }
+    }
+    let json = if repeats == 1 {
+        serde_json::to_string_pretty(&reports[0])
+    } else {
+        serde_json::to_string_pretty(&layer_check_cycles(reports))
+    };
+    match json {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("could not serialize layer check: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -528,6 +579,7 @@ mod tests {
             cli.command,
             super::Command::CheckQwenLayerMetal {
                 tokens: 3,
+                repeats: 1,
                 max_weight_bytes: 268_435_456,
                 candidate_only: false,
                 ..
@@ -536,6 +588,8 @@ mod tests {
         for (flag, value) in [
             ("--tokens", "0"),
             ("--tokens", "33"),
+            ("--repeats", "0"),
+            ("--repeats", "65"),
             ("--max-weight-bytes", "0"),
             ("--max-weight-bytes", "1073741825"),
         ] {
@@ -557,15 +611,44 @@ mod tests {
             "--model",
             "model",
             "--candidate-only",
+            "--repeats",
+            "64",
         ])
         .unwrap();
         assert!(matches!(
             cli.command,
             super::Command::CheckQwenLayerMetal {
                 candidate_only: true,
+                repeats: 64,
                 ..
             }
         ));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn repeated_layer_checks_serialize_a_typed_cycle_envelope() {
+        let output = super::layer_check_cycles(vec![
+            serde_json::json!({"layer": 0}),
+            serde_json::json!({"layer": 0}),
+        ]);
+        let json = serde_json::to_value(output).expect("cycle envelope is serializable");
+
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["operation"], "qwen3_selected_layer_cycles");
+        assert_eq!(json["repeats"], 2);
+        assert_eq!(
+            json["runs"],
+            serde_json::json!([{"layer": 0}, {"layer": 0}])
+        );
+        let repeats = usize::try_from(json["repeats"].as_u64().expect("JSON repeat count"))
+            .expect("repeat count fits usize");
+        assert_eq!(json["runs"].as_array().map(Vec::len), Some(repeats));
+        assert!(
+            json["scope"]
+                .as_str()
+                .is_some_and(|scope| scope.contains("whole diagnostic lifecycle"))
+        );
     }
 
     fn root_help() -> String {
