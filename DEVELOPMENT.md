@@ -5,6 +5,53 @@ loader, numerical, and single-sequence decode experiments. A new model earns
 an adapter through a verified checkpoint contract and numerical reference, not
 through a model-name entry alone.
 
+The product priorities are larger-than-RAM model execution on one Mac, timely
+support for new architectures, structured/constrained generation and fast
+serving. Quantization and local adaptation are future workflows, not reasons
+to turn the serving engine into a training framework now. Each diagnostic
+should retire a gate toward those outcomes, not become the product itself.
+Track fit and speed separately: SSD-backed execution can enable a model without
+meeting a useful latency target. Constrained generation needs sampler-level
+token validity and completion/error semantics, not post-hoc JSON repair.
+
+## Keep model assumptions local
+
+The first two adapters are test cases, not a universal model architecture.
+Keep layer ordering, attention/cache representation, expert routing, embedding
+tying, positional encodings and packed weight layouts in their model adapters.
+The synchronous Qwen stream is a diagnostic implementation, not a required
+execution schedule for future models.
+
+Before promoting an adapter helper into the engine, demonstrate the shared
+contract with materially different execution/state needs. Stress-test proposed
+interfaces against recurrent or hybrid state, sliding or compressed attention,
+sparse expert loading, untied output heads and multimodal encoder state.
+These are design probes, not claims of implemented model support. Do not add
+empty traits or a capability flag for each hypothetical architecture.
+
+The engine's logical KV-page pool is useful for paged KV reservations; it is
+not a complete model-memory estimator or a mandatory state representation.
+Future admission must account for the adapter's actual state, scratch and
+weight-residency requirements. Prefix reuse and speculative rollback need
+explicit state-compatibility rules, not an assumption that every state is a
+token-indexed KV tensor.
+
+Choose fast paths by validated layout, precision, workload shape and backend
+capability, with a numerical fallback/reference and a measured crossover.
+Do not select them solely by model name or force all models through the same
+fusion, batching or offload strategy. Extract shared mechanisms when real
+adapters demonstrate reuse; retain specialized kernels where they earn it.
+
+Use Rust types to enforce these boundaries: validated layouts rather than raw
+configuration fields, distinct units for bytes/tokens/pages, owned reservation
+handles and explicit execution/verification outcomes. Construct validated values
+through fallible APIs and keep their invariants private. A candidate run is not
+a verified comparison; absent evidence must not become a zero-error result.
+Use enums for genuinely exclusive states and newtypes where mixing values is
+meaningfully wrong. Avoid boolean capability matrices, unchecked casts and
+speculative trait hierarchies; add type-state transitions where they prevent
+an actual invalid operation, not merely to encode the current implementation.
+
 ## Keep findings traceable
 
 Use the [research index](docs/research/README.md) to connect sources, code,
@@ -86,7 +133,12 @@ for the exact command and checkpoint identity.
 `check-qwen-stream-metal` composes a complete uncached forward for at most 32
 raw tokens. `--max-weight-bytes` limits the planned maximum sequential
 weight/loading stage, not process memory; the resident oracle runs afterward
-and is outside that budget. See the
+and is outside that budget. Add `--candidate-only` to exclude the oracle from
+process-memory measurement. That mode emits all final-token logits and a
+distinct `candidate_only` verification status, with no comparison fields.
+Treat those logits as explicit diagnostic output, not general telemetry.
+Run the normal comparison separately; candidate timing excludes report
+serialization, while an external process measurement includes it. See the
 [complete stream ledger](docs/experiments/loader-qualification.md#complete-synchronous-streamed-forward).
 
 `check-qwen-layer-metal` extends this to one real block on synthetic hidden

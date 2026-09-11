@@ -17,6 +17,7 @@ explicit gaps, not retrospectively pinned evidence.
 | What runs on Metal, and what improved? | [Qwen qualification ledger](../experiments/qwen-metal.md) |
 | Can selected weights execute a block, and what checks precede V4.1 loading? | [Loader qualification](../experiments/loader-qualification.md) |
 | How are experiments run? | [Developer guide](../../DEVELOPMENT.md) |
+| What can we learn from serving adoption, hardware DSE and teaching implementations? | [Serving in the wild](serving-in-the-wild.md), [LLMShare](llmshare.md), [Inference book code](llm-model-inference.md) |
 
 ## Technical reference guide
 
@@ -41,7 +42,9 @@ Mac experiment, not portable performance guarantees.
 
 The [complete uncached Qwen stream](../experiments/loader-qualification.md#complete-synchronous-streamed-forward)
 now composes bounded embedding, layer and projection reads against the resident
-oracle. Next are candidate-only memory measurements and cached streaming.
+oracle. [Candidate-only process measurements](../experiments/loader-qualification.md#candidate-only-process-footprint)
+now isolate that execution and directly compare its emitted logits with CPU.
+Next are repeated/variable-shape lifetimes and cached streaming.
 DeepSeek-V4.1 still needs its own text-forward numerical fixture;
 Qwen correctness does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.

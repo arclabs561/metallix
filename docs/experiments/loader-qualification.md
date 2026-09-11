@@ -232,9 +232,76 @@ generation throughput. Receipts: `artifacts/stream-oracle-{0,1,2}.json` and
 `artifacts/stream-repeat-{1,2,3}.json`, with corresponding stderr. Executable:
 `3507f68f2a1647a94fa81ed44bac13809e74f4dbfa385cd836f2b57a29f74205`.
 
-Next: isolate candidate-only process-memory measurements, then qualify cached
-streaming. DeepSeek-V4.1 needs its own numerical fixtures and operators; this
+The candidate-only measurement below advances the memory gate. Cached streaming
+and DeepSeek-V4.1's own numerical fixtures/operators remain unfinished; this
 Qwen result does not establish V4.1 support.
+
+### Candidate-only process footprint
+
+At `2d387fa` (Qwen) and `44d14bf` (CLI), `--candidate-only` uses the same
+planning and numerical path without constructing the resident oracle.
+Its distinct Rust report contains complete candidate logits
+and `verification: "candidate_only"`, never comparison/error-count fields.
+Non-finite logits fail with an indexed typed error before JSON serialization.
+
+```sh
+/usr/bin/time -l target/release/mx check-qwen-stream-metal \
+  --model /path/to/Qwen3-0.6B --input-ids 9707,11,1879 \
+  --tile-rows 1024 --max-weight-bytes 81798144 --candidate-only
+```
+
+Three serial fresh processes on the same M3 Max/checkpoint, 2026-09-11:
+
+| Trial | Maximum RSS, bytes | Peak footprint, bytes | Candidate time, ms |
+|---|---:|---:|---:|
+| 1 | 117,948,416 | 295,060,152 | 586.590 |
+| 2 | 118,816,768 | 295,912,096 | 371.754 |
+| 3 | 118,931,456 | 296,043,192 | 367.804 |
+
+Footprint median: 295,912,096 bytes; min–max span: 983,040 bytes.
+Candidate-time median: 371.754 ms. OS cache and compilation state were not
+controlled; the first run is not evidence of steady-state performance.
+Process peaks include inspection, runtime/allocator overhead and output
+serialization. Candidate time excludes planning and serialization. Neither
+memory counter is the 81,798,144-byte logical weight/staging budget.
+
+The earlier oracle-inclusive command measured 3,606,627,960–3,934,291,792 bytes
+of peak footprint. That comparison demonstrates oracle contamination, not an
+inference optimization: the commands perform different work. The candidate
+still requests 1,192,105,984 payload bytes cumulatively for this input. This is
+not measured physical SSD traffic or evidence of a checkpoint exceeding RAM.
+
+A separate CPU float32 eager capture (Transformers 5.12.1, Torch 2.13.0,
+one thread) checked all 151,936 emitted logits from each candidate process.
+Maximum absolute error was approximately 4.10e-5, with zero mismatches under
+`5e-4 + 1e-4 * abs(reference)`. Unlike the earlier transitive check, this
+compares candidate output directly with CPU output. CPU loading ran outside
+the measured processes. Input/config/checkpoint identities matched those above.
+The capture command was `uv run scripts/qwen-reference.py --model
+/path/to/Qwen3-0.6B --input-ids 9707,11,1879 --logits-output
+artifacts/stream-memory-cpu.f32`; stdout was retained as the JSON manifest.
+The comparison decoded this sidecar as little-endian FP32, checked equal vector
+lengths and finite values, then applied the stated tolerance elementwise to
+each JSON `candidate_logits` vector.
+The default resident comparison still passed with zero observed error;
+candidate-only budget 81,798,143 failed with empty stdout.
+
+Receipts: `artifacts/stream-memory-before-{1,2,3}.{json,time}`,
+`artifacts/stream-memory-candidate-{1,2,3}.{json,time}`,
+`artifacts/stream-memory-cpu.{json,f32,stderr}`,
+`artifacts/stream-memory-direct-parity.json`, and
+`artifacts/stream-memory-{qualified-after,under-budget}.{json,stderr}`.
+Candidate executable SHA-256:
+`79b1a25df32c6fa7472bb027d166ccc2c854cf0258493ee8043bdc4b6a5083a5`.
+Baseline executable is the preceding `3507f68...` identity.
+Canonical Metal/default checks and release build passed; logs are
+`artifacts/check-stream-candidate-metal-final.log`,
+`artifacts/check-stream-candidate-default.log` and
+`artifacts/build-stream-candidate-release.log`.
+
+Next: measure repeated complete forwards and varying shapes before making an
+allocator-stability claim, then qualify cached streamed generation and growing
+state. Keep Qwen's sequential weight schedule adapter-local.
 
 ## One-block selected-weight execution
 
