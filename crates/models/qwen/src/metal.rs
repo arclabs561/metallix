@@ -15,6 +15,8 @@ mod row_check;
 pub use row_check::{Qwen3TensorRowsCheck, qualify_tensor_rows};
 mod embedding_check;
 pub use embedding_check::{Qwen3EmbeddingCheck, qualify_embedding};
+mod projection_check;
+pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
 #[derive(Debug, serde::Serialize)]
