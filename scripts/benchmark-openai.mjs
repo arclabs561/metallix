@@ -6,6 +6,7 @@ const defaults = {
   concurrency: 1,
   maxTokens: 64,
   requests: 3,
+  timeoutMs: 120_000,
   warmup: 1,
 };
 
@@ -14,7 +15,7 @@ const cacheConditions = new Set(["cold-start", "warm", "mixed"]);
 function usage(message) {
   if (message) console.error(message);
   console.error(
-    "usage: node scripts/benchmark-openai.mjs --url URL --model MODEL --cache-condition cold-start|warm|mixed [--prompt TEXT] [--requests N] [--concurrency N] [--max-tokens N] [--warmup N] [--seed N]",
+    "usage: node scripts/benchmark-openai.mjs --url URL --model MODEL --cache-condition cold-start|warm|mixed [--prompt TEXT] [--requests N] [--concurrency N] [--max-tokens N] [--warmup N] [--seed N] [--timeout-ms N]",
   );
   process.exitCode = 2;
 }
@@ -49,6 +50,7 @@ function parseArgs(arguments_) {
       case "--requests": options.requests = parsePositiveInteger(value, flag); break;
       case "--concurrency": options.concurrency = parsePositiveInteger(value, flag); break;
       case "--max-tokens": options.maxTokens = parsePositiveInteger(value, flag); break;
+      case "--timeout-ms": options.timeoutMs = parsePositiveInteger(value, flag); break;
       case "--warmup": options.warmup = parseNonNegativeInteger(value, flag); break;
       case "--seed": {
         const seed = Number(value);
@@ -111,6 +113,8 @@ function createSseParser(onEvent) {
 
 async function runRequest(options) {
   const started = performance.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
   const payload = {
     model: options.model,
     messages: [{ role: "user", content: options.prompt }],
@@ -120,22 +124,25 @@ async function runRequest(options) {
     stream_options: { include_usage: true },
   };
   if (options.seed !== undefined) payload.seed = options.seed;
-  const response = await fetch(`${options.url}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok || !response.body) throw new Error(`request failed: ${response.status} ${response.statusText}`);
+  let reader;
+  try {
+    const response = await fetch(`${options.url}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) throw new Error(`request failed: ${response.status} ${response.statusText}`);
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let firstEvent;
-  let firstContentDelta;
-  let lastContentDelta;
-  let contentDeltaCount = 0;
-  let usage;
-  let receivedDone = false;
-  const parser = createSseParser((data) => {
+    reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let firstEvent;
+    let firstContentDelta;
+    let lastContentDelta;
+    let contentDeltaCount = 0;
+    let usage;
+    let receivedDone = false;
+    const parser = createSseParser((data) => {
     const now = performance.now();
     firstEvent ??= now;
     if (data === "[DONE]") {
@@ -148,6 +155,7 @@ async function runRequest(options) {
     } catch {
       throw new Error("server returned an invalid JSON SSE data event");
     }
+      if (event.error) throw new Error("server returned an SSE error event");
     if (event.choices?.some((choice) => {
       const content = choice.delta?.content;
       return typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
@@ -156,21 +164,30 @@ async function runRequest(options) {
       lastContentDelta = now;
       contentDeltaCount += 1;
     }
-    if (event.usage) usage = event.usage;
-  });
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parser.push(decoder.decode(value, { stream: true }));
-  }
-  parser.push(decoder.decode());
-  parser.finish();
-  const totalMs = performance.now() - started;
-  const completionTokens = Number.isSafeInteger(usage?.completion_tokens) ? usage.completion_tokens : null;
-  const promptTokens = Number.isSafeInteger(usage?.prompt_tokens) ? usage.prompt_tokens : null;
-  const firstStreamEventMs = firstEvent === undefined ? null : firstEvent - started;
-  const ttftMs = firstContentDelta === undefined ? null : firstContentDelta - started;
-  return {
+      if (event.usage) {
+        tokenCount(event.usage.completion_tokens, "completion_tokens");
+        tokenCount(event.usage.prompt_tokens, "prompt_tokens");
+        usage = event.usage;
+      }
+    });
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parser.push(decoder.decode(value, { stream: true }));
+      if (receivedDone) {
+        await reader.cancel();
+        break;
+      }
+    }
+    parser.push(decoder.decode());
+    parser.finish();
+    if (!receivedDone) throw new Error("stream ended without [DONE]");
+    const totalMs = performance.now() - started;
+    const completionTokens = tokenCount(usage?.completion_tokens, "completion_tokens");
+    const promptTokens = tokenCount(usage?.prompt_tokens, "prompt_tokens");
+    const firstStreamEventMs = firstEvent === undefined ? null : firstEvent - started;
+    const ttftMs = firstContentDelta === undefined ? null : firstContentDelta - started;
+    return {
     first_stream_event_ms: firstStreamEventMs === null ? null : Math.round(firstStreamEventMs * 1000) / 1000,
     ttft_ms: ttftMs === null ? null : Math.round(ttftMs * 1000) / 1000,
     total_ms: Math.round(totalMs * 1000) / 1000,
@@ -183,8 +200,23 @@ async function runRequest(options) {
     content_delta_count: contentDeltaCount,
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
-    received_done: receivedDone,
-  };
+      received_done: receivedDone,
+    };
+  } catch (error) {
+    await reader?.cancel(error).catch(() => {});
+    if (controller.signal.aborted) throw new Error(`request timed out after ${options.timeoutMs} ms`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function tokenCount(value, name) {
+  if (value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`server returned an invalid ${name} usage value`);
+  }
+  return value;
 }
 
 function median(values) {
@@ -229,6 +261,7 @@ async function main() {
       requests: options.requests,
       concurrency: options.concurrency,
       max_tokens: options.maxTokens,
+      timeout_ms: options.timeoutMs,
       warmup_requests_excluded: options.warmup,
       sampling: { temperature: 0, seed: options.seed ?? null },
       streaming: { requested: true, include_usage: true },
