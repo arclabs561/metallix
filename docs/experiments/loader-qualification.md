@@ -53,6 +53,44 @@ Passing selected reads alone does not satisfy those gates. The subsequent
 [nested-header fix](../research/README.md#nested-header-uniqueness) closes the
 duplicate-key parser follow-up without changing the streamed-execution gate.
 
+## Contiguous BF16 row reads
+
+The adapter-private [`read_bf16_rows`](../../crates/models/qwen/src/checkpoint/read.rs)
+reads a nonempty half-open range from a validated rank-two BF16 tensor. Checked
+arithmetic establishes containment and the selected raw-byte budget before
+payload allocation or opening the shard. Inspection still reads headers.
+[`qualify_tensor_rows`](../../crates/models/qwen/src/metal/row_check.rs)
+compares the selected values with a slice from the independent resident MLX
+loader. It slices BF16 reference rows before widening them to FP32.
+
+```sh
+target/release/metallix check-qwen-rows-metal --model /path/to/Qwen3-0.6B \
+  --start-row 65535 --rows 3 --max-bytes 6144
+```
+
+On M3 Max, the same Qwen checkpoint identified above produced:
+
+| Embedding rows (half-open) | Raw bytes | Values compared | Result |
+|---|---:|---:|---|
+| `65535..65538` | 6,144 | 3,072 | Bit-exact |
+| `151935..151936` | 2,048 | 1,024 | Bit-exact |
+| `0..4096` | 8,388,608 | 4,194,304 | Bit-exact |
+
+All three commands exited 0. The middle slice with `--max-bytes 6143` and
+the out-of-bounds `--start-row 151936 --rows 1` each exited 1. Unit tests
+also cover invalid dtype/rank, empty/reversed ranges, exact budgets and
+rejection before payload I/O. Default and Metal canonical checks passed.
+
+Receipts: `artifacts/qwen-rows-{middle,last,tile}.json`, corresponding stderr
+files, `artifacts/qwen-rows-{budget,oob}.stderr`, and
+`artifacts/check-rows-{default,metal}.log`. Executable SHA-256:
+`ecdde624d791f885dcef99f2a8c3f018df1325371c9ffcfa9e914821e19fa5ab`.
+
+This prepares embedding lookup and tiled output-projection experiments; it
+does not implement either in the decoder. The raw budget excludes decoded
+FP32 buffers, headers, allocator overhead and the full resident reference.
+Single read timings do not establish SSD throughput or a performance gain.
+
 ## One-block selected-weight execution
 
 At `51f61d0`, [`qualify_layer`](../../crates/models/qwen/src/metal/layer_check.rs) reads the

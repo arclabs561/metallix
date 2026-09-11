@@ -128,6 +128,20 @@ Silicon. It builds native MLX, requiring CMake and a working Xcode Metal toolcha
 cargo build --workspace
 ```
 
+Both `mx` and `metallix` are native executables sharing the same CLI. Build
+and run either name from the repository root:
+
+```sh
+cargo build -p server --release --features metal
+target/release/mx --help
+target/release/metallix --help
+```
+
+Existing `cargo run -p server -- ...` commands still select `metallix`.
+Use `--bin mx` to select the short name explicitly. Before installing `mx`
+on your PATH, check `command -v mx`: other tools, including GraalVM's build
+tool, use that name. No shell alias or shell-configuration change is required.
+
 ## Benchmark a compatible server
 
 The checked-in benchmark client measures TTFT to the first non-empty content
