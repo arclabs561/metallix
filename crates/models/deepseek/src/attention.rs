@@ -10,6 +10,11 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
+#[cfg(feature = "metal")]
+mod metal;
+#[cfg(feature = "metal")]
+pub use metal::{SparseAttentionMetalError, sparse_attention_metal_f32};
+
 /// Validated dense buffers and sparse-index shape for one attention call.
 ///
 /// Query values are contiguous `[batch, query_position, head, dimension]`;
