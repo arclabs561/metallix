@@ -78,6 +78,8 @@ def main() -> int:
         ),
         (["cargo", "doc", "--workspace", "--no-deps", *feature_args], True),
         ([sys.executable, "scripts/test_benchmark_qwen.py"], False),
+        ([sys.executable, "scripts/test_compare_qwen.py"], False),
+        ([sys.executable, "scripts/test_checkpoint_io.py"], False),
         (["node", "--test", "scripts/benchmark-openai.test.mjs"], False),
         (["ruff", "check", "scripts"], False),
         (["ruff", "format", "--check", "scripts"], False),
