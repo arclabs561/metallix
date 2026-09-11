@@ -134,6 +134,12 @@ impl Qwen3ForwardConfig {
             .and_then(|value| value.checked_mul(u64::try_from(size_of::<f32>()).ok()?))
             .ok_or(Qwen3ForwardError::ShapeOverflow)
     }
+
+    /// Effective context limit of the bounded dense qualification path.
+    #[must_use]
+    pub(crate) fn maximum_cached_tokens(&self) -> usize {
+        MAX_DENSE_DEBUG_TOKENS.min(self.max_position_embeddings)
+    }
 }
 
 /// Runs a complete uncached Qwen3 forward pass and reads back the last-token

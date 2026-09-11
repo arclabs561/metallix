@@ -20,6 +20,7 @@ use crate::{
 const FINAL_NORM: &str = "model.norm.weight";
 const ABSOLUTE_TOLERANCE: f32 = 5e-4;
 const RELATIVE_TOLERANCE: f32 = 1e-4;
+const STREAM_EXECUTOR_MAX_TOKENS: usize = 32;
 
 /// Per-layer candidate evidence in a synchronous streamed qualification.
 #[derive(Debug, serde::Serialize)]
@@ -354,6 +355,219 @@ fn prepare_cached_stream(
         });
     }
     Ok((plan, planned_final_kv_bytes))
+}
+
+/// Reusable, candidate-only Qwen3 executor with layer-at-a-time weight reads.
+///
+/// This is deliberately adapter-local: it retains only detached Qwen3 K/V,
+/// the initial prompt, and the most recently produced logits. It does not
+/// construct a resident checkpoint oracle or retain a per-step history.
+/// Weight and K/V budgets are logical planning contracts; they do not cover
+/// MLX allocator retention, activations, or operator scratch.
+pub struct Qwen3StreamExecutor {
+    plan: StreamForwardPlan,
+    prompt_ids: Vec<i32>,
+    max_total_tokens: usize,
+    max_kv_bytes: u64,
+    cache: Vec<Option<Qwen3LayerKv>>,
+    cached_tokens: usize,
+    retained_kv_bytes: u64,
+    current_logits: Vec<f32>,
+    state: StreamExecutorState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamExecutorState {
+    Ready,
+    Prefilled,
+    Poisoned,
+}
+
+impl Qwen3StreamExecutor {
+    /// Plans a bounded streamed sequence before reading any tensor payload.
+    ///
+    /// `max_total_tokens` includes the supplied prompt and every later decode
+    /// token. It is therefore a conservative, fixed K/V reservation contract.
+    pub fn new(
+        model: &Path,
+        prompt_ids: &[i32],
+        max_total_tokens: usize,
+        max_weight_bytes: u64,
+        max_kv_bytes: u64,
+        tile_rows: usize,
+    ) -> Result<Self, Qwen3MetalLoadError> {
+        // `StreamForwardPlan::new` reads only configuration and safetensors
+        // metadata. It validates prompt IDs against the inspected vocabulary;
+        // tensor payloads are first read by prefill/decode below.
+        let plan = StreamForwardPlan::new(model, prompt_ids, max_weight_bytes, tile_rows)?;
+        validate_executor_context(
+            prompt_ids.len(),
+            max_total_tokens,
+            STREAM_EXECUTOR_MAX_TOKENS.min(plan.config.maximum_cached_tokens()),
+        )?;
+        let planned_final_kv_bytes = plan.config.cached_kv_bytes(max_total_tokens)?;
+        if planned_final_kv_bytes > max_kv_bytes {
+            return Err(Qwen3MetalLoadError::CachedStateBudget {
+                required: planned_final_kv_bytes,
+                maximum: max_kv_bytes,
+            });
+        }
+        let cache = (0..plan.config.hidden_layers()).map(|_| None).collect();
+        Ok(Self {
+            plan,
+            prompt_ids: prompt_ids.to_vec(),
+            max_total_tokens,
+            max_kv_bytes,
+            cache,
+            cached_tokens: 0,
+            retained_kv_bytes: 0,
+            current_logits: Vec::new(),
+            state: StreamExecutorState::Ready,
+        })
+    }
+
+    /// Fills the cache from the constructor prompt and returns the final logits.
+    pub fn prefill_last_logits(&mut self) -> Result<Vec<f32>, Qwen3MetalLoadError> {
+        match self.state {
+            StreamExecutorState::Ready => self.append_prefill(),
+            StreamExecutorState::Prefilled => Err(Qwen3MetalLoadError::StreamPrefillAlreadyDone),
+            StreamExecutorState::Poisoned => Err(Qwen3MetalLoadError::StreamPoisoned),
+        }
+    }
+
+    /// Appends one token and returns its final logits.
+    pub fn decode_last_logits(&mut self, token: i32) -> Result<Vec<f32>, Qwen3MetalLoadError> {
+        match self.state {
+            StreamExecutorState::Ready => {
+                return Err(Qwen3MetalLoadError::StreamDecodeWithoutPrefill);
+            }
+            StreamExecutorState::Poisoned => return Err(Qwen3MetalLoadError::StreamPoisoned),
+            StreamExecutorState::Prefilled => {}
+        }
+        let next_tokens =
+            self.cached_tokens
+                .checked_add(1)
+                .ok_or(Qwen3MetalLoadError::DimensionOutOfRange(
+                    "cached token count",
+                ))?;
+        if next_tokens > self.max_total_tokens {
+            return Err(Qwen3MetalLoadError::StreamContextLimit {
+                requested: next_tokens,
+                maximum: self.max_total_tokens,
+            });
+        }
+        validate_stream_token(token, self.plan.inspection.contract().vocab_size())?;
+        self.append(&[token])
+    }
+
+    /// Number of tokens represented by every live cache layer.
+    #[must_use]
+    pub const fn cached_tokens(&self) -> usize {
+        self.cached_tokens
+    }
+
+    /// Logical byte total of the retained detached K/V arrays.
+    #[must_use]
+    pub const fn kv_bytes(&self) -> u64 {
+        self.retained_kv_bytes
+    }
+
+    /// Peak planned weight and explicit staging bytes for one streamed stage.
+    #[must_use]
+    pub const fn planned_weight_bytes(&self) -> u64 {
+        self.plan.memory.peak
+    }
+
+    fn append_prefill(&mut self) -> Result<Vec<f32>, Qwen3MetalLoadError> {
+        let prompt_ids = self.prompt_ids.clone();
+        self.append(&prompt_ids)
+    }
+
+    fn append(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3MetalLoadError> {
+        let result = run_cached_append(&self.plan, input_ids, self.cached_tokens, &mut self.cache)
+            .and_then(|logits| {
+                validate_candidate_logits(&logits)?;
+                let next_tokens = self.cached_tokens.checked_add(input_ids.len()).ok_or(
+                    Qwen3MetalLoadError::DimensionOutOfRange("cached token count"),
+                )?;
+                let retained = cached_kv_bytes(&self.cache)?;
+                let expected = self.plan.config.cached_kv_bytes(next_tokens)?;
+                if retained != expected {
+                    return Err(crate::forward::Qwen3ForwardError::CacheInconsistent.into());
+                }
+                if retained > self.max_kv_bytes {
+                    return Err(Qwen3MetalLoadError::CachedStateBudget {
+                        required: retained,
+                        maximum: self.max_kv_bytes,
+                    });
+                }
+                Ok((logits, next_tokens, retained))
+            });
+        match result {
+            Ok((logits, next_tokens, retained_kv_bytes)) => {
+                self.cached_tokens = next_tokens;
+                self.retained_kv_bytes = retained_kv_bytes;
+                self.current_logits = logits;
+                self.state = StreamExecutorState::Prefilled;
+                Ok(self.current_logits.clone())
+            }
+            Err(error) => {
+                self.poison();
+                Err(error)
+            }
+        }
+    }
+
+    fn poison(&mut self) {
+        self.cache.iter_mut().for_each(|entry| *entry = None);
+        self.cached_tokens = 0;
+        self.retained_kv_bytes = 0;
+        self.current_logits.clear();
+        self.state = StreamExecutorState::Poisoned;
+    }
+}
+
+fn validate_executor_context(
+    prompt_tokens: usize,
+    max_total_tokens: usize,
+    configured_maximum: usize,
+) -> Result<(), Qwen3MetalLoadError> {
+    if max_total_tokens < prompt_tokens {
+        return Err(Qwen3MetalLoadError::StreamMaximumBelowPrompt {
+            maximum: max_total_tokens,
+            prompt_tokens,
+        });
+    }
+    if max_total_tokens > configured_maximum {
+        return Err(Qwen3MetalLoadError::StreamContextLimit {
+            requested: max_total_tokens,
+            maximum: configured_maximum,
+        });
+    }
+    Ok(())
+}
+
+fn validate_stream_token(token: i32, vocab_size: u32) -> Result<(), Qwen3MetalLoadError> {
+    if u32::try_from(token).map_or(true, |id| id >= vocab_size) {
+        return Err(Qwen3MetalLoadError::InvalidTokenId { token, vocab_size });
+    }
+    Ok(())
+}
+
+fn cached_kv_bytes(cache: &[Option<Qwen3LayerKv>]) -> Result<u64, Qwen3MetalLoadError> {
+    cache.iter().flatten().try_fold(0_u64, |total, kv| {
+        let bytes = u64::try_from(kv.keys.nbytes())
+            .ok()
+            .and_then(|keys| {
+                u64::try_from(kv.values.nbytes())
+                    .ok()
+                    .and_then(|values| keys.checked_add(values))
+            })
+            .ok_or(Qwen3MetalLoadError::DimensionOutOfRange("cached KV bytes"))?;
+        total
+            .checked_add(bytes)
+            .ok_or(Qwen3MetalLoadError::DimensionOutOfRange("cached KV bytes"))
+    })
 }
 
 struct CachedCandidateStep {
@@ -972,6 +1186,8 @@ fn load_bf16_tensor(
 
 #[cfg(test)]
 mod tests {
+    use std::{env, path::PathBuf, time::Instant};
+
     use mlx_rs::{Array, StreamOrDevice};
 
     use crate::GPU_TEST_LOCK;
@@ -979,7 +1195,8 @@ mod tests {
     use super::{
         EmbeddingPlan, LayerPlan, ProjectionPlan, Qwen3StreamCachedCandidateReport,
         Qwen3StreamCachedCandidateStep, Qwen3StreamCandidateReport, Qwen3StreamLayer,
-        Qwen3StreamVerification, StreamMemoryPlan,
+        Qwen3StreamVerification, StreamMemoryPlan, validate_executor_context,
+        validate_stream_token,
     };
 
     #[test]
@@ -1019,6 +1236,138 @@ mod tests {
                 crate::forward::Qwen3ForwardError::EmptyInput
             ))
         ));
+    }
+
+    #[test]
+    fn reusable_executor_preflight_reserves_the_entire_promised_context() {
+        assert!(validate_executor_context(3, 32, 32).is_ok());
+        assert!(matches!(
+            validate_executor_context(3, 2, 32),
+            Err(super::Qwen3MetalLoadError::StreamMaximumBelowPrompt {
+                maximum: 2,
+                prompt_tokens: 3,
+            })
+        ));
+        assert!(matches!(
+            validate_executor_context(3, 33, 32),
+            Err(super::Qwen3MetalLoadError::StreamContextLimit {
+                requested: 33,
+                maximum: 32,
+            })
+        ));
+    }
+
+    #[test]
+    fn reusable_executor_token_preflight_rejects_invalid_ids_before_execution() {
+        assert!(validate_stream_token(0, 8).is_ok());
+        assert!(validate_stream_token(7, 8).is_ok());
+        for token in [-1, 8, i32::MAX] {
+            assert!(matches!(
+                validate_stream_token(token, 8),
+                Err(super::Qwen3MetalLoadError::InvalidTokenId {
+                    token: actual,
+                    vocab_size: 8,
+                }) if actual == token
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+    fn streamed_executor_repeated_lifetimes_keep_only_live_candidate_cache() {
+        let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+            eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+            return;
+        };
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+
+        // These are independent executor lifetimes in one process. There is
+        // intentionally no resident model or cached/full-prefix oracle here.
+        for (request, prompt_ids, maximum_total_tokens, decode_ids) in [
+            (0, &[9_707, 11][..], 4_usize, &[13, 13][..]),
+            (1, &[9_707, 11, 1_879][..], 6_usize, &[13, 13, 13][..]),
+        ] {
+            let started = Instant::now();
+            let mut executor = super::Qwen3StreamExecutor::new(
+                &model,
+                prompt_ids,
+                maximum_total_tokens,
+                u64::MAX,
+                u64::MAX,
+                1_024,
+            )
+            .expect("candidate-only executor plan");
+            assert_eq!(executor.cached_tokens(), 0);
+            assert_eq!(executor.kv_bytes(), 0);
+            assert!(
+                executor
+                    .prefill_last_logits()
+                    .expect("prefill logits")
+                    .len()
+                    > 1
+            );
+            assert_eq!(executor.cached_tokens(), prompt_ids.len());
+            assert_eq!(
+                executor.kv_bytes(),
+                executor
+                    .plan
+                    .config
+                    .cached_kv_bytes(prompt_ids.len())
+                    .expect("prefill logical KV plan")
+            );
+
+            let before_invalid = (executor.cached_tokens(), executor.kv_bytes());
+            assert!(matches!(
+                executor.decode_last_logits(i32::MAX),
+                Err(super::Qwen3MetalLoadError::InvalidTokenId { .. })
+            ));
+            assert_eq!(
+                (executor.cached_tokens(), executor.kv_bytes()),
+                before_invalid,
+                "invalid token must fail before cache mutation"
+            );
+            assert!(matches!(
+                executor.prefill_last_logits(),
+                Err(super::Qwen3MetalLoadError::StreamPrefillAlreadyDone)
+            ));
+
+            for &token in decode_ids {
+                assert!(
+                    executor
+                        .decode_last_logits(token)
+                        .expect("decode logits")
+                        .len()
+                        > 1
+                );
+                assert_eq!(
+                    executor.kv_bytes(),
+                    executor
+                        .plan
+                        .config
+                        .cached_kv_bytes(executor.cached_tokens())
+                        .expect("decode logical KV plan")
+                );
+            }
+            assert_eq!(executor.cached_tokens(), maximum_total_tokens);
+            let before_limit = (executor.cached_tokens(), executor.kv_bytes());
+            assert!(matches!(
+                executor.decode_last_logits(13),
+                Err(super::Qwen3MetalLoadError::StreamContextLimit { .. })
+            ));
+            assert_eq!(
+                (executor.cached_tokens(), executor.kv_bytes()),
+                before_limit,
+                "context-limit rejection must not mutate the live cache"
+            );
+            eprintln!(
+                "stream executor lifecycle request={request} prompt_tokens={} total_tokens={} logical_kv_bytes={} planned_weight_bytes={} elapsed_ms={:.3}",
+                prompt_ids.len(),
+                executor.cached_tokens(),
+                executor.kv_bytes(),
+                executor.planned_weight_bytes(),
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
     }
 
     #[test]

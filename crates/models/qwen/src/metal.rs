@@ -20,8 +20,8 @@ pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
 mod stream_check;
 pub use stream_check::{
     Qwen3StreamCachedCandidateReport, Qwen3StreamCachedCheck, Qwen3StreamCandidateReport,
-    Qwen3StreamCheck, qualify_streamed_cached_forward, qualify_streamed_forward,
-    run_streamed_cached_candidate, run_streamed_forward_candidate,
+    Qwen3StreamCheck, Qwen3StreamExecutor, qualify_streamed_cached_forward,
+    qualify_streamed_forward, run_streamed_cached_candidate, run_streamed_forward_candidate,
 };
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
@@ -349,6 +349,31 @@ pub enum Qwen3MetalSmokeError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Qwen3MetalLoadError {
+    /// A streamed executor promised fewer total tokens than its initial prompt.
+    #[error("streamed executor maximum {maximum} is smaller than prompt length {prompt_tokens}")]
+    StreamMaximumBelowPrompt {
+        /// Total context requested by the caller.
+        maximum: usize,
+        /// Tokens that must be consumed during prefill.
+        prompt_tokens: usize,
+    },
+    /// A streamed executor requested more context than this qualified path supports.
+    #[error("streamed executor requested {requested} total tokens, maximum is {maximum}")]
+    StreamContextLimit {
+        /// Total context requested by the caller.
+        requested: usize,
+        /// Effective model and qualification limit.
+        maximum: usize,
+    },
+    /// Decode was called before the executor established its KV cache.
+    #[error("streamed executor decode requires a successful prefill")]
+    StreamDecodeWithoutPrefill,
+    /// Prefill is intentionally single-use for this sequence executor.
+    #[error("streamed executor prefill may only run once")]
+    StreamPrefillAlreadyDone,
+    /// The executor observed an execution failure after cache mutation and cannot be reused.
+    #[error("streamed executor is poisoned after a failed cache-mutating operation")]
+    StreamPoisoned,
     /// A cached streamed step differed from a named resident control.
     #[error("cached stream step {step} differs from {reference} at logit {index}")]
     CachedStreamParity {
