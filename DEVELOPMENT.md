@@ -83,6 +83,12 @@ not the output array or resident oracle. See the
 [selected embedding result](docs/experiments/loader-qualification.md#token-ordered-selected-embedding)
 for the exact command and checkpoint identity.
 
+`check-qwen-stream-metal` composes a complete uncached forward for at most 32
+raw tokens. `--max-weight-bytes` limits the planned maximum sequential
+weight/loading stage, not process memory; the resident oracle runs afterward
+and is outside that budget. See the
+[complete stream ledger](docs/experiments/loader-qualification.md#complete-synchronous-streamed-forward).
+
 `check-qwen-layer-metal` extends this to one real block on synthetic hidden
 states. Its `--max-weight-bytes` bounds logical weights and loading staging,
 not scratch or process memory. Use `--candidate-only` when measuring process

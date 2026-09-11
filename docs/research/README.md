@@ -39,9 +39,10 @@ legacy SIMD-group matrix operations must not be assigned the newer Metal 4
 tensor feature's availability floor. CUDA paper results are hypotheses for a
 Mac experiment, not portable performance guarantees.
 
-The next runtime gate is to consume bounded row reads in embedding/output
-projection and qualify complete streamed Qwen forward against the resident
-oracle. DeepSeek-V4.1 still needs its own text-forward numerical fixture;
+The [complete uncached Qwen stream](../experiments/loader-qualification.md#complete-synchronous-streamed-forward)
+now composes bounded embedding, layer and projection reads against the resident
+oracle. Next are candidate-only memory measurements and cached streaming.
+DeepSeek-V4.1 still needs its own text-forward numerical fixture;
 Qwen correctness does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.
 

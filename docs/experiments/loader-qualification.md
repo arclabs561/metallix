@@ -1,9 +1,9 @@
 # Bounded Qwen loading and V4.1 shape qualification
 
-This pass qualifies selected Qwen tensor reads and initial V4.1 configuration
-relationships. The later one-block experiment below executes selected weights.
-Neither experiment implements a full streamed decoder, a weight pager, V4.1
-text inference, or a process-wide memory ceiling.
+This ledger follows selected Qwen tensor reads through component checks to a
+complete synchronous uncached streamed forward. It also records initial V4.1
+configuration relationships. A weight pager, cached streamed generation,
+V4.1 text inference and a process-wide memory ceiling remain unfinished.
 
 ## Qwen selected-tensor reads
 
@@ -171,8 +171,70 @@ Executable SHA-256:
 `d0b297637a806394ab4824938b3fdaaa0e931f274e7fe76e76ac6555a63acae2`.
 The checkpoint/config identities are the Qwen identities recorded above.
 
-Next: compose selected embeddings, real layer outputs, final normalization
-and tiled projection; compare complete streamed logits before adding KV reuse.
+The complete-forward experiment below composes these pieces. KV reuse remains
+a subsequent qualification gate.
+
+## Complete synchronous streamed forward
+
+[`qualify_streamed_forward`](../../crates/models/qwen/src/metal/stream_check.rs)
+composes selected embedding rows, all decoder layers, final RMS normalization
+and tiled output projection. Each layer is evaluated and its hidden state
+copied to the host and reconstructed as a fresh MLX array before its weights
+are released. This explicitly severs lazy graph dependencies. Shared loader
+and operator helpers also remain used by the component diagnostics.
+
+```sh
+target/release/mx check-qwen-stream-metal --model /path/to/Qwen3-0.6B \
+  --input-ids 1,2,3 --tile-rows 1024 --max-weight-bytes 81798144
+```
+
+On the same M3 Max, four initial fresh-process runs used raw IDs `1..=N` for
+N = 1, 3, 17 and 32. Each executed all 28 layers and compared every one of
+151,936 final logits with an independently loaded resident FP32 Qwen decoder.
+All observed absolute errors were zero; the acceptance criterion is still
+`5e-4 + 1e-4 * abs(reference)`, not guaranteed bitwise arithmetic.
+
+The sequential logical weight/staging peak was 81,798,144 bytes. That exact
+budget passed; one byte less failed during planning before payload reads.
+The plan takes the largest embedding/layer/final-norm/projection stage, not
+their sum. It excludes hidden activations, operator scratch, headers, allocator
+retention and the resident reference. No process-peak measurement or
+larger-than-host-memory claim follows from these results.
+
+Candidate wall times in that initial order were 1,216.77, 861.48, 478.89 and
+413.36 ms. Cache/compilation state was not controlled, so the decreasing times
+are not a sequence-length scaling result. The 32-token run attributed 214.34 ms
+to layer loading, 52.31 ms to layer execution/readback, 71.32 ms to projection
+loading and 51.21 ms to projection execution/readback. This is one diagnostic
+trace, not an optimized serving benchmark. It read 1,192,165,376 raw bytes
+cumulatively. Resident-reference time includes loading and FP32 preparation
+and is not a steady-state decoder baseline.
+
+The independent CPU regression suite also passed its 1/3/17/64-token cases
+after the shared-helper refactor. That suite runs the resident decoder; the
+stream diagnostic separately checks the resident implementation. Inputs over
+32 tokens and invalid vocabulary IDs are rejected by the stream diagnostic.
+
+Initial receipts: `artifacts/stream-{1,3,17,32}.json`, their stderr files,
+`artifacts/stream-exact-budget.json`, `artifacts/stream-budget.stderr`, and
+`artifacts/stream-cpu-regression.log`. Initial executable SHA-256:
+`9337298d0a6e0caa90d739671855d78f54ae1f8c995f33a5d9149839cea10e89`.
+The checkpoint/config identities are recorded above. Both canonical checks
+pass; logs are `artifacts/check-stream-{default,metal}.log`.
+
+After improving the input-length error message, streamed runs using the first
+three CPU-suite inputs (last vocabulary row, ordinary three-token text and
+17 repeated tokens) also matched resident logits exactly. Three further fresh
+processes on the same three-token input took 375.72, 384.61 and 375.00 ms in
+the candidate stage (median 375.72 ms). These followed the earlier reads, with
+no enforced cache state; they establish a repeatable diagnostic workload, not
+generation throughput. Receipts: `artifacts/stream-oracle-{0,1,2}.json` and
+`artifacts/stream-repeat-{1,2,3}.json`, with corresponding stderr. Executable:
+`3507f68f2a1647a94fa81ed44bac13809e74f4dbfa385cd836f2b57a29f74205`.
+
+Next: isolate candidate-only process-memory measurements, then qualify cached
+streaming. DeepSeek-V4.1 needs its own numerical fixtures and operators; this
+Qwen result does not establish V4.1 support.
 
 ## One-block selected-weight execution
 

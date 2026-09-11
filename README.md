@@ -12,6 +12,10 @@ The current milestone runs a complete dense Qwen3 decoder through MLX on
 Metal, with a reproducible CPU comparison and single-sequence KV reuse. DeepSeek-V4.1
 configuration and checkpoint-index inspection are available; V4.1 execution
 and HTTP serving remain unfinished.
+An [uncached streamed Qwen qualification](docs/experiments/loader-qualification.md#complete-synchronous-streamed-forward)
+now reads one layer at a time and checks complete logits against resident
+weights. Its logical loading budget is not a process-memory ceiling; streamed
+generation and KV reuse remain unimplemented.
 [V4.1 operator diagnostics](docs/experiments/v41-candidates.md) compare CPU
 candidate masks and Metal FP32 index scores with pinned official expressions
 on synthetic inputs. They do not qualify the BF16/FP4 execution path.
