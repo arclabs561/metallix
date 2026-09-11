@@ -1,5 +1,6 @@
 [package]
 name = "server"
+default-run = "metallix"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +10,10 @@ publish.workspace = true
 [[bin]]
 name = "metallix"
 path = "src/main.rs"
+
+[[bin]]
+name = "mx"
+path = "src/bin/mx.rs"
 
 [features]
 metal = ["qwen/metal", "deepseek/metal"]
