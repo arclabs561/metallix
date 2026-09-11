@@ -110,7 +110,11 @@ fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, Qwen3MetalLoadError> {
     let mut values = vec![0.0_f32; bytes.len() / 2];
     let mut all_finite = true;
     for (destination, pair) in values.iter_mut().zip(bytes.chunks_exact(2)) {
-        let bits = u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16;
+        // Copy the chunk as a unit so LLVM can widen halfword loads, rather
+        // than reconstructing each word from separate byte lanes. No alignment
+        // assumption is made about the source slice.
+        let word = u16::from_le_bytes(pair.try_into().expect("exact two-byte chunk"));
+        let bits = u32::from(word) << 16;
         let value = f32::from_bits(bits);
         all_finite &= value.is_finite();
         *destination = value;
@@ -500,6 +504,24 @@ mod tests {
         assert_eq!(decoded.len(), finite_words.len());
         for (value, word) in decoded.iter().zip(finite_words) {
             assert_eq!(value.to_bits(), u32::from(word) << 16);
+        }
+    }
+
+    #[test]
+    fn bf16_widening_handles_unaligned_slices_and_vector_tails() {
+        for offset in 0..16 {
+            for count in 0..=65 {
+                let words: Vec<u16> = (0..count)
+                    .map(|index| [0, 0x8000, 1, 0x807f, 0x3f80, 0xff7f][index % 6])
+                    .collect();
+                let mut bytes = vec![0xff; offset];
+                bytes.extend(words.iter().flat_map(|word| word.to_le_bytes()));
+                let values = super::decode_bf16(&bytes[offset..]).expect("finite unaligned words");
+                assert_eq!(values.len(), count);
+                for (value, word) in values.iter().zip(words) {
+                    assert_eq!(value.to_bits(), u32::from(word) << 16);
+                }
+            }
         }
     }
 
