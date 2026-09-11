@@ -14,7 +14,15 @@ use qwen::{
 };
 
 #[derive(Debug, Parser)]
-#[command(about = "Apple-Silicon model-serving runtime")]
+#[command(
+    about = "Inspect model files and run experimental Metal inference",
+    after_help = "\
+Scope:
+  No HTTP serving is implemented.
+  Inspect commands read model configuration or checkpoint headers; they do not load weights.
+  Metal commands require an Apple-Silicon build with --features metal.
+  Qwen forward and generate use a local --model directory, raw token IDs, and one sequence."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -329,4 +337,48 @@ fn inspect_v41(config: &PathBuf) -> ExitCode {
     );
     println!("required backend: CED, sparse MoE, Engram, paged weights, tiered cache");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    fn root_help() -> String {
+        Cli::command().render_long_help().to_string()
+    }
+
+    #[test]
+    fn root_help_explains_the_current_scope() {
+        let help = root_help();
+
+        assert!(help.contains("Inspect model files and run experimental Metal inference"));
+        assert!(help.contains("No HTTP serving is implemented."));
+        assert!(help.contains("Inspect commands read model configuration or checkpoint headers"));
+        assert!(help.contains("--features metal"));
+        assert!(help.contains("raw token IDs, and one sequence"));
+        assert!(help.contains("inspect-v41"));
+        assert!(help.contains("inspect-qwen"));
+    }
+
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn default_help_hides_metal_commands() {
+        let help = root_help();
+
+        assert!(!help.contains("generate-qwen-metal"));
+        assert!(!help.contains("forward-qwen-metal"));
+        assert!(!help.contains("check-v41-indexer-metal"));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_help_lists_the_existing_metal_commands() {
+        let help = root_help();
+
+        assert!(help.contains("generate-qwen-metal"));
+        assert!(help.contains("forward-qwen-metal"));
+        assert!(help.contains("check-v41-indexer-metal"));
+    }
 }
