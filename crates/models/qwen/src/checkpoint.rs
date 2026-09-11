@@ -205,18 +205,40 @@ fn read_header(path: &Path) -> Result<Vec<(String, TensorRange)>, Qwen3Checkpoin
             path: path.to_path_buf(),
             source,
         })?;
-    let header: BTreeMap<String, RawTensor> =
+    let header: BTreeMap<String, serde_json::Value> =
         serde_json::from_slice(&json).map_err(|source| Qwen3CheckpointError::HeaderJson {
             path: path.to_path_buf(),
             source,
         })?;
 
-    let data_bytes = file_bytes - SAFETENSORS_PREFIX_BYTES - header_bytes;
+    validate_header_tensors(
+        path,
+        file_bytes - SAFETENSORS_PREFIX_BYTES - header_bytes,
+        header,
+    )
+}
+
+fn validate_header_tensors(
+    path: &Path,
+    data_bytes: u64,
+    header: BTreeMap<String, serde_json::Value>,
+) -> Result<Vec<(String, TensorRange)>, Qwen3CheckpointError> {
     let mut tensors = Vec::new();
-    for (name, tensor) in header {
+    let mut ranges = Vec::new();
+    for (name, value) in header {
         if name == "__metadata__" {
+            if serde_json::from_value::<BTreeMap<String, String>>(value).is_err() {
+                return Err(Qwen3CheckpointError::InvalidMetadata(path.to_path_buf()));
+            }
             continue;
         }
+        let tensor: RawTensor = serde_json::from_value(value).map_err(|source| {
+            Qwen3CheckpointError::InvalidTensorHeader {
+                path: path.to_path_buf(),
+                tensor: name.clone(),
+                source,
+            }
+        })?;
         if tensor.data_offsets.len() != 2 {
             return Err(Qwen3CheckpointError::InvalidTensorOffsets {
                 path: path.to_path_buf(),
@@ -231,6 +253,30 @@ fn read_header(path: &Path) -> Result<Vec<(String, TensorRange)>, Qwen3Checkpoin
                 tensor: name,
             });
         }
+        let element_count = tensor.shape.iter().try_fold(1_u64, |total, dimension| {
+            total
+                .checked_mul(*dimension)
+                .ok_or(Qwen3CheckpointError::TensorShapeOverflow {
+                    path: path.to_path_buf(),
+                    tensor: name.clone(),
+                })
+        })?;
+        let expected_bytes = tensor_byte_length(&tensor.dtype, element_count).ok_or_else(|| {
+            Qwen3CheckpointError::UnsupportedTensorDtype {
+                path: path.to_path_buf(),
+                tensor: name.clone(),
+                dtype: tensor.dtype.clone(),
+            }
+        })?;
+        if end - start != expected_bytes {
+            return Err(Qwen3CheckpointError::TensorByteLengthMismatch {
+                path: path.to_path_buf(),
+                tensor: name,
+                expected_bytes,
+                actual_bytes: end - start,
+            });
+        }
+        ranges.push((start, end));
         tensors.push((
             name,
             TensorRange {
@@ -239,14 +285,45 @@ fn read_header(path: &Path) -> Result<Vec<(String, TensorRange)>, Qwen3Checkpoin
             },
         ));
     }
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|ranges| ranges[1].0 < ranges[0].1) {
+        return Err(Qwen3CheckpointError::OverlappingTensorRanges(
+            path.to_path_buf(),
+        ));
+    }
+    let mut expected_start = 0_u64;
+    for (start, end) in ranges {
+        if start != expected_start {
+            return Err(Qwen3CheckpointError::NonContiguousPayload(
+                path.to_path_buf(),
+            ));
+        }
+        expected_start = end;
+    }
+    if expected_start != data_bytes {
+        return Err(Qwen3CheckpointError::NonContiguousPayload(
+            path.to_path_buf(),
+        ));
+    }
     Ok(tensors)
+}
+
+fn tensor_byte_length(dtype: &str, element_count: u64) -> Option<u64> {
+    let bytes_per_element = match dtype {
+        "BOOL" | "U8" | "I8" | "F8_E4M3FN" | "F8_E4M3FNUZ" | "F8_E5M2" | "F8_E5M2FNUZ"
+        | "F8_E8M0FNU" => 1,
+        "U16" | "I16" | "F16" | "BF16" => 2,
+        "U32" | "I32" | "F32" => 4,
+        "U64" | "I64" | "F64" => 8,
+        _ => return None,
+    };
+    element_count.checked_mul(bytes_per_element)
 }
 
 #[derive(Debug, Deserialize)]
 struct RawTensor {
-    #[serde(default)]
+    dtype: String,
     data_offsets: Vec<u64>,
-    #[serde(default)]
     shape: Vec<u64>,
 }
 
@@ -435,6 +512,19 @@ pub enum Qwen3CheckpointError {
         /// JSON failure.
         source: serde_json::Error,
     },
+    /// Reserved safetensors metadata was not a JSON object.
+    #[error("invalid safetensors metadata in {0}")]
+    InvalidMetadata(PathBuf),
+    /// A non-metadata header entry did not describe a tensor.
+    #[error("invalid tensor header for {tensor:?} in {path}: {source}")]
+    InvalidTensorHeader {
+        /// Shard path.
+        path: PathBuf,
+        /// Tensor name.
+        tensor: String,
+        /// JSON failure.
+        source: serde_json::Error,
+    },
     /// A tensor did not declare exactly one start/end range.
     #[error("invalid data offsets for tensor {tensor:?} in {path}")]
     InvalidTensorOffsets {
@@ -451,6 +541,42 @@ pub enum Qwen3CheckpointError {
         /// Tensor name.
         tensor: String,
     },
+    /// A tensor's dimensions overflowed the element count.
+    #[error("tensor {tensor:?} has an overflowing shape in {path}")]
+    TensorShapeOverflow {
+        /// Shard path.
+        path: PathBuf,
+        /// Tensor name.
+        tensor: String,
+    },
+    /// A tensor uses a safetensors dtype this inspector does not understand.
+    #[error("tensor {tensor:?} has unsupported safetensors dtype {dtype:?} in {path}")]
+    UnsupportedTensorDtype {
+        /// Shard path.
+        path: PathBuf,
+        /// Tensor name.
+        tensor: String,
+        /// Header dtype.
+        dtype: String,
+    },
+    /// A tensor range did not match its dtype and shape.
+    #[error("tensor {tensor:?} has {actual_bytes} bytes in {path}, expected {expected_bytes}")]
+    TensorByteLengthMismatch {
+        /// Shard path.
+        path: PathBuf,
+        /// Tensor name.
+        tensor: String,
+        /// Bytes implied by dtype and shape.
+        expected_bytes: u64,
+        /// Bytes named by the tensor range.
+        actual_bytes: u64,
+    },
+    /// Two tensor ranges overlap in one shard.
+    #[error("safetensors shard has overlapping tensor ranges: {0}")]
+    OverlappingTensorRanges(PathBuf),
+    /// Tensor ranges did not cover the shard payload exactly once.
+    #[error("safetensors shard has holes or trailing payload bytes: {0}")]
+    NonContiguousPayload(PathBuf),
     /// A shard header named an empty tensor.
     #[error("safetensors shard has a blank tensor name: {0}")]
     BlankTensorName(PathBuf),
@@ -497,7 +623,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Qwen3CheckpointError, Qwen3CheckpointInspection, RawCheckpointLayout,
+        Qwen3CheckpointError, Qwen3CheckpointInspection, RawCheckpointLayout, read_header,
         required_dense_tensors,
     };
     use crate::Qwen3TextContract;
@@ -522,7 +648,7 @@ mod tests {
         fn write_config(&self) {
             fs::write(
                 self.path.join("config.json"),
-                r#"{"model_type":"qwen3","num_hidden_layers":28,"hidden_size":1024,"num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"vocab_size":151936,"intermediate_size":3072,"tie_word_embeddings":true}"#,
+                r#"{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":4,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"max_position_embeddings":16,"vocab_size":8,"intermediate_size":6,"tie_word_embeddings":true}"#,
             )
             .expect("write config");
         }
@@ -536,14 +662,14 @@ mod tests {
 
     fn expected_tensors() -> Vec<super::ExpectedTensor> {
         let contract = Qwen3TextContract::parse(
-            r#"{"model_type":"qwen3","num_hidden_layers":28,"hidden_size":1024,"vocab_size":151936,"num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960}"#,
+            r#"{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":4,"vocab_size":8,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"max_position_embeddings":16}"#,
         )
         .expect("valid contract");
         required_dense_tensors(
             &contract,
             &RawCheckpointLayout {
-                vocab_size: 151_936,
-                intermediate_size: 3_072,
+                vocab_size: 8,
+                intermediate_size: 6,
                 tie_word_embeddings: true,
             },
         )
@@ -555,11 +681,13 @@ mod tests {
         let mut header = serde_json::Map::new();
         header.insert("__metadata__".to_owned(), json!({"format":"pt"}));
         for tensor in tensors {
+            let element_count = tensor.shape.iter().product::<u64>();
+            let byte_length = element_count * 2;
             header.insert(
                 tensor.name.clone(),
-                json!({"dtype":"BF16","shape": tensor.shape,"data_offsets":[offset, offset + 2]}),
+                json!({"dtype":"BF16","shape": tensor.shape,"data_offsets":[offset, offset + byte_length]}),
             );
-            offset += 2;
+            offset += byte_length;
         }
         let header = serde_json::to_vec(&header).expect("serialize header");
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -571,6 +699,14 @@ mod tests {
         fs::write(path, bytes).expect("write safetensors fixture");
     }
 
+    fn write_raw_shard(path: &Path, header: &serde_json::Value, payload_bytes: usize) {
+        let header = serde_json::to_vec(header).expect("serialize header");
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + payload_bytes, 0);
+        fs::write(path, bytes).expect("write raw shard");
+    }
+
     #[test]
     fn inspects_qwen3_headers_without_reading_tensor_payloads() {
         let fixture = Fixture::new();
@@ -580,9 +716,9 @@ mod tests {
 
         let inspection =
             Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-        assert_eq!(inspection.contract().total_layers(), 28);
+        assert_eq!(inspection.contract().total_layers(), 1);
         assert_eq!(inspection.tensor_count(), tensors.len());
-        assert_eq!(inspection.tensor_bytes(), (tensors.len() * 2) as u64);
+        assert!(inspection.tensor_bytes() > tensors.len() as u64);
         assert_eq!(inspection.shards().len(), 1);
         assert!(inspection.shards()[0].ends_with("model-00001.safetensors"));
     }
@@ -607,7 +743,7 @@ mod tests {
         let fixture = Fixture::new();
         fixture.write_config();
         let header = serde_json::to_vec(&json!({
-            "model.embed_tokens.weight": {"data_offsets": [0, 999]}
+            "model.embed_tokens.weight": {"dtype":"BF16", "shape":[8, 4], "data_offsets": [0, 999]}
         }))
         .expect("serialize header");
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
@@ -620,5 +756,69 @@ mod tests {
             error,
             Qwen3CheckpointError::TensorOutsidePayload { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_byte_ranges_that_do_not_match_bf16_shape() {
+        let fixture = Fixture::new();
+        let path = fixture.path.join("bad.safetensors");
+        write_raw_shard(
+            &path,
+            &json!({"weight": {"dtype":"BF16", "shape":[2], "data_offsets":[0, 2]}}),
+            2,
+        );
+
+        let error = read_header(&path).expect_err("two BF16 values need four bytes");
+        assert!(matches!(
+            error,
+            Qwen3CheckpointError::TensorByteLengthMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_overlapping_tensor_ranges() {
+        let fixture = Fixture::new();
+        let path = fixture.path.join("overlap.safetensors");
+        write_raw_shard(
+            &path,
+            &json!({
+                "first": {"dtype":"BF16", "shape":[1], "data_offsets":[0, 2]},
+                "second": {"dtype":"BF16", "shape":[1], "data_offsets":[1, 3]}
+            }),
+            3,
+        );
+
+        let error = read_header(&path).expect_err("ranges must not overlap");
+        assert!(matches!(
+            error,
+            Qwen3CheckpointError::OverlappingTensorRanges(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_holes_and_trailing_payload_bytes() {
+        let fixture = Fixture::new();
+        let path = fixture.path.join("hole.safetensors");
+        write_raw_shard(
+            &path,
+            &json!({"weight": {"dtype":"BF16", "shape":[1], "data_offsets":[1, 3]}}),
+            3,
+        );
+
+        let error = read_header(&path).expect_err("payload must be exactly covered");
+        assert!(matches!(
+            error,
+            Qwen3CheckpointError::NonContiguousPayload(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_object_metadata_without_treating_it_as_a_tensor() {
+        let fixture = Fixture::new();
+        let path = fixture.path.join("metadata.safetensors");
+        write_raw_shard(&path, &json!({"__metadata__": "not an object"}), 0);
+
+        let error = read_header(&path).expect_err("metadata must be an object");
+        assert!(matches!(error, Qwen3CheckpointError::InvalidMetadata(_)));
     }
 }

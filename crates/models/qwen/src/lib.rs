@@ -2,8 +2,15 @@
 
 pub mod checkpoint;
 #[cfg(feature = "metal")]
+pub mod forward;
+#[cfg(feature = "metal")]
 pub mod metal;
 pub mod preflight;
+
+// MLX's native test operations share process-global device initialization.
+// Serialize GPU tests; pure config/header tests remain parallel.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use serde::Deserialize;
 use thiserror::Error;

@@ -1,5 +1,10 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
+#[cfg(feature = "metal")]
+mod parity;
+#[cfg(feature = "metal")]
+mod qwen_forward;
+
 use clap::{Parser, Subcommand};
 use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
 use qwen::{
@@ -15,6 +20,37 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate greedy raw token IDs with per-sequence KV reuse on Metal.
+    #[cfg(feature = "metal")]
+    GenerateQwenMetal {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+        input_ids: Vec<i32>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=256))]
+        max_tokens: u32,
+        /// Compare each cached result with a full forward outside timed regions.
+        #[arg(long)]
+        verify_cache: bool,
+    },
+    /// Run and time the complete uncached Qwen3 decoder on raw token IDs.
+    #[cfg(feature = "metal")]
+    ForwardQwenMetal {
+        #[arg(long)]
+        model: PathBuf,
+        /// Comma-separated raw token IDs; excludes chat-template/tokenizer effects.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+        input_ids: Vec<i32>,
+        /// Full final-token reference logits, little-endian float32.
+        #[arg(long, requires = "reference_manifest")]
+        reference: Option<PathBuf>,
+        /// CPU capture JSON binding token IDs, checkpoint hashes, and reference bytes.
+        #[arg(long, requires = "reference")]
+        reference_manifest: Option<PathBuf>,
+        /// Number of measured repeats after one excluded warmup.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeats: u32,
+    },
     /// Validate a DeepSeek-V4.1 configuration without loading weights.
     InspectV41 {
         /// Path to the upstream model configuration.
@@ -61,6 +97,26 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "metal")]
+        Command::GenerateQwenMetal {
+            model,
+            input_ids,
+            max_tokens,
+            verify_cache,
+        } => qwen_forward::generate(&model, &input_ids, max_tokens, verify_cache),
+        #[cfg(feature = "metal")]
+        Command::ForwardQwenMetal {
+            model,
+            input_ids,
+            reference,
+            reference_manifest,
+            repeats,
+        } => qwen_forward::run(
+            &model,
+            &input_ids,
+            reference.as_deref().zip(reference_manifest.as_deref()),
+            repeats,
+        ),
         Command::InspectV41 { config } => inspect_v41(&config),
         Command::InspectQwen { config } => inspect_qwen(&config),
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
