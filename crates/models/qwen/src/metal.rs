@@ -11,6 +11,8 @@ use crate::checkpoint::{Qwen3CheckpointError, Qwen3CheckpointInspection};
 
 mod layer_check;
 pub use layer_check::{LayerCheckMode, Qwen3LayerCheck, qualify_layer};
+mod row_check;
+pub use row_check::{Qwen3TensorRowsCheck, qualify_tensor_rows};
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
 #[derive(Debug, serde::Serialize)]

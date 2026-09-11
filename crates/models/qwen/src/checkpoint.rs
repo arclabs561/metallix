@@ -11,9 +11,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(any(feature = "metal", test))]
-use std::io::{Seek, SeekFrom};
-
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -21,6 +18,9 @@ use crate::{Qwen3ConfigError, Qwen3TextContract};
 
 const SAFETENSORS_PREFIX_BYTES: u64 = 8;
 const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+
+#[cfg(any(feature = "metal", test))]
+mod read;
 
 /// Header-only facts about a validated local Qwen3 checkpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,77 +167,6 @@ impl Qwen3CheckpointInspection {
             });
         }
         Ok(location.range.byte_length)
-    }
-
-    /// Reads one validated tensor without loading a whole shard.
-    ///
-    /// This is adapter-private plumbing for a future Qwen streaming loader;
-    /// it intentionally returns raw checkpoint bytes rather than an MLX
-    /// array. `max_bytes` is checked before allocation. The checkpoint input
-    /// must remain immutable between [`Self::inspect`] and this call: the
-    /// length and modification time are rechecked, but that is not a security
-    /// guarantee against concurrent in-place writes which preserve both.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Qwen3CheckpointError`] if the tensor does not fit the
-    /// caller's budget, the shard metadata drifted, or its byte range can no
-    /// longer be read exactly.
-    #[cfg(any(feature = "metal", test))]
-    pub(crate) fn read_tensor(
-        &self,
-        name: &str,
-        max_bytes: u64,
-    ) -> Result<Qwen3TensorBytes, Qwen3CheckpointError> {
-        let location = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| Qwen3CheckpointError::UnknownTensor(name.to_owned()))?;
-        if location.range.byte_length > max_bytes {
-            return Err(Qwen3CheckpointError::TensorExceedsReadBudget {
-                tensor: name.to_owned(),
-                tensor_bytes: location.range.byte_length,
-                max_bytes,
-            });
-        }
-        let allocation_bytes = usize::try_from(location.range.byte_length).map_err(|_| {
-            Qwen3CheckpointError::ReadBudgetCannotFitAddressSpace {
-                tensor: name.to_owned(),
-                tensor_bytes: location.range.byte_length,
-            }
-        })?;
-
-        let mut file =
-            File::open(&location.shard).map_err(|source| Qwen3CheckpointError::OpenShard {
-                path: location.shard.clone(),
-                source,
-            })?;
-        ensure_shard_identity(&file, &location.shard, location.identity)?;
-        file.seek(SeekFrom::Start(location.range.file_offset))
-            .map_err(|source| Qwen3CheckpointError::ReadShard {
-                path: location.shard.clone(),
-                source,
-            })?;
-        let mut bytes = vec![0_u8; allocation_bytes];
-        if let Err(source) = file.read_exact(&mut bytes) {
-            if source.kind() == std::io::ErrorKind::UnexpectedEof {
-                return Err(Qwen3CheckpointError::TensorPayloadTruncated {
-                    path: location.shard.clone(),
-                    tensor: name.to_owned(),
-                });
-            }
-            return Err(Qwen3CheckpointError::ReadShard {
-                path: location.shard.clone(),
-                source,
-            });
-        }
-        ensure_shard_identity(&file, &location.shard, location.identity)?;
-
-        Ok(Qwen3TensorBytes {
-            dtype: location.range.dtype.clone(),
-            shape: location.range.shape.clone(),
-            bytes,
-        })
     }
 }
 
@@ -967,7 +896,7 @@ pub enum Qwen3CheckpointError {
     TensorExceedsReadBudget {
         /// Requested tensor name.
         tensor: String,
-        /// Validated payload byte count.
+        /// Requested payload byte count.
         tensor_bytes: u64,
         /// Maximum allocation authorized by the caller.
         max_bytes: u64,
@@ -1000,441 +929,43 @@ pub enum Qwen3CheckpointError {
         /// Requested tensor name.
         tensor: String,
     },
+    /// A row read was requested for a tensor that is not a rank-two matrix.
+    #[error("Qwen3 tensor {tensor:?} has shape {shape:?}; row reads require rank two")]
+    TensorRowsRequireMatrix {
+        /// Requested tensor name.
+        tensor: String,
+        /// Validated safetensors shape.
+        shape: Vec<u64>,
+    },
+    /// A row read requires BF16 payload elements.
+    #[error("Qwen3 tensor {tensor:?} has dtype {dtype:?}; row reads require BF16")]
+    TensorRowsRequireBf16 {
+        /// Requested tensor name.
+        tensor: String,
+        /// Validated safetensors dtype.
+        dtype: String,
+    },
+    /// A row selection was empty or outside the validated matrix bounds.
+    #[error(
+        "Qwen3 tensor {tensor:?} row range {start}..{end} is outside its {row_count} rows or empty"
+    )]
+    InvalidTensorRowRange {
+        /// Requested tensor name.
+        tensor: String,
+        /// Inclusive range start supplied by the caller.
+        start: usize,
+        /// Exclusive range end supplied by the caller.
+        end: usize,
+        /// Validated matrix row count.
+        row_count: u64,
+    },
+    /// Validated matrix dimensions cannot produce a safe selected byte range.
+    #[error("Qwen3 tensor {tensor:?} row layout overflowed")]
+    TensorRowLayoutOverflow {
+        /// Requested tensor name.
+        tensor: String,
+    },
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        io::{Seek, SeekFrom, Write},
-        path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
-        time::Duration,
-    };
-
-    use serde_json::json;
-
-    use super::{
-        Qwen3CheckpointError, Qwen3CheckpointInspection, RawCheckpointLayout, read_header,
-        required_dense_tensors,
-    };
-    use crate::Qwen3TextContract;
-
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-
-    struct Fixture {
-        path: PathBuf,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "metallix-qwen-checkpoint-{}-{}",
-                std::process::id(),
-                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).expect("create fixture directory");
-            Self { path }
-        }
-
-        fn write_config(&self) {
-            fs::write(
-                self.path.join("config.json"),
-                r#"{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":4,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"max_position_embeddings":16,"vocab_size":8,"intermediate_size":6,"tie_word_embeddings":true}"#,
-            )
-            .expect("write config");
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.path).expect("remove fixture directory");
-        }
-    }
-
-    fn expected_tensors() -> Vec<super::ExpectedTensor> {
-        let contract = Qwen3TextContract::parse(
-            r#"{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":4,"vocab_size":8,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"max_position_embeddings":16}"#,
-        )
-        .expect("valid contract");
-        required_dense_tensors(
-            &contract,
-            &RawCheckpointLayout {
-                vocab_size: 8,
-                intermediate_size: 6,
-                tie_word_embeddings: true,
-            },
-        )
-        .expect("valid layout")
-    }
-
-    fn write_safetensors(path: &Path, tensors: &[super::ExpectedTensor]) {
-        let payload_bytes = tensors
-            .iter()
-            .map(|tensor| tensor.shape.iter().product::<u64>() * 2)
-            .sum::<u64>();
-        write_safetensors_with_payload(
-            path,
-            tensors,
-            &vec![0; usize::try_from(payload_bytes).expect("small payload")],
-        );
-    }
-
-    fn write_safetensors_with_payload(
-        path: &Path,
-        tensors: &[super::ExpectedTensor],
-        payload: &[u8],
-    ) {
-        let mut offset = 0_u64;
-        let mut header = serde_json::Map::new();
-        header.insert("__metadata__".to_owned(), json!({"format":"pt"}));
-        for tensor in tensors {
-            let element_count = tensor.shape.iter().product::<u64>();
-            let byte_length = element_count * 2;
-            header.insert(
-                tensor.name.clone(),
-                json!({"dtype":"BF16","shape": tensor.shape,"data_offsets":[offset, offset + byte_length]}),
-            );
-            offset += byte_length;
-        }
-        let header = serde_json::to_vec(&header).expect("serialize header");
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend(header);
-        assert_eq!(
-            payload.len(),
-            usize::try_from(offset).expect("small payload")
-        );
-        bytes.extend_from_slice(payload);
-        fs::write(path, bytes).expect("write safetensors fixture");
-    }
-
-    fn payload_range(tensors: &[super::ExpectedTensor], name: &str) -> std::ops::Range<usize> {
-        let mut offset = 0_usize;
-        for tensor in tensors {
-            let len =
-                usize::try_from(tensor.shape.iter().product::<u64>() * 2).expect("small payload");
-            if tensor.name == name {
-                return offset..offset + len;
-            }
-            offset += len;
-        }
-        panic!("fixture tensor must exist: {name}");
-    }
-
-    fn write_raw_shard(path: &Path, header: &serde_json::Value, payload_bytes: usize) {
-        let header = serde_json::to_vec(header).expect("serialize header");
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend(header);
-        bytes.resize(bytes.len() + payload_bytes, 0);
-        fs::write(path, bytes).expect("write raw shard");
-    }
-
-    #[test]
-    fn inspects_qwen3_headers_without_reading_tensor_payloads() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let tensors = expected_tensors();
-        write_safetensors(&fixture.path.join("model-00001.safetensors"), &tensors);
-
-        let inspection =
-            Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-        assert_eq!(inspection.contract().total_layers(), 1);
-        assert_eq!(inspection.tensor_count(), tensors.len());
-        assert!(inspection.tensor_bytes() > tensors.len() as u64);
-        assert_eq!(inspection.shards().len(), 1);
-        assert!(inspection.shards()[0].ends_with("model-00001.safetensors"));
-    }
-
-    #[test]
-    fn reads_only_one_validated_tensor_with_exact_bytes_and_header_facts() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let tensors = expected_tensors();
-        let total = tensors
-            .iter()
-            .map(|tensor| tensor.shape.iter().product::<u64>() * 2)
-            .sum::<u64>();
-        let payload = (0..usize::try_from(total).expect("small payload"))
-            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
-            .collect::<Vec<_>>();
-        let path = fixture.path.join("model.safetensors");
-        write_safetensors_with_payload(&path, &tensors, &payload);
-
-        let inspection =
-            Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-        let name = "model.layers.0.input_layernorm.weight";
-        let tensor = inspection
-            .read_tensor(name, 8)
-            .expect("bounded tensor read");
-        assert_eq!(tensor.dtype(), "BF16");
-        assert_eq!(tensor.shape(), &[4]);
-        assert_eq!(tensor.bytes(), &payload[payload_range(&tensors, name)]);
-    }
-
-    #[test]
-    fn rejects_a_selected_tensor_before_allocating_beyond_the_budget() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let tensors = expected_tensors();
-        write_safetensors(&fixture.path.join("model.safetensors"), &tensors);
-
-        let inspection =
-            Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-        fs::remove_file(fixture.path.join("model.safetensors"))
-            .expect("make a failed open observable if the budget is checked too late");
-        let error = inspection
-            .read_tensor("model.layers.0.input_layernorm.weight", 7)
-            .expect_err("the 8-byte tensor must not allocate under a 7-byte budget");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::TensorExceedsReadBudget {
-                tensor_bytes: 8,
-                max_bytes: 7,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_an_unknown_tensor_before_opening_any_shard() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let tensors = expected_tensors();
-        let path = fixture.path.join("model.safetensors");
-        write_safetensors(&path, &tensors);
-        let inspection =
-            Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-        fs::remove_file(path).expect("make an accidental open fail");
-
-        let error = inspection
-            .read_tensor("not.a.validated.tensor", 0)
-            .expect_err("unknown name must be rejected from validated metadata alone");
-        assert!(
-            matches!(error, Qwen3CheckpointError::UnknownTensor(name) if name == "not.a.validated.tensor")
-        );
-    }
-
-    #[test]
-    fn rejects_a_truncated_shard_after_its_header_was_validated() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let tensors = expected_tensors();
-        let path = fixture.path.join("model.safetensors");
-        write_safetensors(&path, &tensors);
-        let inspection =
-            Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-
-        fs::write(&path, [0_u8; 3]).expect("truncate fixture shard");
-        let error = inspection
-            .read_tensor("model.layers.0.input_layernorm.weight", 8)
-            .expect_err("changed shard must not be read through a validated range");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::ShardMetadataDrift { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_same_length_shard_mutation_when_the_timestamp_drifts() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let tensors = expected_tensors();
-        let path = fixture.path.join("model.safetensors");
-        write_safetensors(&path, &tensors);
-        let inspection =
-            Qwen3CheckpointInspection::inspect(&fixture.path).expect("valid checkpoint");
-        let before = fs::metadata(&path)
-            .expect("fixture metadata")
-            .modified()
-            .expect("fixture modification time");
-
-        let mut shard = fs::File::options()
-            .write(true)
-            .open(&path)
-            .expect("open fixture for same-length write");
-        shard
-            .seek(SeekFrom::End(-1))
-            .expect("seek to the final payload byte");
-        shard.write_all(&[0]).expect("overwrite one payload byte");
-        let changed = before
-            .checked_add(Duration::from_secs(2))
-            .expect("fixture timestamp has headroom");
-        shard
-            .set_times(fs::FileTimes::new().set_modified(changed))
-            .expect("set distinct fixture modification time");
-
-        let error = inspection
-            .read_tensor("model.layers.0.input_layernorm.weight", 8)
-            .expect_err("same-size shard with a new timestamp must be rejected");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::ShardMetadataDrift { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_missing_required_dense_tensor() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let mut tensors = expected_tensors();
-        tensors.pop();
-        write_safetensors(&fixture.path.join("model.safetensors"), &tensors);
-
-        let error = Qwen3CheckpointInspection::inspect(&fixture.path)
-            .expect_err("incomplete decoder layout must be rejected");
-        assert!(
-            matches!(error, Qwen3CheckpointError::MissingRequiredTensor(name) if name == "model.norm.weight")
-        );
-    }
-
-    #[test]
-    fn rejects_a_tensor_range_outside_the_payload() {
-        let fixture = Fixture::new();
-        fixture.write_config();
-        let header = serde_json::to_vec(&json!({
-            "model.embed_tokens.weight": {"dtype":"BF16", "shape":[8, 4], "data_offsets": [0, 999]}
-        }))
-        .expect("serialize header");
-        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-        bytes.extend(header);
-        fs::write(fixture.path.join("model.safetensors"), bytes).expect("write malformed shard");
-
-        let error = Qwen3CheckpointInspection::inspect(&fixture.path)
-            .expect_err("out-of-range tensor must be rejected");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::TensorOutsidePayload { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_byte_ranges_that_do_not_match_bf16_shape() {
-        let fixture = Fixture::new();
-        let path = fixture.path.join("bad.safetensors");
-        write_raw_shard(
-            &path,
-            &json!({"weight": {"dtype":"BF16", "shape":[2], "data_offsets":[0, 2]}}),
-            2,
-        );
-
-        let error = read_header(&path).expect_err("two BF16 values need four bytes");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::TensorByteLengthMismatch { .. }
-        ));
-    }
-
-    #[test]
-    fn rejects_overlapping_tensor_ranges() {
-        let fixture = Fixture::new();
-        let path = fixture.path.join("overlap.safetensors");
-        write_raw_shard(
-            &path,
-            &json!({
-                "first": {"dtype":"BF16", "shape":[1], "data_offsets":[0, 2]},
-                "second": {"dtype":"BF16", "shape":[1], "data_offsets":[1, 3]}
-            }),
-            3,
-        );
-
-        let error = read_header(&path).expect_err("ranges must not overlap");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::OverlappingTensorRanges(_)
-        ));
-    }
-
-    #[test]
-    fn rejects_holes_and_trailing_payload_bytes() {
-        let fixture = Fixture::new();
-        let path = fixture.path.join("hole.safetensors");
-        write_raw_shard(
-            &path,
-            &json!({"weight": {"dtype":"BF16", "shape":[1], "data_offsets":[1, 3]}}),
-            3,
-        );
-
-        let error = read_header(&path).expect_err("payload must be exactly covered");
-        assert!(matches!(
-            error,
-            Qwen3CheckpointError::NonContiguousPayload(_)
-        ));
-    }
-
-    #[test]
-    fn rejects_duplicate_top_level_header_keys_including_escaped_names() {
-        // Raw JSON is essential: serializing a map would erase the duplicate.
-        // The safetensors format explicitly disallows duplicate keys.
-        // Provenance: docs/research/README.md#checkpoint-header-key-uniqueness.
-        for header in [
-            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
-            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"\u0077eight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
-            r#"{"__metadata__":{},"__metadata__":{},"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
-        ] {
-            let fixture = Fixture::new();
-            let path = fixture.path.join("duplicate.safetensors");
-            let mut bytes = u64::try_from(header.len())
-                .expect("small header")
-                .to_le_bytes()
-                .to_vec();
-            bytes.extend_from_slice(header.as_bytes());
-            bytes.extend_from_slice(&[0, 0]);
-            fs::write(&path, bytes).expect("write duplicate-key header");
-
-            let error = read_header(&path).expect_err("duplicate keys must not be collapsed");
-            assert!(matches!(error, Qwen3CheckpointError::HeaderJson { .. }));
-        }
-    }
-
-    #[test]
-    fn rejects_duplicate_nested_tensor_and_metadata_fields() {
-        for header in [
-            r#"{"weight":{"dtype":"F32","dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
-            r#"{"weight":{"dtype":"BF16","shape":[2],"shape":[1],"data_offsets":[0,2]}}"#,
-            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,1],"data_offsets":[0,2]}}"#,
-            r#"{"__metadata__":{"format":"bad","\u0066ormat":"pt"},"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#,
-            r#"{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2],"extra":[{"x":1,"x":2}]}}"#,
-        ] {
-            let fixture = Fixture::new();
-            let path = fixture.path.join("duplicate-nested.safetensors");
-            let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
-            bytes.extend_from_slice(header.as_bytes());
-            bytes.extend_from_slice(&[0, 0]);
-            fs::write(&path, bytes).expect("write ambiguous raw header");
-            assert!(
-                matches!(
-                    read_header(&path),
-                    Err(Qwen3CheckpointError::HeaderJson { .. })
-                ),
-                "must reject {header}"
-            );
-        }
-    }
-
-    #[test]
-    fn unique_header_preserves_valid_json_value_types() {
-        let json = r#"{"array":[true,false,null,-7,18446744073709551615,1.25,"escaped\ntext",{"key":"value"}],"empty":{}}"#;
-        let actual = serde_json::from_str::<super::UniqueHeader>(json)
-            .expect("valid unique JSON")
-            .0;
-        let expected: std::collections::BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(json).expect("independent JSON value parser");
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn unique_header_keeps_the_json_recursion_limit() {
-        let json = format!("{{\"x\":{}0{}}}", "[".repeat(150), "]".repeat(150));
-        assert!(serde_json::from_str::<super::UniqueHeader>(&json).is_err());
-    }
-
-    #[test]
-    fn rejects_non_object_metadata_without_treating_it_as_a_tensor() {
-        let fixture = Fixture::new();
-        let path = fixture.path.join("metadata.safetensors");
-        write_raw_shard(&path, &json!({"__metadata__": "not an object"}), 0);
-
-        let error = read_header(&path).expect_err("metadata must be an object");
-        assert!(matches!(error, Qwen3CheckpointError::InvalidMetadata(_)));
-    }
-}
+mod tests;
