@@ -6,7 +6,7 @@ primary PDFs before the requirements below were recorded.
 
 ## V4.1 execution
 
-The [DeepSeek-V4.1-Flash technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf)
+The [DeepSeek-V4.1-Flash technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/DeepSeek_V41_Tech_Report.pdf)
 defines the first adapter's non-negotiable layout:
 
 - CED divides the 40 layers into a 20-layer encoder and 20-layer decoder. The
@@ -15,15 +15,23 @@ defines the first adapter's non-negotiable layout:
 - CSA2 uses statically assigned Full, Reindex, and Reuse modes. The adapter
   must represent shared global KV, indexer K, and Top-K index ownership
   explicitly rather than allocating one independent cache tensor per layer.
-- Global KV is the durable prefix-cache candidate. Sliding-window KV is
-  short-lived; a future persistent cache must test bounded replay after a
-  global-cache hit instead of silently treating that reconstruction as exact.
-- The report's reported 890 global-KV bytes/token is a model-specific target,
-  not a generic engine constant. Metallix must measure resident bytes and SSD
-  bytes per generated token against it on the actual adapter.
-- DSpark comes after a correct greedy and sampled decode path. Its acceptance
-  rate, extra draft work, and output-distribution parity decide whether it is
-  retained.
+- Global KV is the durable prefix-cache candidate. Bounded sliding-window
+  replay is intentionally approximate, not exact cache reconstruction. Qualify
+  the report's replay behavior separately from full-forward numerical parity.
+- The reported 890 bytes/token covers accelerator-resident global KV after
+  CSA2 and FP4 compression. It excludes other allocations and is not an SSD
+  traffic metric or generic engine constant.
+- Global-KV FP4 uses quantization-aware training and a specific E2M1 encoding
+  with per-16-channel E4M3 scales (§2.4.4). A generic 4-bit conversion is not
+  qualified by that result; test the actual representation and scale decoding.
+- DSpark requires trained draft blocks and Markov/confidence heads, not just
+  an engine switch. After a correct greedy and sampled path, measure acceptance,
+  draft and verification cost, and output-distribution parity.
+
+Reading anchors: CED §2.2, CSA2 §2.3, Engram §2.4.2 and §3.1.3,
+DSpark §2.4.3, persistent cache and bounded replay §§3.2.1–3.2.2.
+The pinned report's SHA-256 is
+`ba68e2e40408125ae6d2f63a9a241b61c73910691c74ec1a2a7023c851eac08d`.
 
 The first V4.1 loader gate therefore expands from configuration validation to
 a small text-only forward parity fixture. It must verify CED state flow, the
@@ -47,9 +55,9 @@ is the intended contract.
 
 ## Near-term experiments
 
-1. Implement dense Qwen3 BF16 loading and single-request prefill/decode via
-   the selected native Metal substrate; compare logits on the checked-in fixed
-   raw-token reference at `fixtures/qwen3-0.6b/forward-reference.json`.
+1. Use the implemented Qwen3 BF16-to-FP32 Metal path as the resident control.
+   Compare bounded tensor loading against the checked-in raw-token reference
+   at `fixtures/qwen3-0.6b/forward-reference.json` before adding overlap.
 2. Run `scripts/benchmark-openai.mjs` against both the reference server and
    Metallix using 512, 8k, and 32k cold/shared-prefix profiles once Metallix
    streams tokens.
@@ -58,3 +66,7 @@ is the intended contract.
 
 MTP/DSpark, SSD expert/Engram prefetch, fusion, and KV quantization are
 measured follow-ons. They are not substitutes for the first parity gate.
+
+The [host-memory investigation](host-memory.md) records the full Flash/Fiddler
+readings, current implementation reports, and the initial local I/O curve.
+Use [DEVELOPMENT.md](../../DEVELOPMENT.md) for repeatable checks and comparisons.
