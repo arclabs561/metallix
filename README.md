@@ -3,209 +3,103 @@
 Metallix qualifies model layouts and builds Metal execution paths for one
 Apple-Silicon Mac. Its first target is DeepSeek-V4.1-Flash.
 
-The intended service is OpenAI-compatible local text generation with bounded
-concurrency, reusable context, and measured memory behavior.
+Qwen3-0.6B is the working control: resident greedy generation, KV reuse, and
+JSON Schema constraints run on Metal through MLX. DeepSeek-V4.1 currently has
+layout inspection and synthetic operator qualification, not a decoder.
+An OpenAI-compatible local service is intended; there is no HTTP server yet.
 
-## Status
+## Build and try it
 
-The current milestone runs a complete dense Qwen3 decoder through MLX on
-Metal, with a reproducible CPU comparison and single-sequence KV reuse. DeepSeek-V4.1
-configuration and checkpoint-index inspection are available; V4.1 execution
-and HTTP serving remain unfinished.
-An [uncached streamed Qwen qualification](docs/experiments/loader-qualification.md#complete-synchronous-streamed-forward)
-now reads one layer at a time and checks complete logits against resident
-weights. Its logical loading budget is not a process-memory ceiling; streamed
-generation and KV reuse remain unimplemented.
-[V4.1 operator diagnostics](docs/experiments/v41-candidates.md) compare CPU
-candidate masks and Metal FP32 index scores with pinned official expressions
-on synthetic inputs. They do not qualify the BF16/FP4 execution path.
+From the repository root, with Rust 1.87+, Apple Silicon, CMake, and a working
+Xcode Metal toolchain:
 
 ```sh
-cargo run -p server -- inspect-v41 --config /path/to/deepseek-v41-config.json
-```
-
-Expected output includes the sparse routing, Engram, and dynamic-FP8/FP4
-checkpoint layout required by the V4.1 adapter.
-
-Qwen3 is the small comparison model used to qualify shared server behavior:
-
-```sh
-cargo run -p server -- inspect-qwen --config /path/to/qwen3-config.json
-```
-
-For Qwen3-0.6B this reports a head dimension of 128 and 114,688 BF16 KV bytes
-per token before allocator overhead. It is a sizing preflight, not inference.
-
-Validate a local Qwen3 checkpoint without reading its tensor payloads:
-
-```sh
-cargo run -p server -- inspect-qwen-checkpoint --model /path/to/Qwen3-0.6B
-```
-
-On Apple Silicon, this optional command proves the pinned Rust MLX binding can
-evaluate a GPU graph. It does not load model weights:
-
-```sh
-cargo run -p server --features metal -- smoke-qwen-metal
-```
-
-Metallix does not currently convert quantizations. V4.1 support begins by
-validating the expected FP8/FP4 layout of supplied artifacts; conversion or lower-bit
-formats need separate parity and quality gates.
-
-On Apple Silicon, load an inspected Qwen3 safetensors checkpoint as MLX Metal
-arrays and force evaluation of its token embedding:
-
-```sh
-cargo run -p server --features metal -- load-qwen-metal --model /path/to/Qwen3-0.6B
-```
-
-This checks checkpoint-payload compatibility without running the decoder.
-The loaded tensors live only for the process lifetime.
-
-The embedding command runs the same fixed raw IDs `[1, 2, 3]` recorded in the
-reference fixture and reports the output shape:
-
-```sh
-cargo run -p server --features metal -- embed-qwen-metal --model /path/to/Qwen3-0.6B
-```
-
-Run one excluded warmup and three measured uncached forwards:
-
-```sh
-cargo run -p server --features metal -- forward-qwen-metal \
-  --model /path/to/Qwen3-0.6B --input-ids 1,2,3 --repeats 3
-```
-
-The command emits JSON with timings and top logits. `--reference PATH` plus
-`--reference-manifest JSON` compare every vocabulary logit against a local
-float32 reference, checking input IDs and checkpoint/reference hashes first.
-Disagreement exits nonzero. Float32 weights are prepared once before
-warmup. This diagnostic path accepts at most 512 raw tokens per sequence.
-An absent reference is reported as `"parity": null`.
-
-Generate greedy token IDs with contiguous KV reuse:
-
-```sh
-cargo run -p server --release --features metal -- generate-qwen-metal \
-  --model /path/to/Qwen3-0.6B --input-ids 785,6722,315,9625,374 \
-  --max-tokens 12 --verify-cache
-```
-
-Those input IDs encode “The capital of France is”. The output begins
-`12095,13,576` (“ Paris. The” with the Qwen tokenizer). `--verify-cache`
-compares each cached result with a full Metal recomputation outside the timed
-regions. This diagnostic uses greedy sampling, one sequence, and at most 512
-input plus generated tokens. KV byte counts describe live arrays, excluding
-allocator overhead and temporary copies.
-
-For independent CPU parity, install [uv](https://docs.astral.sh/uv/) and run
-the four-case suite. The scripts declare pinned Torch/Transformers dependencies
-and use an already-downloaded local Qwen3-0.6B checkpoint:
-
-```sh
-cargo build -p server --release --features metal
-uv run scripts/qwen-parity-suite.py --binary target/release/metallix \
-  --model /path/to/Qwen3-0.6B
-```
-
-This compares all logits for prompts of 1, 3, 17, and 64 tokens. Temporary
-reference files are cleaned up by the harness. See
-[the local experiment](docs/experiments/qwen-metal.md) for measured results.
-Removing layer-by-layer GPU waits reduced warm cached decode from 20.3 to
-8.74 ms per step on an M3 Max (three 32-token runs, 90 measured decode steps).
-This is a single-sequence diagnostic, not a serving-throughput comparison.
-The experiment page also documents a repeatable local benchmark harness with
-checkpoint hashes and per-run statistics.
-
-See [the architecture](docs/architecture.md) for the serving contract and
-delivery gates, and [the efficiency requirements](docs/research/efficiency-methods.md)
-for the paper-derived implementation checks.
-
-## Build
-
-Build from source with Rust. The default build provides checkpoint inspection;
-`--features metal` enables Qwen execution and V4.1 operator checks on Apple
-Silicon. It builds native MLX, requiring CMake and a working Xcode Metal toolchain.
-
-```sh
-cargo build --workspace
-```
-
-Both `mx` and `metallix` are native executables sharing the same CLI. Build
-and run either name from the repository root:
-
-```sh
-cargo build -p server --release --features metal
+cargo build -p server --release --all-features
 target/release/mx --help
-target/release/metallix --help
 ```
 
-Existing `cargo run -p server -- ...` commands still select `metallix`.
-Use `--bin mx` to select the short name explicitly. Before installing `mx`
-on your PATH, check `command -v mx`: other tools, including GraalVM's build
-tool, use that name. No shell alias or shell-configuration change is required.
+Both `mx` and `metallix` are native executables with the same CLI; no shell
+alias is required. Nothing is installed on your PATH by these commands.
 
-## Benchmark a compatible server
-
-The checked-in benchmark client measures TTFT to the first non-empty content
-delta, time to the first SSE event, per-request completion time, and aggregate
-reported completion throughput from an OpenAI-compatible endpoint. It also
-reports two clearly labeled estimates: mean time between content-delta events,
-and mean inter-token time inferred from server-reported token usage. It can
-compare a reference server with Metallix once Metallix has an endpoint.
+With an already-downloaded Qwen3-0.6B safetensors checkpoint, including its
+`config.json` and `tokenizer.json`, replace the model path below:
 
 ```sh
-node scripts/benchmark-openai.mjs \
-  --url http://127.0.0.1:8010 \
-  --model /path/to/Qwen3-0.6B \
-  --cache-condition cold-start \
-  --warmup 0 \
-  --requests 4 \
-  --concurrency 4 \
-  --max-tokens 64
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 64 --verify-cache \
+  --json-schema fixtures/constraints/record.json --logprobs --preview
 ```
 
-The command prints versioned JSON with a prompt digest (not prompt text),
-sampling parameters, warmup count, server-reported usage coverage, and an
-explicit cache-condition declaration. `cold-start` requires `--warmup 0`; it
-describes the state at the start of the run, not a cache reset between requests.
-`warm` and `mixed` are operator declarations because the client cannot inspect
-or clear a server cache. Keep the same model revision, cache condition, request
-shape, and prompt digest when comparing runs. It does not claim a model
-benchmark for the metadata-inspection commands.
+This uses raw prompt token IDs, not a text/chat prompt. In the qualified local
+run, the generated JSON was:
 
-Requests have a 120-second deadline, configurable with `--timeout-ms`.
-Truncated streams, SSE errors, and invalid token usage fail the run; `[DONE]`
-ends measurement even if the server keeps the connection open.
+```json
+{"status":"ready","count":1}
+```
+
+Stdout contains a JSON diagnostic report, including `constraint.output`,
+`constraint.status: "validated"`, token IDs, timings, and requested scores.
+The object above is the generated value, not the entire stdout report.
+A token limit reached before grammar completion reports `incomplete` and exits
+nonzero; only completed, independently validated JSON counts as success.
+
+`--preview` adds a readable stderr view without changing stdout. Score colors
+describe token likelihood, not answer correctness; non-TTY output and
+`NO_COLOR=1` disable color. `--logprobs` includes both original-model and
+grammar-conditioned token log probabilities. `--debug` / `--verbose` add
+metadata-only phase diagnostics. These options are off by default.
+See [the generation guide](DEVELOPMENT.md) for limits and score semantics.
+
+`--verify-cache` compares each cached result with a full-prefix Metal
+recomputation outside the measured decode regions. It is a correctness check,
+not an independent CPU reference or a serving benchmark.
+
+| Feature | Enables |
+|---|---|
+| Default | Configuration and checkpoint inspection; no Metal execution |
+| `metal` | Qwen execution and V4.1 operator diagnostics on Apple Silicon |
+| `structured-output` with `metal` | Qwen JSON Schema constrained generation |
+
+## What is qualified
+
+[V4.1 operator checks](docs/experiments/v41-candidates.md) cover candidate
+masks, final selection, index scores, and rotary tails against pinned official
+expressions on synthetic inputs. They do not establish full-model or BF16/FP4
+execution parity.
+
+[Qwen experiments](docs/experiments/qwen-metal.md) record independent CPU
+logit comparisons and measured decode changes.
+[Streamed loading checks](docs/experiments/loader-qualification.md) include
+teacher-forced cached prefill and appends compared with resident controls.
+Streamed greedy generation remains unfinished. A logical weight-loading
+budget is not a process-memory ceiling or proof of larger-than-RAM serving.
 
 ## Development
 
-See the [developer guide](DEVELOPMENT.md) for measurement workflows and the
-[research index](docs/research/README.md) for source-to-code provenance.
+The [developer guide](DEVELOPMENT.md) covers profiling, benchmarks and
+diagnostic commands. The [research reference](docs/research/README.md) tracks
+source versions, reading coverage, implementation status and next tests.
+The [architecture](docs/architecture.md) records the serving contract.
 
-Checks require Node.js and Ruff on `PATH`, in addition to Rust and uv.
+Checks additionally require uv, Node.js, and Ruff:
 
 ```sh
 uv run scripts/check.py
-```
-
-On Apple Silicon, include the optional Metal execution path:
-
-```sh
 uv run scripts/check.py --metal
 ```
 
-The runner checks formatting, tests, strict Clippy, rustdoc, and the Python/Node
-harness tests. It stops at the first failure and does not download model weights.
+These run formatting, tests, strict Clippy, rustdoc, and Python/Node harness
+checks without downloading model weights. Run them sequentially.
 
 ## Limitations
 
-There is no HTTP server or V4.1 decoder yet. Qwen's diagnostic forward works
-on raw IDs; tokenizer/chat templates, paged KV, continuous batching, and
-quantization conversion are unfinished. The HTTP benchmark client measures
-an independently running compatible server. V4.1 weight download remains
-gated on its own small text-forward parity fixture.
+Generation is currently a single resident FP32 Qwen sequence, using greedy
+selection and at most `min(model context, 512)` input plus generated tokens.
+There is no canonical text-prompt/chat-template pipeline, V4.1 decoder,
+HTTP serving, continuous batching, execution-backed paged KV, quantization
+conversion, or tuning workflow yet. Beyond-RAM execution remains a goal,
+not a demonstrated capability. V4.1 weight download is gated on its own small
+text-forward numerical fixture.
 
 ## License
 

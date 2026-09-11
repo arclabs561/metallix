@@ -106,12 +106,14 @@ policy, not a claim that an upstream "large subset" equals all JSON Schema.
 
 The existing Qwen cached greedy diagnostic is sufficient as a model-loop
 starting point; it does **not** need HTTP serving or speculative rollback for a
-first constrained generation.  Its missing integration prerequisites are:
+first constrained generation. The new optional session now owns the token-byte
+trie, grammar matcher, mask application and independent validator. Remaining
+integration prerequisites beyond that diagnostic are:
 
-- no tokenizer byte table or tokenizer revision binding;
+- no canonical text encoder or immutable checkpoint/tokenizer revision binding;
 - only a single parsed `eos_token_id`, no multi-EOS/stop policy;
-- no structured sampling interface (only `greedy_token`); and
-- no sampler/mask handoff that carries tokenizer identity.
+- no stochastic, speculative or batched constrained decoding; and
+- no device-resident masked sampling path.
 
 The first implementation is feature-gated in
 [`llguidance_qwen_tokenizer.rs`](../../crates/engine/tests/llguidance_qwen_tokenizer.rs):
@@ -133,13 +135,87 @@ METALLIX_QWEN_TOKENIZER=/path/to/Qwen3-0.6B/tokenizer.json \
 ```
 
 Both tests passed, with zero ignored tests and no compiler warnings in this
-run (`artifacts/llguidance-qwen-smoke.log`). The feature currently enables a
-qualification test, not a public engine API or CLI structured-output mode.
-The complete workspace also passed `rustup run 1.87.0 cargo check --workspace
+run (`artifacts/llguidance-qwen-smoke.log`). This initial qualification predates
+the engine session and CLI integration below.
+That workspace also passed `rustup run 1.87.0 cargo check --workspace
 --all-features --all-targets --locked` on Apple Silicon, including LLGuidance
 and Metal (`artifacts/msrv-187-final.log`).
 See [AICI and newer research](structured-generation-frontiers.md) for the
 separate fast-forward, precompiled-mask and reasoning-quality experiments.
+
+## Cached generation integration
+
+`engine::constraint::JsonConstraintSession` binds a grammar to one exact token
+byte table and model logit width. Model padding beyond the tokenizer vocabulary
+cannot be selected. EOS is consumed but not appended as JSON bytes. Only an
+accepting non-resource stop can complete; truncation never validates as success.
+The CLI reads bounded local files, rejects grammar compilation warnings and
+external schema references, and independently validates completed output with
+[`jsonschema` 0.56.0](https://docs.rs/jsonschema/0.56.0/jsonschema/).
+Its default features are disabled and the validator uses `.offline()`; no
+schema retrieval is allowed. The dialect is draft 2020-12. Acceptance by these
+two implementations is not a claim of support for every JSON Schema keyword.
+Format annotations are not a universal semantic-validation guarantee.
+
+```sh
+cargo build -p server --release --all-features
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 64 --verify-cache \
+  --json-schema fixtures/constraints/record.json
+```
+
+The local release run produced `{"status":"ready","count":1}` in 12 tokens.
+Boolean and Unicode/escaped-string fixtures also completed and passed independent
+validation. Every step passed cached/full-prefix logit parity. A one-token
+record budget emitted `constraint.status: incomplete`, `output: null`, and
+exit code 1. Receipts use the `artifacts/constrained-serial-` prefix, the
+`boolean`, `record` or `unicode` fixture name, and `.json`/`.stderr` suffixes;
+the negative case is `artifacts/constrained-truncated.{json,stderr}`.
+
+Serial, quiet, parity-enabled baseline measurements on the M3 Max control host:
+
+| Fixture | Output tokens | Constraint setup ms | Mask/select/consume total ms | Model decode total ms |
+|---|---:|---:|---:|---:|
+| Boolean | 3 | 388.611 | 0.524 | 20.315 |
+| Record | 12 | 389.624 | 2.012 | 103.539 |
+| Unicode constant | 14 | 393.021 | 2.198 | 127.566 |
+
+Setup includes local reads, JSON hashing, tokenizer/trie construction, grammar
+compilation and independent-validator construction; it is not grammar compile
+time alone. Decode excludes prefill and final sampled token (no next-step forward
+is needed). Verification is outside timings but can warm execution. These are
+single runs, not throughput, quality or comparative speedup evidence. Earlier
+`constrained-{boolean,record,unicode}` smoke launches are not used for timings
+because their process completion was not serialized explicitly.
+
+This baseline makes reusable tokenizer/compiled-grammar setup the next measured
+startup experiment; it does not yet justify speculative parser acceleration.
+Keep per-request matcher state separate from any shared immutable artifact.
+The CLI intentionally retains raw prompt IDs and has no forced-token skipping,
+canonical token healing, HTTP serving or V4.1 generation yet.
+
+### Selected-token log probabilities
+
+`--logprobs` records natural-log probabilities under the original full model
+vocabulary, the grammar-renormalized distribution, and the model mass remaining
+in the allowed set. Padded model rows participate in the original partition
+but never become legal output tokens. Max-shifted FP64 reductions avoid both
+exponential overflow and loss of the normalization term at large equal offsets.
+Analytic equal-logit, padded-row and `1e30` translation tests cover this boundary.
+
+On the record fixture, the first selected token had raw logprob `-11.908898`,
+conditional logprob `-0.737955`, and allowed log-mass `-11.170943`. The difference
+illustrates grammar conditioning, not increased answer correctness. All 12
+generated IDs matched the no-logprob control, and cached/full-prefix parity
+passed at every step. The four-token unconstrained control likewise preserved
+its IDs; both quiet stderr captures were empty. Receipts:
+`artifacts/logprobs-{plain,constrained}.{json,stderr}`.
+
+The score-enabled record run spent `6.486 ms` in mask/select/consume plus score
+collection. This is one instrumented run, not an estimated regression or a
+throughput comparison. Scores are opt-in; default selection does not compute
+these exponential reductions. See [uncertainty signals](uncertainty.md) for
+what additional data is needed before interpreting any score as confidence.
 
 ## Provenance
 

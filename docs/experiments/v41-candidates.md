@@ -98,9 +98,29 @@ Three cases cover rank-three, multi-batch/multi-head rank-four, and inverse
 rotation. Rust compares each scalar within absolute tolerance `1e-6` and tests
 length, shape-overflow and non-finite-input rejection without buffer mutation.
 Finite inputs retain upstream IEEE FP32 overflow behavior; finite output is not
-promised. This does not generate frequencies, rotate BF16/FP4, execute on Metal,
-or implement an attention block. Receipts:
+promised. This does not generate frequencies, rotate BF16/FP4,
+or implement an attention block. CPU receipts:
 `artifacts/v41-rotary-regenerated.{json,stderr}`.
+
+The optional `rotate_tail_metal` path now performs the same adjacent-pair
+arithmetic with MLX indexing, broadcast arithmetic, stacking and logical
+flattening before readback. It is a host-to-GPU diagnostic, not a fused kernel
+or an in-place cache update. Reproduce its qualification and timing with:
+
+```sh
+cargo test -p deepseek --features metal rotary
+cargo build -p server --release --features metal
+target/release/mx check-v41-rotary-metal --repeats 5
+```
+
+On the M3 Max control host, all three pinned cases passed every warmup and
+measured comparison. Maximum absolute error was `2.3841858e-7` against the
+`1e-6` gate. Five measured round trips per case ranged from `0.204` to `1.042`
+ms; startup warmups are excluded and reported separately. These tiny synthetic
+cases measure graph/dispatch/readback costs, not useful model throughput or a
+speedup over CPU. Receipts: `artifacts/rotary-metal-test.log` and
+`artifacts/v41-rotary-metal.{json,stderr}`. The next integration gate remains
+device-resident attention/cache use with a complete upstream numerical oracle.
 
 ## CPU final selection
 

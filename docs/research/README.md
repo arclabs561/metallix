@@ -33,6 +33,11 @@ is still pending where the ledger says excerpts or selected sections.
 | Training | [Training efficiency](training-efficiency.md) | Rematerialization, precision, microbatching and adapters |
 | Serving | [Serving efficiency](serving-efficiency.md) | Attention, batching, KV reuse, speculation and offload |
 | Structured generation | [Constraints and tokenizers](constrained-generation.md) | Grammar masks, exact token bytes, EOS and independently checked output |
+| Inference interventions | [Prompt, logit and activation controls](inference-interventions.md) | Mechanism boundaries, reference probabilities and quality/cache controls |
+| Uncertainty | [Probability, entropy and calibration](uncertainty.md) | Observable token statistics versus independently calibrated answer correctness |
+| Probabilistic control | [GenLM and LLaMPPL](genlm-control.md) | Target versus proposal, weighted grammars and finite-particle guarantees |
+| Feynman–Kac methods | [Correctors and particle speculation](feynman-kac-steering.md) | Diffusion versus autoregressive state and approximation costs |
+| Power sampling | [Power-SMC](power-smc.md) | Sequence-level targets, importance weights, EOS and cache ancestry |
 | Quantization | [Quantization and precision](quantization-precision.md) | Exact format decoding versus quality-changing conversion |
 
 Version lookup: consult the Metal chapters' macOS and GPU-family gates before
@@ -45,7 +50,9 @@ The [complete uncached Qwen stream](../experiments/loader-qualification.md#compl
 now composes bounded embedding, layer and projection reads against the resident
 oracle. [Candidate-only process measurements](../experiments/loader-qualification.md#candidate-only-process-footprint)
 now isolate that execution and directly compare its emitted logits with CPU.
-Next are repeated/variable-shape lifetimes and cached streaming.
+Teacher-forced cached streaming is also qualified against resident controls;
+sampled streamed generation and candidate-only cached process measurements
+remain next gates, alongside repeated/variable-shape lifetimes.
 DeepSeek-V4.1 still needs its own text-forward numerical fixture;
 Qwen correctness does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.

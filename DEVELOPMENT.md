@@ -154,18 +154,48 @@ target/release/mx gen --model /path/to/Qwen3-0.6B \
   --input-ids 9707,11,1879 --max-tokens 4 --verify-cache --debug
 ```
 
-This generates raw token IDs, not decoded text; it does not run V4.1 yet.
+Without a schema this generates raw token IDs, not decoded text; it does not run V4.1 yet.
 `--debug`, `--verbose` and `-v` are equivalent opt-in generation diagnostics.
 They emit phase timings, token counts and logical memory sizes to stderr,
 without adding model paths, token values or logits. Stdout remains the existing
 JSON diagnostic report, which intentionally includes input/generated IDs.
 Timing regions exclude the stderr writes, but logging can perturb a benchmark;
 leave verbosity off for comparisons. Resident generation has a 512-token
-diagnostic context limit, distinct from the streamed check's 32-token limit.
+diagnostic context cap (or the model's smaller configured limit), distinct from
+the streamed check's 32-token limit. Prompt and EOS IDs are checked before loading weights.
 The local four-output-token smoke passed cache verification with and without
 verbosity; generated IDs and JSON field sets matched, and quiet stderr was
 empty. Receipts: `artifacts/gen-{debug,quiet}.{json,stderr}`. This verifies CLI
 behavior, not a generation-quality or speed improvement.
+
+For constrained JSON generation, build with `--all-features`, then add
+`--json-schema fixtures/constraints/record.json`. This optional path masks real
+model logits and independently validates completed JSON. `--max-tokens` still
+bounds work: an incomplete grammar reports failure rather than a successful
+partial object. Schemas are local-only and limited to 32 KiB; tokenizer JSON is
+limited to 64 MiB and decoded output to 1 MiB. See the
+[integration and measurements](docs/research/constrained-generation.md#cached-generation-integration).
+
+Add `--logprobs` to request selected-token natural-log probabilities in the JSON
+report. `model_logprob` uses the original model distribution; constrained runs
+also report `constrained_logprob` after masking and `allowed_log_mass` for the
+grammar-allowed set. These are temperature-one categorical probabilities, not
+the probability of the deterministic greedy policy or of an entire valid
+sequence. Scores are opt-in and never appear in debug logs. Their computation
+adds work, so compare runs with matching flags.
+
+`--preview` adds a human-readable summary on stderr without changing stdout
+JSON. It shows decoded constrained output (or explicitly raw IDs for the
+unconstrained diagnostic), timings and any requested logprobs. Colors are
+terminal-only and describe token likelihood, not answer correctness. Generated
+terminal-control characters are escaped. Unlike metadata-only `--debug`,
+`--preview` explicitly opts into displaying generated content.
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 64 \
+  --json-schema fixtures/constraints/record.json --logprobs --preview
+```
 
 `check-qwen-stream-metal` composes a complete uncached forward for at most 32
 raw tokens. `--max-weight-bytes` limits the planned maximum sequential
