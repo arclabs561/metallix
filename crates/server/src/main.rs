@@ -115,6 +115,22 @@ enum Command {
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
         max_bytes: u64,
     },
+    /// Evaluate one selected-weight Qwen block and compare with resident weights.
+    #[cfg(feature = "metal")]
+    CheckQwenLayerMetal {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=32))]
+        tokens: u32,
+        /// Logical weights plus read/conversion staging; excludes scratch and reference.
+        #[arg(long, default_value_t = 268_435_456, value_parser = clap::value_parser!(u64).range(1..=1_073_741_824))]
+        max_weight_bytes: u64,
+        /// Skip the resident comparison for candidate-only process-memory measurement.
+        #[arg(long)]
+        candidate_only: bool,
+    },
     /// Execute the fixed [1, 2, 3] Qwen3 embedding lookup on Metal.
     #[cfg(feature = "metal")]
     EmbedQwenMetal {
@@ -174,6 +190,37 @@ fn main() -> ExitCode {
         } => check_qwen_tensor_metal(&model, &tensor, max_bytes),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
+        #[cfg(feature = "metal")]
+        Command::CheckQwenLayerMetal {
+            model,
+            layer,
+            tokens,
+            max_weight_bytes,
+            candidate_only,
+        } => {
+            let mode = if candidate_only {
+                qwen::metal::LayerCheckMode::CandidateOnly
+            } else {
+                qwen::metal::LayerCheckMode::CompareResident
+            };
+            match qwen::metal::qualify_layer(&model, layer, tokens as usize, max_weight_bytes, mode)
+            {
+                Ok(result) => match serde_json::to_string_pretty(&result) {
+                    Ok(json) => {
+                        println!("{json}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("could not serialize layer check: {error}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("Qwen layer check failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -470,6 +517,55 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn layer_check_bounds_inputs_and_keeps_comparison_on_by_default() {
+        let cli = Cli::try_parse_from(["metallix", "check-qwen-layer-metal", "--model", "model"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Command::CheckQwenLayerMetal {
+                tokens: 3,
+                max_weight_bytes: 268_435_456,
+                candidate_only: false,
+                ..
+            }
+        ));
+        for (flag, value) in [
+            ("--tokens", "0"),
+            ("--tokens", "33"),
+            ("--max-weight-bytes", "0"),
+            ("--max-weight-bytes", "1073741825"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "metallix",
+                    "check-qwen-layer-metal",
+                    "--model",
+                    "model",
+                    flag,
+                    value
+                ])
+                .is_err()
+            );
+        }
+        let cli = Cli::try_parse_from([
+            "metallix",
+            "check-qwen-layer-metal",
+            "--model",
+            "model",
+            "--candidate-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Command::CheckQwenLayerMetal {
+                candidate_only: true,
+                ..
+            }
+        ));
     }
 
     fn root_help() -> String {
