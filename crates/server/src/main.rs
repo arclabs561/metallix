@@ -4,6 +4,8 @@ use std::{fs, path::PathBuf, process::ExitCode};
 mod parity;
 #[cfg(feature = "metal")]
 mod qwen_forward;
+#[cfg(feature = "metal")]
+mod v41_indexer;
 
 use clap::{Parser, Subcommand};
 use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
@@ -20,6 +22,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Compare V4.1 FP32 index-score arithmetic on Metal with a pinned CPU fixture.
+    #[cfg(feature = "metal")]
+    CheckV41IndexerMetal {
+        #[arg(
+            long,
+            default_value = "fixtures/deepseek-v41/index-score-reference.json"
+        )]
+        fixture: PathBuf,
+        /// Repeats per case after one excluded warmup; not model throughput.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=100))]
+        repeats: u32,
+    },
     /// Generate greedy raw token IDs with per-sequence KV reuse on Metal.
     #[cfg(feature = "metal")]
     GenerateQwenMetal {
@@ -97,6 +111,8 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "metal")]
+        Command::CheckV41IndexerMetal { fixture, repeats } => v41_indexer::run(&fixture, repeats),
         #[cfg(feature = "metal")]
         Command::GenerateQwenMetal {
             model,

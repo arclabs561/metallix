@@ -11,7 +11,7 @@ name = "metallix"
 path = "src/main.rs"
 
 [features]
-metal = ["qwen/metal"]
+metal = ["qwen/metal", "deepseek/metal"]
 
 [dependencies]
 clap.workspace = true

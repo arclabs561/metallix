@@ -142,11 +142,25 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 pub(crate) fn compare_logits(actual: &[f32], expected: &[f32]) -> Result<LogitComparison, String> {
+    compare_vectors(actual, expected, 0.0005, 0.0001)
+}
+
+pub(crate) fn compare_index_scores(
+    actual: &[f32],
+    expected: &[f32],
+) -> Result<LogitComparison, String> {
+    compare_vectors(actual, expected, 0.0001, 0.00001)
+}
+
+fn compare_vectors(
+    actual: &[f32],
+    expected: &[f32],
+    absolute_tolerance: f64,
+    relative_tolerance: f64,
+) -> Result<LogitComparison, String> {
     if actual.is_empty() || actual.len() != expected.len() {
-        return Err("actual and reference must have the same nonempty vocabulary".into());
+        return Err("actual and reference must have the same nonempty length".into());
     }
-    let absolute_tolerance = 0.0005;
-    let relative_tolerance = 0.0001;
     let mut max_absolute_error = 0.0_f64;
     let mut squared_error = 0.0;
     let mut mismatches = 0;
@@ -183,7 +197,13 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{compare_logits, read_reference, sha256_file};
+    use super::{compare_index_scores, compare_logits, read_reference, sha256_file};
+
+    #[test]
+    fn index_score_tolerance_is_stricter_than_decoder_logit_tolerance() {
+        assert!(compare_logits(&[0.0002], &[0.0]).unwrap().passed());
+        assert!(!compare_index_scores(&[0.0002], &[0.0]).unwrap().passed());
+    }
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
