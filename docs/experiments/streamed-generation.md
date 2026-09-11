@@ -114,3 +114,104 @@ resident weight bytes.
 
 HTTP scheduling, batching, quantized execution and beyond-RAM operation remain
 separate implementation gates. These results do not qualify them.
+
+## Sampled host profile
+
+The shipped baseline binary was sampled headlessly during 16-token streamed
+generation, without verification, constraints or preview:
+
+```sh
+samply record --save-only --unstable-presymbolicate --duration 20 \
+  -o artifacts/stream-gen-samply.json.gz -- \
+  target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --memory-mode streamed --max-tokens 16 \
+  --max-weight-bytes 81798144 --max-kv-bytes 7340032
+```
+
+The capture completed normally. Its symbol sidecar resolved the Rust/MLX
+frames used below. Of 5,465 nonempty main-thread sampled stacks, 3,011 included
+`load_layer`, 1,734 included `decode_bf16`, 1,713 included `project_tiled`,
+and 1,562 included `read_exact_range`. These are **inclusive, overlapping**
+sample counts, not additive cost fractions. The profile also includes blocked
+waits; it does not measure GPU kernel time. Summary receipt:
+`artifacts/stream-gen-samply-summary.json`; symbol sidecar:
+`artifacts/stream-gen-samply.json.syms.json`.
+
+This supports investigating weight staging/conversion and projection before
+changing sampling or attention algorithms. It does not distinguish physical
+SSD traffic from warm filesystem-cache reads, nor prove that asynchronous I/O
+or device-side conversion will be faster. Those need separate parity and
+memory-budget-preserving experiments.
+
+## Opt-in phase timing
+
+`mx gen --memory-mode streamed --debug` now reports one consumed profile per
+prefill/decode in `streamed.phase_profiles`, plus aggregate metadata on stderr.
+Quiet streamed and resident reports have no profile field. The executor keeps
+only its latest profile; failed operations cannot return a stale success
+profile. Disabling profiling clears it. Profile data contains counts and times,
+not model paths, token values or logits.
+Implementation: Qwen executor/profile commit `80a598a`, CLI integration
+`af95150`. Default/Metal quality gates and the Rust 1.87 all-feature check pass;
+logs are `artifacts/check-stream-profile-{default,metal-pass}.log` and
+`artifacts/msrv-stream-profile.log`.
+
+The intervals are host wall-clock boundaries around reads/conversion,
+explicit evaluation and readback. Layer execution includes dropping its
+temporary arrays. Projection uses its existing sequential load and execution
+timers. `total_ms` brackets the tracked append stages, not the sampler or
+subsequent report serialization; the outer CLI timing remains authoritative
+for the complete prefill/decode call. An explicit remainder accounts for work
+outside the named phases. No isolated GPU timing or physical SSD claim follows.
+
+Three fresh-process, eight-output-token runs used the same prompt and budgets
+as the speed baseline, with `--verbose` enabled. The 21 decode profiles (seven
+per run, no first-decode discard) produced identical token IDs and these means:
+
+| Tracked phase | Mean ms/decode | Share of tracked total |
+|---|---:|---:|
+| Layer load/conversion | 188.85 | 54.1% |
+| Projection load/conversion | 61.97 | 17.7% |
+| Projection execution/readback | 51.89 | 14.9% |
+| Layer execution/readback | 45.88 | 13.1% |
+
+Mean tracked total was 349.36 ms. Embedding, final norm and remainder account
+for the remaining time. These instrumented values diagnose cost, not speedup.
+Every profile had finite nonnegative phases, exact token/K/V counts, and a
+phase-plus-remainder sum equal to total within `1e-6` ms. Receipts:
+`artifacts/stream-profile-{1,2,3}.{json,stderr}`, `stream-profile-decode-samples.json`
+and `stream-profile-summary.json`. Measured binary SHA-256:
+`9923d870082c5e9ba73e1fbf375759cb472fd61cd26f1bfec8b6b584c7e5d389`.
+
+The next optimization hypothesis is narrower now: reducing repeated host-side
+weight staging/conversion may save more than changing decoder math. A
+device-side conversion candidate must still reject invalid payloads, reproduce
+FP32 inputs bit-for-bit and satisfy the explicit live staging budget. It has
+not been implemented or measured by this profiling pass.
+
+The final real-checkpoint lifecycle test
+`repeated_candidate_lifetimes_emit_one_profile_per_successful_append` passed
+in release mode across both request sizes. It checks profile single-consumption,
+clearing an unread profile after invalid input, exact K/V counts and cache
+non-mutation on rejection. Receipt: `artifacts/stream-profile-lifetimes.log`.
+The constrained record run with both profiling and `--verify-cache` also
+validated its JSON and all 12 full-vocabulary comparisons:
+`artifacts/stream-profile-parity.json`.
+
+Quiet-path controls used three fresh processes and 18 post-discard decode
+observations per capture. Streamed median was 347.84 ms before instrumentation,
+342.68 ms in the first after-capture, and 349.03 ms in the repeat. The first
+after-capture had two spikes (626.85 and 557.70 ms), increasing its sample
+standard deviation to 80.87 ms; the repeat's standard deviation was 7.06 ms.
+Resident control medians were 9.18 ms before, 9.87 ms after, then 9.17 ms on
+repeat. Outputs matched throughout. This does not show a consistent regression,
+but the sequential, non-interleaved measurements do not prove zero overhead
+or attribute the noise. This is retained instrumentation, not an optimization.
+
+Receipts: `artifacts/stream-profile-{streamed,resident}-{after,repeat}.json`,
+`stream-profile-resident-before.json`, and their `*-comparison.json` sidecars.
+The before captures used binary
+`967ef964da45d60309cb0ea029ec40f25fdaaebc6314c4b0c470837445e31389`;
+after/repeat captures used
+`038bfe232e77fa7f2e8dffa7a750afdefe10bde26c7820d172bf89ef9c741214`.
+This is a comparison across builds, not a same-binary instrumentation toggle.

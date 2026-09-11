@@ -188,6 +188,10 @@ projection output and allocator retention are excluded. `--verify-cache`
 additionally loads a resident full-prefix oracle and excludes that verification
 from candidate timings; omit it when measuring candidate memory or speed.
 See [streamed generation measurements](docs/experiments/streamed-generation.md).
+In streamed mode, `--debug` / `--verbose` also adds `streamed.phase_profiles`
+to the JSON report and an aggregate stderr summary. These host wall-clock
+intervals separate layer loading/conversion, execution/readback and tiled
+projection; they are not GPU-only timings. Quiet generation omits them.
 
 For constrained JSON generation, build with `--all-features`, then add
 `--json-schema fixtures/constraints/record.json`. This optional path masks real
