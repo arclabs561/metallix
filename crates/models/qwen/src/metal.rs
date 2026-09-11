@@ -95,14 +95,16 @@ fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, Qwen3MetalLoadError> {
     if bytes.len() % 2 != 0 {
         return Err(Qwen3MetalLoadError::RangeCheckOddBytes);
     }
-    let mut values = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    let mut values = vec![0.0_f32; bytes.len() / 2];
+    let mut all_finite = true;
+    for (destination, pair) in values.iter_mut().zip(bytes.chunks_exact(2)) {
         let bits = u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16;
         let value = f32::from_bits(bits);
-        if !value.is_finite() {
-            return Err(Qwen3MetalLoadError::RangeCheckNonFinite);
-        }
-        values.push(value);
+        all_finite &= value.is_finite();
+        *destination = value;
+    }
+    if !all_finite {
+        return Err(Qwen3MetalLoadError::RangeCheckNonFinite);
     }
     Ok(values)
 }
@@ -412,6 +414,46 @@ mod tests {
         assert!(super::decode_bf16(&[0]).is_err());
         assert!(super::decode_bf16(&[128, 127]).is_err());
         assert!(super::decode_bf16(&[192, 127]).is_err());
+    }
+
+    #[test]
+    fn bf16_widening_covers_every_bit_pattern() {
+        let mut finite_words = Vec::new();
+        for word in 0..=u16::MAX {
+            let decoded = super::decode_bf16(&word.to_le_bytes());
+            if word & 0x7f80 == 0x7f80 {
+                assert!(matches!(
+                    decoded,
+                    Err(Qwen3MetalLoadError::RangeCheckNonFinite)
+                ));
+            } else {
+                assert_eq!(decoded.unwrap()[0].to_bits(), u32::from(word) << 16);
+                finite_words.push(word);
+            }
+        }
+        let bytes: Vec<_> = finite_words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let decoded = super::decode_bf16(&bytes).unwrap();
+        assert_eq!(decoded.len(), finite_words.len());
+        for (value, word) in decoded.iter().zip(finite_words) {
+            assert_eq!(value.to_bits(), u32::from(word) << 16);
+        }
+    }
+
+    #[test]
+    fn bf16_widening_rejects_nonfinite_at_any_batch_position() {
+        for position in [0, 512, 1023] {
+            for word in [0x7f80_u16, 0xff80, 0x7f81, 0xffff] {
+                let mut bytes = vec![0_u8; 2048];
+                bytes[position * 2..position * 2 + 2].copy_from_slice(&word.to_le_bytes());
+                assert!(matches!(
+                    super::decode_bf16(&bytes),
+                    Err(Qwen3MetalLoadError::RangeCheckNonFinite)
+                ));
+            }
+        }
     }
 
     #[test]
