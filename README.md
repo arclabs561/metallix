@@ -12,6 +12,8 @@ The current milestone runs a complete dense Qwen3 decoder through MLX on
 Metal, with a reproducible CPU comparison and single-sequence KV reuse. DeepSeek-V4.1
 configuration and checkpoint-index inspection are available; V4.1 execution
 and HTTP serving remain unfinished.
+An initial [V4.1 candidate-block diagnostic](docs/experiments/v41-candidates.md)
+checks CPU masks against the pinned official helper on synthetic inputs.
 
 ```sh
 cargo run -p server -- inspect-v41 --config /path/to/deepseek-v41-config.json

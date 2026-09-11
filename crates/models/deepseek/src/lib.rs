@@ -1,6 +1,9 @@
-//! DeepSeek-V4.1 execution-contract parsing and validation.
+//! DeepSeek-V4.1 execution-contract parsing and bounded CPU qualifications.
 
+pub mod csa2;
 pub mod manifest;
+
+pub use csa2::{CandidateError, candidate_mask};
 
 use serde::Deserialize;
 use thiserror::Error;
