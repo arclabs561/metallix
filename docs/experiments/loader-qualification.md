@@ -426,6 +426,37 @@ Default/Metal canonical checks, Rust 1.87 all-feature locked checking, and
 release build passed (`artifacts/check-cached-rope-{default,metal-final}.log`,
 `artifacts/msrv-cached-rope.log`, `artifacts/build-cached-rope.log`).
 
+### Context boundary and prefill partition check
+
+An additional candidate-only check reaches exactly 32 tokens in two ways:
+prefill `9707,11,1879` followed by individual IDs 4 through 32 (30 steps),
+and prefill those first 31 IDs followed by ID 32 (two steps). Both finish
+with 7,340,032 logical K/V bytes; every emitted step has 151,936 finite logits
+and the expected token-count-scaled K/V size. A 33-token request fails with
+empty stdout before execution.
+
+Separately captured CPU FP32 full-prefix logits check the final position,
+not every intermediate step. Both partitions pass all 151,936 values under
+`5e-4 + 1e-4 * abs(reference)`, with maximum absolute CPU errors of
+`7.361e-5` (growing) and `8.434e-5` (long prefill). Their maximum difference
+from each other is `3.950e-5`, also within that tolerance. This is numerical
+partition consistency, not bit identity or a generation-quality claim.
+
+One fresh process per partition recorded peak footprints of 440,812,264 and
+305,988,280 bytes respectively. These are diagnostic observations, not a
+repeated benchmark: the growing path executes more forwards and retains 30
+logit vectors rather than two, including their larger serialized report.
+Do not interpret the difference as a cache leak or a measured speedup.
+Repeated request lifetimes and generated-token streaming remain unqualified.
+
+Receipts: `artifacts/cached-boundary-{growing,split}.{json,time}`,
+`artifacts/cached-boundary-cpu.{json,f32,stderr}`,
+`artifacts/cached-boundary-over.{json,stderr}`, and
+`artifacts/cached-boundary-parity.json`. The local comparison recipe is
+`artifacts/compare-cached-boundary.mjs`; it checks prefix/checkpoint identity,
+reference sidecar hash, vector lengths, finiteness and tolerances. The binary
+is the `e7e8b7f...` identity above. No model/runtime code changed in this audit.
+
 ## One-block selected-weight execution
 
 At `51f61d0`, [`qualify_layer`](../../crates/models/qwen/src/metal/layer_check.rs) reads the
