@@ -271,6 +271,7 @@ name = "deepseek"
 version = "0.1.0"
 dependencies = [
  "divan",
+ "mlx-rs",
  "serde",
  "serde_json",
  "thiserror",

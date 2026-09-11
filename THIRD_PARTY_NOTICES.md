@@ -1,9 +1,11 @@
 # Third-party notices
 
-The candidate-block selection diagnostic in `crates/models/deepseek/src/csa2.rs`
-follows `select_candidate_blocks` from DeepSeek's official V4.1 Flash inference
-implementation, revision `dba1be0a40aa45a94ad051997016db3960a90277`.
-The fixture capture script executes that hash-pinned helper on synthetic data.
+The candidate-block selection and FP32 index-score diagnostics in
+`crates/models/deepseek/src/csa2.rs` and `indexer.rs` follow
+`select_candidate_blocks` and the score-reduction expressions in
+`Indexer.forward` from DeepSeek's official V4.1 Flash inference implementation,
+revision `dba1be0a40aa45a94ad051997016db3960a90277`.
+The fixture capture script executes those hash-pinned operations on synthetic data.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 

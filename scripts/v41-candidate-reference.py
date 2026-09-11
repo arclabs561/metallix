@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["torch==2.13.0"]
 # ///
-"""Capture weight-free candidate masks from the pinned official V4.1 helper."""
+"""Capture weight-free masks or FP32 index scores from pinned V4.1 source."""
 
 from __future__ import annotations
 
@@ -36,16 +36,107 @@ CASES = [
 ]
 
 
+def capture_index_scores(tree: ast.Module) -> dict[str, object]:
+    indexer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Indexer"
+    )
+    forward = next(
+        node
+        for node in indexer.body
+        if isinstance(node, ast.FunctionDef) and node.name == "forward"
+    )
+    statements = [
+        node
+        for node in forward.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "index_score"
+            for target in node.targets
+        )
+    ]
+    if len(statements) != 2:
+        raise ValueError("expected the two official index-score assignments")
+    score_code = compile(
+        ast.Module(body=statements, type_ignores=[]), SOURCE_URL, "exec"
+    )
+    cases = [
+        ("signed_head_weights", 2, [1, 0, -1, 1], [2, 0, 0, 2, -2, 1], [1, -0.5]),
+        ("relu_before_weight_and_sum", 1, [1, -2], [1, -1], [-1, 1]),
+        ("zero_weights", 2, [1, 2, -3, 4], [5, -6, 7, 8], [0, 0]),
+        ("negative_dots_are_zero", 2, [1, 2], [-3, -4, -5, -6], [-2]),
+        (
+            "configured_heads_and_dimension",
+            128,
+            [((index * 7 + 3) % 19 - 9) / 7 for index in range(32 * 128)],
+            [((index * 11 + 5) % 29 - 14) / 11 for index in range(17 * 128)],
+            [(index % 7 - 3) / 13 for index in range(32)],
+        ),
+    ]
+    captured = []
+    with torch.inference_mode():
+        for name, head_dim, query, keys, weights in cases:
+            heads, positions = len(weights), len(keys) // head_dim
+            namespace = {
+                "torch": torch,
+                "q": torch.tensor(query, dtype=torch.float32).reshape(
+                    1, 1, heads, head_dim
+                ),
+                "index_k": torch.tensor(keys, dtype=torch.float32).reshape(
+                    1, positions, head_dim
+                ),
+                "weights": torch.tensor(weights, dtype=torch.float32).reshape(
+                    1, 1, heads
+                ),
+            }
+            exec(score_code, namespace)  # noqa: S102 - inspected hash-pinned assignments only
+            captured.append(
+                {
+                    "name": name,
+                    "head_dim": head_dim,
+                    "query": query,
+                    "keys": keys,
+                    "head_weights": weights,
+                    "expected_scores": namespace["index_score"].flatten().tolist(),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "source": {
+            "url": SOURCE_URL,
+            "revision": REVISION,
+            "sha256": SOURCE_SHA256,
+            "symbol": "Indexer.forward:index_score",
+            "license": "MIT",
+        },
+        "reference": {
+            "torch_version": torch.__version__,
+            "device": "cpu",
+            "dtype": "float32",
+        },
+        "scope": "Synthetic one-query FP32 score arithmetic only. Inputs stand in for post-RoPE query/key vectors and already-scaled head weights. No FP4 rounding, BF16 execution, projections, distributed reduction, causal masking, Top-K, or model weights.",
+        "cases": captured,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source", type=Path, required=True, help="pinned inference/model.py"
+    )
+    parser.add_argument(
+        "--kind", choices=("candidates", "index-scores"), default="candidates"
     )
     args = parser.parse_args()
     source = args.source.read_bytes()
     if hashlib.sha256(source).hexdigest() != SOURCE_SHA256:
         parser.error("source SHA256 differs from the pinned official implementation")
     tree = ast.parse(source)
+    torch.set_num_threads(1)
+    if args.kind == "index-scores":
+        print(json.dumps(capture_index_scores(tree), indent=2, allow_nan=False))
+        return
     functions = [
         node
         for node in tree.body
