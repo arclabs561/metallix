@@ -13,6 +13,8 @@ mod layer_check;
 pub use layer_check::{LayerCheckMode, Qwen3LayerCheck, qualify_layer};
 mod row_check;
 pub use row_check::{Qwen3TensorRowsCheck, qualify_tensor_rows};
+mod embedding_check;
+pub use embedding_check::{Qwen3EmbeddingCheck, qualify_embedding};
 
 /// A selected-tensor loader comparison, not a bounded-residency inference result.
 #[derive(Debug, serde::Serialize)]
