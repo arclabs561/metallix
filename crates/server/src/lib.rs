@@ -130,6 +130,17 @@ enum Command {
         #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
         max_bytes: u64,
     },
+    /// Compare selected Qwen embedding rows with the resident MLX loader.
+    #[cfg(feature = "metal")]
+    CheckQwenEmbeddingMetal {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+        input_ids: Vec<i32>,
+        /// Bound only the selected raw embedding payload; resident comparison is outside this budget.
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=67_108_864))]
+        max_bytes: u64,
+    },
     /// Evaluate one selected-weight Qwen block and compare with resident weights.
     #[cfg(feature = "metal")]
     CheckQwenLayerMetal {
@@ -216,6 +227,12 @@ pub fn run() -> ExitCode {
             rows,
             max_bytes,
         } => check_qwen_rows_metal(&model, &tensor, start_row, rows, max_bytes),
+        #[cfg(feature = "metal")]
+        Command::CheckQwenEmbeddingMetal {
+            model,
+            input_ids,
+            max_bytes,
+        } => check_qwen_embedding_metal(&model, &input_ids, max_bytes),
         #[cfg(feature = "metal")]
         Command::EmbedQwenMetal { model } => embed_qwen_metal(&model),
         #[cfg(feature = "metal")]
@@ -356,6 +373,30 @@ fn checked_row_range(start_row: usize, rows: u32) -> Option<std::ops::Range<usiz
     start_row
         .checked_add(rows)
         .map(|end_row| start_row..end_row)
+}
+
+#[cfg(feature = "metal")]
+fn check_qwen_embedding_metal(
+    model: &std::path::Path,
+    input_ids: &[i32],
+    max_bytes: u64,
+) -> ExitCode {
+    match qwen::metal::qualify_embedding(model, input_ids, max_bytes) {
+        Ok(result) => match serde_json::to_string_pretty(&result) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("could not serialize embedding comparison: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("Qwen embedding check failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(feature = "metal")]
@@ -668,6 +709,45 @@ mod tests {
         }
         assert_eq!(super::checked_row_range(usize::MAX, 1), None);
         assert_eq!(super::checked_row_range(4, 3), Some(4..7));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn embedding_check_requires_ids_and_bounds_the_selected_payload() {
+        let cli =
+            Cli::try_parse_from(["metallix", "check-qwen-embedding-metal", "--model", "model"])
+                .expect("default embedding diagnostic");
+        assert!(matches!(
+            cli.command,
+            super::Command::CheckQwenEmbeddingMetal {
+                input_ids,
+                max_bytes: 1_048_576,
+                ..
+            } if input_ids == [1, 2, 3]
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "metallix",
+                "check-qwen-embedding-metal",
+                "--model",
+                "model",
+                "--input-ids",
+            ])
+            .is_err()
+        );
+        for limit in ["0", "67108865"] {
+            assert!(
+                Cli::try_parse_from([
+                    "metallix",
+                    "check-qwen-embedding-metal",
+                    "--model",
+                    "model",
+                    "--max-bytes",
+                    limit,
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[cfg(feature = "metal")]
