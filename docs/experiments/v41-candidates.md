@@ -76,7 +76,7 @@ uv run scripts/v41-candidate-reference.py --kind index-scores \
   --source artifacts/v41-reference-model.py > artifacts/v41-index-score-reference.json
 ```
 
-## Final selection reference
+## CPU final selection
 
 The capture script also records ten synthetic cases for the final three
 statements in the pinned `Indexer.forward`: clamp Top-K to row width, select by
@@ -88,7 +88,8 @@ uv run scripts/v41-candidate-reference.py --kind selection \
 cmp fixtures/deepseek-v41/selection-reference.json artifacts/v41-selection-reference.json
 ```
 
-This is reference evidence, not a Rust or Metal selection implementation.
+The CPU `deepseek::select_indices` helper checks these ten reference cases.
+It is not a Metal selection kernel or a complete indexer.
 Inputs are already masked. A selected negative-infinity score does **not**
 automatically produce `-1`: that conversion checks only causal reachability.
 For example, `[8, -inf, -inf]` with three reachable positions, Top-K 3, and
@@ -96,7 +97,39 @@ offset 10 produces `[10, 11, 12]`. Fewer finite scores than requested positions
 can therefore select candidate-masked but reachable entries. The fixture avoids
 cutoff ties; sorting selected positions does not settle ambiguous Top-K membership.
 
+The helper rejects ambiguous cutoff ties, including signed zero and negative
+infinity. A cutoff tie entirely among future positions is permitted because
+every possible choice maps to the same `-1` output. Ties wholly selected or
+wholly excluded are also unambiguous. Inputs are bounded to 1,048,576 positions;
+future scores must already be negative infinity, and reachable offsets must
+fit signed 32-bit indices. The offset addresses compressed KV after the
+sliding-window KV segment; it is not a token-position offset.
+
+```sh
+cargo test -p deepseek selection
+cargo bench -p deepseek --bench selection
+```
+
+The CPU benchmark selects 512 positions from distinct synthetic score rows of
+width 512, 4,096, and 16,384. Input construction is excluded; validation,
+selection, allocations, and output disposal are included. These are diagnostic
+operator costs, not model throughput.
+
+At `ed732b1`, three release runs on M3 Max each measured 100 samples per shape
+(default features, resident synthetic inputs, no concurrent benchmark). Medians
+in microseconds were:
+
+| Score positions | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| 512 | 7.582 | 7.832 | 7.833 |
+| 4,096 | 51.74 | 52.58 | 51.24 |
+| 16,384 | 215.7 | 213.5 | 213.4 |
+
+The implementation fully sorts scores before sorting selected positions. These
+measurements establish a baseline, not a speedup or a representative workload
+distribution; real score ties and masking patterns need separate measurements.
+
 These are operator-level parity gates and reference captures. They do not satisfy the text-forward
 gate for downloading the full V4.1 checkpoint, and they are not a performance or
-model-quality result. Next are BF16/FP4 score qualification, second-stage
-selection, and sparse attention with the same numerical and masking checks.
+model-quality result. Next are BF16/FP4 score qualification, Metal selection,
+and sparse attention with the same numerical and masking checks.
