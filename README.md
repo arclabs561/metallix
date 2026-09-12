@@ -3,13 +3,16 @@
 </p>
 <h1 align="center">metallix</h1>
 
-Metallix qualifies model layouts and builds Metal execution paths for one
-Apple-Silicon Mac. Its first target is DeepSeek-V4.1-Flash.
+A local inference engine for Apple Silicon, built around Rust and Metal.
 
-Qwen3-0.6B is the working control: resident or streamed generation, KV reuse, and
-JSON Schema constraints run on Metal through MLX. DeepSeek-V4.1 currently has
-layout inspection and synthetic operator qualification, not a decoder.
-An OpenAI-compatible local service is intended; there is no HTTP server yet.
+Run Qwen3-0.6B with KV caching, layer-streamed weights, and JSON Schema
+constraints. The `mx` CLI exposes token probabilities, timing, and correctness
+checks; GPU execution uses MLX.
+
+DeepSeek-V4.1-Flash is the main target. Checkpoint inspection and isolated
+operator tests work today; full-model generation is still in development.
+Larger-than-memory inference and an OpenAI-compatible server are goals,
+not supported features yet.
 
 ## Build and try it
 

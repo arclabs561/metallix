@@ -2,7 +2,7 @@
 # https://github.com/repository-settings/app
 
 repository:
-  description: "Metallix qualifies model layouts and builds Metal execution paths for one Apple-Silicon Mac."
+  description: "A local inference engine for Apple Silicon, built around Rust and Metal."
   default_branch: main
 
   topics:
