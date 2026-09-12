@@ -61,6 +61,8 @@ def main() -> int:
         parser.error("--metal requires Darwin arm64")
     feature_args = ["--all-features"] if args.metal else []
     commands = [
+        ([sys.executable, "scripts/check_engram_fixtures.py"], False),
+        ([sys.executable, "scripts/test_check_engram_fixtures.py"], False),
         (["cargo", "fmt", "--check"], False),
         (["cargo", "test", "--workspace", *feature_args], False),
         (
