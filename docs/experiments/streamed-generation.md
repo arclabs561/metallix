@@ -1,5 +1,49 @@
 # Bounded Qwen streamed generation
 
+## Projection tile-size experiment
+
+On 2026-09-12, the existing release binary was exercised without rebuilding:
+SHA-256 `65938171449e55c003736fb2aa8c0182b579aa3558d02239b5a9d06c81eff9b4`.
+This identifies the executable, not its source revision. The checkpoint is the
+same hash-pinned Qwen control recorded below. Hypothesis: larger output tiles
+reduce dispatch overhead while remaining inside the existing logical budget.
+
+```sh
+uv run scripts/benchmark-qwen.py --binary target/release/mx \
+  --model /path/to/Qwen3-0.6B --input-ids 9707,11,1879 --max-tokens 8 \
+  --memory-mode streamed --max-weight-bytes 81798144 --max-kv-bytes 7340032 \
+  --tile-rows 1024 --runs 3 --output artifacts/tile-sweep-1024.json
+```
+
+The same command was repeated with tile rows 4096, then 1024 again. A resident
+control used the same prompt/output count with streamed-only flags omitted.
+Each capture has three fresh processes and 18 retained decode samples after
+discarding the first decode per process. File caches were not flushed; model
+hashing warms them. No correctness-oracle work is included in the timings.
+
+| Capture order | Median decode ms | Sample standard deviation ms |
+|---|---:|---:|
+| Streamed 1024 | 260.03 | 5.01 |
+| Streamed 4096 | 579.07 | 178.73 |
+| Streamed 1024 repeat | 337.22 | 203.12 |
+| Resident control | 9.14 | 0.38 |
+
+All runs produced `13,358,2776,264,5458,315,279,3822`. Both streamed tile sizes
+reported 81,798,144 planned weight/staging bytes, within the unchanged budget.
+This is not measured process memory or full-logit parity across tile sizes.
+
+**Decision: no default change.** The larger tile did not demonstrate a win;
+baseline drift and variance prevent attributing the timing difference solely
+to tile size. Host activity, allocator behavior and filesystem/GPU effects were
+not isolated. A quieter interleaved experiment and all-logit parity are needed
+before adopting a tile-size change. This is neither a speedup nor evidence of
+physical SSD throughput or beyond-RAM execution.
+
+Receipts: `artifacts/tile-sweep-{1024,4096,1024-repeat,resident-control}.json`
+and corresponding `.log` files. No performance code changed.
+
+## Existing execution contract
+
 The Qwen adapter can generate greedily from layer-at-a-time weight reads,
 keeping detached live K/V between tokens. `mx gen --memory-mode streamed`
 uses the same grammar, logprob and preview path as resident generation.
