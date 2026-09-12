@@ -109,13 +109,13 @@ enum Command {
         /// Compare each cached result with a full forward outside timed regions.
         #[arg(long)]
         verify_cache: bool,
-        /// Emit phase timing and logical-memory diagnostics on stderr.
+        /// Emit phase timing and logical-memory diagnostics on stderr; streamed mode also adds phase profiles to JSON.
         #[arg(short, long, visible_alias = "debug")]
         verbose: bool,
-        /// Include selected-token natural-log probabilities in the JSON report.
+        /// Include selected-token natural-log probabilities in the JSON report; does not change greedy selection.
         #[arg(long)]
         logprobs: bool,
-        /// Show generated content and diagnostics on stderr; color only on a terminal.
+        /// Render a bounded stderr summary; decoded text only with --json-schema, otherwise raw IDs.
         #[arg(long)]
         preview: bool,
         /// Constrain generated JSON using a local schema (32 KiB maximum).
@@ -1047,6 +1047,19 @@ mod tests {
                 super::Command::GenerateQwenMetal { verbose: true, .. }
             ));
         }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("generate-qwen-metal")
+            .expect("generation subcommand")
+            .render_long_help()
+            .to_string();
+        let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_help.contains("streamed mode also adds phase profiles to JSON"));
+        assert!(normalized_help.contains("does not change greedy selection"));
+        assert!(
+            normalized_help.contains("decoded text only with --json-schema, otherwise raw IDs")
+        );
     }
 
     #[cfg(all(feature = "metal", feature = "structured-output"))]

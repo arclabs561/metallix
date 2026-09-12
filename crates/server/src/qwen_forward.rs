@@ -15,15 +15,21 @@ struct GenerationConfig {
 }
 
 impl GenerationConfig {
-    fn validate(&self, input_ids: &[i32], max_tokens: u32) -> Result<(), &'static str> {
+    fn validate(&self, input_ids: &[i32], max_tokens: u32) -> Result<(), String> {
         let maximum = self
             .max_position_embeddings
             .min(qwen::forward::MAX_DENSE_DEBUG_TOKENS);
         if input_ids.is_empty() || max_tokens == 0 {
-            return Err("prompt and generation budget must be nonempty");
+            return Err(String::from(
+                "prompt and generation budget must be nonempty",
+            ));
         }
-        if input_ids.len().saturating_add(max_tokens as usize) > maximum {
-            return Err("prompt plus generation budget exceeds model diagnostic context limit");
+        let total_tokens = input_ids.len().saturating_add(max_tokens as usize);
+        if total_tokens > maximum {
+            return Err(format!(
+                "model diagnostic requires prompt_tokens + max_tokens <= {maximum}; received {} + {max_tokens} = {total_tokens}",
+                input_ids.len(),
+            ));
         }
         if input_ids
             .iter()
@@ -34,7 +40,9 @@ impl GenerationConfig {
                     .is_none_or(|id| id >= self.vocab_size)
             })
         {
-            return Err("prompt or EOS token ID is outside model vocabulary");
+            return Err(String::from(
+                "prompt or EOS token ID is outside model vocabulary",
+            ));
         }
         Ok(())
     }
@@ -86,25 +94,27 @@ impl GenerationMemoryConfig {
         self,
         prompt_tokens: usize,
         max_tokens: u32,
-    ) -> Result<Option<StreamedGenerationPlan>, &'static str> {
+    ) -> Result<Option<StreamedGenerationPlan>, String> {
         match self.mode {
             GenerationMemoryMode::Resident => {
                 if self.max_weight_bytes.is_some()
                     || self.max_kv_bytes.is_some()
                     || self.tile_rows.is_some()
                 {
-                    return Err("streamed tuning flags require --memory-mode streamed");
+                    return Err(String::from(
+                        "streamed tuning flags require --memory-mode streamed",
+                    ));
                 }
                 Ok(None)
             }
             GenerationMemoryMode::Streamed => {
                 let maximum_total_tokens = prompt_tokens
                     .checked_add(max_tokens as usize)
-                    .ok_or("prompt plus generation budget overflows")?;
+                    .ok_or_else(|| String::from("prompt plus generation budget overflows"))?;
                 if maximum_total_tokens > STREAMED_MAX_TOKENS {
-                    return Err(
-                        "streamed prompt plus generation budget exceeds its 32-token qualification limit",
-                    );
+                    return Err(format!(
+                        "streamed generation requires prompt_tokens + max_tokens <= {STREAMED_MAX_TOKENS}; received {prompt_tokens} + {max_tokens} = {maximum_total_tokens}",
+                    ));
                 }
                 Ok(Some(StreamedGenerationPlan {
                     max_weight_bytes: self
@@ -691,7 +701,12 @@ mod tests {
             max_position_embeddings: 16,
         };
         assert!(config.validate(&[1, 2], 14).is_ok());
-        assert!(config.validate(&[1, 2], 15).is_err());
+        assert_eq!(
+            config.validate(&[1, 2], 15),
+            Err(String::from(
+                "model diagnostic requires prompt_tokens + max_tokens <= 16; received 2 + 15 = 17"
+            ))
+        );
         assert!(config.validate(&[], 1).is_err());
         assert!(config.validate(&[-1], 1).is_err());
         assert!(config.validate(&[8], 1).is_err());
@@ -734,15 +749,17 @@ mod tests {
         .expect("default streamed plan")
         .expect("streamed plan");
         assert_eq!(defaults.max_kv_bytes, 7_340_032);
-        assert!(
-            GenerationMemoryConfig {
-                mode: GenerationMemoryMode::Streamed,
-                max_weight_bytes: None,
-                max_kv_bytes: None,
-                tile_rows: None,
-            }
-            .streamed_plan(3, 30)
-            .is_err()
+        let over_limit = GenerationMemoryConfig {
+            mode: GenerationMemoryMode::Streamed,
+            max_weight_bytes: None,
+            max_kv_bytes: None,
+            tile_rows: None,
+        }
+        .streamed_plan(3, 30)
+        .expect_err("over-limit streamed prompt must fail");
+        assert_eq!(
+            over_limit,
+            "streamed generation requires prompt_tokens + max_tokens <= 32; received 3 + 30 = 33"
         );
         assert!(
             GenerationMemoryConfig {
