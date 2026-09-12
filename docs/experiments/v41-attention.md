@@ -64,6 +64,10 @@ For a four-slot ring:
 The helpers bound element counts and validate buffer lengths before modifying
 the ring. Short prefill deliberately leaves unused slots unchanged, matching
 the source; the mask, not clearing, prevents stale values from contributing.
+An exhaustive small-geometry test compares bulk prefill with incremental writes
+for windows 1–8 and sequence lengths 1–24, using two batches of width-three
+vectors. At every decode step, scheduled ring reads must equal the independent
+chronological input suffix, including across repeated wraps.
 Separate composition tests feed those indices and BF16 values widened to FP32
 into the semantic attention reference. They do not qualify BF16 attention
 arithmetic, GPU cache storage, compressed-cache sharing, or full-model decoding.

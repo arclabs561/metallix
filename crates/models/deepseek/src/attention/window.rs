@@ -503,6 +503,77 @@ mod tests {
     }
 
     #[test]
+    fn bulk_prefill_matches_incremental_writes_and_chronological_history() {
+        for window in 1..=8 {
+            for tokens in 1..=24 {
+                let batches = 2;
+                let width = 3;
+                // Unique opaque markers identify batch, token, and component.
+                let input = (0..batches * tokens * width)
+                    .map(|value| u16::try_from(value).unwrap())
+                    .collect::<Vec<_>>();
+                let mut bulk = vec![u16::MAX; batches * window * width];
+                let mut incremental = bulk.clone();
+                write_window_kv_bf16(
+                    WindowStep::Prefill { tokens: nz(tokens) },
+                    &input,
+                    nz(batches),
+                    nz(window),
+                    nz(width),
+                    &mut bulk,
+                )
+                .unwrap();
+                for position in 0..tokens {
+                    let next = (0..batches)
+                        .flat_map(|batch| {
+                            let offset = (batch * tokens + position) * width;
+                            input[offset..offset + width].iter().copied()
+                        })
+                        .collect::<Vec<_>>();
+                    let step = if position == 0 {
+                        WindowStep::Prefill { tokens: nz(1) }
+                    } else {
+                        WindowStep::Decode {
+                            position: nz(position),
+                        }
+                    };
+                    write_window_kv_bf16(
+                        step,
+                        &next,
+                        nz(batches),
+                        nz(window),
+                        nz(width),
+                        &mut incremental,
+                    )
+                    .unwrap();
+                    if position == 0 {
+                        continue; // Prefill indices address the input chunk, not the ring.
+                    }
+                    let schedule = window_topk_indices(step, nz(window), nz(batches)).unwrap();
+                    for batch in 0..batches {
+                        let observed = schedule[batch * window..(batch + 1) * window]
+                            .iter()
+                            .filter_map(|&slot| usize::try_from(slot).ok())
+                            .flat_map(|slot| {
+                                let offset = (batch * window + slot) * width;
+                                incremental[offset..offset + width].iter().copied()
+                            })
+                            .collect::<Vec<_>>();
+                        let first = (position + 1).saturating_sub(window);
+                        let expected = &input[(batch * tokens + first) * width
+                            ..(batch * tokens + position + 1) * width];
+                        assert_eq!(
+                            observed, expected,
+                            "window={window}, position={position}, batch={batch}"
+                        );
+                    }
+                }
+                assert_eq!(bulk, incremental, "window={window}, tokens={tokens}");
+            }
+        }
+    }
+
+    #[test]
     fn one_slot_decode_avoids_absolute_position_addition() {
         assert_eq!(
             window_topk_indices(
