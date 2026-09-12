@@ -149,6 +149,60 @@ mod tests {
         );
     }
 
+    // This deliberately uses the definition of q directly, rather than the
+    // production sampler's centered-weight/CDF implementation. It is a small
+    // finite oracle for Gate 1's fixed-entropy policy contract.
+    fn enumerate_policy_f64(logits: &[f32], legal: &[bool], temperature: f64) -> Vec<f64> {
+        let weights = logits
+            .iter()
+            .zip(legal)
+            .map(|(&logit, &is_legal)| {
+                if is_legal {
+                    (f64::from(logit) / temperature).exp()
+                } else {
+                    0.0
+                }
+            })
+            .collect::<Vec<_>>();
+        let normalizer = weights.iter().sum::<f64>();
+        weights
+            .into_iter()
+            .map(|weight| weight / normalizer)
+            .collect()
+    }
+
+    fn oracle_token(probabilities: &[f64], uniform: f64) -> usize {
+        let mut cumulative = 0.0;
+        let mut final_positive = None;
+        for (index, &probability) in probabilities.iter().enumerate() {
+            cumulative += probability;
+            if probability > 0.0 {
+                final_positive = Some(index);
+            }
+            if uniform < cumulative {
+                return index;
+            }
+        }
+        final_positive.expect("the test oracle has nonempty support")
+    }
+
+    fn assert_fixed_entropy_matches_f64_oracle(
+        logits: &[f32],
+        legal: &[bool],
+        temperature: f64,
+        uniform: f64,
+    ) {
+        let probabilities = enumerate_policy_f64(logits, legal, temperature);
+        let expected = oracle_token(&probabilities, uniform);
+        let sample = sample_categorical(logits, legal, temperature, uniform)
+            .expect("finite toy policy must sample");
+        assert_eq!(
+            sample.token_id,
+            u32::try_from(expected).expect("small test vocabulary")
+        );
+        assert_close(sample.sampling_logprob, probabilities[expected].ln());
+    }
+
     #[test]
     fn samples_a_hand_computed_distribution() {
         let logits = [0.0, std::f32::consts::LN_2];
@@ -225,6 +279,41 @@ mod tests {
         let first = sample_categorical(&logits, &legal, 0.7, 0.8).expect("valid sample");
         let second = sample_categorical(&logits, &legal, 0.7, 0.8).expect("valid sample");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn independent_f64_oracle_covers_ties_masked_rows_and_temperature() {
+        let tied_logits = [0.0, 0.0, 100.0, -100.0];
+        let tied_legal = [true, true, false, false];
+        let tied_q = enumerate_policy_f64(&tied_logits, &tied_legal, 1.0);
+        assert_close(tied_q[0], 0.5);
+        assert_close(tied_q[1], 0.5);
+        assert_close(tied_q[2], 0.0);
+        assert_close(tied_q[3], 0.0);
+        for uniform in [0.0, 0.5, f64::from_bits(0x3fef_ffff_ffff_ffff)] {
+            assert_fixed_entropy_matches_f64_oracle(&tied_logits, &tied_legal, 1.0, uniform);
+        }
+
+        let logits = [0.0, std::f32::consts::LN_2, 2.0 * std::f32::consts::LN_2];
+        let legal = [true, true, true];
+        for uniform in [0.0, 0.1, 0.5, 0.99] {
+            assert_fixed_entropy_matches_f64_oracle(&logits, &legal, 0.5, uniform);
+        }
+    }
+
+    #[test]
+    fn independent_f64_oracle_preserves_representable_tiny_eos_mass() {
+        // Token 1 stands in for EOS here: this stateless primitive only sees a
+        // legal model row, while EOS interpretation belongs to the caller.
+        let logits = [0.0, -20.0];
+        let legal = [true, true];
+        let probabilities = enumerate_policy_f64(&logits, &legal, 1.0);
+        assert!(probabilities[0] > 0.999_999_99);
+        assert!(probabilities[1] > 0.0);
+        assert!(probabilities[1] < 1.0e-8);
+
+        assert_fixed_entropy_matches_f64_oracle(&logits, &legal, 1.0, 0.0);
+        assert_fixed_entropy_matches_f64_oracle(&logits, &legal, 1.0, 1.0 - 1.0e-10);
     }
 
     #[test]

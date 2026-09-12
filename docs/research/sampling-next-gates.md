@@ -82,11 +82,20 @@ without a file-cache flush.
 **Question.** Given raw logits and a grammar allowed set,
 what distribution actually selected the token?
 
-The remaining Gate 1 oracle is independent `f64` enumeration against the
-production policy. Given finite toy logits, temperature, and a specified
-reproducible RNG, it must compare support, normalized deployed distribution
-`q`, and sampled token. Cover ties, tiny remaining mass, EOS, invalid
-parameters, and padded vocabulary rows. On error it must not advance the RNG.
+The stateless primitive now has an independent finite-toy `f64` oracle in
+`crates/engine/src/sampling.rs`: direct uncentered exponentials and normalized
+probabilities are compared with the production centered implementation at
+fixed entropy values. Cases cover ties, masked/padded rows, temperature, and
+a representable tiny legal mass, checking selected IDs and policy logprob.
+The tiny row stands in for EOS only numerically; the primitive does not know
+grammar or EOS semantics. This is not a statistical distribution test or an
+oracle for underflowed tails.
+
+The remaining Gate 1 join is the reproducible RNG policy: independently check
+the entropy conversion/stream against those distributions and preserve RNG on
+errors. Existing CLI tests prove bounded replay and rollback, not an independent
+RNG-stream oracle or cross-device/model execution parity.
+Run `cargo test -p engine independent_f64_oracle` for the new toy checks.
 The engine tests now cover grammar masks analytically, accepting EOS without
 special-token bytes, and rejected draws/output limits without committed state
 changes. Top-k/top-p and their support changes remain future inputs, not
