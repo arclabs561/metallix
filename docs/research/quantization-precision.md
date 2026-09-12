@@ -220,6 +220,54 @@ for supplied-format inference, not a calibrated checkpoint converter.
 
 Run `cargo test -p deepseek precision::activation`.
 
+## Expert composition: preserve the casts
+
+The pinned `Expert.forward` is not simply three FP32 matrix products around
+SwiGLU. For a quantized expert in the BF16 execution context, its numerical
+sequence is:
+
+1. Quantize BF16 input into E4M3FN activations and E8M0 scales for each linear.
+2. Compute `w1` and `w3`, rounding each linear output to BF16, then promote
+   those results to FP32.
+3. When the configured limit is positive, clamp the up branch on both sides
+   but the gate branch only from above. Compute `SiLU(gate) * up` in FP32.
+4. Multiply the selected routing weight into that intermediate, then cast to
+   BF16 **before** the down-projection's activation quantization and `w2`.
+5. Round the down-projection output to BF16. MoE accumulates routed outputs
+   in FP32, adds the unweighted shared expert, and casts the sum to input dtype.
+
+Moving routing weights after `w2` is not equivalent across these rounding and
+quantization boundaries. Clamping the gate symmetrically is also a different
+function. A test should distinguish both changes, not only check a zero or
+uniform-weight example.
+
+Source: pinned `model.py` `Expert`, `MoE`, and its BF16 main context; pinned
+`kernel.py` `fp4_gemm_kernel` and `fp8_gemm_kernel` copy their FP32 accumulator
+into BF16 shared output. Their wrappers allocate using the global default
+dtype but do not override the kernel's BF16 default. This qualifies the BF16
+context, not arbitrary default dtypes or actual hardware rounding behavior.
+
+The shared expert is a separate missing numerical join: routed experts
+explicitly select FP4, whereas the shared expert inherits the FP8 default.
+FP8 weight scales cover `[ceil(N/G), K/G]` blocks, unlike FP4's per-output-row
+`[N,K/32]` scales. The pinned model uses `G=32`. For each K block the FP8
+kernel forms an unscaled dot, multiplies activation scale then weight scale,
+and accumulates in FP32; the weight scale index uses `output_row / G`.
+A future shared-expert reference must test output rows across that boundary.
+Reusing the FP4 scale indexing or substituting an unquantized shared expert
+would not establish full MoE agreement.
+
+The test-only `precision::expert_composition_tests` now joins the existing
+activation and FP4 linear references with software nearest-even BF16 casts.
+Five reduced 32-wide cases distinguish route-after-`w2`, route-after-hidden-BF16,
+omitted first-linear BF16 casts, a symmetric gate clamp, and a missing up-branch
+lower clamp. Hand-derived projection and final values anchor the routing and
+linear-cast cases. These are synthetic scalar composition
+checks, not an executable model adapter, independent upstream execution,
+hardware parity, or full MoE coverage.
+
+Run `cargo test -p deepseek expert_composition_tests`.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights

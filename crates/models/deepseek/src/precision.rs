@@ -15,6 +15,9 @@ pub use activation::{ActivationQuantError, quantize_bf16_activations_e4m3fn};
 mod linear;
 pub use linear::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
 
+#[cfg(test)]
+mod expert_composition_tests;
+
 /// Expands an E2M1 sign/exponent/mantissa nibble, preserving signed zero.
 ///
 /// Returns `None` if any upper four bits are set. This function deliberately
