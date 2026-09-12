@@ -102,6 +102,12 @@ scalar composition can use this reference under its explicit rounding
 assumption. Upstream cast qualification and Metal execution remain separate
 gates; passing this oracle does not establish either.
 
+Scale-encoder tests cover every nonnegative finite E4M3 code and every adjacent
+midpoint, including immediate FP32 neighbors. A targeted mutation reversing
+the even-tie preference was rejected by the midpoint test. Shape overflow,
+work limits and short buffers are tested without allocating the requested
+oversized shape, with caller output required to remain unchanged.
+
 ```sh
 uv run scripts/v41-fp4-activation-reference.py > artifacts/fp4-activation-reference.json
 cargo test -p deepseek --test fp4_activation

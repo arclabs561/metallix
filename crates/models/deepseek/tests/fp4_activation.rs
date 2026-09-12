@@ -416,3 +416,90 @@ fn failures_are_atomic_for_shape_nonfinite_and_scale_overflow() {
     ));
     assert_eq!(index_output, [0xdead; 32]);
 }
+
+#[test]
+fn e4m3_scale_encoder_covers_every_positive_code_and_rounding_boundary() {
+    for code in 0_u8..=126 {
+        assert_eq!(encode_e4m3_rne(decode_e4m3fn(code)), Some(code));
+    }
+    for lower in 0_u8..126 {
+        let midpoint = decode_e4m3fn(lower).midpoint(decode_e4m3fn(lower + 1));
+        let even = if lower & 1 == 0 { lower } else { lower + 1 };
+        assert_eq!(encode_e4m3_rne(midpoint), Some(even));
+        assert_eq!(encode_e4m3_rne(midpoint.next_down()), Some(lower));
+        assert_eq!(encode_e4m3_rne(midpoint.next_up()), Some(lower + 1));
+    }
+    for unsupported in [448.0_f32.next_up(), f32::INFINITY, f32::NAN, -1.0] {
+        assert_eq!(encode_e4m3_rne(unsupported), None);
+    }
+}
+
+#[test]
+fn malformed_shapes_and_buffers_leave_output_untouched_without_large_allocations() {
+    let input = [0_u16; 16];
+    for (rows, width, input_len, expected) in [
+        (0, 16, 16, Fp4ActivationError::EmptyShape),
+        (1, 0, 16, Fp4ActivationError::EmptyShape),
+        (usize::MAX, 16, 16, Fp4ActivationError::ShapeOverflow),
+        (
+            MAX_ELEMENTS,
+            16,
+            16,
+            Fp4ActivationError::ElementLimit {
+                elements: MAX_ELEMENTS * 16,
+            },
+        ),
+        (
+            1,
+            16,
+            15,
+            Fp4ActivationError::Length {
+                field: "input",
+                actual: 15,
+                expected: 16,
+            },
+        ),
+        (
+            1,
+            32,
+            16,
+            Fp4ActivationError::Length {
+                field: "input",
+                actual: 16,
+                expected: 32,
+            },
+        ),
+    ] {
+        let mut output = [0xdead_u16; 16];
+        let error = fp4_activation_reference(
+            &input[..input_len],
+            rows,
+            width,
+            Fp4Mode::CompressedKv16E4m3,
+            &mut output,
+        )
+        .err()
+        .expect("invalid shape or input buffer");
+        assert_eq!(error, expected);
+        assert_eq!(output, [0xdead; 16]);
+    }
+    let mut short_output = [0xdead_u16; 15];
+    let error = fp4_activation_reference(
+        &input,
+        1,
+        16,
+        Fp4Mode::CompressedKv16E4m3,
+        &mut short_output,
+    )
+    .err()
+    .expect("short output buffer");
+    assert_eq!(
+        error,
+        Fp4ActivationError::Length {
+            field: "output",
+            actual: 15,
+            expected: 16
+        }
+    );
+    assert_eq!(short_output, [0xdead; 15]);
+}
