@@ -112,6 +112,12 @@ output component is BF16 `0x3e89` when both keys share a block and `0x3e8a` when
 they straddle the block boundary. Rescaling an earlier FP32 accumulation is
 not the same operation as rounding its exponential weight to BF16.
 
+Padding probes place a single live key at the beginning, middle, and end of
+rows spanning up to three blocks, with all other slots masked. Leading and
+trailing empty blocks must preserve its closed-form result; entirely masked
+rows must return zero. This checks the finite initial maximum (`-1e30`): an
+initial `-inf` would make an empty leading block evaluate `exp(-inf - -inf)`.
+
 This is still not TileLang/CUDA or Metal parity: scalar dot/reduction order and
 host exponentials do not reproduce device GEMM and exponential instructions.
 The reference bounds buffers and work, returns zero for all-masked rows, and

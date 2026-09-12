@@ -16,6 +16,40 @@ fn bf16(value: f32) -> u16 {
 }
 
 #[test]
+fn empty_blocks_before_and_after_a_live_key_do_not_change_its_result() {
+    for slots in [1, 63, 64, 65, 127, 128, 129] {
+        for live_slot in [0, slots / 2, slots - 1] {
+            let mut indices = vec![-1; slots];
+            indices[live_slot] = 0;
+            let output = sparse_attention_bf16_reference(
+                &[0x3f80],
+                &[0x3f80],
+                &[0.0],
+                &indices,
+                1.0,
+                layout(1, 1, slots),
+            )
+            .unwrap();
+            // A single score-one/value-one key with sink zero: 1/(1+exp(-1)).
+            assert_eq!(output, [0x3f3b], "slots={slots}, live_slot={live_slot}");
+        }
+        assert_eq!(
+            sparse_attention_bf16_reference(
+                &[0x3f80],
+                &[0x3f80],
+                &[0.0],
+                &vec![-1; slots],
+                1.0,
+                layout(1, 1, slots),
+            )
+            .unwrap(),
+            [0],
+            "all-masked slots={slots}"
+        );
+    }
+}
+
+#[test]
 fn numerator_cast_and_fp32_denominator_have_distinct_rounding_boundaries() {
     // q=1, KV=[0,k], sink=0: BF16(k*BF16(exp(k))/(2+exp(k))).
     // k=-1/16 catches a missing probability cast (0xbca4 instead of 0xbca3).
