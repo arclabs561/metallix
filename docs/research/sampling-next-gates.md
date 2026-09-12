@@ -169,6 +169,15 @@ resampling variance, or model quality.
 
 ## Gate 3: cache ownership, then uncertainty calibration
 
+The test-only `crates/engine/tests/particle_ancestry.rs` now exercises a fixed
+three-particle resampling trace through the production categorical sampler.
+An independent FP64 CDF checks duplicated/discarded ancestors, absorbing EOS,
+post-resampling weight reset, normalization and ESS, and weighted terminal
+selection rather than MAP or equal-particle selection. This is a finite
+accounting gate, not a model-backed particle runtime, normalizer-unbiasedness
+proof, or convergence experiment. Physical prefix/cache branching remains
+unqualified.
+
 **Question.** Can real decode state be forked/reindexed correctly and does any
 reported uncertainty mean more than a token statistic?
 
