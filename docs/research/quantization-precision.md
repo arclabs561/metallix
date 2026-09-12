@@ -50,6 +50,68 @@ scale placement, fused arithmetic, quantization, or full-model execution.
 Next: identify packed layouts from headers and upstream packing code, then
 compare approved real slices before attaching these decoders to a loader.
 
+## Source INT8 expert storage: one real header qualified
+
+The [pinned converter](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/convert.py)
+was read in full (205 lines, 2026-09-12), not executed. Its
+`cast_e2m1fn_to_e4m3fn` takes a rank-two INT8 tensor, views its bytes as unsigned,
+unpacks low nibble then high nibble, and doubles the input dimension. Its FP4
+export branch reinterprets INT8 as `float4_e2m1fn_x2` without arithmetic.
+The optional FP8 branch instead transforms weights and scales; it is not the
+same representation-preserving path. The helper's "lossless" description is
+not an independently qualified numerical guarantee here.
+
+Metadata-only inspection of pinned `model-00009-of-00048.safetensors` obtained
+bytes 0–7 (length prefix) and 8–258143 (258,136-byte header), both via bounded
+HTTP range requests. The complete shard length is 7,389,759,032 bytes; no tensor
+payload was fetched. The entire header passed range/byte-count validation and
+exact tensor-name agreement with the pinned index after the dtype fix below.
+For `layers.6.ffn.experts.0`, the actual metadata is:
+
+| Projection | Weight storage / shape | Scale storage / shape | Logical weight shape from converter |
+|---|---|---|---|
+| `w1` | `I8 [2304,2560]` | `F8_E8M0 [2304,160]` | `[2304,5120]` |
+| `w2` | `I8 [5120,1152]` | `F8_E8M0 [5120,72]` | `[5120,2304]` |
+| `w3` | `I8 [2304,2560]` | `F8_E8M0 [2304,160]` | `[2304,5120]` |
+
+The source index pairs `.weight` and `.scale` directly. The converter also
+accepts the older `weight_scale_inv` spelling and renames it, without inverting
+it in the FP4 branch. A suffix alone is not evidence of inverse-scale math.
+Routed experts are assigned to model-parallel ranks by expert index; shared
+experts follow a different branch. This inspection does not generalize their
+ownership, or the Engram layout, from a single routed expert.
+
+The real header exposed missing canonical dtype spellings in our parser:
+`F8_E4M3` and `F8_E8M0`. Safetensors 0.6.2's
+[Python binding](https://github.com/huggingface/safetensors/blob/v0.6.2/bindings/python/src/lib.rs)
+explicitly maps these to `float8_e4m3fn` and `float8_e8m0fnu` in both directions.
+The parser now accepts them alongside its previous explicit-suffix spellings.
+The minimal spelling test and the full local header/index test failed before
+the fix and passed afterward. The local data test is deliberately ignored in
+ordinary checks; it is run explicitly with absolute `METALLIX_V41_HEADER` and
+`METALLIX_V41_INDEX` paths:
+
+```sh
+cargo test -p deepseek pinned_v41_shard09_metadata -- --ignored
+```
+
+Retained source and data identities (SHA-256):
+
+| Local artifact | SHA-256 |
+|---|---|
+| `artifacts/v41-convert-pinned.py` | `035028340479145594a81d6084a8424e57363adf83c0d5983914783d95614d76` |
+| `artifacts/v41-shard09-header-pinned.json` | `139eeea4664aba161a4b4cb82a60a86a2429467601ee6584a887825f8137adfd` |
+| `artifacts/v41-index-pinned.json` | `74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8` |
+| `artifacts/safetensors-0.6.2-python-lib.rs` | `651fc421fe2489f6424220c13f6c541039d890a0d38c4216d5f37ec6a310f95e` |
+
+Receipts: `artifacts/check-v41-storage-spelling-{before,after}.log` and
+`artifacts/check-v41-shard09-{before-absolute,after}.log`. Next: a validated
+INT8 weight/scale pair descriptor tied to the index and header ranges, followed
+by explicitly approved payload-slice comparison. Converted raw `F4` storage,
+all-shard coverage, decoded numerical parity and full V4.1 execution remain
+unqualified. The current fixed-width parser still rejects packed FP4 dtype
+tags; source INT8 byte storage does not require accepting them.
+
 ## Next numerical join: FP4 linear runtime contract
 
 Source: pinned V4.1

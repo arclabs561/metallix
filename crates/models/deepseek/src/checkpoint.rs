@@ -18,9 +18,10 @@ const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A fixed-width storage dtype established by the held safetensors contract.
 ///
-/// The accepted spellings and byte widths mirror the existing local
-/// Qwen safetensors inspector. This is a storage fact, not a claim about a
-/// `DeepSeek` runtime tensor layout.
+/// Canonical FP8 spellings follow safetensors 0.6.2, whose Python binding maps
+/// `F8_E4M3` to `float8_e4m3fn` and `F8_E8M0` to `float8_e8m0fnu`.
+/// The previously accepted explicit-suffix spellings remain supported. Storage
+/// identity does not establish a `DeepSeek` tensor's runtime layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum V41StorageDtype {
@@ -78,11 +79,11 @@ impl V41StorageDtype {
             "U64" => Self::U64,
             "I64" => Self::I64,
             "F64" => Self::F64,
-            "F8_E4M3FN" => Self::F8E4M3Fn,
+            "F8_E4M3" | "F8_E4M3FN" => Self::F8E4M3Fn,
             "F8_E4M3FNUZ" => Self::F8E4M3Fnuz,
             "F8_E5M2" => Self::F8E5M2,
             "F8_E5M2FNUZ" => Self::F8E5M2Fnuz,
-            "F8_E8M0FNU" => Self::F8E8M0Fnu,
+            "F8_E8M0" | "F8_E8M0FNU" => Self::F8E8M0Fnu,
             _ => return None,
         })
     }
@@ -684,6 +685,57 @@ mod tests {
 
     fn file_bytes(header: &[u8], payload_bytes: u64) -> u64 {
         8 + u64::try_from(header.len()).expect("small test header") + payload_bytes
+    }
+
+    #[test]
+    fn canonical_safetensors_fp8_spellings_have_one_byte_storage() {
+        for (spelling, expected) in [
+            ("F8_E4M3", V41StorageDtype::F8E4M3Fn),
+            ("F8_E8M0", V41StorageDtype::F8E8M0Fnu),
+        ] {
+            let header = format!(
+                r#"{{"weight":{{"dtype":"{spelling}","shape":[2],"data_offsets":[0,2]}}}}"#
+            );
+            let parsed =
+                V41SafetensorsHeader::parse(header.as_bytes(), file_bytes(header.as_bytes(), 2))
+                    .expect("canonical safetensors FP8 storage tag");
+            let tensor = parsed.tensor("weight").expect("weight");
+            assert_eq!(tensor.dtype(), expected);
+            assert_eq!(tensor.byte_length(), 2);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires pinned shard09 header and index metadata; no tensor payload"]
+    fn pinned_v41_shard09_metadata_matches_index_and_expert_shapes() {
+        let header_path = std::env::var("METALLIX_V41_HEADER").expect("set METALLIX_V41_HEADER");
+        let index_path = std::env::var("METALLIX_V41_INDEX").expect("set METALLIX_V41_INDEX");
+        let header = std::fs::read(header_path).expect("read bounded local header");
+        assert_eq!(header.len(), 258_136);
+        let parsed =
+            V41SafetensorsHeader::parse(&header, 7_389_759_032).expect("pinned shard09 header");
+        let index = V41SafetensorsIndex::parse(
+            &std::fs::read_to_string(index_path).expect("read bounded local index"),
+        )
+        .expect("pinned index");
+        parsed
+            .validate_index_shard(&index, "model-00009-of-00048.safetensors")
+            .expect("exact full-shard tensor set");
+        for (projection, rows, packed_columns, weight_start, scale_start) in [
+            ("w1", 2_304, 2_560, 594_728_408, 8_015_576),
+            ("w2", 5_120, 1_152, 600_626_648, 8_384_216),
+            ("w3", 2_304, 2_560, 606_524_888, 8_752_856),
+        ] {
+            let base = format!("layers.6.ffn.experts.0.{projection}");
+            let weight = parsed.tensor(&format!("{base}.weight")).expect("weight");
+            let scale = parsed.tensor(&format!("{base}.scale")).expect("scale");
+            assert_eq!(weight.dtype(), V41StorageDtype::I8);
+            assert_eq!(weight.shape(), [rows, packed_columns]);
+            assert_eq!(scale.dtype(), V41StorageDtype::F8E8M0Fnu);
+            assert_eq!(scale.shape(), [rows, packed_columns / 16]);
+            assert_eq!(weight.file_range().start, 258_144 + weight_start);
+            assert_eq!(scale.file_range().start, 258_144 + scale_start);
+        }
     }
 
     #[test]
