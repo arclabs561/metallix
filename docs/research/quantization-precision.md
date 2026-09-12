@@ -368,16 +368,26 @@ the mutation was removed.
 
 The FFN composition now collapses two residual copies containing alternating
 `±2` and `±6` with incoming pre coefficients `[0.75, 0.25]`, asserting `±3`
-before RMSNorm. Separately, synthetic zero HC logits, epsilon `0.5`, and one
-iteration yield post weights `1` and residual-matrix entries `0.4`.
+before RMSNorm. A nonzero HC projection of that same residual produces next-pre
+logits `±2/sqrt(20)`; the remaining rows cancel to zero. Synthetic epsilon
+`0.5` and one iteration yield post weights `1` and residual-matrix entries `0.4`.
 Expansion adds `±3.2` to the FFN output `648`, giving BF16 `652` and `644`.
 These deliberately visible residuals are not the released HC settings.
 The incoming pre belongs to the preceding sublayer; the newly computed pre
 is for the next one (`Block.forward`, lines 975–993), not this FFN's collapse.
 
-This joins supplied-coefficient HC flow to the quantized FFN. The normalized
-FP32 projection producing the HC logits, actual checkpoint weights, and the
-attention/cache path are still missing from this composition.
+`hc::projection::project_hc_coefficients` produces these logits from BF16
+residual storage and a row-major FP32 matrix, then calls the coefficient split.
+Pinned `model.py`, lines 946–955, normalizes over the entire flattened residual
+stream and scales the completed projection by that reciprocal RMS; it does
+not normalize each copy separately or scale inputs before the dot product.
+The captured shard-09 header identifies `layers.6.hc_ffn_fn` as FP32
+`[24, 20480]`. The scalar reference bounds projection work to 1,048,576 matrix
+elements and rejects invalid shapes, nonfinite values, and scalar overflow.
+
+This joins residual-derived HC coefficients and supplied incoming pre to the
+quantized FFN. Actual checkpoint weights and the attention/cache path remain
+outside this synthetic composition; scalar arithmetic is not kernel parity.
 
 ## Serving-side choices
 

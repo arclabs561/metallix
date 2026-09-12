@@ -427,9 +427,10 @@ fn hc_normalized_fixture() -> ([u16; WIDTH], [u16; 2 * WIDTH]) {
 #[test]
 fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
     // This qualifies HC collapse → RMSNorm → gate → experts → HC expansion.
-    // Incoming pre coefficients and current projected HC logits are supplied;
-    // this is not a complete block or a hardware kernel oracle.
+    // Incoming pre coefficients are supplied; current HC logits are projected
+    // from the residual. This is not a complete block or hardware kernel oracle.
     let (input, residual) = hc_normalized_fixture();
+    let coefficients = hc_coefficients_fixture(&residual);
     let mut gate_weights = [0x0000_u16; 3 * WIDTH];
     gate_weights[WIDTH] = 0x3f80; // expert 1: dot 1
     gate_weights[2 * WIDTH..2 * WIDTH + 3].fill(0x3f80); // expert 2: dot 3
@@ -517,12 +518,6 @@ fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
         bf16_value(expert0[0] + expert1[0]).to_bits()
     );
 
-    // Synthetic HC epsilon 0.5 exposes the residual contribution after BF16
-    // rounding. Zero affine logits give pre=1, post=1, comb=1/(2+0.5)=0.4
-    // after the first column normalization. These are not Flash's defaults.
-    let coefficients = crate::hc::split_hc_coefficients(&[0.0; 8], &[1.0; 3], &[0.0; 8], 2, 1, 0.5)
-        .expect("bounded HC coefficient split");
-    assert_eq!(coefficients.pre(), &[1.0; 2]);
     let mut expanded = [0_u16; 2 * WIDTH];
     crate::hc::mixing::hc_post_bf16_reference(
         &bf16_row(&combined),
@@ -541,4 +536,37 @@ fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
         };
         assert_eq!(u32::from(*bits) << 16, expected.to_bits());
     }
+}
+
+fn hc_coefficients_fixture(residual: &[u16; 2 * WIDTH]) -> crate::hc::HcCoefficients {
+    let mut projection = [0.0_f32; 8 * 2 * WIDTH];
+    projection[0] = 1.0;
+    projection[2 * WIDTH] = -1.0;
+    // Remaining rows use nonzero weights that cancel the first ±2 pair.
+    for row in 2..8 {
+        projection[row * 2 * WIDTH..row * 2 * WIDTH + 2].fill(1.0);
+    }
+    let coefficients = crate::hc::projection::project_hc_coefficients(
+        residual,
+        &projection,
+        &[1.0; 3],
+        &[0.0; 8],
+        2,
+        1.0e-20,
+        1,
+        0.5,
+    )
+    .expect("bounded normalized HC projection");
+    // Mean square across BOTH residual copies is (4 + 36)/2 = 20.
+    // Only next-pre logits are nonzero: ±2/sqrt(20). These do not replace
+    // the previous sublayer's incoming pre used by hc_normalized_fixture.
+    let logit = 2.0_f64 / 20.0_f64.sqrt();
+    for (actual, sign) in coefficients.pre().iter().zip([1.0, -1.0]) {
+        let expected = 0.5 + 1.0 / (1.0 + (-sign * logit).exp());
+        assert!((f64::from(*actual) - expected).abs() < 1.0e-6);
+    }
+    // Synthetic epsilon 0.5 and one iteration give post=1, comb=0.4.
+    // These are not Flash's released HC settings.
+    assert_eq!(coefficients.post(), &[1.0; 2]);
+    coefficients
 }

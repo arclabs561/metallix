@@ -7,6 +7,7 @@
 use thiserror::Error;
 
 pub mod mixing;
+pub mod projection;
 
 /// One token's Hyper-Connection coefficients.
 #[derive(Clone, Debug, PartialEq)]
