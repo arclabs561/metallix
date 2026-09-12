@@ -19,6 +19,22 @@ consolidation, not a new literature survey.  The LLaMPPL v2 paper was read in
 full there; the FKC, SMC-SD and AWRS sources have the explicitly selective
 coverage recorded in their respective notes.
 
+## Offline EOS particle accounting
+
+`crates/engine/tests/eos_particle_target.rs` extends the finite target oracle
+to EOS-terminated paths. It checks incremental log weights, normalization,
+effective sample size, duplicate/discarded ancestors, absorbing EOS and
+population extinction. Multinomial ancestor draws and weighted terminal
+selection exercise the engine's categorical sampler against an independent
+CDF oracle at fixed entropy values.
+
+The exact enumerated target has normalizer 0.36; the chosen finite particle
+trace estimates 23/30 and loses a supported path. That deliberate disagreement
+guards against presenting finite-particle inference as exact conditioning.
+This is test-only accounting, not a particle runtime, model-backed cache
+fork, convergence experiment or calibrated-confidence feature. Physical
+cache-fork/reindex parity remains a prerequisite for model-backed particles.
+
 ## Gate 1: one explicit sampled-policy distribution
 
 The implemented Qwen slice accepts FP32 logits, a legal mask, positive finite
