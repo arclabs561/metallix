@@ -164,6 +164,23 @@ The real 4 MiB Qwen projection was checked again after rebuilding; all
 2,097,152 values remained bit-exact against MLX. Receipt:
 `artifacts/qwen-nested-header-qproj.json`.
 
+### V4.1 prefix-to-header intake
+
+The same pinned format defines an eight-byte little-endian header length.
+[`V41SafetensorsHeader::parse_prefixed_header`](../../crates/models/deepseek/src/checkpoint.rs)
+now accepts exactly that prefix plus its JSON header, without tensor payload.
+It checks the declared length against the header cap, complete shard length,
+and supplied body length before delegating to the existing range validator.
+The body-only `parse` entry point retains its existing contract.
+
+Tests cover padded JSON and absolute ranges, short prefixes, oversized lengths,
+insufficient declared shard length, truncated bodies, trailing supplied bytes,
+and delegation of invalid JSON and unsupported packed FP4. This is an offline
+metadata boundary, not a reader or file-to-runtime FP4 mapping. Callers must
+still bound allocations before acquiring these bytes. Targeted check:
+`cargo test -p deepseek prefixed_header`; local receipt:
+`artifacts/check-prefixed-header-targeted.log`.
+
 ## Research that has not become runtime support
 
 [Host-memory notes](host-memory.md) distinguish full readings of LLM in a Flash

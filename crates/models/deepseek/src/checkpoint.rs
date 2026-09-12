@@ -153,6 +153,49 @@ pub struct V41SafetensorsHeader {
 }
 
 impl V41SafetensorsHeader {
+    /// Parses exactly the eight-byte length prefix and its declared JSON header.
+    ///
+    /// `prefix_and_header` must exclude tensor payload bytes. The little-endian
+    /// length is checked against the header cap, declared complete shard length,
+    /// and supplied body length before JSON parsing. This method performs no I/O
+    /// and does not bound an allocation already made by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41SafetensorsHeaderError`] for a short prefix, oversized or
+    /// mismatched header length, insufficient shard length, or an invalid header.
+    pub fn parse_prefixed_header(
+        prefix_and_header: &[u8],
+        file_bytes: u64,
+    ) -> Result<Self, V41SafetensorsHeaderError> {
+        let (prefix, header) = prefix_and_header.split_first_chunk::<8>().ok_or(
+            V41SafetensorsHeaderError::PrefixTooShort {
+                actual_bytes: prefix_and_header.len(),
+            },
+        )?;
+        let declared_bytes = u64::from_le_bytes(*prefix);
+        if declared_bytes > MAX_HEADER_BYTES {
+            return Err(V41SafetensorsHeaderError::HeaderTooLarge {
+                header_bytes: declared_bytes,
+            });
+        }
+        // The cap above also proves this addition cannot overflow.
+        let required_bytes = SAFETENSORS_PREFIX_BYTES + declared_bytes;
+        if file_bytes < required_bytes {
+            return Err(V41SafetensorsHeaderError::FileLengthTooSmall {
+                file_bytes,
+                required_bytes,
+            });
+        }
+        if usize::try_from(declared_bytes).ok() != Some(header.len()) {
+            return Err(V41SafetensorsHeaderError::HeaderLengthMismatch {
+                declared_bytes,
+                actual_bytes: header.len(),
+            });
+        }
+        Self::parse(header, file_bytes)
+    }
+
     /// Parses an already-bounded safetensors JSON header.
     ///
     /// `header_bytes` must be the exact bytes after the eight-byte little-endian
@@ -504,6 +547,20 @@ struct RawTensor {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum V41SafetensorsHeaderError {
+    /// The supplied metadata does not contain the full eight-byte length prefix.
+    #[error("safetensors length prefix needs 8 bytes, received {actual_bytes}")]
+    PrefixTooShort {
+        /// Total supplied metadata bytes.
+        actual_bytes: usize,
+    },
+    /// Supplied header bytes do not exactly match the on-file length prefix.
+    #[error("safetensors prefix declares {declared_bytes} header bytes, received {actual_bytes}")]
+    HeaderLengthMismatch {
+        /// Header byte count encoded in the prefix.
+        declared_bytes: u64,
+        /// Supplied bytes after the prefix, excluding no trailing bytes implicitly.
+        actual_bytes: usize,
+    },
     /// The supplied header exceeds the parser's explicit bound.
     #[error("safetensors header is {header_bytes} bytes, above the {MAX_HEADER_BYTES}-byte limit")]
     HeaderTooLarge {
@@ -627,6 +684,93 @@ mod tests {
 
     fn file_bytes(header: &[u8], payload_bytes: u64) -> u64 {
         8 + u64::try_from(header.len()).expect("small test header") + payload_bytes
+    }
+
+    #[test]
+    fn prefixed_header_preserves_padded_absolute_ranges_without_payload() {
+        let mut header =
+            br#"{"weight":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}"#.to_vec();
+        header.resize(512, b' ');
+        let mut metadata = 512_u64.to_le_bytes().to_vec();
+        metadata.extend_from_slice(&header);
+        let parsed = V41SafetensorsHeader::parse_prefixed_header(&metadata, 524)
+            .expect("prefix plus padded header, no payload supplied");
+        assert_eq!(parsed.payload_range(), 520..524);
+        assert_eq!(
+            parsed.tensor("weight").expect("weight").file_range(),
+            520..524
+        );
+        assert_eq!(
+            parsed,
+            V41SafetensorsHeader::parse(&header, 524).expect("same body contract")
+        );
+        metadata.push(0);
+        assert!(matches!(
+            V41SafetensorsHeader::parse_prefixed_header(&metadata, 524),
+            Err(V41SafetensorsHeaderError::HeaderLengthMismatch {
+                declared_bytes: 512,
+                actual_bytes: 513,
+            })
+        ));
+    }
+
+    #[test]
+    fn prefixed_header_checks_lengths_before_json_or_allocation() {
+        for length in 0..8 {
+            assert!(matches!(
+                V41SafetensorsHeader::parse_prefixed_header(&[0; 8][..length], 8),
+                Err(V41SafetensorsHeaderError::PrefixTooShort { actual_bytes })
+                    if actual_bytes == length
+            ));
+        }
+        for declared in [super::MAX_HEADER_BYTES + 1, u64::MAX] {
+            assert!(matches!(
+                V41SafetensorsHeader::parse_prefixed_header(&declared.to_le_bytes(), u64::MAX),
+                Err(V41SafetensorsHeaderError::HeaderTooLarge { header_bytes })
+                    if header_bytes == declared
+            ));
+        }
+        assert!(matches!(
+            V41SafetensorsHeader::parse_prefixed_header(&64_u64.to_le_bytes(), 71),
+            Err(V41SafetensorsHeaderError::FileLengthTooSmall {
+                file_bytes: 71,
+                required_bytes: 72,
+            })
+        ));
+        assert!(matches!(
+            V41SafetensorsHeader::parse_prefixed_header(&64_u64.to_le_bytes(), 72),
+            Err(V41SafetensorsHeaderError::HeaderLengthMismatch {
+                declared_bytes: 64,
+                actual_bytes: 0,
+            })
+        ));
+        assert!(matches!(
+            V41SafetensorsHeader::parse_prefixed_header(&0_u64.to_le_bytes(), 7),
+            Err(V41SafetensorsHeaderError::FileLengthTooSmall {
+                file_bytes: 7,
+                required_bytes: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn prefixed_header_still_rejects_invalid_json_and_packed_fp4() {
+        let mut invalid = 1_u64.to_le_bytes().to_vec();
+        invalid.push(b'!');
+        assert!(matches!(
+            V41SafetensorsHeader::parse_prefixed_header(&invalid, 9),
+            Err(V41SafetensorsHeaderError::HeaderJson(_))
+        ));
+        let header = br#"{"weight":{"dtype":"F4_E2M1FN_X2","shape":[32],"data_offsets":[0,16]}}"#;
+        let mut metadata = u64::try_from(header.len())
+            .expect("small header")
+            .to_le_bytes()
+            .to_vec();
+        metadata.extend_from_slice(header);
+        assert!(matches!(
+            V41SafetensorsHeader::parse_prefixed_header(&metadata, file_bytes(header, 16)),
+            Err(V41SafetensorsHeaderError::UnsupportedTensorDtype { .. })
+        ));
     }
 
     #[test]
