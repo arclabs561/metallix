@@ -7,6 +7,9 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Bounded FP32 linear reference with atomic output writes and no BF16
+  narrowing. Compressor fixture tests now execute BF16/FP32 projection
+  matrices before native pooling and normalization.
 - Model-local scalar compressor pooling and partial-group state with separate
   BF16 ratio-one and FP32 gated inputs. Learned projection results are supplied
   by the caller; cache publication and scheduling remain separate.

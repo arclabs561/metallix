@@ -2,10 +2,11 @@
 //!
 //! Fixture outputs come from `Compressor.forward` plus `RMSNorm.forward` at
 //! the checked-in source revision.  The adapter below supplies its documented
-//! identity-KV and reversed/scaled gate stubs to the real Rust API; it does
-//! not reproduce pooling or normalization arithmetic.
+//! identity-KV and reversed/scaled gate weights to library linear operators.
+//! Projection, pooling and normalization all execute in library code.
 
 use deepseek::compressor::{CompressorError, CompressorInput, CompressorState};
+use deepseek::precision::{bf16_linear_reference, fp32_linear_reference};
 use serde::Deserialize;
 
 const BATCHES: usize = 2;
@@ -55,17 +56,23 @@ fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-/// Builds the explicit projection stubs used to create the fixture.
+/// Executes matrices equivalent to the projection stubs used for the capture.
 ///
-/// Ratio one directly accepts the captured BF16 projection. Larger ratios use
-/// identity KV projection and a gate that reverses each width-four row then
-/// scales it by 0.75. The pinned capture is the pooling oracle; the library
-/// computes the actual result.
+/// Larger ratios widen input to FP32 before both linears, with no BF16 cast
+/// between these projections and pooling. The pinned capture remains the oracle.
 fn gated_fixture_inputs(input_bf16: &[u16]) -> (Vec<f32>, Vec<f32>) {
-    let kv: Vec<f32> = input_bf16.iter().copied().map(bf16_to_f32).collect();
-    let mut scores = Vec::with_capacity(kv.len());
-    for row in kv.chunks_exact(WIDTH) {
-        scores.extend(row.iter().rev().map(|value| value * 0.75));
+    let input: Vec<f32> = input_bf16.iter().copied().map(bf16_to_f32).collect();
+    let mut wkv = [0.0; WIDTH * WIDTH];
+    let mut wgate = [0.0; WIDTH * WIDTH];
+    for feature in 0..WIDTH {
+        wkv[feature * WIDTH + feature] = 1.0;
+        wgate[feature * WIDTH + WIDTH - 1 - feature] = 0.75;
+    }
+    let mut kv = vec![0.0; input.len()];
+    let mut scores = vec![0.0; input.len()];
+    for (weight, output) in [(&wkv, &mut kv), (&wgate, &mut scores)] {
+        fp32_linear_reference(&input, weight, input.len() / WIDTH, WIDTH, WIDTH, output)
+            .expect("finite fixture projection");
     }
     (kv, scores)
 }
@@ -76,8 +83,22 @@ fn forward_fixture_call(
     call: &Call,
 ) -> Result<Option<Vec<u16>>, CompressorError> {
     if ratio == 1 {
+        let mut wkv = [0_u16; WIDTH * WIDTH];
+        for feature in 0..WIDTH {
+            wkv[feature * WIDTH + feature] = 0x3f80;
+        }
+        let mut projected = vec![0; call.input_bf16.len()];
+        bf16_linear_reference(
+            &call.input_bf16,
+            &wkv,
+            BATCHES * call.positions,
+            WIDTH,
+            WIDTH,
+            &mut projected,
+        )
+        .expect("ratio-one BF16 fixture projection");
         state.forward(
-            CompressorInput::ProjectedBf16(&call.input_bf16),
+            CompressorInput::ProjectedBf16(&projected),
             call.positions,
             call.start,
         )

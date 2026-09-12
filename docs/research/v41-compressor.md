@@ -58,9 +58,15 @@ Nonfinite scalar intermediates are rejected rather than treated as a claim
 about upstream overflow behavior.
 
 The public API is exercised against the pinned source capture by
-`crates/models/deepseek/tests/compressor_api.rs`. The fixture adapter only
-constructs its declared identity KV and reversed/scaled gate projections;
-pooling and normalization execute in the library.
+`crates/models/deepseek/tests/compressor_api.rs`. The fixture adapter constructs
+matrices equivalent to the capture's identity KV and reversed/scaled gate
+stubs. Ratio one calls `bf16_linear_reference`; larger ratios widen the BF16
+input and call `fp32_linear_reference` for both projections. Projection,
+pooling and normalization therefore execute in library code. The FP32 linear
+reference does not narrow its output before pooling: it uses separate scalar
+products and ascending-index sums, with bounded work and atomic caller-output
+writes. This qualifies synthetic weights, not checkpoint loading or hardware
+GEMM reduction parity.
 Additional tests cover ratio four, independent feature-wise token weights,
 finite softmax underflow and failed completion/reset retries. Restoring an
 early zero-denominator check makes the underflow regression fail: the
