@@ -3,7 +3,10 @@
 //! This checks BF16 boundaries around the existing FP8-activation/FP4-linear
 //! references. It is neither a hardware kernel oracle nor a full `MoE` test.
 
-use super::{ActivationGroup, fp4_linear_runtime_f32, quantize_bf16_activations_e4m3fn};
+use super::{
+    ActivationGroup, fp4_linear_runtime_f32, fp8_linear_runtime_f32,
+    quantize_bf16_activations_e4m3fn,
+};
 
 const WIDTH: usize = 32;
 const PACKED_WIDTH: usize = WIDTH / 2;
@@ -314,4 +317,69 @@ fn up_clamp_has_a_lower_bound_while_gate_clamp_does_not() {
         (-16.0_f32).to_bits()
     );
     assert_ne!(upper_only_up[0].to_bits(), pinned[0].to_bits());
+}
+
+// Shared experts use FP8 weights and two-dimensional weight-scale blocks,
+// unlike the routed FP4 experts above. This fixture has one 32x32 scale block.
+fn shared_projection(input: &[u16; WIDTH]) -> [f32; WIDTH] {
+    let mut codes = [0_u8; WIDTH];
+    let mut scales = [0_u8; 1];
+    quantize_bf16_activations_e4m3fn(
+        input,
+        1,
+        WIDTH,
+        ActivationGroup::Elements32,
+        &mut codes,
+        &mut scales,
+    )
+    .expect("finite shared-expert activation");
+    let mut output = [0.0; WIDTH];
+    fp8_linear_runtime_f32(
+        &codes,
+        &scales,
+        &[0x30; WIDTH * WIDTH], // E4M3FN +0.5
+        &[127],                 // one unit scale for the whole weight tile
+        1,
+        WIDTH,
+        WIDTH,
+        ActivationGroup::Elements32,
+        &mut output,
+    )
+    .expect("finite shared-expert projection");
+    output.map(bf16_value)
+}
+
+#[test]
+fn fp4_routed_and_fp8_shared_outputs_join_before_final_bf16_cast() {
+    let input = [0x3f80_u16; WIDTH];
+    let weights = uniform_weight(0x11);
+    let (routed, _) = routed_expert(
+        &input,
+        &weights,
+        &weights,
+        &weights,
+        4.0,
+        0.3,
+        Variant::Pinned,
+    );
+    let gate = shared_projection(&input);
+    let up = shared_projection(&input);
+    assert_bits_eq(&gate, 16.0);
+    assert_bits_eq(&up, 16.0);
+    let mut hidden = [0.0; WIDTH];
+    for ((value, gate), up) in hidden.iter_mut().zip(gate).zip(up) {
+        let gate = gate.min(4.0);
+        let up = up.clamp(-4.0, 4.0);
+        *value = (gate / (1.0 + (-gate).exp())) * up;
+    }
+    let shared = shared_projection(&bf16_row(&hidden));
+    // Unweighted hidden rounds/requantizes to 16; 32 products with 0.5
+    // yield 256. The routed branch independently contributes 72.
+    assert_bits_eq(&shared, 256.0);
+    assert_bits_eq(&routed, 72.0);
+    let combined = std::array::from_fn(|i| bf16_value(routed[i] + shared[i]));
+    assert_bits_eq(&combined, 328.0);
+    // Shared contribution is added once and is not multiplied by route weight.
+    let incorrectly_routed_shared = bf16_value(routed[0] + 0.3 * shared[0]);
+    assert_ne!(combined[0].to_bits(), incorrectly_routed_shared.to_bits());
 }

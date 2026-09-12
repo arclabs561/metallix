@@ -247,13 +247,13 @@ into BF16 shared output. Their wrappers allocate using the global default
 dtype but do not override the kernel's BF16 default. This qualifies the BF16
 context, not arbitrary default dtypes or actual hardware rounding behavior.
 
-The shared expert is a separate missing numerical join: routed experts
+The shared expert needs a separate numerical representation: routed experts
 explicitly select FP4, whereas the shared expert inherits the FP8 default.
 FP8 weight scales cover `[ceil(N/G), K/G]` blocks, unlike FP4's per-output-row
 `[N,K/32]` scales. The pinned model uses `G=32`. For each K block the FP8
 kernel forms an unscaled dot, multiplies activation scale then weight scale,
 and accumulates in FP32; the weight scale index uses `output_row / G`.
-A future shared-expert reference must test output rows across that boundary.
+The FP8 reference tests output rows across that boundary.
 Reusing the FP4 scale indexing or substituting an unquantized shared expert
 would not establish full MoE agreement.
 
@@ -267,6 +267,26 @@ checks, not an executable model adapter, independent upstream execution,
 hardware parity, or full MoE coverage.
 
 Run `cargo test -p deepseek expert_composition_tests`.
+
+## FP8 shared-expert linear reference
+
+`fp8_linear_runtime_f32` implements the pinned FP8 activation/weight equation
+over caller-supplied E4M3FN codes and E8M0 scales. Weight scales are shared
+across output rows in 32- or 128-row groups, not one scale row per output.
+Complete K groups are required. Each unscaled FP32 group dot is multiplied by
+its activation scale and then weight scale before FP32 accumulation. Exact
+length, shape, nonfinite-code and numerical-overflow checks finish before
+output writes. The output remains FP32; this is not a hardware kernel.
+
+A test-only composition also executes a synthetic FP8 shared expert and adds
+its output once to a supplied-weight FP4 routed branch, with software BF16
+boundaries. Independent hand values are 256 from the shared branch and 72
+from the routed branch, giving 328 after the final BF16 cast. This does not
+yet exercise router selection, multiple routed experts, actual weights, or
+a complete block. It joins numerical representations without claiming full
+MoE or upstream execution parity.
+
+Run `cargo test -p deepseek precision`.
 
 ## Serving-side choices
 

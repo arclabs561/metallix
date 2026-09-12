@@ -1,12 +1,13 @@
 //! Reference expansion for the V4.1 runtime's narrow floating-point types.
 //!
 //! Encodings follow OCP Microscaling Formats v1.0, sections 5.3 and 5.4.
-//! These are decode and scalar-arithmetic references, not quantizers or loaders.
+//! These are decode, activation-quantization and scalar-arithmetic references,
+//! not checkpoint converters or loaders.
 //! Runtime pairs and contiguous 32-element scaled blocks are supported; mapping
 //! checkpoint bytes to that runtime layout remains a separate contract.
 //! Scalar decoders return NaNs; block expansion and linear arithmetic reject
-//! non-finite results. The linear reference preserves per-32-dot scale placement,
-//! not hardware reduction or BF16 rounding.
+//! non-finite results. Linear references preserve their specified per-group
+//! dot/scale placement, not hardware reduction or BF16 output rounding.
 
 mod blocks;
 pub use blocks::{BlockDecodeError, expand_e2m1x2_blocks32};
@@ -14,6 +15,8 @@ mod activation;
 pub use activation::{ActivationQuantError, quantize_bf16_activations_e4m3fn};
 mod linear;
 pub use linear::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
+mod fp8_linear;
+pub use fp8_linear::{Fp8LinearError, fp8_linear_runtime_f32};
 
 #[cfg(test)]
 mod expert_composition_tests;
