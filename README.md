@@ -5,65 +5,120 @@
 
 A local inference engine for Apple Silicon, built around Rust and Metal.
 
-Run Qwen3-0.6B with KV caching, layer-streamed weights, and JSON Schema
-constraints. The `mx` CLI exposes token probabilities, timing, and correctness
-checks; GPU execution uses MLX.
+Generate schema-constrained JSON, inspect token probabilities, and compare
+resident versus layer-streamed inference with `mx`. Qwen3-0.6B runs today
+through MLX; DeepSeek-V4.1-Flash is the main target, still in development.
 
-DeepSeek-V4.1-Flash is the main target. Checkpoint inspection and isolated
-operator tests work today; full-model generation is still in development.
-Larger-than-memory inference and an OpenAI-compatible server are goals,
-not supported features yet.
+## Make it generate a record
 
-## Build and try it
-
-From the repository root, with Rust 1.87+, Apple Silicon, CMake, and a working
-Xcode Metal toolchain:
+With a local Qwen3-0.6B checkpoint and the [built CLI](#build), run from the
+repository root:
 
 ```sh
-cargo build -p server --release --all-features
-target/release/mx --help
+mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 29 \
+  --json-schema fixtures/constraints/record.json --preview
 ```
 
-Both `mx` and `metallix` are native executables with the same CLI; no shell
-alias is required. Nothing is installed on your PATH by these commands.
-
-With an already-downloaded Qwen3-0.6B safetensors checkpoint, including its
-`config.json` and `tokenizer.json`, replace the model path below. Input is raw
-token IDs, not a text prompt or chat template:
-
-```sh
-target/release/mx gen --model /path/to/Qwen3-0.6B \
-  --input-ids 9707,11,1879 --max-tokens 4
-```
-
-Stdout is a JSON diagnostic report with generated token IDs and timings.
-For example, the local control run returned these fields (excerpt):
-
-```json
-{"generated_ids":[13,358,2776,264],"finish_reason":"length"}
-```
-
-To constrain generation to the included JSON Schema:
-
-```sh
-target/release/mx gen --model /path/to/Qwen3-0.6B \
-  --input-ids 9707,11,1879 --max-tokens 64 \
-  --json-schema fixtures/constraints/record.json
-```
-
-The local control run produced this value in `constraint.output`:
+The local run produced this value in `constraint.output`:
 
 ```json
 {"status":"ready","count":1}
 ```
 
-The object above is not the entire stdout report. Successful constrained runs
-report `constraint.status: "validated"`; a token limit reached before grammar
+The schema constrains tokens during generation. `--preview` shows decoded JSON
+and a short diagnostic summary on stderr; stdout remains the full JSON report.
+Successful completion is independently validated. Running out of tokens before
 completion reports `incomplete` and exits nonzero.
 
-Both examples use resident weights and greedy selection. See
-[the generation guide](DEVELOPMENT.md) for readable previews, token scores,
-cache verification, and layer-streamed generation with explicit memory budgets.
+## Build
+
+Requires Rust 1.87+, Apple Silicon, CMake and the Xcode Metal toolchain.
+From the repository root:
+
+```sh
+cargo build -p server --release --all-features
+export PATH="$PWD/target/release:$PATH"
+mx --help
+```
+
+The PATH change lasts for this shell. `mx` and `metallix` are native executables
+with the same CLI; neither needs a shell alias.
+
+For the examples below, point `MODEL` at an already-downloaded Qwen3-0.6B
+safetensors checkpoint with `config.json` and `tokenizer.json`:
+
+```sh
+MODEL=/path/to/Qwen3-0.6B
+```
+
+Inputs are currently raw token IDs, not text prompts or chat templates.
+
+## Explore with mx
+
+**Check your setup without loading weights.** Run a small Metal graph, then
+inspect the checkpoint's headers:
+
+```sh
+mx smoke-qwen-metal
+mx inspect-qwen-checkpoint --model "$MODEL"
+```
+
+**Make a draw reproducible.** Choose a temperature and seed; inspect the selected
+tokens and their probabilities:
+
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 \
+  --sample --temperature 0.7 --seed 42 --logprobs --preview
+```
+
+The local control returned `13,21927,11,1879`; repeating the run preserved IDs
+and scores. Replay requires the same model execution and sampling policy, not
+just the same seed. Without sampling flags, selection is greedy.
+
+**Keep the schema, change the sampling policy.** Combine the same flags with
+the record schema. With `jq`, extract the object and the first token's scores:
+
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 29 \
+  --json-schema fixtures/constraints/record.json \
+  --sample --temperature 0.7 --seed 42 --logprobs \
+  | jq '{output: .constraint.output, first_token: .logprobs.tokens[0]}'
+```
+
+Scores distinguish raw-model, grammar-conditioned and actual sampling-policy
+log probabilities, plus the grammar-allowed log mass. These are natural-log
+quantities, not answer-confidence scores.
+
+**Check that KV reuse preserves the result.** Compare each cached step with a
+full forward and show timing/memory diagnostics:
+
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 \
+  --verify-cache --verbose --preview
+```
+
+Verification adds reference work outside the reported generation timings;
+use this for correctness checks, not speed comparisons.
+
+**Stream the weights a layer at a time.** Keep the JSON constraint while
+selecting explicit weight/staging and KV budgets:
+
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 29 \
+  --memory-mode streamed --max-weight-bytes 81798144 --max-kv-bytes 7340032 \
+  --json-schema fixtures/constraints/record.json --preview --verbose
+```
+
+In streamed mode, `--verbose` adds phase profiles for loading/conversion,
+execution/readback and tiled projection. These measure host wall-clock time,
+not individual GPU kernels. The budgets are logical, not a process-memory cap
+or evidence of beyond-RAM serving.
+
+See [the generation guide](DEVELOPMENT.md) for full reports, benchmark recipes
+and the meanings of individual timing fields.
+
+## Build features
 
 | Feature | Enables |
 |---|---|
