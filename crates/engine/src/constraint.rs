@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
+use crate::sampling::{SamplingError, sample_categorical};
 use jsonschema::{Draft, Validator};
 use llguidance::{
     Matcher, ParserFactory,
@@ -62,6 +63,19 @@ pub struct TokenLogProbs {
     pub constrained_logprob: f64,
     /// Natural log of the model probability mass permitted by the grammar.
     pub allowed_log_mass: f64,
+}
+
+/// Natural-log probabilities for a caller-variate grammar-masked categorical draw.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplingTokenLogProbs {
+    /// Log probability under the unmasked temperature-one model, including padded rows.
+    pub model_logprob: f64,
+    /// Log probability under the temperature-one model conditioned on the grammar mask.
+    pub constrained_logprob: f64,
+    /// Natural log of the temperature-one model mass permitted by the grammar.
+    pub allowed_log_mass: f64,
+    /// Log probability under the deployed temperature-conditioned grammar-masked policy.
+    pub sampling_logprob: f64,
 }
 
 /// How a request ended from this session's perspective.
@@ -123,6 +137,9 @@ pub enum ConstraintError {
     /// At least one logit was NaN or infinite.
     #[error("logits must all be finite")]
     NonFiniteLogit,
+    /// The caller-supplied categorical temperature or variate was invalid.
+    #[error("sampling temperature or uniform variate is invalid")]
+    InvalidSamplingParameter,
     /// No tokenizer token was both grammar-allowed and selectable.
     #[error("grammar left no selectable token")]
     NoAllowedToken,
@@ -155,6 +172,7 @@ pub struct JsonConstraintSession {
     tokenizer_vocab_size: usize,
     eos_token_id: u32,
     output: Vec<u8>,
+    legal_mask: Vec<bool>,
     limits: ConstraintLimits,
     state: SessionState,
 }
@@ -226,6 +244,7 @@ impl JsonConstraintSession {
             tokenizer_vocab_size,
             eos_token_id,
             output: Vec::new(),
+            legal_mask: vec![false; model_vocab_size],
             limits,
             state: SessionState::Active,
         })
@@ -245,11 +264,57 @@ impl JsonConstraintSession {
         Ok((step, logprobs.ok_or(ConstraintError::NoAllowedToken)?))
     }
 
+    /// Samples and consumes one grammar-allowed token from caller-provided entropy.
+    ///
+    /// The caller owns entropy and commits any RNG advance only after this method
+    /// succeeds. On error, the grammar's semantic state and decoded bytes are not
+    /// advanced.
+    ///
+    /// The returned receipt distinguishes raw temperature-one model probability,
+    /// its current grammar-conditioned form, and the deployed temperature-conditioned
+    /// categorical policy. Padded model rows contribute to the raw probability but
+    /// are never grammar-selectable.
+    pub fn select_categorical_with_logprobs(
+        &mut self,
+        logits: &[f32],
+        temperature: f64,
+        uniform: f64,
+    ) -> Result<(ConstraintStep, SamplingTokenLogProbs), ConstraintError> {
+        let matcher = self.prepare_selection(logits)?;
+        let selected = sample_categorical(logits, &self.legal_mask, temperature, uniform)
+            .map_err(map_sampling_error)?;
+        let selected_index = usize::try_from(selected.token_id)
+            .map_err(|_| ConstraintError::TokenizerCompilation)?;
+        let probabilities = self.logprobs_for(logits, selected_index, selected.sampling_logprob);
+        let step = self.commit_selection(matcher, selected_index)?;
+        Ok((step, probabilities))
+    }
+
     fn select(
         &mut self,
         logits: &[f32],
         collect_logprobs: bool,
     ) -> Result<(ConstraintStep, Option<TokenLogProbs>), ConstraintError> {
+        let matcher = self.prepare_selection(logits)?;
+        let mut selected = None;
+        let vocabulary_width = u32::try_from(self.tokenizer_vocab_size)
+            .map_err(|_| ConstraintError::TokenizerCompilation)?;
+        for token_id in 0..vocabulary_width {
+            let index =
+                usize::try_from(token_id).map_err(|_| ConstraintError::TokenizerCompilation)?;
+            if self.legal_mask[index]
+                && selected.is_none_or(|current| logits[index] > logits[current])
+            {
+                selected = Some(index);
+            }
+        }
+        let selected_index = selected.ok_or(ConstraintError::NoAllowedToken)?;
+        let logprobs = collect_logprobs.then(|| self.argmax_logprobs_for(logits, selected_index));
+        let step = self.commit_selection(matcher, selected_index)?;
+        Ok((step, logprobs))
+    }
+
+    fn prepare_selection(&mut self, logits: &[f32]) -> Result<Matcher, ConstraintError> {
         if self.state != SessionState::Active {
             return Err(ConstraintError::TerminalSession);
         }
@@ -259,44 +324,37 @@ impl JsonConstraintSession {
         if logits.iter().any(|logit| !logit.is_finite()) {
             return Err(ConstraintError::NonFiniteLogit);
         }
-        if self.matcher.is_stopped() {
+        let mut matcher = self.matcher.deep_clone();
+        if matcher.is_stopped() {
             return Err(ConstraintError::NonAcceptingStop);
         }
-        let mask = self
-            .matcher
+        let mask = matcher
             .compute_mask()
             .map_err(|_| ConstraintError::NonAcceptingStop)?;
-        let mut selected = None;
-        let mut allowed = Vec::new();
+        self.legal_mask.fill(false);
         let vocabulary_width = u32::try_from(self.tokenizer_vocab_size)
             .map_err(|_| ConstraintError::TokenizerCompilation)?;
         for token_id in 0..vocabulary_width {
-            let index =
-                usize::try_from(token_id).map_err(|_| ConstraintError::TokenizerCompilation)?;
             if mask.is_allowed(token_id) {
-                if selected.is_none_or(|current| logits[index] > logits[current]) {
-                    selected = Some(index);
-                }
-                if collect_logprobs {
-                    allowed.push(logits[index]);
-                }
+                let index =
+                    usize::try_from(token_id).map_err(|_| ConstraintError::TokenizerCompilation)?;
+                self.legal_mask[index] = true;
             }
         }
-        let selected_index = selected.ok_or(ConstraintError::NoAllowedToken)?;
+        self.legal_mask
+            .iter()
+            .any(|allowed| *allowed)
+            .then_some(matcher)
+            .ok_or(ConstraintError::NoAllowedToken)
+    }
+
+    fn commit_selection(
+        &mut self,
+        mut matcher: Matcher,
+        selected_index: usize,
+    ) -> Result<ConstraintStep, ConstraintError> {
         let token_id =
             u32::try_from(selected_index).map_err(|_| ConstraintError::TokenizerCompilation)?;
-        let logprobs = collect_logprobs.then(|| {
-            let (model_maximum, model_log_sum) = logsumexp_parts(logits);
-            let (allowed_maximum, allowed_log_sum) = logsumexp_parts(&allowed);
-            let selected = f64::from(logits[selected_index]);
-            let model_logprob = (selected - model_maximum) - model_log_sum;
-            TokenLogProbs {
-                model_logprob,
-                constrained_logprob: (selected - allowed_maximum) - allowed_log_sum,
-                allowed_log_mass: (allowed_maximum - model_maximum)
-                    + (allowed_log_sum - model_log_sum),
-            }
-        });
         let token_bytes = if token_id == self.eos_token_id {
             Vec::new()
         } else {
@@ -305,18 +363,52 @@ impl JsonConstraintSession {
         if self.output.len().saturating_add(token_bytes.len()) > self.limits.max_output_bytes {
             return Err(ConstraintError::OutputTooLarge);
         }
-        self.matcher
+        matcher
             .consume_token(token_id)
             .map_err(|_| ConstraintError::NonAcceptingStop)?;
-        self.output.extend_from_slice(&token_bytes);
-        if self.matcher.is_stopped() {
-            if !is_accepting_terminal(&mut self.matcher)? {
+        let complete = if matcher.is_stopped() {
+            if !is_accepting_terminal(&mut matcher)? {
                 return Err(ConstraintError::NonAcceptingStop);
             }
+            true
+        } else {
+            false
+        };
+        self.matcher = matcher;
+        self.output.extend_from_slice(&token_bytes);
+        if complete {
             self.state = SessionState::Complete;
-            return Ok((ConstraintStep::Complete { token_id }, logprobs));
+            Ok(ConstraintStep::Complete { token_id })
+        } else {
+            Ok(ConstraintStep::Token { token_id })
         }
-        Ok((ConstraintStep::Token { token_id }, logprobs))
+    }
+
+    fn argmax_logprobs_for(&self, logits: &[f32], selected_index: usize) -> TokenLogProbs {
+        let (model_maximum, model_log_sum) = logsumexp_parts(logits);
+        let (allowed_maximum, allowed_log_sum) = masked_logsumexp_parts(logits, &self.legal_mask);
+        let selected = f64::from(logits[selected_index]);
+        let model_logprob = (selected - model_maximum) - model_log_sum;
+        TokenLogProbs {
+            model_logprob,
+            constrained_logprob: (selected - allowed_maximum) - allowed_log_sum,
+            allowed_log_mass: (allowed_maximum - model_maximum) + (allowed_log_sum - model_log_sum),
+        }
+    }
+
+    fn logprobs_for(
+        &self,
+        logits: &[f32],
+        selected_index: usize,
+        sampling_logprob: f64,
+    ) -> SamplingTokenLogProbs {
+        let argmax = self.argmax_logprobs_for(logits, selected_index);
+        SamplingTokenLogProbs {
+            model_logprob: argmax.model_logprob,
+            constrained_logprob: argmax.constrained_logprob,
+            allowed_log_mass: argmax.allowed_log_mass,
+            sampling_logprob,
+        }
     }
 
     /// Returns whether a consumed token completed an accepting grammar state.
@@ -367,6 +459,35 @@ fn logsumexp_parts(values: &[f32]) -> (f64, f64) {
         .sum::<f64>()
         .ln();
     (maximum, log_sum)
+}
+
+fn masked_logsumexp_parts(values: &[f32], mask: &[bool]) -> (f64, f64) {
+    let mut maximum = f64::NEG_INFINITY;
+    for (&value, &allowed) in values.iter().zip(mask) {
+        if allowed {
+            maximum = maximum.max(f64::from(value));
+        }
+    }
+    let mut sum = 0.0;
+    for (&value, &allowed) in values.iter().zip(mask) {
+        if allowed {
+            sum += (f64::from(value) - maximum).exp();
+        }
+    }
+    (maximum, sum.ln())
+}
+
+fn map_sampling_error(error: SamplingError) -> ConstraintError {
+    match error {
+        SamplingError::EmptySupport => ConstraintError::NoAllowedToken,
+        SamplingError::NonFiniteLogit => ConstraintError::NonFiniteLogit,
+        SamplingError::MaskLengthMismatch | SamplingError::VocabularyTooLarge => {
+            ConstraintError::TokenizerCompilation
+        }
+        SamplingError::EmptyLogits
+        | SamplingError::InvalidTemperature
+        | SamplingError::InvalidUniform => ConstraintError::InvalidSamplingParameter,
+    }
 }
 
 const MAX_TOKENIZER_VOCABULARY: usize = 1_000_000;
@@ -523,6 +644,43 @@ mod tests {
     fn session() -> JsonConstraintSession {
         JsonConstraintSession::new(&tokenizer(), EOS, MODEL_VOCAB, schema(), limits())
             .expect("bounded test session")
+    }
+
+    fn boolean_session() -> JsonConstraintSession {
+        boolean_session_with_output_limit(limits().max_output_bytes)
+    }
+
+    fn boolean_session_with_output_limit(max_output_bytes: usize) -> JsonConstraintSession {
+        let mut configured_limits = limits();
+        configured_limits.max_output_bytes = max_output_bytes;
+        JsonConstraintSession::new(
+            &tokenizer(),
+            EOS,
+            MODEL_VOCAB,
+            json!({"type": "boolean"}),
+            configured_limits,
+        )
+        .expect("bounded boolean session")
+    }
+
+    fn number_session() -> JsonConstraintSession {
+        let tokenizer = json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [{"id": 15, "content": "<eos>", "special": true}],
+            "model": {"vocab": {
+                "{": 0, "}": 1, "\"": 2, "o": 3, "k": 4, ":": 5,
+                "t": 6, "r": 7, "u": 8, "e": 9, "f": 10, "a": 11,
+                "l": 12, "s": 13, "1": 14
+            }}
+        });
+        JsonConstraintSession::new(
+            &tokenizer,
+            15,
+            MODEL_VOCAB,
+            json!({"type": "number"}),
+            limits(),
+        )
+        .expect("bounded number session")
     }
 
     fn logits(token: u32) -> Vec<f32> {
@@ -704,5 +862,143 @@ mod tests {
         assert!(
             JsonConstraintSession::new(&tokenizer(), EOS, MODEL_VOCAB, literal, limits()).is_ok()
         );
+    }
+
+    #[test]
+    fn categorical_receipt_excludes_padded_and_eos_rows_from_temperature_policy() {
+        let mut session = boolean_session();
+        let mut values = vec![-100.0; MODEL_VOCAB];
+        values[token_id(b't') as usize] = 0.0;
+        values[token_id(b'f') as usize] = 1.0;
+        values[EOS as usize] = 3.0;
+        values[TOKENIZER_VOCAB] = 4.0;
+
+        let (step, probabilities) = session
+            .select_categorical_with_logprobs(&values, 0.5, 0.0)
+            .expect("first categorical boolean token");
+        assert_eq!(
+            step,
+            ConstraintStep::Token {
+                token_id: token_id(b't')
+            }
+        );
+        assert_eq!(session.decoded_bytes(), b"t");
+        let allowed_log_sum = (1.0_f64 + (-1.0_f64).exp()).ln();
+        let model_log_sum = (1.0_f64
+            + (-1.0_f64).exp()
+            + (-3.0_f64).exp()
+            + (-4.0_f64).exp()
+            + 14.0 * (-104.0_f64).exp())
+        .ln();
+        assert!((probabilities.model_logprob - (-4.0 - model_log_sum)).abs() < 1e-12);
+        assert!((probabilities.constrained_logprob - (-1.0 - allowed_log_sum)).abs() < 1e-12);
+        assert!(
+            (probabilities.allowed_log_mass - (-3.0 + allowed_log_sum - model_log_sum)).abs()
+                < 1e-12
+        );
+        assert!((probabilities.sampling_logprob + (1.0_f64 + 2.0_f64.exp()).ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn categorical_errors_do_not_advance_the_grammar_session() {
+        let mut after_failure = boolean_session();
+        let mut baseline = boolean_session();
+        let mut invalid = vec![-100.0; MODEL_VOCAB];
+        invalid[token_id(b't') as usize] = 1.0;
+        assert_eq!(
+            after_failure.select_categorical_with_logprobs(&invalid, 1.0, 1.0),
+            Err(ConstraintError::InvalidSamplingParameter)
+        );
+
+        let after = after_failure
+            .select_categorical_with_logprobs(&invalid, 1.0, 0.0)
+            .expect("selection after rejected logits");
+        let expected = baseline
+            .select_categorical_with_logprobs(&invalid, 1.0, 0.0)
+            .expect("fresh selection");
+        assert_eq!(after, expected);
+        assert_eq!(after_failure.decoded_bytes(), baseline.decoded_bytes());
+    }
+
+    #[test]
+    fn output_bound_failure_does_not_commit_the_candidate_grammar_state() {
+        let mut session = boolean_session_with_output_limit(3);
+        for byte in b"tru" {
+            let mut values = vec![-100.0; MODEL_VOCAB];
+            values[token_id(*byte) as usize] = 1.0;
+            session
+                .select_categorical_with_logprobs(&values, 1.0, 0.0)
+                .expect("bounded boolean prefix token");
+        }
+        let mut final_token = vec![-100.0; MODEL_VOCAB];
+        final_token[token_id(b'e') as usize] = 1.0;
+        assert_eq!(
+            session.select_categorical_with_logprobs(&final_token, 1.0, 0.0),
+            Err(ConstraintError::OutputTooLarge)
+        );
+        assert_eq!(session.decoded_bytes(), b"tru");
+        assert!(!session.is_complete());
+        assert_eq!(
+            session.select_categorical_with_logprobs(&final_token, 1.0, 0.0),
+            Err(ConstraintError::OutputTooLarge)
+        );
+        assert_eq!(session.decoded_bytes(), b"tru");
+    }
+
+    #[test]
+    fn categorical_boolean_completion_returns_the_final_token_receipt() {
+        let mut session = boolean_session();
+        for byte in b"true" {
+            let mut values = vec![-100.0; MODEL_VOCAB];
+            values[token_id(*byte) as usize] = 1.0;
+            let (step, probabilities) = session
+                .select_categorical_with_logprobs(&values, 0.7, 0.0)
+                .expect("categorical boolean token");
+            if *byte == b'e' {
+                assert_eq!(
+                    step,
+                    ConstraintStep::Complete {
+                        token_id: token_id(b'e')
+                    }
+                );
+                assert!(probabilities.sampling_logprob.abs() < 1e-12);
+            } else {
+                assert_eq!(
+                    step,
+                    ConstraintStep::Token {
+                        token_id: token_id(*byte)
+                    }
+                );
+            }
+        }
+        assert!(session.is_complete());
+        assert_eq!(session.decoded_bytes(), b"true");
+    }
+
+    #[test]
+    fn categorical_eos_completes_an_accepting_number_without_appending_special_bytes() {
+        let mut session = number_session();
+        let mut one = vec![-100.0; MODEL_VOCAB];
+        one[14] = 1.0;
+        assert_eq!(
+            session
+                .select_categorical_with_logprobs(&one, 1.0, 0.0)
+                .expect("categorical number prefix")
+                .0,
+            ConstraintStep::Token { token_id: 14 }
+        );
+        assert_eq!(session.decoded_bytes(), b"1");
+
+        let mut eos = vec![-100.0; MODEL_VOCAB];
+        eos[15] = 1.0;
+        let (step, probabilities) = session
+            .select_categorical_with_logprobs(&eos, 1.0, 0.5)
+            .expect("categorical accepting EOS");
+        assert_eq!(step, ConstraintStep::Complete { token_id: 15 });
+        assert!(probabilities.sampling_logprob.is_finite());
+        assert!(probabilities.sampling_logprob > -1e-12);
+        assert!(session.is_complete());
+        assert_eq!(session.decoded_bytes(), b"1");
+        assert_eq!(session.validate_complete(), Ok(json!(1)));
     }
 }

@@ -3,13 +3,14 @@
 ## Decision
 
 Do not add a generic sampler framework or a particle-serving API yet.  A
-narrow categorical primitive is appropriate after Gate 1.  The current Qwen
-diagnostic is intentionally greedy; its constrained path records a selected
-token's raw and grammar-renormalized log probability, not a stochastic-policy
-or whole-sequence probability.  The next work should prove three small
-boundaries in order.  The first two need no checkpoint, Metal execution, or
-cache fork.  The third needs a qualified decode path; confidence calibration
-also needs independently labelled data.
+narrow seeded categorical policy is now wired to the unconstrained Qwen
+diagnostic: `mx gen --sample --temperature T --seed S` has no top-k/top-p
+truncation and records both raw model `p` and deployed-policy `q` when
+`--logprobs` is requested.  It is deliberately rejected with `--json-schema`;
+CLI grammar-mask sampling is not yet qualified. The next work should prove the
+remaining three small boundaries in order.  The first two need no checkpoint,
+Metal execution, or cache fork.  The third needs a qualified decode path;
+confidence calibration also needs independently labelled data.
 
 This note follows [GenLM/LLaMPPL](genlm-control.md),
 [Feynman--Kac methods](feynman-kac-steering.md),
@@ -20,26 +21,60 @@ coverage recorded in their respective notes.
 
 ## Gate 1: one explicit sampled-policy distribution
 
-The first implementation slice is `engine::sampling::sample_categorical`:
-FP32 logits, an exact-length legal mask, positive finite temperature, and a
-caller-supplied uniform variate. It returns a token and temperature-conditioned
-`sampling_logprob`, using FP64 accumulation. It owns no RNG or grammar state
-and is not wired into `mx gen`. Seed management, raw/conditioned probability
-receipts, top-k/top-p, and real-generation replay remain integration gates.
-It rejects nonfinite logits and temperature scaling that overflows; floating-
-point underflow can remove tiny probabilities, so this is not an exact-real
-importance proposal with guaranteed full support.
+The implemented Qwen slice accepts FP32 logits, a full-vocabulary legal mask,
+positive finite temperature, and a deterministic `ChaCha8Rng` variate. It
+returns a token and temperature-conditioned `sampling_logprob`, using FP64
+accumulation. `sampling_policy` records the RNG, seed, temperature, uniform
+conversion and absence of truncation; `model_logprob` remains raw
+temperature-one `p`. The path rejects nonfinite logits and temperature scaling
+that overflows. Floating-point underflow can remove tiny probabilities, so it
+is not an exact-real importance proposal with guaranteed full support.
 
-**Question.** Given raw logits and an optional grammar allowed set, what
-distribution actually selected the token?
+This closes seed management, `p`/`q` receipts, and same-policy replay for the
+unconstrained diagnostic. It does not close grammar-mask sampling, top-k/top-p,
+device-versus-reference distribution parity, or any whole-sequence target
+claim.
 
-Implement a pure, offline categorical-policy oracle first.  Given finite toy
-logits, temperature, optional top-k/top-p and a grammar mask, it returns the
-support, normalized deployed distribution `q`, and one sampled token from a
-specified reproducible RNG.  Its reference is direct `f64` enumeration, not
-the production kernel.  Cover ties, tiny remaining mass, EOS, empty support,
-invalid parameters, and padded vocabulary rows.  On error it must not advance
-the RNG or grammar state.
+The engine now additionally exposes
+`JsonConstraintSession::select_categorical_with_logprobs`: caller-supplied
+temperature and uniform entropy, with four separate receipts (`model_logprob`,
+`constrained_logprob`, `allowed_log_mass`, `sampling_logprob`). It prepares the
+mask and consumes a token on a deep-cloned matcher, committing grammar state
+and decoded bytes only on success. Padded model rows contribute to raw `p`
+but never grammar `q`. Greedy selection shares this transactional boundary.
+This is not a fast-forward or cache-fork implementation. The engine owns no
+RNG, and CLI grammar sampling remains
+disabled pending RNG/grammar integration and real-generation replay.
+
+The shared transactional boundary was exercised through the existing greedy
+Qwen schema command (prompt `9707,11,1879`, limit 64, record schema, logprobs).
+Three before/after fresh-process runs preserved every generated ID and
+probability receipt and independently validated `{"status":"ready","count":1}`.
+Total selection time across 12 tokens was 6.411/6.687/6.551 ms before, versus
+11.282/11.461/11.107 ms after. The roughly 4.7 ms/request overhead is retained
+for error atomicity, not reported as an optimization. This measures the
+whole selection-boundary change, not matcher cloning in isolation; the two
+three-run blocks were sequential, not an interleaved crossover experiment.
+Receipts: `artifacts/grammar-transaction-{before,after}-{1,2,3}.json`.
+Release/all-features binary SHA-256 before (`9259433`):
+`514b1e4f588a3f5e3e49c96fa8596ecca70a85b1485504b15107c14ee9b0b0bc`;
+after: `f3d03a73ebdfb14b343eeb3ccadc5e20fa5d627a09422f261cd57305c11bef92`.
+This used the same local M3 Max and Qwen checkpoint described in
+[the streamed-generation ledger](../experiments/streamed-generation.md),
+without a file-cache flush.
+
+**Question.** Given raw logits and a grammar allowed set,
+what distribution actually selected the token?
+
+The remaining Gate 1 oracle is independent `f64` enumeration against the
+production policy. Given finite toy logits, temperature, and a specified
+reproducible RNG, it must compare support, normalized deployed distribution
+`q`, and sampled token. Cover ties, tiny remaining mass, EOS, invalid
+parameters, and padded vocabulary rows. On error it must not advance the RNG.
+The engine tests now cover grammar masks analytically, accepting EOS without
+special-token bytes, and rejected draws/output limits without committed state
+changes. Top-k/top-p and their support changes remain future inputs, not
+current `mx gen` behavior.
 
 The receipt must name three distinct things: raw model `p`, deployed sampling
 policy `q`, and (only when an SMC/control experiment names one) target `π`.
@@ -52,10 +87,11 @@ LLaMPPL Feynman--Kac formulation and the Power-SMC target/proposal analysis
 ([LLaMPPL v2, §§2--3](https://arxiv.org/html/2306.03081v2),
 [Power-SMC](power-smc.md#correctness-boundary)).
 
-**Advance criterion:** analytic oracle tests pass and a trace can make a
-replayable claim about `p`, `q`, mask identity, policy parameters and seed.
-This is implementable offline now.  It does not prove Metal sampler parity;
-that later needs a device-versus-reference distribution test.
+**Advance criterion:** analytic oracle tests pass and an unconstrained trace
+can make a replayable claim about `p`, `q`, policy parameters and seed. A
+future grammar trace additionally needs mask identity. This does not prove
+Metal sampler parity; that later needs a device-versus-reference distribution
+test.
 
 ## Gate 2: target/weight/ancestry oracle before cache work
 
@@ -116,15 +152,16 @@ proposal mismatch; they are not calibrated answer correctness
 
 ## Stop rule
 
-Ordinary single-sequence categorical sampling, including a local grammar mask,
-may integrate after Gate 1 proves its RNG, mask and probability accounting.
-Particle or global-control serving remains behind Gate 2 and the cache-replay
-portion of Gate 3.  Confidence claims remain separately behind Gate 3's
-labelled calibration work.  A result that reverses particle work is simple: if
-cache replay is correct but `N=2` increases per-token latency or memory without
-a predeclared distribution/quality gain, do not pursue particle serving on this
-Mac.  DeepSeek V4.1 Flash forward and cache qualification still take precedence
-over all three gates.
+Ordinary unconstrained single-sequence categorical sampling has integrated with
+an explicit seed, temperature and `p`/`q` receipt. Grammar-mask sampling
+remains behind a mask/RNG/probability-accounting gate. Particle or global-control
+serving remains behind Gate 2 and the cache-replay portion of Gate 3.
+Confidence claims remain separately behind Gate 3's labelled calibration work.
+A result that reverses particle work is simple: if cache replay is correct but
+`N=2` increases per-token latency or memory without a predeclared
+distribution/quality gain, do not pursue particle serving on this Mac. DeepSeek
+V4.1 Flash forward and cache qualification still take precedence over all three
+gates.
 
 ## Fresh GenLM Control check: integration traps
 
