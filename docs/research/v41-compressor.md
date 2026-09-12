@@ -50,6 +50,35 @@ window KV uses the separate FP8/E8M0 path. A shared representation chosen only
 because the tensors have similar dimensions would erase source semantics.
 The current pooling capture does **not** qualify these downstream joins.
 
+These are **numerical quantization boundaries, not packed-cache memory
+claims**. `inference/kernel.py:fp4_act_quant` with `inplace=True` writes
+dequantized values back into `x` in its original dtype. The model allocates
+cache tensors with the current Torch default dtype, set to BF16 by its local
+example entry point. Copying this path does not produce four-bit physical
+cache storage. A packed cache would require a separate layout, scale ownership,
+kernel consumer and measured allocation contract.
+
+This distinction was checked against the complete `fp4_quant_kernel` and
+`fp4_act_quant` bodies in the same revision's
+[kernel.py](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/kernel.py),
+retained SHA-256
+`1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455`.
+Neither TileLang kernel was executed locally. FP4 cast rounding and E4M3 versus
+E8M0 scale behavior still need a qualified numerical implementation before
+removing the compressed-publication harness's quantization stub.
+
+For that implementation, the kernel's scale paths are not interchangeable:
+
+| Consumer | Group | Scale computation before E2M1 encoding |
+|---|---|---|
+| Compressed KV | 16 | Floor `amax` at `6 * 2^-9`, divide by 6, cast to E4M3, then widen the stored scale for division/reconstruction |
+| Index keys/queries | 32 | Floor `amax` at `6 * 2^-126`, then use the power-of-two `fast_round_scale` path |
+
+Both clamp normalized values to `[-6, 6]`. In-place reconstruction casts to
+E2M1, widens to FP32, multiplies by the selected scale, and narrows to the
+input dtype. Tests must cover all-zero groups, scale-bin boundaries, E2M1 ties,
+signed zero and reconstruction overflow before this replaces a stub.
+
 ## Qualification artifacts
 
 `scripts/v41-compressor-reference.py` executes only SHA-checked
@@ -76,6 +105,22 @@ feeds attention; current attention pre-mix feeds the current FFN; current FFN
 pre-mix feeds the next block. Normalized sublayer inputs, block outputs and
 returned pre-mix tensors are checked against the independent source capture.
 It is not a complete learned block.
+
+`scripts/v41-compressed-publication-reference.py` executes only the pinned
+`Attention._compress_kv` and `_compress_topk_idxs` methods, using visibly
+mutating rotary/quantization stubs and explicit compressor/indexer stubs.
+`fixtures/deepseek-v41/compressed-publication-reference.json` captures prefill,
+singleton completion, nonboundary decode, zero compressed length and consumer
+reuse. `cargo test -p deepseek --test compressed_publication` checks that source
+trace; it does not execute a Rust publication implementation. In particular,
+`latent=None` still invokes the indexer when an existing compressed prefix is
+available; only zero compressed length skips it on an index-source layer.
+Consumer reuse checks the current source's returned indices as well as cache
+contents. Regenerate with:
+
+```sh
+uv run scripts/v41-compressed-publication-reference.py > artifacts/compressed-publication-reference.json
+```
 
 Next consumer: replace the projection stubs with qualified weight execution,
 then join pre-RoPE index-key production, compressed-cache publication, sparse

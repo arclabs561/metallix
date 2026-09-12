@@ -35,6 +35,10 @@ follows that residual expression with supplied preprojected tensors.
 The compressor and block composition captures and tests follow
 `Compressor.forward`, `Block.forward`, the block HC helpers and `RMSNorm.forward`
 at the same revision, with explicitly stubbed projections or sublayers.
+The compressed-publication capture executes `Attention._compress_kv` and
+`Attention._compress_topk_idxs` at that revision, with explicit compressor,
+indexer, rotary and quantization stubs. Its Rust tests check captured control
+flow, not the upstream numerical kernels.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 

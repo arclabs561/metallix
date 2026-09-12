@@ -1,0 +1,327 @@
+{
+  "schema_version": 1,
+  "source": {
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "path": "artifacts/v41-reference-model.py",
+    "symbols": [
+      "Attention._compress_kv",
+      "Attention._compress_topk_idxs"
+    ],
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L722"
+  },
+  "receipt": {
+    "device": "cpu",
+    "torch_version": "2.13.0"
+  },
+  "scope": {
+    "included": "source publication control flow with explicit observable stubs",
+    "excluded": [
+      "compressor pooling and norm math",
+      "index scoring/top-k math",
+      "rotary math",
+      "FP4 quantization math",
+      "attention, cache allocation, and Metal execution"
+    ]
+  },
+  "stub_contract": {
+    "compressor": "scheduled explicit BF16 latent or None",
+    "indexer": "records latent then returns sentinel int32 indices",
+    "rotary": "adds 10 to the latent tail in place",
+    "quant": "adds 1 in place after recording block-16 E4M3 arguments"
+  },
+  "assertions": [
+    "indexer sees the latent before rotary/quant mutation",
+    "source publishes index results before cache mutation",
+    "returned prefix is read after source cache write",
+    "prefill and singleton completion select group-start frequencies",
+    "incomplete and zero-compress calls omit rotary/quant/cache write",
+    "consumer reuse reads shared cache without compressor or indexer"
+  ],
+  "cases": [
+    {
+      "name": "prefill_ratio2_s3",
+      "start_pos": 0,
+      "seqlen": 3,
+      "offset": 7,
+      "returned_prefix": {
+        "name": "prefix",
+        "dtype": "torch.bfloat16",
+        "encoding": "bf16_bits_u16",
+        "shape": [
+          1,
+          1,
+          2
+        ],
+        "sha256_le_bytes": "c6b77d1fe611c752c3456c4f8383cf871fa6cf535b08e3f41b7973066a1fcf3c",
+        "values": [
+          16704,
+          16720
+        ]
+      },
+      "returned_indices_i32": [
+        1,
+        1,
+        1
+      ],
+      "events": [
+        {
+          "event": "compressor",
+          "start_pos": 0,
+          "seqlen": 3,
+          "latent_bf16": [
+            16256,
+            16384
+          ]
+        },
+        {
+          "event": "indexer",
+          "start_pos": 0,
+          "offset": 7,
+          "latent_before_mutation_bf16": [
+            16256,
+            16384
+          ]
+        },
+        {
+          "event": "rotary",
+          "frequency_indices": [
+            0
+          ],
+          "tail_before_bf16": [
+            16256,
+            16384
+          ]
+        },
+        {
+          "event": "quant",
+          "block_size": 16,
+          "inplace": true,
+          "scale_dtype": "torch.float8_e4m3fn",
+          "value_before_bf16": [
+            16688,
+            16704
+          ]
+        },
+        {
+          "event": "cache_write",
+          "key": "(slice(None, 1, None), slice(0, 1, None))",
+          "value_bf16": [
+            16704,
+            16720
+          ]
+        },
+        {
+          "event": "cache_read",
+          "key": "(slice(None, 1, None), slice(None, 1, None))"
+        }
+      ]
+    },
+    {
+      "name": "singleton_completion_start3",
+      "start_pos": 3,
+      "seqlen": 1,
+      "offset": 7,
+      "returned_prefix": {
+        "name": "prefix",
+        "dtype": "torch.bfloat16",
+        "encoding": "bf16_bits_u16",
+        "shape": [
+          1,
+          2,
+          2
+        ],
+        "sha256_le_bytes": "0ca66aa075cb26b7b04d0a487ef1a3f82cad3d870e7798849ea03c0dba5cc114",
+        "values": [
+          16704,
+          16720,
+          16736,
+          16752
+        ]
+      },
+      "returned_indices_i32": [
+        2
+      ],
+      "events": [
+        {
+          "event": "compressor",
+          "start_pos": 3,
+          "seqlen": 1,
+          "latent_bf16": [
+            16448,
+            16512
+          ]
+        },
+        {
+          "event": "indexer",
+          "start_pos": 3,
+          "offset": 7,
+          "latent_before_mutation_bf16": [
+            16448,
+            16512
+          ]
+        },
+        {
+          "event": "rotary",
+          "frequency_indices": [
+            2
+          ],
+          "tail_before_bf16": [
+            16448,
+            16512
+          ]
+        },
+        {
+          "event": "quant",
+          "block_size": 16,
+          "inplace": true,
+          "scale_dtype": "torch.float8_e4m3fn",
+          "value_before_bf16": [
+            16720,
+            16736
+          ]
+        },
+        {
+          "event": "cache_write",
+          "key": "(slice(None, 1, None), slice(1, 2, None))",
+          "value_bf16": [
+            16736,
+            16752
+          ]
+        },
+        {
+          "event": "cache_read",
+          "key": "(slice(None, 1, None), slice(None, 2, None))"
+        }
+      ]
+    },
+    {
+      "name": "nonboundary_start4",
+      "start_pos": 4,
+      "seqlen": 1,
+      "offset": 7,
+      "returned_prefix": {
+        "name": "prefix",
+        "dtype": "torch.bfloat16",
+        "encoding": "bf16_bits_u16",
+        "shape": [
+          1,
+          2,
+          2
+        ],
+        "sha256_le_bytes": "0ca66aa075cb26b7b04d0a487ef1a3f82cad3d870e7798849ea03c0dba5cc114",
+        "values": [
+          16704,
+          16720,
+          16736,
+          16752
+        ]
+      },
+      "returned_indices_i32": [
+        3
+      ],
+      "events": [
+        {
+          "event": "compressor",
+          "start_pos": 4,
+          "seqlen": 1,
+          "latent_bf16": null
+        },
+        {
+          "event": "indexer",
+          "start_pos": 4,
+          "offset": 7,
+          "latent_before_mutation_bf16": null
+        },
+        {
+          "event": "cache_read",
+          "key": "(slice(None, 1, None), slice(None, 2, None))"
+        }
+      ]
+    },
+    {
+      "name": "initial_s1_zero_compress",
+      "start_pos": 0,
+      "seqlen": 1,
+      "offset": 7,
+      "returned_prefix": {
+        "name": "prefix",
+        "dtype": "torch.bfloat16",
+        "encoding": "bf16_bits_u16",
+        "shape": [
+          1,
+          0,
+          2
+        ],
+        "sha256_le_bytes": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "values": []
+      },
+      "returned_indices_i32": [],
+      "events": [
+        {
+          "event": "compressor",
+          "start_pos": 0,
+          "seqlen": 1,
+          "latent_bf16": null
+        },
+        {
+          "event": "cache_read",
+          "key": "(slice(None, 1, None), slice(None, 0, None))"
+        }
+      ]
+    },
+    {
+      "name": "consumer_reuses_shared_cache",
+      "start_pos": 4,
+      "seqlen": 1,
+      "offset": 7,
+      "returned_prefix": {
+        "name": "prefix",
+        "dtype": "torch.bfloat16",
+        "encoding": "bf16_bits_u16",
+        "shape": [
+          1,
+          2,
+          2
+        ],
+        "sha256_le_bytes": "0ca66aa075cb26b7b04d0a487ef1a3f82cad3d870e7798849ea03c0dba5cc114",
+        "values": [
+          16704,
+          16720,
+          16736,
+          16752
+        ]
+      },
+      "returned_indices_i32": [
+        3
+      ],
+      "events": [
+        {
+          "event": "cache_read",
+          "key": "(slice(None, 1, None), slice(None, 2, None))"
+        }
+      ]
+    }
+  ],
+  "final_cache": {
+    "name": "compressed_cache",
+    "dtype": "torch.bfloat16",
+    "encoding": "bf16_bits_u16",
+    "shape": [
+      1,
+      4,
+      2
+    ],
+    "sha256_le_bytes": "9eea02587e31f8ecffb49d24799c3c2455363ed04f8ae8657b380af62e034628",
+    "values": [
+      16704,
+      16720,
+      16736,
+      16752,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

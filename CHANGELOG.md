@@ -25,6 +25,10 @@ published release; reference operators do not imply full-model support.
 - Offline particle ancestry tests for absorbing EOS, resampling, effective
   sample size and weighted final selection through the categorical sampler.
   These do not provide model-backed SMC or physical cache branching.
+- Pinned V4.1 compressed-cache publication traces covering indexer visibility
+  before mutation, post-write cache reads, partial groups and shared consumers.
+  These check source control flow with explicit numerical stubs, not a native
+  Rust attention implementation.
 
 ### Fixed
 
