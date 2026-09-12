@@ -601,6 +601,52 @@ mod tests {
     }
 
     #[test]
+    fn bf16_gate_keeps_products_and_accumulation_in_fp32() {
+        // 1 + 2^-8 - 1 = 2^-8. BF16 round-to-nearest-even after each
+        // addition would instead erase the half-ULP and give zero.
+        let accumulation = flash_bf16_gate_routes(
+            &[0x3f80; 3],
+            &[0x3f80, 0x3b80, 0xbf80, 0x3b00, 0, 0],
+            2,
+            3,
+            &[0.0; 2],
+            1,
+            2.0_f32.powi(-8),
+            false,
+            1.0,
+        )
+        .expect("FP32 accumulation preserves the cancellation residual");
+
+        // (1 + 2^-7)^2 - (1 + 2^-6) = 2^-14. Rounding the first
+        // product to BF16 would erase that residual before subtraction.
+        let product = flash_bf16_gate_routes(
+            &[0x3f81, 0x3f80],
+            &[0x3f81, 0xbf82, 0, 0x3800],
+            2,
+            2,
+            &[0.0; 2],
+            1,
+            2.0_f32.powi(-14),
+            false,
+            1.0,
+        )
+        .expect("FP32 multiplication preserves the cancellation residual");
+
+        // Both exact scaled rows are [1, 0.5]. The deliberately separate
+        // f64 score formula checks the selected unnormalized route weight.
+        let expected_weight = (1.0_f64.exp() + 1.0).ln().sqrt();
+        for routes in [&accumulation, &product] {
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].expert_index(), 0);
+            assert!((f64::from(routes[0].weight()) - expected_weight).abs() < 1.0e-7);
+        }
+        let prematurely_rounded =
+            flash_sqrt_softplus_routes(&[0.0, 0.5], &[0.0; 2], 1, 1.0, false, 1.0)
+                .expect("premature BF16 rounding changes the winner without a tie");
+        assert_eq!(prematurely_rounded[0].expert_index(), 1);
+    }
+
+    #[test]
     fn bf16_gate_projection_rejects_shapes_nonfinite_values_and_overflow() {
         assert!(matches!(
             flash_bf16_gate_routes(&[0x3f80], &[], 1, 2, &[0.0], 1, 1.0, false, 1.0),

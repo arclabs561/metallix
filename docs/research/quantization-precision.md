@@ -314,6 +314,15 @@ BF16 `[384, 5120]`. The source's module-local FP8 `default_dtype` selects
 `Linear` storage, not Torch's global default used by the gate. This software
 dot reference does not establish hardware reduction parity or load weights.
 
+Cancellation fixtures distinguish FP32 arithmetic from premature BF16 rounding:
+`1 + 2^-8 - 1` preserves an accumulation residual, and
+`(1 + 2^-7)^2 - (1 + 2^-6)` preserves a product residual. Each residual changes
+the selected expert. The qualification test was checked against two temporary
+production mutations (BF16 rounding of each product, then each accumulation);
+both failed by selecting expert 1 instead of expert 0. Both mutations were
+removed. This establishes sensitivity to those two rounding errors, not
+general hardware equivalence.
+
 The reduced fixture uses width/intermediate width 32, three candidate experts,
 Top-2 selection, gate temperature 1, route scale 1, and SwiGLU limit 4, with
 synthetic weights. These are test settings, not the released Flash dimensions
