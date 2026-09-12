@@ -18,6 +18,13 @@ published release; reference operators do not imply full-model support.
 - `just check`, `just check-metal`, and `just check-fixtures` development
   commands. The Engram fixture integrity checker also runs in the canonical
   quality gate.
+- Source-captured V4.1 compressor and two-block sequencing tests, using
+  explicit projection/sublayer stubs. Compressor checks cover partial groups,
+  sequential decode, reset and exact BF16 output; block checks cover the
+  attention-to-FFN and inter-block pre-mix handoff.
+- Offline particle ancestry tests for absorbing EOS, resampling, effective
+  sample size and weighted final selection through the categorical sampler.
+  These do not provide model-backed SMC or physical cache branching.
 
 ### Fixed
 

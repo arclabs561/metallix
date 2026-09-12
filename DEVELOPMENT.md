@@ -92,6 +92,10 @@ The runner stops at the first failure. Each command has a timeout and owned
 child processes are terminated if it expires. It runs no model downloads.
 Do not run competing Cargo builds or benchmarks in this checkout concurrently.
 
+`just check` and `just check-metal` call the same runner. For the focused
+Engram integrity gate, use `just check-fixtures`; see the
+[check recipes and custom-lint policy](docs/development.md).
+
 ## Measure one change
 
 For a CPU selection baseline:
