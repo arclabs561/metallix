@@ -630,3 +630,92 @@ fn rotated_fp4_compressed_keys_feed_sparse_attention_in_source_order() {
         );
     }
 }
+
+/// Joins the actual GPU score core and CPU selection with attention. The index
+/// operands are supplied post-projection/post-RoPE, not produced by a full indexer.
+#[cfg(feature = "metal")]
+#[test]
+fn fp4_index_scores_select_the_compressed_vector_consumed_by_attention() {
+    use deepseek::indexer::index_scores_f32;
+    use deepseek::selection::select_indices;
+
+    let mut query = [0x3f80_u16; 64]; // two heads: +1, -1
+    query[32..].fill(0xbf80);
+    let mut keys = [0x4110_u16; 64]; // two keys: +9, -3
+    keys[32..].fill(0xc040);
+    let mut quantized_query = [0; 64];
+    let mut quantized_keys = [0; 64];
+    fp4_activation_reference(&query, 2, 32, Fp4Mode::Index32E8m0, &mut quantized_query)
+        .expect("index query preparation");
+    fp4_activation_reference(&keys, 2, 32, Fp4Mode::Index32E8m0, &mut quantized_keys)
+        .expect("index key preparation");
+    assert_eq!(&quantized_keys[..32], &[0x4100; 32]); // 9 -> 8 at scale 2
+    assert_eq!(&quantized_keys[32..], &[0xc040; 32]); // -3 preserved
+    let q: Vec<_> = quantized_query.iter().copied().map(bf16_to_f32).collect();
+    let k: Vec<_> = quantized_keys.iter().copied().map(bf16_to_f32).collect();
+    let scores = index_scores_f32(
+        &q,
+        &k,
+        &[-4.0, 1.0],
+        NonZeroUsize::new(32).expect("index width"),
+    )
+    .expect("Metal score reduction");
+    // Dot rows [256,-96],[-256,96]; ReLU BEFORE signed head weighting.
+    assert_eq!(
+        scores
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [-1024.0_f32, 96.0].map(f32::to_bits)
+    );
+    let selected = select_indices(&scores, 2, 1, 0).expect("strict score cutoff");
+    assert_eq!(selected, [1]);
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/compressed-attention-reference.json"
+    ))
+    .expect("supplied compressed latent fixture");
+    let rotated = rotate_compressed_tails(
+        &fixture_words(&fixture, "latent_bf16"),
+        &fixture_floats(&fixture, "frequencies_f32"),
+    );
+    let mut cache = vec![0; 32];
+    fp4_activation_reference(&rotated, 2, 16, Fp4Mode::CompressedKv16E4m3, &mut cache)
+        .expect("compressed KV preparation");
+    let cache: Vec<_> = cache.into_iter().map(bf16_to_f32).collect();
+    let nz = |value| NonZeroUsize::new(value).expect("fixed nonzero dimension");
+    let layout = SparseAttentionLayout::new(nz(1), nz(1), nz(1), nz(16), nz(2), nz(1))
+        .expect("one selected compressed position");
+    // Zero attention query and zero sink yield exactly half the selected KV:
+    // one key contributes exp(0), the sink contributes exp(0) only to denominator.
+    let output = sparse_attention_reference(&[0.0; 16], &cache, &[0.0], &selected, 0.25, layout)
+        .expect("attention consumes calculated indices");
+    let expected: Vec<_> = cache[16..]
+        .iter()
+        .map(|value| (value * 0.5).to_bits())
+        .collect();
+    assert_eq!(
+        output
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let earlier = select_indices(&[scores[0], f32::NEG_INFINITY], 1, 1, 0)
+        .expect("future compressed key is masked before selection");
+    assert_eq!(earlier, [0]);
+    let wrong = sparse_attention_reference(&[0.0; 16], &cache, &[0.0], &earlier, 0.25, layout)
+        .expect("earlier causal prefix selects the other vector");
+    assert!(
+        output
+            .iter()
+            .zip(wrong)
+            .any(|(actual, wrong)| (actual - wrong).abs() > 0.1)
+    );
+    let none =
+        select_indices(&[f32::NEG_INFINITY; 2], 0, 1, 0).expect("no completed compressed group");
+    assert_eq!(none, [-1]);
+    let empty = sparse_attention_reference(&[0.0; 16], &cache, &[0.0], &none, 0.25, layout)
+        .expect("unreachable keys do not contribute");
+    assert!(empty.iter().all(|value| value.to_bits() == 0));
+}

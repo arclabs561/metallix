@@ -129,9 +129,22 @@ index scoring, window/cache ownership, BF16 attention-kernel rounding, output
 projections and full-model generation are not exercised. Frequencies and
 already-prepared query vectors are supplied rather than generated here.
 
+With the `metal` feature, a second composition test replaces the supplied
+final indices with the existing GPU score core and CPU final selection.
+Its supplied index operands pass through group-32 E8M0-scale FP4 reconstruction.
+Two signed query heads and two keys yield independently derived scores
+`[-1024, 96]`, selecting position 1. The calculated index then drives attention
+over rotary/FP4-prepared compressed KV; a zero query and zero sink give the
+closed-form result of half the selected vector. This checks real Metal score
+execution and the handoff, not projection/norm/RoPE preparation of index
+operands, candidate filtering or the upstream BF16 score-kernel rounding.
+The same handoff checks a shorter causal prefix selecting position 0 and an
+empty prefix producing a `-1` sentinel and zero attention output.
+
 ```sh
 uv run scripts/v41-compressed-attention-reference.py > artifacts/compressed-attention-reference.json
 cargo test -p deepseek --test fp4_activation rotated_fp4_compressed_keys_feed_sparse_attention_in_source_order
+cargo test -p deepseek --features metal --test fp4_activation fp4_index_scores_select_the_compressed_vector_consumed_by_attention
 ```
 
 ```sh

@@ -36,6 +36,9 @@ published release; reference operators do not imply full-model support.
   reconstruction and mathematical sparse attention with supplied latents
   and indices. Intermediate BF16 values and final attention are checked
   against an independent CPU oracle.
+- Metal-feature composition of FP4-prepared index operands, GPU index scores,
+  final selection and compressed-vector attention, checked against closed-form
+  scores and output. Index projections remain supplied, not integrated.
 
 ### Fixed
 
