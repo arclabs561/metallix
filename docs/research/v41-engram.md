@@ -69,13 +69,43 @@ before that block executes. Image token types mask Engram; text-only calls pass
 no mask. This establishes placement and hash ownership, not row decoding or
 the gated residual's weights.
 
-## Next gate
+## Compressed-token reference
 
-Add a tiny pinned fixture containing the exact tokenizer backend/version, a
+`crates/models/deepseek/src/engram.rs` now consumes explicit compressed
+`Live`/`Dead` tokens and captured hash tensors. Its state update computes
+addresses against a private candidate history and commits only on success.
+The cumulative blocked flag makes the lookback work linear in n-gram width;
+history, tensor, output and work limits are checked. Products and addresses
+must remain in non-negative signed-64-bit range.
+
+`scripts/v41-engram-reference.py` hash-checks and extracts only the pinned
+`NgramHashState.forward`, then captures CPU Torch 2.13.0 results using explicit
+synthetic token maps, multipliers, divisors and offsets. The checked-in
+`fixtures/deepseek-v41/engram-hash-reference.json` covers two independent batch
+histories, two layers, multiple heads, full/split/tokenwise calls and DEAD
+boundaries. Rust tests compare the addresses directly with this capture.
+No upstream constructors, tokenizer normalization or RNG setup execute.
+The local capture emitted Torch's optional missing-NumPy warning; serialization
+uses explicit little-endian integer packing and does not require NumPy.
+
+Start-position zero invalidates unwritten prior tail slots in the Rust
+reference. This is a stricter lifecycle guard than the upstream caller-owned
+cache: a short reset cannot make a later skipped append read an earlier
+sequence's tail. Failure preserves the previous state.
+
+Regenerate after acquiring the source identified above:
+
+```sh
+uv run scripts/v41-engram-reference.py > artifacts/v41-engram-reference.json
+cargo test -p deepseek engram
+```
+
+## Remaining gates
+
+The next fixture must cover the exact tokenizer backend/version and a
 small original-ID-to-decoded-text projection (including case, whitespace,
 accent, U+FFFD, pad, and image/dead cases), compressed IDs, explicit primes,
-multipliers, offsets, and final addresses. It must compare one-shot prefill
-with an equivalent split prefill/decode call and verify that a dead span breaks
-all longer histories. Only then is a pure Rust address oracle justified. A
-separate fixture with fetched rows and `wkv`/gate weights is required before
+multipliers, offsets, and final addresses. The existing explicit-map address
+fixture does not qualify these derivations. A separate fixture with fetched
+rows and `wkv`/gate weights is required before
 claiming Engram residual or full-forward parity.

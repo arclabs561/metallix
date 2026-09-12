@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod checkpoint;
 pub mod csa2;
+pub mod engram;
 pub mod hc;
 #[cfg(feature = "metal")]
 pub mod indexer;

@@ -22,6 +22,11 @@ follows the inverse-rotary, grouped `wo_a`, and `wo_b` ordering in
 `Attention.forward`. `scripts/v41-output-reference.py` independently captures
 its grouped BF16 einsum expression on synthetic CPU tensors after checking
 source identity; it does not execute the complete model or quantized kernels.
+The compressed-token hash reference in `crates/models/deepseek/src/engram.rs`
+follows `inference/engram.py:NgramHashState.forward` at that revision.
+`scripts/v41-engram-reference.py` executes only that hash-checked method with
+explicit synthetic tensors, excluding tokenizer normalization, RNG setup and
+embedding-table access.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
