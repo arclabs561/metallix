@@ -260,6 +260,14 @@ def main() -> None:
     if not torch.equal(output[:, 2], x[:, 2]):
         raise AssertionError("masked Engram position did not preserve the input copies")
 
+    # Masking zeros the gate, not the residual addition. IEEE signed-zero
+    # arithmetic distinguishes h + (0 * value) from a bitwise copy of h.
+    signed_zero_stream = x.clone()
+    signed_zero_stream[:, 2].fill_(-0.0)
+    signed_zero_output = forward(receiver, signed_zero_stream, hash_ids, token_mask)
+    if bf16_bits(signed_zero_output[:, 2]) != [0, 0x8000, 0, 0x8000] * 2:
+        raise AssertionError("masked residual lost source signed-zero arithmetic")
+
     # The zero-dot third position is masked above. Re-run it unmasked so the
     # clamp floor has observable source output rather than a hidden gate.
     unmasked_gate = recomputed_gate(
@@ -350,7 +358,8 @@ def main() -> None:
             "positive and negative dots produce opposite signed-sqrt gate directions",
             "q_weight and k_weight affect output only through their product",
             "one shared value broadcasts across HC copies",
-            "masked token preserves BF16 input copies",
+            "masked nonzero token preserves BF16 input copies",
+            "masked negative-zero stream still executes zero-times-value and residual addition",
             "unmasked zero dot applies the positive signed-sqrt clamp floor",
         ],
         "parameters": {
@@ -372,6 +381,8 @@ def main() -> None:
             tensor_record("token_mask", token_mask),
             tensor_record("expected_gate", gate),
             tensor_record("expected_output", output),
+            tensor_record("masked_signed_zero_stream", signed_zero_stream),
+            tensor_record("masked_signed_zero_output", signed_zero_output),
             tensor_record("unmasked_zero_dot_gate", unmasked_gate),
             tensor_record("unmasked_zero_dot_output", unmasked_output),
         ],

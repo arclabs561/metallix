@@ -1,8 +1,9 @@
-# V4.1 Engram hash contract
+# V4.1 Engram hash and residual-gate contracts
 
-This is a narrow contract for the token-to-row-address portion of Engram.  It
-does not establish table payload layout, loader ranges, residual numerical
-parity, CED behavior, or a Metal implementation.
+These are narrow contracts for token-to-row addresses and the residual gate
+with supplied, preprojected tensors. They do not establish table payload
+layout, loader ranges, complete Engram parity, CED behavior, or a Metal
+implementation.
 
 ## Provenance and reading coverage
 
@@ -100,7 +101,7 @@ uv run scripts/v41-engram-reference.py > artifacts/v41-engram-reference.json
 cargo test -p deepseek engram
 ```
 
-## Remaining gates
+## Preprojected residual gate
 
 The source capture `scripts/v41-engram-gate-reference.py` now exercises the
 pinned `Engram.forward` with explicit BF16 key/value tensors supplied by
@@ -113,9 +114,22 @@ broadcasting distinguish the fixture's intended boundaries.
 
 Run `uv run scripts/v41-engram-gate-reference.py` to emit the bit-preserving
 capture. The local run passed its assertions; Torch warned about optional
-NumPy initialization, which this script does not use. A Rust consumer of
-these preprojected residual-gate results is still required. This capture
-does not qualify FP8 rows/scales, table sharding, `wkv` weights or Metal.
+NumPy initialization, which this script does not use.
+
+`crates/models/deepseek/src/engram/gate.rs` consumes these preprojected tensors
+as a bounded scalar BF16 reference. Tests require exact captured BF16 output
+and absolute FP32 gate error at most `2e-6`; this is not a claim of bitwise
+FP32 reduction parity. Inputs and intermediate results must remain finite,
+and failures leave the caller's output unchanged.
+
+Two source-order details matter: form `q_weight * k_weight` before multiplying
+the stream, and mask the gate rather than copying the residual. A masked row
+still computes `h + 0 * value`, which can change the sign of zero. The capture
+includes this signed-zero case. Per-copy reductions start from positive zero.
+This reference does not qualify FP8 rows/scales, table sharding, `wkv` weights
+or Metal.
+
+## Remaining gates
 
 The next fixture must cover the exact tokenizer backend/version and a
 small original-ID-to-decoded-text projection (including case, whitespace,

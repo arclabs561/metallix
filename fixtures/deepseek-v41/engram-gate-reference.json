@@ -1,0 +1,434 @@
+{
+  "assertions": [
+    "fixed hash IDs reach embedding and rows flatten before wkv",
+    "per-HC normalization differs from joint-HC normalization",
+    "positive and negative dots produce opposite signed-sqrt gate directions",
+    "q_weight and k_weight affect output only through their product",
+    "one shared value broadcasts across HC copies",
+    "masked nonzero token preserves BF16 input copies",
+    "masked negative-zero stream still executes zero-times-value and residual addition",
+    "unmasked zero dot applies the positive signed-sqrt clamp floor"
+  ],
+  "parameters": {
+    "clamp_value": 1e-06,
+    "clamp_value_f32_bits": 897988541,
+    "eps": 1e-06,
+    "eps_f32_bits": 897988541
+  },
+  "receipt": {
+    "device": "cpu",
+    "torch_version": "2.13.0"
+  },
+  "schema_version": 1,
+  "scope": {
+    "excluded": [
+      "Engram hash generation",
+      "FP8 table rows and scales",
+      "embedding sharding and all_reduce",
+      "wkv weight projection",
+      "checkpoint loading",
+      "CED and Metal execution"
+    ],
+    "included": "Engram.forward residual gate with explicit stubbed embedding and wkv output"
+  },
+  "source": {
+    "path": "artifacts/v41-reference-model.py",
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "symbol": "Engram.forward",
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L328"
+  },
+  "tensors": [
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "x",
+      "sha256_le_bytes": "4ed20dfb341f596c907ff0f4f26e7a7c2ea368951222d537cc23e0106401971e",
+      "shape": [
+        1,
+        3,
+        2,
+        4
+      ],
+      "values": [
+        16256,
+        16384,
+        49024,
+        16128,
+        16384,
+        49024,
+        16128,
+        16256,
+        16000,
+        48896,
+        16256,
+        16384,
+        16448,
+        16128,
+        49152,
+        16256,
+        16256,
+        16256,
+        16256,
+        16256,
+        49024,
+        49024,
+        49024,
+        49024
+      ]
+    },
+    {
+      "dtype": "torch.int64",
+      "encoding": "i64",
+      "name": "hash_ids",
+      "sha256_le_bytes": "36e3ca1ea75353a7a0bf2b7e6b88fd40d1da8a43e18bb6be0dc34dc8398ea046",
+      "shape": [
+        1,
+        3,
+        2
+      ],
+      "values": [
+        2,
+        5,
+        7,
+        11,
+        13,
+        17
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "stubbed_embedding_rows",
+      "sha256_le_bytes": "9cb7fb61d21406a6fcd3e475b864dec55ef78d46e54cd5fe64050aba28cfefaa",
+      "shape": [
+        1,
+        3,
+        2,
+        2
+      ],
+      "values": [
+        16128,
+        49024,
+        16320,
+        16000,
+        48896,
+        16384,
+        16192,
+        49088,
+        16256,
+        16256,
+        49024,
+        49024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "stubbed_wkv_key",
+      "sha256_le_bytes": "4ffe7917889b0c02db8dd799a2ed067db3d97075813fcc1e14d3743bde51a689",
+      "shape": [
+        1,
+        3,
+        2,
+        4
+      ],
+      "values": [
+        16256,
+        16128,
+        48896,
+        16384,
+        49024,
+        48896,
+        16128,
+        49152,
+        49152,
+        16256,
+        16000,
+        48896,
+        16128,
+        16384,
+        49024,
+        16000,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "stubbed_wkv_value",
+      "sha256_le_bytes": "9a458ff5c01bef31e35077ad27348fc64718bb290cee3c9bdf29bb519f772e26",
+      "shape": [
+        1,
+        3,
+        4
+      ],
+      "values": [
+        16128,
+        49024,
+        16384,
+        16000,
+        16256,
+        16128,
+        48768,
+        16384,
+        16512,
+        49280,
+        16384,
+        49152
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "name": "q_weight",
+      "sha256_le_bytes": "0f5e55cabf3e4609bec6c11a265bb07267bde94fb700061d3717f1396c43066e",
+      "shape": [
+        2,
+        4
+      ],
+      "values": [
+        1073741824,
+        1056964608,
+        1077936128,
+        1065353216,
+        1048576000,
+        1082130432,
+        1056964608,
+        1073741824
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "name": "k_weight",
+      "sha256_le_bytes": "c0ddae369387818fedc918a1fda04057668e5f9146c54d2cd8211af6978513c2",
+      "shape": [
+        2,
+        4
+      ],
+      "values": [
+        1056964608,
+        1073741824,
+        1056964608,
+        1065353216,
+        1082130432,
+        1048576000,
+        1073741824,
+        1056964608
+      ]
+    },
+    {
+      "dtype": "torch.bool",
+      "encoding": "bool",
+      "name": "token_mask",
+      "sha256_le_bytes": "9f44ac6acb8a37b00b615dc89259d306035be82dee7db2b472e4c48326195440",
+      "shape": [
+        1,
+        3
+      ],
+      "values": [
+        true,
+        true,
+        false
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "name": "expected_gate",
+      "sha256_le_bytes": "ef656a300a30be459426102de4839bf75c452eae7ba259af921081b97b8856d3",
+      "shape": [
+        1,
+        3,
+        2
+      ],
+      "values": [
+        1061260026,
+        1048866734,
+        1050718649,
+        1060987756,
+        0,
+        0
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "expected_output",
+      "sha256_le_bytes": "415ac9467e5b2d0c4c1e9eaaccdb2c48073da537f20004dc9075a407484a620a",
+      "shape": [
+        1,
+        3,
+        2,
+        4
+      ],
+      "values": [
+        16304,
+        16287,
+        16131,
+        16176,
+        16392,
+        49057,
+        16258,
+        16264,
+        16144,
+        48816,
+        16236,
+        16424,
+        16495,
+        16223,
+        49164,
+        16415,
+        16256,
+        16256,
+        16256,
+        16256,
+        49024,
+        49024,
+        49024,
+        49024
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "masked_signed_zero_stream",
+      "sha256_le_bytes": "ac9857332d634c5e178dbf78b8d1584cacb940a7c232deb0a8c74d0766653e1e",
+      "shape": [
+        1,
+        3,
+        2,
+        4
+      ],
+      "values": [
+        16256,
+        16384,
+        49024,
+        16128,
+        16384,
+        49024,
+        16128,
+        16256,
+        16000,
+        48896,
+        16256,
+        16384,
+        16448,
+        16128,
+        49152,
+        16256,
+        32768,
+        32768,
+        32768,
+        32768,
+        32768,
+        32768,
+        32768,
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "masked_signed_zero_output",
+      "sha256_le_bytes": "ba19731a1023eb4e2d7c0800921f2ef4bb235cb28ec4cf36090a4adc86600c06",
+      "shape": [
+        1,
+        3,
+        2,
+        4
+      ],
+      "values": [
+        16304,
+        16287,
+        16131,
+        16176,
+        16392,
+        49057,
+        16258,
+        16264,
+        16144,
+        48816,
+        16236,
+        16424,
+        16495,
+        16223,
+        49164,
+        16415,
+        0,
+        32768,
+        0,
+        32768,
+        0,
+        32768,
+        0,
+        32768
+      ]
+    },
+    {
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "name": "unmasked_zero_dot_gate",
+      "sha256_le_bytes": "c2bd948b4a81ad7f83b8f9d128c5bbdca7a9a5f773c3be1d2c805055236d52bd",
+      "shape": [
+        1,
+        3,
+        2
+      ],
+      "values": [
+        1061260026,
+        1048866734,
+        1050718649,
+        1060987756,
+        1056968802,
+        1056968802
+      ]
+    },
+    {
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "name": "unmasked_zero_dot_output",
+      "sha256_le_bytes": "c54018d876f935421c13be308eb8a109463fc426af664e48f09aadfb84cfc189",
+      "shape": [
+        1,
+        3,
+        2,
+        4
+      ],
+      "values": [
+        16304,
+        16287,
+        16131,
+        16176,
+        16392,
+        49057,
+        16258,
+        16264,
+        16144,
+        48816,
+        16236,
+        16424,
+        16495,
+        16223,
+        49164,
+        16415,
+        16448,
+        49024,
+        16384,
+        47619,
+        16256,
+        49216,
+        14851,
+        49152
+      ]
+    }
+  ]
+}

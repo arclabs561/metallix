@@ -4,6 +4,8 @@
 //! per-layer hash tensors. This deliberately does not normalize tokenizer text,
 //! generate primes or RNG multipliers, read embedding tables, or run a GPU.
 
+pub mod gate;
+
 use thiserror::Error;
 
 /// Largest number of cached compressed-token slots accepted by this reference.
