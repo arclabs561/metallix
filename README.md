@@ -28,41 +28,42 @@ Both `mx` and `metallix` are native executables with the same CLI; no shell
 alias is required. Nothing is installed on your PATH by these commands.
 
 With an already-downloaded Qwen3-0.6B safetensors checkpoint, including its
-`config.json` and `tokenizer.json`, replace the model path below:
+`config.json` and `tokenizer.json`, replace the model path below. Input is raw
+token IDs, not a text prompt or chat template:
 
 ```sh
 target/release/mx gen --model /path/to/Qwen3-0.6B \
-  --input-ids 9707,11,1879 --max-tokens 64 --verify-cache \
-  --json-schema fixtures/constraints/record.json --logprobs --preview
+  --input-ids 9707,11,1879 --max-tokens 4
 ```
 
-This uses raw prompt token IDs, not a text/chat prompt. In the qualified local
-run, the generated JSON was:
+Stdout is a JSON diagnostic report with generated token IDs and timings.
+For example, the local control run returned these fields (excerpt):
+
+```json
+{"generated_ids":[13,358,2776,264],"finish_reason":"length"}
+```
+
+To constrain generation to the included JSON Schema:
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 64 \
+  --json-schema fixtures/constraints/record.json
+```
+
+The local control run produced this value in `constraint.output`:
 
 ```json
 {"status":"ready","count":1}
 ```
 
-Stdout contains a JSON diagnostic report, including `constraint.output`,
-`constraint.status: "validated"`, token IDs, timings, and requested scores.
-The object above is the generated value, not the entire stdout report.
-A token limit reached before grammar completion reports `incomplete` and exits
-nonzero; only completed, independently validated JSON counts as success.
+The object above is not the entire stdout report. Successful constrained runs
+report `constraint.status: "validated"`; a token limit reached before grammar
+completion reports `incomplete` and exits nonzero.
 
-`--preview` adds a readable stderr view without changing stdout. Score colors
-describe token likelihood, not answer correctness; non-TTY output and
-`NO_COLOR=1` disable color. `--logprobs` includes original-model probabilities
-and, with a schema, grammar-conditioned scores. `--debug` / `--verbose` add
-metadata-only phase diagnostics. These options are off by default.
-See [the generation guide](DEVELOPMENT.md) for limits and score semantics.
-
-`--verify-cache` compares each cached result with a full-prefix Metal
-recomputation outside the measured decode regions. It is a correctness check,
-not an independent CPU reference or a serving benchmark.
-
-For layer-streamed generation, use `--max-tokens 16 --memory-mode streamed
---max-weight-bytes 81798144 --max-kv-bytes 7340032` in the example above.
-Omit `--verify-cache` to avoid loading the resident verification model.
+Both examples use resident weights and greedy selection. See
+[the generation guide](DEVELOPMENT.md) for readable previews, token scores,
+cache verification, and layer-streamed generation with explicit memory budgets.
 
 | Feature | Enables |
 |---|---|
@@ -104,8 +105,9 @@ checks without downloading model weights. Run them sequentially.
 ## Limitations
 
 Generation is a single FP32 Qwen sequence with greedy selection. Resident mode
-allows `min(model context, 512)` input plus generated tokens; streamed mode
-allows at most 32 and separately checks weight/staging and retained-KV budgets.
+allows at most `min(model context, 512)` total prompt-plus-generated tokens;
+streamed mode allows at most 32 total and separately checks weight/staging
+and retained-KV budgets.
 There is no canonical text-prompt/chat-template pipeline, V4.1 decoder,
 HTTP serving, continuous batching, execution-backed paged KV, quantization
 conversion, or tuning workflow yet. Beyond-RAM execution remains a goal,
