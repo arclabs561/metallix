@@ -94,6 +94,33 @@ arithmetic, and narrows its final result to
 FP32. It neither executes CUDA/TileLang nor claims BF16, kernel, or Metal
 parity.
 
+### BF16 scalar arithmetic reference
+
+The separate `sparse_attention_bf16_reference` consumes BF16 query/KV storage
+and returns BF16 output. It models the pinned kernel's 64-slot blocks with
+ordered scalar FP32 arithmetic: update the running maximum, rescale the old
+denominator and numerator, and add the new block. Unnormalized exponential
+weights are rounded to BF16 **only for the numerator**; the denominator retains
+FP32 weights. The sink contributes to the denominator after all key blocks,
+without changing the running maximum.
+
+[`bf16_tests.rs`](../../crates/models/deepseek/src/attention/bf16_tests.rs)
+contains closed-form probes that distinguish this from rounding only the final
+output, rounding denominator weights, or incorporating the sink in the maximum.
+With query `[1, 0]`, shared KV `[[0, 1], [1, 0]]`, scale 1, and sink −100, the second
+output component is BF16 `0x3e89` when both keys share a block and `0x3e8a` when
+they straddle the block boundary. Rescaling an earlier FP32 accumulation is
+not the same operation as rounding its exponential weight to BF16.
+
+This is still not TileLang/CUDA or Metal parity: scalar dot/reduction order and
+host exponentials do not reproduce device GEMM and exponential instructions.
+The reference bounds buffers and work, returns zero for all-masked rows, and
+rejects nonfinite arithmetic instead of publishing it. These guards deliberately
+narrow the source kernel's behavior on extreme inputs. No speed result or
+full-model decoding is implied.
+
+### FP32 semantic fixture
+
 Regenerate the pinned synthetic fixture after obtaining the already
 hash-qualified source:
 

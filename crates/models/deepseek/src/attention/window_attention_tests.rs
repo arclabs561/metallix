@@ -71,4 +71,10 @@ fn partial_decode_masks_stale_physical_slot() {
         .expect("append BF16 two");
     assert_eq!(ring, [0, 0x3f80, 0x4000, 0x42c6]);
     assert!((attend(&ring, decode, 1, 4)[0] - 0.75).abs() < 1e-6);
+    let indices = window_topk_indices(decode, nz(4), nz(1)).unwrap();
+    let layout = SparseAttentionLayout::new(nz(1), nz(1), nz(1), nz(1), nz(4), nz(4)).unwrap();
+    let bf16_output =
+        super::sparse_attention_bf16_reference(&[0], &ring, &[0.0], &indices, 1.0, layout)
+            .expect("raw window cache feeds BF16 attention staging");
+    assert_eq!(bf16_output, [0x3f40]); // (0+1+2)/(three keys + one sink) = 0.75.
 }

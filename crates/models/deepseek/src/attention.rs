@@ -12,6 +12,14 @@ use thiserror::Error;
 
 pub mod window;
 
+mod bf16;
+pub use bf16::{
+    MAX_BF16_ATTENTION_ELEMENTS, SparseAttentionBf16Error, sparse_attention_bf16_reference,
+};
+
+#[cfg(test)]
+mod bf16_tests;
+
 #[cfg(feature = "metal")]
 mod metal;
 #[cfg(feature = "metal")]
