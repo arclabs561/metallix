@@ -39,7 +39,8 @@ The compressed-publication capture executes `Attention._compress_kv` and
 `Attention._compress_topk_idxs` at that revision, with explicit compressor,
 indexer, rotary and quantization stubs. Its Rust tests check captured control
 flow, not the upstream numerical kernels.
-The test-only FP4 activation arithmetic follows `fp4_quant_kernel` and
+The scalar FP4 activation arithmetic in
+`crates/models/deepseek/src/precision/fp4_activation.rs` follows `fp4_quant_kernel` and
 `fast_round_scale` in the same revision's `inference/kernel.py`. Its independent
 CPU oracle uses explicit software E2M1 rounding and Torch CPU casts; it does
 not execute the upstream TileLang kernel.

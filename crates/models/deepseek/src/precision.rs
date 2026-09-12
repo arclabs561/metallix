@@ -24,6 +24,11 @@ mod roundtrip;
 pub use roundtrip::{
     ActivationRoundtripError, MAX_ACTIVATION_ROUNDTRIP_ELEMENTS, requantize_bf16_activations_e4m3fn,
 };
+mod fp4_activation;
+pub use fp4_activation::{
+    Fp4ActivationError, Fp4ActivationMode, MAX_FP4_ACTIVATION_ELEMENTS,
+    requantize_bf16_activations_e2m1,
+};
 
 #[cfg(test)]
 mod expert_composition_tests;

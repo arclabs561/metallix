@@ -29,8 +29,11 @@ published release; reference operators do not imply full-model support.
   before mutation, post-write cache reads, partial groups and shared consumers.
   These check source control flow with explicit numerical stubs, not a native
   Rust attention implementation.
-- Test-only V4.1 FP4 activation reconstruction with separate compressed-KV
-  E4M3 and indexer E8M0 scales, compared with an independent CPU oracle.
+- Library FP4 activation reconstruction through
+  `deepseek::precision::requantize_bf16_activations_e2m1`, with typed
+  compressed-KV E4M3 and indexer E8M0 modes. The former test-only implementation
+  now serves the oracle and composition tests through the public API, using
+  one fallible staging allocation and no diagnostic trace arrays.
   E2M1 rounding remains a software assumption, not qualified GPU behavior.
 - Compressed-only attention composition tests joining rotary, FP4
   reconstruction and mathematical sparse attention with supplied latents

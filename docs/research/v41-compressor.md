@@ -81,13 +81,23 @@ signed zero and reconstruction overflow before this replaces a stub.
 
 ### Software FP4 arithmetic qualification
 
-`crates/models/deepseek/tests/fp4_activation.rs` is a bounded test-only
-BF16 → E2M1 → BF16 implementation with separate compressed-KV and indexer
-modes. `scripts/v41-fp4-activation-reference.py` provides an independent CPU
+`deepseek::precision::requantize_bf16_activations_e2m1` is the bounded scalar
+BF16 → E2M1 → BF16 library reference, with `Fp4ActivationMode` distinguishing
+compressed-KV and indexer modes. The implementation lives in
+`crates/models/deepseek/src/precision/fp4_activation.rs`; the composition tests
+in `crates/models/deepseek/tests/fp4_activation.rs` call that API directly.
+`scripts/v41-fp4-activation-reference.py` provides an independent CPU
 arithmetic oracle: Torch performs E4M3 scale casts and BF16 narrowing; explicit
 midpoint intervals provide assumed E2M1 round-to-nearest, ties-to-even.
 Its fixture is `fixtures/deepseek-v41/fp4-activation-reference.json`.
 This is **not** an upstream kernel capture or a hardware-parity result.
+
+The API writes reconstructed BF16 values to caller-provided storage, not
+packed four-bit codes. It validates shape and finite inputs before reserving
+one temporary output buffer, reports allocation failure, and copies results
+only after all groups succeed. Diagnostic scale/code assertions remain in
+unit tests; callers do not allocate or receive trace arrays. The request
+limit is `MAX_FP4_ACTIVATION_ELEMENTS`.
 
 For example, a group with `amax=9` uses E4M3 scale `1.5` for compressed KV,
 but E8M0 scale `2` for the indexer. The indexer scale expression multiplies by
