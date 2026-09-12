@@ -115,6 +115,38 @@ resident weight bytes.
 HTTP scheduling, batching, quantized execution and beyond-RAM operation remain
 separate implementation gates. These results do not qualify them.
 
+## Seeded replay profiling follow-up
+
+At `9259433`, three fresh-process streamed runs were interleaved with three
+resident controls. Each used prompt IDs `9707,11,1879`, four output tokens,
+`--sample --temperature 0.7 --seed 42`. Streamed runs also used `--verbose`,
+`--max-weight-bytes 81798144 --max-kv-bytes 7340032`; tile rows remained 1024.
+No scores, grammar, preview or resident verification oracle were enabled.
+All six runs produced `13,21927,11,1879`.
+
+The existing local checkpoint and release/all-features build were used on the
+M3 Max. File caches were not flushed; this is not a cold-storage measurement.
+Binary SHA-256: `514b1e4f588a3f5e3e49c96fa8596ecca70a85b1485504b15107c14ee9b0b0bc`.
+Across nine decode calls per mode (no first-call discard), streamed median was
+295.805 ms, sample standard deviation 8.642 ms; resident median was 9.665 ms,
+sample standard deviation 0.736 ms. Samples within a process are correlated;
+three processes do not establish a stable performance distribution.
+
+| Streamed host phase | Mean ms/decode | Sample standard deviation |
+|---|---:|---:|
+| Layer load/conversion | 155.053 | 2.587 |
+| Layer execution/readback | 48.280 | 5.813 |
+| Projection load/conversion | 50.289 | 0.783 |
+| Projection execution/readback | 40.711 | 1.671 |
+
+This confirms staging/conversion as the next profiling target; it does not
+separate file-cache reads, copies and conversion within those intervals.
+Nor is the difference from older runs an optimization result: policy, output
+length and run conditions differ. No performance implementation changed in
+this experiment. Raw receipts:
+`artifacts/stream-profile-repeat-{1,2,3}.{json,stderr}` and
+`artifacts/resident-profile-control-{1,2,3}.json`.
+
 ## Sampled host profile
 
 The shipped baseline binary was sampled headlessly during 16-token streamed
