@@ -513,6 +513,54 @@ fn projected_normalized_index_keys(latent: &[u16], frequencies: &[f32]) -> Vec<f
 }
 
 #[cfg(feature = "metal")]
+fn projected_fp8_index_query() -> [u16; 64] {
+    use deepseek::precision::{
+        ActivationGroup, fp8_linear_runtime_f32, quantize_bf16_activations_e4m3fn,
+    };
+
+    let mut qr = [0_u16; 32];
+    qr[0] = 0x4114; // 9.25 is BF16-exact, but not preserved by this FP8 group.
+    let mut codes = [0_u8; 32];
+    let mut scales = [0_u8; 1];
+    quantize_bf16_activations_e4m3fn(
+        &qr,
+        1,
+        32,
+        ActivationGroup::Elements32,
+        &mut codes,
+        &mut scales,
+    )
+    .expect("query latent FP8 activation preparation");
+    // ceil(log2(9.25/448))=-5. 296 rounds to E4M3 288, reconstructing 9.
+    assert_eq!(scales, [122]);
+    assert_eq!(codes[0], 0x79);
+    assert_eq!(&codes[1..], &[0; 31]);
+    let mut weights = [0_u8; 64 * 32];
+    for (row, weight) in weights.chunks_exact_mut(32).enumerate() {
+        weight[0] = if row < 32 { 0x38 } else { 0xc0 }; // +1, -2
+    }
+    let mut projected = [0.0_f32; 64];
+    fp8_linear_runtime_f32(
+        &codes,
+        &scales,
+        &weights,
+        &[127, 126],
+        1,
+        32,
+        64,
+        ActivationGroup::Elements32,
+        &mut projected,
+    )
+    .expect("two output blocks with independent E8M0 weight scales");
+    // Output-group scales 1 and 1/2 give effective weights +1 and -1.
+    // Sharing the first scale would incorrectly make the second head -18.
+    assert_eq!(&projected[..32], &[9.0; 32]);
+    assert_eq!(&projected[32..], &[-9.0; 32]);
+    assert_ne!(projected[0].to_bits(), bf16_to_f32(qr[0]).to_bits());
+    projected.map(f32_to_bf16_rne)
+}
+
+#[cfg(feature = "metal")]
 #[test]
 fn projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights() {
     use deepseek::indexer::index_scores_f32;
@@ -536,6 +584,10 @@ fn projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights() {
         .expect("BF16 query projection");
     assert_eq!(&projected[..32], &[0x4110; 32]);
     assert_eq!(&projected[32..], &[0xc110; 32]);
+    // The FP8 branch starts from 9.25, explicitly rounds the activations,
+    // applies independent 32x32 weight scales, then narrows its GEMM result.
+    let fp8_projected = projected_fp8_index_query();
+    assert_eq!(fp8_projected, projected);
 
     let rotate = |input: &[u16; 64]| {
         let mut tail: Vec<_> = input
@@ -563,7 +615,7 @@ fn projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights() {
             .expect("independent group per query head");
         output
     };
-    let query = quantize(&rotate(&projected));
+    let query = quantize(&rotate(&fp8_projected));
     // (9+9i)*(0.6+0.8i) = -1.8+12.6i. BF16 narrowing then scale-4
     // E2M1 gives (-2,12); the nonrotary 9s become 8. Head sum is 244.
     assert_eq!(&query[..28], &[0x4100; 28]);

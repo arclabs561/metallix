@@ -167,10 +167,10 @@ concurrent MLX requests or solve runtime device ownership for serving.
 
 The query-side composition test
 `projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights`
-executes the **BF16-configured** `wq_b` branch and the explicitly BF16
+executes synthetic BF16 and FP8 `wq_b` branches and the explicitly BF16
 `weights_proj` branch of pinned `Indexer.forward` (lines 550–555). `wq_b`
-inherits the configured default weight dtype; this test does not cover its
-FP8 checkpoint path or the preceding `wq_a`/`q_norm` producing `qr`.
+inherits the configured default weight dtype; this test does not load
+checkpoint tensors or cover the preceding `wq_a`/`q_norm` producing `qr`.
 With synthetic weights, two projected heads are constant +9 and -9. Tail
 rotation by `0.6 + 0.8i`, BF16 narrowing and group-32 FP4 reconstruction give
 head sums +244 and -244. A separate projection gives weights `[-32, 8]`;
@@ -185,6 +185,19 @@ omitting scaling gives `[-7808, 1952]`, and quantizing before rotation also
 changes the scores. These analytical checks qualify the composition under the
 scalar rounding assumptions, not upstream BF16 GEMM/reduction parity or
 full indexer cache/candidate orchestration.
+
+The FP8 query branch uses the existing activation quantizer and
+`fp8_linear_runtime_f32`, then explicitly narrows the result to BF16.
+Its supplied `qr` has one value 9.25 in a 32-element group. Scale `2^-5`
+(E8M0 code 122) normalizes it to 296; software E4M3 RNE yields 288
+(code `0x79`), reconstructing 9. The two 32-row weight blocks select that
+element with codes +1 and -2 and separate scales 1 and 1/2. The resulting
+heads are exactly +9 and -9, equal to the BF16 branch's outputs before the
+shared rotary/FP4/scoring path. Exact intermediate assertions detect skipped
+activation quantization (9.25 instead of 9) and shared output-block scales
+(-18 instead of -9). This follows the G32 FP8 branch of pinned `linear`
+(lines 196–204), using synthetic runtime buffers rather than checkpoint
+decoding or upstream GPU GEMM execution.
 
 ```sh
 uv run scripts/v41-compressed-attention-reference.py > artifacts/compressed-attention-reference.json
