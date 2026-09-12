@@ -69,6 +69,14 @@ fn f32_to_bf16_rne(value: f32) -> u16 {
 }
 
 fn rotate_final_pair_per_head(values: &mut [u16], heads: usize) {
+    rotate_final_pair_with_frequency(
+        values,
+        heads,
+        RotaryFrequency::new(0.0, 1.0).expect("finite quarter-turn"),
+    );
+}
+
+fn rotate_final_pair_with_frequency(values: &mut [u16], heads: usize, frequency: RotaryFrequency) {
     assert_eq!(values.len(), heads * WIDTH);
     let mut tail = values
         .chunks_exact(WIDTH)
@@ -85,8 +93,7 @@ fn rotate_final_pair_per_head(values: &mut [u16], heads: usize) {
         NonZeroUsize::new(1).expect("one complex pair"),
     )
     .expect("small synthetic tail layout");
-    let frequency = [RotaryFrequency::new(0.0, 1.0).expect("finite quarter-turn")];
-    rotate_tail(&mut tail, layout, &frequency, RotaryDirection::Forward)
+    rotate_tail(&mut tail, layout, &[frequency], RotaryDirection::Forward)
         .expect("small finite rotary tail");
     for (head, rotated) in tail.chunks_exact(2).enumerate() {
         values[head * WIDTH + WIDTH - 2] = f32_to_bf16_rne(rotated[0]);
@@ -236,5 +243,50 @@ fn window_kv_rotates_before_its_pinned_g32_requantization() {
     assert_eq!(
         &prepared_kv[WIDTH - 2..],
         &[BF16_NEGATIVE_ONE_POINT_TWO_FIVE, BF16_ONE_POINT_TWO_FIVE]
+    );
+}
+
+#[test]
+fn window_kv_non_quarter_turn_distinguishes_quantization_order() {
+    let pre_norm = fp8_project_bf16(
+        &[BF16_ONE; WIDTH],
+        &half_then_one_weights(WIDTH),
+        &[127],
+        WIDTH,
+    );
+    let mut normalized = [0_u16; WIDTH];
+    rms_norm_bf16_reference(&pre_norm, &[BF16_ONE; WIDTH], 1.0e-20, &mut normalized)
+        .expect("finite synthetic KV norm");
+    let frequency = RotaryFrequency::new(0.5, 0.866_025_4).expect("finite sixty-degree turn");
+    let mut rotated = normalized;
+    rotate_final_pair_with_frequency(&mut rotated, 1, frequency);
+    // 1.265625 * (0.5 ± sqrt(3)/2), narrowed to BF16.
+    assert_eq!(&rotated[WIDTH - 2..], &[0xbeed, 0x3fdd]);
+    let mut prepared = [0_u16; WIDTH];
+    requantize_bf16_activations_e4m3fn(
+        &rotated,
+        1,
+        WIDTH,
+        ActivationGroup::Elements32,
+        &mut prepared,
+    )
+    .expect("post-rotation FP8 round trip");
+    // The group scale is 2^-8; E4M3 rounds the tail to -120 and 448.
+    assert_eq!(&prepared[WIDTH - 2..], &[0xbef0, 0x3fe0]); // -0.46875, 1.75
+
+    let mut reordered = [0_u16; WIDTH];
+    requantize_bf16_activations_e4m3fn(
+        &normalized,
+        1,
+        WIDTH,
+        ActivationGroup::Elements32,
+        &mut reordered,
+    )
+    .expect("deliberately misplaced FP8 round trip");
+    rotate_final_pair_with_frequency(&mut reordered, 1, frequency);
+    assert_eq!(&reordered[WIDTH - 2..], &[0xbeea, 0x3fdb]);
+    assert_ne!(
+        prepared, reordered,
+        "moving quantization before rotation changes KV"
     );
 }

@@ -31,6 +31,11 @@ preserves signed zero, and leaves output untouched on error. Unlike the source
 kernel, it rejects nonfinite reconstruction. Compressed KV's FP4/G16 path is
 distinct and is not implemented by this helper.
 
+A sixty-degree window-KV fixture also checks the ordering boundary: rotating
+before quantization yields a BF16 tail of −0.46875 and 1.75, while deliberately
+moving quantization before rotation yields −0.45703125 and 1.7109375. Unlike
+the quarter-turn fixture, this case detects that reordering.
+
 These tests do not qualify ring-cache updates, compressed-cache ownership,
 attention-probability BF16 rounding, output projections, or full-model logits.
 They are software reference compositions, not GPU-cast parity or speed results.
