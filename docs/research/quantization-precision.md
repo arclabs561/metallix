@@ -91,13 +91,21 @@ the requested scale dtype. The pinned model selects 32-element activation
 groups and E8M0 scales. A reference must distinguish the computed scale from
 its stored representation, and must not omit activation quantization.
 
-Next executable tests: nonsymmetric rows to catch transposition; distinct
-weight scales in adjacent 32-element groups; distinct activation scales for
-G=32 versus one shared scale for G=128; signed low/high nibbles; activation
-floor and power-of-two boundaries. Use exactly representable hand vectors
-first. Hardware conversion/reduction and BF16 output require an independent
-pinned capture before claiming those rounding paths. No new linear executor
-or activation quantizer is implemented by this note.
+`deepseek::precision::fp4_linear_runtime_f32` now implements the narrow scalar
+FP32 equation over caller-supplied E4M3FN activation codes, E8M0 activation and
+weight scales, and low-first E2M1x2 weights. It accepts complete G=32 or G=128
+groups, checks exact buffer lengths and shape arithmetic, and validates every
+result before writing the caller's output. This deliberately computes twice
+to avoid allocating an unbudgeted temporary output; it is a numerical
+reference, not an optimized serving kernel.
+
+Exactly representable hand vectors check transposition, scale grouping and
+packed signs. These test the stated scalar equation, not an independent CUDA
+capture. Activation floor, power-of-two boundaries, FP8 conversion/reduction,
+and BF16 output remain separate qualification gates. No activation quantizer
+or checkpoint file-to-runtime mapping is established by this reference.
+
+Run `cargo test -p deepseek precision::linear`.
 
 ## Serving-side choices
 
