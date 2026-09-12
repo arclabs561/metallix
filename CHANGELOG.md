@@ -32,6 +32,10 @@ published release; reference operators do not imply full-model support.
 - Test-only V4.1 FP4 activation reconstruction with separate compressed-KV
   E4M3 and indexer E8M0 scales, compared with an independent CPU oracle.
   E2M1 rounding remains a software assumption, not qualified GPU behavior.
+- Compressed-only attention composition tests joining rotary, FP4
+  reconstruction and mathematical sparse attention with supplied latents
+  and indices. Intermediate BF16 values and final attention are checked
+  against an independent CPU oracle.
 
 ### Fixed
 

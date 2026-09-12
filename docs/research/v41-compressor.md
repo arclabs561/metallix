@@ -108,6 +108,32 @@ the even-tie preference was rejected by the midpoint test. Shape overflow,
 work limits and short buffers are tested without allocating the requested
 oversized shape, with caller output required to remain unchanged.
 
+### Compressed-only attention composition
+
+The FP4 test harness also joins the existing `rotate_tail` and
+`sparse_attention_reference` implementations. Supplied BF16 compressed latents
+are widened for tail rotation, narrowed to BF16, reconstructed with the
+group-16 E4M3-scale FP4 reference, then consumed as shared keys/values.
+The independent CPU oracle is
+`scripts/v41-compressed-attention-reference.py`; its capture is
+`fixtures/deepseek-v41/compressed-attention-reference.json`.
+
+The test compares intermediate BF16 words exactly and mathematical attention
+outputs within a predeclared `2e-6` absolute tolerance. It includes duplicate
+sparse slots, a denominator-only sink and an all-masked query. Quantizing
+before rotation, or omitting quantization, must change the final result by
+more than `1e-3` in at least one component.
+
+This is supplied-latent, supplied-index composition: compressor projections,
+index scoring, window/cache ownership, BF16 attention-kernel rounding, output
+projections and full-model generation are not exercised. Frequencies and
+already-prepared query vectors are supplied rather than generated here.
+
+```sh
+uv run scripts/v41-compressed-attention-reference.py > artifacts/compressed-attention-reference.json
+cargo test -p deepseek --test fp4_activation rotated_fp4_compressed_keys_feed_sparse_attention_in_source_order
+```
+
 ```sh
 uv run scripts/v41-fp4-activation-reference.py > artifacts/fp4-activation-reference.json
 cargo test -p deepseek --test fp4_activation

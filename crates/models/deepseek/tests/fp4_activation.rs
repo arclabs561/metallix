@@ -4,7 +4,10 @@
 //! assumption. It is not CUDA/TileLang instruction-level parity or a packed
 //! FP4 storage implementation.
 
+use deepseek::attention::{SparseAttentionLayout, sparse_attention_reference};
 use deepseek::precision::{decode_e2m1, decode_e4m3fn, decode_e8m0};
+use deepseek::rotary::{RotaryDirection, RotaryFrequency, RotaryTailLayout, rotate_tail};
+use std::num::NonZeroUsize;
 use thiserror::Error;
 
 const MAX_ELEMENTS: usize = 1 << 20;
@@ -502,4 +505,128 @@ fn malformed_shapes_and_buffers_leave_output_untouched_without_large_allocations
         }
     );
     assert_eq!(short_output, [0xdead; 15]);
+}
+
+fn fixture_floats(fixture: &serde_json::Value, field: &str) -> Vec<f32> {
+    serde_json::from_value(fixture[field].clone()).expect("FP32 fixture array")
+}
+
+// Fixed two-key, width-16 composition. This is not a runtime cache API.
+fn rotate_compressed_tails(input: &[u16], frequencies: &[f32]) -> Vec<u16> {
+    let one = NonZeroUsize::new(1).expect("one");
+    let two = NonZeroUsize::new(2).expect("two");
+    assert_eq!(input.len(), 32);
+    assert_eq!(frequencies.len(), 8);
+    let mut tail: Vec<f32> = input
+        .chunks_exact(16)
+        .flat_map(|row| row[12..].iter().copied().map(bf16_to_f32))
+        .collect();
+    let frequencies: Vec<_> = frequencies
+        .chunks_exact(2)
+        .map(|pair| RotaryFrequency::new(pair[0], pair[1]).expect("finite frequency"))
+        .collect();
+    rotate_tail(
+        &mut tail,
+        RotaryTailLayout::new(one, two, one, two).expect("tail layout"),
+        &frequencies,
+        RotaryDirection::Forward,
+    )
+    .expect("rotated supplied latent");
+    let mut result = input.to_vec();
+    for (row, rotated) in result.chunks_exact_mut(16).zip(tail.chunks_exact(4)) {
+        for (output, &value) in row[12..].iter_mut().zip(rotated) {
+            *output = f32_to_bf16_rne(value);
+        }
+    }
+    result
+}
+
+fn compressed_attention_output(kv: &[u16], fixture: &serde_json::Value) -> Vec<f32> {
+    let nz = |value| NonZeroUsize::new(value).expect("fixed nonzero dimension");
+    let keys: Vec<_> = kv.iter().copied().map(bf16_to_f32).collect();
+    let indices: Vec<i32> =
+        serde_json::from_value(fixture["indices_i32"].clone()).expect("indices");
+    let scale: f32 = serde_json::from_value(fixture["softmax_scale"].clone()).expect("scale");
+    sparse_attention_reference(
+        &fixture_floats(fixture, "query_f32"),
+        &keys,
+        &fixture_floats(fixture, "sink_f32"),
+        &indices,
+        scale,
+        SparseAttentionLayout::new(nz(1), nz(2), nz(1), nz(16), nz(2), nz(4))
+            .expect("attention layout"),
+    )
+    .expect("compressed-only mathematical attention")
+}
+
+#[test]
+fn rotated_fp4_compressed_keys_feed_sparse_attention_in_source_order() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/compressed-attention-reference.json"
+    ))
+    .expect("independent composition oracle");
+    assert_eq!(fixture["schema_version"], 1);
+    assert_eq!(
+        fixture["indices_i32"],
+        serde_json::json!([1, 0, 1, -1, -1, -1, -1, -1])
+    );
+    assert_eq!(
+        fixture["source"]["revision"],
+        "dba1be0a40aa45a94ad051997016db3960a90277"
+    );
+    assert_eq!(
+        fixture["source"]["model_sha256"],
+        "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+    );
+    assert_eq!(
+        fixture["source"]["kernel_sha256"],
+        "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455"
+    );
+    assert_eq!(fixture["receipt"]["torch_version"], "2.13.0");
+    assert_eq!(fixture["receipt"]["device"], "cpu");
+    let latent = fixture_words(&fixture, "latent_bf16");
+    let frequencies = fixture_floats(&fixture, "frequencies_f32");
+    let rotated = rotate_compressed_tails(&latent, &frequencies);
+    assert_eq!(rotated, fixture_words(&fixture, "rotated_bf16"));
+    let mut reconstructed = vec![0; 32];
+    fp4_activation_reference(
+        &rotated,
+        2,
+        16,
+        Fp4Mode::CompressedKv16E4m3,
+        &mut reconstructed,
+    )
+    .expect("post-rotation quantization");
+    assert_eq!(reconstructed, fixture_words(&fixture, "reconstructed_bf16"));
+    let actual = compressed_attention_output(&reconstructed, &fixture);
+    let expected = fixture_floats(&fixture, "output_f32");
+    assert_eq!(expected.len(), 32);
+    for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 2e-6,
+            "attention element {index}: {actual} != {expected}"
+        );
+    }
+    assert!(actual[16..].iter().all(|value| value.to_bits() == 0));
+    let mut early_quantized = vec![0; 32];
+    fp4_activation_reference(
+        &latent,
+        2,
+        16,
+        Fp4Mode::CompressedKv16E4m3,
+        &mut early_quantized,
+    )
+    .expect("wrong-order distinguisher");
+    let wrong_order = rotate_compressed_tails(&early_quantized, &frequencies);
+    assert_ne!(wrong_order, reconstructed);
+    for wrong_keys in [&wrong_order, &rotated] {
+        let wrong = compressed_attention_output(wrong_keys, &fixture);
+        assert!(
+            wrong
+                .iter()
+                .zip(&actual)
+                .any(|(wrong, actual)| (wrong - actual).abs() > 1e-3),
+            "oracle must distinguish reordered or omitted quantization"
+        );
+    }
 }

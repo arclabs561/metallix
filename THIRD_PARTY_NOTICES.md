@@ -43,6 +43,10 @@ The test-only FP4 activation arithmetic follows `fp4_quant_kernel` and
 `fast_round_scale` in the same revision's `inference/kernel.py`. Its independent
 CPU oracle uses explicit software E2M1 rounding and Torch CPU casts; it does
 not execute the upstream TileLang kernel.
+The compressed-attention composition oracle joins independently expressed
+rotary, FP4 reconstruction and mathematical sparse attention in CPU Torch.
+It follows the same pinned ordering with supplied latents and indices, not
+the complete upstream attention implementation.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
