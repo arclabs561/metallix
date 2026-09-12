@@ -8,6 +8,7 @@ pub mod indexer;
 pub mod manifest;
 pub mod precision;
 pub mod rotary;
+pub mod routing;
 pub mod selection;
 
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
@@ -24,6 +25,9 @@ pub use rotary::{
 };
 #[cfg(feature = "metal")]
 pub use rotary::{RotaryMetalError, rotate_tail_metal};
+pub use routing::{
+    ExpertRoute, FlashRoutingError, MAX_FLASH_ROUTING_WIDTH, flash_sqrt_softplus_routes,
+};
 pub use selection::{SelectionError, select_indices};
 
 // MLX's native test operations share process-global device initialization.

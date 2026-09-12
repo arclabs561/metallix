@@ -383,3 +383,84 @@ fn fp4_routed_and_fp8_shared_outputs_join_before_final_bf16_cast() {
     let incorrectly_routed_shared = bf16_value(routed[0] + 0.3 * shared[0]);
     assert_ne!(combined[0].to_bits(), incorrectly_routed_shared.to_bits());
 }
+
+#[test]
+fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
+    // This supplies logits directly. It qualifies the text-route/expert join,
+    // not the gate projection or a complete `MoE` block.
+    let routes =
+        crate::flash_sqrt_softplus_routes(&[0.0, 1.0, 3.0], &[0.0, 0.0, -10.0], 2, 1.0, true, 1.0)
+            .expect("finite distinct selected expert scores");
+    assert_eq!(
+        routes
+            .iter()
+            .map(|route| route.expert_index())
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+
+    // Independent scalar route arithmetic keeps the correction bias out of
+    // each gathered route weight, then normalizes the two selected scores.
+    let score1 = (1.0_f32.exp().ln_1p()).sqrt();
+    let score0 = (0.0_f32.exp().ln_1p()).sqrt();
+    let denominator = score0 + score1 + 1.0e-20_f32;
+    assert_eq!(
+        routes[0].weight().to_bits(),
+        (score0 / denominator).to_bits()
+    );
+    assert_eq!(
+        routes[1].weight().to_bits(),
+        (score1 / denominator).to_bits()
+    );
+
+    let input = [0x3f80_u16; WIDTH];
+    let expert0_weights = uniform_weight(0x11); // FP4 +0.5
+    let expert1_weights = uniform_weight(0x22); // FP4 +1.0
+    let (expert0, _) = routed_expert(
+        &input,
+        &expert0_weights,
+        &expert0_weights,
+        &expert0_weights,
+        4.0,
+        routes[0].weight(),
+        Variant::Pinned,
+    );
+    let (expert1, _) = routed_expert(
+        &input,
+        &expert1_weights,
+        &expert1_weights,
+        &expert1_weights,
+        4.0,
+        routes[1].weight(),
+        Variant::Pinned,
+    );
+    let shared_gate = shared_projection(&input);
+    let shared_up = shared_projection(&input);
+    let mut shared_hidden = [0.0_f32; WIDTH];
+    for ((destination, &gate), &up) in shared_hidden.iter_mut().zip(&shared_gate).zip(&shared_up) {
+        *destination = (gate.min(4.0) / (1.0 + (-gate.min(4.0)).exp())) * up.clamp(-4.0, 4.0);
+    }
+    let shared = shared_projection(&bf16_row(&shared_hidden));
+
+    // The selected weights are about 0.421 and 0.579. After SwiGLU,
+    // BF16 and FP8 rounding, W2 sees 6.5 and 9 respectively. Thus the
+    // distinct down projections give 32*0.5*6.5=104 and 32*1*9=288.
+    assert_bits_eq(&expert0, 104.0);
+    assert_bits_eq(&expert1, 288.0);
+    assert_bits_eq(&shared, 256.0);
+    let combined =
+        std::array::from_fn(|index| bf16_value(expert0[index] + expert1[index] + shared[index]));
+    assert_bits_eq(&combined, 648.0);
+    assert_ne!(
+        combined[0].to_bits(),
+        bf16_value(expert0[0] + shared[0]).to_bits()
+    );
+    assert_ne!(
+        combined[0].to_bits(),
+        bf16_value(expert1[0] + shared[0]).to_bits()
+    );
+    assert_ne!(
+        combined[0].to_bits(),
+        bf16_value(expert0[0] + expert1[0]).to_bits()
+    );
+}

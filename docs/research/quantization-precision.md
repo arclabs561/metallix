@@ -288,6 +288,31 @@ MoE or upstream execution parity.
 
 Run `cargo test -p deepseek precision`.
 
+## Text routing into multiple experts
+
+`flash_sqrt_softplus_routes` consumes one supplied row of gate logits and
+correction biases. It applies the pinned gate temperature, sqrt-softplus
+scores (softplus threshold 20), biased Top-K selection, unbiased gathered
+weights, optional normalization only for K greater than one with `1e-20`, and
+the route scale. Source: pinned `model.py` `Gate.forward`, lines 807–827.
+The selected weights are normalized in biased-selection order before results
+are presented in ascending expert ID, matching the MoE execution loop.
+
+The helper bounds width to 4,096 experts, rejects nonfinite/intermediate
+overflow and ambiguous cutoff ties, and does not invent a portable PyTorch
+tie order. Within-selected-set ties and scalar reductions are not hardware
+bit-parity guarantees. Gate projection and vision bias selection remain
+unimplemented by this function.
+
+The reduced fixture uses width/intermediate width 32, three candidate experts,
+Top-2 selection, gate temperature 1, route scale 1, and SwiGLU limit 4, with
+synthetic weights. These are test settings, not the released Flash dimensions
+or its route scale. The reduced composition selects two distinct FP4 experts while correction
+bias excludes the highest raw-logit expert. Their down projections give
+hand-derived outputs 104 and 288, and the unweighted FP8 shared expert gives
+256; final BF16 output is 648. This joins routing to quantized experts, not
+the gate projection, a complete block, or pretrained-model execution.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
