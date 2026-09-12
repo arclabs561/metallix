@@ -11,6 +11,7 @@ explicit gaps, not retrospectively pinned evidence.
 |---|---|
 | What does V4.1 require, and what do its optimizations actually mean? | [Efficiency requirements](efficiency-methods.md) |
 | What might let a model exceed a Mac's RAM? | [Host-memory investigation](host-memory.md) |
+| How does the runtime compare with existing systems and emerging model families? | [Architecture landscape](architecture-landscape.md) |
 | Which precision and quantization ideas are faithful formats versus new quality experiments? | [Quantization and precision](quantization-precision.md) |
 | What gates separate categorical sampling, particle control, and calibrated uncertainty? | [Sampling implementation gates](sampling-next-gates.md) |
 | How would diffusion text generation differ from the token-step decoder? | [Diffusion text models](diffusion-text.md) |
