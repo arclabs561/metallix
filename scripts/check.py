@@ -63,6 +63,8 @@ def main() -> int:
     commands = [
         ([sys.executable, "scripts/check_engram_fixtures.py"], False),
         ([sys.executable, "scripts/test_check_engram_fixtures.py"], False),
+        ([sys.executable, "scripts/test_v41_forward_manifest.py"], False),
+        ([sys.executable, "scripts/test_v41_source_loader.py"], False),
         (["cargo", "fmt", "--check"], False),
         (["cargo", "test", "--workspace", *feature_args], False),
         (

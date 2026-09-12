@@ -52,6 +52,15 @@ rotary, FP4 reconstruction and mathematical sparse attention in CPU Torch.
 It follows the same pinned ordering with supplied latents and indices, not
 the complete upstream attention implementation.
 
+`scripts/v41_source_loader.py` loads the same revision's retained, hash-checked
+text graph and Engram source. `scripts/v41-forward-reference.py` executes that
+graph with synthetic encoded weights and independent CPU replacements in
+`scripts/v41_cpu_kernels.py`. Those replacements follow the quantization,
+scaled GEMM, sparse-attention and HC/Sinkhorn boundaries in `inference/kernel.py`.
+They preserve explicit numerical representations but do not execute TileLang
+or establish GPU reduction parity. The reduced manifest and receipts record
+the synthetic configuration separately from the released checkpoint.
+
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
 ```text

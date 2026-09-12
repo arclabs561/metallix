@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Reduced V4.1 CPU source-forward harness with an explicit shape/schedule
+  manifest, hash-checked source loading and independent quantized-kernel
+  replacements. Synthetic prefill/decode captures include final logits and
+  candidate-filter checks; this is not native Rust full-model execution or
+  upstream GPU parity.
 - Bounded FP32 linear reference with atomic output writes and no BF16
   narrowing. Compressor fixture tests now execute BF16/FP32 projection
   matrices before native pooling and normalization.
