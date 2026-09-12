@@ -102,6 +102,21 @@ cargo test -p deepseek engram
 
 ## Remaining gates
 
+The source capture `scripts/v41-engram-gate-reference.py` now exercises the
+pinned `Engram.forward` with explicit BF16 key/value tensors supplied by
+embedding/projection stubs. Its CPU receipt covers signed dots, per-HC-copy
+normalization, q/k factorization, shared-value broadcasting, masked
+passthrough and the unmasked zero-dot clamp floor. Recomputing the same
+Torch expression is a consistency check, not an independent numerical
+oracle. Deliberately wrong joint-HC normalization and copy-specific value
+broadcasting distinguish the fixture's intended boundaries.
+
+Run `uv run scripts/v41-engram-gate-reference.py` to emit the bit-preserving
+capture. The local run passed its assertions; Torch warned about optional
+NumPy initialization, which this script does not use. A Rust consumer of
+these preprojected residual-gate results is still required. This capture
+does not qualify FP8 rows/scales, table sharding, `wkv` weights or Metal.
+
 The next fixture must cover the exact tokenizer backend/version and a
 small original-ID-to-decoded-text projection (including case, whitespace,
 accent, U+FFFD, pad, and image/dead cases), compressed IDs, explicit primes,

@@ -27,6 +27,9 @@ follows `inference/engram.py:NgramHashState.forward` at that revision.
 `scripts/v41-engram-reference.py` executes only that hash-checked method with
 explicit synthetic tensors, excluding tokenizer normalization, RNG setup and
 embedding-table access.
+`scripts/v41-engram-gate-reference.py` captures the hash-checked
+`Engram.forward` residual gate with explicit embedding/projection stubs;
+it does not execute real table lookups or projection weights.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
