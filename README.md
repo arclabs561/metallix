@@ -5,118 +5,96 @@
 
 A local inference engine for Apple Silicon, built around Rust and Metal.
 
-Generate schema-constrained JSON, inspect token probabilities, and compare
-resident versus layer-streamed inference with `mx`. Qwen3-0.6B runs today
-through MLX; DeepSeek-V4.1-Flash is the main target, still in development.
+Generate JSON that follows your schema. Replay a sampled sequence. Inspect
+token probabilities and check the KV cache—all from `mx`.
 
-## Make it generate a record
+Qwen3-0.6B runs today. DeepSeek-V4.1-Flash is the main target; its
+configuration and isolated Metal operators work today, but it cannot generate
+yet.
 
-With a local Qwen3-0.6B checkpoint and the [built CLI](#build), run from the
-repository root:
+## Setup
+
+Requires Rust 1.87+, Apple Silicon, CMake and the Xcode Metal toolchain. From
+the repository root, build once and make the release binary available in this
+shell:
 
 ```sh
-mx gen --model /path/to/Qwen3-0.6B \
-  --input-ids 9707,11,1879 --max-tokens 29 \
+cargo build -p server --release --all-features
+export PATH="$PWD/target/release:$PATH"
+MODEL=/path/to/Qwen3-0.6B
+```
+
+`MODEL` is an already-downloaded Qwen3-0.6B safetensors directory containing
+`config.json` and `tokenizer.json`. Use materialized checkpoint files; discovery
+currently skips symlink-only Hub cache shards. `mx` and `metallix` are native
+executables with the same CLI; no shell alias is needed.
+
+## Generate, then inspect
+
+Inputs are raw token IDs, not text prompts or chat templates.
+
+**Generate four greedy tokens.**
+
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4
+```
+
+The local report includes:
+
+```json
+{"generated_ids":[13,358,2776,264],"finish_reason":"length"}
+```
+
+**Generate a JSON record.** The schema constrains token selection, and the
+preview shows decoded output:
+
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 29 \
   --json-schema fixtures/constraints/record.json --preview
 ```
 
-The local run produced this value in `constraint.output`:
+The local control produced this `constraint.output` value:
 
 ```json
 {"status":"ready","count":1}
 ```
 
-The schema constrains tokens during generation. `--preview` shows decoded JSON
-and a short diagnostic summary on stderr; stdout remains the full JSON report.
-Successful completion is independently validated. Running out of tokens before
-completion reports `incomplete` and exits nonzero.
+Successful schema output is independently validated. A token budget that ends
+before the grammar completes reports `incomplete` and exits nonzero.
 
-## Build
-
-Requires Rust 1.87+, Apple Silicon, CMake and the Xcode Metal toolchain.
-From the repository root:
-
-```sh
-cargo build -p server --release --all-features
-export PATH="$PWD/target/release:$PATH"
-mx --help
-```
-
-The PATH change lasts for this shell. `mx` and `metallix` are native executables
-with the same CLI; neither needs a shell alias.
-
-For the examples below, point `MODEL` at an already-downloaded Qwen3-0.6B
-safetensors checkpoint with `config.json` and `tokenizer.json`:
-
-```sh
-MODEL=/path/to/Qwen3-0.6B
-```
-
-Inputs are currently raw token IDs, not text prompts or chat templates.
-
-## Explore with mx
-
-**Check your setup without loading weights.** Run a small Metal graph, then
-inspect the checkpoint's headers:
-
-```sh
-mx smoke-qwen-metal
-mx inspect-qwen-checkpoint --model "$MODEL"
-```
-
-**Make a draw reproducible.** Choose a temperature and seed; inspect the selected
-tokens and their probabilities:
+**Try a different sequence—and replay it.** Turn on sampling, set the
+temperature, and keep a seed:
 
 ```sh
 mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 \
-  --sample --temperature 0.7 --seed 42 --logprobs --preview
+  --sample --temperature 0.7 --seed 42 --logprobs
 ```
 
-The local control returned `13,21927,11,1879`; repeating the run preserved IDs
-and scores. Replay requires the same model execution and sampling policy, not
-just the same seed. Without sampling flags, selection is greedy.
+The local run returned `13,21927,11,1879`. Replay requires the same model
+execution and sampling policy, not only the same seed.
 
-**Keep the schema, change the sampling policy.** Combine the same flags with
-the record schema. With `jq`, extract the object and the first token's scores:
+**Inspect probabilities and a terminal preview.** `--logprobs` adds
+selected-token natural-log probabilities to stdout; `--preview` writes a
+bounded summary to stderr. The probabilities are not answer-confidence scores.
 
 ```sh
-mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 29 \
-  --json-schema fixtures/constraints/record.json \
-  --sample --temperature 0.7 --seed 42 --logprobs \
-  | jq '{output: .constraint.output, first_token: .logprobs.tokens[0]}'
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 --logprobs
 ```
 
-Scores distinguish raw-model, grammar-conditioned and actual sampling-policy
-log probabilities, plus the grammar-allowed log mass. These are natural-log
-quantities, not answer-confidence scores.
+```sh
+mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 --preview
+```
 
-**Check that KV reuse preserves the result.** Compare each cached step with a
-full forward and show timing/memory diagnostics:
+**Check cached decoding.** Compare each cached step with a full forward. This
+adds reference work outside reported generation timings:
 
 ```sh
 mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 \
-  --verify-cache --verbose --preview
+  --verify-cache --verbose
 ```
 
-Verification adds reference work outside the reported generation timings;
-use this for correctness checks, not speed comparisons.
-
-**Stream the weights a layer at a time.** Keep the JSON constraint while
-selecting explicit weight/staging and KV budgets:
-
-```sh
-mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 29 \
-  --memory-mode streamed --max-weight-bytes 81798144 --max-kv-bytes 7340032 \
-  --json-schema fixtures/constraints/record.json --preview --verbose
-```
-
-In streamed mode, `--verbose` adds phase profiles for loading/conversion,
-execution/readback and tiled projection. These measure host wall-clock time,
-not individual GPU kernels. The budgets are logical, not a process-memory cap
-or evidence of beyond-RAM serving.
-
-See [the generation guide](DEVELOPMENT.md) for full reports, benchmark recipes
-and the meanings of individual timing fields.
+See [the generation guide](DEVELOPMENT.md) for streamed weights, memory
+budgets, profiles, benchmarks, and the full JSON report fields.
 
 ## Build features
 
