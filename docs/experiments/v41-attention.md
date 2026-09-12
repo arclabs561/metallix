@@ -133,6 +133,12 @@ explicit BF16 narrowing between stages. The validated layout bounds staging
 buffers and arithmetic work. This is a scalar composition over supplied
 runtime buffers, not checkpoint loading or a complete attention layer.
 
+A joined test now feeds the BF16 sparse-attention result into both output
+projections. Its closed-form cases combine a masked stale key, denominator-only
+sink mass, inverse rotation, and differently weighted head groups. It checks
+intermediate BF16 tails and final hidden values, rather than treating prepared
+attention output as evidence that the sparse-attention boundary is connected.
+
 The grouped BF16 projection has an independent CPU PyTorch capture in
 `fixtures/deepseek-v41/output-projection-reference.json`. Its cases cover
 batch/sequence/group/rank indexing, group isolation, and rounding after a

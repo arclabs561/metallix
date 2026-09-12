@@ -641,6 +641,60 @@ mod tests {
     }
 
     #[test]
+    fn sparse_attention_flows_through_inverse_rope_and_both_projections() {
+        use std::num::NonZeroUsize;
+
+        use crate::attention::{SparseAttentionLayout, sparse_attention_bf16_reference};
+
+        let nz = |value| NonZeroUsize::new(value).unwrap();
+        let attention_layout =
+            SparseAttentionLayout::new(nz(1), nz(1), nz(2), nz(32), nz(2), nz(2)).unwrap();
+        let output_layout = AttentionOutputLayout::new(1, 1, 2, 32, 1, 2, 16, 32).unwrap();
+        let mut kv = vec![0_u16; 64];
+        kv[30..32].copy_from_slice(&[0x4000, 0x4080]); // live tail [2, 4]
+        kv[32..].fill(0x42c6); // masked stale key: every coordinate is 99
+        let mut wo_a = vec![0_u16; 2 * 16 * 32];
+        wo_a[31] = 0x3f80; // group 0 selects final coordinate
+        wo_a[16 * 32 + 31] = 0x4000; // group 1 doubles it
+        let mut wo_b = vec![0_u8; 32 * 32];
+        wo_b[0] = 0x38;
+        wo_b[32 + 16] = 0x38;
+
+        // One zero-score key and a zero-score sink give exactly half the KV.
+        // Raising the sink mass to three gives one quarter, without adding
+        // any value vector. Both cases must survive all precision boundaries.
+        for (sink, expected_tail, expected_output) in [
+            (0.0, [0x3f80, 0x4000], [0xbf80, 0xc000]),
+            (3.0_f32.ln(), [0x3f00, 0x3f80], [0xbf00, 0xbf80]),
+        ] {
+            let attention = sparse_attention_bf16_reference(
+                &[0_u16; 64],
+                &kv,
+                &[sink; 2],
+                &[0, -1],
+                1.0,
+                attention_layout,
+            )
+            .unwrap();
+            for head in attention.chunks_exact(32) {
+                assert_eq!(&head[30..], &expected_tail);
+                assert!(head[..30].iter().all(|&bits| bits == 0));
+            }
+            let output = attention_output_reference(
+                &attention,
+                &[RotaryFrequency::new(0.0, 1.0).unwrap()],
+                &wo_a,
+                &wo_b,
+                &[127],
+                output_layout,
+            )
+            .unwrap();
+            assert_eq!(&output[..2], &expected_output);
+            assert!(output[2..].iter().all(|&bits| bits == 0));
+        }
+    }
+
+    #[test]
     fn non_quarter_inverse_rope_rounds_before_wo_a_staging() {
         let layout = AttentionOutputLayout::new(1, 1, 1, 32, 1, 1, 32, 1).unwrap();
         let mut attention = vec![0_u16; 32];
