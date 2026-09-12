@@ -1,4 +1,7 @@
-# Metallix
+<p align="center">
+  <img src="docs/assets/metallix.png" alt="" width="160" />
+</p>
+<h1 align="center">metallix</h1>
 
 Metallix qualifies model layouts and builds Metal execution paths for one
 Apple-Silicon Mac. Its first target is DeepSeek-V4.1-Flash.
