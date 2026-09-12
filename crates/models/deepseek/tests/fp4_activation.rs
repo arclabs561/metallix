@@ -667,6 +667,45 @@ fn projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights() {
 }
 
 #[cfg(feature = "metal")]
+fn streamed_compressor_latents() -> Vec<u16> {
+    use deepseek::compressor::{CompressorInput, CompressorState};
+
+    let mut compressor = CompressorState::new(1, 16, 2, &[0x4110; 16], 1e-6)
+        .expect("ratio-two compressor with learned norm weight 9");
+    let mut projected = [1.0_f32; 3 * 16];
+    projected[32..].fill(-4.0);
+    let mut latent = compressor
+        .forward(
+            CompressorInput::Gated {
+                kv: &projected,
+                scores: &[0.0; 48],
+            },
+            3,
+            0,
+        )
+        .expect("prefill pools first pair and retains third token")
+        .expect("first completed group");
+    assert_eq!(latent, [0x4110; 16]); // pooled +1 -> normalized +9
+    assert_eq!(compressor.next_position(), 3);
+    let completed = compressor
+        .forward(
+            CompressorInput::Gated {
+                kv: &[-4.0; 16],
+                scores: &[0.0; 16],
+            },
+            1,
+            3,
+        )
+        .expect("singleton completes the pending second pair")
+        .expect("second completed group");
+    assert_eq!(completed, [0xc110; 16]); // pooled -4 -> normalized -9
+    assert_eq!(compressor.next_position(), 4);
+    // B=1, so append complete groups in sequence order without batch transpose.
+    latent.extend(completed);
+    latent
+}
+
+#[cfg(feature = "metal")]
 #[test]
 fn index_projection_must_read_latents_before_attention_rotates_them() {
     use deepseek::indexer::index_scores_f32;
@@ -679,70 +718,74 @@ fn index_projection_must_read_latents_before_attention_rotates_them() {
         "../../../../fixtures/deepseek-v41/compressed-attention-reference.json"
     ))
     .expect("compressed latent fixture");
-    let latent = fixture_words(&fixture, "latent_bf16");
     let frequencies = fixture_floats(&fixture, "frequencies_f32");
-    let keys = projected_normalized_index_keys(&latent, &frequencies);
-    // wk selects +1 and -4; k_norm rounds to +9 and -9. After key RoPE
-    // and scale-4 FP4 reconstruction, row sums are exactly +248 and -248.
-    assert_eq!(
-        keys[..32].iter().sum::<f32>().to_bits(),
-        248.0_f32.to_bits()
-    );
-    assert_eq!(
-        keys[32..].iter().sum::<f32>().to_bits(),
-        (-248.0_f32).to_bits()
-    );
-    let mut query = [1.0_f32; 64];
-    query[32..].fill(-1.0); // supplied, exactly FP4-representable query heads
-    let score = |keys: &[f32]| {
-        index_scores_f32(
-            &query,
-            keys,
-            &[-4.0, 1.0],
-            NonZeroUsize::new(32).expect("index width"),
+    for latent in [
+        fixture_words(&fixture, "latent_bf16"),
+        streamed_compressor_latents(),
+    ] {
+        let keys = projected_normalized_index_keys(&latent, &frequencies);
+        // Both supplied and natively pooled latents normalize to +9 and -9. After key RoPE
+        // and scale-4 FP4 reconstruction, row sums are exactly +248 and -248.
+        assert_eq!(
+            keys[..32].iter().sum::<f32>().to_bits(),
+            248.0_f32.to_bits()
+        );
+        assert_eq!(
+            keys[32..].iter().sum::<f32>().to_bits(),
+            (-248.0_f32).to_bits()
+        );
+        let mut query = [1.0_f32; 64];
+        query[32..].fill(-1.0); // supplied, exactly FP4-representable query heads
+        let score = |keys: &[f32]| {
+            index_scores_f32(
+                &query,
+                keys,
+                &[-4.0, 1.0],
+                NonZeroUsize::new(32).expect("index width"),
+            )
+            .expect("Metal index scores")
+        };
+        let scores = score(&keys);
+        assert_eq!(
+            scores
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [-992.0_f32, 248.0].map(f32::to_bits)
+        );
+        let selected = select_indices(&scores, 2, 1, 0).expect("strict cutoff");
+        assert_eq!(selected, [1]);
+        let mutated = rotate_compressed_tails(&latent, &frequencies);
+        let mut cache = [0; 32];
+        fp4_activation_reference(&mutated, 2, 16, Fp4Mode::CompressedKv16E4m3, &mut cache)
+            .expect("attention cache reconstruction");
+        let cache: Vec<_> = cache.into_iter().map(bf16_to_f32).collect();
+        let nz = |value| NonZeroUsize::new(value).expect("fixed dimension");
+        let output = sparse_attention_reference(
+            &[0.0; 16],
+            &cache,
+            &[0.0],
+            &selected,
+            0.25,
+            SparseAttentionLayout::new(nz(1), nz(1), nz(1), nz(16), nz(2), nz(1))
+                .expect("attention layout"),
         )
-        .expect("Metal index scores")
-    };
-    let scores = score(&keys);
-    assert_eq!(
-        scores
-            .iter()
-            .map(|value| value.to_bits())
-            .collect::<Vec<_>>(),
-        [-992.0_f32, 248.0].map(f32::to_bits)
-    );
-    let selected = select_indices(&scores, 2, 1, 0).expect("strict cutoff");
-    assert_eq!(selected, [1]);
-    let mutated = rotate_compressed_tails(&latent, &frequencies);
-    let mut cache = [0; 32];
-    fp4_activation_reference(&mutated, 2, 16, Fp4Mode::CompressedKv16E4m3, &mut cache)
-        .expect("attention cache reconstruction");
-    let cache: Vec<_> = cache.into_iter().map(bf16_to_f32).collect();
-    let nz = |value| NonZeroUsize::new(value).expect("fixed dimension");
-    let output = sparse_attention_reference(
-        &[0.0; 16],
-        &cache,
-        &[0.0],
-        &selected,
-        0.25,
-        SparseAttentionLayout::new(nz(1), nz(1), nz(1), nz(16), nz(2), nz(1))
-            .expect("attention layout"),
-    )
-    .expect("projected index keys drive attention selection");
-    for (&actual, &value) in output.iter().zip(&cache[16..]) {
-        assert_eq!(actual.to_bits(), (value * 0.5).to_bits());
+        .expect("projected index keys drive attention selection");
+        for (&actual, &value) in output.iter().zip(&cache[16..]) {
+            assert_eq!(actual.to_bits(), (value * 0.5).to_bits());
+        }
+        let wrong_keys = projected_normalized_index_keys(&mutated, &frequencies);
+        let wrong_scores = score(&wrong_keys);
+        assert_eq!(
+            wrong_scores
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            [248.0_f32, 248.0].map(f32::to_bits)
+        );
+        assert_eq!(
+            select_indices(&wrong_scores, 2, 1, 0),
+            Err(SelectionError::AmbiguousCutoffTie)
+        );
     }
-    let wrong_keys = projected_normalized_index_keys(&mutated, &frequencies);
-    let wrong_scores = score(&wrong_keys);
-    assert_eq!(
-        wrong_scores
-            .iter()
-            .map(|value| value.to_bits())
-            .collect::<Vec<_>>(),
-        [248.0_f32, 248.0].map(f32::to_bits)
-    );
-    assert_eq!(
-        select_indices(&wrong_scores, 2, 1, 0),
-        Err(SelectionError::AmbiguousCutoffTie)
-    );
 }

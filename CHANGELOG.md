@@ -10,6 +10,9 @@ published release; reference operators do not imply full-model support.
 - Model-local scalar compressor pooling and partial-group state with separate
   BF16 ratio-one and FP32 gated inputs. Learned projection results are supplied
   by the caller; cache publication and scheduling remain separate.
+- Native compressor prefill and singleton completion joined with index-key
+  preparation, Metal selection and mathematical attention in a batch-one
+  composition test, retaining the premature-latent-rotation counterexample.
 - Text prompts for `mx gen --prompt`, with decoded generated text in its JSON
   report. Raw `--input-ids` remains available for numerical diagnostics.
   Prompts are encoded as plain text, without a chat template.

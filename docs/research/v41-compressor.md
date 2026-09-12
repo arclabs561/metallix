@@ -196,6 +196,17 @@ whereas prematurely rotated inputs yield an ambiguous `[248, 248]` cutoff.
 This turns the shared-latent ordering requirement into a numerical check.
 Compressor latents, query heads and projection/norm weights remain synthetic;
 checkpoint loading and the full indexer are not qualified by this test.
+The same test now also runs with latents produced by native `CompressorState`:
+a three-token prefill at ratio two emits one group and retains one token;
+a singleton continuation completes the second group. Supplied projected
+rows `(+1, +1, -4, -4)` with uniform gates and norm weight 9 produce
+constant BF16 latent rows +9 and -9. Those outputs feed the actual key
+preparation, Metal scoring, selection and mathematical attention operations.
+The exact scores and premature-rotation failure remain the same as above.
+Appending emitted groups is explicit test orchestration for batch one only,
+not a cache-publication API or multi-batch append contract. Learned compressor
+projections, supplied query heads and request/cache ownership remain outside
+this composition.
 The integration binary serializes its Metal operations using the same
 test-only device guard convention as the library tests. An unguarded parallel
 run crashed, while an explicitly serial run passed. These tests do not qualify
