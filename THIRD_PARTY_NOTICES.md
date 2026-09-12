@@ -35,6 +35,9 @@ follows that residual expression with supplied preprojected tensors.
 The compressor and block composition captures and tests follow
 `Compressor.forward`, `Block.forward`, the block HC helpers and `RMSNorm.forward`
 at the same revision, with explicitly stubbed projections or sublayers.
+The bounded scalar implementation in `crates/models/deepseek/src/compressor.rs`
+follows that compressor pooling and normalization order with caller-supplied
+projection results; it does not execute checkpoint projection weights.
 The compressed-publication capture executes `Attention._compress_kv` and
 `Attention._compress_topk_idxs` at that revision, with explicit compressor,
 indexer, rotary and quantization stubs. Its Rust tests check captured control

@@ -34,6 +34,42 @@ extra operator to invent independently of the actual layer schedule.
   all slots of a new complete group are replaced before pooling. A runtime
   must separately enforce position continuity, batch identity and capacity.
 
+## Native pooling boundary
+
+The model-local `deepseek::compressor` boundary owns preprojected pooling,
+normalization and partial-group state. Learned projection execution remains
+upstream; rotary, index-key publication, attention cache ownership and request
+scheduling remain downstream or engine concerns. This keeps the model-specific
+token-axis gate out of generic cache/scheduler APIs.
+
+`CompressorInput::ProjectedBf16` supplies the ratio-one projection result.
+For larger ratios, `CompressorInput::Gated` supplies separate FP32 KV and score
+projections. `CompressorState` fixes batch count, width, ratio and normalization
+parameters at construction. Inputs and outputs use batch/position/feature
+order. A successful start-zero call resets the sequence; larger-ratio
+continuations must be sequential singleton calls. This is a bounded scalar
+reference, not a learned checkpoint compressor or a GPU implementation.
+All ratios enforce stream continuity as an API safety policy; the upstream
+ratio-one branch itself is stateless and does not impose that restriction.
+Failed validation, allocation, pooling or normalization leaves the prior
+partial group and next position unchanged. State is staged before commit;
+`MAX_COMPRESSOR_ELEMENTS` bounds each buffer, not aggregate process memory.
+Nonfinite scalar intermediates are rejected rather than treated as a claim
+about upstream overflow behavior.
+
+The public API is exercised against the pinned source capture by
+`crates/models/deepseek/tests/compressor_api.rs`. The fixture adapter only
+constructs its declared identity KV and reversed/scaled gate projections;
+pooling and normalization execute in the library.
+Additional tests cover ratio four, independent feature-wise token weights,
+finite softmax underflow and failed completion/reset retries. Restoring an
+early zero-denominator check makes the underflow regression fail: the
+denominator is only required to be positive after all token terms are summed.
+
+```sh
+cargo test -p deepseek --test compressor_api
+```
+
 ## The attention join that must remain ordered
 
 1. A KV-source layer produces the **unrotated** pooled latent.

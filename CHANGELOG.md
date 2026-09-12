@@ -7,6 +7,9 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Model-local scalar compressor pooling and partial-group state with separate
+  BF16 ratio-one and FP32 gated inputs. Learned projection results are supplied
+  by the caller; cache publication and scheduling remain separate.
 - Text prompts for `mx gen --prompt`, with decoded generated text in its JSON
   report. Raw `--input-ids` remains available for numerical diagnostics.
   Prompts are encoded as plain text, without a chat template.

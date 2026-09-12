@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod checkpoint;
+pub mod compressor;
 pub mod csa2;
 pub mod engram;
 pub mod hc;
