@@ -2,7 +2,10 @@
 
 use std::{fs, path::Path, process::ExitCode, time::Instant};
 
+use engine::sampling::sample_categorical;
 use qwen::metal::Qwen3MlxWeights;
+use rand_chacha::ChaCha8Rng;
+use rand_core::{RngCore, SeedableRng};
 use serde_json::json;
 
 use crate::parity::{compare_logits, read_reference};
@@ -53,6 +56,82 @@ pub(crate) struct GenerationDiagnostics {
     pub(crate) verbose: bool,
     pub(crate) logprobs: bool,
     pub(crate) preview: bool,
+    pub(crate) sampling: Option<SamplingConfiguration>,
+}
+
+/// The explicit request settings for a reproducible categorical policy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SamplingConfiguration {
+    pub(crate) seed: u64,
+    pub(crate) temperature: f64,
+}
+
+impl SamplingConfiguration {
+    fn report(self) -> serde_json::Value {
+        json!({
+            "algorithm": "rand_chacha::ChaCha8Rng",
+            "crate_version": "0.9.0",
+            "seed": self.seed,
+            "temperature": self.temperature,
+            "uniform": "next_u64 top 53 bits divided by 2^53",
+            "truncation": "none",
+        })
+    }
+}
+
+struct SamplingPolicy {
+    configuration: SamplingConfiguration,
+    rng: ChaCha8Rng,
+    legal_mask: Vec<bool>,
+}
+
+impl SamplingPolicy {
+    fn new(configuration: SamplingConfiguration, vocabulary_size: usize) -> Self {
+        Self {
+            configuration,
+            rng: ChaCha8Rng::seed_from_u64(configuration.seed),
+            legal_mask: vec![true; vocabulary_size],
+        }
+    }
+
+    fn sample(
+        &mut self,
+        logits: &[f32],
+        logprobs: bool,
+    ) -> Result<(i32, Option<serde_json::Value>), String> {
+        // Advance a cloned stream first, committing it only after the sampler
+        // accepts the logits. Invalid model output must not make a replay drift.
+        let mut candidate_rng = self.rng.clone();
+        let uniform = unit_uniform(candidate_rng.next_u64());
+        let sample = sample_categorical(
+            logits,
+            &self.legal_mask,
+            self.configuration.temperature,
+            uniform,
+        )
+        .map_err(|error| error.to_string())?;
+        let token = i32::try_from(sample.token_id).map_err(|error| error.to_string())?;
+        let scores = if logprobs {
+            Some(json!({
+                "model_logprob": selected_model_logprob(logits, sample.token_id)?,
+                "sampling_logprob": sample.sampling_logprob,
+            }))
+        } else {
+            None
+        };
+        self.rng = candidate_rng;
+        Ok((token, scores))
+    }
+}
+
+fn unit_uniform(word: u64) -> f64 {
+    const TWO_TO_21: f64 = 2_097_152.0;
+    const TWO_TO_53: f64 = 9_007_199_254_740_992.0;
+    let top_53 = word >> 11;
+    let high = u32::try_from(top_53 >> 21).expect("top 53 bits split into 32 and 21 bits");
+    let low =
+        u32::try_from(top_53 & ((1 << 21) - 1)).expect("top 53 bits split into 32 and 21 bits");
+    (f64::from(high) * TWO_TO_21 + f64::from(low)) / TWO_TO_53
 }
 
 /// Qwen-specific residency selection for the diagnostic generator.
@@ -241,6 +320,7 @@ fn generate_inner(
         verbose,
         logprobs,
         preview,
+        sampling: sampling_configuration,
     } = diagnostics;
     if input_ids.len().saturating_add(max_tokens as usize) > qwen::forward::MAX_DENSE_DEBUG_TOKENS {
         return Err("prompt plus generation budget exceeds diagnostic context limit".into());
@@ -253,6 +333,13 @@ fn generate_inner(
     let raw = fs::read_to_string(model.join("config.json"))?;
     let generation: GenerationConfig = serde_json::from_str(&raw)?;
     generation.validate(input_ids, max_tokens)?;
+    #[cfg(feature = "structured-output")]
+    if sampling_configuration.is_some() && json_schema.is_some() {
+        return Err(
+            "--sample cannot be used with --json-schema until grammar-mask sampling is qualified"
+                .into(),
+        );
+    }
     #[cfg(feature = "structured-output")]
     let mut constraint = json_schema
         .map(|path| crate::qwen_constraints::ConstraintRun::load(model, path))
@@ -306,6 +393,8 @@ fn generate_inner(
     let started = Instant::now();
     let mut logits = executor.prefill_last_logits(input_ids)?;
     let prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut sampling_policy = sampling_configuration
+        .map(|configuration| SamplingPolicy::new(configuration, logits.len()));
     let mut phase_profiles = Vec::new();
     if verbose {
         record_stream_profile(&mut executor, &mut phase_profiles, "prefill", 0)?;
@@ -352,12 +441,19 @@ fn generate_inner(
             comparisons.push(result);
         }
         #[cfg(feature = "structured-output")]
-        let (token, scores) = match constraint.as_mut() {
-            Some(constraint) => constraint.sample(&logits, logprobs)?,
-            None => greedy_sample(&logits, logprobs)?,
+        let (token, scores) = match (constraint.as_mut(), sampling_policy.as_mut()) {
+            (Some(constraint), None) => constraint.sample(&logits, logprobs)?,
+            (None, Some(policy)) => policy.sample(&logits, logprobs)?,
+            (None, None) => greedy_sample(&logits, logprobs)?,
+            (Some(_), Some(_)) => {
+                return Err("sampled structured output was not rejected during setup".into());
+            }
         };
         #[cfg(not(feature = "structured-output"))]
-        let (token, scores) = greedy_sample(&logits, logprobs)?;
+        let (token, scores) = sampling_policy.as_mut().map_or_else(
+            || greedy_sample(&logits, logprobs),
+            |policy| policy.sample(&logits, logprobs),
+        )?;
         if let Some(mut scores) = scores {
             scores["token_id"] = json!(token);
             token_scores.push(scores);
@@ -395,9 +491,10 @@ fn generate_inner(
         );
         emit_stream_profile_summary(&phase_profiles);
     }
+    let sampled = sampling_configuration.is_some();
     let mut report = json!({
     "schema_version": 1,
-    "operation": "qwen3_greedy_cached_generation",
+    "operation": if sampled { "qwen3_sampled_cached_generation" } else { "qwen3_greedy_cached_generation" },
     "backend": "mlx-rs 0.25.3 Metal float32",
     "input_ids": input_ids,
     "generated_ids": generated,
@@ -411,7 +508,11 @@ fn generate_inner(
     "scope": "single sequence; contiguous KV; first prefill not warmed; verification excluded from timed regions but may warm execution"
     });
     if let Some(plan) = streamed {
-        report["operation"] = json!("qwen3_greedy_streamed_generation");
+        report["operation"] = json!(if sampled {
+            "qwen3_sampled_streamed_generation"
+        } else {
+            "qwen3_greedy_streamed_generation"
+        });
         report["streamed"] = json!({
             "maximum_total_tokens": plan.maximum_total_tokens,
             "max_weight_bytes": plan.max_weight_bytes,
@@ -434,11 +535,18 @@ fn generate_inner(
             .logical_weight_bytes();
         report["logical_weight_bytes"] = json!(logical_weight_bytes);
     }
+    if let Some(configuration) = sampling_configuration {
+        report["sampling_policy"] = configuration.report();
+    }
     if logprobs {
         report["logprobs"] = json!({
             "log_base": "e",
             "tokens": token_scores,
-            "scope": "selected-token probabilities under temperature-one model logits; constrained scores renormalize the current allowed set; not the probability of a complete valid sequence or of the deterministic greedy policy"
+            "scope": if sampled {
+                "model_logprob is raw temperature-one model p; sampling_logprob is deployed temperature-conditioned q with no truncation; neither is a complete-sequence probability"
+            } else {
+                "selected-token probabilities under temperature-one model logits; constrained scores renormalize the current allowed set; not the probability of a complete valid sequence or of the deterministic greedy policy"
+            }
         });
     }
     #[cfg(feature = "structured-output")]
@@ -567,17 +675,35 @@ fn greedy_sample(
 ) -> Result<(i32, Option<serde_json::Value>), String> {
     let token = greedy_token(logits)?;
     let scores = if logprobs {
-        let selected =
-            f64::from(logits[usize::try_from(token).map_err(|error| error.to_string())?]);
-        let shifted_sum = logits
-            .iter()
-            .map(|&value| (f64::from(value) - selected).exp())
-            .sum::<f64>();
-        Some(json!({ "model_logprob": -shifted_sum.ln() }))
+        Some(json!({
+            "model_logprob": selected_model_logprob(
+                logits,
+                u32::try_from(token).map_err(|error| error.to_string())?,
+            )?,
+        }))
     } else {
         None
     };
     Ok((token, scores))
+}
+
+fn selected_model_logprob(logits: &[f32], token_id: u32) -> Result<f64, String> {
+    if logits.is_empty() || logits.iter().any(|value| !value.is_finite()) {
+        return Err("model log probability requires finite nonempty logits".into());
+    }
+    let token = usize::try_from(token_id).map_err(|error| error.to_string())?;
+    let selected = *logits
+        .get(token)
+        .ok_or_else(|| String::from("selected token is outside model vocabulary"))?;
+    let maximum = logits
+        .iter()
+        .map(|&value| f64::from(value))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let shifted_sum = logits
+        .iter()
+        .map(|&value| (f64::from(value) - maximum).exp())
+        .sum::<f64>();
+    Ok(f64::from(selected) - maximum - shifted_sum.ln())
 }
 
 pub(crate) fn run(
@@ -668,7 +794,10 @@ fn measure(
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationMemoryConfig, GenerationMemoryMode, verbose_preflight};
+    use super::{
+        GenerationMemoryConfig, GenerationMemoryMode, SamplingConfiguration, SamplingPolicy,
+        selected_model_logprob, unit_uniform, verbose_preflight,
+    };
 
     #[test]
     fn logprobs_are_opt_in_stable_and_do_not_change_greedy_ties() {
@@ -691,6 +820,92 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+    }
+
+    #[test]
+    fn seeded_policy_replays_and_matches_analytic_raw_and_deployed_logprobs() {
+        let configuration = SamplingConfiguration {
+            seed: 7,
+            temperature: 0.5,
+        };
+        let logits = [0.0, 1.0];
+        let mut first = SamplingPolicy::new(configuration, logits.len());
+        let mut replay = SamplingPolicy::new(configuration, logits.len());
+
+        let first_tokens = (0..4)
+            .map(|_| first.sample(&logits, true).expect("valid sampled token"))
+            .collect::<Vec<_>>();
+        let replay_tokens = (0..4)
+            .map(|_| replay.sample(&logits, true).expect("valid replay token"))
+            .collect::<Vec<_>>();
+        assert_eq!(first_tokens, replay_tokens);
+
+        let (_, scores) = &first_tokens[0];
+        let scores = scores.as_ref().expect("requested sampled scores");
+        let token = u32::try_from(first_tokens[0].0).expect("sampled token ID");
+        let raw = scores["model_logprob"].as_f64().expect("raw score");
+        let deployed = scores["sampling_logprob"].as_f64().expect("deployed score");
+        let selected = f64::from(logits[usize::try_from(token).expect("two token IDs")]);
+        let expected_raw = selected - (1.0_f64 + 1.0_f64.exp()).ln();
+        let expected_deployed = 2.0 * selected - (1.0_f64 + 2.0_f64.exp()).ln();
+        assert!((raw - expected_raw).abs() < 1e-12);
+        assert!((deployed - expected_deployed).abs() < 1e-12);
+        assert!(
+            (raw - selected_model_logprob(&logits, token).expect("raw reference")).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn uniform_conversion_is_half_open_and_uses_all_top_53_bits() {
+        assert_eq!(unit_uniform(0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(unit_uniform(u64::MAX).to_bits(), 0x3fef_ffff_ffff_ffff);
+        assert_eq!(unit_uniform(1 << 11).to_bits(), 0x3ca0_0000_0000_0000);
+        assert_eq!(
+            unit_uniform((1 << 11) | ((1 << 11) - 1)).to_bits(),
+            0x3ca0_0000_0000_0000
+        );
+    }
+
+    #[test]
+    fn failed_sampling_does_not_advance_the_seeded_rng() {
+        let configuration = SamplingConfiguration {
+            seed: 13,
+            temperature: 1.0,
+        };
+        let mut after_failure = SamplingPolicy::new(configuration, 2);
+        let mut fresh = SamplingPolicy::new(configuration, 2);
+        assert!(after_failure.sample(&[f32::NAN, 0.0], true).is_err());
+        assert_eq!(
+            after_failure
+                .sample(&[0.0, 1.0], true)
+                .expect("valid sampled token"),
+            fresh
+                .sample(&[0.0, 1.0], true)
+                .expect("same first sampled token")
+        );
+    }
+
+    #[test]
+    fn requesting_logprobs_does_not_change_the_seeded_token_sequence() {
+        let configuration = SamplingConfiguration {
+            seed: 29,
+            temperature: 1.3,
+        };
+        let logits = [0.0, 0.5, 1.0];
+        let mut with_scores = SamplingPolicy::new(configuration, logits.len());
+        let mut without_scores = SamplingPolicy::new(configuration, logits.len());
+
+        for _ in 0..8 {
+            let scored = with_scores
+                .sample(&logits, true)
+                .expect("valid scored draw");
+            let unscored = without_scores
+                .sample(&logits, false)
+                .expect("valid unscored draw");
+            assert_eq!(scored.0, unscored.0);
+            assert!(scored.1.is_some());
+            assert!(unscored.1.is_none());
+        }
     }
 
     #[test]

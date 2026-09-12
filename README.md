@@ -104,8 +104,9 @@ checks without downloading model weights. Run them sequentially.
 
 ## Limitations
 
-Generation is a single FP32 Qwen sequence with greedy selection. Resident mode
-allows at most `min(model context, 512)` total prompt-plus-generated tokens;
+Generation is a single FP32 Qwen sequence. Selection defaults to greedy;
+seeded temperature sampling is opt-in and currently excludes schema constraints.
+Resident mode allows at most `min(model context, 512)` total prompt-plus-generated tokens;
 streamed mode allows at most 32 total and separately checks weight/staging
 and retained-KV budgets.
 There is no canonical text-prompt/chat-template pipeline, V4.1 decoder,

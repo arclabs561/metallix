@@ -109,7 +109,7 @@ fn render_logprob_preview(output: &mut String, report: &Value, color: bool) {
     }
 
     output.push_str(
-        "selected_token_logprobs: first 256; green >= -1, yellow >= -3, red < -3 nats; likelihood/surprisal only, not confidence or correctness\n",
+        "selected_token_logprobs: first 256; model_logprob_p is raw model p, sampling_logprob_q appears only for a deployed sampler; green >= -1, yellow >= -3, red < -3 nats; colors describe p likelihood/surprisal only, not confidence or correctness\n",
     );
     for token in tokens.iter().take(MAX_PREVIEW_TOKENS) {
         let Some(token) = token.as_object() else {
@@ -120,17 +120,23 @@ fn render_logprob_preview(output: &mut String, report: &Value, color: bool) {
             .and_then(Value::as_i64)
             .map_or_else(|| String::from("?"), |id| id.to_string());
         let model = token.get("model_logprob").and_then(Value::as_f64);
-        let constrained = token.get("constrained_logprob").and_then(Value::as_f64);
-        let allowed_mass = token.get("allowed_log_mass").and_then(Value::as_f64);
         let model = color_logprob(&format_number(model), model, color);
         output.push_str("  id=");
         output.push_str(&token_id);
-        output.push_str(" model_logprob=");
+        output.push_str(" model_logprob_p=");
         output.push_str(&model);
-        output.push_str(" constrained_logprob=");
-        output.push_str(&format_number(constrained));
-        output.push_str(" allowed_log_mass=");
-        output.push_str(&format_number(allowed_mass));
+        if let Some(sampling) = token.get("sampling_logprob") {
+            output.push_str(" sampling_logprob_q=");
+            output.push_str(&format_number(sampling.as_f64()));
+        }
+        if let Some(constrained) = token.get("constrained_logprob") {
+            output.push_str(" constrained_logprob=");
+            output.push_str(&format_number(constrained.as_f64()));
+        }
+        if let Some(allowed_mass) = token.get("allowed_log_mass") {
+            output.push_str(" allowed_log_mass=");
+            output.push_str(&format_number(allowed_mass.as_f64()));
+        }
         output.push('\n');
     }
     if tokens.len() > MAX_PREVIEW_TOKENS {
@@ -243,7 +249,9 @@ mod tests {
         );
 
         assert!(!preview.contains('\x1b'));
-        assert!(preview.contains("model_logprob=-0.500"));
+        assert!(preview.contains("model_logprob_p=-0.500"));
+        assert!(!preview.contains("sampling_logprob_q="));
+        assert!(!preview.contains("constrained_logprob="));
     }
 
     #[test]
@@ -254,6 +262,41 @@ mod tests {
         );
 
         assert!(preview.contains("\x1b[32m-0.500\x1b[0m"));
+    }
+
+    #[test]
+    fn sampled_preview_shows_deployed_q_separately_from_raw_model_p() {
+        let preview = render(
+            &json!({
+                "sampling_policy": {"seed": 7, "temperature": 0.5},
+                "logprobs": {"tokens": [{
+                    "token_id": 3,
+                    "model_logprob": -0.5,
+                    "sampling_logprob": -1.25,
+                }]},
+            }),
+            false,
+        );
+
+        assert!(preview.contains("model_logprob_p=-0.500"));
+        assert!(preview.contains("sampling_logprob_q=-1.250"));
+    }
+
+    #[test]
+    fn constrained_score_fields_are_preserved_only_when_reported() {
+        let preview = render(
+            &json!({"logprobs": {"tokens": [{
+                "token_id": 3,
+                "model_logprob": -0.5,
+                "constrained_logprob": -0.25,
+                "allowed_log_mass": -0.75,
+            }]}}),
+            false,
+        );
+
+        assert!(preview.contains("constrained_logprob=-0.250"));
+        assert!(preview.contains("allowed_log_mass=-0.750"));
+        assert!(!preview.contains("sampling_logprob_q="));
     }
 
     #[test]

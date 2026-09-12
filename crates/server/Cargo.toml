@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal"]
+metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core"]
 structured-output = ["dep:engine", "engine/structured-output"]
 
 [dependencies]
@@ -27,6 +27,8 @@ sha2.workspace = true
 deepseek = { path = "../models/deepseek" }
 qwen = { path = "../models/qwen" }
 engine = { path = "../engine", optional = true }
+rand_chacha = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -168,6 +168,36 @@ verbosity; generated IDs and JSON field sets matched, and quiet stderr was
 empty. Receipts: `artifacts/gen-{debug,quiet}.{json,stderr}`. This verifies CLI
 behavior, not a generation-quality or speed improvement.
 
+For seeded categorical sampling instead of greedy selection:
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 4 \
+  --sample --temperature 0.7 --seed 42 --logprobs
+```
+
+All three sampling flags are required together. Temperature must be finite and
+positive; omitting them preserves greedy behavior. This first sampling path
+supports resident and streamed execution, but rejects `--json-schema` rather
+than silently ignoring the schema. It does not apply top-k or top-p truncation.
+
+The report records `sampling_policy`, including the RNG, seed, temperature and
+uniform conversion. With `--logprobs`, `model_logprob` remains the selected
+token's natural-log probability under the raw temperature-one model;
+`sampling_logprob` is its natural-log probability under the actual
+temperature-conditioned sampling policy.
+Replay requires the same policy and model execution, not just the same seed:
+different logits or floating-point execution can select different tokens.
+
+Local qualification on an M3 Max (FP32 Qwen3-0.6B): the command above produced
+IDs `13,21927,11,1879`. A repeated run reproduced IDs and both log-probability
+fields exactly; disabling scores preserved IDs. The streamed path with the
+budgets below matched IDs and scores exactly on this prompt. Greedy selection
+still produced `13,358,2776,264`, and the schema example remained independently
+validated. These are bounded replay checks, not cross-device reproducibility
+or throughput guarantees. Local receipts are in
+`artifacts/sampling-{resident-42-*,streamed-42,greedy-control,schema-control}.json`.
+
 For bounded layer-streamed generation, use:
 
 ```sh
@@ -201,8 +231,8 @@ partial object. Schemas are local-only and limited to 32 KiB; tokenizer JSON is
 limited to 64 MiB and decoded output to 1 MiB. See the
 [integration and measurements](docs/research/constrained-generation.md#cached-generation-integration).
 
-Add `--logprobs` to request selected-token natural-log probabilities in the JSON
-report. `model_logprob` uses the original model distribution; constrained runs
+For greedy generation, add `--logprobs` to request selected-token natural-log
+probabilities in the JSON report. `model_logprob` uses the original model distribution; constrained runs
 also report `constrained_logprob` after masking and `allowed_log_mass` for the
 grammar-allowed set. These are temperature-one categorical probabilities, not
 the probability of the deterministic greedy policy or of an entire valid

@@ -60,6 +60,41 @@ const fn generation_max_tokens(mode: GenerationMemoryMode, requested: Option<u32
     }
 }
 
+#[cfg(feature = "metal")]
+fn parse_temperature(value: &str) -> Result<f64, String> {
+    let temperature = value
+        .parse::<f64>()
+        .map_err(|_| String::from("temperature must be a finite number greater than zero"))?;
+    if temperature.is_finite() && temperature > 0.0 {
+        Ok(temperature)
+    } else {
+        Err(String::from(
+            "temperature must be a finite number greater than zero",
+        ))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn sampling_configuration(
+    sample: bool,
+    temperature: Option<f64>,
+    seed: Option<u64>,
+) -> Result<Option<qwen_forward::SamplingConfiguration>, String> {
+    match (sample, temperature, seed) {
+        (false, None, None) => Ok(None),
+        (true, Some(temperature), Some(seed)) if temperature.is_finite() && temperature > 0.0 => {
+            Ok(Some(qwen_forward::SamplingConfiguration {
+                seed,
+                temperature,
+            }))
+        }
+        (true, _, _) => Err(String::from(
+            "--sample requires a finite positive --temperature and --seed",
+        )),
+        (false, _, _) => Err(String::from("--temperature and --seed require --sample")),
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
@@ -83,7 +118,7 @@ enum Command {
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeats: u32,
     },
-    /// Generate greedy Qwen3 raw token IDs with per-sequence KV reuse on Metal.
+    /// Generate Qwen3 raw token IDs with per-sequence KV reuse on Metal.
     #[cfg(feature = "metal")]
     #[command(visible_alias = "gen")]
     GenerateQwenMetal {
@@ -115,6 +150,16 @@ enum Command {
         /// Include selected-token natural-log probabilities in the JSON report; does not change greedy selection.
         #[arg(long)]
         logprobs: bool,
+        /// Enable explicit reproducible categorical sampling; requires --temperature and --seed.
+        #[cfg_attr(feature = "structured-output", arg(conflicts_with = "json_schema"))]
+        #[arg(long, requires_all = ["temperature", "seed"])]
+        sample: bool,
+        /// Positive finite categorical-sampling temperature; requires --sample.
+        #[arg(long, requires = "sample", value_parser = parse_temperature)]
+        temperature: Option<f64>,
+        /// Deterministic categorical-sampling seed; requires --sample.
+        #[arg(long, requires = "sample")]
+        seed: Option<u64>,
         /// Render a bounded stderr summary; decoded text only with --json-schema, otherwise raw IDs.
         #[arg(long)]
         preview: bool,
@@ -319,11 +364,21 @@ pub fn run() -> ExitCode {
             verify_cache,
             verbose,
             logprobs,
+            sample,
+            temperature,
+            seed,
             preview,
             #[cfg(feature = "structured-output")]
             json_schema,
         } => {
             let max_tokens = generation_max_tokens(memory_mode, max_tokens);
+            let sampling = match sampling_configuration(sample, temperature, seed) {
+                Ok(sampling) => sampling,
+                Err(error) => {
+                    eprintln!("Qwen generation failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             qwen_forward::generate(
                 &model,
                 &input_ids,
@@ -348,6 +403,7 @@ pub fn run() -> ExitCode {
                     verbose,
                     logprobs,
                     preview,
+                    sampling,
                 },
                 #[cfg(feature = "structured-output")]
                 json_schema.as_deref(),
@@ -975,7 +1031,7 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
-    fn qwen_generation_alias_preserves_the_existing_raw_id_diagnostic() {
+    fn qwen_generation_defaults_and_streamed_limits_are_explicit() {
         let default = Cli::try_parse_from(["mx", "gen", "--model", "model"])
             .expect("generation alias with defaults");
         assert!(matches!(
@@ -990,6 +1046,9 @@ mod tests {
                 verify_cache: false,
                 verbose: false,
                 logprobs: false,
+                sample: false,
+                temperature: None,
+                seed: None,
                 preview: false,
                 ..
             } if input_ids == [1, 2, 3]
@@ -1032,13 +1091,68 @@ mod tests {
             super::generation_max_tokens(super::GenerationMemoryMode::Streamed, Some(29)),
             29
         );
+    }
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qwen_sampling_and_diagnostic_flags_have_explicit_contracts() {
         let scores = Cli::try_parse_from(["mx", "gen", "--model", "model", "--logprobs"])
             .expect("opt-in log probabilities");
         assert!(matches!(
             scores.command,
             super::Command::GenerateQwenMetal { logprobs: true, .. }
         ));
+        let sampled = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--sample",
+            "--temperature",
+            "0.7",
+            "--seed",
+            "9",
+        ])
+        .expect("complete sampled policy");
+        assert!(matches!(
+            sampled.command,
+            super::Command::GenerateQwenMetal {
+                sample: true,
+                temperature: Some(temperature),
+                seed: Some(9),
+                ..
+            } if (temperature - 0.7).abs() < f64::EPSILON
+        ));
+        for arguments in [
+            vec!["mx", "gen", "--model", "model", "--temperature", "0.7"],
+            vec!["mx", "gen", "--model", "model", "--seed", "9"],
+            vec!["mx", "gen", "--model", "model", "--sample", "--seed", "9"],
+            vec![
+                "mx",
+                "gen",
+                "--model",
+                "model",
+                "--sample",
+                "--temperature",
+                "0.7",
+            ],
+            vec![
+                "mx",
+                "gen",
+                "--model",
+                "model",
+                "--sample",
+                "--temperature",
+                "0",
+                "--seed",
+                "9",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(arguments).is_err(),
+                "incomplete or invalid sampled-policy arguments must fail"
+            );
+        }
         for flag in ["--verbose", "--debug", "-v"] {
             let cli = Cli::try_parse_from(["mx", "gen", "--model", "model", flag])
                 .expect("generation diagnostic verbosity spelling");
@@ -1047,7 +1161,11 @@ mod tests {
                 super::Command::GenerateQwenMetal { verbose: true, .. }
             ));
         }
+    }
 
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qwen_generation_help_describes_the_diagnostic_scope() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("generate-qwen-metal")
@@ -1080,6 +1198,27 @@ mod tests {
             super::Command::GenerateQwenMetal { json_schema: Some(path), verbose: true, preview: true, .. }
             if path == std::path::Path::new("schema.json")
         ));
+    }
+
+    #[cfg(all(feature = "metal", feature = "structured-output"))]
+    #[test]
+    fn sampled_generation_rejects_a_json_schema_before_runtime() {
+        assert!(
+            Cli::try_parse_from([
+                "mx",
+                "gen",
+                "--model",
+                "model",
+                "--sample",
+                "--temperature",
+                "1",
+                "--seed",
+                "3",
+                "--json-schema",
+                "schema.json",
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(feature = "metal")]
