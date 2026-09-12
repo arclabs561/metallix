@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core"]
+metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers"]
 structured-output = ["dep:engine", "engine/structured-output"]
 
 [dependencies]
@@ -29,6 +29,7 @@ qwen = { path = "../models/qwen" }
 engine = { path = "../engine", optional = true }
 rand_chacha = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 
 [lints]
 workspace = true

@@ -35,6 +35,7 @@ pub(crate) fn render(report: &Value, color: bool) -> String {
 
     render_timing_summary(&mut output, report);
     render_constraint_preview(&mut output, report);
+    render_cache_summary(&mut output, report);
     render_logprob_preview(&mut output, report, color);
     output
 }
@@ -79,6 +80,11 @@ fn render_constraint_preview(output: &mut String, report: &Value) {
         line(output, "constraint_status", "not_requested");
     }
 
+    if let Some(text) = report.get("generated_text").and_then(Value::as_str) {
+        line(output, "output_text", &sanitize_terminal_text(text));
+        return;
+    }
+
     let ids = generated_ids(report);
     output.push_str("raw_token_ids: ");
     if ids.is_empty() {
@@ -87,6 +93,25 @@ fn render_constraint_preview(output: &mut String, report: &Value) {
         output.push_str(&ids.join(","));
         output.push('\n');
     }
+}
+
+fn render_cache_summary(output: &mut String, report: &Value) {
+    let Some(comparisons) = report.get("cache_comparisons").and_then(Value::as_array) else {
+        return;
+    };
+    if comparisons.is_empty() {
+        return;
+    }
+    let passed = comparisons
+        .iter()
+        .filter(|comparison| comparison.get("passed").and_then(Value::as_bool) == Some(true))
+        .count();
+    writeln!(
+        output,
+        "cache_checks: {passed}/{} passed",
+        comparisons.len()
+    )
+    .expect("writing to a String cannot fail");
 }
 
 fn render_logprob_preview(output: &mut String, report: &Value, color: bool) {
@@ -165,6 +190,7 @@ fn report_number(report: &Value, field: &str) -> Option<f64> {
 
 fn format_number(value: Option<f64>) -> String {
     match value.filter(|value| value.is_finite()) {
+        Some(0.0) => String::from("0.000"),
         Some(value) => format!("{value:.3}"),
         None => String::from("unavailable"),
     }
@@ -324,6 +350,34 @@ mod tests {
 
         assert!(preview.contains("raw_token_ids: 7,8"));
         assert!(!preview.contains("output_text:"));
+    }
+
+    #[test]
+    fn plain_generated_text_is_visible_and_terminal_safe() {
+        let preview = render(
+            &json!({"generated_text": "Hello\nworld\u{1b}[31m", "generated_ids": [7, 8]}),
+            false,
+        );
+        assert!(preview.contains("output_text: Hello\\u{000A}world\\u{001B}[31m"));
+        assert!(!preview.contains("raw_token_ids:"));
+        assert!(!preview.contains('\x1b'));
+    }
+
+    #[test]
+    fn cache_summary_requires_explicit_passes() {
+        let preview = render(
+            &json!({"cache_comparisons": [{"passed": true}, {"passed": false}, {}]}),
+            false,
+        );
+        assert!(preview.contains("cache_checks: 1/3 passed"));
+        assert!(!render(&json!({"cache_comparisons": []}), false).contains("cache_checks:"));
+    }
+
+    #[test]
+    fn no_decode_steps_display_zero_not_negative_zero() {
+        let preview = render(&json!({"decode_ms": []}), false);
+        assert!(preview.contains("decode_total=0.000 decode_steps=0"));
+        assert!(!preview.contains("-0.000"));
     }
 
     #[test]

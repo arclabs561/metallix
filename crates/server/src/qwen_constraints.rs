@@ -9,6 +9,28 @@ use sha2::{Digest, Sha256};
 const MAX_SCHEMA_BYTES: usize = 32 * 1024;
 const MAX_TOKENIZER_BYTES: usize = 64 * 1024 * 1024;
 
+/// Explicit local schema input; both forms share compilation and validation.
+#[derive(Clone, Copy)]
+pub(crate) enum SchemaSource<'a> {
+    File(&'a Path),
+    Inline(&'a str),
+}
+
+impl SchemaSource<'_> {
+    fn read(self) -> Result<Value, Box<dyn std::error::Error>> {
+        match self {
+            Self::File(path) => read_json(path, MAX_SCHEMA_BYTES),
+            Self::Inline(text) => {
+                if text.len() > MAX_SCHEMA_BYTES {
+                    return Err("inline JSON schema exceeds its 32 KiB byte limit".into());
+                }
+                serde_json::from_str(text)
+                    .map_err(|_| "inline JSON schema is not valid JSON".into())
+            }
+        }
+    }
+}
+
 pub(crate) struct ConstraintRun {
     session: JsonConstraintSession,
     setup_ms: f64,
@@ -21,10 +43,10 @@ pub(crate) struct ConstraintRun {
 impl ConstraintRun {
     pub(crate) fn load(
         model: &Path,
-        schema_path: &Path,
+        schema_source: SchemaSource<'_>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let started = Instant::now();
-        let schema = read_json(schema_path, MAX_SCHEMA_BYTES)?;
+        let schema = schema_source.read()?;
         let config = read_json(&model.join("config.json"), MAX_SCHEMA_BYTES)?;
         let eos = config["eos_token_id"]
             .as_u64()
@@ -208,4 +230,55 @@ fn read_json(path: &Path, maximum: usize) -> Result<Value, Box<dyn std::error::E
         return Err("constraint input exceeds its byte limit".into());
     }
     serde_json::from_slice(&bytes).map_err(|_| "constraint input is not valid JSON".into())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::{MAX_SCHEMA_BYTES, SchemaSource};
+    use serde_json::json;
+
+    #[test]
+    fn inline_schema_keeps_its_constraints() {
+        let schema = SchemaSource::Inline(r#"{"type":"string","enum":["ready","waiting"]}"#)
+            .read()
+            .unwrap();
+        assert_eq!(
+            schema,
+            json!({"type": "string", "enum": ["ready", "waiting"]})
+        );
+        assert_eq!(SchemaSource::Inline("false").read().unwrap(), json!(false));
+    }
+
+    #[test]
+    fn file_and_inline_schema_have_identical_semantics() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/constraints/record.json");
+        let file = SchemaSource::File(&path).read().unwrap();
+        let inline =
+            SchemaSource::Inline(include_str!("../../../fixtures/constraints/record.json"))
+                .read()
+                .unwrap();
+        assert_eq!(file, inline);
+        assert_eq!(file["additionalProperties"], json!(false));
+        assert_eq!(file["required"], json!(["status", "count"]));
+    }
+
+    #[test]
+    fn inline_schema_rejects_invalid_and_oversized_inputs_without_echoing_them() {
+        let error = SchemaSource::Inline("private invalid text")
+            .read()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "inline JSON schema is not valid JSON");
+        let oversized = " ".repeat(MAX_SCHEMA_BYTES + 1);
+        assert!(
+            SchemaSource::Inline(&oversized)
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("32 KiB")
+        );
+        let exact = format!("{}true", " ".repeat(MAX_SCHEMA_BYTES - 4));
+        assert_eq!(SchemaSource::Inline(&exact).read().unwrap(), json!(true));
+    }
 }

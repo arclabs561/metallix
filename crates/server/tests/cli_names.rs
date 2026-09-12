@@ -24,3 +24,50 @@ fn both_names_share_commands_and_report_the_invoked_name() {
         );
     }
 }
+
+#[cfg(feature = "metal")]
+#[test]
+fn prompt_and_raw_ids_conflict_before_model_loading() {
+    for binary in [env!("CARGO_BIN_EXE_metallix"), env!("CARGO_BIN_EXE_mx")] {
+        let output = Command::new(binary)
+            .args([
+                "gen",
+                "--model",
+                "/no-model-needed",
+                "--prompt",
+                "Hello",
+                "--input-ids",
+                "1,2,3",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("cannot be used with"));
+        assert!(error.contains("--prompt"));
+        assert!(error.contains("--input-ids"));
+    }
+}
+
+#[cfg(all(feature = "metal", feature = "structured-output"))]
+#[test]
+fn inline_and_file_schema_conflict_before_model_loading() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mx"))
+        .args([
+            "gen",
+            "--model",
+            "/no-model-needed",
+            "--json-schema",
+            "schema.json",
+            "--json-schema-inline",
+            r#"{"type":"string"}"#,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("cannot be used with"));
+    assert!(error.contains("--json-schema-inline"));
+}

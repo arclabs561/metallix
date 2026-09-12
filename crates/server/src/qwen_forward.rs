@@ -3,7 +3,7 @@
 use std::{fs, path::Path, process::ExitCode, time::Instant};
 
 #[cfg(feature = "structured-output")]
-use crate::qwen_constraints::ConstraintRun;
+use crate::qwen_constraints::{ConstraintRun, SchemaSource};
 use engine::sampling::sample_categorical;
 use qwen::metal::Qwen3MlxWeights;
 use rand_chacha::ChaCha8Rng;
@@ -54,11 +54,13 @@ impl GenerationConfig {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct GenerationDiagnostics {
+pub(crate) struct GenerationDiagnostics<'a> {
     pub(crate) verbose: bool,
     pub(crate) logprobs: bool,
     pub(crate) preview: bool,
     pub(crate) sampling: Option<SamplingConfiguration>,
+    /// Optional decoder for text in the output receipt; execution still uses IDs.
+    pub(crate) tokenizer: Option<&'a crate::qwen_tokenizer::QwenTokenizer>,
 }
 
 /// The explicit request settings for a reproducible categorical policy.
@@ -305,8 +307,8 @@ pub(crate) fn generate(
     max_tokens: u32,
     verify_cache: bool,
     memory: GenerationMemoryConfig,
-    diagnostics: GenerationDiagnostics,
-    #[cfg(feature = "structured-output")] json_schema: Option<&Path>,
+    diagnostics: GenerationDiagnostics<'_>,
+    #[cfg(feature = "structured-output")] schema_source: Option<SchemaSource<'_>>,
 ) -> ExitCode {
     match generate_inner(
         model,
@@ -316,7 +318,7 @@ pub(crate) fn generate(
         memory,
         diagnostics,
         #[cfg(feature = "structured-output")]
-        json_schema,
+        schema_source,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -336,14 +338,15 @@ fn generate_inner(
     max_tokens: u32,
     verify_cache: bool,
     memory: GenerationMemoryConfig,
-    diagnostics: GenerationDiagnostics,
-    #[cfg(feature = "structured-output")] json_schema: Option<&Path>,
+    diagnostics: GenerationDiagnostics<'_>,
+    #[cfg(feature = "structured-output")] schema_source: Option<SchemaSource<'_>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let GenerationDiagnostics {
         verbose,
         logprobs,
         preview,
         sampling: sampling_configuration,
+        tokenizer,
     } = diagnostics;
     if input_ids.len().saturating_add(max_tokens as usize) > qwen::forward::MAX_DENSE_DEBUG_TOKENS {
         return Err("prompt plus generation budget exceeds diagnostic context limit".into());
@@ -356,9 +359,12 @@ fn generate_inner(
     let raw = fs::read_to_string(model.join("config.json"))?;
     let generation: GenerationConfig = serde_json::from_str(&raw)?;
     generation.validate(input_ids, max_tokens)?;
+    if let Some(tokenizer) = tokenizer {
+        tokenizer.check_model_vocabulary(generation.vocab_size, generation.eos_token_id)?;
+    }
     #[cfg(feature = "structured-output")]
-    let mut constraint = json_schema
-        .map(|path| crate::qwen_constraints::ConstraintRun::load(model, path))
+    let mut constraint = schema_source
+        .map(|source| crate::qwen_constraints::ConstraintRun::load(model, source))
         .transpose()?;
     let started = Instant::now();
     let resident_weights = if streamed.is_none() {
@@ -527,6 +533,9 @@ fn generate_inner(
     "cache_comparisons": comparisons,
     "scope": "single sequence; contiguous KV; first prefill not warmed; verification excluded from timed regions but may warm execution"
     });
+    if let Some(tokenizer) = tokenizer {
+        report["generated_text"] = json!(tokenizer.decode_generated(&generated)?);
+    }
     if let Some(plan) = streamed {
         report["operation"] = json!(if sampled {
             "qwen3_sampled_streamed_generation"

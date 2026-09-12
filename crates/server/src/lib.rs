@@ -9,6 +9,8 @@ mod qwen_constraints;
 #[cfg(feature = "metal")]
 mod qwen_forward;
 #[cfg(feature = "metal")]
+mod qwen_tokenizer;
+#[cfg(feature = "metal")]
 mod v41_indexer;
 #[cfg(feature = "metal")]
 mod v41_rotary;
@@ -27,7 +29,7 @@ Scope:
   No HTTP serving is implemented.
   Inspect commands read model configuration or checkpoint headers; they do not load weights.
   Metal commands require an Apple-Silicon build with --features metal.
-  Qwen forward and generate use a local --model directory, raw token IDs, and one sequence."
+  Qwen forward uses raw token IDs; generate also accepts a local-tokenizer plain-text prompt for one sequence."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -57,6 +59,29 @@ const fn generation_max_tokens(mode: GenerationMemoryMode, requested: Option<u32
             // total-context envelope for its default three-token prompt.
             GenerationMemoryMode::Streamed => 4,
         },
+    }
+}
+
+#[cfg(feature = "metal")]
+enum GenerationInput {
+    RawIds(Vec<i32>),
+    Prompt(String),
+}
+
+/// Keeps the existing raw-ID diagnostic default while making text input an
+/// explicit, tokenizer-backed request.
+#[cfg(feature = "metal")]
+fn generation_input(
+    input_ids: Option<Vec<i32>>,
+    prompt: Option<String>,
+) -> Result<GenerationInput, String> {
+    match (input_ids, prompt) {
+        (Some(input_ids), None) => Ok(GenerationInput::RawIds(input_ids)),
+        (None, Some(prompt)) => Ok(GenerationInput::Prompt(prompt)),
+        (None, None) => Ok(GenerationInput::RawIds(vec![1, 2, 3])),
+        (Some(_), Some(_)) => Err(String::from(
+            "--input-ids and --prompt cannot be used together",
+        )),
     }
 }
 
@@ -118,14 +143,18 @@ enum Command {
         #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=100))]
         repeats: u32,
     },
-    /// Generate Qwen3 raw token IDs with per-sequence KV reuse on Metal.
+    /// Generate one Qwen3 sequence with per-sequence KV reuse on Metal.
     #[cfg(feature = "metal")]
     #[command(visible_alias = "gen")]
     GenerateQwenMetal {
         #[arg(long)]
         model: PathBuf,
-        #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
-        input_ids: Vec<i32>,
+        /// Comma-separated raw token IDs; defaults to 1,2,3 when --prompt is absent.
+        #[arg(long, value_delimiter = ',', conflicts_with = "prompt")]
+        input_ids: Option<Vec<i32>>,
+        /// Plain-text prompt (at most 1 MiB), encoded by local tokenizer.json without a chat template or special tokens.
+        #[arg(long, conflicts_with = "input_ids")]
+        prompt: Option<String>,
         /// Generated-token limit; default is 32 resident or 4 streamed. Streamed prompt plus limit must fit 32.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
         max_tokens: Option<u32>,
@@ -159,13 +188,17 @@ enum Command {
         /// Deterministic categorical-sampling seed; requires --sample.
         #[arg(long, requires = "sample")]
         seed: Option<u64>,
-        /// Render a bounded stderr summary; decoded text only with --json-schema, otherwise raw IDs.
+        /// Render a bounded stderr summary; decoded text for --prompt or schema output, otherwise raw IDs.
         #[arg(long)]
         preview: bool,
         /// Constrain generated JSON using a local schema (32 KiB maximum).
         #[cfg(feature = "structured-output")]
         #[arg(long)]
         json_schema: Option<PathBuf>,
+        /// Constrain generated JSON using inline JSON schema text (32 KiB maximum).
+        #[cfg(feature = "structured-output")]
+        #[arg(long, conflicts_with = "json_schema")]
+        json_schema_inline: Option<String>,
     },
     /// Run and time the complete uncached Qwen3 decoder on raw token IDs.
     #[cfg(feature = "metal")]
@@ -355,6 +388,7 @@ pub fn run() -> ExitCode {
         Command::GenerateQwenMetal {
             model,
             input_ids,
+            prompt,
             max_tokens,
             memory_mode,
             max_weight_bytes,
@@ -369,8 +403,34 @@ pub fn run() -> ExitCode {
             preview,
             #[cfg(feature = "structured-output")]
             json_schema,
+            #[cfg(feature = "structured-output")]
+            json_schema_inline,
         } => {
             let max_tokens = generation_max_tokens(memory_mode, max_tokens);
+            let (input_ids, tokenizer) = match generation_input(input_ids, prompt) {
+                Ok(GenerationInput::RawIds(input_ids)) => (input_ids, None),
+                Ok(GenerationInput::Prompt(prompt)) => {
+                    let tokenizer = match qwen_tokenizer::QwenTokenizer::load(&model) {
+                        Ok(tokenizer) => tokenizer,
+                        Err(error) => {
+                            eprintln!("Qwen prompt failed: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    let input_ids = match tokenizer.encode_prompt(&prompt) {
+                        Ok(input_ids) => input_ids,
+                        Err(error) => {
+                            eprintln!("Qwen prompt failed: {error}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    (input_ids, Some(tokenizer))
+                }
+                Err(error) => {
+                    eprintln!("Qwen prompt failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let sampling = match sampling_configuration(sample, temperature, seed) {
                 Ok(sampling) => sampling,
                 Err(error) => {
@@ -399,13 +459,24 @@ pub fn run() -> ExitCode {
                     tile_rows: tile_rows.map(|rows| rows as usize),
                 },
                 qwen_forward::GenerationDiagnostics {
+                    tokenizer: tokenizer.as_ref(),
                     verbose,
                     logprobs,
                     preview,
                     sampling,
                 },
                 #[cfg(feature = "structured-output")]
-                json_schema.as_deref(),
+                match (json_schema.as_deref(), json_schema_inline.as_deref()) {
+                    (Some(path), None) => Some(qwen_constraints::SchemaSource::File(path)),
+                    (None, Some(schema)) => Some(qwen_constraints::SchemaSource::Inline(schema)),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => {
+                        eprintln!(
+                            "Qwen generation failed: --json-schema and --json-schema-inline cannot be used together"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                },
             )
         }
         #[cfg(feature = "metal")]
@@ -1036,7 +1107,8 @@ mod tests {
         assert!(matches!(
             default.command,
             super::Command::GenerateQwenMetal {
-                input_ids,
+                input_ids: None,
+                prompt: None,
                 max_tokens: None,
                 memory_mode: super::GenerationMemoryMode::Resident,
                 max_weight_bytes: None,
@@ -1050,8 +1122,37 @@ mod tests {
                 seed: None,
                 preview: false,
                 ..
-            } if input_ids == [1, 2, 3]
+            }
         ));
+        assert!(matches!(
+            super::generation_input(None, None),
+            Ok(super::GenerationInput::RawIds(input_ids)) if input_ids == [1, 2, 3]
+        ));
+
+        let prompt =
+            Cli::try_parse_from(["mx", "gen", "--model", "model", "--prompt", "plain prompt"])
+                .expect("plain prompt generation");
+        assert!(matches!(
+            prompt.command,
+            super::Command::GenerateQwenMetal {
+                input_ids: None,
+                prompt: Some(prompt),
+                ..
+            } if prompt == "plain prompt"
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "mx",
+                "gen",
+                "--model",
+                "model",
+                "--input-ids",
+                "1,2,3",
+                "--prompt",
+                "plain prompt",
+            ])
+            .is_err()
+        );
 
         let streamed = Cli::try_parse_from([
             "mx",
@@ -1174,8 +1275,10 @@ mod tests {
         let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(normalized_help.contains("streamed mode also adds phase profiles to JSON"));
         assert!(normalized_help.contains("does not change greedy selection"));
+        assert!(normalized_help.contains("without a chat template or special tokens"));
         assert!(
-            normalized_help.contains("decoded text only with --json-schema, otherwise raw IDs")
+            normalized_help
+                .contains("decoded text for --prompt or schema output, otherwise raw IDs")
         );
     }
 
@@ -1194,9 +1297,36 @@ mod tests {
         ])
         .expect("constrained generation arguments");
         assert!(matches!(cli.command,
-            super::Command::GenerateQwenMetal { json_schema: Some(path), verbose: true, preview: true, .. }
+            super::Command::GenerateQwenMetal { json_schema: Some(path), json_schema_inline: None, verbose: true, preview: true, .. }
             if path == std::path::Path::new("schema.json")
         ));
+
+        let inline = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--json-schema-inline",
+            r#"{"type":"object"}"#,
+        ])
+        .expect("inline constrained generation arguments");
+        assert!(matches!(inline.command,
+            super::Command::GenerateQwenMetal { json_schema: None, json_schema_inline: Some(schema), .. }
+            if schema == r#"{"type":"object"}"#
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "mx",
+                "gen",
+                "--model",
+                "model",
+                "--json-schema",
+                "schema.json",
+                "--json-schema-inline",
+                r#"{"type":"object"}"#,
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(all(feature = "metal", feature = "structured-output"))]
@@ -1560,13 +1690,14 @@ mod tests {
 
     #[test]
     fn root_help_explains_the_current_scope() {
-        let help = root_help();
+        let help = root_help().split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(help.contains("Inspect model files and run experimental Metal inference"));
         assert!(help.contains("No HTTP serving is implemented."));
         assert!(help.contains("Inspect commands read model configuration or checkpoint headers"));
         assert!(help.contains("--features metal"));
-        assert!(help.contains("raw token IDs, and one sequence"));
+        assert!(help.contains("Qwen forward uses raw token IDs"));
+        assert!(help.contains("plain-text prompt for one sequence"));
         assert!(help.contains("inspect-v41"));
         assert!(help.contains("inspect-qwen"));
     }
