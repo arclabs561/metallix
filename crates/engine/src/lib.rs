@@ -6,6 +6,7 @@ pub mod benchmark;
 pub mod constraint;
 pub mod kv;
 pub mod lifecycle;
+pub mod sampling;
 
 use std::num::NonZeroU32;
 
