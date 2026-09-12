@@ -614,6 +614,27 @@ Executable SHA-256 identities (same input hashes as above):
 - Rejected: `8c4191b9d69676aa69c7ec70acd21f878c24f0302a271b8649271524a394b078`.
 - Kept: `213d1f4a6fbe50b892f1de90efa994e8eba22d5e9fe80f2e02f3205b5717436a`.
 
+## V4.1 index placement
+
+`V41SafetensorsIndex` now retains tensor-to-shard assignments for exact lookup
+and deterministic iteration. Duplicate decoded tensor names are rejected,
+including identical assignments and alternate JSON escape spellings. Existing
+shard enumeration and tensor counts are unchanged. This is not a tensor-header
+reader: payload offsets, dtype, shape and scale associations remain unverified.
+
+The synthetic `checkpoint_index` benchmark constructs 96,085 tensor entries
+across 48 shards. `cargo bench -p deepseek --bench checkpoint_index` measured
+32.24 ms median across 100 iterations on M3 Max, macOS 26.6.2,
+Rust 1.98.0 (Homebrew), release profile; range
+30.82–38.67 ms. JSON construction is outside the measured function; parsing,
+validation, map retention and result destruction are inside. This is a single
+local run, not a before/after speedup or an SSD measurement. Receipt:
+`artifacts/bench-v41-mapping.log`.
+Benchmark executable SHA-256:
+`d633417e1a63a07e7620fbc4dbeb0ccbb408547dfca6119c20d226df7780ccfc`.
+
+Scalar FP4/FP8 expansion is a separate [format gate](../research/quantization-precision.md#scalar-decoding-gate).
+
 ## V4.1 initial dimensions and live cache sources
 
 At `e7fbd92`, [`V41ExecutionShape`](../../crates/models/deepseek/src/lib.rs)

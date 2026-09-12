@@ -5,6 +5,7 @@ pub mod csa2;
 #[cfg(feature = "metal")]
 pub mod indexer;
 pub mod manifest;
+pub mod precision;
 pub mod rotary;
 pub mod selection;
 

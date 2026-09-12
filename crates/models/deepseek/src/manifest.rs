@@ -85,6 +85,7 @@ pub struct V41SafetensorsIndex {
     total_bytes: NonZeroU64,
     tensor_count: usize,
     shard_paths: Vec<String>,
+    weight_map: BTreeMap<String, String>,
 }
 
 impl V41SafetensorsIndex {
@@ -120,6 +121,7 @@ impl V41SafetensorsIndex {
             total_bytes,
             tensor_count: index.weight_map.len(),
             shard_paths: shard_paths.into_iter().collect(),
+            weight_map: index.weight_map,
         })
     }
 
@@ -139,6 +141,23 @@ impl V41SafetensorsIndex {
     #[must_use]
     pub fn shard_paths(&self) -> &[String] {
         &self.shard_paths
+    }
+
+    /// Returns the shard assigned to an exact tensor name, or `None` if absent.
+    ///
+    /// This is index placement only, not proof that the shard contains the
+    /// tensor or that its header, dtype, shape, or payload is valid.
+    #[must_use]
+    pub fn shard_for_tensor(&self, tensor: &str) -> Option<&str> {
+        self.weight_map.get(tensor).map(String::as_str)
+    }
+
+    /// Iterates tensor names and assigned shards in tensor-name order.
+    #[must_use]
+    pub fn tensor_shards(&self) -> impl ExactSizeIterator<Item = (&str, &str)> + '_ {
+        self.weight_map
+            .iter()
+            .map(|(tensor, shard)| (tensor.as_str(), shard.as_str()))
     }
 }
 
@@ -193,7 +212,42 @@ fn is_safe_artifact_path(path: &str) -> bool {
 #[derive(Debug, Deserialize)]
 struct RawSafetensorsIndex {
     metadata: RawSafetensorsMetadata,
+    #[serde(deserialize_with = "unique_weight_map")]
     weight_map: BTreeMap<String, String>,
+}
+
+// Check decoded keys before insertion: alternate JSON escape spellings must
+// not allow an ambiguous tensor assignment to silently replace an earlier one.
+fn unique_weight_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct WeightMapVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for WeightMapVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a tensor-to-shard map with unique tensor names")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut weights = BTreeMap::new();
+            while let Some(tensor) = map.next_key::<String>()? {
+                if weights.contains_key(&tensor) {
+                    return Err(serde::de::Error::custom(
+                        "duplicate tensor name in weight_map",
+                    ));
+                }
+                weights.insert(tensor, map.next_value::<String>()?);
+            }
+            Ok(weights)
+        }
+    }
+
+    deserializer.deserialize_map(WeightMapVisitor)
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,6 +386,21 @@ mod tests {
         assert_eq!(index.total_bytes().get(), 96);
         assert_eq!(index.tensor_count(), 3);
         assert_eq!(
+            index.shard_for_tensor("layer.1"),
+            Some("model-00002.safetensors")
+        );
+        assert_eq!(index.shard_for_tensor("layer.unknown"), None);
+        assert_eq!(index.shard_for_tensor(" layer.1"), None);
+        assert_eq!(index.tensor_shards().len(), index.tensor_count());
+        assert_eq!(
+            index.tensor_shards().collect::<Vec<_>>(),
+            [
+                ("layer.0", "model-00001.safetensors"),
+                ("layer.1", "model-00002.safetensors"),
+                ("layer.2", "model-00002.safetensors"),
+            ]
+        );
+        assert_eq!(
             index.shard_paths(),
             ["model-00001.safetensors", "model-00002.safetensors"]
         );
@@ -347,5 +416,35 @@ mod tests {
             V41SafetensorsIndex::parse(r#"{"metadata":{"total_size":1},"weight_map":{}}"#),
             Err(CheckpointManifestError::EmptyWeightMap)
         ));
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_assignments_including_decoded_escapes() {
+        for mapping in [
+            r#""layer.0":"a", "layer.0":"b""#,
+            r#""layer.0":"a", "layer.0":"a""#,
+            r#""layer.0":"a", "layer.\u0030":"b""#,
+            // An unsafe first assignment must not disappear behind a safe one.
+            r#""layer.0":"../bad", "layer.0":"safe""#,
+        ] {
+            let json = format!(r#"{{"metadata":{{"total_size":1}},"weight_map":{{{mapping}}}}}"#);
+            let error = V41SafetensorsIndex::parse(&json).expect_err("ambiguous index");
+            assert!(matches!(error, CheckpointManifestError::IndexJson(_)));
+            assert!(error.to_string().contains("duplicate tensor name"));
+        }
+    }
+
+    #[test]
+    fn mapping_is_independent_of_json_order_and_owned_after_parse() {
+        let first =
+            String::from(r#"{"metadata":{"total_size":2},"weight_map":{"b":"two","a":"one"}}"#);
+        let index = V41SafetensorsIndex::parse(&first).expect("valid index");
+        drop(first);
+        let reordered = V41SafetensorsIndex::parse(
+            r#"{"weight_map":{"a":"one","b":"two"},"metadata":{"total_size":2}}"#,
+        )
+        .expect("valid reordered index");
+        assert_eq!(index, reordered);
+        assert_eq!(index.shard_for_tensor("b"), Some("two"));
     }
 }

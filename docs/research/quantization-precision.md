@@ -31,6 +31,25 @@ blocks plus FP4 experts; actual tensor metadata must identify the decoder. The
 report separately specifies global-KV FP4. Neither fact proves an on-disk
 expert representation until a tensor manifest is inspected.
 
+## Scalar decoding gate
+
+`deepseek::precision` now expands E2M1, E4M3FN and E8M0 scalar codes to FP32.
+Tests cover every encoding, signed zeros, subnormals, NaNs, and rejection of
+non-nibble E2M1 inputs. They use scalar equations and hand vectors, not an
+upstream executable oracle or checkpoint slices.
+
+Encoding authority: [OCP MX specification v1.0](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf),
+sections 5.3.1, 5.3.3 and 5.4.1 (tables 2, 5, 7; read with sections 5.1–5.4).
+E8M0 byte zero is 2^-127, not zero; byte 255 is NaN. E4M3FN has two NaN
+codes and no infinities. E2M1 has sixteen finite codes including signed zero.
+Section 5.1 explicitly leaves physical block placement unspecified.
+
+The pinned `inference/model.py` above names these scalar formats in `Linear`.
+This gate does **not** establish checkpoint nibble order, tensor offsets,
+scale placement, fused arithmetic, quantization, or full-model execution.
+Next: identify packed layouts from headers and upstream packing code, then
+compare approved real slices before attaching these decoders to a loader.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
