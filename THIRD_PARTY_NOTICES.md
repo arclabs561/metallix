@@ -32,6 +32,9 @@ embedding-table access.
 it does not execute real table lookups or projection weights.
 The scalar BF16 reference in `crates/models/deepseek/src/engram/gate.rs`
 follows that residual expression with supplied preprojected tensors.
+The compressor and block composition captures and tests follow
+`Compressor.forward`, `Block.forward`, the block HC helpers and `RMSNorm.forward`
+at the same revision, with explicitly stubbed projections or sublayers.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 

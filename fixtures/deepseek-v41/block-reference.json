@@ -1,0 +1,389 @@
+{
+  "schema_version": 1,
+  "source": {
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "path": "artifacts/v41-reference-model.py",
+    "symbols": [
+      "Block.forward",
+      "Block.hc_pre",
+      "Block.hc_post",
+      "RMSNorm.forward"
+    ],
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L907"
+  },
+  "receipt": {
+    "device": "cpu",
+    "torch_version": "2.13.0"
+  },
+  "scope": {
+    "included": "two reduced source Block.forward calls with source HC and RMSNorm methods",
+    "excluded": [
+      "real attention",
+      "real MoE/FFN",
+      "HC coefficient projection and Sinkhorn",
+      "checkpoint loading",
+      "multi-token/cache behavior",
+      "Metal execution"
+    ]
+  },
+  "assertions": [
+    "previous FFN pre collapses block 0 attention input",
+    "current attention pre collapses block 0 FFN input",
+    "current FFN pre is returned for block 1 attention input",
+    "attention stub swaps features and FFN stub preserves them"
+  ],
+  "tensors": [
+    {
+      "name": "initial",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "ab80003dba73ba406f978103db448c4256a2e5d63f00b86b779440dee9ac166c",
+      "values": [
+        16384,
+        49024,
+        16576,
+        16448
+      ]
+    },
+    {
+      "name": "previous_ffn_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "ab2a21ab5e1262d555eea5678035e8fe3e76542c6b474cc04a16a39d4aa02645",
+      "values": [
+        1048576000,
+        1056964608
+      ]
+    },
+    {
+      "name": "block0_attn_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "26e84143dee7d5c385ed31d1e933ac71560ea420e10009e7b466c22496efeee5",
+      "values": [
+        1061158912,
+        1040187392
+      ]
+    },
+    {
+      "name": "block0_attn_post",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "b09540ff36f486fafd91acb451c6d92cc0c31ab1e9f4379a9342bc0cc88df1a6",
+      "values": [
+        1065353216,
+        1056964608
+      ]
+    },
+    {
+      "name": "block0_attn_comb",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "a666c95f0822c64e01580063e9bb27c629d4d0534e3163a9611738599f97df2a",
+      "values": [
+        1065353216,
+        0,
+        0,
+        1065353216
+      ]
+    },
+    {
+      "name": "block0_ffn_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "25031e63e329118c4fade586a04f8fa6fe641b515e134b28a5d779a3775ca559",
+      "values": [
+        1059061760,
+        1052770304
+      ]
+    },
+    {
+      "name": "block0_ffn_post",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "73184e666b08050d630aaca717562fdcc9ea7d795382c2b445c328ab9f3993e8",
+      "values": [
+        1061158912,
+        1067450368
+      ]
+    },
+    {
+      "name": "block0_ffn_comb",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "d72fb9fe14d3250816558b2800a2205f395174fe86c62efa3dbbea0e998f802c",
+      "values": [
+        0,
+        1065353216,
+        1065353216,
+        0
+      ]
+    },
+    {
+      "name": "block0_attn_norm_input",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "68a0d1661322bb37cf5fe11462949ae381a06bb8f20fe915be381c74d004037b",
+      "values": [
+        16298,
+        16116
+      ]
+    },
+    {
+      "name": "block0_ffn_norm_input",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "3fec68419cb95554f4792ec4a3b7609dd41b69d55ee5b7fcb2791f157f686e5c",
+      "values": [
+        16303,
+        16059
+      ]
+    },
+    {
+      "name": "block0_output",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "55956dfa6773618427895944c251130bcabd15e32b3d44bb6ee3cf8b630733bc",
+      "values": [
+        16617,
+        16508,
+        16518,
+        16201
+      ]
+    },
+    {
+      "name": "block0_next_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "25031e63e329118c4fade586a04f8fa6fe641b515e134b28a5d779a3775ca559",
+      "values": [
+        1059061760,
+        1052770304
+      ]
+    },
+    {
+      "name": "block1_attn_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "b3f689962d5d23d2c4d34e32885e60cb9af0119e64bbf4ce2446694c45d9cdb9",
+      "values": [
+        1056964608,
+        1056964608
+      ]
+    },
+    {
+      "name": "block1_attn_post",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "80b8fd6d60fa85fd14a38b5295cb92abd80dfec5ca406c9f969609a79d36809d",
+      "values": [
+        1065353216,
+        1065353216
+      ]
+    },
+    {
+      "name": "block1_attn_comb",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "a666c95f0822c64e01580063e9bb27c629d4d0534e3163a9611738599f97df2a",
+      "values": [
+        1065353216,
+        0,
+        0,
+        1065353216
+      ]
+    },
+    {
+      "name": "block1_ffn_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "6516b08abb125e345d30c45505ffa1a6562e15a4bc78e8cda3c23babd2590cb7",
+      "values": [
+        1053609165,
+        1058642330
+      ]
+    },
+    {
+      "name": "block1_ffn_post",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "80b8fd6d60fa85fd14a38b5295cb92abd80dfec5ca406c9f969609a79d36809d",
+      "values": [
+        1065353216,
+        1065353216
+      ]
+    },
+    {
+      "name": "block1_ffn_comb",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "a666c95f0822c64e01580063e9bb27c629d4d0534e3163a9611738599f97df2a",
+      "values": [
+        1065353216,
+        0,
+        0,
+        1065353216
+      ]
+    },
+    {
+      "name": "block1_attn_norm_input",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "3e07e559cfa5ad02507513ff656b53faf4f148d3e555dd2e6e6e1df5d824e16f",
+      "values": [
+        16293,
+        16148
+      ]
+    },
+    {
+      "name": "block1_ffn_norm_input",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "f50b2debfce2061ded9279546b4dfece70be8c8ad34f0342fd86e4ca3f471bdd",
+      "values": [
+        16285,
+        16181
+      ]
+    },
+    {
+      "name": "block1_output",
+      "dtype": "torch.bfloat16",
+      "encoding": "bf16_bits_u16",
+      "shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "sha256_le_bytes": "ee9d97f0c02d27f8bd22aac96478b0e285483e8d077c13ce151f31ec7c984e5e",
+      "values": [
+        16658,
+        16574,
+        16575,
+        16434
+      ]
+    },
+    {
+      "name": "block1_next_pre",
+      "dtype": "torch.float32",
+      "encoding": "f32_bits_u32",
+      "shape": [
+        1,
+        1,
+        2
+      ],
+      "sha256_le_bytes": "6516b08abb125e345d30c45505ffa1a6562e15a4bc78e8cda3c23babd2590cb7",
+      "values": [
+        1053609165,
+        1058642330
+      ]
+    }
+  ]
+}

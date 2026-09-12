@@ -43,6 +43,7 @@ is still pending where the ledger says excerpts or selected sections.
 | Power sampling | [Power-SMC](power-smc.md) | Sequence-level targets, importance weights, EOS and cache ancestry |
 | Quantization | [Quantization and precision](quantization-precision.md) | Exact format decoding versus quality-changing conversion |
 | V4.1 Engram | [Hash and lookup contract](v41-engram.md) | Token normalization, table identity and sequence-boundary state |
+| V4.1 state and ordering | [Compressed KV and block joins](v41-compressor.md) | Partial pooling groups, pre-RoPE index keys and inter-sublayer pre-mix handoff |
 
 Version lookup: consult the Metal chapters' macOS and GPU-family gates before
 using an API. Metal 4 availability does not establish MLX backend support;
