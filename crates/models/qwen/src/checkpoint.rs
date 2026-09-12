@@ -36,8 +36,9 @@ impl Qwen3CheckpointInspection {
     /// Validates a model directory and reads every safetensors header in it.
     ///
     /// The directory must contain a valid `config.json`, at least one regular
-    /// `.safetensors` file, and the dense tensor names required by the Qwen3
-    /// decoder layout. Tensor payload bytes are never read.
+    /// `.safetensors` target (including a symlink to one), and the dense tensor
+    /// names required by the Qwen3 decoder layout. Tensor payload bytes are
+    /// never read.
     ///
     /// # Errors
     ///
@@ -147,6 +148,10 @@ impl Qwen3CheckpointInspection {
     }
 
     /// Returns regular safetensors shard paths in deterministic order.
+    ///
+    /// A returned path may itself be a symlink, but its target was a regular
+    /// file at inspection time. The original path is retained so later
+    /// bounded reads continue to use the model directory's declared layout.
     #[must_use]
     pub fn shards(&self) -> &[PathBuf] {
         &self.shards
@@ -183,17 +188,21 @@ fn discover_shards(model_dir: &Path) -> Result<Vec<PathBuf>, Qwen3CheckpointErro
         let is_safetensors = path
             .extension()
             .is_some_and(|extension| extension == "safetensors");
-        if is_safetensors
-            && entry
-                .file_type()
-                .map_err(|source| Qwen3CheckpointError::FileType {
-                    path: path.clone(),
-                    source,
-                })?
-                .is_file()
-        {
-            shards.push(path);
+        if !is_safetensors {
+            continue;
         }
+        // `DirEntry::file_type` describes the directory entry itself, so it
+        // reports the symlink used by Hugging Face's snapshot cache rather
+        // than its blob target. `metadata` follows that link and lets the
+        // later `File::open`/identity checks retain the same declared path.
+        let metadata = fs::metadata(&path).map_err(|source| Qwen3CheckpointError::FileType {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(Qwen3CheckpointError::NonRegularShard(path));
+        }
+        shards.push(path);
     }
     shards.sort();
     if shards.is_empty() {
@@ -742,14 +751,17 @@ pub enum Qwen3CheckpointError {
     /// One model-directory entry could not be read.
     #[error("could not read a model-directory entry: {0}")]
     DirectoryEntry(std::io::Error),
-    /// A candidate shard's type could not be read.
-    #[error("could not inspect candidate shard {path}: {source}")]
+    /// A safetensors shard target could not be resolved or inspected.
+    #[error("could not resolve safetensors shard target {path}: {source}")]
     FileType {
         /// Candidate path.
         path: PathBuf,
         /// I/O failure.
         source: std::io::Error,
     },
+    /// A safetensors-named entry did not resolve to a regular file.
+    #[error("safetensors shard target is not a regular file: {0}")]
+    NonRegularShard(PathBuf),
     /// The model root contained no regular safetensors shard.
     #[error("Qwen3 model directory has no safetensors shards: {0}")]
     NoSafetensors(PathBuf),
@@ -969,3 +981,81 @@ pub enum Qwen3CheckpointError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod shard_discovery_tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{Qwen3CheckpointError, discover_shards};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct Directory {
+        path: PathBuf,
+    }
+
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "metallix-qwen-shard-discovery-{}-{}",
+                std::process::id(),
+                NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).expect("create shard-discovery fixture");
+            Self { path }
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).expect("remove shard-discovery fixture");
+        }
+    }
+
+    #[test]
+    fn discovers_a_safetensors_symlink_to_a_regular_blob() {
+        let fixture = Directory::new();
+        let blobs = fixture.path.join("blobs");
+        fs::create_dir(&blobs).expect("create blob directory");
+        let target = blobs.join("payload");
+        fs::write(&target, b"not parsed by discovery").expect("write blob target");
+        let shard = fixture.path.join("model-00001.safetensors");
+        std::os::unix::fs::symlink(&target, &shard).expect("link checkpoint shard");
+
+        assert_eq!(
+            discover_shards(&fixture.path).expect("discover linked shard"),
+            vec![shard]
+        );
+    }
+
+    #[test]
+    fn rejects_a_broken_safetensors_symlink_with_its_link_path() {
+        let fixture = Directory::new();
+        let shard = fixture.path.join("model-00001.safetensors");
+        std::os::unix::fs::symlink(fixture.path.join("missing-blob"), &shard)
+            .expect("link missing checkpoint blob");
+
+        assert!(matches!(
+            discover_shards(&fixture.path),
+            Err(Qwen3CheckpointError::FileType { path, .. }) if path == shard
+        ));
+    }
+
+    #[test]
+    fn rejects_a_safetensors_symlink_to_a_directory() {
+        let fixture = Directory::new();
+        let target = fixture.path.join("not-a-file");
+        fs::create_dir(&target).expect("create nonregular target");
+        let shard = fixture.path.join("model-00001.safetensors");
+        std::os::unix::fs::symlink(&target, &shard).expect("link nonregular target");
+
+        assert!(matches!(
+            discover_shards(&fixture.path),
+            Err(Qwen3CheckpointError::NonRegularShard(path)) if path == shard
+        ));
+    }
+}
