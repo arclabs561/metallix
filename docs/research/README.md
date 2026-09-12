@@ -42,6 +42,7 @@ is still pending where the ledger says excerpts or selected sections.
 | Feynman–Kac methods | [Correctors and particle speculation](feynman-kac-steering.md) | Diffusion versus autoregressive state and approximation costs |
 | Power sampling | [Power-SMC](power-smc.md) | Sequence-level targets, importance weights, EOS and cache ancestry |
 | Quantization | [Quantization and precision](quantization-precision.md) | Exact format decoding versus quality-changing conversion |
+| V4.1 Engram | [Hash and lookup contract](v41-engram.md) | Token normalization, table identity and sequence-boundary state |
 
 Version lookup: consult the Metal chapters' macOS and GPU-family gates before
 using an API. Metal 4 availability does not establish MLX backend support;
@@ -102,6 +103,7 @@ The report, configuration, and executable reference use Hub revision
 |---|---|
 | [Technical report](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/DeepSeek_V41_Tech_Report.pdf) | `ba68e2e40408125ae6d2f63a9a241b61c73910691c74ec1a2a7023c851eac08d` |
 | [Inference source](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py) | `4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65` |
+| [Engram hash/layout source](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/inference/engram.py) | `11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897` |
 | [Configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/config.json) | `8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879` |
 
 Report coverage: technical body §§1–6 and appendices A–C; referenced papers
