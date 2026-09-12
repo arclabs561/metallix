@@ -828,8 +828,8 @@ mod tests {
     };
     #[cfg(feature = "structured-output")]
     use engine::constraint::{ConstraintLimits, JsonConstraintSession};
-    #[cfg(feature = "structured-output")]
-    use rand_core::RngCore;
+    use rand_chacha::ChaCha8Rng;
+    use rand_core::{RngCore, SeedableRng};
     #[cfg(feature = "structured-output")]
     use serde_json::json;
 
@@ -867,6 +867,50 @@ mod tests {
         let mut logits = vec![-100.0; CONSTRAINT_TEST_VOCABULARY];
         logits[token_id] = 1.0;
         logits
+    }
+
+    fn independent_uniform(word: u64) -> f64 {
+        const TWO_TO_21: f64 = 2_097_152.0;
+        const TWO_TO_53: f64 = 9_007_199_254_740_992.0;
+        let high = u32::try_from(word >> 32).expect("upper source bits fit u32");
+        let low = u32::try_from((word >> 11) & ((1 << 21) - 1))
+            .expect("lower retained source bits fit u32");
+        (f64::from(high) * TWO_TO_21 + f64::from(low)) / TWO_TO_53
+    }
+
+    fn independently_enumerated_draw(logits: &[f32], temperature: f64, word: u64) -> (i32, f64) {
+        let weights = logits
+            .iter()
+            .map(|&logit| (f64::from(logit) / temperature).exp())
+            .collect::<Vec<_>>();
+        let normalizer = weights.iter().sum::<f64>();
+        let uniform = independent_uniform(word);
+        let target = uniform * normalizer;
+        let mut cumulative = 0.0;
+        for (index, weight) in weights.iter().enumerate() {
+            cumulative += weight;
+            if target < cumulative {
+                return (
+                    i32::try_from(index).expect("small test vocabulary"),
+                    (weight / normalizer).ln(),
+                );
+            }
+        }
+        let index = weights
+            .iter()
+            .rposition(|weight| *weight > 0.0)
+            .expect("finite test logits have positive support");
+        (
+            i32::try_from(index).expect("small test vocabulary"),
+            (weights[index] / normalizer).ln(),
+        )
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "expected {expected}, got {actual}"
+        );
     }
 
     #[test]
@@ -937,6 +981,25 @@ mod tests {
     }
 
     #[test]
+    fn uniform_conversion_maps_every_source_bit_and_extreme_exactly() {
+        for bit in 0_u32..64 {
+            let word = 1_u64 << bit;
+            let expected = if bit < 11 {
+                0.0
+            } else {
+                2.0_f64.powi(i32::try_from(bit).expect("bit fits i32") - 64)
+            };
+            assert_eq!(
+                unit_uniform(word).to_bits(),
+                expected.to_bits(),
+                "bit {bit}"
+            );
+        }
+        assert_eq!(unit_uniform(0).to_bits(), 0.0_f64.to_bits());
+        assert_eq!(unit_uniform(u64::MAX).to_bits(), 0x3fef_ffff_ffff_ffff);
+    }
+
+    #[test]
     fn failed_sampling_does_not_advance_the_seeded_rng() {
         let configuration = SamplingConfiguration {
             seed: 13,
@@ -976,6 +1039,68 @@ mod tests {
             assert!(scored.1.is_some());
             assert!(unscored.1.is_none());
         }
+    }
+
+    #[test]
+    fn seeded_policy_matches_independent_stream_and_enumerated_q_with_or_without_scores() {
+        // This intentionally reuses ChaCha8Rng: it checks this policy's
+        // documented seed consumption and uniform transform, not the RNG
+        // algorithm's implementation.
+        let configuration = SamplingConfiguration {
+            seed: 41,
+            temperature: 0.7,
+        };
+        let logits = [0.0, 1.0, -2.0];
+        let mut expected_rng = ChaCha8Rng::seed_from_u64(configuration.seed);
+        let mut scored = SamplingPolicy::new(configuration, logits.len());
+        let mut unscored = SamplingPolicy::new(configuration, logits.len());
+
+        for _ in 0..8 {
+            let expected = independently_enumerated_draw(
+                &logits,
+                configuration.temperature,
+                expected_rng.next_u64(),
+            );
+            let scored_draw = scored.sample(&logits, true).expect("scored policy draw");
+            let unscored_draw = unscored
+                .sample(&logits, false)
+                .expect("unscored policy draw");
+            assert_eq!(scored_draw.0, expected.0);
+            assert_eq!(unscored_draw.0, expected.0);
+            let score = scored_draw.1.expect("requested score");
+            assert_close(
+                score["sampling_logprob"].as_f64().expect("deployed q"),
+                expected.1,
+            );
+            assert!(unscored_draw.1.is_none());
+        }
+    }
+
+    #[test]
+    fn rejected_policy_draw_preserves_the_next_documented_entropy_word() {
+        let configuration = SamplingConfiguration {
+            seed: 97,
+            temperature: 1.0,
+        };
+        let mut policy = SamplingPolicy::new(configuration, 3);
+        let mut expected_rng = ChaCha8Rng::seed_from_u64(configuration.seed);
+        assert!(policy.sample(&[f32::NAN, 0.0, 1.0], true).is_err());
+
+        let logits = [0.0, 0.0, -20.0];
+        let expected_word = expected_rng.next_u64();
+        assert_eq!(policy.rng.clone().next_u64(), expected_word);
+        let expected =
+            independently_enumerated_draw(&logits, configuration.temperature, expected_word);
+        let actual = policy
+            .sample(&logits, true)
+            .expect("first valid policy draw");
+        assert_eq!(actual.0, expected.0);
+        assert_close(
+            actual.1.expect("requested score")["sampling_logprob"]
+                .as_f64()
+                .expect("deployed q"),
+            expected.1,
+        );
     }
 
     #[cfg(feature = "structured-output")]

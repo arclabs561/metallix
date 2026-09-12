@@ -91,10 +91,13 @@ The tiny row stands in for EOS only numerically; the primitive does not know
 grammar or EOS semantics. This is not a statistical distribution test or an
 oracle for underflowed tails.
 
-The remaining Gate 1 join is the reproducible RNG policy: independently check
-the entropy conversion/stream against those distributions and preserve RNG on
-errors. Existing CLI tests prove bounded replay and rollback, not an independent
-RNG-stream oracle or cross-device/model execution parity.
+The CLI policy tests now join a separately seeded ChaCha8 stream to a direct
+finite-distribution oracle, checking eight scored and unscored draws plus
+rollback after a rejected draw. A separate bit-basis test checks all 64 source
+bits in the 53-bit uniform conversion, including discarded low bits and both
+extrema. These check policy consumption and conversion, not the ChaCha
+algorithm itself, statistical convergence, or cross-device/model parity.
+Run `cargo test -p server --all-features qwen_forward::tests` for this join.
 Run `cargo test -p engine independent_f64_oracle` for the new toy checks.
 The engine tests now cover grammar masks analytically, accepting EOS without
 special-token bytes, and rejected draws/output limits without committed state
