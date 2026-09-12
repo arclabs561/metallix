@@ -38,10 +38,15 @@ published release; reference operators do not imply full-model support.
   against an independent CPU oracle.
 - Metal-feature composition of FP4-prepared index operands, GPU index scores,
   final selection and compressed-vector attention, checked against closed-form
-  scores and output. Index projections remain supplied, not integrated.
+  scores and output. That test supplies post-projection index operands.
+- Synthetic-weight index-key projection and RMSNorm joined with rotary,
+  FP4 preparation and Metal selection. A numerical ordering check detects
+  reading compressed latents after attention has rotated them.
 
 ### Fixed
 
+- New Metal composition tests serialize process-global MLX device use,
+  matching the library tests' guard convention.
 - Qwen checkpoint discovery accepts Hugging Face cache shard symlinks that
   resolve to regular files, while rejecting broken and non-file targets.
 - Generation tokenization disables saved tokenizer padding and truncation,

@@ -141,6 +141,20 @@ operands, candidate filtering or the upstream BF16 score-kernel rounding.
 The same handoff checks a shorter causal prefix selecting position 0 and an
 empty prefix producing a `-1` sentinel and zero attention output.
 
+A further Metal-feature test executes index-key `wk` and `k_norm` using the
+existing BF16 linear and RMSNorm references with synthetic weights, followed
+by key rotation, group-32 FP4 reconstruction, scoring, selection and attention.
+The projection reads a latent tail component whose sign changes under the
+attention rotation: correct pre-rotation inputs yield scores `[-992, 248]`,
+whereas prematurely rotated inputs yield an ambiguous `[248, 248]` cutoff.
+This turns the shared-latent ordering requirement into a numerical check.
+Compressor latents, query heads and projection/norm weights remain synthetic;
+checkpoint loading and the full indexer are not qualified by this test.
+The integration binary serializes its Metal operations using the same
+test-only device guard convention as the library tests. An unguarded parallel
+run crashed, while an explicitly serial run passed. These tests do not qualify
+concurrent MLX requests or solve runtime device ownership for serving.
+
 ```sh
 uv run scripts/v41-compressed-attention-reference.py > artifacts/compressed-attention-reference.json
 cargo test -p deepseek --test fp4_activation rotated_fp4_compressed_keys_feed_sparse_attention_in_source_order

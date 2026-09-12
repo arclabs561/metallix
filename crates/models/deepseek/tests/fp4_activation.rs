@@ -12,6 +12,11 @@ use thiserror::Error;
 
 const MAX_ELEMENTS: usize = 1 << 20;
 
+// This integration binary has its own process; the library's cfg(test) guard
+// is not linked into it. Match the unit-test guard for MLX global device state.
+#[cfg(feature = "metal")]
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Fp4Mode {
     CompressedKv16E4m3,
@@ -513,13 +518,18 @@ fn fixture_floats(fixture: &serde_json::Value, field: &str) -> Vec<f32> {
 
 // Fixed two-key, width-16 composition. This is not a runtime cache API.
 fn rotate_compressed_tails(input: &[u16], frequencies: &[f32]) -> Vec<u16> {
+    rotate_two_row_tails(input, 16, frequencies)
+}
+
+fn rotate_two_row_tails(input: &[u16], width: usize, frequencies: &[f32]) -> Vec<u16> {
     let one = NonZeroUsize::new(1).expect("one");
     let two = NonZeroUsize::new(2).expect("two");
-    assert_eq!(input.len(), 32);
+    assert!(width >= 4);
+    assert_eq!(input.len(), 2 * width);
     assert_eq!(frequencies.len(), 8);
     let mut tail: Vec<f32> = input
-        .chunks_exact(16)
-        .flat_map(|row| row[12..].iter().copied().map(bf16_to_f32))
+        .chunks_exact(width)
+        .flat_map(|row| row[width - 4..].iter().copied().map(bf16_to_f32))
         .collect();
     let frequencies: Vec<_> = frequencies
         .chunks_exact(2)
@@ -533,8 +543,8 @@ fn rotate_compressed_tails(input: &[u16], frequencies: &[f32]) -> Vec<u16> {
     )
     .expect("rotated supplied latent");
     let mut result = input.to_vec();
-    for (row, rotated) in result.chunks_exact_mut(16).zip(tail.chunks_exact(4)) {
-        for (output, &value) in row[12..].iter_mut().zip(rotated) {
+    for (row, rotated) in result.chunks_exact_mut(width).zip(tail.chunks_exact(4)) {
+        for (output, &value) in row[width - 4..].iter_mut().zip(rotated) {
             *output = f32_to_bf16_rne(value);
         }
     }
@@ -639,6 +649,10 @@ fn fp4_index_scores_select_the_compressed_vector_consumed_by_attention() {
     use deepseek::indexer::index_scores_f32;
     use deepseek::selection::select_indices;
 
+    let _guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let mut query = [0x3f80_u16; 64]; // two heads: +1, -1
     query[32..].fill(0xbf80);
     let mut keys = [0x4110_u16; 64]; // two keys: +9, -3
@@ -718,4 +732,113 @@ fn fp4_index_scores_select_the_compressed_vector_consumed_by_attention() {
     let empty = sparse_attention_reference(&[0.0; 16], &cache, &[0.0], &none, 0.25, layout)
         .expect("unreachable keys do not contribute");
     assert!(empty.iter().all(|value| value.to_bits() == 0));
+}
+
+#[cfg(feature = "metal")]
+fn projected_normalized_index_keys(latent: &[u16], frequencies: &[f32]) -> Vec<f32> {
+    use deepseek::norm::rms_norm_bf16_reference;
+    use deepseek::precision::bf16_linear_reference;
+
+    // Every output selects latent column 12, which changes sign under the
+    // fixture's first rotation. This makes premature latent mutation observable.
+    let mut weight = [0_u16; 32 * 16];
+    for row in weight.chunks_exact_mut(16) {
+        row[12] = 0x3f80;
+    }
+    let mut projected = [0; 64];
+    bf16_linear_reference(latent, &weight, 2, 16, 32, &mut projected).expect("index wk projection");
+    let mut normalized = [0; 64];
+    for (row, output) in projected
+        .chunks_exact(32)
+        .zip(normalized.chunks_exact_mut(32))
+    {
+        rms_norm_bf16_reference(row, &[0x4110; 32], 1e-6, output)
+            .expect("index k_norm with learned scale 9");
+    }
+    let rotated = rotate_two_row_tails(&normalized, 32, frequencies);
+    let mut quantized = [0; 64];
+    fp4_activation_reference(&rotated, 2, 32, Fp4Mode::Index32E8m0, &mut quantized)
+        .expect("index key FP4 preparation");
+    quantized.into_iter().map(bf16_to_f32).collect()
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn index_projection_must_read_latents_before_attention_rotates_them() {
+    use deepseek::indexer::index_scores_f32;
+    use deepseek::selection::{SelectionError, select_indices};
+
+    let _guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/compressed-attention-reference.json"
+    ))
+    .expect("compressed latent fixture");
+    let latent = fixture_words(&fixture, "latent_bf16");
+    let frequencies = fixture_floats(&fixture, "frequencies_f32");
+    let keys = projected_normalized_index_keys(&latent, &frequencies);
+    // wk selects +1 and -4; k_norm rounds to +9 and -9. After key RoPE
+    // and scale-4 FP4 reconstruction, row sums are exactly +248 and -248.
+    assert_eq!(
+        keys[..32].iter().sum::<f32>().to_bits(),
+        248.0_f32.to_bits()
+    );
+    assert_eq!(
+        keys[32..].iter().sum::<f32>().to_bits(),
+        (-248.0_f32).to_bits()
+    );
+    let mut query = [1.0_f32; 64];
+    query[32..].fill(-1.0); // supplied, exactly FP4-representable query heads
+    let score = |keys: &[f32]| {
+        index_scores_f32(
+            &query,
+            keys,
+            &[-4.0, 1.0],
+            NonZeroUsize::new(32).expect("index width"),
+        )
+        .expect("Metal index scores")
+    };
+    let scores = score(&keys);
+    assert_eq!(
+        scores
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [-992.0_f32, 248.0].map(f32::to_bits)
+    );
+    let selected = select_indices(&scores, 2, 1, 0).expect("strict cutoff");
+    assert_eq!(selected, [1]);
+    let mutated = rotate_compressed_tails(&latent, &frequencies);
+    let mut cache = [0; 32];
+    fp4_activation_reference(&mutated, 2, 16, Fp4Mode::CompressedKv16E4m3, &mut cache)
+        .expect("attention cache reconstruction");
+    let cache: Vec<_> = cache.into_iter().map(bf16_to_f32).collect();
+    let nz = |value| NonZeroUsize::new(value).expect("fixed dimension");
+    let output = sparse_attention_reference(
+        &[0.0; 16],
+        &cache,
+        &[0.0],
+        &selected,
+        0.25,
+        SparseAttentionLayout::new(nz(1), nz(1), nz(1), nz(16), nz(2), nz(1))
+            .expect("attention layout"),
+    )
+    .expect("projected index keys drive attention selection");
+    for (&actual, &value) in output.iter().zip(&cache[16..]) {
+        assert_eq!(actual.to_bits(), (value * 0.5).to_bits());
+    }
+    let wrong_keys = projected_normalized_index_keys(&mutated, &frequencies);
+    let wrong_scores = score(&wrong_keys);
+    assert_eq!(
+        wrong_scores
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        [248.0_f32, 248.0].map(f32::to_bits)
+    );
+    assert_eq!(
+        select_indices(&wrong_scores, 2, 1, 0),
+        Err(SelectionError::AmbiguousCutoffTie)
+    );
 }
