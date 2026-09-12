@@ -10,6 +10,8 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
+pub mod window;
+
 #[cfg(feature = "metal")]
 mod metal;
 #[cfg(feature = "metal")]
@@ -20,6 +22,9 @@ mod composition_tests;
 
 #[cfg(test)]
 mod preparation_tests;
+
+#[cfg(test)]
+mod window_attention_tests;
 
 /// Validated dense buffers and sparse-index shape for one attention call.
 ///

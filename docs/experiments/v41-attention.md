@@ -36,9 +36,37 @@ before quantization yields a BF16 tail of −0.46875 and 1.75, while deliberatel
 moving quantization before rotation yields −0.45703125 and 1.7109375. Unlike
 the quarter-turn fixture, this case detects that reordering.
 
-These tests do not qualify ring-cache updates, compressed-cache ownership,
+These preparation tests do not qualify ring-cache updates, compressed-cache ownership,
 attention-probability BF16 rounding, output projections, or full-model logits.
 They are software reference compositions, not GPU-cast parity or speed results.
+
+## Raw-window cache reference
+
+[`attention::window`](../../crates/models/deepseek/src/attention/window.rs)
+separates prefill and decode with `WindowStep`. It follows the pinned
+[`get_window_topk_idxs`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L410)
+and [`_window_kv`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L700)
+rules for prepared BF16 values. This is not a request scheduler or a compressed
+cache manager; callers still own sequence continuity and cache lifetime.
+
+Prefill indices address the original input chunk, right-padding early query
+rows with `-1`. Only the last window of input is copied into the ring, at
+absolute token position modulo window size. Decode writes one new token and
+returns physical ring indices, masking slots that have not yet been filled.
+For a four-slot ring:
+
+| Operation | Physical ring values | Attention indices |
+|---|---|---|
+| Prefill tokens 0–5 | `[4, 5, 2, 3]` | Final query: `[2, 3, 4, 5]` into the input chunk |
+| Decode token 6 | `[4, 5, 6, 3]` | `[3, 0, 1, 2]` into the ring |
+| Decode token 7 | `[4, 5, 6, 7]` | `[0, 1, 2, 3]` into the ring |
+
+The helpers bound element counts and validate buffer lengths before modifying
+the ring. Short prefill deliberately leaves unused slots unchanged, matching
+the source; the mask, not clearing, prevents stale values from contributing.
+Separate composition tests feed those indices and BF16 values widened to FP32
+into the semantic attention reference. They do not qualify BF16 attention
+arithmetic, GPU cache storage, compressed-cache sharing, or full-model decoding.
 
 ## Sparse-attention operator
 
