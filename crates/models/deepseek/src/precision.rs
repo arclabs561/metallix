@@ -1,9 +1,13 @@
-//! Exact scalar expansion for the V4.1 reference's narrow floating-point types.
+//! Reference expansion for the V4.1 runtime's narrow floating-point types.
 //!
 //! Encodings follow OCP Microscaling Formats v1.0, sections 5.3 and 5.4.
 //! These are decode-only references, not quantizers or packed tensor loaders.
-//! Nibble order, scale association, block layout and arithmetic rounding remain
-//! separate checkpoint/kernel contracts. NaNs are returned, not sanitized.
+//! Runtime pairs and contiguous 32-element scaled blocks are supported; mapping
+//! checkpoint bytes to that runtime layout remains a separate contract.
+//! Scalar decoders return NaNs; block expansion rejects non-finite results.
+
+mod blocks;
+pub use blocks::{BlockDecodeError, expand_e2m1x2_blocks32};
 
 /// Expands an E2M1 sign/exponent/mantissa nibble, preserving signed zero.
 ///
@@ -14,12 +18,26 @@ pub fn decode_e2m1(nibble: u8) -> Option<f32> {
     if nibble > 0x0f {
         return None;
     }
+    Some(decode_nibble(nibble))
+}
+
+fn decode_nibble(nibble: u8) -> f32 {
     let magnitude = [0.0_f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][usize::from(nibble & 7)];
-    Some(if nibble & 8 == 0 {
+    if nibble & 8 == 0 {
         magnitude
     } else {
         -magnitude
-    })
+    }
+}
+
+/// Expands a `PyTorch` `E2M1x2` runtime byte in logical element order.
+///
+/// The low nibble is the first element, the high nibble the second. This
+/// describes the typed runtime representation, not an uninspected checkpoint.
+/// See [PyTorch's pinned encoding definition](https://github.com/pytorch/pytorch/blob/84e524623ea4754a748936bf1ba6ecaaa92c3ae6/torch/headeronly/util/Float4_e2m1fn_x2.h).
+#[must_use]
+pub fn decode_e2m1x2(byte: u8) -> [f32; 2] {
+    [decode_nibble(byte & 15), decode_nibble(byte >> 4)]
 }
 
 /// Expands E4M3FN to FP32, including signed zero and subnormals.

@@ -243,3 +243,23 @@ These are operator-level parity gates and reference captures. They do not satisf
 gate for downloading the full V4.1 checkpoint, and they are not a performance or
 model-quality result. Next are BF16/FP4 score qualification, Metal selection,
 and sparse attention with the same numerical and masking checks.
+
+## Packed FP4 runtime expansion
+
+`deepseek::precision` expands E2M1x2 bytes in low-nibble-first order and
+contiguous 32-element blocks with one E8M0 scale. The representation follows
+[PyTorch's pinned byte definition](https://github.com/pytorch/pytorch/blob/84e524623ea4754a748936bf1ba6ecaaa92c3ae6/torch/headeronly/util/Float4_e2m1fn_x2.h)
+and the V4.1 reference's
+[linear allocation](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py)
+and [FP4 kernel input layout](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/kernel.py).
+Read coverage is those representation boundaries, not a full checkpoint loader.
+
+`cargo test -p deepseek precision::` covers every packed byte, signed zeros,
+block-scale boundaries, subnormals, and rejection without partial output.
+Expansion allocates nothing; the caller supplies the output buffer. All scales
+and scaled values are checked before writes begin.
+
+This qualifies runtime representation and scalar FP32 multiplication only.
+Safetensors byte layout, loader transforms, row padding, and fused GEMM rounding
+are not established by these tests. It is not a quantizer or a file decoder,
+and there is no performance claim.
