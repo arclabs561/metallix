@@ -190,15 +190,24 @@ This does **not** justify exposing arbitrary user programs or embedding a
 Python-like DSL in Metallix's generation API. The full v2 paper reading and
 its finite-particle caveat remain recorded in [GenLM control](genlm-control.md).
 
-**Next executable experiment, offline only:** implement one private toy
-two-step interpreter in a test/harness. It draws `x ∈ {A,B}` then `y ∈ {0,1}`
+**Implemented offline accounting experiment:**
+[`programmed_target.rs`](../../crates/engine/tests/programmed_target.rs)
+enumerates a private two-step program, not an interpreter API. It draws
+`x ∈ {A,B}` then `y ∈ {0,1}`
 from enumerated base probabilities; applies hard
 `condition(!(x == B && y == 0))`; then soft-observes `true` from a tabulated
-Bernoulli likelihood `r(x,y)`. Give it an alternate full-support proposal `q`
-and record, for every leaf, `log p`, hard indicator, `log r`, `log q`, and
-`log weight`. Direct enumeration must equal the normalized target
-`p(x,y) 1[condition] r(x,y)`; importance averaging must recover its
-unnormalized mass. This proves program-to-potential accounting and distinguishes
+Bernoulli likelihood `r(x,y)`. It uses an alternate full-support proposal `q`
+and records, for every leaf, `log p`, hard indicator, `log r`, `log q`, and
+`log weight`. Direct enumeration checks the target proportional to
+`p(x,y) 1[condition] r(x,y)`; the proposal-weighted sum recovers its
+unnormalized mass. This checks program-to-potential accounting and distinguishes
 hard from soft control without a model, RNG-owned public API, grammar backend,
-or cache fork. Only after it passes does Gate 2's particle oracle earn a real
-sampler integration.
+or cache fork. The leaf target masses are `[0.21, 0.045, 0, 0.288]`, with
+normalizer `0.543`. The nonuniform proposal `[0.25, 0.25, 0.125, 0.375]`
+recovers that mass with correction; omitting correction gives `0.17175`
+and changes the normalized distribution. A separate test exercises the
+production categorical primitive's staged proposal log probabilities.
+
+Run `cargo test -p engine --test programmed_target`. This is a deterministic
+finite-sum identity, not evidence of finite-particle accuracy. EOS trees,
+resampling, ESS, ancestor accounting, and cache replay remain separate gates.
