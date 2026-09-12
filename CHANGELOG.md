@@ -12,6 +12,9 @@ published release; reference operators do not imply full-model support.
   replacements. Synthetic prefill/decode captures include final logits and
   candidate-filter checks; this is not native Rust full-model execution or
   upstream GPU parity.
+- Native FP32 output-head comparison using hidden states and encoded weights
+  from the complete synthetic V4.1 source capture, with a fixed dot-product
+  error bound and wrong-position/vocabulary-order negative controls.
 - Bounded FP32 linear reference with atomic output writes and no BF16
   narrowing. Compressor fixture tests now execute BF16/FP32 projection
   matrices before native pooling and normalization.

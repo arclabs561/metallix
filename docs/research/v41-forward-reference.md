@@ -72,3 +72,25 @@ HC kernel calls are observed without changing the source graph: ten calls per
 forward record their inputs and pre/post/combination coefficients. Finite
 logits, candidate-mask checks and these recorded boundaries are a
 source-execution milestone, not acceptance of the full Rust comparison gate.
+
+## First Rust consumer: the output head
+
+```sh
+uv run scripts/v41-forward-reference.py --output artifacts/v41-forward-reference.json \
+  --head-fixture-output fixtures/deepseek-v41/forward-head-reference.json
+cargo test -p deepseek --test forward_head
+```
+
+The small checked-in subset contains exact BF16 final-normalization outputs,
+FP32 head weights and FP32 logits from all three source calls. Rust executes
+`fp32_linear_reference` using the last prefill position, then both decode
+positions. Negative controls select the wrong prefill position or reverse
+vocabulary rows; neither may satisfy the comparison.
+
+The tolerance is fixed before candidate execution: the sum of two FP32
+dot-product roundoff bounds, each `gamma(2K) * sum(abs(x*w))`, with
+`gamma(n) = n*u/(1-n*u)` and `u = 2^-24`. The bound is evaluated in FP64 with
+a guard for that evaluation's own roundoff. This is input-dependent absolute
+error, not a blanket relative tolerance near cancellation. Finite normal
+arithmetic without underflow/overflow is required. The test qualifies this
+head boundary only; the hidden states still come from the source graph.

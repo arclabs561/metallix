@@ -43,6 +43,7 @@ TRACE_INPUT_IDS = ((0, 1, 2, 3, 4, 5, 6),)
 MAX_HOOK_RECORDS = 96
 SAMPLE_VALUES = 8
 MAX_CAPTURE_BYTES = 16 << 20
+MAX_HEAD_FIXTURE_BYTES = 30 << 10
 
 sys.path.insert(0, str(SCRIPTS))
 import v41_cpu_kernels as kernels
@@ -87,6 +88,13 @@ class SyntheticTokenizer:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def serialized_capture(receipt: dict[str, object]) -> bytes:
+    """Return the canonical complete-capture artifact bytes for its receipt."""
+    return (
+        json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
 
 
 def tensor_record(
@@ -622,15 +630,150 @@ def run_capture() -> dict[str, object]:
     }
 
 
+def _storage_bits(record: dict[str, Any], *, width: int, dtype: str) -> list[int]:
+    """Decode receipt storage to exact scalar bit patterns without float math."""
+    if record.get("dtype") != dtype:
+        raise RuntimeError(
+            f"head fixture expected {dtype} storage, got {record.get('dtype')!r}"
+        )
+    storage_hex = record.get("storage_hex")
+    if not isinstance(storage_hex, str):
+        raise TypeError("head fixture requires complete tensor storage")
+    raw = bytes.fromhex(storage_hex)
+    numel = record.get("numel")
+    if not isinstance(numel, int) or len(raw) != numel * width:
+        raise RuntimeError("head fixture tensor storage length does not match numel")
+    # tensor_record writes native CPU storage.  The resulting integers are
+    # endianness-independent bit patterns, and the fixture pins this capture's
+    # little-endian encoding so a Rust reader never interprets raw bytes.
+    if sys.byteorder != "little":
+        raise RuntimeError("head fixture export requires little-endian CPU storage")
+    return [
+        int.from_bytes(raw[offset : offset + width], byteorder="little")
+        for offset in range(0, len(raw), width)
+    ]
+
+
+def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Select source-produced final-norm inputs and head logits for Rust tests.
+
+    This function only decodes exact receipt storage.  It deliberately performs
+    no head computation, rounding, or expected-value reconstruction.
+    """
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError("head fixture export requires a completed source capture")
+    coverage = receipt.get("coverage_status")
+    if not isinstance(coverage, dict) or coverage.get("pending") != []:
+        raise RuntimeError("head fixture export requires a complete source capture")
+    source = receipt.get("source")
+    encoded = receipt.get("encoded_parameters")
+    steps = receipt.get("steps")
+    manifest_sha = receipt.get("manifest_canonical_sha256")
+    if (
+        not isinstance(source, dict)
+        or not isinstance(encoded, dict)
+        or not isinstance(steps, list)
+        or not isinstance(manifest_sha, str)
+    ):
+        raise TypeError("complete capture has an invalid head-fixture shape")
+    weight = encoded.get("head.weight")
+    if not isinstance(weight, dict):
+        raise TypeError("complete capture did not record head.weight")
+    weight_shape = weight.get("shape")
+    if (
+        not isinstance(weight_shape, list)
+        or len(weight_shape) != 2
+        or any(not isinstance(width, int) or width <= 0 for width in weight_shape)
+    ):
+        raise RuntimeError("head.weight must be a nonempty rank-two tensor")
+
+    cases: list[dict[str, object]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            raise TypeError("complete capture includes an invalid step")
+        start_pos = step.get("start_pos")
+        intermediates = step.get("intermediates")
+        logits = step.get("logits")
+        if not isinstance(start_pos, int) or not isinstance(intermediates, dict):
+            raise TypeError("complete capture step lacks source boundaries")
+        norm = intermediates.get("norm")
+        if not isinstance(norm, dict) or not isinstance(logits, dict):
+            raise TypeError("complete capture step lacks final norm or logits")
+        input_shape = norm.get("shape")
+        logits_shape = logits.get("shape")
+        if (
+            not isinstance(input_shape, list)
+            or len(input_shape) != 3
+            or not isinstance(logits_shape, list)
+            or len(logits_shape) != 2
+        ):
+            raise RuntimeError("head fixture source tensors have unexpected rank")
+        if input_shape[-1] != weight_shape[1] or logits_shape[-1] != weight_shape[0]:
+            raise RuntimeError("head fixture source tensors disagree with head.weight")
+        cases.append(
+            {
+                "start_pos": start_pos,
+                "input_shape": input_shape,
+                "input_bf16": _storage_bits(norm, width=2, dtype="torch.bfloat16"),
+                "logits_shape": logits_shape,
+                "logits_fp32_bits": _storage_bits(
+                    logits, width=4, dtype="torch.float32"
+                ),
+            }
+        )
+    if [case["start_pos"] for case in cases] != [0, 5, 6]:
+        raise RuntimeError("head fixture requires the pinned prefill/decode trace")
+    if cases[0]["input_shape"][1] != 5:
+        raise RuntimeError("head fixture must retain all five prefill norm rows")
+
+    complete_bytes = serialized_capture(receipt)
+    return {
+        "schema_version": 1,
+        "source": {
+            "revision": source.get("revision"),
+            "model_sha256": source.get("model_sha256"),
+            "cpu_backend_sha256": source.get("cpu_backend_sha256"),
+            "complete_capture_sha256": _sha256_bytes(complete_bytes),
+            "manifest_canonical_sha256": manifest_sha,
+        },
+        "weight_shape": weight_shape,
+        "weight_fp32_bits": _storage_bits(weight, width=4, dtype="torch.float32"),
+        "cases": cases,
+        "comparison_policy": {
+            "kind": "two_fp32_dot_error_bounds",
+            "unit_roundoff_exponent": -24,
+            "operation_count_per_dot": 2 * weight_shape[1],
+            "bound": "abs_error <= 2 * gamma(operation_count_per_dot) * sum_i(abs(x_i * w_i))",
+            "gamma": "gamma(n) = n * u / (1 - n * u)",
+            "accumulator": "f64 bound evaluation; compared values are FP32",
+            "assumptions": [
+                "input, weight, and product values are finite normal values",
+                "the FP32 dot product has no underflow or overflow",
+                "input_bf16, weight_fp32_bits, and logits_fp32_bits are exact integer encodings from the source receipt",
+            ],
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output", type=Path, help="write the bounded capture JSON here"
     )
+    parser.add_argument(
+        "--head-fixture-output",
+        type=Path,
+        help=(
+            "write the compact final-norm/FP32-head fixture derived from a "
+            "complete source capture"
+        ),
+    )
     args = parser.parse_args()
     receipt = run_capture()
-    payload = json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False)
-    artifact_bytes = (payload + "\n").encode("utf-8")
+    artifact_bytes = serialized_capture(receipt)
     if len(artifact_bytes) > MAX_CAPTURE_BYTES:
         raise RuntimeError(f"capture exceeds {MAX_CAPTURE_BYTES} byte receipt cap")
     if args.output is not None:
@@ -649,8 +792,37 @@ def main() -> int:
                 sort_keys=True,
             )
         )
-    else:
-        print(payload)
+    if args.head_fixture_output is not None:
+        fixture = head_fixture(receipt)
+        # The public fixture contains exact per-scalar encodings.  Compact JSON
+        # keeps that audit surface below its deliberately small size cap.
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_HEAD_FIXTURE_BYTES:
+            raise RuntimeError(
+                f"head fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_HEAD_FIXTURE_BYTES} bytes"
+            )
+        args.head_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.head_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "complete_capture_sha256": fixture["source"][
+                        "complete_capture_sha256"
+                    ],
+                    "path": str(args.head_fixture_output),
+                    "status": "source_forward_head_fixture",
+                },
+                sort_keys=True,
+            )
+        )
+    if args.output is None and args.head_fixture_output is None:
+        print(artifact_bytes.decode("utf-8"), end="")
     return 0
 
 
