@@ -329,13 +329,13 @@ synthetic weights. These are test settings, not the released Flash dimensions
 or its route scale. The reduced composition selects two distinct FP4 experts while correction
 bias excludes the highest raw-logit expert. Their down projections give
 hand-derived outputs 104 and 288, and the unweighted FP8 shared expert gives
-256; final BF16 output is 648. The same 32-wide BF16 hidden row feeds
+256; the FFN's BF16 output is 648 before HC expansion. The same 32-wide BF16 hidden row feeds
 the synthetic `[3, 32]` gate matrix and every expert; the gate produces logits
 `[0, 1, 3]`. This joins gate projection, routing, and quantized experts, not a
 complete block or pretrained-model execution.
 
 The fixture now produces that hidden row with `rms_norm_bf16_reference`:
-alternating BF16 inputs `+2, -2` and learned weights `+1, -1`, with epsilon
+alternating BF16 inputs `+3, -3` and learned weights `+1, -1`, with epsilon
 `1e-20`, give exactly 32 BF16 ones before the gate. A separate hand-derived
 four-element test uses different learned weights to check scaling and signs.
 The source sequence is pinned `model.py`, `RMSNorm.forward`, lines 281–294:
@@ -343,9 +343,41 @@ FP32 square/mean, reciprocal square root after epsilon, input scaling, learned
 weight multiplication, then conversion back to the input dtype. The scalar
 reference bounds width to 16,384 and leaves caller output unchanged on error,
 including overflow during BF16 rounding. Neither the scalar reduction nor
-`1 / sqrt` claims GPU `rsqrt` parity. HC coefficient generation and residual
-mixing still precede/follow this FFN path in `Block.forward` (lines 985–993);
-they are not supplied by this composition.
+`1 / sqrt` claims GPU `rsqrt` parity.
+
+## HC residual flow around the FFN
+
+`hc::split_hc_coefficients` implements the scalar split/Sinkhorn sequence from
+the [pinned kernel](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/inference/kernel.py),
+lines 407–473. It consumes already-projected FP32 logits, three scales, and
+biases. Pre uses sigmoid plus epsilon; post uses twice sigmoid. The residual
+matrix uses row-softmax plus epsilon, then column normalization, followed by
+the remaining row/column normalization pairs. Epsilon and finite iterations
+mean its sums need not be exactly one. Scalar transcendental/reduction results
+are not a TileLang bit-parity claim.
+
+`hc::mixing` qualifies the BF16 collapse and expansion from pinned `model.py`,
+lines 958–969. The matrix convention is `comb[source_copy, destination_copy]`,
+not the common output-first convention: expansion reduces the source axis.
+A nonsymmetric matrix fixture distinguishes these interpretations.
+Expansion completes the residual reduction before adding the post-scaled
+sublayer output. A cancellation fixture with residuals `[2^24, -2^24]` and
+a sublayer contribution of `1` checks this order. Temporarily adding that
+contribution before the reduction made the test fail with `0` instead of `1`;
+the mutation was removed.
+
+The FFN composition now collapses two residual copies containing alternating
+`±2` and `±6` with incoming pre coefficients `[0.75, 0.25]`, asserting `±3`
+before RMSNorm. Separately, synthetic zero HC logits, epsilon `0.5`, and one
+iteration yield post weights `1` and residual-matrix entries `0.4`.
+Expansion adds `±3.2` to the FFN output `648`, giving BF16 `652` and `644`.
+These deliberately visible residuals are not the released HC settings.
+The incoming pre belongs to the preceding sublayer; the newly computed pre
+is for the next one (`Block.forward`, lines 975–993), not this FFN's collapse.
+
+This joins supplied-coefficient HC flow to the quantized FFN. The normalized
+FP32 projection producing the HC logits, actual checkpoint weights, and the
+attention/cache path are still missing from this composition.
 
 ## Serving-side choices
 

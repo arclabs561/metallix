@@ -384,28 +384,52 @@ fn fp4_routed_and_fp8_shared_outputs_join_before_final_bf16_cast() {
     assert_ne!(combined[0].to_bits(), incorrectly_routed_shared.to_bits());
 }
 
-#[test]
-fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
-    // This qualifies BF16 RMSNorm → gate → text-route → expert composition,
-    // not a complete `MoE` block or a hardware kernel oracle.
+fn hc_normalized_fixture() -> ([u16; WIDTH], [u16; 2 * WIDTH]) {
     let mut pre_norm = [0_u16; WIDTH];
+    let mut residual = [0_u16; 2 * WIDTH];
     let mut norm_weight = [0_u16; WIDTH];
     for (index, (input, weight)) in pre_norm.iter_mut().zip(&mut norm_weight).enumerate() {
         *input = if index.is_multiple_of(2) {
+            0x4040
+        } else {
+            0xc040
+        }; // Expected collapsed ±3.
+        residual[index] = if index.is_multiple_of(2) {
             0x4000
         } else {
             0xc000
         }; // ±2
+        residual[WIDTH + index] = if index.is_multiple_of(2) {
+            0x40c0
+        } else {
+            0xc0c0
+        }; // ±6
         *weight = if index.is_multiple_of(2) {
             0x3f80
         } else {
             0xbf80
         }; // ±1
     }
+    let expected_pre_norm = pre_norm;
+    pre_norm.fill(0xdead);
+    // The incoming pre belongs to the previous sublayer, not this FFN's
+    // newly generated coefficients. 0.75*(±2) + 0.25*(±6) = ±3.
+    crate::hc::mixing::hc_pre_bf16_reference(&residual, &[0.75, 0.25], WIDTH, &mut pre_norm)
+        .expect("bounded HC collapse");
+    assert_eq!(pre_norm, expected_pre_norm);
     let mut input = [0_u16; WIDTH];
     crate::rms_norm_bf16_reference(&pre_norm, &norm_weight, 1.0e-20, &mut input)
         .expect("finite BF16 RMSNorm");
-    assert_eq!(input, [0x3f80; WIDTH]); // `[2, -2]` RMS-normalizes to `[1, -1]`.
+    assert_eq!(input, [0x3f80; WIDTH]); // `[3, -3]` RMS-normalizes to `[1, -1]`.
+    (input, residual)
+}
+
+#[test]
+fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
+    // This qualifies HC collapse → RMSNorm → gate → experts → HC expansion.
+    // Incoming pre coefficients and current projected HC logits are supplied;
+    // this is not a complete block or a hardware kernel oracle.
+    let (input, residual) = hc_normalized_fixture();
     let mut gate_weights = [0x0000_u16; 3 * WIDTH];
     gate_weights[WIDTH] = 0x3f80; // expert 1: dot 1
     gate_weights[2 * WIDTH..2 * WIDTH + 3].fill(0x3f80); // expert 2: dot 3
@@ -492,4 +516,29 @@ fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
         combined[0].to_bits(),
         bf16_value(expert0[0] + expert1[0]).to_bits()
     );
+
+    // Synthetic HC epsilon 0.5 exposes the residual contribution after BF16
+    // rounding. Zero affine logits give pre=1, post=1, comb=1/(2+0.5)=0.4
+    // after the first column normalization. These are not Flash's defaults.
+    let coefficients = crate::hc::split_hc_coefficients(&[0.0; 8], &[1.0; 3], &[0.0; 8], 2, 1, 0.5)
+        .expect("bounded HC coefficient split");
+    assert_eq!(coefficients.pre(), &[1.0; 2]);
+    let mut expanded = [0_u16; 2 * WIDTH];
+    crate::hc::mixing::hc_post_bf16_reference(
+        &bf16_row(&combined),
+        &residual,
+        coefficients.post(),
+        coefficients.comb(),
+        &mut expanded,
+    )
+    .expect("bounded HC expansion");
+    // Each destination adds ±3.2 to 648, rounding to 652 or 644 in BF16.
+    for (index, bits) in expanded.iter().enumerate() {
+        let expected: f32 = if index.is_multiple_of(2) {
+            652.0
+        } else {
+            644.0
+        };
+        assert_eq!(u32::from(*bits) << 16, expected.to_bits());
+    }
 }
