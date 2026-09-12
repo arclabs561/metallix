@@ -13,6 +13,9 @@ use thiserror::Error;
 
 use crate::manifest::V41SafetensorsIndex;
 
+mod source_fp4;
+pub use source_fp4::{V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection};
+
 const SAFETENSORS_PREFIX_BYTES: u64 = 8;
 const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -721,6 +724,21 @@ mod tests {
         parsed
             .validate_index_shard(&index, "model-00009-of-00048.safetensors")
             .expect("exact full-shard tensor set");
+        let mut checked_pairs = 0;
+        for (name, _) in parsed
+            .tensors()
+            .filter(|(name, _)| name.contains(".ffn.experts.") && name.ends_with(".weight"))
+        {
+            super::V41ExpertI8ScalePair::parse(
+                &parsed,
+                &index,
+                "model-00009-of-00048.safetensors",
+                name,
+            )
+            .expect("every routed expert weight in pinned shard09 has a valid pair");
+            checked_pairs += 1;
+        }
+        assert_eq!(checked_pairs, 1_152);
         for (projection, rows, packed_columns, weight_start, scale_start) in [
             ("w1", 2_304, 2_560, 594_728_408, 8_015_576),
             ("w2", 5_120, 1_152, 600_626_648, 8_384_216),
@@ -735,6 +753,21 @@ mod tests {
             assert_eq!(scale.shape(), [rows, packed_columns / 16]);
             assert_eq!(weight.file_range().start, 258_144 + weight_start);
             assert_eq!(scale.file_range().start, 258_144 + scale_start);
+            let pair = super::V41ExpertI8ScalePair::parse(
+                &parsed,
+                &index,
+                "model-00009-of-00048.safetensors",
+                &format!("{base}.weight"),
+            )
+            .expect("real source-I8 expert pair");
+            assert_eq!(pair.layer(), 6);
+            assert_eq!(pair.expert(), 0);
+            assert_eq!(pair.logical_shape(), [rows, 2 * packed_columns]);
+            assert_eq!(pair.weight_range(), weight);
+            assert_eq!(pair.scale_range(), scale);
+            assert_eq!(pair.weight_name(), format!("{base}.weight"));
+            assert_eq!(pair.scale_name(), format!("{base}.scale"));
+            assert_eq!(pair.shard(), "model-00009-of-00048.safetensors");
         }
     }
 

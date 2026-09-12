@@ -12,7 +12,8 @@ pub mod selection;
 
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
 pub use checkpoint::{
-    V41SafetensorsHeader, V41SafetensorsHeaderError, V41StorageDtype, V41TensorRange,
+    V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection, V41SafetensorsHeader,
+    V41SafetensorsHeaderError, V41StorageDtype, V41TensorRange,
 };
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]

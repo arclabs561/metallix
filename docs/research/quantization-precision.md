@@ -105,12 +105,41 @@ Retained source and data identities (SHA-256):
 | `artifacts/safetensors-0.6.2-python-lib.rs` | `651fc421fe2489f6424220c13f6c541039d890a0d38c4216d5f37ec6a310f95e` |
 
 Receipts: `artifacts/check-v41-storage-spelling-{before,after}.log` and
-`artifacts/check-v41-shard09-{before-absolute,after}.log`. Next: a validated
-INT8 weight/scale pair descriptor tied to the index and header ranges, followed
-by explicitly approved payload-slice comparison. Converted raw `F4` storage,
+`artifacts/check-v41-shard09-{before-absolute,after}.log`. A validated
+INT8 weight/scale pair descriptor is described below; explicitly approved
+payload-slice comparison remains a later gate. Converted raw `F4` storage,
 all-shard coverage, decoded numerical parity and full V4.1 execution remain
 unqualified. The current fixed-width parser still rejects packed FP4 dtype
 tags; source INT8 byte storage does not require accepting them.
+
+### Selected expert-pair metadata
+
+`V41ExpertI8ScalePair` carries the checked relation between one source INT8
+weight and its E8M0 scale. It accepts only the evidenced canonical name shape
+`layers.L.ffn.experts.E.w1|w2|w3.weight`, with canonical unsigned numeric layer
+and expert segments. Projection identity is an enum. It derives the exact
+`.scale` mate, checks both index assignments against the caller-declared shard,
+and obtains their validated ranges from the supplied header.
+
+The weight must be nonempty rank-two INT8 `[N,P]`; logical `K = 2P` must fit
+`u64` and be divisible by 32. Scale storage must be E8M0 `[N,K/32]`.
+The descriptor preserves the source names, shard and byte ranges alongside
+logical shape `[N,K]`. It does not require physical adjacency and does not
+rescan unrelated index/header entries. Use `validate_index_shard` separately
+when full-shard agreement is required.
+
+This is metadata validation, not file authentication: the caller still binds
+the header to an actual file and revision and checks layer/expert limits against
+the model configuration. No payload read, nibble expansion or numerical parity
+is implied. MTP, shared experts, alternate source names and converted raw-F4
+headers remain outside this deliberately narrow constructor.
+
+The explicit shard-09 metadata test now constructs descriptors for all 1,152
+routed-expert pairs in that header, plus checks exact ranges and logical shapes
+for expert 0's three projections. Module tests exercise names, missing or
+misassigned mates, dtypes, ranks, zero dimensions, scale dimensions, grouping,
+and logical-width overflow. These do not allocate tensor payloads. Local
+execution receipt: `artifacts/check-v41-pair-shard09.log`.
 
 ## Next numerical join: FP4 linear runtime contract
 
