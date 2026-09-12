@@ -10,6 +10,8 @@
 
 mod blocks;
 pub use blocks::{BlockDecodeError, expand_e2m1x2_blocks32};
+mod activation;
+pub use activation::{ActivationQuantError, quantize_bf16_activations_e4m3fn};
 mod linear;
 pub use linear::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
 

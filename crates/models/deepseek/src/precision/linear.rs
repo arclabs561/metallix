@@ -21,7 +21,7 @@ pub enum ActivationGroup {
 }
 
 impl ActivationGroup {
-    const fn elements(self) -> usize {
+    pub(crate) const fn elements(self) -> usize {
         match self {
             Self::Elements32 => 32,
             Self::Elements128 => 128,

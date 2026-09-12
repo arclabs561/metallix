@@ -84,8 +84,10 @@ allocates using `torch.get_default_dtype()`; qualify that call context and
 output cast rather than infer them from storage dtypes.
 
 Activation preparation is a separate required boundary: per row/group,
-`amax = max(max(abs(x)), 1e-4)`, followed by `amax / 448` or its next
-power-of-two scale when `scale_fmt` is set. Divide by the computed scale,
+`amax = max(max(abs(x)), 1e-4)`, followed by FP32 multiplication by the
+rounded FP32 reciprocal of 448, then its next power-of-two scale when
+`scale_fmt` is set. Do not replace the reciprocal multiplication with division
+when qualifying rounding boundaries. Divide by the computed scale,
 clamp to `[-448, 448]`, and cast to E4M3FN; the scale itself is stored using
 the requested scale dtype. The pinned model selects 32-element activation
 groups and E8M0 scales. A reference must distinguish the computed scale from
@@ -101,11 +103,31 @@ reference, not an optimized serving kernel.
 
 Exactly representable hand vectors check transposition, scale grouping and
 packed signs. These test the stated scalar equation, not an independent CUDA
-capture. Activation floor, power-of-two boundaries, FP8 conversion/reduction,
-and BF16 output remain separate qualification gates. No activation quantizer
-or checkpoint file-to-runtime mapping is established by this reference.
+capture. Hardware FP8 conversion/reduction and BF16 output remain separate
+qualification gates. No checkpoint file-to-runtime mapping is established.
 
 Run `cargo test -p deepseek precision::linear`.
+
+## BF16 activation preparation reference
+
+`quantize_bf16_activations_e4m3fn` covers the pinned non-inplace activation path:
+BF16 storage bits promoted exactly to FP32, complete 32- or 128-element groups,
+the `1e-4` absolute-maximum floor, reciprocal multiplication, and upward
+power-of-two E8M0 scales. The model selects groups of 32; 128 is a supported
+kernel variant. Finite BF16 inputs bound scale exponents to -22 through 120,
+so stored scales are exact and representable. Normalization uses the computed
+scale; no unrounded-scale or in-place BF16 reconstruction mode is inferred.
+Input/shape validation completes before either caller-owned output changes.
+
+The private FP8 encoder enumerates finite E4M3FN values with nearest-even
+rounding and preserves signed zero. This is a software reference choice.
+[NVIDIA's CUDA 13.0 conversion API](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-math-api/cuda_math_api/group__CUDA__MATH__FP8__MISC.html)
+documents nearest-even FP8 conversion, but that does **not** establish the
+pinned TileLang cast lowering, subnormal handling, or hardware parity. Those
+require an independent generated-kernel capture. This is activation preparation
+for supplied-format inference, not a calibrated checkpoint converter.
+
+Run `cargo test -p deepseek precision::activation`.
 
 ## Serving-side choices
 
