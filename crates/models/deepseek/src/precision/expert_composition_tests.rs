@@ -386,9 +386,26 @@ fn fp4_routed_and_fp8_shared_outputs_join_before_final_bf16_cast() {
 
 #[test]
 fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
-    // This qualifies the BF16 gate/text-route/expert join, not a complete
-    // `MoE` block or a hardware gate-projection oracle.
-    let input = [0x3f80_u16; WIDTH]; // The same BF16 row feeds gate and experts.
+    // This qualifies BF16 RMSNorm → gate → text-route → expert composition,
+    // not a complete `MoE` block or a hardware kernel oracle.
+    let mut pre_norm = [0_u16; WIDTH];
+    let mut norm_weight = [0_u16; WIDTH];
+    for (index, (input, weight)) in pre_norm.iter_mut().zip(&mut norm_weight).enumerate() {
+        *input = if index.is_multiple_of(2) {
+            0x4000
+        } else {
+            0xc000
+        }; // ±2
+        *weight = if index.is_multiple_of(2) {
+            0x3f80
+        } else {
+            0xbf80
+        }; // ±1
+    }
+    let mut input = [0_u16; WIDTH];
+    crate::rms_norm_bf16_reference(&pre_norm, &norm_weight, 1.0e-20, &mut input)
+        .expect("finite BF16 RMSNorm");
+    assert_eq!(input, [0x3f80; WIDTH]); // `[2, -2]` RMS-normalizes to `[1, -1]`.
     let mut gate_weights = [0x0000_u16; 3 * WIDTH];
     gate_weights[WIDTH] = 0x3f80; // expert 1: dot 1
     gate_weights[2 * WIDTH..2 * WIDTH + 3].fill(0x3f80); // expert 2: dot 3
