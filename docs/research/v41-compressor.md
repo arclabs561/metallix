@@ -165,10 +165,32 @@ test-only device guard convention as the library tests. An unguarded parallel
 run crashed, while an explicitly serial run passed. These tests do not qualify
 concurrent MLX requests or solve runtime device ownership for serving.
 
+The query-side composition test
+`projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights`
+executes the **BF16-configured** `wq_b` branch and the explicitly BF16
+`weights_proj` branch of pinned `Indexer.forward` (lines 550–555). `wq_b`
+inherits the configured default weight dtype; this test does not cover its
+FP8 checkpoint path or the preceding `wq_a`/`q_norm` producing `qr`.
+With synthetic weights, two projected heads are constant +9 and -9. Tail
+rotation by `0.6 + 0.8i`, BF16 narrowing and group-32 FP4 reconstruction give
+head sums +244 and -244. A separate projection gives weights `[-32, 8]`;
+the source's `index_head_dim^-0.5 * n_heads^-0.5` factor is 1/8 for this
+32-wide, two-head case, giving BF16 weights `[-4, 1]`.
+The weight projection consumes `x`, not `qr`; `n_heads` is the global head
+count, not the local shard count. This single-rank test does not exercise
+distributed head reduction or distinguish those counts.
+Against supplied keys +1 and -1, the real Metal core produces exact scores
+`[-976, 244]` and selects position 1. Omitting rotation gives `[-1024, 256]`,
+omitting scaling gives `[-7808, 1952]`, and quantizing before rotation also
+changes the scores. These analytical checks qualify the composition under the
+scalar rounding assumptions, not upstream BF16 GEMM/reduction parity or
+full indexer cache/candidate orchestration.
+
 ```sh
 uv run scripts/v41-compressed-attention-reference.py > artifacts/compressed-attention-reference.json
 cargo test -p deepseek --test fp4_activation rotated_fp4_compressed_keys_feed_sparse_attention_in_source_order
 cargo test -p deepseek --features metal --test fp4_activation fp4_index_scores_select_the_compressed_vector_consumed_by_attention
+cargo test -p deepseek --features metal --test fp4_activation projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights
 ```
 
 ```sh

@@ -45,6 +45,10 @@ published release; reference operators do not imply full-model support.
 - Synthetic-weight index-key projection and RMSNorm joined with rotary,
   FP4 preparation and Metal selection. A numerical ordering check detects
   reading compressed latents after attention has rotated them.
+- BF16-configured index-query projection and signed head-weight projection
+  joined with rotary, FP4 reconstruction and Metal scoring. Closed-form checks
+  distinguish omitted rotation, early quantization and omitted head scaling;
+  this does not qualify the checkpoint's FP8 query projection.
 
 ### Fixed
 

@@ -514,6 +514,108 @@ fn projected_normalized_index_keys(latent: &[u16], frequencies: &[f32]) -> Vec<f
 
 #[cfg(feature = "metal")]
 #[test]
+fn projected_index_queries_rotate_before_fp4_and_scale_signed_head_weights() {
+    use deepseek::indexer::index_scores_f32;
+    use deepseek::precision::bf16_linear_reference;
+    use deepseek::selection::select_indices;
+
+    let _guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let nz = |value| NonZeroUsize::new(value).expect("fixed dimension");
+    // Qualify the source's BF16-configured wq_b branch, not FP8 checkpoint GEMM.
+    // One supplied qr row [9, 2]; output heads select +qr[0] and -qr[0].
+    let mut wq_b = [0_u16; 64 * 2];
+    for (head, rows) in wq_b.chunks_exact_mut(32 * 2).enumerate() {
+        for row in rows.chunks_exact_mut(2) {
+            row[0] = if head == 0 { 0x3f80 } else { 0xbf80 };
+        }
+    }
+    let mut projected = [0_u16; 64];
+    bf16_linear_reference(&[0x4110, 0x4000], &wq_b, 1, 2, 64, &mut projected)
+        .expect("BF16 query projection");
+    assert_eq!(&projected[..32], &[0x4110; 32]);
+    assert_eq!(&projected[32..], &[0xc110; 32]);
+
+    let rotate = |input: &[u16; 64]| {
+        let mut tail: Vec<_> = input
+            .chunks_exact(32)
+            .flat_map(|head| head[28..].iter().copied().map(bf16_to_f32))
+            .collect();
+        rotate_tail(
+            &mut tail,
+            RotaryTailLayout::new(nz(1), nz(1), nz(2), nz(2)).expect("one query, two heads"),
+            &[RotaryFrequency::new(0.6, 0.8).expect("frequency"); 2],
+            RotaryDirection::Forward,
+        )
+        .expect("query position frequency broadcasts over heads");
+        let mut output = *input;
+        for (head, tail) in output.chunks_exact_mut(32).zip(tail.chunks_exact(4)) {
+            for (word, &value) in head[28..].iter_mut().zip(tail) {
+                *word = f32_to_bf16_rne(value);
+            }
+        }
+        output
+    };
+    let quantize = |input: &[u16; 64]| {
+        let mut output = [0; 64];
+        fp4_activation_reference(input, 2, 32, Fp4Mode::Index32E8m0, &mut output)
+            .expect("independent group per query head");
+        output
+    };
+    let query = quantize(&rotate(&projected));
+    // (9+9i)*(0.6+0.8i) = -1.8+12.6i. BF16 narrowing then scale-4
+    // E2M1 gives (-2,12); the nonrotary 9s become 8. Head sum is 244.
+    assert_eq!(&query[..28], &[0x4100; 28]);
+    assert_eq!(&query[28..32], &[0xc000, 0x4140, 0xc000, 0x4140]);
+    for (&positive, &negative) in query[..32].iter().zip(&query[32..]) {
+        assert_eq!(positive ^ 0x8000, negative);
+    }
+
+    // weights_proj(x): [2,1] @ [[-16,0],[0,8]]^T = [-32,8].
+    let mut weights_bf16 = [0; 2];
+    bf16_linear_reference(
+        &[0x4000, 0x3f80],
+        &[0xc180, 0, 0, 0x4100],
+        1,
+        2,
+        2,
+        &mut weights_bf16,
+    )
+    .expect("signed BF16 weights projection");
+    assert_eq!(weights_bf16, [0xc200, 0x4100]);
+    // Source scales by D^-0.5 * H^-0.5; D=32,H=2 gives 1/8.
+    // Narrow back to BF16 after multiplication, as the source tensor does.
+    let scale = 0.125_f32;
+    let weights = weights_bf16.map(|word| bf16_to_f32(f32_to_bf16_rne(bf16_to_f32(word) * scale)));
+    assert_eq!(weights.map(f32::to_bits), [-4.0_f32, 1.0].map(f32::to_bits));
+    let mut keys = [1.0_f32; 64]; // supplied, exactly FP4-representable keys
+    keys[32..].fill(-1.0);
+    let score = |query: &[u16; 64], weights: &[f32]| {
+        let query: Vec<_> = query.iter().copied().map(bf16_to_f32).collect();
+        index_scores_f32(&query, &keys, weights, nz(32)).expect("Metal score core")
+    };
+    let scores = score(&query, &weights);
+    assert_eq!(scores, [-976.0, 244.0]); // ReLU([244,-244],[-244,244]), signed sum
+    assert_eq!(
+        select_indices(&scores, 2, 1, 0).expect("strict cutoff"),
+        [1]
+    );
+    assert_eq!(score(&quantize(&projected), &weights), [-1024.0, 256.0]);
+    assert!(
+        score(&rotate(&quantize(&projected)), &weights)
+            .iter()
+            .zip(&scores)
+            .any(|(wrong, right)| (wrong - right).abs() > 1.0)
+    );
+    assert_eq!(
+        score(&query, &weights_bf16.map(bf16_to_f32)),
+        [-7808.0, 1952.0]
+    );
+}
+
+#[cfg(feature = "metal")]
+#[test]
 fn index_projection_must_read_latents_before_attention_rotates_them() {
     use deepseek::indexer::index_scores_f32;
     use deepseek::selection::{SelectionError, select_indices};
