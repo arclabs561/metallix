@@ -17,6 +17,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).with_name("benchmark-qwen.py")
 SPEC = importlib.util.spec_from_file_location("benchmark_qwen", SCRIPT)
@@ -510,21 +511,80 @@ class ReceiptCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             model = make_model(root)
-            pid_path = root / "child.pid"
-            binary = make_binary(
-                root,
-                """
-                import os
-                import pathlib
-                import time
-
-                pathlib.Path(os.environ["BENCHMARK_TEST_CHILD_PID"]).write_text(str(os.getpid()))
-                time.sleep(30)
-                """,
-            )
+            binary = make_binary(root, "import time\ntime.sleep(30)\n")
             output = root / "timeout.json"
+            children: list[subprocess.Popen[object]] = []
+            real_popen = subprocess.Popen
 
-            result = run_benchmark(
+            def capture_popen(
+                *args: object, **kwargs: object
+            ) -> subprocess.Popen[object]:
+                child = real_popen(*args, **kwargs)
+                command = args[0] if args else kwargs["args"]
+                if isinstance(command, list) and command[0] == str(binary.resolve()):
+                    children.append(child)
+                return child
+
+            arguments = [
+                str(SCRIPT),
+                "--binary",
+                str(binary),
+                "--model",
+                str(model),
+                "--output",
+                str(output),
+                "--input-ids",
+                "1,2",
+                "--max-tokens",
+                "4",
+                "--runs",
+                "3",
+                "--timeout-seconds",
+                "1",
+            ]
+            try:
+                with (
+                    mock.patch.object(sys, "argv", arguments),
+                    mock.patch.object(
+                        benchmark_qwen,
+                        "checkout_state",
+                        return_value={"available": False},
+                    ),
+                    mock.patch.object(
+                        benchmark_qwen.platform, "system", return_value="Linux"
+                    ),
+                    mock.patch.object(
+                        benchmark_qwen, "remaining_seconds", return_value=0.05
+                    ),
+                    mock.patch.object(
+                        benchmark_qwen.subprocess, "Popen", side_effect=capture_popen
+                    ),
+                ):
+                    result = benchmark_qwen.main()
+
+                self.assertEqual(result, 1)
+                receipt = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["status"], "failed")
+                self.assertIn("TimeoutExpired", receipt["error"])
+                self.assertEqual(len(children), 1)
+                child = children[0]
+                self.assertIsNotNone(child.returncode)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child.pid, 0)
+            finally:
+                for child in children:
+                    if child.returncode is None:
+                        child.kill()
+                        child.wait()
+
+    def test_global_deadline_expiring_before_spawn_writes_failed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            model = make_model(root)
+            binary = make_binary(root, "import sys\nsys.exit(0)\n")
+            output = root / "deadline.json"
+            arguments = [
+                str(SCRIPT),
                 "--binary",
                 str(binary),
                 "--model",
@@ -539,16 +599,22 @@ class ReceiptCliTests(unittest.TestCase):
                 "3",
                 "--timeout-seconds",
                 "0.5",
-                environment={"BENCHMARK_TEST_CHILD_PID": str(pid_path)},
-            )
+            ]
+            with (
+                mock.patch.object(sys, "argv", arguments),
+                mock.patch.object(
+                    benchmark_qwen.time, "monotonic", side_effect=[0.0, 1.0]
+                ),
+                mock.patch.object(benchmark_qwen.subprocess, "Popen") as popen,
+            ):
+                result = benchmark_qwen.main()
 
-            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result, 1)
+            popen.assert_not_called()
             receipt = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(receipt["status"], "failed")
-            self.assertIn("TimeoutExpired", receipt["error"])
-            child_pid = int(pid_path.read_text(encoding="utf-8"))
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+            self.assertIn("TimeoutError", receipt["error"])
+            self.assertIn("benchmark exceeded its total deadline", receipt["error"])
 
 
 if __name__ == "__main__":
