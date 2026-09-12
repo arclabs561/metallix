@@ -50,6 +50,55 @@ scale placement, fused arithmetic, quantization, or full-model execution.
 Next: identify packed layouts from headers and upstream packing code, then
 compare approved real slices before attaching these decoders to a loader.
 
+## Next numerical join: FP4 linear runtime contract
+
+Source: pinned V4.1
+[`linear` / `Linear`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py)
+and [`act_quant_kernel` / `fp4_gemm_kernel` / `fp4_gemm`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/kernel.py).
+Those functions were read in full on 2026-09-11 from the retained source;
+this is source inspection, not CUDA execution or full-file reading.
+
+The smallest next numerical reference can consume already-quantized runtime
+buffers without pretending to interpret checkpoint bytes:
+
+| Input | Logical arrangement |
+|---|---|
+| Activation codes | E4M3FN `[M, K]` |
+| Activation scales | `[M, K/G]`, with `G` equal to 32 or 128 |
+| Weight codes | E2M1x2 physical `[N, K/2]`, logical `[N, K]` |
+| Weight scales | E8M0 `[N, K/32]` |
+| Output | `[M, N]`, computing activation times transposed weight |
+
+Require complete groups: `K % G == 0`. For each output element, take an
+unscaled 32-term dot product, multiply its result by the corresponding
+activation and weight scales, then add to the accumulated output. At group
+index `g`, the activation scale index is `g / (G / 32)` and the weight scale
+index is `g`. Applying scales to expanded weights before a whole-row dot is
+not the same stated arithmetic order.
+
+The existing `expand_e2m1x2_blocks32` establishes runtime lane/scale decoding,
+not this GEMM. A scalar FP32 implementation of the equation would still not
+establish Tensor Core reduction order or CUDA bit parity: `T.gemm` owns that
+reduction. The kernel defaults to BF16 output, while its Python wrapper
+allocates using `torch.get_default_dtype()`; qualify that call context and
+output cast rather than infer them from storage dtypes.
+
+Activation preparation is a separate required boundary: per row/group,
+`amax = max(max(abs(x)), 1e-4)`, followed by `amax / 448` or its next
+power-of-two scale when `scale_fmt` is set. Divide by the computed scale,
+clamp to `[-448, 448]`, and cast to E4M3FN; the scale itself is stored using
+the requested scale dtype. The pinned model selects 32-element activation
+groups and E8M0 scales. A reference must distinguish the computed scale from
+its stored representation, and must not omit activation quantization.
+
+Next executable tests: nonsymmetric rows to catch transposition; distinct
+weight scales in adjacent 32-element groups; distinct activation scales for
+G=32 versus one shared scale for G=128; signed low/high nibbles; activation
+floor and power-of-two boundaries. Use exactly representable hand vectors
+first. Hardware conversion/reduction and BF16 output require an independent
+pinned capture before claiming those rounding paths. No new linear executor
+or activation quantizer is implemented by this note.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
