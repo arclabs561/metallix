@@ -29,6 +29,9 @@ published release; reference operators do not imply full-model support.
   before mutation, post-write cache reads, partial groups and shared consumers.
   These check source control flow with explicit numerical stubs, not a native
   Rust attention implementation.
+- Test-only V4.1 FP4 activation reconstruction with separate compressed-KV
+  E4M3 and indexer E8M0 scales, compared with an independent CPU oracle.
+  E2M1 rounding remains a software assumption, not qualified GPU behavior.
 
 ### Fixed
 

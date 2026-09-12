@@ -79,6 +79,34 @@ E2M1, widens to FP32, multiplies by the selected scale, and narrows to the
 input dtype. Tests must cover all-zero groups, scale-bin boundaries, E2M1 ties,
 signed zero and reconstruction overflow before this replaces a stub.
 
+### Software FP4 arithmetic qualification
+
+`crates/models/deepseek/tests/fp4_activation.rs` is a bounded test-only
+BF16 → E2M1 → BF16 implementation with separate compressed-KV and indexer
+modes. `scripts/v41-fp4-activation-reference.py` provides an independent CPU
+arithmetic oracle: Torch performs E4M3 scale casts and BF16 narrowing; explicit
+midpoint intervals provide assumed E2M1 round-to-nearest, ties-to-even.
+Its fixture is `fixtures/deepseek-v41/fp4-activation-reference.json`.
+This is **not** an upstream kernel capture or a hardware-parity result.
+
+For example, a group with `amax=9` uses E4M3 scale `1.5` for compressed KV,
+but E8M0 scale `2` for the indexer. The indexer scale expression multiplies by
+the FP32 reciprocal of six; do not silently substitute division when porting
+the expression. The all-zero index group uses scale `2^-126`; the compressed
+KV group uses the minimum E4M3 subnormal scale `2^-9`.
+
+The bounded software reference rejects raw E4M3 scales above 448 and nonfinite
+reconstructions without changing caller output. That is a deliberate safety
+restriction, not a claim about upstream overflow/saturation behavior. A reduced
+scalar composition can use this reference under its explicit rounding
+assumption. Upstream cast qualification and Metal execution remain separate
+gates; passing this oracle does not establish either.
+
+```sh
+uv run scripts/v41-fp4-activation-reference.py > artifacts/fp4-activation-reference.json
+cargo test -p deepseek --test fp4_activation
+```
+
 ## Qualification artifacts
 
 `scripts/v41-compressor-reference.py` executes only SHA-checked
