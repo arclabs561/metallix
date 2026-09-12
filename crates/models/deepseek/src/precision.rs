@@ -11,6 +11,8 @@
 
 mod blocks;
 pub use blocks::{BlockDecodeError, expand_e2m1x2_blocks32};
+mod bf16_linear;
+pub use bf16_linear::{Bf16LinearError, MAX_BF16_LINEAR_ELEMENTS, bf16_linear_reference};
 mod activation;
 pub use activation::{ActivationQuantError, quantize_bf16_activations_e4m3fn};
 mod linear;

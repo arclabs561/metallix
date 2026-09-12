@@ -12,6 +12,12 @@ use thiserror::Error;
 
 pub mod window;
 
+mod output;
+pub use output::{
+    AttentionOutputError, AttentionOutputLayout, AttentionOutputLayoutError,
+    attention_output_reference,
+};
+
 mod bf16;
 pub use bf16::{
     MAX_BF16_ATTENTION_ELEMENTS, SparseAttentionBf16Error, sparse_attention_bf16_reference,

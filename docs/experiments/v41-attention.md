@@ -125,6 +125,32 @@ rejects nonfinite arithmetic instead of publishing it. These guards deliberately
 narrow the source kernel's behavior on extreme inputs. No speed result or
 full-model decoding is implied.
 
+### Output projection staging
+
+`attention_output_reference` now joins inverse rotary-tail transformation,
+group-local BF16 `wo_a`, G32 activation quantization, and FP8 `wo_b`, with
+explicit BF16 narrowing between stages. The validated layout bounds staging
+buffers and arithmetic work. This is a scalar composition over supplied
+runtime buffers, not checkpoint loading or a complete attention layer.
+
+The grouped BF16 projection has an independent CPU PyTorch capture in
+`fixtures/deepseek-v41/output-projection-reference.json`. Its cases cover
+batch/sequence/group/rank indexing, group isolation, and rounding after a
+multi-term reduction. Regenerate with:
+
+```sh
+uv run scripts/v41-output-reference.py \
+  --source artifacts/v41-reference-model.py \
+  > artifacts/v41-output-reference.json
+```
+
+The script pins PyTorch 2.13.0 and verifies the model source hash before
+executing the isolated `bsgd,grd->bsgr` CPU einsum. The capture does not execute
+the imported model, its quantized kernels, or any checkpoint weights. The
+first local environment emitted an optional missing-NumPy warning; these
+operations use Torch tensors directly. Agreement on these bounded cases does
+not establish arbitrary GEMM reduction-order parity or a speed result.
+
 ### FP32 semantic fixture
 
 Regenerate the pinned synthetic fixture after obtaining the already

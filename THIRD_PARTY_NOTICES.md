@@ -17,6 +17,11 @@ from those pinned helpers. The mathematical sparse-attention reference in
 and denominator-only sink semantics of `inference/kernel.py:sparse_attn_kernel`
 at the same revision. Its independent fixture generator does not execute the
 upstream kernel or reproduce its BF16 intermediate rounding.
+The scalar output composition in `crates/models/deepseek/src/attention/output.rs`
+follows the inverse-rotary, grouped `wo_a`, and `wo_b` ordering in
+`Attention.forward`. `scripts/v41-output-reference.py` independently captures
+its grouped BF16 einsum expression on synthetic CPU tensors after checking
+source identity; it does not execute the complete model or quantized kernels.
 
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 

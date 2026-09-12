@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "source": {
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py",
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "symbol": "Attention.forward:wo_a_grouped_einsum",
+    "license": "MIT"
+  },
+  "reference": {
+    "torch_version": "2.13.0",
+    "device": "cpu",
+    "input_dtype": "bfloat16",
+    "output_dtype": "bfloat16_bits",
+    "einsum": "bsgd,grd->bsgr"
+  },
+  "scope": "Independent CPU Torch BF16 grouped wo_a projection on bounded synthetic inputs. The pinned source is hash-checked and AST-inspected for the einsum, but this script does not import or execute the full model, CUDA, Triton, checkpoint weights, attention, RoPE, routing, or wo_b.",
+  "cases": [
+    {
+      "name": "nontrivial_batch_sequence_group_rank",
+      "input_shape": [
+        2,
+        2,
+        2,
+        3
+      ],
+      "input_bf16_bits": [
+        16256,
+        16128,
+        49024,
+        16384,
+        48896,
+        16000,
+        48896,
+        16256,
+        16384,
+        16320,
+        49024,
+        16128,
+        16000,
+        16384,
+        16128,
+        49024,
+        16320,
+        48896,
+        16256,
+        48896,
+        16384,
+        49024,
+        16000,
+        16320
+      ],
+      "weight_shape": [
+        2,
+        2,
+        3
+      ],
+      "weight_bf16_bits": [
+        16256,
+        49024,
+        16128,
+        16000,
+        16384,
+        48896,
+        49024,
+        16128,
+        16256,
+        16384,
+        16000,
+        48896
+      ],
+      "expected_shape": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "expected_output_bf16_bits": [
+        0,
+        16352,
+        49152,
+        16496,
+        48896,
+        16224,
+        49088,
+        16416,
+        49088,
+        16500,
+        16288,
+        49072,
+        16416,
+        49120,
+        16424,
+        49196
+      ]
+    },
+    {
+      "name": "group_isolation",
+      "input_shape": [
+        1,
+        1,
+        2,
+        3
+      ],
+      "input_bf16_bits": [
+        16256,
+        49152,
+        16448,
+        0,
+        32768,
+        0
+      ],
+      "weight_shape": [
+        2,
+        2,
+        3
+      ],
+      "weight_bf16_bits": [
+        16256,
+        16128,
+        49024,
+        48896,
+        16384,
+        16256,
+        17096,
+        49864,
+        17096,
+        49864,
+        17096,
+        49864
+      ],
+      "expected_shape": [
+        1,
+        1,
+        2,
+        2
+      ],
+      "expected_output_bf16_bits": [
+        49216,
+        49088,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "output_rounding_after_multi_term_accumulation",
+      "input_shape": [
+        1,
+        1,
+        1,
+        4
+      ],
+      "input_bf16_bits": [
+        16256,
+        16256,
+        16256,
+        16256
+      ],
+      "weight_shape": [
+        1,
+        1,
+        4
+      ],
+      "weight_bf16_bits": [
+        16256,
+        15360,
+        15232,
+        15104
+      ],
+      "expected_shape": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "expected_output_bf16_bits": [
+        16258
+      ]
+    }
+  ]
+}
