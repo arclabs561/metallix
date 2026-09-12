@@ -3,13 +3,13 @@
 ## Decision
 
 Do not add a generic sampler framework or a particle-serving API yet.  A
-narrow seeded categorical policy is now wired to the unconstrained Qwen
-diagnostic: `mx gen --sample --temperature T --seed S` has no top-k/top-p
+narrow seeded categorical policy is now wired to the Qwen diagnostic, including
+`--json-schema`: `mx gen --sample --temperature T --seed S` has no top-k/top-p
 truncation and records both raw model `p` and deployed-policy `q` when
-`--logprobs` is requested.  It is deliberately rejected with `--json-schema`;
-CLI grammar-mask sampling is not yet qualified. The next work should prove the
-remaining three small boundaries in order.  The first two need no checkpoint,
-Metal execution, or cache fork.  The third needs a qualified decode path;
+`--logprobs` is requested. The grammar path is transactional, and same-checkpoint
+sampled grammar replay passed on the local Qwen control. The next work should prove
+the remaining three small boundaries in order. The first two need no checkpoint,
+Metal execution, or cache fork. The third needs a qualified decode path;
 confidence calibration also needs independently labelled data.
 
 This note follows [GenLM/LLaMPPL](genlm-control.md),
@@ -21,17 +21,17 @@ coverage recorded in their respective notes.
 
 ## Gate 1: one explicit sampled-policy distribution
 
-The implemented Qwen slice accepts FP32 logits, a full-vocabulary legal mask,
-positive finite temperature, and a deterministic `ChaCha8Rng` variate. It
-returns a token and temperature-conditioned `sampling_logprob`, using FP64
-accumulation. `sampling_policy` records the RNG, seed, temperature, uniform
-conversion and absence of truncation; `model_logprob` remains raw
-temperature-one `p`. The path rejects nonfinite logits and temperature scaling
-that overflows. Floating-point underflow can remove tiny probabilities, so it
-is not an exact-real importance proposal with guaranteed full support.
+The implemented Qwen slice accepts FP32 logits, a legal mask, positive finite
+temperature, and a deterministic `ChaCha8Rng` variate. It returns a token and
+temperature-conditioned `sampling_logprob`, using FP64 accumulation.
+`sampling_policy` records the RNG, seed, temperature, uniform conversion and
+absence of truncation; `model_logprob` remains raw temperature-one `p`. The
+path rejects nonfinite logits and temperature scaling that overflows. Floating-
+point underflow can remove tiny probabilities, so it is not an exact-real
+importance proposal with guaranteed full support.
 
-This closes seed management, `p`/`q` receipts, and same-policy replay for the
-unconstrained diagnostic. It does not close grammar-mask sampling, top-k/top-p,
+This closes seed management, `p`/`q` receipts, and bounded same-policy replay for
+the diagnostic. It does not close cross-device replay, top-k/top-p,
 device-versus-reference distribution parity, or any whole-sequence target
 claim.
 
@@ -43,8 +43,24 @@ mask and consumes a token on a deep-cloned matcher, committing grammar state
 and decoded bytes only on success. Padded model rows contribute to raw `p`
 but never grammar `q`. Greedy selection shares this transactional boundary.
 This is not a fast-forward or cache-fork implementation. The engine owns no
-RNG, and CLI grammar sampling remains
-disabled pending RNG/grammar integration and real-generation replay.
+RNG. The CLI supplies candidate entropy from a cloned seeded policy, checks
+that the model vocabulary fits signed server token IDs before a grammar advance,
+and commits the candidate RNG only after `ConstraintRun` succeeds. Thus a
+failed grammar draw commits neither RNG nor grammar state. This transactional
+boundary is wired to `mx gen --sample --json-schema`.
+
+Local sampled-schema qualification used FP32 Qwen3-0.6B, input IDs
+`9707,11,1879`, the record schema, temperature 0.7, seed 42 and token limit 29.
+Resident, repeated resident, unscored resident and streamed runs independently
+validated `{"status":"ready","count":1}` and selected identical 12-token
+sequences. All four probability fields matched exactly across the three scored
+runs. The greedy and unconstrained sampled controls retained their prior IDs.
+Redirected preview preserved diagnostics without ANSI escapes and stdout stayed
+JSON. Receipts: `artifacts/sampled-schema-{resident-a,resident-b,unscored,streamed}.json`,
+`artifacts/sampled-schema-{greedy-control,unconstrained-control}.json` and
+`artifacts/sampled-schema-preview.stderr`. See [the development guide](../../DEVELOPMENT.md)
+for the command and streamed budgets. This is bounded replay evidence, not a
+cross-device reproducibility or throughput claim.
 
 The shared transactional boundary was exercised through the existing greedy
 Qwen schema command (prompt `9707,11,1879`, limit 64, record schema, logprobs).
@@ -87,9 +103,10 @@ LLaMPPL Feynman--Kac formulation and the Power-SMC target/proposal analysis
 ([LLaMPPL v2, §§2--3](https://arxiv.org/html/2306.03081v2),
 [Power-SMC](power-smc.md#correctness-boundary)).
 
-**Advance criterion:** analytic oracle tests pass and an unconstrained trace
-can make a replayable claim about `p`, `q`, policy parameters and seed. A
-future grammar trace additionally needs mask identity. This does not prove
+**Advance criterion:** analytic oracle tests pass and unit traces can make a
+replayable claim about `p`, `q`, policy parameters, seed and grammar-mask
+identity. A real-model grammar replay must reproduce IDs and all probability
+receipts under the same checkpoint and execution policy. This does not prove
 Metal sampler parity; that later needs a device-versus-reference distribution
 test.
 
@@ -152,16 +169,16 @@ proposal mismatch; they are not calibrated answer correctness
 
 ## Stop rule
 
-Ordinary unconstrained single-sequence categorical sampling has integrated with
-an explicit seed, temperature and `p`/`q` receipt. Grammar-mask sampling
-remains behind a mask/RNG/probability-accounting gate. Particle or global-control
-serving remains behind Gate 2 and the cache-replay portion of Gate 3.
-Confidence claims remain separately behind Gate 3's labelled calibration work.
-A result that reverses particle work is simple: if cache replay is correct but
-`N=2` increases per-token latency or memory without a predeclared
-distribution/quality gain, do not pursue particle serving on this Mac. DeepSeek
-V4.1 Flash forward and cache qualification still take precedence over all three
-gates.
+Ordinary single-sequence categorical sampling, including the transactional
+grammar-mask path, has integrated with an explicit seed, temperature and
+`p`/`q` receipt. Local Qwen sampled-grammar replay passed as described above.
+Particle or global-control serving remains behind Gate 2 and the cache-replay
+portion of Gate 3. Confidence claims remain separately behind Gate 3's labelled
+calibration work. A result that reverses particle work is simple: if cache
+replay is correct but `N=2` increases per-token latency or memory without a
+predeclared distribution/quality gain, do not pursue particle serving on this
+Mac. DeepSeek V4.1 Flash forward and cache qualification still take precedence
+over all three gates.
 
 ## Fresh GenLM Control check: integration traps
 

@@ -2,6 +2,8 @@
 
 use std::{fs, path::Path, process::ExitCode, time::Instant};
 
+#[cfg(feature = "structured-output")]
+use crate::qwen_constraints::ConstraintRun;
 use engine::sampling::sample_categorical;
 use qwen::metal::Qwen3MlxWeights;
 use rand_chacha::ChaCha8Rng;
@@ -121,6 +123,27 @@ impl SamplingPolicy {
         };
         self.rng = candidate_rng;
         Ok((token, scores))
+    }
+
+    #[cfg(feature = "structured-output")]
+    fn sample_constrained(
+        &mut self,
+        constraint: &mut ConstraintRun,
+        logits: &[f32],
+        logprobs: bool,
+    ) -> Result<(i32, Option<serde_json::Value>), Box<dyn std::error::Error>> {
+        // `ConstraintRun` owns grammar-state commit. Keep the corresponding
+        // entropy transition private until it reports the same successful draw.
+        let mut candidate_rng = self.rng.clone();
+        let uniform = unit_uniform(candidate_rng.next_u64());
+        let sampled = constraint.sample_categorical(
+            logits,
+            self.configuration.temperature,
+            uniform,
+            logprobs,
+        )?;
+        self.rng = candidate_rng;
+        Ok(sampled)
     }
 }
 
@@ -334,13 +357,6 @@ fn generate_inner(
     let generation: GenerationConfig = serde_json::from_str(&raw)?;
     generation.validate(input_ids, max_tokens)?;
     #[cfg(feature = "structured-output")]
-    if sampling_configuration.is_some() && json_schema.is_some() {
-        return Err(
-            "--sample cannot be used with --json-schema until grammar-mask sampling is qualified"
-                .into(),
-        );
-    }
-    #[cfg(feature = "structured-output")]
     let mut constraint = json_schema
         .map(|path| crate::qwen_constraints::ConstraintRun::load(model, path))
         .transpose()?;
@@ -445,8 +461,8 @@ fn generate_inner(
             (Some(constraint), None) => constraint.sample(&logits, logprobs)?,
             (None, Some(policy)) => policy.sample(&logits, logprobs)?,
             (None, None) => greedy_sample(&logits, logprobs)?,
-            (Some(_), Some(_)) => {
-                return Err("sampled structured output was not rejected during setup".into());
+            (Some(constraint), Some(policy)) => {
+                policy.sample_constrained(constraint, &logits, logprobs)?
             }
         };
         #[cfg(not(feature = "structured-output"))]
@@ -492,6 +508,10 @@ fn generate_inner(
         emit_stream_profile_summary(&phase_profiles);
     }
     let sampled = sampling_configuration.is_some();
+    #[cfg(feature = "structured-output")]
+    let sampled_constrained = constraint.is_some();
+    #[cfg(not(feature = "structured-output"))]
+    let sampled_constrained = false;
     let mut report = json!({
     "schema_version": 1,
     "operation": if sampled { "qwen3_sampled_cached_generation" } else { "qwen3_greedy_cached_generation" },
@@ -543,7 +563,11 @@ fn generate_inner(
             "log_base": "e",
             "tokens": token_scores,
             "scope": if sampled {
-                "model_logprob is raw temperature-one model p; sampling_logprob is deployed temperature-conditioned q with no truncation; neither is a complete-sequence probability"
+                if sampled_constrained {
+                    "model_logprob is raw temperature-one model p; constrained_logprob conditions p on the grammar mask; allowed_log_mass is grammar-allowed p mass; sampling_logprob is deployed temperature-conditioned grammar-masked q with no truncation; none is a complete-sequence probability"
+                } else {
+                    "model_logprob is raw temperature-one model p; sampling_logprob is deployed temperature-conditioned q with no truncation; neither is a complete-sequence probability"
+                }
             } else {
                 "selected-token probabilities under temperature-one model logits; constrained scores renormalize the current allowed set; not the probability of a complete valid sequence or of the deterministic greedy policy"
             }
@@ -553,12 +577,16 @@ fn generate_inner(
     let report = {
         let mut report = report;
         if let Some(constraint) = constraint.as_ref() {
-            report["operation"] = json!(if streamed.is_some() {
+            report["operation"] = json!(if sampled && streamed.is_some() {
+                "qwen3_sampled_constrained_streamed_generation"
+            } else if sampled {
+                "qwen3_sampled_constrained_cached_generation"
+            } else if streamed.is_some() {
                 "qwen3_constrained_streamed_generation"
             } else {
                 "qwen3_constrained_cached_generation"
             });
-            report["constraint"] = constraint.report(verbose)?;
+            report["constraint"] = constraint.report(verbose, sampled)?;
         }
         report
     };
@@ -798,6 +826,48 @@ mod tests {
         GenerationMemoryConfig, GenerationMemoryMode, SamplingConfiguration, SamplingPolicy,
         selected_model_logprob, unit_uniform, verbose_preflight,
     };
+    #[cfg(feature = "structured-output")]
+    use engine::constraint::{ConstraintLimits, JsonConstraintSession};
+    #[cfg(feature = "structured-output")]
+    use rand_core::RngCore;
+    #[cfg(feature = "structured-output")]
+    use serde_json::json;
+
+    #[cfg(feature = "structured-output")]
+    const CONSTRAINT_TEST_VOCABULARY: usize = 18;
+
+    #[cfg(feature = "structured-output")]
+    fn constrained_run(max_output_bytes: usize) -> crate::qwen_constraints::ConstraintRun {
+        let tokenizer = json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [{"id": 14, "content": "<eos>", "special": true}],
+            "model": {"vocab": {
+                "{": 0, "}": 1, "\"": 2, "o": 3, "k": 4, ":": 5,
+                "t": 6, "r": 7, "u": 8, "e": 9, "f": 10, "a": 11,
+                "l": 12, "s": 13
+            }}
+        });
+        let session = JsonConstraintSession::new(
+            &tokenizer,
+            14,
+            CONSTRAINT_TEST_VOCABULARY,
+            json!({"type": "boolean"}),
+            ConstraintLimits {
+                max_schema_bytes: 4_096,
+                max_tokenizer_bytes: 4_096,
+                max_output_bytes,
+            },
+        )
+        .expect("bounded categorical constraint session");
+        crate::qwen_constraints::ConstraintRun::from_session(session)
+    }
+
+    #[cfg(feature = "structured-output")]
+    fn forced_constraint_logits(token_id: usize) -> Vec<f32> {
+        let mut logits = vec![-100.0; CONSTRAINT_TEST_VOCABULARY];
+        logits[token_id] = 1.0;
+        logits
+    }
 
     #[test]
     fn logprobs_are_opt_in_stable_and_do_not_change_greedy_ties() {
@@ -906,6 +976,84 @@ mod tests {
             assert!(scored.1.is_some());
             assert!(unscored.1.is_none());
         }
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn sampled_constraints_preserve_p_conditionals_and_deployed_q() {
+        let configuration = SamplingConfiguration {
+            seed: 7,
+            temperature: 0.5,
+        };
+        let mut scored_policy = SamplingPolicy::new(configuration, CONSTRAINT_TEST_VOCABULARY);
+        let mut unscored_policy = SamplingPolicy::new(configuration, CONSTRAINT_TEST_VOCABULARY);
+        let mut scored_constraint = constrained_run(1_024);
+        let mut unscored_constraint = constrained_run(1_024);
+        let mut logits = vec![-100.0; CONSTRAINT_TEST_VOCABULARY];
+        logits[6] = 0.0;
+        logits[10] = 1.0;
+        logits[14] = 3.0;
+        logits[15] = 4.0;
+
+        let scored = scored_policy
+            .sample_constrained(&mut scored_constraint, &logits, true)
+            .expect("sampled constrained receipt");
+        let unscored = unscored_policy
+            .sample_constrained(&mut unscored_constraint, &logits, false)
+            .expect("same sampled constrained draw without scores");
+        assert_eq!(scored.0, unscored.0);
+        assert!(unscored.1.is_none());
+
+        let receipt = scored.1.expect("requested constrained scores");
+        let selected = f64::from(logits[usize::try_from(scored.0).expect("token ID")]);
+        let allowed_log_sum = (1.0_f64 + (-1.0_f64).exp()).ln();
+        let model_log_sum = (1.0_f64
+            + (-1.0_f64).exp()
+            + (-3.0_f64).exp()
+            + (-4.0_f64).exp()
+            + 14.0 * (-104.0_f64).exp())
+        .ln();
+        let model_logprob = receipt["model_logprob"].as_f64().expect("raw p");
+        let constrained_logprob = receipt["constrained_logprob"]
+            .as_f64()
+            .expect("grammar conditional p");
+        let allowed_log_mass = receipt["allowed_log_mass"]
+            .as_f64()
+            .expect("allowed p mass");
+        let sampling_logprob = receipt["sampling_logprob"].as_f64().expect("deployed q");
+        assert!((model_logprob - (selected - 4.0 - model_log_sum)).abs() < 1e-12);
+        assert!((constrained_logprob - (selected - 1.0 - allowed_log_sum)).abs() < 1e-12);
+        assert!((allowed_log_mass - (-3.0 + allowed_log_sum - model_log_sum)).abs() < 1e-12);
+        assert!(
+            (sampling_logprob - (2.0 * selected - (1.0_f64 + 2.0_f64.exp()).ln())).abs() < 1e-12
+        );
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn failed_sampled_constraint_preserves_rng_and_grammar_state() {
+        let configuration = SamplingConfiguration {
+            seed: 13,
+            temperature: 1.0,
+        };
+        let mut policy = SamplingPolicy::new(configuration, CONSTRAINT_TEST_VOCABULARY);
+        let mut constraint = constrained_run(3);
+        for (token_id, expected) in [(6, "t"), (7, "tr"), (8, "tru")] {
+            let token = policy
+                .sample_constrained(&mut constraint, &forced_constraint_logits(token_id), false)
+                .expect("bounded categorical prefix");
+            assert_eq!(token.0, i32::try_from(token_id).expect("small test token"));
+            assert_eq!(constraint.decoded_bytes(), expected.as_bytes());
+        }
+        let mut expected_rng = policy.rng.clone();
+        assert!(
+            policy
+                .sample_constrained(&mut constraint, &forced_constraint_logits(9), false)
+                .is_err()
+        );
+        assert_eq!(constraint.decoded_bytes(), b"tru");
+        assert!(!constraint.is_complete());
+        assert_eq!(policy.rng.next_u64(), expected_rng.next_u64());
     }
 
     #[test]

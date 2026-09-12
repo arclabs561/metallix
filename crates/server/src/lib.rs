@@ -151,7 +151,6 @@ enum Command {
         #[arg(long)]
         logprobs: bool,
         /// Enable explicit reproducible categorical sampling; requires --temperature and --seed.
-        #[cfg_attr(feature = "structured-output", arg(conflicts_with = "json_schema"))]
         #[arg(long, requires_all = ["temperature", "seed"])]
         sample: bool,
         /// Positive finite categorical-sampling temperature; requires --sample.
@@ -1202,23 +1201,29 @@ mod tests {
 
     #[cfg(all(feature = "metal", feature = "structured-output"))]
     #[test]
-    fn sampled_generation_rejects_a_json_schema_before_runtime() {
-        assert!(
-            Cli::try_parse_from([
-                "mx",
-                "gen",
-                "--model",
-                "model",
-                "--sample",
-                "--temperature",
-                "1",
-                "--seed",
-                "3",
-                "--json-schema",
-                "schema.json",
-            ])
-            .is_err()
-        );
+    fn sampled_generation_accepts_a_json_schema_before_runtime() {
+        let cli = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--sample",
+            "--temperature",
+            "1",
+            "--seed",
+            "3",
+            "--json-schema",
+            "schema.json",
+        ])
+        .expect("sampled constrained generation arguments");
+        assert!(matches!(
+            cli.command,
+            super::Command::GenerateQwenMetal {
+                sample: true,
+                json_schema: Some(path),
+                ..
+            } if path == std::path::Path::new("schema.json")
+        ));
     }
 
     #[cfg(feature = "metal")]

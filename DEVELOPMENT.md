@@ -177,9 +177,24 @@ target/release/mx gen --model /path/to/Qwen3-0.6B \
 ```
 
 All three sampling flags are required together. Temperature must be finite and
-positive; omitting them preserves greedy behavior. This first sampling path
-supports resident and streamed execution, but rejects `--json-schema` rather
-than silently ignoring the schema. It does not apply top-k or top-p truncation.
+positive; omitting them preserves greedy behavior. Sampling supports resident
+and streamed execution, including `--json-schema`. It does not apply top-k or
+top-p truncation.
+
+For reproducible schema-constrained sampling:
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --input-ids 9707,11,1879 --max-tokens 29 \
+  --json-schema fixtures/constraints/record.json \
+  --sample --temperature 0.7 --seed 42 --logprobs --preview
+```
+
+The grammar mask is applied before sampling. A rejected draw commits neither
+the random stream nor the grammar. `constrained_logprob` and `allowed_log_mass`
+describe the temperature-one grammar restriction; `sampling_logprob` describes
+the actual temperature-conditioned masked policy. This local conditioning is
+not sampling from the model conditioned on eventual whole-sequence validity.
 
 The report records `sampling_policy`, including the RNG, seed, temperature and
 uniform conversion. With `--logprobs`, `model_logprob` remains the selected
@@ -189,14 +204,23 @@ temperature-conditioned sampling policy.
 Replay requires the same policy and model execution, not just the same seed:
 different logits or floating-point execution can select different tokens.
 
-Local qualification on an M3 Max (FP32 Qwen3-0.6B): the command above produced
-IDs `13,21927,11,1879`. A repeated run reproduced IDs and both log-probability
+Local qualification on an M3 Max (FP32 Qwen3-0.6B): the unconstrained four-token
+command produced IDs `13,21927,11,1879`. A repeated run reproduced IDs and both log-probability
 fields exactly; disabling scores preserved IDs. The streamed path with the
 budgets below matched IDs and scores exactly on this prompt. Greedy selection
 still produced `13,358,2776,264`, and the schema example remained independently
 validated. These are bounded replay checks, not cross-device reproducibility
 or throughput guarantees. Local receipts are in
 `artifacts/sampling-{resident-42-*,streamed-42,greedy-control,schema-control}.json`.
+
+The sampled-schema command above also passed locally: all four runs (resident,
+repeat, scores disabled, streamed) independently validated
+`{"status":"ready","count":1}` and selected the same 12 token IDs. The three
+scored runs matched all four probability fields exactly. Redirected preview
+contained the probability diagnostics without ANSI escapes; stdout remained
+JSON. These are same-checkpoint correctness checks, not speedup measurements.
+Receipts: `artifacts/sampled-schema-{resident-a,resident-b,unscored,streamed}.json`
+and `artifacts/sampled-schema-preview.stderr`.
 
 For bounded layer-streamed generation, use:
 

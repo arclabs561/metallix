@@ -90,11 +90,58 @@ impl ConstraintRun {
         Ok((i32::try_from(token_id)?, scores))
     }
 
+    /// Samples one grammar-allowed token from caller-supplied uniform entropy.
+    ///
+    /// The caller retains responsibility for committing its entropy source only
+    /// after this method succeeds. The model vocabulary is checked for the
+    /// server's signed token-ID boundary before the grammar session can advance.
+    pub(crate) fn sample_categorical(
+        &mut self,
+        logits: &[f32],
+        temperature: f64,
+        uniform: f64,
+        logprobs: bool,
+    ) -> Result<(i32, Option<Value>), Box<dyn std::error::Error>> {
+        let maximum_token_id = logits
+            .len()
+            .checked_sub(1)
+            .ok_or("sampled constrained generation requires nonempty logits")?;
+        i32::try_from(maximum_token_id)
+            .map_err(|_| "model vocabulary cannot be represented by server token IDs")?;
+
+        let started = Instant::now();
+        let (step, scores) =
+            self.session
+                .select_categorical_with_logprobs(logits, temperature, uniform)?;
+        self.sampling_ms
+            .push(started.elapsed().as_secs_f64() * 1000.0);
+        let token_id = match step {
+            ConstraintStep::Token { token_id } => token_id,
+            ConstraintStep::Complete { token_id } => {
+                self.complete = true;
+                token_id
+            }
+        };
+        let scores = logprobs.then(|| {
+            json!({
+                "model_logprob": scores.model_logprob,
+                "constrained_logprob": scores.constrained_logprob,
+                "allowed_log_mass": scores.allowed_log_mass,
+                "sampling_logprob": scores.sampling_logprob,
+            })
+        });
+        Ok((i32::try_from(token_id)?, scores))
+    }
+
     pub(crate) fn is_complete(&self) -> bool {
         self.complete
     }
 
-    pub(crate) fn report(&self, verbose: bool) -> Result<Value, Box<dyn std::error::Error>> {
+    pub(crate) fn report(
+        &self,
+        verbose: bool,
+        sampled: bool,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
         let started = Instant::now();
         let output = if self.complete {
             Some(self.session.validate_complete()?)
@@ -120,8 +167,29 @@ impl ConstraintRun {
             "schema_json_sha256": self.schema_json_sha256,
             "tokenizer_json_sha256": self.tokenizer_json_sha256,
             "identity_scope": "SHA-256 of parsed JSON reserialized by serde_json, not original file bytes; binds constraint inputs, not checkpoint weights",
-            "scope": "LLGuidance masks; independent JSON Schema validation; greedy sampling; no forced-token fast-forward; incomplete output is not success"
+            "scope": if sampled {
+                "LLGuidance masks; independent JSON Schema validation; caller-variate categorical sampling; no forced-token fast-forward; incomplete output is not success"
+            } else {
+                "LLGuidance masks; independent JSON Schema validation; greedy sampling; no forced-token fast-forward; incomplete output is not success"
+            }
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decoded_bytes(&self) -> &[u8] {
+        self.session.decoded_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_session(session: JsonConstraintSession) -> Self {
+        Self {
+            session,
+            setup_ms: 0.0,
+            sampling_ms: Vec::new(),
+            complete: false,
+            schema_json_sha256: String::new(),
+            tokenizer_json_sha256: String::new(),
+        }
     }
 }
 
