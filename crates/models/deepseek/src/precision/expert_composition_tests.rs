@@ -386,11 +386,24 @@ fn fp4_routed_and_fp8_shared_outputs_join_before_final_bf16_cast() {
 
 #[test]
 fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
-    // This supplies logits directly. It qualifies the text-route/expert join,
-    // not the gate projection or a complete `MoE` block.
-    let routes =
-        crate::flash_sqrt_softplus_routes(&[0.0, 1.0, 3.0], &[0.0, 0.0, -10.0], 2, 1.0, true, 1.0)
-            .expect("finite distinct selected expert scores");
+    // This qualifies the BF16 gate/text-route/expert join, not a complete
+    // `MoE` block or a hardware gate-projection oracle.
+    let input = [0x3f80_u16; WIDTH]; // The same BF16 row feeds gate and experts.
+    let mut gate_weights = [0x0000_u16; 3 * WIDTH];
+    gate_weights[WIDTH] = 0x3f80; // expert 1: dot 1
+    gate_weights[2 * WIDTH..2 * WIDTH + 3].fill(0x3f80); // expert 2: dot 3
+    let routes = crate::routing::flash_bf16_gate_routes(
+        &input,
+        &gate_weights,
+        3,
+        WIDTH,
+        &[0.0, 0.0, -10.0],
+        2,
+        1.0,
+        true,
+        1.0,
+    )
+    .expect("finite distinct BF16 gate projections");
     assert_eq!(
         routes
             .iter()
@@ -413,7 +426,6 @@ fn two_flash_selected_fp4_experts_and_one_fp8_shared_expert_compose() {
         (score1 / denominator).to_bits()
     );
 
-    let input = [0x3f80_u16; WIDTH];
     let expert0_weights = uniform_weight(0x11); // FP4 +0.5
     let expert1_weights = uniform_weight(0x22); // FP4 +1.0
     let (expert0, _) = routed_expert(

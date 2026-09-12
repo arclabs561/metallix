@@ -304,14 +304,26 @@ tie order. Within-selected-set ties and scalar reductions are not hardware
 bit-parity guarantees. Gate projection and vision bias selection remain
 unimplemented by this function.
 
+`routing::flash_bf16_gate_routes` now supplies that projection for one BF16
+hidden row and a row-major BF16 gate matrix. It promotes both operands to
+FP32, checks each scalar product and accumulation, and feeds the logits into
+the same routing helper. The explicit work bound is 4,194,304 matrix elements.
+The pinned source's `Gate.forward` explicitly calls `.float()` on both
+operands; the captured shard-09 header records `layers.6.ffn.gate.weight` as
+BF16 `[384, 5120]`. The source's module-local FP8 `default_dtype` selects
+`Linear` storage, not Torch's global default used by the gate. This software
+dot reference does not establish hardware reduction parity or load weights.
+
 The reduced fixture uses width/intermediate width 32, three candidate experts,
 Top-2 selection, gate temperature 1, route scale 1, and SwiGLU limit 4, with
 synthetic weights. These are test settings, not the released Flash dimensions
 or its route scale. The reduced composition selects two distinct FP4 experts while correction
 bias excludes the highest raw-logit expert. Their down projections give
 hand-derived outputs 104 and 288, and the unweighted FP8 shared expert gives
-256; final BF16 output is 648. This joins routing to quantized experts, not
-the gate projection, a complete block, or pretrained-model execution.
+256; final BF16 output is 648. The same 32-wide BF16 hidden row now feeds
+the synthetic `[3, 32]` gate matrix and every expert; the gate produces logits
+`[0, 1, 3]`. This joins gate projection, routing, and quantized experts, not a
+complete block or pretrained-model execution.
 
 ## Serving-side choices
 
