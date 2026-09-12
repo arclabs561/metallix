@@ -18,6 +18,9 @@ pub use metal::{SparseAttentionMetalError, sparse_attention_metal_f32};
 #[cfg(all(test, feature = "metal"))]
 mod composition_tests;
 
+#[cfg(test)]
+mod preparation_tests;
+
 /// Validated dense buffers and sparse-index shape for one attention call.
 ///
 /// Query values are contiguous `[batch, query_position, head, dimension]`;

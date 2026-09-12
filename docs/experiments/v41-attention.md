@@ -5,6 +5,38 @@ official V4.1 [`sparse_attn_kernel`](https://huggingface.co/deepseek-ai/DeepSeek
 It is deliberately an operator gate, not a V4.1 text-forward implementation or
 a performance result.
 
+## Attention input preparation
+
+The separate scalar tests in
+[`preparation_tests.rs`](../../crates/models/deepseek/src/attention/preparation_tests.rs)
+compose synthetic FP8 projections, BF16 RMSNorm, and tail RoPE before attention.
+The pinned [model source](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L27)
+sets FP8 grouping to **32**, overriding the quantization and GEMM wrappers'
+128-element defaults. The query path is `wq_a → q_norm → wq_b → tail RoPE`;
+each projection stores BF16. Ordinary attention queries are not the indexer's
+FP4-quantized queries.
+
+The hand-calculated test starts with width-32 BF16 ones. The first projection
+produces halves of 16 and 32; normalization stores 0.6328125 and 1.265625.
+The next projection quantizes those activations to 0.625 and 1.25 and produces
+two synthetic heads of 15 and −30. A quarter-turn rotates only each head's last
+pair, leaving the other components unchanged. These are deliberately small
+synthetic dimensions, not checkpoint dimensions.
+
+Window KV follows `wkv → kv_norm → tail RoPE → FP8 round trip`. The new
+[`requantize_bf16_activations_e4m3fn`](../../crates/models/deepseek/src/precision/roundtrip.rs)
+models that final G32 E4M3FN/E8M0 quantize/dequantize operation: the resulting
+cache values are still BF16, not physically packed FP8. It bounds allocation,
+preserves signed zero, and leaves output untouched on error. Unlike the source
+kernel, it rejects nonfinite reconstruction. Compressed KV's FP4/G16 path is
+distinct and is not implemented by this helper.
+
+These tests do not qualify ring-cache updates, compressed-cache ownership,
+attention-probability BF16 rounding, output projections, or full-model logits.
+They are software reference compositions, not GPU-cast parity or speed results.
+
+## Sparse-attention operator
+
 The explicit input layouts are query `[batch, query, head, dimension]`, shared
 KV `[batch, key, dimension]`, sparse indices `[batch, query, slot]`, and one
 sink logit per head. An index is either `-1` (empty) or a shared-KV position.

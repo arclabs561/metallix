@@ -17,6 +17,10 @@ mod linear;
 pub use linear::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
 mod fp8_linear;
 pub use fp8_linear::{Fp8LinearError, fp8_linear_runtime_f32};
+mod roundtrip;
+pub use roundtrip::{
+    ActivationRoundtripError, MAX_ACTIVATION_ROUNDTRIP_ELEMENTS, requantize_bf16_activations_e4m3fn,
+};
 
 #[cfg(test)]
 mod expert_composition_tests;
