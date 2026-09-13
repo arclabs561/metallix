@@ -12,6 +12,7 @@ explicit gaps, not retrospectively pinned evidence.
 | What does V4.1 require, and what do its optimizations actually mean? | [Efficiency requirements](efficiency-methods.md) |
 | What might let a model exceed a Mac's RAM? | [Host-memory investigation](host-memory.md) |
 | How does the runtime compare with existing systems and emerging model families? | [Architecture landscape](architecture-landscape.md) |
+| Which mathematical proposals survived checking, and what remains hypothetical? | [Math corrections and experiment gates](math-validation.md) |
 | Which precision and quantization ideas are faithful formats versus new quality experiments? | [Quantization and precision](quantization-precision.md) |
 | What gates separate categorical sampling, particle control, and calibrated uncertainty? | [Sampling implementation gates](sampling-next-gates.md) |
 | How would diffusion text generation differ from the token-step decoder? | [Diffusion text models](diffusion-text.md) |
@@ -32,6 +33,7 @@ is still pending where the ledger says excerpts or selected sections.
 |---|---|---|
 | Memory and file I/O | [Metal memory](metal-memory.md) | Storage modes, allocation ownership, residency and measured working sets |
 | GPU execution | [Metal execution](metal-execution.md) | Queue ordering, synchronization and resource lifetime |
+| Rust backend boundary | [MLX and Metal](mlx-backend.md) | What executes today, lazy graphs, binding exposure and custom-kernel choices |
 | Kernels and profiling | [Metal kernels](metal-kernels.md) | Threadgroups, specialization, matrix APIs and counter-driven experiments |
 | Training | [Training efficiency](training-efficiency.md) | Rematerialization, precision, microbatching and adapters |
 | Serving | [Serving efficiency](serving-efficiency.md) | Attention, batching, KV reuse, speculation and offload |

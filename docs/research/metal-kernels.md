@@ -17,9 +17,36 @@ three checks:
 The [Metal Feature Set Tables](https://developer.apple.com/metal/limits/) list
 `MTLDataType.bfloat` scalar/vector cases from Apple family 6, so M3 clears that
 hardware-family floor. This establishes a type-availability floor, not a
-throughput claim or a V4.1 numerical-accuracy budget. FP4 is not established
-by the reviewed Apple sources as a native arithmetic type: begin with explicit
-packed-load, group-scale, conversion, and accumulation semantics.
+throughput claim or a V4.1 numerical-accuracy budget. Apple's newer TensorOps
+documentation establishes low-bit tensor formats, not arbitrary scalar FP4
+arithmetic or compatibility with V4.1's formats; see the version ledger below.
+Begin with explicit packed-load, group-scale, conversion, and accumulation
+semantics.
+
+### TensorOps version ledger
+
+The full [WWDC26 TensorOps session](https://developer.apple.com/videos/play/wwdc2026/330/)
+distinguishes these generations. They are API availability statements, not
+benchmarks or proof of exposure through the locked Rust/MLX stack.
+
+| Operation | Documented software generation | Remaining implementation gate |
+|---|---|---|
+| Metal 4 inline tensor matmul | macOS/Xcode 26+ in [Apple's sample](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4) | Device support, exact types/layout, pipeline creation and parity |
+| TensorOps INT4/INT8 formats | macOS/iOS 26 | Scale/packing contract and typed operation support |
+| TensorOps FP4/FP8/INT2 formats | macOS/iOS 27 | New SDK/runtime; exact format/scale-plane equivalence |
+| Cooperative tensor used directly as a matmul input | macOS 27-era path described in WWDC26; macOS 26 uses staging | API availability plus left/right input compatibility check; no backdeployment established |
+
+The inspected development baseline is macOS 26.6.2, Xcode 26.2, SDK 26.2.
+Version-27 features are therefore future probes, not capabilities established
+on this baseline. No toolchain upgrade or new GPU probe was performed by this
+documentation pass. The [MLX boundary guide](mlx-backend.md) separates core
+capability from Rust API exposure.
+
+The session's FP8 example uses E4M3 data with an E8M0 scale plane and `[32,1]`
+blocks. Matching those type names is insufficient: logical extents, strides,
+scale orientation, rounding, output and accumulator types must also agree.
+V4.1 main KV uses per-16-channel E4M3 scales, while its index representation
+uses G32/E8M0. Neither follows from an undifferentiated FP4 feature flag.
 
 ### Important matrix-operation correction
 
@@ -27,7 +54,7 @@ There are two similarly named but different facilities:
 
 - **Legacy MSL `simdgroup_matrix`** types and
   `simdgroup_multiply[_accumulate]` are the cooperative 8-by-8 matrix API.
-  The current MSL specification search extract says SIMD-group matrix types
+  The MSL 4.1 specification's §2.4 says SIMD-group matrix types
   have existed since Metal 2.3; legacy `half` and `float` forms predate Metal
   4, while the `bfloat` form is MSL 3.1 or later. Every participating lane must
   execute its operations under uniform SIMD-group control flow, and the mapping
@@ -38,15 +65,13 @@ There are two similarly named but different facilities:
   legacy MSL API above. It denotes a newer feature-table category. Any code
   using that newer facility needs its own Metal-4/runtime gate.
 
-The [official Metal resources page](https://developer.apple.com/metal/resources/)
-identifies the Metal Shading Language Specification as definitive. Its linked
-PDF did not render in the research reader, so the legacy-version/type summary
-above comes from a current indexed specification extract rather than a
-line-audited official PDF. Before writing a matrix kernel, verify the locally
-installed current MSL specification sections **2.4 SIMD-group Matrix Data
-Types** and **6.7 SIMD-group Matrix Functions**, and compile a capability probe
-for its exact MSL target. This documented gap is intentional: it is safer than
-inventing matrix layouts or operation support from CUDA/WGSL conventions.
+The [MSL 4.1 specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf),
+dated 2026-06-04, was checked at **§2.4 SIMD-group Matrix Data Types**,
+**§6.8 SIMD-group Matrix Functions**, and **§6.10.1 barriers**. This replaces
+the earlier indexed-excerpt-only evidence, not a full-spec review. Loads/stores
+have explicit memory space, row stride, origin and transpose parameters.
+Compile a capability probe for the installed MSL target before implementation;
+do not invent matrix lane layouts from CUDA/WGSL conventions.
 
 ## Execution shape, registers, and threadgroup memory
 
@@ -164,6 +189,10 @@ requires checking `is_compatible_as_left_input` or
 `is_compatible_as_right_input` first: element type and operation layout may
 make direct reuse invalid. The required fallback is store to threadgroup memory,
 barrier, load with the target operation's cooperative layout, then run.
+The barrier scope must match the producer/consumer scope: a SIMD-group barrier
+only covers a handoff within that group. Cross-SIMD-group exchange requires
+threadgroup synchronization. Do not copy the sample's narrower barrier into a
+different tile ownership scheme.
 
 Treat direct reuse as a qualified prefill/attention optimization, not as a
 general register-passing primitive or a GDN substitute. A correct probe must
@@ -237,7 +266,7 @@ resource backpressure. A counter is a hypothesis discriminator, not a score.
 | [Build GPU binaries with Metal](https://developer.apple.com/videos/play/wwdc2020/10615/) | Complete transcript | AIR-to-device pipeline compilation and binary archives. |
 | [MLX-LM packed Gated DeltaNet source](https://github.com/ml-explore/mlx-lm/blob/dcbcf786c0cf56f9a12fabe9468c887781431ae2/mlx_lm/models/gated_delta.py#L233-L480) | Revision-pinned source | Scalar, unmasked `Dk=128`/FP32 packed state mapping and its explicit reduction contract. |
 | [Optimize custom ML operations with Metal tensors](https://developer.apple.com/videos/play/wwdc2026/330/) | Complete transcript | Cooperative-tensor compatibility check, direct reuse, and threadgroup fallback. |
-| [Metal resources](https://developer.apple.com/metal/resources/) | Complete page | Official MSL-specification link; linked PDF could not be read in this research environment. |
+| [MSL 4.1 specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) | §§2.4, 6.8 and 6.10.1; dated 2026-06-04 | Matrix type/function and barrier contracts; not full-spec coverage. |
 
 No external MLX or llama.cpp source was copied or adapted here. No GPU build,
 benchmark, or implementation is implied by this research note.
