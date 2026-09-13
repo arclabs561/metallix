@@ -15,6 +15,9 @@ published release; reference operators do not imply full-model support.
 - Native FP32 output-head comparison using hidden states and encoded weights
   from the complete synthetic V4.1 source capture, with a fixed dot-product
   error bound and wrong-position/vocabulary-order negative controls.
+- Native final HC collapse and RMSNorm joined to that output head. All seven
+  captured prefill/decode positions match the source's BF16 intermediate bits;
+  final-block state and coefficients remain source-provided.
 - Bounded FP32 linear reference with atomic output writes and no BF16
   narrowing. Compressor fixture tests now execute BF16/FP32 projection
   matrices before native pooling and normalization.

@@ -1,11 +1,13 @@
 //! Consume the final-head boundary from a complete synthetic source forward.
 //!
-//! This executes the native FP32 linear, not a native full-model graph. The
-//! comparison policy is fixed before candidate execution: two FP32 dot-product
+//! This executes native final HC collapse, `RMSNorm` and FP32 linear, not a
+//! full-model graph. The comparison policy is fixed before candidate execution:
+//! two FP32 dot-product
 //! error bounds, each gamma(2K) * sum(abs(x*w)), with u = 2^-24. It permits
 //! reduction-order differences, not arbitrary relative error near cancellation.
 
 use deepseek::precision::fp32_linear_reference;
+use deepseek::{hc::mixing::hc_pre_bf16_reference, rms_norm_bf16_reference};
 use serde::Deserialize;
 
 const WIDTH: usize = 128;
@@ -19,6 +21,8 @@ struct Fixture {
     weight_fp32_bits: Vec<u32>,
     cases: Vec<Case>,
     comparison_policy: Policy,
+    norm_weight_bf16: Vec<u16>,
+    norm_epsilon_bits: u32,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +41,11 @@ struct Case {
     input_bf16: Vec<u16>,
     logits_shape: [usize; 2],
     logits_fp32_bits: Vec<u32>,
+    final_block_shape: [usize; 4],
+    final_block_bf16: Vec<u16>,
+    final_pre_shape: [usize; 3],
+    final_pre_fp32_bits: Vec<u32>,
+    collapsed_bf16: Vec<u16>,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +64,8 @@ fn fixture() -> Fixture {
     assert_eq!(fixture.weight_shape, [VOCAB, WIDTH]);
     assert_eq!(fixture.weight_fp32_bits.len(), VOCAB * WIDTH);
     assert_eq!(fixture.cases.len(), 3);
+    assert_eq!(fixture.norm_weight_bf16.len(), WIDTH);
+    assert_eq!(fixture.norm_epsilon_bits, 1e-20_f32.to_bits());
     assert_eq!(
         fixture.source.revision,
         "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -83,6 +94,11 @@ fn fixture() -> Fixture {
         assert_eq!(case.input_bf16.len(), positions * WIDTH);
         assert_eq!(case.logits_shape, [1, VOCAB]);
         assert_eq!(case.logits_fp32_bits.len(), VOCAB);
+        assert_eq!(case.final_block_shape, [1, positions, 2, WIDTH]);
+        assert_eq!(case.final_block_bf16.len(), positions * 2 * WIDTH);
+        assert_eq!(case.final_pre_shape, [1, positions, 2]);
+        assert_eq!(case.final_pre_fp32_bits.len(), positions * 2);
+        assert_eq!(case.collapsed_bf16.len(), positions * WIDTH);
     }
     fixture
 }
@@ -195,5 +211,86 @@ fn source_fixture_distinguishes_first_token_from_last_and_vocabulary_order() {
     assert!(
         !agrees(&logits(&last, &reversed), &case.logits_fp32_bits, &limits),
         "reversing vocabulary rows must not qualify"
+    );
+}
+
+#[test]
+fn native_final_hc_collapse_norm_and_head_match_source_forward() {
+    let fixture = fixture();
+    let weights: Vec<f32> = fixture
+        .weight_fp32_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    for case in &fixture.cases {
+        let mut normalized = vec![0_u16; WIDTH];
+        for position in 0..case.input_shape[1] {
+            let residual = &case.final_block_bf16[position * 2 * WIDTH..(position + 1) * 2 * WIDTH];
+            let pre: Vec<f32> = case.final_pre_fp32_bits[position * 2..(position + 1) * 2]
+                .iter()
+                .copied()
+                .map(f32::from_bits)
+                .collect();
+            let mut collapsed = vec![0_u16; WIDTH];
+            hc_pre_bf16_reference(residual, &pre, WIDTH, &mut collapsed)
+                .expect("native final HC collapse");
+            assert_eq!(
+                collapsed,
+                case.collapsed_bf16[position * WIDTH..(position + 1) * WIDTH],
+                "exact BF16 collapse at start {}, position {position}",
+                case.start_pos
+            );
+            rms_norm_bf16_reference(
+                &collapsed,
+                &fixture.norm_weight_bf16,
+                f32::from_bits(fixture.norm_epsilon_bits),
+                &mut normalized,
+            )
+            .expect("native final normalization");
+            assert_eq!(
+                normalized,
+                case.input_bf16[position * WIDTH..(position + 1) * WIDTH],
+                "exact BF16 normalization at start {}, position {position}",
+                case.start_pos
+            );
+        }
+        let native_input: Vec<f32> = normalized
+            .iter()
+            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+            .collect();
+        let limits = bounds(&native_input, &weights, &fixture.comparison_policy);
+        assert!(
+            agrees(
+                &logits(&native_input, &weights),
+                &case.logits_fp32_bits,
+                &limits
+            ),
+            "native tail logits at start {}",
+            case.start_pos
+        );
+    }
+}
+
+#[test]
+fn tail_fixture_rejects_bypassing_hc_or_normalization() {
+    let fixture = fixture();
+    let case = &fixture.cases[0];
+    let mut bypassed_hc = vec![0_u16; WIDTH];
+    hc_pre_bf16_reference(
+        &case.final_block_bf16[..2 * WIDTH],
+        &[1.0, 0.0],
+        WIDTH,
+        &mut bypassed_hc,
+    )
+    .expect("one-copy negative control");
+    assert_ne!(
+        bypassed_hc,
+        case.collapsed_bf16[..WIDTH],
+        "passing one residual copy through must not match HC collapse"
+    );
+    assert_ne!(
+        case.collapsed_bf16, case.input_bf16,
+        "omitting final normalization must change the observed boundary"
     );
 }

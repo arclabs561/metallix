@@ -93,4 +93,15 @@ dot-product roundoff bounds, each `gamma(2K) * sum(abs(x*w))`, with
 a guard for that evaluation's own roundoff. This is input-dependent absolute
 error, not a blanket relative tolerance near cancellation. Finite normal
 arithmetic without underflow/overflow is required. The test qualifies this
-head boundary only; the hidden states still come from the source graph.
+head boundary only.
+
+The tail-composition test now starts earlier, from the captured final-block
+residual copies and returned pre-mix coefficients. Native HC collapse and
+RMSNorm must match the source BF16 storage exactly at all seven positions;
+the native normalized last row then feeds the output head under the same
+unchanged dot-product bound. The collapsed reference is observed by a pre-hook
+on the source's final norm, not recomputed by the fixture exporter. Controls
+reject passing through one residual copy and omitting normalization.
+
+Final-block execution and derivation of its pre-mix coefficients still come
+from the source graph; this qualifies the native tail, not the full Rust model.

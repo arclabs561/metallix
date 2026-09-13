@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import platform
+import struct
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -43,7 +44,10 @@ TRACE_INPUT_IDS = ((0, 1, 2, 3, 4, 5, 6),)
 MAX_HOOK_RECORDS = 96
 SAMPLE_VALUES = 8
 MAX_CAPTURE_BYTES = 16 << 20
-MAX_HEAD_FIXTURE_BYTES = 30 << 10
+# HC state and its source-produced collapse are both exact bit fixtures.  Keep
+# the expanded oracle intentionally bounded, while allowing the three pinned
+# prefill/decode cases to retain all required representations.
+MAX_HEAD_FIXTURE_BYTES = 48 << 10
 
 sys.path.insert(0, str(SCRIPTS))
 import v41_cpu_kernels as kernels
@@ -277,6 +281,20 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
 
         return hook
 
+    def capture_input(name: str):
+        """Capture a selected module's source input without recomputing it."""
+
+        def hook(_module: torch.nn.Module, inputs: tuple[object, ...]) -> None:
+            if len(records) >= MAX_HOOK_RECORDS:
+                raise RuntimeError("hook receipt cap reached")
+            if len(inputs) != 1:
+                raise RuntimeError(
+                    f"expected one source input for {name}, got {len(inputs)}"
+                )
+            records[name] = object_record(inputs[0], include_storage=True)
+
+        return hook
+
     for name, module in model.named_modules():
         pieces = name.split(".")
         selected = (
@@ -302,6 +320,13 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
             # Source block, Engram, attention, compressor/indexer and routing
             # boundaries are sufficient to reconstruct this bounded graph trace.
             handles.append(module.register_forward_hook(capture(name)))
+        if name == "norm":
+            # The final HC collapse is passed directly to RMSNorm.  Retain the
+            # source-produced input rather than reimplementing either operation
+            # while exporting a test fixture.
+            handles.append(
+                module.register_forward_pre_hook(capture_input("norm_input"))
+            )
     try:
         yield records
     finally:
@@ -680,8 +705,14 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
     ):
         raise TypeError("complete capture has an invalid head-fixture shape")
     weight = encoded.get("head.weight")
+    norm_weight = encoded.get("norm.weight")
+    model_args = receipt.get("model_args")
     if not isinstance(weight, dict):
         raise TypeError("complete capture did not record head.weight")
+    if not isinstance(norm_weight, dict):
+        raise TypeError("complete capture did not record norm.weight")
+    if not isinstance(model_args, dict):
+        raise TypeError("complete capture did not record model args")
     weight_shape = weight.get("shape")
     if (
         not isinstance(weight_shape, list)
@@ -689,6 +720,10 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
         or any(not isinstance(width, int) or width <= 0 for width in weight_shape)
     ):
         raise RuntimeError("head.weight must be a nonempty rank-two tensor")
+    norm_eps = model_args.get("norm_eps")
+    if not isinstance(norm_eps, (int, float)) or not float(norm_eps) > 0:
+        raise RuntimeError("head fixture requires a positive source norm_eps")
+    norm_epsilon_bits = struct.unpack("<I", struct.pack("<f", float(norm_eps)))[0]
 
     cases: list[dict[str, object]] = []
     for step in steps:
@@ -700,9 +735,21 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
         if not isinstance(start_pos, int) or not isinstance(intermediates, dict):
             raise TypeError("complete capture step lacks source boundaries")
         norm = intermediates.get("norm")
+        norm_input = intermediates.get("norm_input")
+        final_block = intermediates.get("layers.4")
         if not isinstance(norm, dict) or not isinstance(logits, dict):
             raise TypeError("complete capture step lacks final norm or logits")
+        if not isinstance(norm_input, dict) or not isinstance(final_block, list):
+            raise TypeError("complete capture step lacks final HC boundaries")
+        if len(final_block) != 2 or not all(
+            isinstance(value, dict) for value in final_block
+        ):
+            raise TypeError("final source block must return exactly two tensors")
+        final_block_state, final_pre_mix = final_block
         input_shape = norm.get("shape")
+        collapsed_shape = norm_input.get("shape")
+        final_block_shape = final_block_state.get("shape")
+        final_pre_shape = final_pre_mix.get("shape")
         logits_shape = logits.get("shape")
         if (
             not isinstance(input_shape, list)
@@ -711,6 +758,18 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
             or len(logits_shape) != 2
         ):
             raise RuntimeError("head fixture source tensors have unexpected rank")
+        if (
+            collapsed_shape != input_shape
+            or not isinstance(final_block_shape, list)
+            or len(final_block_shape) != 4
+            or not isinstance(final_pre_shape, list)
+            or len(final_pre_shape) != 3
+            or final_block_shape[:2] != input_shape[:2]
+            or final_pre_shape[:2] != input_shape[:2]
+            or final_pre_shape[-1] != final_block_shape[-2]
+            or final_block_shape[-1] != input_shape[-1]
+        ):
+            raise RuntimeError("head fixture HC boundaries have unexpected shapes")
         if input_shape[-1] != weight_shape[1] or logits_shape[-1] != weight_shape[0]:
             raise RuntimeError("head fixture source tensors disagree with head.weight")
         cases.append(
@@ -718,6 +777,17 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "start_pos": start_pos,
                 "input_shape": input_shape,
                 "input_bf16": _storage_bits(norm, width=2, dtype="torch.bfloat16"),
+                "final_block_shape": final_block_shape,
+                "final_block_bf16": _storage_bits(
+                    final_block_state, width=2, dtype="torch.bfloat16"
+                ),
+                "final_pre_shape": final_pre_shape,
+                "final_pre_fp32_bits": _storage_bits(
+                    final_pre_mix, width=4, dtype="torch.float32"
+                ),
+                "collapsed_bf16": _storage_bits(
+                    norm_input, width=2, dtype="torch.bfloat16"
+                ),
                 "logits_shape": logits_shape,
                 "logits_fp32_bits": _storage_bits(
                     logits, width=4, dtype="torch.float32"
@@ -741,6 +811,8 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
         },
         "weight_shape": weight_shape,
         "weight_fp32_bits": _storage_bits(weight, width=4, dtype="torch.float32"),
+        "norm_weight_bf16": _storage_bits(norm_weight, width=2, dtype="torch.bfloat16"),
+        "norm_epsilon_bits": norm_epsilon_bits,
         "cases": cases,
         "comparison_policy": {
             "kind": "two_fp32_dot_error_bounds",
