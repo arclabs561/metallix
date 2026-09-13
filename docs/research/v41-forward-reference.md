@@ -343,8 +343,41 @@ the [pinned attention constructor](https://huggingface.co/deepseek-ai/DeepSeek-V
 This is not a general rule for sharing rotary buffers between models.
 
 `prepare_index_keys` matches the captured final BF16 key bytes at starts
-zero, five and six. The test checks that captured earlier cache prefixes
-remain unchanged and that replaying position-zero frequencies during decode
-changes the result. It does not own a cache or execute the compressor, and
-it does not establish arbitrary Torch/GPU reduction parity. The captured
-weights are from the synthetic reduced model, not the released checkpoint.
+zero, five and six. `IndexKeyState` retains these keys and exposes the complete
+per-batch prefix, compared byte-for-byte with the source cache after each call.
+Replaying position-zero frequencies during decode changes the result.
+`forward_index_attention` feeds this native prefix into the BF16 scorer and
+selector, then passes their selected indices to native layer attention.
+Compressor latents, candidate masks and compressed KV still come from the
+capture. These tests do not execute the compressor or establish arbitrary
+Torch/GPU reduction parity. The captured weights are from the synthetic
+reduced model, not the released checkpoint.
+
+The cache is DeepSeek-local and request-local: it does not reproduce the
+source's process-global shared slots. Its offsets count completed compressed
+positions, not tokens. The caller remains responsible for compression-group
+completion and token continuity. An empty append advances the call ordinal
+without adding a key. Source-layer, epoch and call checks are local safeguards,
+not features of the source implementation. Candidates and selected indices
+have separate ownership. Identity checks guard appends; the current scorer
+accepts a numeric slice and does not authenticate its owner. A future integrated
+indexer must carry publication identity through that consumer boundary. Borrowing
+prevents mutation while a prefix is live, but copied values carry no identity.
+
+Backing storage is `[batch, capacity, key_dimension]`; a valid prefix is a
+separate borrowed slice for each batch. Truncating the entire backing buffer
+would mix capacity padding into multi-batch scoring. Chunking properties cover
+this layout, empty appends, late invalid input, retry and reset. Cache updates
+are atomic individually, not across a later attention or FFN failure. The
+current one-million-element cap bounds a CPU reference cache, not a general
+GPU or larger-than-memory cache manager.
+
+The next capture boundary is layer three's attention input. For this reduced
+model, layer three has compression ratio one: its compressor is BF16 `wkv`
+followed by RMSNorm, with no grouped pooling. Existing linear and compressor
+primitives cover that arithmetic, but the compact key fixture supplies its
+output rather than its input. Capture that earlier input and retain the
+compressor's own weights before replacing the supplied latent. The acceptance
+gate is exact latent bytes followed by the same key-prefix and attention checks.
+A composed owner call must stage compressor and key-cache state together so
+a later key-preparation failure does not advance only the compressor.

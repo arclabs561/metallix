@@ -1,9 +1,8 @@
 //! Source-captured index-selection to layer-attention integration for V4.1.
 //!
 //! This test joins the production index-query prefix, BF16 scorer, strict
-//! selector, and attention adapter. The source QR, shared index keys,
-//! candidate mask, and compressed KV remain explicit fixture boundaries: a
-//! cache-owning indexer is deliberately outside this qualification.
+//! selector, key-cache owner, and attention adapter. The source QR, compressor
+//! latents, candidate mask, and compressed KV remain explicit fixture boundaries.
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -19,6 +18,8 @@ use deepseek::{
     attention::layer::{LayerAttentionError, LayerAttentionState},
     indexer::{
         bf16::index_scores_bf16_reference,
+        cache::{IndexKeyPublicationId, IndexKeyState},
+        key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
         query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
     },
     select_indices,
@@ -215,6 +216,7 @@ fn generated_indices(
     attention_case: &attention_capture::Case,
     layout: IndexQueryLayout,
     weights: IndexQueryWeights<'_>,
+    keys: &[u16],
 ) -> Vec<i32> {
     let model = field(root, "model");
     let indexer = field(raw_case, "indexer");
@@ -255,7 +257,11 @@ fn generated_indices(
         bf16(field(operations, "q_after_rope_fp4")),
         "start {start} index Q"
     );
-    let keys = bf16(field(inputs, "shared_index_k_prefix"));
+    assert_eq!(
+        keys,
+        bf16(field(inputs, "shared_index_k_prefix")),
+        "native owner prefix"
+    );
     let keys_per_position = shape(field(inputs, "shared_index_k_prefix"))[1];
     let mut score_bits = Vec::with_capacity(positions * keys_per_position);
     for position in 0..positions {
@@ -263,7 +269,7 @@ fn generated_indices(
         let weights_start = position * heads;
         let scores = index_scores_bf16_reference(
             &query.query_post_fp4[query_start..query_start + heads * head_dimension],
-            &keys,
+            keys,
             &query.scaled_head_weights[weights_start..weights_start + heads],
             nonzero(head_dimension),
         )
@@ -323,6 +329,10 @@ fn generated_indices(
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the source-capture join keeps owner and consumer evidence together"
+)]
 fn native_index_selection_drives_captured_attention_calls() {
     let raw = raw_fixture();
     let attention = attention_fixture();
@@ -357,6 +367,36 @@ fn native_index_selection_drives_captured_attention_calls() {
     let all_frequencies = frequencies(&attention);
     let attention_weights = attention_weights(&attention.encoded_parameters);
     let mut state = LayerAttentionState::new(attention_layout(&attention.model));
+    let owner: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+    ))
+    .expect("owner fixture");
+    assert_eq!(
+        field(field(&owner, "source"), "complete_capture_sha256").as_str(),
+        Some(CAPTURE_SHA256)
+    );
+    assert_eq!(
+        field(field(&owner, "source"), "revision").as_str(),
+        Some(REVISION)
+    );
+    let owner_model = field(&owner, "model");
+    assert_eq!(usize_field(owner_model, "owner_layer"), 3);
+    assert_eq!(usize_field(owner_model, "batches"), 1);
+    let owner_cases = field(&owner, "cases").as_array().expect("owner calls");
+    assert_eq!(owner_cases.len(), attention.cases.len());
+    let owner_weights = field(&owner, "weights");
+    let wk = bf16(field(owner_weights, "wk"));
+    let norm = bf16(field(owner_weights, "norm"));
+    let key_layout = IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
+        .expect("captured key layout");
+    assert_eq!(usize_field(owner_model, "key_dimension"), head_dimension);
+    let mut key_state = IndexKeyState::new(
+        nonzero(1),
+        nonzero(64),
+        nonzero(usize_field(owner_model, "cache_capacity")),
+        3,
+    )
+    .expect("bounded owner cache");
     for (call_id, (raw_case, attention_case)) in field(&raw, "cases")
         .as_array()
         .expect("raw cases")
@@ -364,8 +404,36 @@ fn native_index_selection_drives_captured_attention_calls() {
         .zip(&attention.cases)
         .enumerate()
     {
-        let indices =
-            generated_indices(&raw, raw_case, attention_case, index_layout, index_weights);
+        let owner_case = &owner_cases[call_id];
+        assert_eq!(
+            usize_field(owner_case, "start_pos"),
+            attention_case.start_pos
+        );
+        let latent = field(owner_case, "latent");
+        let prepared = prepare_index_keys(
+            &bf16(latent),
+            &source_frequencies(&raw, attention_case.start_pos, shape(latent)[1], 16),
+            IndexKeyWeights::new(&wk, &norm),
+            key_layout,
+        )
+        .expect("native owner keys");
+        key_state
+            .append_prepared(
+                IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID")),
+                attention_case.start_pos,
+                &prepared.post_fp4,
+            )
+            .expect("native owner append");
+        let keys = key_state.prefix(0).expect("batch zero");
+        assert_eq!(keys, bf16(field(owner_case, "index_cache_after")));
+        let indices = generated_indices(
+            &raw,
+            raw_case,
+            attention_case,
+            index_layout,
+            index_weights,
+            keys,
+        );
         let compressed = attention_case.compressed_kv.bf16();
         let diagnostic = forward_with_publication(
             &mut state,
@@ -417,6 +485,16 @@ fn generated_prefill_indices(raw: &Value, attention: &attention_capture::Fixture
             wq_b_scales: &wq_b_scales,
             weights_proj: &weights_proj,
         },
+        &bf16(field(
+            field(
+                field(
+                    &field(raw, "cases").as_array().expect("raw cases")[0],
+                    "indexer",
+                ),
+                "inputs",
+            ),
+            "shared_index_k_prefix",
+        )),
     )
 }
 

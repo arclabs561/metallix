@@ -7,20 +7,25 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Bounded, per-request V4.1 index-key cache ownership with atomic prepared-key
+  append/reset, source/epoch/call checks and borrowed per-batch prefixes.
+  Source-capture tests join native owner-key preparation and cache retention
+  to index selection and attention. Compressor latents, candidates and
+  compressed KV remain source-supplied; full-model generation is still open.
 - Native V4.1 owner-key preparation matches the reduced source-forward
   key-cache append regions exactly at starts 0, 5 and 6. An offline extractor
   retains the actual indexer weights and pre-mutation compressor latents;
   corruption, wrong-layer weight and wrong-rotary-position controls guard the
-  comparison. Compressor execution and native cache publication remain open.
+  comparison. Compressor execution remains open.
 - Stateless V4.1 index-key preparation from the original compressor latent:
   bounded BF16 projection, RMSNorm, rotary and G32/E8M0 FP4 reconstruction.
   Hand-staged numerical checks and batch/position properties cover the API;
   the existing premature-latent-rotation control now calls it. Owner-layer
-  checkpoint parity and shared cache publication remain open.
+  checkpoint parity remains open.
 - Native V4.1 index selection now feeds the layer-attention integration test
   across captured prefill and decode calls, with exact attention-boundary
-  comparisons. QR, shared index keys, candidates and compressed KV remain
-  source-supplied; the test does not yet own the index cache or full model.
+  comparisons. QR, compressor latents, candidates and compressed KV remain
+  source-supplied; the test does not execute the full model.
 - DeepSeek-local BF16 index-score reference API with explicit dot, rectified,
   weighted and final-score boundaries. It preserves negative zero through
   ReLU, checks shape/work limits before allocation, and rejects FP32 and BF16

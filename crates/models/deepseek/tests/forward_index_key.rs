@@ -1,11 +1,14 @@
 //! Owner-layer key preparation against the reduced source-forward capture.
-//! Compressor latents remain supplied; this is not a native key-cache owner.
+//! Compressor latents remain supplied; prepared keys enter a native cache owner.
 
 use std::num::NonZeroUsize;
 
 use deepseek::{
     RotaryFrequency,
-    indexer::key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
+    indexer::{
+        cache::{IndexKeyPublicationId, IndexKeyState},
+        key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
+    },
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -34,6 +37,7 @@ struct Model {
     rope_pairs: usize,
     norm_epsilon: f32,
     owner_layer: usize,
+    cache_capacity: usize,
 }
 
 #[derive(Deserialize)]
@@ -108,8 +112,7 @@ fn nz(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("nonzero captured dimension")
 }
 
-#[test]
-fn native_owner_keys_match_captured_cache_append_regions() {
+fn fixture() -> Fixture {
     let fixture: Fixture = serde_json::from_str(include_str!(
         "../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
     ))
@@ -123,6 +126,12 @@ fn native_owner_keys_match_captured_cache_append_regions() {
         fixture.source.complete_capture_sha256,
         "e27dde6ead409c74f7bb2c9e08d4cd5a2b0cfc3c9505c7d6b8908b1cd78b1cc6"
     );
+    fixture
+}
+
+#[test]
+fn native_owner_keys_match_captured_cache_append_regions() {
+    let fixture = fixture();
     let model = fixture.model;
     assert_eq!(
         (
@@ -153,8 +162,16 @@ fn native_owner_keys_match_captured_cache_append_regions() {
     let weights = IndexKeyWeights::new(&wk, &norm);
     let frequencies = fixture.frequencies.frequencies();
     let mut previous_prefix = Vec::new();
+    let owner = u16::try_from(model.owner_layer).expect("source layer");
+    let mut state = IndexKeyState::new(
+        nz(model.batches),
+        nz(model.key_dimension),
+        nz(model.cache_capacity),
+        owner,
+    )
+    .expect("bounded source cache");
     let mut wrong_frequency_detected = false;
-    for case in fixture.cases {
+    for (call_id, case) in fixture.cases.into_iter().enumerate() {
         let positions = if case.start_pos == 0 { 5 } else { 1 };
         assert_eq!(case.latent.shape, [1, positions, 64]);
         assert_eq!(
@@ -186,6 +203,18 @@ fn native_owner_keys_match_captured_cache_append_regions() {
         assert!(
             prepared.post_fp4.iter().any(|&bits| bits & 0x7fff != 0),
             "nontrivial captured keys"
+        );
+        state
+            .append_prepared(
+                IndexKeyPublicationId::new(owner, 0, u64::try_from(call_id).expect("call ID")),
+                case.start_pos,
+                &prepared.post_fp4,
+            )
+            .expect("atomic native append");
+        assert_eq!(
+            state.prefix(0).expect("batch zero"),
+            cache,
+            "complete native prefix"
         );
         if case.start_pos != 0 {
             let wrong = prepare_index_keys(&latent, &frequencies[..16], weights, layout)
