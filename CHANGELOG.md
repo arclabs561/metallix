@@ -7,6 +7,12 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Joined native V4.1 attention, HC residual mixing and FFN comparison. Native
+  HC/normalization input feeds one cache-continuous attention sequence, whose
+  output now feeds the existing numerical-envelope checks. Capture-identity,
+  call-order and discarded-output controls guard the join. Upstream block
+  inputs, incoming coefficients, compressed KV and selected indices are still
+  source-supplied; this is not full-model execution.
 - Native V4.1 layer-four attention composition from encoded projections through
   query normalization, rotary tails, the window ring, sparse attention and
   output projection. Captured prefill and decode boundaries match BF16 storage

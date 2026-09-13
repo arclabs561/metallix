@@ -1,5 +1,7 @@
 //! Native complete `MoE` sublayer against encoded synthetic source-forward data.
-//! Source-provided input means this is not a complete native block or model.
+//! The joined attention/HC/FFN test still supplies upstream block inputs,
+//! incoming coefficients, compressed KV and selected indices from the source.
+//! It is not complete native model execution.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +18,8 @@ use deepseek::{
 };
 use serde::Deserialize;
 
+#[path = "support/attention_capture.rs"]
+mod attention_capture;
 #[path = "support/hc_chain_bounds.rs"]
 mod hc_chain_bounds;
 #[path = "support/hc_coefficient_bounds.rs"]
@@ -797,6 +801,8 @@ fn append_collapse_differences(
 #[derive(Clone, Copy, PartialEq)]
 enum BlockControl {
     SourceAttention,
+    NativeAttention,
+    NativeAttentionZeroed,
     WrongFfnPre,
     ZeroAttention,
 }
@@ -816,6 +822,11 @@ fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<
     validate_block_tail_fixture(f);
     let parameters = block_tail_parameters(f);
     let config = &f.block_config;
+    let native_attention = matches!(
+        control,
+        BlockControl::NativeAttention | BlockControl::NativeAttentionZeroed
+    )
+    .then(|| native_block_attention_outputs(f, &parameters));
     with_model(f, false, |model| {
         let ffn = FfnSublayerReference::new(
             model,
@@ -838,7 +849,16 @@ fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<
         };
         f.cases
             .iter()
-            .map(|case| run_block_tail_case(&context, case))
+            .enumerate()
+            .map(|(index, case)| {
+                run_block_tail_case(
+                    &context,
+                    case,
+                    native_attention
+                        .as_ref()
+                        .map(|outputs| outputs[index].as_slice()),
+                )
+            })
             .collect()
     })
 }
@@ -885,12 +905,18 @@ struct BlockCaseData<'a> {
     expected_attention_input: &'a [u16],
 }
 
-fn run_block_tail_case(context: &BlockTailContext<'_>, case: &Case) -> Vec<u16> {
+fn run_block_tail_case(
+    context: &BlockTailContext<'_>,
+    case: &Case,
+    attention_override: Option<&[u16]>,
+) -> Vec<u16> {
     let positions = case.input.shape[1];
     assert_block_case_shapes(case, positions);
     let block_input = case.block_input.bf16();
     let incoming = case.block_incoming_pre.fp32();
-    let attention = case.attention_output.bf16();
+    let attention =
+        attention_override.map_or_else(|| case.attention_output.bf16(), <[u16]>::to_vec);
+    assert_eq!(attention.len(), positions * 128);
     let expected_attention_input = case.attention_input.bf16();
     let data = BlockCaseData {
         block_input: &block_input,
@@ -935,7 +961,10 @@ fn run_block_tail_position(
     )
     .unwrap();
     assert_attention_input(context, case, position, residual, data, &row);
-    let attention_row = if context.control == BlockControl::ZeroAttention {
+    let attention_row = if matches!(
+        context.control,
+        BlockControl::ZeroAttention | BlockControl::NativeAttentionZeroed
+    ) {
         &[0; 128][..]
     } else {
         &data.attention[row.clone()]
@@ -987,24 +1016,12 @@ fn assert_attention_input(
     data: &BlockCaseData<'_>,
     row: &std::ops::Range<usize>,
 ) {
-    // Attention output is source-supplied, but its incoming HC handoff remains
-    // observable at this source attention-input boundary.
-    let mut collapsed = vec![0; 128];
-    hc_pre_bf16_reference(
+    let normalized = derive_attention_input(
         residual,
         &data.incoming[position * 2..(position + 1) * 2],
-        128,
-        &mut collapsed,
-    )
-    .unwrap();
-    let mut normalized = vec![0; 128];
-    rms_norm_bf16_reference(
-        &collapsed,
         &context.parameters.attn_norm,
         context.fixture.block_config.norm_eps,
-        &mut normalized,
-    )
-    .unwrap();
+    );
     assert_eq!(
         normalized,
         data.expected_attention_input[row.clone()],
@@ -1013,12 +1030,77 @@ fn assert_attention_input(
     );
 }
 
+fn derive_attention_input(
+    residual: &[u16],
+    incoming_pre: &[f32],
+    norm_weight: &[u16],
+    norm_eps: f32,
+) -> Vec<u16> {
+    let mut collapsed = vec![0; 128];
+    hc_pre_bf16_reference(residual, incoming_pre, 128, &mut collapsed).unwrap();
+    let mut normalized = vec![0; 128];
+    rms_norm_bf16_reference(&collapsed, norm_weight, norm_eps, &mut normalized).unwrap();
+    normalized
+}
+
+fn native_block_attention_outputs(f: &Fixture, parameters: &BlockTailParameters) -> Vec<Vec<u16>> {
+    let inputs = f
+        .cases
+        .iter()
+        .map(|case| {
+            let positions = case.input.shape[1];
+            assert_block_case_shapes(case, positions);
+            let residual = case.block_input.bf16();
+            let incoming = case.block_incoming_pre.fp32();
+            let input = (0..positions)
+                .flat_map(|position| {
+                    derive_attention_input(
+                        &residual[position * 256..(position + 1) * 256],
+                        &incoming[position * 2..(position + 1) * 2],
+                        &parameters.attn_norm,
+                        f.block_config.norm_eps,
+                    )
+                })
+                .collect();
+            (case.start_pos, input)
+        })
+        .collect::<Vec<_>>();
+    let outputs =
+        attention_capture::native_outputs_from_inputs(&inputs, &f.source.complete_capture_sha256);
+    assert_eq!(outputs.len(), f.cases.len());
+    for (output, case) in outputs.iter().zip(&f.cases) {
+        // The HC envelope uses this source tensor as an exact point. Its
+        // identity with the actual native output is a prerequisite, not a
+        // tolerance or substitution of source values into native execution.
+        assert_eq!(
+            output,
+            &case.attention_output.bf16(),
+            "native attention must equal HC contract point at start {}",
+            case.start_pos
+        );
+    }
+    outputs
+}
+
 #[test]
 fn native_block_tail_matches_source_numerical_contract() {
     let f = fixture();
     // Numerical and exact discrete assertions run at each joined boundary.
     let output = block_tail(&f, BlockControl::SourceAttention, true);
     assert_eq!(output.len(), f.cases.len());
+}
+
+#[test]
+fn native_attention_hc_ffn_chain_matches_source_numerical_contract() {
+    let f = fixture();
+    let output = block_tail(&f, BlockControl::NativeAttention, true);
+    assert_eq!(output.len(), f.cases.len());
+}
+
+#[test]
+#[should_panic(expected = "MoE checkpoint must agree exactly")]
+fn joined_contract_rejects_discarded_native_attention_output() {
+    block_tail(&fixture(), BlockControl::NativeAttentionZeroed, true);
 }
 
 #[test]

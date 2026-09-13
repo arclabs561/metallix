@@ -290,3 +290,29 @@ reindexing results**, not indices reused from layer three. Native reindexing,
 the native compressed-cache producer and full-block composition remain
 separate acceptance gates. This diagnostic is not pretrained-model execution
 or a performance benchmark.
+
+## Joined native attention, HC and FFN
+
+The `native_attention_hc_ffn_chain_matches_source_numerical_contract` test in
+`forward_moe.rs` removes the source-provided attention-output boundary from
+the block-tail comparison. Native HC collapse and normalization derive the
+attention input from the captured block residual and incoming pre-mix. That
+actual derived buffer feeds one native attention state through all three
+calls. Native attention output then feeds HC post-mixing and the native FFN.
+The outgoing pre-mix is the freshly derived FFN pre-mix, not the attention
+pre-mix; the existing contract checks it against the captured outgoing
+coefficients.
+
+The shared attention harness requires equal complete-capture identities,
+matching call counts and positions, and exact derived attention-input bits.
+Native attention output must also equal the MoE fixture's attention tensor
+before that tensor can serve as an exact point in the HC error envelope.
+The numerical policy is unchanged. A control executes native attention but
+discards its output; the downstream exact MoE checkpoint must reject it.
+Separate controls reject a mismatched capture identity and reordered calls.
+
+Upstream block residuals and incoming coefficients, including upstream Engram
+effects, still come from the source graph. Compressed KV and the layer-four
+indexer results are also supplied. This establishes the joined arithmetic
+path for the captured executions, not end-to-end native model generation or
+block-level transactional state rollback if a later sublayer fails.
