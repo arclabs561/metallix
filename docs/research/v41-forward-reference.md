@@ -474,3 +474,25 @@ The gate is exact source-stage and candidate-mask parity at starts zero, five
 and six, followed by unchanged layer-four selected IDs and attention results.
 Wrong-layer weights, future-position masking and candidate-bit perturbations
 must expose errors. Whole-block transaction work follows this producer edge.
+
+The present layer-four observer cannot simply be pointed at layer three:
+
+- It requires an already-published key prefix and candidate mask at entry.
+  The owner publishes its updated keys during the call and produces the new
+  candidate mask afterward. Read the scoring operand at the actual einsum
+  boundary, not from a possibly stale entry snapshot.
+- Its first active FP4 call is labeled `q_after_rope_fp4`. In the owner, key
+  quantization precedes query quantization. Identify the query operand through
+  its source operation, rather than assuming the first quantized tensor is Q.
+- The compressor fixture currently checks the live observer hash. An observer
+  extension needs a new capture identity and an explicit historical hash for
+  the old fixture, not silently relabeled old bytes. New fixtures must check
+  their own capture identity and cross-capture numerical agreement.
+
+The proposed instrumentation change is a fixed producer/consumer role in the
+existing observer, with separate per-call state and restoration checks for both
+indexers. This is not a generic tracing framework. Before using the new oracle,
+verify that observation leaves the original source outputs unchanged, that key
+and query FP4 records remain distinct, and that an exception restores every
+patched instance and graph binding. This observer change precedes any shared
+Rust query-prefix extraction.
