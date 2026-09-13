@@ -1,6 +1,6 @@
 //! Typed layer-three candidate-producer capture oracle.
 //!
-//! The fixture provides QR, residual input, and already-published index keys.
+//! The fixture provides residual input and already-published index keys.
 //! It qualifies those arithmetic and masking boundaries, not cache ownership or
 //! a complete candidate producer.
 
@@ -13,10 +13,14 @@ use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::{
     RotaryFrequency,
+    attention::layer::Fp8Projection,
     csa2::{CandidateError, candidate_mask},
     indexer::{
         bf16::index_scores_bf16_reference,
-        query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
+        query::{
+            CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
+            prepare_candidate_query, prepare_index_query,
+        },
     },
 };
 use serde::Deserialize;
@@ -55,12 +59,14 @@ struct Model {
     input_dimension: usize,
     query_rank: usize,
     rope_pairs: usize,
+    norm_epsilon: f32,
 }
 
 #[derive(Deserialize)]
 struct Case {
     start_pos: usize,
     attention_input: Tensor,
+    wq_a_output: Tensor,
     q_norm_output: Tensor,
     candidate_mask: Tensor,
     inputs: Inputs,
@@ -300,11 +306,15 @@ pub(super) fn captured_keys(start: usize) -> Vec<u16> {
 
 /// Generates one source-captured candidate mask from supplied native index keys.
 ///
-/// QR and X remain fixture-fed source boundaries. `native_keys` must exactly
+/// X remains a fixture-fed source boundary. `native_keys` must exactly
 /// equal the independently captured layer-three FP4 key prefix at `start`.
 #[expect(
     clippy::too_many_lines,
     reason = "keep source-stage parity assertions in execution order"
+)]
+#[allow(
+    clippy::similar_names,
+    reason = "retain source wq_a and wq_b projection names"
 )]
 pub(super) fn generated_candidates(start: usize, native_keys: &[u16]) -> Vec<bool> {
     let fixture = fixture();
@@ -318,19 +328,32 @@ pub(super) fn generated_candidates(start: usize, native_keys: &[u16]) -> Vec<boo
     let wq_b_codes = parameters["layers.3.attn.indexer.wq_b.weight"].fp8();
     let wq_b_scales = parameters["layers.3.attn.indexer.wq_b.scale"].fp8();
     let weights_proj = parameters["layers.3.attn.indexer.weights_proj.weight"].bf16();
-    let positions = case.inputs.qr.shape[1];
-    let query = prepare_index_query(
-        &case.inputs.qr.bf16(),
+    let wq_a_codes = parameters["layers.3.attn.wq_a.weight"].fp8();
+    let wq_a_scales = parameters["layers.3.attn.wq_a.scale"].fp8();
+    let q_norm = parameters["layers.3.attn.q_norm.weight"].bf16();
+    let positions = case.inputs.x.shape[1];
+    let prepared = prepare_candidate_query(
         &case.inputs.x.bf16(),
         &call_frequencies(&fixture, start, positions),
-        IndexQueryWeights {
-            wq_b_codes: &wq_b_codes,
-            wq_b_scales: &wq_b_scales,
-            weights_proj: &weights_proj,
+        CandidateQueryWeights {
+            wq_a: Fp8Projection {
+                codes: &wq_a_codes,
+                scales: &wq_a_scales,
+            },
+            q_norm: &q_norm,
+            index: IndexQueryWeights {
+                wq_b_codes: &wq_b_codes,
+                wq_b_scales: &wq_b_scales,
+                weights_proj: &weights_proj,
+            },
         },
-        index_layout(&fixture.model),
+        CandidateQueryLayout::new(index_layout(&fixture.model), fixture.model.norm_epsilon)
+            .expect("bounded candidate QR layout"),
     )
     .expect("bounded candidate index query");
+    assert_eq!(prepared.wq_a, case.wq_a_output.bf16(), "start {start} wq_a");
+    assert_eq!(prepared.qr, case.q_norm_output.bf16(), "start {start} QR");
+    let query = prepared.index;
     assert_eq!(
         query.query_post_fp4,
         case.operations.q_after_rope_fp4.bf16(),

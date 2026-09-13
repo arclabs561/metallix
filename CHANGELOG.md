@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Stateless DeepSeek candidate-query preparation now derives QR from input
+  activations through the same private FP8 projection/RMSNorm helper as attention.
+  Validated candidate layouts keep query dimensions consistent without requiring
+  a KV publication or advancing attention state. Source tests compare both QR
+  stages before continuing through candidates, selection and attention.
 - Native DeepSeek candidate queries, BF16 scores and block masks now compose
   with owner-produced keys, layer-four selection and native-KV attention in
   source-oracle tests. Prefill and two decode calls match exact captured stages;

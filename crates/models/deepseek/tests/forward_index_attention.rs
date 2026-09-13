@@ -2,7 +2,8 @@
 //!
 //! This test joins the production index-query prefix, BF16 scorer, strict
 //! selector, candidate producer, atomic compressor/key/KV owner, and attention
-//! adapter. Source QR and owner/consumer layer inputs remain fixture boundaries.
+//! adapter. Consumer QR and owner/consumer layer inputs remain fixture boundaries;
+//! producer QR is computed by the native candidate-query adapter.
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;

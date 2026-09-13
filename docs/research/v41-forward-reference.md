@@ -460,15 +460,20 @@ Layer three produces the candidate mask consumed by layer four. The pinned
 prepares its query, reduces weighted scores, masks future compressed positions,
 then selects candidate blocks. The existing `csa2::candidate_mask` implements
 the block-selection rule. The native query, score and mask chain is now joined
-in source-oracle tests; query-prefix formation and a runtime adapter remain open.
+in source-oracle tests, including native producer QR formation. A complete
+candidate-selection runtime adapter remains open.
 
 The candidate capture observes layer-three `wq_a`, `q_norm`, and indexer query,
 weight and score stages, alongside the final candidate mask. It is separate
 from historical fixtures, which retain their capture identities.
 Candidate composition reuses index-query preparation, BF16 scoring and
-the coupled key prefix. Before extracting shared query preparation, compare
-the candidate producer's contract with the existing attention adapter's
-`wq_a`/RMSNorm prefix; sharing must preserve its precision and shape checks.
+the coupled key prefix. `CandidateQueryLayout` combines an existing validated
+index-query layout with the matching private QR layout. The stateless
+`prepare_candidate_query` derives QR through the same private `wq_a`/RMSNorm
+helper used by attention. It takes no KV publication, window, or mutable state.
+The helper retains G32 FP8 activation quantization and BF16 narrowing at the
+projection and normalization boundaries; it is model-local, not a universal
+query interface.
 
 `forward_candidate.rs` and `forward_index_attention.rs` now check exact
 source-stage and candidate-mask parity at starts zero, five and six, followed
@@ -483,11 +488,13 @@ projection; removing a selected candidate changes both selection and attention.
 The latter control holds captured consumer scores and KV fixed to isolate the
 mask effect; it does not replace the positive native-owner integration.
 
-Layer-three QR and input activations remain captured operands. Causal masking
-is test-local composition around production scoring and block selection. The
-next step is native `wq_a` plus RMSNorm, preserving FP8/BF16 rounding boundaries
-without invoking stateful attention merely to prepare a query. Whole-block
-transaction work follows this producer edge.
+Layer-three input activations remain captured operands; its `wq_a` and QR are
+now computed and checked against captured expectations before the native
+index-query path consumes them. The separate layer-four consumer QR is still
+captured. Causal masking remains test-local composition around production
+scoring and block selection. The remaining runtime work joins these operators
+with explicit key-publication and candidate-selection contracts, followed by
+whole-block transaction handling.
 
 The earlier consumer-only observer could not simply be pointed at layer three:
 
@@ -527,5 +534,5 @@ compares outputs and cache bytes exactly, checks historical attention values,
 and injects a producer-query exception to verify hook and binding restoration.
 It also checks that the produced candidate mask equals the consumer's input.
 These runtime checks establish observation integrity. The Rust integration
-tests separately qualify the native candidate chain from captured QR onward;
+tests separately qualify the native candidate chain from captured input onward;
 neither establishes full-model generation.

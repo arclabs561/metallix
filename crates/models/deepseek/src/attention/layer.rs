@@ -172,6 +172,83 @@ pub struct Fp8Projection<'a> {
     pub scales: &'a [u8],
 }
 
+/// The stateless source-shaped dimensions shared by attention's QR prefix and the indexer.
+///
+/// This intentionally excludes attention-window, head, and publication settings:
+/// QR is computed before either sparse attention or candidate selection consumes
+/// it. Keeping that seam explicit lets a candidate source reuse the exact
+/// `wq_a` then `RMSNorm` path without constructing an attention cache owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AttentionQrLayout {
+    batches: NonZeroUsize,
+    hidden_dimension: NonZeroUsize,
+    q_rank: NonZeroUsize,
+    norm_epsilon_bits: u32,
+}
+
+impl AttentionQrLayout {
+    /// Validates the bounded, stateless QR prefix geometry.
+    pub(crate) fn new(
+        batches: NonZeroUsize,
+        hidden_dimension: NonZeroUsize,
+        q_rank: NonZeroUsize,
+        norm_epsilon: f32,
+    ) -> Result<Self, LayerAttentionLayoutError> {
+        if !norm_epsilon.is_finite() || norm_epsilon <= 0.0 {
+            return Err(LayerAttentionLayoutError::InvalidNormEpsilon);
+        }
+        for (field, width) in [
+            ("hidden dimension", hidden_dimension.get()),
+            ("q rank", q_rank.get()),
+        ] {
+            if !width.is_multiple_of(32) {
+                return Err(LayerAttentionLayoutError::UngroupedFp8Reduction { field, width });
+            }
+        }
+        for (field, elements) in [
+            (
+                "one-position input",
+                checked_product(
+                    &[batches.get(), hidden_dimension.get()],
+                    "one-position input",
+                )?,
+            ),
+            (
+                "one-position q rank",
+                checked_product(&[batches.get(), q_rank.get()], "one-position q rank")?,
+            ),
+        ] {
+            if elements > MAX_LAYER_ATTENTION_ELEMENTS {
+                return Err(LayerAttentionLayoutError::ElementLimit { field, elements });
+            }
+        }
+        Ok(Self {
+            batches,
+            hidden_dimension,
+            q_rank,
+            norm_epsilon_bits: norm_epsilon.to_bits(),
+        })
+    }
+
+    fn norm_epsilon(self) -> f32 {
+        f32::from_bits(self.norm_epsilon_bits)
+    }
+}
+
+/// Borrowed parameters for attention's stateless QR prefix.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttentionQrWeights<'a> {
+    pub(crate) wq_a: Fp8Projection<'a>,
+    pub(crate) q_norm: &'a [u16],
+}
+
+/// BF16 stages shared by attention query preparation and a candidate source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AttentionQrDiagnostic {
+    pub(crate) wq_a: Vec<u16>,
+    pub(crate) qr: Vec<u16>,
+}
+
 /// Borrowed weights needed by the source-shaped attention path.
 #[derive(Clone, Copy, Debug)]
 pub struct LayerAttentionWeights<'a> {
@@ -389,23 +466,22 @@ impl LayerAttentionState {
         frequencies: &[RotaryFrequency],
         weights: LayerAttentionWeights<'_>,
     ) -> Result<QueryStages, LayerAttentionError> {
-        let rows = checked_product(&[self.layout.batches.get(), positions], "input rows")?;
-        let wq_a = fp8_project_bf16(
+        let qr_stages = prepare_attention_qr(
             attention_input,
-            rows,
-            self.layout.hidden_dimension.get(),
-            self.layout.q_rank.get(),
-            weights.wq_a,
+            AttentionQrWeights {
+                wq_a: weights.wq_a,
+                q_norm: weights.q_norm,
+            },
+            AttentionQrLayout::new(
+                self.layout.batches,
+                self.layout.hidden_dimension,
+                self.layout.q_rank,
+                self.layout.norm_epsilon(),
+            )?,
         )?;
-        let qr = rms_norm_rows(
-            &wq_a,
-            rows,
-            self.layout.q_rank.get(),
-            weights.q_norm,
-            self.layout.norm_epsilon(),
-        )?;
+        let rows = checked_product(&[self.layout.batches.get(), positions], "input rows")?;
         let wq_b_pre_rope = fp8_project_bf16(
-            &qr,
+            &qr_stages.qr,
             rows,
             self.layout.q_rank.get(),
             self.query_width()?,
@@ -424,8 +500,8 @@ impl LayerAttentionState {
             RotaryDirection::Forward,
         )?;
         Ok(QueryStages {
-            wq_a,
-            qr,
+            wq_a: qr_stages.wq_a,
+            qr: qr_stages.qr,
             wq_b_pre_rope,
             q_after_rope,
         })
@@ -801,6 +877,61 @@ impl LayerAttentionLayout {
     }
 }
 
+/// Computes the source attention QR prefix without owning a cache or state transition.
+///
+/// `input` is BF16 `[batch, position, hidden_dimension]`. The returned
+/// diagnostics retain the BF16 `wq_a` projection and subsequent `RMSNorm`
+/// result, which are also the source indexer's `qr` operand.
+pub(crate) fn prepare_attention_qr(
+    input: &[u16],
+    weights: AttentionQrWeights<'_>,
+    layout: AttentionQrLayout,
+) -> Result<AttentionQrDiagnostic, LayerAttentionError> {
+    let input_stride = checked_product(
+        &[layout.batches.get(), layout.hidden_dimension.get()],
+        "attention QR input stride",
+    )?;
+    if input.is_empty() || !input.len().is_multiple_of(input_stride) {
+        return Err(LayerAttentionError::InputLength {
+            actual: input.len(),
+            stride: input_stride,
+        });
+    }
+    if input.len() > MAX_LAYER_ATTENTION_ELEMENTS {
+        return Err(LayerAttentionError::ElementLimit {
+            field: "attention QR input",
+            elements: input.len(),
+        });
+    }
+    let positions = input.len() / input_stride;
+    let rows = checked_product(&[layout.batches.get(), positions], "attention QR rows")?;
+    let output_elements = checked_product(
+        &[rows, layout.q_rank.get()],
+        "attention QR projection output",
+    )?;
+    if output_elements > MAX_LAYER_ATTENTION_ELEMENTS {
+        return Err(LayerAttentionError::ElementLimit {
+            field: "attention QR projection output",
+            elements: output_elements,
+        });
+    }
+    let wq_a = fp8_project_bf16(
+        input,
+        rows,
+        layout.hidden_dimension.get(),
+        layout.q_rank.get(),
+        weights.wq_a,
+    )?;
+    let qr = rms_norm_rows(
+        &wq_a,
+        rows,
+        layout.q_rank.get(),
+        weights.q_norm,
+        layout.norm_epsilon(),
+    )?;
+    Ok(AttentionQrDiagnostic { wq_a, qr })
+}
+
 /// Invalid layer-attention configuration.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1121,8 +1252,9 @@ fn bf16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompressedAttentionPublication, LayerAttentionError, LayerAttentionLayout,
-        LayerAttentionLayoutError, LayerAttentionState, WindowStep,
+        AttentionQrLayout, AttentionQrWeights, CompressedAttentionPublication, Fp8Projection,
+        LayerAttentionError, LayerAttentionLayout, LayerAttentionLayoutError, LayerAttentionState,
+        WindowStep, prepare_attention_qr,
     };
     use std::num::NonZeroUsize;
 
@@ -1147,6 +1279,63 @@ mod tests {
             0.25,
         )
         .expect("small grouped layout")
+    }
+
+    fn qr_layout() -> AttentionQrLayout {
+        AttentionQrLayout::new(nonzero(1), nonzero(32), nonzero(32), 1e-5).expect("small QR layout")
+    }
+
+    fn qr_weights() -> AttentionQrWeights<'static> {
+        AttentionQrWeights {
+            wq_a: Fp8Projection {
+                codes: &[0x38; 32 * 32],
+                scales: &[127],
+            },
+            q_norm: &[0x3f80; 32],
+        }
+    }
+
+    #[test]
+    fn stateless_qr_keeps_projection_and_norm_stages() {
+        let result = prepare_attention_qr(&[0x3f80; 32], qr_weights(), qr_layout())
+            .expect("finite source-shaped QR");
+        assert_eq!(result.wq_a.len(), 32);
+        assert_eq!(result.qr.len(), 32);
+        assert!(result.wq_a.iter().all(|&bits| bits == 0x4200));
+        assert!(result.qr.iter().all(|&bits| bits == 0x3f80));
+    }
+
+    #[test]
+    fn stateless_qr_rejects_invalid_shape_and_layout_invariants() {
+        assert!(matches!(
+            AttentionQrLayout::new(nonzero(1), nonzero(32), nonzero(32), 0.0),
+            Err(LayerAttentionLayoutError::InvalidNormEpsilon)
+        ));
+        assert!(matches!(
+            AttentionQrLayout::new(nonzero(1), nonzero(31), nonzero(32), 1e-5),
+            Err(LayerAttentionLayoutError::UngroupedFp8Reduction {
+                field: "hidden dimension",
+                width: 31
+            })
+        ));
+        assert!(matches!(
+            prepare_attention_qr(&[0x3f80; 31], qr_weights(), qr_layout()),
+            Err(LayerAttentionError::InputLength {
+                actual: 31,
+                stride: 32
+            })
+        ));
+    }
+
+    #[test]
+    fn stateless_qr_rejects_an_oversized_one_position_input_before_allocation() {
+        assert!(matches!(
+            AttentionQrLayout::new(nonzero(32_769), nonzero(32), nonzero(32), 1e-5),
+            Err(LayerAttentionLayoutError::ElementLimit {
+                field: "one-position input",
+                elements: 1_048_608
+            })
+        ));
     }
 
     #[test]

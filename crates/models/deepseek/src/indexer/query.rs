@@ -11,6 +11,10 @@ use thiserror::Error;
 
 use crate::{
     RotaryDirection, RotaryError, RotaryFrequency, RotaryTailLayout,
+    attention::layer::{
+        AttentionQrLayout, AttentionQrWeights, Fp8Projection, LayerAttentionError,
+        LayerAttentionLayoutError, prepare_attention_qr,
+    },
     precision::{
         ActivationGroup, ActivationQuantError, Bf16LinearError, Fp4ActivationError,
         Fp4ActivationMode, Fp8LinearError, bf16_linear_reference, f32_to_bf16_rne,
@@ -106,6 +110,33 @@ impl IndexQueryLayout {
     }
 }
 
+/// Model-local geometry for deriving an index query from an attention input.
+///
+/// This composes the bounded attention `wq_a`/`RMSNorm` QR prefix with the
+/// existing index-query prefix. It is stateless and does not own index keys,
+/// cache publication, candidate masking, or selection.
+#[derive(Clone, Copy, Debug)]
+pub struct CandidateQueryLayout {
+    index: IndexQueryLayout,
+    qr: AttentionQrLayout,
+}
+
+impl CandidateQueryLayout {
+    /// Validates the shared QR geometry and the supplied index-query geometry.
+    pub fn new(
+        index: IndexQueryLayout,
+        norm_epsilon: f32,
+    ) -> Result<Self, LayerAttentionLayoutError> {
+        let qr = AttentionQrLayout::new(
+            index.batches,
+            index.hidden_dimension,
+            index.q_rank,
+            norm_epsilon,
+        )?;
+        Ok(Self { index, qr })
+    }
+}
+
 /// Borrowed FP8/BF16 weights used by the index-query prefix.
 #[derive(Clone, Copy, Debug)]
 pub struct IndexQueryWeights<'a> {
@@ -115,6 +146,17 @@ pub struct IndexQueryWeights<'a> {
     pub wq_b_scales: &'a [u8],
     /// BF16 `weights_proj` values `[heads, hidden_dimension]`.
     pub weights_proj: &'a [u16],
+}
+
+/// Borrowed weights for deriving and preparing one model-local index query.
+#[derive(Clone, Copy, Debug)]
+pub struct CandidateQueryWeights<'a> {
+    /// Attention `wq_a` projection that derives QR from the residual input.
+    pub wq_a: Fp8Projection<'a>,
+    /// BF16 attention QR `RMSNorm` weights.
+    pub q_norm: &'a [u16],
+    /// Index-query projection and signed-weight parameters.
+    pub index: IndexQueryWeights<'a>,
 }
 
 /// Source-visible precision boundaries from index-query preparation.
@@ -130,6 +172,17 @@ pub struct IndexQueryDiagnostic {
     pub projected_head_weights: Vec<u16>,
     /// BF16 signed head weights after `index_head_dim^-0.5 * n_heads^-0.5`.
     pub scaled_head_weights: Vec<u16>,
+}
+
+/// Source-visible boundaries from model-local QR derivation and index-query preparation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateQueryDiagnostic {
+    /// BF16 attention `wq_a(x)` before QR `RMSNorm`.
+    pub wq_a: Vec<u16>,
+    /// BF16 QR consumed by the index-query prefix.
+    pub qr: Vec<u16>,
+    /// BF16/FP4 boundaries of the index-query prefix.
+    pub index: IndexQueryDiagnostic,
 }
 
 /// Invalid index-query geometry.
@@ -192,6 +245,43 @@ pub enum IndexQueryError {
     NonFiniteRotary { element: usize },
     #[error("source index scalar could not narrow to finite BF16 at head weight {element}")]
     NonFiniteScale { element: usize },
+}
+
+/// Rejected model-local candidate-query preparation.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CandidateQueryError {
+    #[error(transparent)]
+    AttentionQr(#[from] LayerAttentionError),
+    #[error(transparent)]
+    Index(#[from] IndexQueryError),
+}
+
+/// Derives QR from `x` and prepares the index-query precision boundaries.
+///
+/// `x` is BF16 `[batch, position, hidden_dimension]`; `frequencies` is the
+/// call-local rotary span. This is an arithmetic adapter only: it neither
+/// produces index keys nor manages cache, candidate masks, or selection.
+pub fn prepare_candidate_query(
+    x: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: CandidateQueryWeights<'_>,
+    layout: CandidateQueryLayout,
+) -> Result<CandidateQueryDiagnostic, CandidateQueryError> {
+    let attention = prepare_attention_qr(
+        x,
+        AttentionQrWeights {
+            wq_a: weights.wq_a,
+            q_norm: weights.q_norm,
+        },
+        layout.qr,
+    )?;
+    let index = prepare_index_query(&attention.qr, x, frequencies, weights.index, layout.index)?;
+    Ok(CandidateQueryDiagnostic {
+        wq_a: attention.wq_a,
+        qr: attention.qr,
+        index,
+    })
 }
 
 /// Prepares the source indexer's FP4 query and scaled signed head weights.
@@ -443,10 +533,14 @@ fn bf16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexQueryError, IndexQueryLayout, IndexQueryLayoutError, IndexQueryWeights,
+        CandidateQueryError, CandidateQueryLayout, CandidateQueryWeights, IndexQueryError,
+        IndexQueryLayout, IndexQueryLayoutError, IndexQueryWeights, prepare_candidate_query,
         prepare_index_query,
     };
-    use crate::RotaryFrequency;
+    use crate::{
+        RotaryFrequency,
+        attention::layer::{Fp8Projection, LayerAttentionError, LayerAttentionLayoutError},
+    };
     use std::num::NonZeroUsize;
 
     fn nonzero(value: usize) -> NonZeroUsize {
@@ -566,6 +660,121 @@ mod tests {
                 qr_positions: 1,
                 x_positions: 2
             }
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "retain source wq_a and wq_b projection names"
+    )]
+    fn derives_attention_qr_before_preparing_the_index_query() {
+        let layout = CandidateQueryLayout::new(layout(), 1.0e-20).expect("candidate layout");
+        let wq_a_codes = vec![0; 32 * 32];
+        let wq_a_scales = vec![127];
+        let q_norm = vec![bf16(1.0); 32];
+        let wq_b_codes = vec![0; 64 * 32];
+        let wq_b_scales = vec![127; 2];
+        let weights_proj = vec![0; 64];
+        let diagnostic = prepare_candidate_query(
+            &[0; 32],
+            &[RotaryFrequency::new(1.0, 0.0).expect("identity frequency")],
+            CandidateQueryWeights {
+                wq_a: Fp8Projection {
+                    codes: &wq_a_codes,
+                    scales: &wq_a_scales,
+                },
+                q_norm: &q_norm,
+                index: IndexQueryWeights {
+                    wq_b_codes: &wq_b_codes,
+                    wq_b_scales: &wq_b_scales,
+                    weights_proj: &weights_proj,
+                },
+            },
+            layout,
+        )
+        .expect("zero-shaped candidate query");
+        assert_eq!(diagnostic.wq_a, vec![0; 32]);
+        assert_eq!(diagnostic.qr, vec![0; 32]);
+        assert_eq!(diagnostic.index.query_post_fp4, vec![0; 64]);
+        assert_eq!(diagnostic.index.scaled_head_weights, vec![0; 2]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::similar_names,
+        reason = "retain source wq_a and wq_b projection names"
+    )]
+    fn q_norm_perturbation_changes_qr_and_the_index_query() {
+        let candidate_layout = CandidateQueryLayout::new(layout(), 1.0e-20).expect("layout");
+        let mut wq_a_codes = vec![0; 32 * 32];
+        wq_a_codes[0] = 0x38;
+        let wq_a_scales = vec![127];
+        let mut wq_b_codes = vec![0; 64 * 32];
+        wq_b_codes[0] = 0x38;
+        let wq_b_scales = vec![127; 2];
+        let weights_proj = vec![0; 64];
+        let input = [bf16(1.0); 32];
+        let frequencies = [RotaryFrequency::new(1.0, 0.0).expect("identity")];
+        let base_norm = vec![bf16(1.0); 32];
+        let mut changed_norm = base_norm.clone();
+        changed_norm[0] = bf16(2.0);
+        let run = |q_norm: &[u16]| {
+            prepare_candidate_query(
+                &input,
+                &frequencies,
+                CandidateQueryWeights {
+                    wq_a: Fp8Projection {
+                        codes: &wq_a_codes,
+                        scales: &wq_a_scales,
+                    },
+                    q_norm,
+                    index: IndexQueryWeights {
+                        wq_b_codes: &wq_b_codes,
+                        wq_b_scales: &wq_b_scales,
+                        weights_proj: &weights_proj,
+                    },
+                },
+                candidate_layout,
+            )
+            .expect("finite nonzero candidate query")
+        };
+        let base = run(&base_norm);
+        let changed = run(&changed_norm);
+        assert_ne!(base.qr, changed.qr, "q_norm changes derived QR");
+        assert_ne!(
+            base.index.query_post_fp4, changed.index.query_post_fp4,
+            "derived QR changes the index query"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_input_length_and_invalid_qr_epsilon() {
+        assert!(matches!(
+            CandidateQueryLayout::new(layout(), 0.0),
+            Err(LayerAttentionLayoutError::InvalidNormEpsilon)
+        ));
+        let error = prepare_candidate_query(
+            &[0; 31],
+            &[],
+            CandidateQueryWeights {
+                wq_a: Fp8Projection {
+                    codes: &[],
+                    scales: &[],
+                },
+                q_norm: &[],
+                index: IndexQueryWeights {
+                    wq_b_codes: &[],
+                    wq_b_scales: &[],
+                    weights_proj: &[],
+                },
+            },
+            CandidateQueryLayout::new(layout(), 1.0e-20).expect("layout"),
+        )
+        .expect_err("bad attention input length");
+        assert!(matches!(
+            error,
+            CandidateQueryError::AttentionQr(LayerAttentionError::InputLength { actual: 31, .. })
         ));
     }
 }
