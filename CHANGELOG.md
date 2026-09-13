@@ -7,6 +7,10 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Existing rotary and G16/E4M3 primitives reproduce the captured compressed-KV
+  append regions from native owner latents. Wrong-mode and wrong-position
+  controls distinguish this path from index-key preparation. This is numerical
+  qualification; compressed-KV cache ownership remains unimplemented.
 - Atomic owner output now drives the V4.1 selection-to-attention capture test:
   raw owner input → compressor → prepared key cache → scores → selected indices
   → attention. Exact stage checks connect the supplementary compressor capture

@@ -15,6 +15,7 @@ use attention_capture::{
     weights as attention_weights,
 };
 use deepseek::{
+    RotaryDirection, RotaryFrequency, RotaryTailLayout,
     attention::layer::{LayerAttentionError, LayerAttentionState},
     indexer::{
         bf16::index_scores_bf16_reference,
@@ -23,7 +24,8 @@ use deepseek::{
         owner::{RatioOneIndexKeyOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
         query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
     },
-    select_indices,
+    precision::{Fp4ActivationMode, requantize_bf16_activations_e2m1},
+    rotate_tail, select_indices,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -170,6 +172,39 @@ fn bf16_from_f32(value: f32) -> u16 {
 
 fn f32_from_bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
+}
+
+// Test-only composition of existing primitives; no compressed-KV cache owner.
+fn compressed_kv_rows(
+    latent: &[u16],
+    frequencies: &[RotaryFrequency],
+    mode: Fp4ActivationMode,
+) -> Vec<u16> {
+    assert!(!latent.is_empty() && latent.len().is_multiple_of(64));
+    let positions = latent.len() / 64;
+    let mut tails: Vec<f32> = latent
+        .chunks_exact(64)
+        .flat_map(|row| row[32..].iter().copied().map(f32_from_bf16))
+        .collect();
+    rotate_tail(
+        &mut tails,
+        RotaryTailLayout::new(nonzero(1), nonzero(positions), nonzero(1), nonzero(16))
+            .expect("owner tails"),
+        frequencies,
+        RotaryDirection::Forward,
+    )
+    .expect("compressed rotary");
+    let mut rotated = latent.to_vec();
+    for (row, tail) in rotated.chunks_exact_mut(64).zip(tails.chunks_exact(32)) {
+        for (output, &value) in row[32..].iter_mut().zip(tail) {
+            assert!(value.is_finite());
+            *output = bf16_from_f32(value);
+        }
+    }
+    let mut output = vec![0; latent.len()];
+    requantize_bf16_activations_e2m1(&rotated, positions, 64, mode, &mut output)
+        .expect("compressed activation reconstruction");
+    output
 }
 
 fn source_frequencies(
@@ -436,6 +471,8 @@ fn native_index_selection_drives_captured_attention_calls() {
         1e-20,
     )
     .expect("bounded atomic owner");
+    let mut wrong_group_detected = false;
+    let mut wrong_frequency_detected = false;
     for (call_id, (raw_case, attention_case)) in field(&raw, "cases")
         .as_array()
         .expect("raw cases")
@@ -487,6 +524,29 @@ fn native_index_selection_drives_captured_attention_calls() {
             keys,
         );
         let compressed = attention_case.compressed_kv.bf16();
+        let owner_frequencies = source_frequencies(&raw, attention_case.start_pos, positions, 16);
+        let native_kv = compressed_kv_rows(
+            &prepared.latent,
+            &owner_frequencies,
+            Fp4ActivationMode::CompressedKv16E4m3,
+        );
+        assert_eq!(
+            native_kv,
+            compressed[attention_case.start_pos * 64..],
+            "native compressed-KV append region at call {call_id}"
+        );
+        wrong_group_detected |= compressed_kv_rows(
+            &prepared.latent,
+            &owner_frequencies,
+            Fp4ActivationMode::Index32E8m0,
+        ) != native_kv;
+        if attention_case.start_pos != 0 {
+            wrong_frequency_detected |= compressed_kv_rows(
+                &prepared.latent,
+                &source_frequencies(&raw, 0, positions, 16),
+                Fp4ActivationMode::CompressedKv16E4m3,
+            ) != native_kv;
+        }
         let diagnostic = forward_with_publication(
             &mut state,
             &attention_case.input.bf16(),
@@ -507,6 +567,14 @@ fn native_index_selection_drives_captured_attention_calls() {
         );
         assert_diagnostic(attention_case, &diagnostic);
     }
+    assert!(
+        wrong_group_detected,
+        "oracle distinguishes index-key quantization from KV quantization"
+    );
+    assert!(
+        wrong_frequency_detected,
+        "oracle distinguishes decode rotary positions"
+    );
 }
 
 fn generated_prefill_indices(raw: &Value, attention: &attention_capture::Fixture) -> Vec<i32> {
