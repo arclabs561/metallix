@@ -7,8 +7,9 @@
 //! BF16/FP4 parity. [`bf16`] provides a separate CPU-only source-staging
 //! reference for prepared BF16 operands. [`query`] and [`key`] prepare their
 //! respective operands through source-shaped quantization. [`cache`] owns a
-//! separate request-local prefix of prepared owner-layer keys. These surfaces
-//! do not own candidate selection or a complete indexer.
+//! separate request-local prefix of prepared owner-layer keys. [`selection`]
+//! composes candidate masking and final selection over supplied BF16 scores;
+//! these surfaces do not constitute a complete indexer or model runner.
 
 use std::num::NonZeroUsize;
 
@@ -22,6 +23,7 @@ pub mod compressed_kv;
 pub mod key;
 pub mod owner;
 pub mod query;
+pub mod selection;
 
 /// Largest permitted `[heads, positions]` core score matrix for this diagnostic.
 ///

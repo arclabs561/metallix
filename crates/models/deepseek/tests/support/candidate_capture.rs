@@ -17,10 +17,12 @@ use deepseek::{
     csa2::{CandidateError, candidate_mask},
     indexer::{
         bf16::index_scores_bf16_reference,
+        cache::IndexKeyPublicationId,
         query::{
             CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
             prepare_candidate_query, prepare_index_query,
         },
+        selection::{CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates},
     },
 };
 use serde::Deserialize;
@@ -231,11 +233,6 @@ fn f32_from_bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-fn bf16_from_f32(value: f32) -> u16 {
-    let bits = value.to_bits();
-    u16::try_from(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16).expect("BF16 high half")
-}
-
 fn call_frequencies(fixture: &Fixture, start: usize, positions: usize) -> Vec<RotaryFrequency> {
     let pairs = fixture.model.rope_pairs;
     let end = start.checked_add(positions).expect("bounded frequency end");
@@ -270,25 +267,36 @@ fn index_layout(model: &Model) -> IndexQueryLayout {
     .expect("captured index-query layout")
 }
 
-fn causal_mask(scores: &[u16], start: usize, positions: usize, keys: usize) -> Vec<u16> {
-    assert_eq!(scores.len(), positions * keys, "score geometry");
-    assert!(start == 0 || positions == 1, "captured causal geometry");
-    let mut masked = scores.to_vec();
-    for position in 0..positions {
-        let reachable = start + position + 1;
-        for key in reachable..keys {
-            masked[position * keys + key] = bf16_from_f32(f32::NEG_INFINITY);
-        }
-    }
-    masked
-}
-
 fn source_case(fixture: &Fixture, start: usize) -> &Case {
     fixture
         .cases
         .iter()
         .find(|case| case.start_pos == start)
         .unwrap_or_else(|| panic!("no captured candidate case starts at {start}"))
+}
+
+/// Maps a captured call to the test owner's epoch-zero publication sequence.
+pub(super) fn source_call(start: usize) -> SelectionCall {
+    let fixture = fixture();
+    let (call_id, case) = fixture
+        .cases
+        .iter()
+        .enumerate()
+        .find(|(_, case)| case.start_pos == start)
+        .unwrap_or_else(|| panic!("no captured candidate call starts at {start}"));
+    let geometry = SelectionGeometry::new(
+        start,
+        nonzero(case.inputs.x.shape[1]),
+        nonzero(case.inputs.shared_index_k_prefix.shape[1]),
+        nonzero(1),
+        case.inputs.offset,
+    )
+    .expect("captured selection geometry");
+    SelectionCall::new(
+        IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("three captured calls")),
+        0,
+        geometry,
+    )
 }
 
 /// Returns the source-captured, already FP4-reconstructed index key prefix.
@@ -316,9 +324,18 @@ pub(super) fn captured_keys(start: usize) -> Vec<u16> {
     clippy::similar_names,
     reason = "retain source wq_a and wq_b projection names"
 )]
-pub(super) fn generated_candidates(start: usize, native_keys: &[u16]) -> Vec<bool> {
+pub(super) fn generated_candidates(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+) -> CandidateSelection {
     let fixture = fixture();
     let case = source_case(&fixture, start);
+    assert_eq!(
+        call,
+        source_call(start),
+        "source selection call at start {start}"
+    );
     let expected_keys = case.inputs.shared_index_k_prefix.bf16();
     assert_eq!(
         native_keys, expected_keys,
@@ -413,27 +430,34 @@ pub(super) fn generated_candidates(start: usize, native_keys: &[u16]) -> Vec<boo
         case.operations.scores_after_head_sum.bf16(),
         "start {start} head sum scores"
     );
-    let causal = causal_mask(&scores, start, positions, key_count);
-    if let Some(expected) = &case.operations.scores_after_causal_mask {
-        assert_eq!(causal, expected.bf16(), "start {start} causal scores");
-    }
-    let mut candidates = Vec::with_capacity(causal.len());
-    for position in 0..positions {
-        candidates.extend(
-            candidate_mask(
-                &causal[position * key_count..(position + 1) * key_count]
-                    .iter()
-                    .map(|&bits| f32_from_bf16(bits))
-                    .collect::<Vec<_>>(),
-                start + position + 1,
-                fixture.model.candidate_topk_blocks,
-                nonzero(fixture.model.candidate_block_size),
-            )
-            .expect("captured candidate row"),
-        );
-    }
+    assert_eq!(scores.len(), positions * key_count, "score geometry");
+    let candidates = produce_candidates(
+        &scores,
+        call,
+        fixture.model.candidate_topk_blocks,
+        nonzero(fixture.model.candidate_block_size),
+    )
+    .expect("captured candidate rows");
     assert_eq!(
-        candidates,
+        candidates.call(),
+        call,
+        "start {start} candidate call identity"
+    );
+    let expected_causal = case
+        .operations
+        .scores_after_causal_mask
+        .as_ref()
+        .map_or_else(
+            || case.operations.scores_after_head_sum.bf16(),
+            Tensor::bf16,
+        );
+    assert_eq!(
+        candidates.causal_scores(),
+        expected_causal,
+        "start {start} causal scores"
+    );
+    assert_eq!(
+        candidates.mask(),
         case.candidate_mask.bools(),
         "start {start} candidate mask"
     );

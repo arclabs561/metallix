@@ -7,6 +7,12 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- A stateless DeepSeek selection adapter now applies causal masks, produces
+  opaque candidate results and selects indices from BF16 scores. Validated
+  geometry and publication/batch metadata prevent accidental cross-call reuse.
+  The source-oracle owner-to-attention test now calls this adapter instead of
+  test-local masking and selection loops. Query scoring and cache ownership
+  remain separate.
 - The DeepSeek owner-to-attention source test now derives both producer and
   consumer QR natively. Captured QR is an exact expected result rather than a
   scoring input; layer activations and full-model orchestration remain outside

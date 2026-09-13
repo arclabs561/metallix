@@ -493,11 +493,30 @@ now computed and checked against captured expectations before the native
 index-query path consumes them. The layer-four consumer now uses the same
 stateless adapter with its own captured weights and input, checking its native
 projection and QR against the attention oracle before scoring. Neither producer
-nor consumer scoring consumes captured QR. Causal masking remains test-local
-composition around production
-scoring and block selection. The remaining runtime work joins these operators
-with explicit key-publication and candidate-selection contracts, followed by
-whole-block transaction handling.
+nor consumer scoring consumes captured QR.
+
+`indexer::selection` now owns causal masking, candidate-block selection and
+final selection over supplied head-summed BF16 scores. Its `SelectionGeometry`
+requires the exact completed-group key count, bounded score storage, an
+in-range index offset, and prefill or single-position decode geometry.
+Zero-key calls bypass this initial nonempty-prefix adapter. Each call processes
+one batch and carries its explicit batch index and key-publication identity.
+An opaque `CandidateSelection` can be consumed only with matching call metadata.
+This is a consistency check on caller assertions, not proof of key provenance.
+Producer and consumer scores are intentionally different: the shared result is
+the producer's candidate mask, not its score matrix. Requiring score equality
+would reject the source's cross-layer CSA2 path.
+
+All raw scores must be finite, including future entries that will be masked.
+Candidate bits may include future positions in a selected partial block;
+final selection independently reapplies causality before candidate filtering.
+The joined source test uses these production stages. Its isolated mask-bit
+perturbation control keeps test-local masking to change a single bit without
+providing a public constructor for arbitrary candidate results.
+
+Scoring orchestration remains in the test harness. The remaining runtime work
+joins prepared queries, owner key prefixes and these selection stages into
+the model runner, followed by whole-block transaction handling.
 
 The earlier consumer-only observer could not simply be pointed at layer three:
 

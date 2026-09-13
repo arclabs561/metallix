@@ -7,8 +7,12 @@ mod candidate_capture;
 fn captured_candidate_masks_match_starts_zero_five_and_six() {
     for start in [0, 5, 6] {
         let keys = candidate_capture::captured_keys(start);
-        let candidates = candidate_capture::generated_candidates(start, &keys);
-        assert!(!candidates.is_empty(), "start {start} candidates");
+        let candidates = candidate_capture::generated_candidates(
+            start,
+            &keys,
+            candidate_capture::source_call(start),
+        );
+        assert!(!candidates.mask().is_empty(), "start {start} candidates");
     }
 }
 

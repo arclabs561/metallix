@@ -30,6 +30,7 @@ use deepseek::{
             CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
             prepare_candidate_query,
         },
+        selection::{SelectionCall, SelectionGeometry, select_from_candidates},
     },
     precision::{Fp4ActivationMode, requantize_bf16_activations_e2m1},
     select_indices,
@@ -252,6 +253,7 @@ fn generated_indices(
     layout: IndexQueryLayout,
     weights: IndexQueryWeights<'_>,
     keys: &[u16],
+    publication: IndexKeyPublicationId,
 ) -> Vec<i32> {
     let model = field(root, "model");
     let indexer = field(raw_case, "indexer");
@@ -341,40 +343,45 @@ fn generated_indices(
             .expect("ratio"),
     )
     .expect("ratio fits usize");
-    let candidates = candidate_capture::generated_candidates(start, keys);
+    let offset = usize_field(inputs, "offset");
+    let call = SelectionCall::new(
+        publication,
+        0,
+        SelectionGeometry::new(
+            start,
+            nonzero(positions),
+            nonzero(keys_per_position),
+            nonzero(ratio),
+            offset,
+        )
+        .expect("source consumer selection geometry"),
+    );
+    let candidates = candidate_capture::generated_candidates(start, keys, call);
     assert_eq!(
-        candidates,
+        candidates.mask(),
         bools(field(inputs, "candidate_mask")),
         "native producer matches historical consumer mask at start {start}"
     );
-    let masked = masked_scores(
+    let selection = select_from_candidates(
         &score_bits,
+        call,
         &candidates,
-        start,
-        positions,
-        keys_per_position,
-        ratio,
-    );
+        usize_field(model, "index_topk"),
+    )
+    .expect("source selection adapter");
+    if let Some(expected) = operations.get("scores_after_causal_mask") {
+        assert_eq!(
+            selection.causal_scores,
+            bf16(expected),
+            "consumer causal scores"
+        );
+    }
     assert_eq!(
-        masked,
+        selection.masked_scores,
         bf16(field(operations, "scores_after_candidate_mask")),
         "start {start} masked scores"
     );
-    let offset = usize_field(inputs, "offset");
-    let output: Vec<i32> = (0..positions)
-        .flat_map(|position| {
-            select_indices(
-                &masked[position * keys_per_position..(position + 1) * keys_per_position]
-                    .iter()
-                    .map(|&bits| f32_from_bf16(bits))
-                    .collect::<Vec<_>>(),
-                (start + position + 1) / ratio,
-                usize_field(model, "index_topk"),
-                offset,
-            )
-            .expect("source cutoff is unambiguous")
-        })
-        .collect();
+    let output = selection.indices;
     assert_eq!(
         output,
         i32s(field(indexer, "output_indices")),
@@ -524,6 +531,7 @@ fn native_index_selection_drives_captured_attention_calls() {
             index_layout,
             index_weights,
             keys,
+            IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID")),
         );
         let compressed = key_owner.kv_prefix(0).expect("batch zero compressed KV");
         assert_eq!(
@@ -620,6 +628,7 @@ fn generated_prefill_indices(raw: &Value, attention: &attention_capture::Fixture
             ),
             "shared_index_k_prefix",
         )),
+        IndexKeyPublicationId::new(3, 0, 0),
     )
 }
 
@@ -708,7 +717,10 @@ fn removing_a_generated_candidate_changes_selection_and_attention() {
     let indexer = field(raw_case, "indexer");
     let inputs = field(indexer, "inputs");
     let keys = bf16(field(inputs, "shared_index_k_prefix"));
-    let mut candidates = candidate_capture::generated_candidates(0, &keys);
+    let mut candidates =
+        candidate_capture::generated_candidates(0, &keys, candidate_capture::source_call(0))
+            .mask()
+            .to_vec();
     let original_ids = generated_prefill_indices(&raw, &attention);
     let offset = usize_field(inputs, "offset");
     let positions = shape(field(inputs, "qr"))[1];
