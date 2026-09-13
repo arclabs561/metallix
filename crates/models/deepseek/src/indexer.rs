@@ -1,4 +1,4 @@
-//! FP32 Metal qualification for the V4.1 indexer's score-reduction core.
+//! FP32 CPU and Metal qualification for the V4.1 indexer's score-reduction core.
 //!
 //! This follows the score sequence in the pinned upstream
 //! [`Indexer.forward`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L558):
@@ -8,14 +8,19 @@
 
 use std::num::NonZeroUsize;
 
+#[cfg(feature = "metal")]
 use mlx_rs::{Array, StreamOrDevice, ops};
 use thiserror::Error;
 
 /// Largest permitted `[heads, positions]` core score matrix for this diagnostic.
 ///
-/// This bounds the 64 MiB FP32 matrix itself, not MLX temporary allocations or
-/// peak GPU memory.
+/// Shared logical geometry cap. On Metal this bounds the 64 MiB FP32 matrix
+/// itself, not MLX temporary allocations or peak GPU memory. CPU scoring does
+/// not allocate that matrix and additionally bounds scalar work.
 pub const MAX_INDEX_SCORE_ELEMENTS: usize = 16 * 1024 * 1024;
+
+/// Maximum scalar multiply-accumulate terms in one CPU diagnostic call.
+pub const MAX_INDEX_REFERENCE_TERMS: usize = 16 * 1024 * 1024;
 
 /// Errors from the bounded V4.1 index-score qualification operation.
 #[derive(Debug, Error)]
@@ -51,11 +56,21 @@ pub enum IndexScoreError {
         field: &'static str,
         position: usize,
     },
+    /// The CPU dot products exceed the explicit scalar work budget.
+    #[error("CPU index-score dot products exceed {max_terms} scalar terms")]
+    ScalarWorkloadTooLarge { max_terms: usize },
+    /// The CPU result buffer could not be reserved.
+    #[error("could not allocate {elements} CPU index scores")]
+    AllocationFailed { elements: usize },
+    /// A finite input overflowed during the ordered CPU reduction.
+    #[error("CPU index-score intermediate for head {head}, position {position} is not finite")]
+    NonFiniteIntermediate { head: usize, position: usize },
     /// MLX could not construct, evaluate, or read back the GPU graph.
+    #[cfg(feature = "metal")]
     #[error("MLX Metal index-score evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
-    /// GPU readback did not produce finite scores.
-    #[error("GPU index score at position {position} is not finite")]
+    /// Evaluation did not produce finite scores.
+    #[error("index score at position {position} is not finite")]
     NonFiniteOutput { position: usize },
 }
 
@@ -65,12 +80,103 @@ pub enum IndexScoreError {
 /// `[positions, head_dim]`; and `head_weights` supplies one signed scalar per
 /// head. The operation is GPU-only after CPU validation: `q @ kᵀ`, `ReLU`,
 /// signed head weighting, and reduction across heads.
+#[cfg(feature = "metal")]
 pub fn index_scores_f32(
     query: &[f32],
     keys: &[f32],
     head_weights: &[f32],
     head_dim: NonZeroUsize,
 ) -> Result<Vec<f32>, IndexScoreError> {
+    let (heads, positions) = validate_inputs(query, keys, head_weights, head_dim)?;
+    let heads_i32 = as_i32(heads, "heads")?;
+    let positions_i32 = as_i32(positions, "positions")?;
+    let dim_i32 = as_i32(head_dim.get(), "head_dim")?;
+    let stream = StreamOrDevice::gpu();
+    let query = Array::from_slice(query, &[heads_i32, dim_i32]);
+    let keys = Array::from_slice(keys, &[positions_i32, dim_i32]);
+    let weights = Array::from_slice(head_weights, &[heads_i32, 1]);
+    let dot = query.matmul_device(&keys.transpose_device(&stream)?, &stream)?;
+    let zero = Array::from_slice(&[0.0_f32], &[]);
+    let rectified = ops::maximum_device(&dot, &zero, &stream)?;
+    let weighted = rectified.multiply_device(&weights, &stream)?;
+    let scores = weighted.sum_axis_device(0, false, &stream)?;
+    scores.eval()?;
+    let output = scores.as_slice::<f32>().to_vec();
+    for (position, &score) in output.iter().enumerate() {
+        if !score.is_finite() {
+            return Err(IndexScoreError::NonFiniteOutput { position });
+        }
+    }
+    Ok(output)
+}
+
+/// Computes bounded scalar index scores without a GPU dependency.
+///
+/// Layouts match the Metal operation: query `[heads, head_dim]`, keys
+/// `[positions, head_dim]`, and already projected/scaled signed weights `[heads]`.
+/// Inputs have already undergone `RoPE` and any FP4 reconstruction; this function
+/// applies no additional head or dimension scale. Each dot product
+/// accumulates in ascending dimension order in FP32, followed by `ReLU`,
+/// signed weighting, and ascending head accumulation. This is not a claim of
+/// bitwise parity with parallel reductions. Callers own quantization, causal
+/// masking, candidates, and selection. Empty key sets are rejected.
+///
+/// # Errors
+///
+/// Rejects invalid shapes, nonfinite inputs or intermediate results, and
+/// workloads exceeding [`MAX_INDEX_REFERENCE_TERMS`]. No partial result escapes.
+pub fn index_scores_reference(
+    query: &[f32],
+    keys: &[f32],
+    head_weights: &[f32],
+    head_dim: NonZeroUsize,
+) -> Result<Vec<f32>, IndexScoreError> {
+    let (heads, positions) = validate_inputs(query, keys, head_weights, head_dim)?;
+    let dim = head_dim.get();
+    if heads
+        .checked_mul(positions)
+        .and_then(|n| n.checked_mul(dim))
+        .is_none_or(|n| n > MAX_INDEX_REFERENCE_TERMS)
+    {
+        return Err(IndexScoreError::ScalarWorkloadTooLarge {
+            max_terms: MAX_INDEX_REFERENCE_TERMS,
+        });
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(positions)
+        .map_err(|_| IndexScoreError::AllocationFailed {
+            elements: positions,
+        })?;
+    output.resize(positions, 0.0_f32);
+    for (position, key) in keys.chunks_exact(dim).enumerate() {
+        for (head, (q, &weight)) in query.chunks_exact(dim).zip(head_weights).enumerate() {
+            let mut dot = 0.0_f32;
+            for (&q, &k) in q.iter().zip(key) {
+                dot += q * k;
+                if !dot.is_finite() {
+                    return Err(IndexScoreError::NonFiniteIntermediate { head, position });
+                }
+            }
+            let weighted = dot.max(0.0) * weight;
+            if !weighted.is_finite() {
+                return Err(IndexScoreError::NonFiniteIntermediate { head, position });
+            }
+            output[position] += weighted;
+            if !output[position].is_finite() {
+                return Err(IndexScoreError::NonFiniteOutput { position });
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn validate_inputs(
+    query: &[f32],
+    keys: &[f32],
+    head_weights: &[f32],
+    head_dim: NonZeroUsize,
+) -> Result<(usize, usize), IndexScoreError> {
     let dim = head_dim.get();
     if query.is_empty() {
         return Err(IndexScoreError::EmptyInput { field: "query" });
@@ -117,28 +223,10 @@ pub fn index_scores_f32(
     validate_finite(keys, "keys")?;
     validate_finite(head_weights, "head_weights")?;
 
-    let heads_i32 = as_i32(heads, "heads")?;
-    let positions_i32 = as_i32(positions, "positions")?;
-    let dim_i32 = as_i32(dim, "head_dim")?;
-    let stream = StreamOrDevice::gpu();
-    let query = Array::from_slice(query, &[heads_i32, dim_i32]);
-    let keys = Array::from_slice(keys, &[positions_i32, dim_i32]);
-    let weights = Array::from_slice(head_weights, &[heads_i32, 1]);
-    let dot = query.matmul_device(&keys.transpose_device(&stream)?, &stream)?;
-    let zero = Array::from_slice(&[0.0_f32], &[]);
-    let rectified = ops::maximum_device(&dot, &zero, &stream)?;
-    let weighted = rectified.multiply_device(&weights, &stream)?;
-    let scores = weighted.sum_axis_device(0, false, &stream)?;
-    scores.eval()?;
-    let output = scores.as_slice::<f32>().to_vec();
-    for (position, &score) in output.iter().enumerate() {
-        if !score.is_finite() {
-            return Err(IndexScoreError::NonFiniteOutput { position });
-        }
-    }
-    Ok(output)
+    Ok((heads, positions))
 }
 
+#[cfg(feature = "metal")]
 fn as_i32(value: usize, field: &'static str) -> Result<i32, IndexScoreError> {
     i32::try_from(value).map_err(|_| IndexScoreError::DimensionOutOfRange { field })
 }
@@ -152,7 +240,7 @@ fn validate_finite(values: &[f32], field: &'static str) -> Result<(), IndexScore
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal"))]
 mod tests {
     use super::{IndexScoreError, index_scores_f32};
     use serde::Deserialize;

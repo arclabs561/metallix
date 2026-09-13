@@ -6,7 +6,6 @@ pub mod compressor;
 pub mod csa2;
 pub mod engram;
 pub mod hc;
-#[cfg(feature = "metal")]
 pub mod indexer;
 pub mod manifest;
 pub mod norm;
@@ -22,7 +21,8 @@ pub use checkpoint::{
 };
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]
-pub use indexer::{IndexScoreError, index_scores_f32};
+pub use indexer::index_scores_f32;
+pub use indexer::{IndexScoreError, index_scores_reference};
 pub use norm::{MAX_RMS_NORM_WIDTH, RmsNormError, rms_norm_bf16_reference};
 pub use rotary::{
     RotaryDirection, RotaryError, RotaryFrequency, RotaryFrequencyError, RotaryFrequencyParameters,

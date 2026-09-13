@@ -7,6 +7,10 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- CPU V4.1 index-score reference with bounded scalar work, explicit FP32
+  reduction order and overflow rejection. Tests join scoring to causal
+  masking, CSA2 candidates and final selection without requiring Metal.
+  Projection, quantization and cache ownership remain caller responsibilities.
 - Reduced V4.1 CPU source-forward harness with an explicit shape/schedule
   manifest, hash-checked source loading and independent quantized-kernel
   replacements. Synthetic prefill/decode captures include final logits and
