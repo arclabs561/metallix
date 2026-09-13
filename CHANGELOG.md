@@ -7,19 +7,24 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- DeepSeek-local BF16 index-score reference API with explicit dot, rectified,
+  weighted and final-score boundaries. It preserves negative zero through
+  ReLU, checks shape/work limits before allocation, and rejects FP32 and BF16
+  narrowing overflow. Exact source-fixture selection checks now call this
+  implementation; key-position permutation properties exercise its layouts.
+  Existing FP32 APIs are unchanged. This is scalar staging, not GPU execution.
 - Source-fixture composition of native V4.1 queries, BF16 score stages,
   causal/candidate masks and final index selection across prefill and decode.
   Every captured score stage and selected index matches exactly. Shared keys
-  and candidates remain source-supplied; this test is not a production BF16
-  scorer or a complete indexer. Masked-score previews are checked against
-  their exact storage, including invalid-JSON and wrong-sign negative controls.
+  and candidates remain source-supplied; this is not a complete indexer.
+  Masked-score previews are checked against their exact storage, including
+  invalid-JSON and wrong-sign negative controls.
 - Native V4.1 source-fixture index-query preparation through FP4-reconstructed
   rotary queries and projected, scaled BF16 head weights at prefill/decode
   starts 0, 5 and 6. The source observer captures the projection boundary and
   serializes nonfinite preview values as strict-JSON strings while retaining
-  exact storage bytes. Index scores, candidate filtering/top-k, shared index
-  cache publication and full reindexing remain open; this is not full-model
-  execution.
+  exact storage bytes. Shared index cache publication and complete reindexing
+  remain open; this is not full-model execution.
 - Joined native V4.1 attention, HC residual mixing and FFN comparison. Native
   HC/normalization input feeds one cache-continuous attention sequence, whose
   output now feeds the existing numerical-envelope checks. Capture-identity,

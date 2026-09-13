@@ -1,10 +1,12 @@
-//! FP32 CPU and Metal qualification for the V4.1 indexer's score-reduction core.
+//! CPU and Metal qualifications for the V4.1 indexer's score-reduction core.
 //!
 //! This follows the score sequence in the pinned upstream
 //! [`Indexer.forward`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L558):
 //! query/key dot product, `ReLU`, signed per-head weighting, then head sum.
-//! Inputs are already post-RoPE FP32 operands. This is not official BF16/FP4
-//! parity, quantization, candidate selection, or a complete indexer.
+//! The existing FP32 functions consume post-RoPE FP32 operands and do not claim
+//! BF16/FP4 parity. [`bf16`] provides a separate CPU-only source-staging
+//! reference for prepared BF16 operands. Neither surface owns quantization,
+//! candidate selection, cache state, or a complete indexer.
 
 use std::num::NonZeroUsize;
 
@@ -12,6 +14,7 @@ use std::num::NonZeroUsize;
 use mlx_rs::{Array, StreamOrDevice, ops};
 use thiserror::Error;
 
+pub mod bf16;
 pub mod query;
 
 /// Largest permitted `[heads, positions]` core score matrix for this diagnostic.

@@ -8,8 +8,10 @@ use std::num::NonZeroUsize;
 
 use deepseek::{
     RotaryFrequency,
-    indexer::query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
-    precision::bf16_linear_reference,
+    indexer::{
+        bf16::index_scores_bf16_reference,
+        query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
+    },
     select_indices,
 };
 use serde_json::Value;
@@ -168,86 +170,6 @@ fn frequencies(root: &Value, start: usize, positions: usize, pairs: usize) -> Ve
         .collect()
 }
 
-fn einsum_bf16(
-    query: &[u16],
-    keys: &[u16],
-    positions: usize,
-    heads: usize,
-    dimension: usize,
-    key_positions: usize,
-) -> Vec<u16> {
-    let mut scores = Vec::with_capacity(positions * heads * key_positions);
-    for position in 0..positions {
-        for head in 0..heads {
-            let query_start = (position * heads + head) * dimension;
-            let mut row = vec![0; key_positions];
-            bf16_linear_reference(
-                &query[query_start..query_start + dimension],
-                keys,
-                1,
-                dimension,
-                key_positions,
-                &mut row,
-            )
-            .expect("bounded source score dot product");
-            scores.extend(row);
-        }
-    }
-    scores
-}
-
-fn relu_bf16(scores: &[u16]) -> Vec<u16> {
-    scores
-        .iter()
-        .map(|&bits| bf16_from_f32(f32_from_bf16(bits).max(0.0)))
-        .collect()
-}
-
-fn weight_bf16(
-    scores: &[u16],
-    weights: &[u16],
-    positions: usize,
-    heads: usize,
-    keys: usize,
-) -> Vec<u16> {
-    assert_eq!(
-        scores.len(),
-        positions
-            .checked_mul(heads)
-            .and_then(|elements| elements.checked_mul(keys))
-            .expect("source score shape fits usize")
-    );
-    assert_eq!(
-        weights.len(),
-        positions
-            .checked_mul(heads)
-            .expect("source weight shape fits usize")
-    );
-    scores
-        .iter()
-        .enumerate()
-        .map(|(flat, &bits)| {
-            let head = (flat / keys) % heads;
-            let position = flat / (heads * keys);
-            bf16_from_f32(f32_from_bf16(bits) * f32_from_bf16(weights[position * heads + head]))
-        })
-        .collect()
-}
-
-fn sum_heads_bf16(weighted: &[u16], positions: usize, heads: usize, keys: usize) -> Vec<u16> {
-    let mut output = Vec::with_capacity(positions * keys);
-    for position in 0..positions {
-        for key in 0..keys {
-            let mut sum = 0.0_f32;
-            for head in 0..heads {
-                sum += f32_from_bf16(weighted[(position * heads + head) * keys + key]);
-            }
-            output.push(bf16_from_f32(sum));
-        }
-    }
-    output
-}
-
 fn causal_mask(
     scores: &[u16],
     start: usize,
@@ -296,6 +218,43 @@ struct Harness<'a> {
     ratio: usize,
 }
 
+#[derive(Default)]
+struct ScoreStages {
+    dot_products: Vec<u16>,
+    rectified: Vec<u16>,
+    weighted: Vec<u16>,
+    scores: Vec<u16>,
+}
+
+fn score_positions(
+    query: &[u16],
+    keys: &[u16],
+    head_weights: &[u16],
+    positions: usize,
+    heads: usize,
+    dimension: usize,
+) -> ScoreStages {
+    assert_eq!(query.len(), positions * heads * dimension);
+    assert_eq!(head_weights.len(), positions * heads);
+    let mut stages = ScoreStages::default();
+    for position in 0..positions {
+        let query_start = position * heads * dimension;
+        let weight_start = position * heads;
+        let diagnostic = index_scores_bf16_reference(
+            &query[query_start..query_start + heads * dimension],
+            keys,
+            &head_weights[weight_start..weight_start + heads],
+            nonzero(dimension),
+        )
+        .expect("bounded production BF16 score chain");
+        stages.dot_products.extend(diagnostic.dot_products);
+        stages.rectified.extend(diagnostic.rectified);
+        stages.weighted.extend(diagnostic.weighted);
+        stages.scores.extend(diagnostic.scores);
+    }
+    stages
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the source fixture's ordered BF16 stages are intentionally asserted together so the first divergent boundary remains visible"
@@ -327,44 +286,41 @@ fn assert_case(harness: &Harness<'_>, case: &Value) {
     );
     let keys = bf16(field(inputs, "shared_index_k_prefix"));
     let key_positions = shape(field(inputs, "shared_index_k_prefix"))[1];
-    let einsum = einsum_bf16(
+    let stages = score_positions(
         &query.query_post_fp4,
         &keys,
-        positions,
-        harness.heads,
-        harness.dimension,
-        key_positions,
-    );
-    assert_eq!(
-        einsum,
-        bf16(field(operations, "scores_einsum")),
-        "start {start} einsum"
-    );
-    let relu = relu_bf16(&einsum);
-    assert_eq!(
-        relu,
-        bf16(field(operations, "scores_after_relu")),
-        "start {start} ReLU"
-    );
-    let weighted = weight_bf16(
-        &relu,
         &query.scaled_head_weights,
         positions,
         harness.heads,
-        key_positions,
+        harness.dimension,
     );
     assert_eq!(
-        weighted,
+        stages.dot_products,
+        bf16(field(operations, "scores_einsum")),
+        "start {start} einsum"
+    );
+    assert_eq!(
+        stages.rectified,
+        bf16(field(operations, "scores_after_relu")),
+        "start {start} ReLU"
+    );
+    assert_eq!(
+        stages.weighted,
         bf16(field(operations, "scores_weighted_per_head")),
         "start {start} weighted"
     );
-    let summed = sum_heads_bf16(&weighted, positions, harness.heads, key_positions);
     assert_eq!(
-        summed,
+        stages.scores,
         bf16(field(operations, "scores_after_head_sum")),
         "start {start} head sum"
     );
-    let causal = causal_mask(&summed, start, positions, key_positions, harness.ratio);
+    let causal = causal_mask(
+        &stages.scores,
+        start,
+        positions,
+        key_positions,
+        harness.ratio,
+    );
     if let Some(expected) = operations.get("scores_after_causal_mask") {
         assert_eq!(causal, bf16(expected), "start {start} causal mask");
     }
