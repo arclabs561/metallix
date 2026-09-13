@@ -348,10 +348,10 @@ per-batch prefix, compared byte-for-byte with the source cache after each call.
 Replaying position-zero frequencies during decode changes the result.
 `forward_index_attention` feeds this native prefix into the BF16 scorer and
 selector, then passes their selected indices to native layer attention.
-Compressor latents, candidate masks and compressed KV still come from the
-capture. These tests do not execute the compressor or establish arbitrary
-Torch/GPU reduction parity. The captured weights are from the synthetic
-reduced model, not the released checkpoint.
+Owner-layer input, candidate masks and compressed KV still come from the
+capture. The ratio-one compressor executes natively through the atomic owner;
+these checks do not establish arbitrary Torch/GPU reduction parity. The captured
+weights are from the synthetic reduced model, not the released checkpoint.
 
 The cache is DeepSeek-local and request-local: it does not reproduce the
 source's process-global shared slots. Its offsets count completed compressed
@@ -388,8 +388,10 @@ output and normalized compressor latent. This reduced model uses compression
 ratio one, with no grouped pooling. Native BF16 linear projection and
 `CompressorState` match both captured stages exactly at starts zero, five and
 six. Their returned latent now feeds the owner-key/cache test; a zero-weight
-control changes that latent. The separate selection-to-attention test still
-uses the older captured latent.
+control changes that latent. The selection-to-attention test now calls the
+atomic owner from the supplementary raw input, checks its projection and latent,
+and passes its committed key prefix into the scorer. It compares that latent
+with the older key fixture before continuing across the capture boundary.
 
 The new complete capture has SHA-256
 `2f2ff3f1734f959b33a673773cf6fe9c056fabb06a82531e5465562af5480c39`;
@@ -415,3 +417,11 @@ an accidental replay cannot replace a live prefix. This API deliberately covers
 ratio one, not grouped compression or candidate selection. Its transaction ends
 at key publication: downstream attention or FFN failure does not roll back the
 owner, and a complete model runner still needs a broader transaction boundary.
+
+The next missing owner product is compressed attention KV, distinct from the
+index keys used to select positions. The [source compressed-KV path](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L739)
+rotates the original compressor latent and uses G16/E4M3 reconstruction; index
+keys instead use `wk`, key normalization and G32/E8M0 reconstruction. The G16
+primitive already exists, but native compressed-KV preparation/cache publication
+does not yet supply this joined test. Its captured consumer prefix provides the
+final-byte oracle. Candidate production remains a separate subsequent boundary.

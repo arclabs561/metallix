@@ -1,8 +1,8 @@
 //! Source-captured index-selection to layer-attention integration for V4.1.
 //!
 //! This test joins the production index-query prefix, BF16 scorer, strict
-//! selector, key-cache owner, and attention adapter. The source QR, compressor
-//! latents, candidate mask, and compressed KV remain explicit fixture boundaries.
+//! selector, atomic compressor/key owner, and attention adapter. The source QR,
+//! owner-layer input, candidate mask, and compressed KV remain fixture boundaries.
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -18,8 +18,9 @@ use deepseek::{
     attention::layer::{LayerAttentionError, LayerAttentionState},
     indexer::{
         bf16::index_scores_bf16_reference,
-        cache::{IndexKeyPublicationId, IndexKeyState},
-        key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
+        cache::IndexKeyPublicationId,
+        key::{IndexKeyLayout, IndexKeyWeights},
+        owner::{RatioOneIndexKeyOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
         query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
     },
     select_indices,
@@ -42,6 +43,31 @@ fn raw_fixture() -> Value {
         Some(CAPTURE_SHA256)
     );
     fixture
+}
+
+fn compressor_fixture() -> Value {
+    let root: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/forward-compressor-reference.json"
+    ))
+    .expect("supplementary compressor fixture");
+    let source = field(&root, "source");
+    assert_eq!(field(source, "revision").as_str(), Some(REVISION));
+    assert_eq!(
+        field(source, "complete_capture_sha256").as_str(),
+        Some("2f2ff3f1734f959b33a673773cf6fe9c056fabb06a82531e5465562af5480c39")
+    );
+    let model = field(&root, "model");
+    for (name, expected) in [
+        ("batches", 1),
+        ("input_dimension", 128),
+        ("latent_dimension", 64),
+        ("owner_layer", 3),
+        ("compression_ratio", 1),
+    ] {
+        assert_eq!(usize_field(model, name), expected, "compressor {name}");
+    }
+    assert_eq!(field(model, "norm_epsilon").as_f64(), Some(1e-20));
+    root
 }
 
 fn field<'a>(value: &'a Value, name: &str) -> &'a Value {
@@ -390,13 +416,26 @@ fn native_index_selection_drives_captured_attention_calls() {
     let key_layout = IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
         .expect("captured key layout");
     assert_eq!(usize_field(owner_model, "key_dimension"), head_dimension);
-    let mut key_state = IndexKeyState::new(
-        nonzero(1),
-        nonzero(64),
+    let compressor = compressor_fixture();
+    let compressor_cases = field(&compressor, "cases")
+        .as_array()
+        .expect("compressor calls");
+    assert_eq!(compressor_cases.len(), owner_cases.len());
+    let compressor_weights = field(&compressor, "weights");
+    assert_eq!(shape(field(compressor_weights, "wkv")), [64, 128]);
+    assert_eq!(shape(field(compressor_weights, "norm")), [64]);
+    let wkv = bf16(field(compressor_weights, "wkv"));
+    let compressor_norm = bf16(field(compressor_weights, "norm"));
+    let weights = RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &norm));
+    let mut key_owner = RatioOneIndexKeyOwner::new(
+        key_layout,
+        nonzero(128),
         nonzero(usize_field(owner_model, "cache_capacity")),
         3,
+        &compressor_norm,
+        1e-20,
     )
-    .expect("bounded owner cache");
+    .expect("bounded atomic owner");
     for (call_id, (raw_case, attention_case)) in field(&raw, "cases")
         .as_array()
         .expect("raw cases")
@@ -409,22 +448,35 @@ fn native_index_selection_drives_captured_attention_calls() {
             usize_field(owner_case, "start_pos"),
             attention_case.start_pos
         );
-        let latent = field(owner_case, "latent");
-        let prepared = prepare_index_keys(
-            &bf16(latent),
-            &source_frequencies(&raw, attention_case.start_pos, shape(latent)[1], 16),
-            IndexKeyWeights::new(&wk, &norm),
-            key_layout,
-        )
-        .expect("native owner keys");
-        key_state
-            .append_prepared(
+        let compressor_case = &compressor_cases[call_id];
+        assert_eq!(
+            usize_field(compressor_case, "start_pos"),
+            attention_case.start_pos
+        );
+        let positions = shape(field(owner_case, "latent"))[1];
+        let input = field(compressor_case, "attention_input");
+        assert_eq!(shape(input), [1, positions, 128]);
+        let prepared = key_owner
+            .forward(RatioOneOwnerCall::new(
                 IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID")),
                 attention_case.start_pos,
-                &prepared.post_fp4,
-            )
-            .expect("native owner append");
-        let keys = key_state.prefix(0).expect("batch zero");
+                nonzero(positions),
+                &bf16(input),
+                &source_frequencies(&raw, attention_case.start_pos, positions, 16),
+                weights,
+            ))
+            .expect("native atomic owner call");
+        assert_eq!(
+            prepared.projected,
+            bf16(field(compressor_case, "projected"))
+        );
+        assert_eq!(prepared.latent, bf16(field(compressor_case, "latent")));
+        assert_eq!(
+            prepared.latent,
+            bf16(field(owner_case, "latent")),
+            "cross-capture latent gate"
+        );
+        let keys = key_owner.prefix(0).expect("batch zero");
         assert_eq!(keys, bf16(field(owner_case, "index_cache_after")));
         let indices = generated_indices(
             &raw,
