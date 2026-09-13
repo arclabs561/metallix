@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Stateless V4.1 index-key preparation from the original compressor latent:
+  bounded BF16 projection, RMSNorm, rotary and G32/E8M0 FP4 reconstruction.
+  Hand-staged numerical checks and batch/position properties cover the API;
+  the existing premature-latent-rotation control now calls it. Owner-layer
+  checkpoint parity and shared cache publication remain open.
 - Native V4.1 index selection now feeds the layer-attention integration test
   across captured prefill and decode calls, with exact attention-boundary
   comparisons. QR, shared index keys, candidates and compressed KV remain

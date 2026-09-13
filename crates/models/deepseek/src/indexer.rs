@@ -5,8 +5,9 @@
 //! query/key dot product, `ReLU`, signed per-head weighting, then head sum.
 //! The existing FP32 functions consume post-RoPE FP32 operands and do not claim
 //! BF16/FP4 parity. [`bf16`] provides a separate CPU-only source-staging
-//! reference for prepared BF16 operands. Neither surface owns quantization,
-//! candidate selection, cache state, or a complete indexer.
+//! reference for prepared BF16 operands. [`query`] and [`key`] prepare their
+//! respective operands through source-shaped quantization. These surfaces do
+//! not own candidate selection, cache state, or a complete indexer.
 
 use std::num::NonZeroUsize;
 
@@ -15,6 +16,7 @@ use mlx_rs::{Array, StreamOrDevice, ops};
 use thiserror::Error;
 
 pub mod bf16;
+pub mod key;
 pub mod query;
 
 /// Largest permitted `[heads, positions]` core score matrix for this diagnostic.

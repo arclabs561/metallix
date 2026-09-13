@@ -484,10 +484,8 @@ fn fp4_index_scores_select_the_compressed_vector_consumed_by_attention() {
     assert!(empty.iter().all(|value| value.to_bits() == 0));
 }
 
-#[cfg(feature = "metal")]
 fn projected_normalized_index_keys(latent: &[u16], frequencies: &[f32]) -> Vec<f32> {
-    use deepseek::norm::rms_norm_bf16_reference;
-    use deepseek::precision::bf16_linear_reference;
+    use deepseek::indexer::key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys};
 
     // Every output selects latent column 12, which changes sign under the
     // fixture's first rotation. This makes premature latent mutation observable.
@@ -495,21 +493,47 @@ fn projected_normalized_index_keys(latent: &[u16], frequencies: &[f32]) -> Vec<f
     for row in weight.chunks_exact_mut(16) {
         row[12] = 0x3f80;
     }
-    let mut projected = [0; 64];
-    bf16_linear_reference(latent, &weight, 2, 16, 32, &mut projected).expect("index wk projection");
-    let mut normalized = [0; 64];
-    for (row, output) in projected
-        .chunks_exact(32)
-        .zip(normalized.chunks_exact_mut(32))
-    {
-        rms_norm_bf16_reference(row, &[0x4110; 32], 1e-6, output)
-            .expect("index k_norm with learned scale 9");
-    }
-    let rotated = rotate_two_row_tails(&normalized, 32, frequencies);
-    let mut quantized = [0; 64];
-    fp4_activation_reference(&rotated, 2, 32, Fp4Mode::Index32E8m0, &mut quantized)
-        .expect("index key FP4 preparation");
-    quantized.into_iter().map(bf16_to_f32).collect()
+    let nz = |value| NonZeroUsize::new(value).expect("fixed key dimension");
+    let frequencies: Vec<_> = frequencies
+        .chunks_exact(2)
+        .map(|pair| RotaryFrequency::new(pair[0], pair[1]).expect("finite frequency"))
+        .collect();
+    prepare_index_keys(
+        latent,
+        &frequencies,
+        IndexKeyWeights::new(&weight, &[0x4110; 32]),
+        IndexKeyLayout::new(nz(1), nz(16), nz(32), nz(2), 1e-6).expect("source-shaped key layout"),
+    )
+    .expect("production index key preparation")
+    .post_fp4
+    .into_iter()
+    .map(bf16_to_f32)
+    .collect()
+}
+
+#[test]
+fn native_index_key_preparation_matches_hand_staged_rotary_fp4_rows() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/compressed-attention-reference.json"
+    ))
+    .expect("compressed latent fixture");
+    let latent = fixture_words(&fixture, "latent_bf16");
+    let original = latent.clone();
+    let keys =
+        projected_normalized_index_keys(&latent, &fixture_floats(&fixture, "frequencies_f32"));
+    // Synthetic column-12 projection and learned norm scale 9 give +9/-9.
+    // The unrotated prefix reconstructs at +/-8; the two rotary pairs then
+    // reconstruct to these exact E2M1 values at scale 4. These are hand-staged
+    // expectations, not captured owner-layer checkpoint weights.
+    let mut expected = vec![8.0_f32; 32];
+    expected[28..].copy_from_slice(&[-2.0, 12.0, 2.0, 12.0]);
+    expected.extend_from_slice(&[-8.0; 32]);
+    expected[60..].copy_from_slice(&[-2.0, -12.0, 2.0, -12.0]);
+    assert_eq!(keys, expected);
+    assert_eq!(
+        latent, original,
+        "key preparation must not mutate the latent"
+    );
 }
 
 #[cfg(feature = "metal")]
