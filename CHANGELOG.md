@@ -7,6 +7,10 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- The DeepSeek owner-to-attention source test now derives both producer and
+  consumer QR natively. Captured QR is an exact expected result rather than a
+  scoring input; layer activations and full-model orchestration remain outside
+  this test's scope.
 - Stateless DeepSeek candidate-query preparation now derives QR from input
   activations through the same private FP8 projection/RMSNorm helper as attention.
   Validated candidate layouts keep query dimensions consistent without requiring

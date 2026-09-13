@@ -490,8 +490,11 @@ mask effect; it does not replace the positive native-owner integration.
 
 Layer-three input activations remain captured operands; its `wq_a` and QR are
 now computed and checked against captured expectations before the native
-index-query path consumes them. The separate layer-four consumer QR is still
-captured. Causal masking remains test-local composition around production
+index-query path consumes them. The layer-four consumer now uses the same
+stateless adapter with its own captured weights and input, checking its native
+projection and QR against the attention oracle before scoring. Neither producer
+nor consumer scoring consumes captured QR. Causal masking remains test-local
+composition around production
 scoring and block selection. The remaining runtime work joins these operators
 with explicit key-publication and candidate-selection contracts, followed by
 whole-block transaction handling.

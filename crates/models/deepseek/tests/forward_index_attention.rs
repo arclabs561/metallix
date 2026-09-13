@@ -2,8 +2,8 @@
 //!
 //! This test joins the production index-query prefix, BF16 scorer, strict
 //! selector, candidate producer, atomic compressor/key/KV owner, and attention
-//! adapter. Consumer QR and owner/consumer layer inputs remain fixture boundaries;
-//! producer QR is computed by the native candidate-query adapter.
+//! adapter. Owner/consumer layer inputs remain fixture boundaries; both producer
+//! and consumer QR are computed by the native candidate-query adapter.
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -19,14 +19,17 @@ use attention_capture::{
     weights as attention_weights,
 };
 use deepseek::{
-    attention::layer::{LayerAttentionError, LayerAttentionState},
+    attention::layer::{Fp8Projection, LayerAttentionError, LayerAttentionState},
     indexer::{
         bf16::index_scores_bf16_reference,
         cache::IndexKeyPublicationId,
         compressed_kv::{CompressedKvLayout, prepare_compressed_kv},
         key::{IndexKeyLayout, IndexKeyWeights},
         owner::{RatioOneCompressedOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
-        query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
+        query::{
+            CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
+            prepare_candidate_query,
+        },
     },
     precision::{Fp4ActivationMode, requantize_bf16_activations_e2m1},
     select_indices,
@@ -268,11 +271,16 @@ fn generated_indices(
         attention_case.input.bf16(),
         "source indexer X is attention input at start {start}"
     );
-    let positions = shape(field(inputs, "qr"))[1];
+    let positions = shape(field(inputs, "x"))[1];
     let heads = usize_field(model, "index_n_heads");
     let head_dimension = usize_field(model, "index_head_dim");
-    let query = prepare_index_query(
-        &qr,
+    let parameters = field(root, "encoded_parameters");
+    let projection_codes = fp8(field(parameters, "layers.4.attn.wq_a.weight"));
+    let projection_scales = fp8(field(parameters, "layers.4.attn.wq_a.scale"));
+    let norm = bf16(field(parameters, "layers.4.attn.q_norm.weight"));
+    let epsilon: f32 = serde_json::from_value(field(model, "norm_eps").clone())
+        .expect("source normalization epsilon");
+    let prepared = prepare_candidate_query(
         &x,
         &source_frequencies(
             root,
@@ -280,10 +288,24 @@ fn generated_indices(
             positions,
             usize_field(model, "rope_head_dim") / 2,
         ),
-        weights,
-        layout,
+        CandidateQueryWeights {
+            wq_a: Fp8Projection {
+                codes: &projection_codes,
+                scales: &projection_scales,
+            },
+            q_norm: &norm,
+            index: weights,
+        },
+        CandidateQueryLayout::new(layout, epsilon).expect("consumer QR layout"),
     )
     .expect("bounded production index query");
+    assert_eq!(
+        prepared.wq_a,
+        attention_case.wq_a_output.bf16(),
+        "consumer projection"
+    );
+    assert_eq!(prepared.qr, qr, "consumer QR");
+    let query = prepared.index;
     assert_eq!(
         query.query_post_fp4,
         bf16(field(operations, "q_after_rope_fp4")),
