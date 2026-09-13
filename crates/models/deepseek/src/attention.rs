@@ -10,6 +10,7 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
+pub mod layer;
 pub mod window;
 
 mod output;

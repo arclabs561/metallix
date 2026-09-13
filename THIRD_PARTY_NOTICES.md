@@ -72,6 +72,13 @@ attention pre-mix, normalize, execute the MoE, then apply the fresh HC post-mix.
 The capture retains the source block's HC inputs, coefficients and residuals
 to diagnose numerical differences; this is not a full-block parity claim.
 
+`crates/models/deepseek/src/attention/layer.rs` composes the same revision's
+`Attention.forward` query, window-cache, sparse-attention and output-projection
+ordering. Compressed numerical KV and the consumer's selected indices remain
+caller-supplied. `scripts/v41_attention_capture.py` extracts observed layer-four
+boundaries from the source-forward capture; it does not recompute expected
+intermediates or establish native indexer, compressor or full-model parity.
+
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
 ```text

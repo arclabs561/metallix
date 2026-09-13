@@ -7,6 +7,13 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native V4.1 layer-four attention composition from encoded projections through
+  query normalization, rotary tails, the window ring, sparse attention and
+  output projection. Captured prefill and decode boundaries match BF16 storage
+  and window indices exactly. Compressed KV and selected compressed indices
+  remain source-supplied; native reindexing and full-model execution are open.
+  Publication checks reject stale identity, wrong prefix lengths, phantom
+  empty-prefix slots and duplicate selected positions without committing state.
 - Native V4.1 FFN composition joining HC coefficient projection, incoming
   residual mixing, RMSNorm, routed/shared experts and HC post-mixing.
   Synthetic source comparisons use input-derived arithmetic envelopes and

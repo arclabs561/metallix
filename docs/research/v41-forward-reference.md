@@ -21,8 +21,9 @@ writes encoded parameters, intermediate outputs, caches and final logits.
 The runner pins its Python dependencies and rejects source-hash mismatches.
 Neither command downloads model weights.
 
-The default `just check` runs the dependency-free manifest and source-loader
-tests. Numerical kernel tests require Torch and are run explicitly above.
+The default `just check` runs the dependency-free manifest, source-loader and
+attention-fixture integrity tests. Numerical kernel tests require Torch and
+are run explicitly above.
 The loader's source-body comparison is skipped if retained source artifacts
 are absent; that skip is not source verification.
 
@@ -235,3 +236,57 @@ Run the boundary probes with:
 cargo test -p deepseek --test forward_moe -- --nocapture
 cargo test -p deepseek ffn:: --lib
 ```
+
+## Layer-four attention capture and native composition
+
+```sh
+uv run scripts/v41-forward-reference.py --output artifacts/v41-forward-reference.json \
+  --head-fixture-output fixtures/deepseek-v41/forward-head-reference.json \
+  --moe-fixture-output fixtures/deepseek-v41/forward-moe-reference.json \
+  --attention-fixture-output fixtures/deepseek-v41/forward-attention-reference.json
+cargo test -p deepseek --test forward_attention
+```
+
+The attention subset records the actual layer-four input, FP8 projection
+weights and scales, BF16 normalization weights, rotary frequencies, query
+stages, window-ring state, compressed numerical KV, selected indices, sparse
+attention output and output projections. Hooks copy observed tensors before
+subsequent in-place operations; the exporter does not recompute intermediate
+answers. A repeated capture reproduced the full capture and attention subset
+byte for byte. Regenerating the head and MoE subsets changed their provenance
+only, not their tensor payloads.
+
+Two window views must remain distinct: prefill returns the newly prepared
+chunk, while decode returns the complete physical ring. The fixture records
+both the newly prepared rows and the returned read, including the wrap at
+decode position six. Its dependency-free integrity gate checks encoded tensor
+lengths and SHA-256 digests, with a deliberately corrupted-byte control.
+
+`deepseek::attention::layer::LayerAttentionState` joins query projection,
+row-wise normalization, rotary tails, quantized window preparation, sparse
+attention and output projection. It owns a bounded numerical BF16 ring, not
+a packed cache or serving scheduler. A call stages state until execution
+succeeds; the publication identifies its source layer, request epoch and
+successful-call ordinal.
+
+The source comparison requires exact BF16 query projection, normalization,
+rotary, prepared-window, returned-window, ring, sparse-output and final-output
+bits, plus exact native window indices, across the prefill and both decodes.
+All these checks pass without widening the comparison policy. The captured
+grouped `wo_b` input remains an available diagnostic, not a separately checked
+native intermediate in this test.
+
+Publication validation rejects an incorrect compressed-prefix length, stale
+identity, noncausal or out-of-range IDs, duplicate nonnegative IDs within a
+query and phantom slots when the prefix is empty. Valid empty prefixes execute
+window-only attention. Negative controls retry successfully against the
+unchanged state. This validates structural ownership and index invariants;
+it does not authenticate supplied values, reproduce indexer scoring or prove
+that the supplied slot count is the source indexer's selected count.
+
+The compressed values still come from layer three in the source capture.
+The supplied selected indices are **layer four's own source-computed
+reindexing results**, not indices reused from layer three. Native reindexing,
+the native compressed-cache producer and full-block composition remain
+separate acceptance gates. This diagnostic is not pretrained-model execution
+or a performance benchmark.

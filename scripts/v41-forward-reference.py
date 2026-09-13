@@ -51,8 +51,13 @@ MAX_HEAD_FIXTURE_BYTES = 48 << 10
 # The full layer-four MoE payload retains packed routed and FP8 shared expert
 # storage.  It is intentionally bigger than the head fixture but bounded.
 MAX_MOE_FIXTURE_BYTES = 512 << 10
+# Layer-four attention retains all encoded projections plus three source cases.
+# The reduced graph is deliberately small enough that complete tensor bytes fit
+# under this limit; exceeding it is a schema/capture regression, not truncation.
+MAX_ATTENTION_FIXTURE_BYTES = 512 << 10
 
 sys.path.insert(0, str(SCRIPTS))
+import v41_attention_capture
 import v41_cpu_kernels as kernels
 import v41_forward_manifest as forward_manifest
 import v41_source_loader as source_loader
@@ -115,6 +120,8 @@ def tensor_record(
     raw = tensor.view(torch.uint8).numpy().tobytes()
     if tensor.dtype == torch.float4_e2m1fn_x2:
         flat = kernels.unpack_fp4_e2m1x2(tensor.view(torch.uint8)).reshape(-1)
+    elif tensor.is_complex():
+        flat = torch.view_as_real(tensor).reshape(-1)
     else:
         flat = tensor.float().reshape(-1)
     sample = [float(item) for item in flat[:SAMPLE_VALUES]]
@@ -144,10 +151,13 @@ def object_record(value: object, *, include_storage: bool = False) -> object:
     raise TypeError(f"unrecordable hook output {type(value)!r}")
 
 
-def tracing_kernel_bundle() -> tuple[ModuleType, list[dict[str, object]]]:
-    """Expose the CPU backend while observing, never altering, HC kernel calls."""
+def tracing_kernel_bundle() -> tuple[
+    ModuleType, list[dict[str, object]], list[dict[str, object]]
+]:
+    """Expose the CPU backend while observing HC and sparse-attention calls."""
     bundle = ModuleType("_metallix_v41_tracing_kernels")
-    records: list[dict[str, object]] = []
+    hc_records: list[dict[str, object]] = []
+    sparse_records: list[dict[str, object]] = []
     for name in source_loader.KERNEL_NAMES:
         setattr(bundle, name, getattr(kernels, name))
 
@@ -166,7 +176,7 @@ def tracing_kernel_bundle() -> tuple[ModuleType, list[dict[str, object]]]:
         )
         pre, post, comb = output
         identity = torch.eye(hc_mult, dtype=comb.dtype, device=comb.device)
-        records.append(
+        hc_records.append(
             {
                 "inputs": {
                     "mixes": tensor_record(mixes, include_storage=True),
@@ -192,8 +202,36 @@ def tracing_kernel_bundle() -> tuple[ModuleType, list[dict[str, object]]]:
         )
         return output
 
+    def traced_sparse_attn(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        sink: torch.Tensor,
+        idxs: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        """Record actual prepared attention operands without changing the call."""
+        output = kernels.sparse_attn(q, kv, sink, idxs, scale)
+        # ``Attention.forward`` inverse-rotates this result in place. Clone
+        # before returning so this remains the real kernel output boundary.
+        sparse_records.append(
+            {
+                "inputs": {
+                    "q_after_rope": tensor_record(q, include_storage=True),
+                    "kv": tensor_record(kv, include_storage=True),
+                    "sink": tensor_record(sink, include_storage=True),
+                    "indices": tensor_record(idxs, include_storage=True),
+                    "softmax_scale": scale,
+                },
+                "output_pre_inverse_rope": tensor_record(
+                    output.clone(), include_storage=True
+                ),
+            }
+        )
+        return output
+
     bundle.hc_split_sinkhorn = traced_hc_split_sinkhorn
-    return bundle, records
+    bundle.sparse_attn = traced_sparse_attn
+    return bundle, hc_records, sparse_records
 
 
 def deterministic_values(shape: tuple[int, ...], ordinal: int) -> torch.Tensor:
@@ -277,6 +315,13 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
     had_hc_mixes_instance_attr = "hc_mixes" in layer_four.__dict__
     prior_hc_mixes = layer_four.__dict__.get("hc_mixes")
     original_hc_mixes = layer_four.hc_mixes
+    layer_four_attention = layer_four.attn
+    had_window_instance_attr = "_window_kv" in layer_four_attention.__dict__
+    prior_window_kv = layer_four_attention.__dict__.get("_window_kv")
+    original_window_kv = layer_four_attention._window_kv
+    had_compress_instance_attr = "_compress_kv" in layer_four_attention.__dict__
+    prior_compress_kv = layer_four_attention.__dict__.get("_compress_kv")
+    original_compress_kv = layer_four_attention._compress_kv
 
     def capture(name: str):
         def hook(
@@ -366,6 +411,18 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
                     capture_input("layers.4.attention_input", exactly_one=False)
                 )
             )
+        if name in {
+            "layers.4.attn.wq_a",
+            "layers.4.attn.q_norm",
+            "layers.4.attn.wq_b",
+        }:
+            handles.append(module.register_forward_hook(capture(name)))
+        if name == "layers.4.attn.wo_b":
+            handles.append(
+                module.register_forward_pre_hook(
+                    capture_input("layers.4.attn.wo_b_input", exactly_one=True)
+                )
+            )
         if name == "layers.4.ffn_norm":
             handles.append(
                 module.register_forward_pre_hook(
@@ -392,10 +449,63 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
             )
         return original_hc_mixes(x, hc_fn, hc_scale, hc_base)
 
+    def observed_window_kv(
+        x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Observe source's newly prepared KV, returned read, and ring after write."""
+        if "layers.4.attn.window" in records:
+            raise RuntimeError("layer-four window KV was observed twice")
+        if len(records) >= MAX_HOOK_RECORDS:
+            raise RuntimeError("hook receipt cap reached")
+        window_kv, window_indices = original_window_kv(x, freqs_cis, start_pos)
+        # On decode the source returns the entire ring, whereas the newly
+        # prepared publication is only the slot it wrote.  Retain both source
+        # views without re-quantizing or otherwise reconstructing either one.
+        prepared_window_kv = (
+            window_kv
+            if start_pos == 0
+            else layer_four_attention.window_kv_cache[
+                : x.size(0),
+                start_pos % layer_four_attention.window_size : start_pos
+                % layer_four_attention.window_size
+                + 1,
+            ]
+        )
+        records["layers.4.attn.window"] = {
+            "prepared_window_kv": object_record(
+                prepared_window_kv, include_storage=True
+            ),
+            "window_kv": object_record(window_kv, include_storage=True),
+            "indices": object_record(window_indices, include_storage=True),
+            "ring_after": object_record(
+                layer_four_attention.window_kv_cache, include_storage=True
+            ),
+        }
+        return window_kv, window_indices
+
+    def observed_compress_kv(
+        x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Observe actual layer-three shared KV and source-produced indices."""
+        if "layers.4.attn.compressed" in records:
+            raise RuntimeError("layer-four compressed KV was observed twice")
+        if len(records) >= MAX_HOOK_RECORDS:
+            raise RuntimeError("hook receipt cap reached")
+        compressed_kv, compressed_indices = original_compress_kv(
+            x, qr, start_pos, offset
+        )
+        records["layers.4.attn.compressed"] = {
+            "borrowed_kv": object_record(compressed_kv, include_storage=True),
+            "indices": object_record(compressed_indices, include_storage=True),
+        }
+        return compressed_kv, compressed_indices
+
     # This instance-level observer calls the original bound method unchanged.
     # Restoration below removes it entirely when the instance did not own an
     # attribute before capture, so it cannot leak into later source forwards.
     layer_four.hc_mixes = observed_hc_mixes
+    layer_four_attention._window_kv = observed_window_kv
+    layer_four_attention._compress_kv = observed_compress_kv
     try:
         yield records
     finally:
@@ -405,6 +515,14 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
             layer_four.hc_mixes = prior_hc_mixes
         else:
             delattr(layer_four, "hc_mixes")
+        if had_window_instance_attr:
+            layer_four_attention._window_kv = prior_window_kv
+        else:
+            delattr(layer_four_attention, "_window_kv")
+        if had_compress_instance_attr:
+            layer_four_attention._compress_kv = prior_compress_kv
+        else:
+            delattr(layer_four_attention, "_compress_kv")
 
 
 def cache_snapshots(graph: ModuleType, model: torch.nn.Module) -> dict[str, object]:
@@ -535,6 +653,17 @@ def hc_step_receipt(
     return labeled
 
 
+def sparse_step_receipt(
+    records: list[dict[str, object]], n_layers: int
+) -> list[dict[str, object]]:
+    """Label source-order sparse-attention observations without weakening scope."""
+    if len(records) != n_layers:
+        raise RuntimeError(
+            f"expected {n_layers} sparse attention calls, got {len(records)}"
+        )
+    return [{"layer_id": index, **record} for index, record in enumerate(records)]
+
+
 def engram_receipt(
     model: torch.nn.Module, manifest: dict[str, Any]
 ) -> dict[str, object]:
@@ -587,7 +716,7 @@ def run_capture() -> dict[str, object]:
         raise RuntimeError(
             "retained upstream kernel hash differs from the capture contract"
         )
-    kernel_bundle, hc_records = tracing_kernel_bundle()
+    kernel_bundle, hc_records, sparse_records = tracing_kernel_bundle()
     graph = source_loader.load_text_graph(kernel_bundle)
     graph.shared_attn = graph.SharedAttentionRuntime()
     # The source expects BF16 default execution results from its replacement
@@ -624,6 +753,7 @@ def run_capture() -> dict[str, object]:
                 for start_pos, chunk in calls:
                     intermediate.clear()
                     hc_records.clear()
+                    sparse_records.clear()
                     output_ids, logits, main_hidden = model(chunk, start_pos=start_pos)
                     if not bool(torch.isfinite(logits).all()):
                         raise RuntimeError(f"nonfinite logits at start_pos={start_pos}")
@@ -642,10 +772,18 @@ def run_capture() -> dict[str, object]:
                             "hyper_connection_mixes": hc_step_receipt(
                                 hc_records, len(model.layers)
                             ),
+                            "sparse_attention_calls": sparse_step_receipt(
+                                sparse_records, len(model.layers)
+                            ),
                             "caches_after": cache_snapshots(graph, model),
                         }
                     )
         candidates = candidate_receipt(graph, args.window_size)
+        attention_static = {
+            "layer_4_freqs_cis": tensor_record(
+                model.layers[4].attn.freqs_cis, include_storage=True
+            )
+        }
     return {
         "schema_version": 1,
         "capture_status": "completed synthetic source-forward capture; no parity claim",
@@ -657,6 +795,7 @@ def run_capture() -> dict[str, object]:
                 "block outputs and pre-mix outputs",
                 "attention, compressor, indexer, routing, and FFN module outputs",
                 "all source HC kernel inputs and coefficients",
+                "layer-four attention projections, prepared cache reads, and sparse kernel boundaries",
                 "final RMSNorm and FP32 head logits",
                 "cache and candidate-filter snapshots",
             ],
@@ -673,6 +812,9 @@ def run_capture() -> dict[str, object]:
             "kernel_source_sha256": KERNEL_SHA256,
             "cpu_backend_sha256": _sha256_bytes(kernel_bytes),
             "runner_sha256": _sha256_bytes(Path(__file__).read_bytes()),
+            "attention_helper_sha256": _sha256_bytes(
+                (SCRIPTS / "v41_attention_capture.py").read_bytes()
+            ),
         },
         "runtime": {
             "python": platform.python_version(),
@@ -723,6 +865,7 @@ def run_capture() -> dict[str, object]:
         },
         "encoded_parameters": encoded,
         "engram": engram,
+        "attention_static": attention_static,
         "steps": steps,
         "candidate_filtering": candidates,
     }
@@ -1235,6 +1378,14 @@ def main() -> int:
             "source capture"
         ),
     )
+    parser.add_argument(
+        "--attention-fixture-output",
+        type=Path,
+        help=(
+            "write the compact layer-four source-attention fixture derived from "
+            "a complete source capture"
+        ),
+    )
     args = parser.parse_args()
     receipt = run_capture()
     artifact_bytes = serialized_capture(receipt)
@@ -1312,10 +1463,40 @@ def main() -> int:
                 sort_keys=True,
             )
         )
+    if args.attention_fixture_output is not None:
+        fixture = v41_attention_capture.attention_fixture(
+            receipt, helper_path=SCRIPTS / "v41_attention_capture.py"
+        )
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_ATTENTION_FIXTURE_BYTES:
+            raise RuntimeError(
+                f"attention fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_ATTENTION_FIXTURE_BYTES} bytes"
+            )
+        args.attention_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.attention_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "complete_capture_sha256": fixture["source"][
+                        "complete_capture_sha256"
+                    ],
+                    "path": str(args.attention_fixture_output),
+                    "status": "source_forward_attention_fixture",
+                },
+                sort_keys=True,
+            )
+        )
     if (
         args.output is None
         and args.head_fixture_output is None
         and args.moe_fixture_output is None
+        and args.attention_fixture_output is None
     ):
         print(artifact_bytes.decode("utf-8"), end="")
     return 0
