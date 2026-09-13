@@ -333,6 +333,115 @@ def index_key_fixture(receipt: dict[str, object]) -> dict[str, object]:
     }
 
 
+def compressor_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Extract exact layer-three compressor stages from the pinned trace.
+
+    The index-key fixture remains the receipt's common validation boundary: it
+    establishes the pinned provenance, source-layer schedule, cache geometry,
+    and three-call trace before this supplementary fixture inspects compressor
+    operands.  This exporter intentionally records tensors only.  It neither
+    recomputes the projection/RMSNorm nor claims native compressor parity.
+    """
+    index_fixture = index_key_fixture(receipt)
+    model = _require_dict(index_fixture.get("model"), "index-key fixture model")
+    source = _require_dict(index_fixture.get("source"), "index-key fixture source")
+    model_args = _require_dict(receipt.get("model_args"), "model args")
+    parameters = _require_dict(receipt.get("encoded_parameters"), "encoded parameters")
+    steps = receipt.get("steps")
+    if not isinstance(steps, list):
+        raise TypeError("compressor fixture has invalid steps")
+
+    input_dimension = model_args.get("dim")
+    latent_dimension = model.get("latent_dimension")
+    if not isinstance(input_dimension, int) or isinstance(input_dimension, bool):
+        raise TypeError("compressor fixture has invalid input dimension")
+    if not isinstance(latent_dimension, int) or isinstance(latent_dimension, bool):
+        raise TypeError("compressor fixture has invalid latent dimension")
+    if model_args.get("compress_ratios", [])[OWNER_LAYER] != 1:
+        raise RuntimeError("compressor fixture requires layer-three ratio-one schedule")
+
+    wkv = _tensor(
+        parameters.get("layers.3.attn.compressor.wkv.weight"),
+        "layers.3.attn.compressor.wkv.weight",
+        dtype="torch.bfloat16",
+        shape=[latent_dimension, input_dimension],
+        byte_width=BF16_BYTES,
+    )
+    norm = _tensor(
+        parameters.get("layers.3.attn.compressor.norm.weight"),
+        "layers.3.attn.compressor.norm.weight",
+        dtype="torch.bfloat16",
+        shape=[latent_dimension],
+        byte_width=BF16_BYTES,
+    )
+
+    cases: list[dict[str, object]] = []
+    for expected_start, step in zip(EXPECTED_START_POSITIONS, steps, strict=True):
+        item = _require_dict(step, f"step {expected_start}")
+        start_pos = _require_int(item.get("start_pos"), "step start_pos")
+        if start_pos != expected_start:
+            raise RuntimeError(
+                f"compressor fixture expected start_pos {expected_start}, got {start_pos}"
+            )
+        sequence = 5 if start_pos == 0 else 1
+        intermediate = _require_dict(
+            item.get("intermediates"), f"step {start_pos} intermediates"
+        )
+        attention_input = _tensor(
+            intermediate.get("layers.3.attention_input"),
+            f"step {start_pos} layer-three attention input",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, input_dimension],
+            byte_width=BF16_BYTES,
+        )
+        projected = _tensor(
+            intermediate.get("layers.3.attn.compressor.wkv"),
+            f"step {start_pos} layer-three compressor projection",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, latent_dimension],
+            byte_width=BF16_BYTES,
+        )
+        latent = _tensor(
+            intermediate.get("layers.3.attn.compressor"),
+            f"step {start_pos} layer-three pre-mutation compressor latent",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, latent_dimension],
+            byte_width=BF16_BYTES,
+        )
+        cases.append(
+            {
+                "start_pos": start_pos,
+                "attention_input": attention_input,
+                "projected": projected,
+                "latent": latent,
+            }
+        )
+    if len(cases) != len(EXPECTED_START_POSITIONS):
+        raise RuntimeError(
+            "compressor fixture requires exactly the pinned three-call trace"
+        )
+
+    return {
+        "schema_version": 1,
+        "scope": (
+            "layer-three source compressor inputs, projection, and normalized latent; "
+            "not native compressor arithmetic, cache ownership, scheduling, or full-model parity"
+        ),
+        "source": source,
+        "model": {
+            "batches": model["batches"],
+            "input_dimension": input_dimension,
+            "latent_dimension": latent_dimension,
+            "norm_epsilon": model["norm_epsilon"],
+            "owner_layer": OWNER_LAYER,
+            "compression_ratio": 1,
+            "expected_start_positions": list(EXPECTED_START_POSITIONS),
+        },
+        "weights": {"wkv": wkv, "norm": norm},
+        "cases": cases,
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -340,6 +449,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path, required=True, help="fixture JSON to write"
+    )
+    parser.add_argument(
+        "--compressor-output",
+        type=Path,
+        help="optional supplementary compressor fixture JSON to write",
     )
     return parser.parse_args()
 
@@ -366,6 +480,14 @@ def main() -> None:
     args.output.write_text(
         json.dumps(fixture, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
+    if args.compressor_output is not None:
+        args.compressor_output.parent.mkdir(parents=True, exist_ok=True)
+        args.compressor_output.write_text(
+            json.dumps(
+                compressor_fixture(receipt), indent=2, sort_keys=True, allow_nan=False
+            )
+            + "\n"
+        )
 
 
 if __name__ == "__main__":

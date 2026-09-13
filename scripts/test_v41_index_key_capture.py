@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
+from pathlib import Path
 
-from v41_index_key_capture import index_key_fixture
+from v41_index_key_capture import compressor_fixture, index_key_fixture
 
 
 def _tensor(
@@ -58,14 +60,24 @@ def _receipt() -> dict[str, object]:
         "encoded_parameters": {
             "layers.3.attn.indexer.wk.weight": _tensor("torch.bfloat16", [64, 64], 2),
             "layers.3.attn.indexer.k_norm.weight": _tensor("torch.bfloat16", [64], 2),
+            "layers.3.attn.compressor.wkv.weight": _tensor(
+                "torch.bfloat16", [64, 128], 2
+            ),
+            "layers.3.attn.compressor.norm.weight": _tensor("torch.bfloat16", [64], 2),
         },
         "steps": [
             {
                 "start_pos": start_pos,
                 "intermediates": {
+                    "layers.3.attention_input": _tensor(
+                        "torch.bfloat16", [1, sequence, 128], 2, start_pos + 3
+                    ),
+                    "layers.3.attn.compressor.wkv": _tensor(
+                        "torch.bfloat16", [1, sequence, 64], 2, start_pos + 4
+                    ),
                     "layers.3.attn.compressor": _tensor(
                         "torch.bfloat16", [1, sequence, 64], 2, start_pos + 1
-                    )
+                    ),
                 },
                 "caches_after": {
                     "layer_3.index_k": _tensor(
@@ -79,6 +91,20 @@ def _receipt() -> dict[str, object]:
 
 
 class IndexKeyCaptureTest(unittest.TestCase):
+    def test_current_compressor_fixture_pins_live_observer(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        fixture = json.loads(
+            (
+                root / "fixtures/deepseek-v41/forward-compressor-reference.json"
+            ).read_text()
+        )
+        self.assertEqual(
+            fixture["source"]["forward_observers_sha256"],
+            hashlib.sha256(
+                (root / "scripts/v41_forward_observers.py").read_bytes()
+            ).hexdigest(),
+        )
+
     def test_extracts_pinned_prefixes_and_provenance(self) -> None:
         fixture = index_key_fixture(_receipt())
         self.assertEqual(fixture["schema_version"], 1)
@@ -149,6 +175,43 @@ class IndexKeyCaptureTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(RuntimeError, "shape"):
             index_key_fixture(receipt)
+
+    def test_extracts_compressor_stages_with_shared_provenance(self) -> None:
+        fixture = compressor_fixture(_receipt())
+        self.assertEqual(fixture["schema_version"], 1)
+        self.assertEqual(fixture["model"]["input_dimension"], 128)
+        self.assertEqual(fixture["model"]["latent_dimension"], 64)
+        self.assertEqual(fixture["model"]["compression_ratio"], 1)
+        self.assertEqual(fixture["weights"]["wkv"]["shape"], [64, 128])
+        self.assertEqual(fixture["weights"]["norm"]["shape"], [64])
+        self.assertEqual([case["start_pos"] for case in fixture["cases"]], [0, 5, 6])
+        self.assertEqual(
+            [case["attention_input"]["shape"] for case in fixture["cases"]],
+            [[1, 5, 128], [1, 1, 128], [1, 1, 128]],
+        )
+        for case in fixture["cases"]:
+            for name in ("attention_input", "projected", "latent"):
+                tensor = case[name]
+                raw = bytes.fromhex(tensor["storage_hex"])
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(), tensor["storage_sha256"]
+                )
+
+    def test_compressor_rejects_wrong_weight_boundary(self) -> None:
+        receipt = _receipt()
+        del receipt["encoded_parameters"]["layers.3.attn.compressor.wkv.weight"]
+        receipt["encoded_parameters"]["layers.3.attn.compressor.wk.weight"] = _tensor(
+            "torch.bfloat16", [64, 128], 2
+        )
+        with self.assertRaisesRegex(TypeError, "compressor.wkv.weight"):
+            compressor_fixture(receipt)
+
+    def test_compressor_rejects_malformed_attention_input(self) -> None:
+        receipt = _receipt()
+        record = receipt["steps"][1]["intermediates"]["layers.3.attention_input"]
+        record["shape"] = [1, 2, 128]
+        with self.assertRaisesRegex(RuntimeError, "attention input.*shape"):
+            compressor_fixture(receipt)
 
 
 if __name__ == "__main__":

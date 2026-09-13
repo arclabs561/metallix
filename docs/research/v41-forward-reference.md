@@ -372,12 +372,35 @@ are atomic individually, not across a later attention or FFN failure. The
 current one-million-element cap bounds a CPU reference cache, not a general
 GPU or larger-than-memory cache manager.
 
-The next capture boundary is layer three's attention input. For this reduced
-model, layer three has compression ratio one: its compressor is BF16 `wkv`
-followed by RMSNorm, with no grouped pooling. Existing linear and compressor
-primitives cover that arithmetic, but the compact key fixture supplies its
-output rather than its input. Capture that earlier input and retain the
-compressor's own weights before replacing the supplied latent. The acceptance
-gate is exact latent bytes followed by the same key-prefix and attention checks.
-A composed owner call must stage compressor and key-cache state together so
-a later key-preparation failure does not advance only the compressor.
+### Native ratio-one compressor input
+
+```sh
+uv run scripts/v41-forward-reference.py --output artifacts/v41-owner-compressor-source.json
+uv run --python 3.13 python scripts/v41_index_key_capture.py \
+  --input artifacts/v41-owner-compressor-source.json \
+  --output artifacts/v41-owner-compressor-index-key.json \
+  --compressor-output fixtures/deepseek-v41/forward-compressor-reference.json
+cargo test -p deepseek --test forward_index_key
+```
+
+The supplementary capture retains layer three's attention input, BF16 `wkv`
+output and normalized compressor latent. This reduced model uses compression
+ratio one, with no grouped pooling. Native BF16 linear projection and
+`CompressorState` match both captured stages exactly at starts zero, five and
+six. Their returned latent now feeds the owner-key/cache test; a zero-weight
+control changes that latent. The separate selection-to-attention test still
+uses the older captured latent.
+
+The new complete capture has SHA-256
+`2f2ff3f1734f959b33a673773cf6fe9c056fabb06a82531e5465562af5480c39`;
+a repeated execution was byte-identical. Older fixtures retain their historical
+capture identities. The native compressor result is checked against both the
+new latent and the old key fixture's latent before continuing, so these captures
+are not assumed numerically interchangeable just because the model is unchanged.
+The latest compressor fixture gates the live observer hash; the older attention
+fixture pins its historical observer hash.
+
+This remains test-level composition. A production owner call must stage
+compressor and key-cache state together so a later key-preparation failure does
+not advance only the compressor. Ratio-greater-than-one scheduling and complete
+model execution are not established by this ratio-one capture.

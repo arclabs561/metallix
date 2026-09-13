@@ -314,12 +314,17 @@ def hooks_for(
                     capture_input("layers.4.ffn_input", exactly_one=False)
                 )
             )
-        if name == "layers.4.attn":
+        if name in {"layers.3.attn", "layers.4.attn"}:
             handles.append(
                 module.register_forward_pre_hook(
-                    capture_input("layers.4.attention_input", exactly_one=False)
+                    capture_input(
+                        f"{name.removesuffix('.attn')}.attention_input",
+                        exactly_one=False,
+                    )
                 )
             )
+        if name == "layers.3.attn.compressor.wkv":
+            handles.append(module.register_forward_hook(capture(name)))
         if name in {"layers.4.attn.wq_a", "layers.4.attn.q_norm", "layers.4.attn.wq_b"}:
             handles.append(module.register_forward_hook(capture(name)))
         if name == "layers.4.attn.wo_b":
