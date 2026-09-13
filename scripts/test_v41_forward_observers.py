@@ -17,8 +17,8 @@ class SourceObserverPolicyTest(unittest.TestCase):
         self.assertIn('"scores_after_candidate_mask"', source)
         self.assertIn('"scores_weighted_per_head"', source)
         self.assertIn('"scores_after_head_sum"', source)
-        self.assertIn("args[0] is self.state.weights_proj_output", source)
-        self.assertIn("args[0] is self.state.einsum_output", source)
+        self.assertIn("args[0] is state.weights_proj_output", source)
+        self.assertIn("args[0] is state.einsum_output", source)
         self.assertNotIn("result.shape == projected.shape", source)
 
     def test_observer_restores_every_patched_source_binding(self) -> None:

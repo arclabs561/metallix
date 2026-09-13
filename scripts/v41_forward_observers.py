@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from enum import Enum, auto
 from types import ModuleType
 from typing import Any
 
@@ -19,27 +20,50 @@ TensorRecord = Callable[..., dict[str, Any]]
 ObjectRecord = Callable[..., object]
 
 
-class _IndexerState:
-    """Per-call storage used only while layer four's source Indexer executes."""
+class IndexerRole(Enum):
+    """The two fixed source Indexers observed by this bounded capture."""
 
-    def __init__(self, tensor_record: TensorRecord) -> None:
+    PRODUCER = auto()
+    CONSUMER = auto()
+
+
+class _QuantizationPhase(Enum):
+    """Source identity of the active Indexer FP4 operation."""
+
+    KEY = auto()
+    QUERY = auto()
+
+
+class _IndexerState:
+    """Per-call storage for one fixed source Indexer role."""
+
+    def __init__(self, role: IndexerRole, tensor_record: TensorRecord) -> None:
+        self.role = role
         self.tensor_record = tensor_record
         self.active = False
         self.recording = False
         self.weights_proj_output: torch.Tensor | None = None
         self.einsum_output: torch.Tensor | None = None
         self.weighted_per_head_output: torch.Tensor | None = None
-        self.candidate_mask: torch.Tensor | None = None
+        self.summed_score_output: torch.Tensor | None = None
+        self.causal_score_output: torch.Tensor | None = None
+        self.index_key_operand: torch.Tensor | None = None
+        self.shared_index_k_prefix: dict[str, Any] | None = None
+        self.quantization_phase: _QuantizationPhase | None = None
         self.operations: dict[str, object] = {}
 
     def begin(self) -> None:
         if self.active:
-            raise RuntimeError("layer-four Indexer observer re-entered")
+            raise RuntimeError(f"{self.role.name.lower()} Indexer observer re-entered")
         self.active = True
         self.weights_proj_output = None
         self.einsum_output = None
         self.weighted_per_head_output = None
-        self.candidate_mask = None
+        self.summed_score_output = None
+        self.causal_score_output = None
+        self.index_key_operand = None
+        self.shared_index_k_prefix = None
+        self.quantization_phase = None
         self.operations = {}
 
     def record(self, name: str, value: torch.Tensor) -> None:
@@ -53,17 +77,63 @@ class _IndexerState:
 
     def end(self) -> dict[str, object]:
         if not self.active:
-            raise RuntimeError("layer-four Indexer observer ended while inactive")
+            raise RuntimeError(
+                f"{self.role.name.lower()} Indexer observer ended while inactive"
+            )
         self.active = False
         return self.operations
+
+    def set_quantization_phase(self, phase: _QuantizationPhase) -> None:
+        if not self.active:
+            return
+        if phase is _QuantizationPhase.KEY and self.role is not IndexerRole.PRODUCER:
+            raise RuntimeError(
+                "only the fixed producer Indexer may quantize index keys"
+            )
+        self.quantization_phase = phase
+
+    def record_score_einsum(
+        self, output: torch.Tensor, index_key_operand: torch.Tensor
+    ) -> None:
+        self.einsum_output = output
+        self.index_key_operand = index_key_operand
+        self.recording = True
+        try:
+            self.shared_index_k_prefix = self.tensor_record(
+                index_key_operand, include_storage=True
+            )
+        finally:
+            self.recording = False
+        self.record("scores_einsum", output)
+
+
+class _IndexerStates:
+    """Fixed producer/consumer state registry for one graph proxy."""
+
+    def __init__(self, tensor_record: TensorRecord) -> None:
+        self._states = {
+            IndexerRole.PRODUCER: _IndexerState(IndexerRole.PRODUCER, tensor_record),
+            IndexerRole.CONSUMER: _IndexerState(IndexerRole.CONSUMER, tensor_record),
+        }
+
+    def for_role(self, role: IndexerRole) -> _IndexerState:
+        return self._states[role]
+
+    def active(self) -> _IndexerState | None:
+        active = [state for state in self._states.values() if state.active]
+        if len(active) > 1:
+            raise RuntimeError(
+                "fixed producer and consumer Indexer observers overlapped"
+            )
+        return active[0] if active else None
 
 
 class _IndexerDispatch(TorchDispatchMode):
     """Observe source tensor operators without copying Indexer.forward logic."""
 
-    def __init__(self, state: _IndexerState) -> None:
+    def __init__(self, states: _IndexerStates) -> None:
         super().__init__()
-        self.state = state
+        self.states = states
 
     def __torch_dispatch__(
         self,
@@ -74,51 +144,61 @@ class _IndexerDispatch(TorchDispatchMode):
     ) -> object:
         del types
         result = func(*args, **({} if kwargs is None else kwargs))
-        if not self.state.active or self.state.recording:
+        state = self.states.active()
+        if state is None or state.recording:
             return result
         name = str(func)
-        if "relu_" in name and result is self.state.einsum_output:
+        if "relu_" in name and result is state.einsum_output:
             # In-place source ReLU changes the einsum output.  The pre-ReLU
             # value was captured by the graph-local einsum proxy already.
-            self.state.record("scores_after_relu", result)
+            state.record("scores_after_relu", result)
         elif "mul" in name and isinstance(result, torch.Tensor) and args:
-            if args[0] is self.state.weights_proj_output:
-                self.state.record("scaled_weights", result)
-            elif args[0] is self.state.einsum_output and result.ndim == 4:
-                self.state.weighted_per_head_output = result
-                self.state.record("scores_weighted_per_head", result)
+            if args[0] is state.weights_proj_output:
+                state.record("scaled_weights", result)
+            elif args[0] is state.einsum_output and result.ndim == 4:
+                state.weighted_per_head_output = result
+                state.record("scores_weighted_per_head", result)
         elif "sum.dim_IntList" in name and isinstance(result, torch.Tensor):
-            if args and args[0] is self.state.weighted_per_head_output:
-                self.state.record("scores_after_head_sum", result)
+            if args and args[0] is state.weighted_per_head_output:
+                state.summed_score_output = result
+                state.record("scores_after_head_sum", result)
         elif "masked_fill_" in name and isinstance(result, torch.Tensor):
-            self.state.record("scores_after_causal_mask", result)
-        elif "masked_fill" in name and isinstance(result, torch.Tensor):
-            candidate = self.state.candidate_mask
-            mask = args[1] if len(args) > 1 else None
-            if (
-                candidate is not None
-                and isinstance(mask, torch.Tensor)
-                and mask.shape == candidate.shape
-            ):
-                self.state.record("scores_after_candidate_mask", result)
+            if args and args[0] is state.summed_score_output:
+                state.causal_score_output = result
+                state.record("scores_after_causal_mask", result)
+        elif (
+            "masked_fill" in name
+            and isinstance(result, torch.Tensor)
+            and state.role is IndexerRole.CONSUMER
+            and args
+            and args[0]
+            is (
+                state.causal_score_output
+                if state.causal_score_output is not None
+                else state.summed_score_output
+            )
+        ):
+            state.record("scores_after_candidate_mask", result)
         return result
 
 
 class _GraphTorchProxy:
     """Observe the source module's einsum name without mutating global torch."""
 
-    def __init__(self, real_torch: ModuleType, state: _IndexerState) -> None:
+    def __init__(self, real_torch: ModuleType, states: _IndexerStates) -> None:
         self._real_torch = real_torch
-        self._state = state
+        self._states = states
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._real_torch, name)
 
     def einsum(self, equation: str, *operands: torch.Tensor) -> torch.Tensor:
         output = self._real_torch.einsum(equation, *operands)
-        if self._state.active and equation == "bshd,btd->bsht":
-            self._state.einsum_output = output
-            self._state.record("scores_einsum", output)
+        state = self._states.active()
+        if state is not None and equation == "bshd,btd->bsht":
+            if len(operands) != 2:
+                raise RuntimeError("source Indexer score einsum must have two operands")
+            state.record_score_einsum(output, operands[1])
         return output
 
 
@@ -214,12 +294,19 @@ def hooks_for(
     """Capture selected source boundaries and restore all observer bindings."""
     records: dict[str, object] = {}
     handles: list[torch.utils.hooks.RemovableHandle] = []
+    layer_three = model.layers[3]
+    layer_three_attention = layer_three.attn
+    layer_three_indexer = layer_three_attention.indexer
     layer_four = model.layers[4]
     layer_four_attention = layer_four.attn
     layer_four_indexer = layer_four_attention.indexer
-    if layer_four_indexer is None:
-        raise RuntimeError("layer four must have an Indexer in the fixed capture graph")
-    index_state = _IndexerState(tensor_record)
+    if layer_three_indexer is None or layer_four_indexer is None:
+        raise RuntimeError(
+            "fixed layer three/four capture graph requires both Indexers"
+        )
+    states = _IndexerStates(tensor_record)
+    producer_state = states.for_role(IndexerRole.PRODUCER)
+    consumer_state = states.for_role(IndexerRole.CONSUMER)
 
     def instance_method(
         module: object, name: str
@@ -238,6 +325,11 @@ def hooks_for(
     had_indexer_forward, prior_indexer_forward, original_indexer_forward = (
         instance_method(layer_four_indexer, "forward")
     )
+    (
+        had_producer_indexer_forward,
+        prior_producer_indexer_forward,
+        original_producer_indexer_forward,
+    ) = instance_method(layer_three_indexer, "forward")
     original_torch = graph.torch
     original_rotary = graph.apply_rotary_emb
     original_fp4_quant = graph.fp4_act_quant
@@ -278,6 +370,31 @@ def hooks_for(
             "residual": object_record(inputs[0], include_storage=True),
             "incoming_pre": object_record(inputs[2], include_storage=True),
         }
+
+    def capture_weights_for(state: _IndexerState):
+        def capture_weights(
+            _module: torch.nn.Module, _inputs: tuple[object, ...], output: object
+        ) -> None:
+            if not isinstance(output, torch.Tensor):
+                raise TypeError(
+                    f"{state.role.name.lower()} Indexer weights projection did not return a tensor"
+                )
+            state.weights_proj_output = output
+            state.record("weights_proj_output", output)
+
+        return capture_weights
+
+    def mark_quantization_phase(state: _IndexerState, phase: _QuantizationPhase):
+        def mark_phase(
+            _module: torch.nn.Module, _inputs: tuple[object, ...], output: object
+        ) -> None:
+            if not isinstance(output, torch.Tensor):
+                raise TypeError(
+                    f"{state.role.name.lower()} Indexer quantization boundary did not return a tensor"
+                )
+            state.set_quantization_phase(phase)
+
+        return mark_phase
 
     for name, module in model.named_modules():
         pieces = name.split(".")
@@ -325,7 +442,14 @@ def hooks_for(
             )
         if name == "layers.3.attn.compressor.wkv":
             handles.append(module.register_forward_hook(capture(name)))
-        if name in {"layers.4.attn.wq_a", "layers.4.attn.q_norm", "layers.4.attn.wq_b"}:
+        if name in {
+            "layers.3.attn.wq_a",
+            "layers.3.attn.q_norm",
+            "layers.3.attn.wq_b",
+            "layers.4.attn.wq_a",
+            "layers.4.attn.q_norm",
+            "layers.4.attn.wq_b",
+        }:
             handles.append(module.register_forward_hook(capture(name)))
         if name == "layers.4.attn.wo_b":
             handles.append(
@@ -339,19 +463,32 @@ def hooks_for(
                     capture_input("layers.4.ffn_collapsed", exactly_one=True)
                 )
             )
+        if name == "layers.3.attn.indexer.weights_proj":
+            handles.append(
+                module.register_forward_hook(capture_weights_for(producer_state))
+            )
         if name == "layers.4.attn.indexer.weights_proj":
-
-            def capture_weights(
-                _module: torch.nn.Module, _inputs: tuple[object, ...], output: object
-            ) -> None:
-                if not isinstance(output, torch.Tensor):
-                    raise TypeError(
-                        "layer-four Indexer weights projection did not return a tensor"
-                    )
-                index_state.weights_proj_output = output
-                index_state.record("weights_proj_output", output)
-
-            handles.append(module.register_forward_hook(capture_weights))
+            handles.append(
+                module.register_forward_hook(capture_weights_for(consumer_state))
+            )
+        if name == "layers.3.attn.indexer.k_norm":
+            handles.append(
+                module.register_forward_hook(
+                    mark_quantization_phase(producer_state, _QuantizationPhase.KEY)
+                )
+            )
+        if name == "layers.3.attn.indexer.wq_b":
+            handles.append(
+                module.register_forward_hook(
+                    mark_quantization_phase(producer_state, _QuantizationPhase.QUERY)
+                )
+            )
+        if name == "layers.4.attn.indexer.wq_b":
+            handles.append(
+                module.register_forward_hook(
+                    mark_quantization_phase(consumer_state, _QuantizationPhase.QUERY)
+                )
+            )
         if name == "layers.4":
             handles.append(module.register_forward_pre_hook(capture_block_input))
 
@@ -410,52 +547,74 @@ def hooks_for(
         }
         return compressed_kv, compressed_indices
 
-    def observed_indexer_forward(
-        x: torch.Tensor,
-        qr: torch.Tensor,
-        latent: torch.Tensor | None,
-        start_pos: int,
-        offset: int,
-    ) -> torch.Tensor:
-        cap_guard("layers.4.attn.indexer_observation")
-        if "layers.4.attn.indexer_observation" in records:
-            raise RuntimeError("layer-four Indexer was observed twice")
-        ratio = layer_four_indexer.compress_ratio
-        end_pos = start_pos + x.size(1)
-        shared_index_k = graph.shared_attn.index_k
-        candidate_mask = graph.shared_attn.candidates
-        if shared_index_k is None:
-            raise RuntimeError(
-                "layer-four Indexer has no source-published shared index K"
-            )
-        if candidate_mask is None:
-            raise RuntimeError("layer-four Indexer has no source candidate mask")
-        # Clone receipt storage before the source Indexer can produce any later
-        # call's cache state.  This is the prefix it actually reads, not compressed KV.
-        inputs = {
-            "x": object_record(x, include_storage=True),
-            "qr": object_record(qr, include_storage=True),
-            "latent": object_record(latent, include_storage=True),
-            "start_pos": start_pos,
-            "offset": offset,
-            "shared_index_k_prefix": object_record(
-                shared_index_k[: x.size(0), : end_pos // ratio], include_storage=True
-            ),
-            "candidate_mask": object_record(candidate_mask, include_storage=True),
-        }
-        index_state.begin()
-        index_state.candidate_mask = candidate_mask
-        try:
-            with _IndexerDispatch(index_state):
-                output = original_indexer_forward(x, qr, latent, start_pos, offset)
-        finally:
-            operations = index_state.end()
-        records["layers.4.attn.indexer_observation"] = {
-            "inputs": inputs,
-            "operations": operations,
-            "output_indices": object_record(output, include_storage=True),
-        }
-        return output
+    def observed_indexer_forward_for(
+        role: IndexerRole,
+        original_forward: Callable[..., torch.Tensor],
+    ) -> Callable[..., torch.Tensor]:
+        state = states.for_role(role)
+        layer_id = 3 if role is IndexerRole.PRODUCER else 4
+        observation_name = f"layers.{layer_id}.attn.indexer_observation"
+
+        def observed_indexer_forward(
+            x: torch.Tensor,
+            qr: torch.Tensor,
+            latent: torch.Tensor | None,
+            start_pos: int,
+            offset: int,
+        ) -> torch.Tensor:
+            cap_guard(observation_name)
+            if observation_name in records:
+                raise RuntimeError(
+                    f"fixed {role.name.lower()} Indexer was observed twice"
+                )
+            inputs: dict[str, object] = {
+                "x": object_record(x, include_storage=True),
+                "qr": object_record(qr, include_storage=True),
+                "latent": object_record(latent, include_storage=True),
+                "start_pos": start_pos,
+                "offset": offset,
+            }
+            if role is IndexerRole.CONSUMER:
+                candidate_mask = graph.shared_attn.candidates
+                if candidate_mask is None:
+                    raise RuntimeError(
+                        "layer-four Indexer has no source candidate mask"
+                    )
+                # Preserve the historical consumer field: it is the source
+                # candidate operand present before the consumer scores.
+                inputs["candidate_mask"] = object_record(
+                    candidate_mask, include_storage=True
+                )
+            state.begin()
+            try:
+                with _IndexerDispatch(states):
+                    output = original_forward(x, qr, latent, start_pos, offset)
+            finally:
+                operations = state.end()
+            if state.shared_index_k_prefix is None:
+                raise RuntimeError(
+                    f"fixed {role.name.lower()} Indexer did not execute its score einsum"
+                )
+            # This receipt comes from the exact second operand at score-einsum
+            # time, not from a predicted cache slice before the source call.
+            inputs["shared_index_k_prefix"] = state.shared_index_k_prefix
+            candidate_mask_after = graph.shared_attn.candidates
+            if candidate_mask_after is None:
+                raise RuntimeError(
+                    f"fixed {role.name.lower()} Indexer did not publish a candidate mask"
+                )
+            observation = {
+                "inputs": inputs,
+                "operations": operations,
+                "output_indices": object_record(output, include_storage=True),
+                "candidate_mask_after": object_record(
+                    candidate_mask_after, include_storage=True
+                ),
+            }
+            records[observation_name] = observation
+            return output
+
+        return observed_indexer_forward
 
     def observed_rotary(
         x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
@@ -469,20 +628,33 @@ def hooks_for(
         scale_dtype: torch.dtype = torch.float8_e8m0fnu,
     ) -> torch.Tensor:
         output = original_fp4_quant(x, block_size, inplace, scale_dtype)
-        if index_state.active:
+        state = states.active()
+        if state is not None:
             if not inplace:
-                raise RuntimeError("source Indexer query quantization must be in place")
-            index_state.record("q_after_rope_fp4", output)
+                raise RuntimeError("source Indexer FP4 quantization must be in place")
+            if state.quantization_phase is _QuantizationPhase.KEY:
+                state.record("k_after_rope_fp4", output)
+            elif state.quantization_phase is _QuantizationPhase.QUERY:
+                state.record("q_after_rope_fp4", output)
+            else:
+                raise RuntimeError(
+                    "source Indexer FP4 quantization lacked a k_norm/wq_b phase boundary"
+                )
         return output
 
-    layer_four.hc_mixes = observed_hc_mixes
-    layer_four_attention._window_kv = observed_window_kv
-    layer_four_attention._compress_kv = observed_compress_kv
-    layer_four_indexer.forward = observed_indexer_forward
-    graph.torch = _GraphTorchProxy(original_torch, index_state)
-    graph.apply_rotary_emb = observed_rotary
-    graph.fp4_act_quant = observed_fp4_quant
     try:
+        layer_four.hc_mixes = observed_hc_mixes
+        layer_four_attention._window_kv = observed_window_kv
+        layer_four_attention._compress_kv = observed_compress_kv
+        layer_three_indexer.forward = observed_indexer_forward_for(
+            IndexerRole.PRODUCER, original_producer_indexer_forward
+        )
+        layer_four_indexer.forward = observed_indexer_forward_for(
+            IndexerRole.CONSUMER, original_indexer_forward
+        )
+        graph.torch = _GraphTorchProxy(original_torch, states)
+        graph.apply_rotary_emb = observed_rotary
+        graph.fp4_act_quant = observed_fp4_quant
         yield records
     finally:
         for handle in handles:
@@ -491,6 +663,12 @@ def hooks_for(
         _restore_instance(layer_four_attention, "_window_kv", had_window, prior_window)
         _restore_instance(
             layer_four_attention, "_compress_kv", had_compress, prior_compress
+        )
+        _restore_instance(
+            layer_three_indexer,
+            "forward",
+            had_producer_indexer_forward,
+            prior_producer_indexer_forward,
         )
         _restore_instance(
             layer_four_indexer,
@@ -508,7 +686,7 @@ def _restore_instance(
 ) -> None:
     if had_instance_attr:
         setattr(module, name, prior)
-    else:
+    elif name in module.__dict__:
         delattr(module, name)
 
 

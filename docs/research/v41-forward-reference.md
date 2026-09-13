@@ -400,8 +400,8 @@ a repeated execution was byte-identical. Older fixtures retain their historical
 capture identities. The native compressor result is checked against both the
 new latent and the old key fixture's latent before continuing, so these captures
 are not assumed numerically interchangeable just because the model is unchanged.
-The latest compressor fixture gates the live observer hash; the older attention
-fixture pins its historical observer hash.
+The compressor and attention fixtures pin their historical observer hashes.
+The newer candidate fixture below gates the live observer hash.
 
 `RatioOneIndexKeyOwner` composes these production primitives in one atomic
 owner call. Projection and compressor progress are staged first; key preparation
@@ -462,9 +462,9 @@ then selects candidate blocks. The existing `csa2::candidate_mask` implements
 the block-selection rule; the missing work is its native producer chain, not
 another selection algorithm.
 
-The next capture should observe layer-three `wq_a`, `q_norm`, and indexer query,
-weight and score stages, alongside the final candidate mask. Keep it separate
-from historical fixtures rather than changing their capture identities.
+The candidate capture observes layer-three `wq_a`, `q_norm`, and indexer query,
+weight and score stages, alongside the final candidate mask. It is separate
+from historical fixtures, which retain their capture identities.
 Candidate composition can then reuse index-query preparation, BF16 scoring and
 the coupled key prefix. Before extracting shared query preparation, compare
 the candidate producer's contract with the existing attention adapter's
@@ -475,24 +475,42 @@ and six, followed by unchanged layer-four selected IDs and attention results.
 Wrong-layer weights, future-position masking and candidate-bit perturbations
 must expose errors. Whole-block transaction work follows this producer edge.
 
-The present layer-four observer cannot simply be pointed at layer three:
+The earlier consumer-only observer could not simply be pointed at layer three:
 
-- It requires an already-published key prefix and candidate mask at entry.
+- It required an already-published key prefix and candidate mask at entry.
   The owner publishes its updated keys during the call and produces the new
   candidate mask afterward. Read the scoring operand at the actual einsum
   boundary, not from a possibly stale entry snapshot.
-- Its first active FP4 call is labeled `q_after_rope_fp4`. In the owner, key
+- Its first active FP4 call was labeled `q_after_rope_fp4`. In the owner, key
   quantization precedes query quantization. Identify the query operand through
   its source operation, rather than assuming the first quantized tensor is Q.
-- The compressor fixture currently checks the live observer hash. An observer
-  extension needs a new capture identity and an explicit historical hash for
-  the old fixture, not silently relabeled old bytes. New fixtures must check
-  their own capture identity and cross-capture numerical agreement.
+- The compressor fixture checked the live observer hash. It now pins its
+  historical hash, not silently relabeled old bytes. The new fixture has its
+  own capture identity and observer hash.
 
-The proposed instrumentation change is a fixed producer/consumer role in the
-existing observer, with separate per-call state and restoration checks for both
-indexers. This is not a generic tracing framework. Before using the new oracle,
-verify that observation leaves the original source outputs unchanged, that key
-and query FP4 records remain distinct, and that an exception restores every
-patched instance and graph binding. This observer change precedes any shared
-Rust query-prefix extraction.
+`IndexerRole` now distinguishes the two fixed producer/consumer roles, with
+separate per-call state. A quantization-phase enum is set by the actual
+`k_norm` and `wq_b` module hooks, not tensor shape or call ordinal. The key
+prefix is copied from the actual score-einsum operand. Mask observations track
+the summed-score tensor identity: prefill has a causal-mask operation, while
+single-token decode does not. The final source index offset follows the window
+width (five, six, six for this trace), not the final token position.
+
+```sh
+uv run scripts/test_v41_observer_runtime.py
+uv run scripts/v41-forward-reference.py --output artifacts/v41-candidate-formatted-source.json
+uv run --python 3.13 python scripts/v41_candidate_capture.py \
+  --input artifacts/v41-candidate-formatted-source.json \
+  --output fixtures/deepseek-v41/forward-candidate-reference.json
+```
+
+The complete candidate capture has SHA-256
+`7c5cc8541da338fa3426d63e32b9a66e9132e07ab68ee26d86fbf9e29f62f48d`;
+a repeated capture is byte-identical. Its observer hash is
+`0235926c7fbd884433021d5ddcef6731884123e0df867466845fb2b39bf33c16`.
+The opt-in runtime test executes the pinned graph with and without observers,
+compares outputs and cache bytes exactly, checks historical attention values,
+and injects a producer-query exception to verify hook and binding restoration.
+It also checks that the produced candidate mask equals the consumer's input.
+These are observation-integrity checks, not native candidate-producer parity.
+The next step remains Rust query-prefix and candidate-path composition.

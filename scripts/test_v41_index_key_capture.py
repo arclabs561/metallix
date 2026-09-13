@@ -91,7 +91,7 @@ def _receipt() -> dict[str, object]:
 
 
 class IndexKeyCaptureTest(unittest.TestCase):
-    def test_current_compressor_fixture_pins_live_observer(self) -> None:
+    def test_compressor_fixture_pins_its_historical_observer(self) -> None:
         root = Path(__file__).resolve().parent.parent
         fixture = json.loads(
             (
@@ -100,9 +100,7 @@ class IndexKeyCaptureTest(unittest.TestCase):
         )
         self.assertEqual(
             fixture["source"]["forward_observers_sha256"],
-            hashlib.sha256(
-                (root / "scripts/v41_forward_observers.py").read_bytes()
-            ).hexdigest(),
+            "71d7f7774df639b3d654aea047756515aaeb896762535a7854abd6bb1c38bf1e",
         )
 
     def test_extracts_pinned_prefixes_and_provenance(self) -> None:
