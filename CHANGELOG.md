@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native V4.1 owner-key preparation matches the reduced source-forward
+  key-cache append regions exactly at starts 0, 5 and 6. An offline extractor
+  retains the actual indexer weights and pre-mutation compressor latents;
+  corruption, wrong-layer weight and wrong-rotary-position controls guard the
+  comparison. Compressor execution and native cache publication remain open.
 - Stateless V4.1 index-key preparation from the original compressor latent:
   bounded BF16 projection, RMSNorm, rotary and G32/E8M0 FP4 reconstruction.
   Hand-staged numerical checks and batch/position properties cover the API;

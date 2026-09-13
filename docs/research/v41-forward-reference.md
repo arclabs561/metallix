@@ -316,3 +316,35 @@ effects, still come from the source graph. Compressed KV and the layer-four
 indexer results are also supplied. This establishes the joined arithmetic
 path for the captured executions, not end-to-end native model generation or
 block-level transactional state rollback if a later sublayer fails.
+
+## Owner-layer index keys
+
+```sh
+uv run --python 3.13 python scripts/v41_index_key_capture.py \
+  --input artifacts/v41-indexer-source.json \
+  --output fixtures/deepseek-v41/forward-index-key-reference.json
+cargo test -p deepseek --test forward_index_key
+```
+
+This offline extractor selects layer three's `indexer.wk.weight` and
+`indexer.k_norm.weight`, not the compressor's projection and normalization
+weights. It retains the compressor output and the completed index-cache
+prefix after each source call. It copies or slices captured storage bytes;
+it does not calculate expected keys. Repeated extraction is byte-identical.
+Source revision, model hash, complete-capture hash, tensor hashes, storage
+types, geometry and the three-call schedule identify the oracle.
+
+The timing of the capture matters: the compressor forward hook serializes
+its output before attention rotates and quantizes that same latent storage.
+The source indexer must read that original latent. The extractor reuses the
+captured layer-four frequencies only for the pinned layer-three/four
+ratio-one layout: both layers take the same nonzero-compression branch in
+the [pinned attention constructor](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L678).
+This is not a general rule for sharing rotary buffers between models.
+
+`prepare_index_keys` matches the captured final BF16 key bytes at starts
+zero, five and six. The test checks that captured earlier cache prefixes
+remain unchanged and that replaying position-zero frequencies during decode
+changes the result. It does not own a cache or execute the compressor, and
+it does not establish arbitrary Torch/GPU reduction parity. The captured
+weights are from the synthetic reduced model, not the released checkpoint.
