@@ -7,6 +7,10 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native V4.1 index selection now feeds the layer-attention integration test
+  across captured prefill and decode calls, with exact attention-boundary
+  comparisons. QR, shared index keys, candidates and compressed KV remain
+  source-supplied; the test does not yet own the index cache or full model.
 - DeepSeek-local BF16 index-score reference API with explicit dot, rectified,
   weighted and final-score boundaries. It preserves negative zero through
   ReLU, checks shape/work limits before allocation, and rejects FP32 and BF16

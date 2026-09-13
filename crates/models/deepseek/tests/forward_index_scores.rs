@@ -1,8 +1,9 @@
 //! Source-captured index-score and selection composition for layer four.
 //!
 //! The production query prefix supplies Q and signed weights. This integration
-//! test composes only source-observed BF16 score stages, masks, and the existing
-//! final selection helper; it deliberately adds no production score API.
+//! test calls the production BF16 scorer, applies source-shaped masks, and
+//! checks the existing final selection helper. Shared keys and candidates
+//! remain source-supplied; this is not a complete native indexer.
 
 use std::num::NonZeroUsize;
 
