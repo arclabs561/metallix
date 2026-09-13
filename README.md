@@ -25,53 +25,75 @@ MODEL=/path/to/Qwen3-0.6B
 ```
 
 `MODEL` is an already-downloaded Qwen3-0.6B safetensors directory containing
-`config.json` and `tokenizer.json`. Use materialized checkpoint files; discovery
-currently skips symlink-only Hub cache shards. `mx` and `metallix` are native
-executables with the same CLI; no shell alias is needed.
+`config.json` and `tokenizer.json`; its checkpoint shards must be locally
+accessible. Shards may be regular files or symlinks to regular files. `mx` and
+`metallix` are native executables with the same CLI; no shell alias is needed.
 
-## Generate, then inspect
+## Complete a prompt
 
-Inputs are raw token IDs, not text prompts or chat templates.
-
-**Generate four greedy tokens.**
-
-```sh
-mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4
-```
-
-The local report includes:
-
-```json
-{"generated_ids":[13,358,2776,264],"finish_reason":"length"}
-```
-
-**Generate a JSON record.** The schema constrains token selection, and the
-preview shows decoded output:
+`mx gen --prompt` encodes plain text with the local `tokenizer.json` and
+returns a JSON receipt on stdout. Its `generated_text` field is decoded model
+output; `--preview` writes a bounded rendering of that receipt to stderr. This
+is text completion, not a chat interface: the CLI adds no chat template or
+special tokens.
 
 ```sh
-mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 29 \
-  --json-schema fixtures/constraints/record.json --preview
+mx gen --model "$MODEL" --prompt "The capital of France is" --max-tokens 8 \
+  --verify-cache --preview
 ```
 
-The local control produced this `constraint.output` value:
+Qwen runs through `mlx-rs` and MLX on Metal in this control path. The command
+checks each cached decode step against a complete uncached forward outside the
+reported generation timings.
 
-```json
-{"status":"ready","count":1}
+Excerpt from a local run (`--preview`):
+
+```text
+finish_reason: length
+output_text:  Paris. The capital of Italy is Rome
+cache_checks: 8/8 passed
+```
+
+It is one deterministic completion and cache-consistency observation, not a
+quality or performance benchmark.
+
+## Generate a JSON record
+
+The schema constrains token selection after the plain prompt is encoded. The
+same JSON receipt carries the decoded constrained output in `generated_text`.
+
+```sh
+mx gen --model "$MODEL" --prompt "Return only the status." --max-tokens 8 \
+  --json-schema-inline '{"type":"string","enum":["ready","waiting"]}' --preview
 ```
 
 Successful schema output is independently validated. A token budget that ends
 before the grammar completes reports `incomplete` and exits nonzero.
 
+Excerpt from a local run:
+
+```json
+{"finish_reason":"grammar_complete","generated_text":"\"waiting\"","constraint":{"status":"validated","output":"waiting"}}
+```
+
+This demonstrates grammar completion and validation for the shown input, not
+general structured-output quality.
+
+## Sampling and diagnostics
+
+`--input-ids` remains available for deterministic forward, cache, sampling,
+and probability diagnostics. It conflicts with `--prompt`.
+
 **Try a different sequence—and replay it.** Turn on sampling, set the
 temperature, and keep a seed:
 
 ```sh
-mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 \
+mx gen --model "$MODEL" --prompt "The capital of France is" --max-tokens 4 \
   --sample --temperature 0.7 --seed 42 --logprobs
 ```
 
-The local run returned `13,21927,11,1879`. Replay requires the same model
-execution and sampling policy, not only the same seed.
+Replay requires the same model execution and sampling policy, not only the
+same seed.
 
 **Inspect probabilities and a terminal preview.** `--logprobs` adds
 selected-token natural-log probabilities to stdout; `--preview` writes a
@@ -142,7 +164,7 @@ seeded temperature sampling is opt-in, with or without a JSON schema.
 Resident mode allows at most `min(model context, 512)` total prompt-plus-generated tokens;
 streamed mode allows at most 32 total and separately checks weight/staging
 and retained-KV budgets.
-There is no canonical text-prompt/chat-template pipeline, V4.1 decoder,
+There is no checkpoint chat-template pipeline, messages API, V4.1 decoder,
 HTTP serving, continuous batching, execution-backed paged KV, quantization
 conversion, or tuning workflow yet. Beyond-RAM execution remains a goal,
 not a demonstrated capability. V4.1 weight download is gated on its own small

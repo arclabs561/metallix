@@ -9,14 +9,47 @@ baseline implementation is commit `66e3013`.
 - Host: one M3 Max with 128 GiB unified memory.
 - Runtime: `mlx-rs 0.25.3` on Metal.
 - Weights: safetensors checkpoint materialized as float32 for the diagnostic.
-- Inputs: raw token IDs only. Tokenization and chat templates are outside the
-  experiment.
+- Inputs: raw token IDs only for this numerical experiment. The CLI separately
+  accepts a local-tokenizer plain-text prompt, but that user interface is not
+  part of these parity observations.
 - Cache: one sequence with contiguous K/V arrays. It is not paged KV, prefix
   caching, or continuous batching.
 
 `logical_weight_bytes` and `logical_kv_bytes` count live logical arrays only.
 They exclude allocator overhead, temporary concatenation buffers, peak memory,
 and concurrent requests.
+
+## Plain-text CLI boundary
+
+`mx gen --prompt` encodes exactly the supplied text with the checkpoint-local
+`tokenizer.json`, then includes decoded `generated_text` in its JSON receipt.
+It adds neither a chat template nor special tokens. Therefore it is a
+single-sequence text-completion interface, not a chat, HTTP-serving, or
+multi-request result. Its cached-decode `--verify-cache` mode compares each
+step with a full uncached Metal forward; that checks cache consistency and is
+not a CPU-reference parity run.
+
+For a local operator check, use a materialized Qwen directory:
+
+```sh
+target/release/mx gen --model /path/to/Qwen3-0.6B \
+  --prompt "The capital of France is" --max-tokens 8 --verify-cache --preview
+```
+
+The primary Qwen execution path uses `mlx-rs` and MLX on Metal. The JSON
+receipt, rather than terminal preview text, is the machine-readable result.
+
+## CLI smoke ledger
+
+`artifacts/qwen-readme-fresh.json` records the prompt command above: greedy
+completion ended by its length budget with decoded text ` Paris. The capital
+of Italy is Rome`; all eight requested cache comparisons passed. Its companion
+stderr preview reports `cache_checks: 8/8 passed`.
+
+`artifacts/qwen-readme-schema-fresh.json` records the inline enum-schema
+command: it ended `grammar_complete`, decoded `"waiting"`, and its constraint
+status is `validated`. These are bounded operator checks for the shown
+inputs—not quality, throughput, latency, or general structured-output claims.
 
 ## Numerical evidence
 
@@ -73,6 +106,47 @@ run; the receipt records running, completed, failed, or interrupted state.
 Early EOS, differing generated IDs, enabled cache verification, invalid timings,
 or changed checkpoint/executable bytes fail the measurement. Run the independent
 parity suite separately before comparing performance.
+
+## Release resident baseline
+
+`artifacts/index-query-qwen-baseline.json` records a completed release-binary
+resident run on an Apple M3 Max with 128 GiB unified memory. It used the MLX
+float32 path, raw IDs `785,6722,315,9625,374`, 32 generated tokens, and three
+runs. Each run started a fresh process and contiguous KV cache; the first
+decode observation was discarded, leaving 90 retained warm-decode observations.
+Load, prefill, and initial-decode time are excluded. The run did not request
+`--verify-cache`, so it is neither a cache-consistency check nor an independent
+correctness oracle.
+
+| Metric | Recorded value |
+| --- | ---: |
+| Median warm decode | 9.169375 ms |
+| Mean warm decode | 9.328383844 ms |
+| Sample standard deviation | 0.47073026 ms |
+| Per-run medians | 9.1741455 / 9.199625 / 9.1189375 ms |
+| Retained observations | 90 |
+
+The recorded binary, config, and weight SHA-256 values are respectively
+`61e9da601f21c2ce6b22d8e7f2e87b789a30b500019c525f3f7201d12a296c4d`,
+`660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd`, and
+`f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`.
+The receipt also records a dirty checkout revision, which is not binary-build
+provenance.
+
+The recorded workload can be reproduced with explicit flags:
+
+```sh
+uv run scripts/benchmark-qwen.py \
+  --binary target/release/mx --model /path/to/Qwen3-0.6B \
+  --output artifacts/index-query-qwen-baseline.json \
+  --input-ids 785,6722,315,9625,374 --max-tokens 32 \
+  --memory-mode resident --runs 3 --discard-decode 1
+```
+
+This is one single-sequence resident decode baseline, not an improvement claim,
+throughput or serving result, V4.1 execution result, or DeepSeek measurement.
+
+## Earlier decode baselines
 
 The first harness run on the same M3 Max measured 90 retained observations:
 median 8.812625 ms, mean 8.8707791 ms, sample standard deviation 0.2694133 ms.
