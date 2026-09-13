@@ -1,11 +1,14 @@
 //! Source-captured index-selection to layer-attention integration for V4.1.
 //!
 //! This test joins the production index-query prefix, BF16 scorer, strict
-//! selector, atomic compressor/key/KV owner, and attention adapter. The source QR,
-//! owner-layer input, and candidate mask remain fixture boundaries.
+//! selector, candidate producer, atomic compressor/key/KV owner, and attention
+//! adapter. Source QR and owner/consumer layer inputs remain fixture boundaries.
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
+
+#[path = "support/candidate_capture.rs"]
+mod candidate_capture;
 
 use std::num::NonZeroUsize;
 
@@ -315,9 +318,15 @@ fn generated_indices(
             .expect("ratio"),
     )
     .expect("ratio fits usize");
+    let candidates = candidate_capture::generated_candidates(start, keys);
+    assert_eq!(
+        candidates,
+        bools(field(inputs, "candidate_mask")),
+        "native producer matches historical consumer mask at start {start}"
+    );
     let masked = masked_scores(
         &score_bits,
-        &bools(field(inputs, "candidate_mask")),
+        &candidates,
         start,
         positions,
         keys_per_position,
@@ -666,4 +675,61 @@ fn legal_but_wrong_generated_index_changes_attention_numerics() {
         case.output.bf16(),
         "a legal wrong generated index changes attention numerics"
     );
+}
+
+#[test]
+fn removing_a_generated_candidate_changes_selection_and_attention() {
+    let raw = raw_fixture();
+    let attention = attention_fixture();
+    let raw_case = &field(&raw, "cases").as_array().expect("cases")[0];
+    let indexer = field(raw_case, "indexer");
+    let inputs = field(indexer, "inputs");
+    let keys = bf16(field(inputs, "shared_index_k_prefix"));
+    let mut candidates = candidate_capture::generated_candidates(0, &keys);
+    let original_ids = generated_prefill_indices(&raw, &attention);
+    let offset = usize_field(inputs, "offset");
+    let positions = shape(field(inputs, "qr"))[1];
+    let key_count = shape(field(inputs, "shared_index_k_prefix"))[1];
+    let last = positions - 1;
+    let selected = usize::try_from(original_ids[last]).expect("valid selected ID") - offset;
+    assert!(candidates[last * key_count + selected]);
+    candidates[last * key_count + selected] = false;
+    // Hold scores fixed to isolate the consumer's response to this mask bit.
+    // The positive join above computes these scores with the native scorer.
+    let scores = bf16(field(field(indexer, "operations"), "scores_after_head_sum"));
+    let masked = masked_scores(&scores, &candidates, 0, positions, key_count, 1);
+    let changed_ids: Vec<i32> = (0..positions)
+        .flat_map(|position| {
+            select_indices(
+                &masked[position * key_count..(position + 1) * key_count]
+                    .iter()
+                    .map(|&bits| f32_from_bf16(bits))
+                    .collect::<Vec<_>>(),
+                position + 1,
+                1,
+                offset,
+            )
+            .expect("remaining candidate has an unambiguous cutoff")
+        })
+        .collect();
+    assert_eq!(&changed_ids[..last], &original_ids[..last]);
+    assert_ne!(changed_ids[last], original_ids[last]);
+    let case = &attention.cases[0];
+    let all_frequencies = frequencies(&attention);
+    let weights = attention_weights(&attention.encoded_parameters);
+    let mut state = LayerAttentionState::new(attention_layout(&attention.model));
+    let output = forward_with_publication(
+        &mut state,
+        &case.input.bf16(),
+        0,
+        0,
+        0,
+        SOURCE_LAYER,
+        &case.compressed_kv.bf16(),
+        &changed_ids,
+        call_frequencies(&all_frequencies, case),
+        weights.borrowed(),
+    )
+    .expect("changed selection remains a legal causal publication");
+    assert_ne!(output.final_output, case.output.bf16());
 }

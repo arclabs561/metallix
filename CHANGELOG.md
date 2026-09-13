@@ -7,11 +7,17 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native DeepSeek candidate queries, BF16 scores and block masks now compose
+  with owner-produced keys, layer-four selection and native-KV attention in
+  source-oracle tests. Prefill and two decode calls match exact captured stages;
+  removing a selected candidate changes selection and attention output.
+  Layer-three QR and input activations remain captured boundaries, not full-model
+  execution.
 - Source capture now distinguishes DeepSeek candidate producers and consumers
   with explicit roles and quantization phases. The new candidate fixture keeps
   query/key stages and prefill/decode masking distinct. Real-source tests verify
   observation leaves outputs unchanged and restores hooks after failure.
-  Native candidate-path composition remains open.
+  Observation integrity is checked separately from native numerical parity.
 - A ratio-one DeepSeek owner now publishes separate index-key and compressed-KV
   caches atomically with compressor progress. Prepared appends validate both
   caches before either commits, without cloning capacity-sized buffers.
