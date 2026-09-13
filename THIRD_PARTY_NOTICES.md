@@ -61,6 +61,11 @@ They preserve explicit numerical representations but do not execute TileLang
 or establish GPU reduction parity. The reduced manifest and receipts record
 the synthetic configuration separately from the released checkpoint.
 
+`crates/models/deepseek/src/moe.rs` composes the same revision's `Gate`,
+`Expert.forward` and `MoE.forward` ordering through the scalar numerical
+references. Its encoded synthetic-weight oracle is extracted from actual
+source-forward hooks by `scripts/v41-forward-reference.py`.
+
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
 ```text

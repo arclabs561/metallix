@@ -8,6 +8,7 @@ pub mod engram;
 pub mod hc;
 pub mod indexer;
 pub mod manifest;
+pub mod moe;
 pub mod norm;
 pub mod precision;
 pub mod rotary;

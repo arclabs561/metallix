@@ -105,3 +105,41 @@ reject passing through one residual copy and omitting normalization.
 
 Final-block execution and derivation of its pre-mix coefficients still come
 from the source graph; this qualifies the native tail, not the full Rust model.
+
+## Native MoE sublayer
+
+```sh
+uv run scripts/v41-forward-reference.py --output artifacts/v41-forward-reference.json \
+  --head-fixture-output fixtures/deepseek-v41/forward-head-reference.json \
+  --moe-fixture-output fixtures/deepseek-v41/forward-moe-reference.json
+cargo test -p deepseek --test forward_moe
+```
+
+The MoE subset retains layer 4's source input, actual gate decisions and output,
+plus its encoded gate, four FP4 routed experts and one FP8 shared expert.
+`deepseek::moe::MoEReference` computes routing and executes the selected experts
+from those weights. All seven captured positions must match the final BF16
+output exactly. Selected expert IDs must match exactly; route weights are
+compared by ID with a fixed absolute tolerance of `2^-20`. That tolerance is
+a diagnostic policy, not a proved bound on transcendental implementations.
+
+Execution preserves the source's BF16 projection boundaries and applies route
+weights after SwiGLU but before the hidden BF16 cast and W2. Routed expert
+outputs accumulate in ascending expert-ID order in FP32; the unweighted shared
+expert contributes once before the final BF16 cast. A source-fixture negative
+control zeros the shared output projection and must fail output agreement.
+Separate analytic tests cover nonzero clamps and route-weight placement; this
+source manifest has its SwiGLU clamp disabled.
+
+Two bounded property tests add coverage beyond the source trace: flipping the
+up branch's sign must flip SwiGLU's sign, and renaming two routed experts
+together with their gate rows and biases must preserve their combined output.
+Each runs 64 generated cases with shrinking. The permutation property is
+deliberately limited to two selected experts; it does not assume arbitrary
+FP32 summation order is invariant. Run the properties and analytic tests with
+`cargo test -p deepseek moe:: --lib`.
+
+The API is a bounded scalar diagnostic over runtime-encoded weight views, not
+a checkpoint loader, scheduler, or optimized serving path. MoE input still
+comes from the source block. Attention, cache ownership and complete block
+composition remain necessary before native full-graph parity can be claimed.

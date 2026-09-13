@@ -17,6 +17,7 @@ metal = ["dep:mlx-rs"]
 
 [dev-dependencies]
 divan = "0.1"
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "checkpoint_index"

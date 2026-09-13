@@ -48,6 +48,9 @@ MAX_CAPTURE_BYTES = 16 << 20
 # the expanded oracle intentionally bounded, while allowing the three pinned
 # prefill/decode cases to retain all required representations.
 MAX_HEAD_FIXTURE_BYTES = 48 << 10
+# The full layer-four MoE payload retains packed routed and FP8 shared expert
+# storage.  It is intentionally bigger than the head fixture but bounded.
+MAX_MOE_FIXTURE_BYTES = 512 << 10
 
 sys.path.insert(0, str(SCRIPTS))
 import v41_cpu_kernels as kernels
@@ -281,15 +284,15 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
 
         return hook
 
-    def capture_input(name: str):
+    def capture_input(name: str, *, exactly_one: bool):
         """Capture a selected module's source input without recomputing it."""
 
         def hook(_module: torch.nn.Module, inputs: tuple[object, ...]) -> None:
             if len(records) >= MAX_HOOK_RECORDS:
                 raise RuntimeError("hook receipt cap reached")
-            if len(inputs) != 1:
+            if not inputs or (exactly_one and len(inputs) != 1):
                 raise RuntimeError(
-                    f"expected one source input for {name}, got {len(inputs)}"
+                    f"unexpected source inputs for {name}: got {len(inputs)}"
                 )
             records[name] = object_record(inputs[0], include_storage=True)
 
@@ -325,7 +328,17 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
             # source-produced input rather than reimplementing either operation
             # while exporting a test fixture.
             handles.append(
-                module.register_forward_pre_hook(capture_input("norm_input"))
+                module.register_forward_pre_hook(
+                    capture_input("norm_input", exactly_one=True)
+                )
+            )
+        if name == "layers.4.ffn":
+            # MoE.forward receives (x, image_mask); x is the actual source
+            # hidden state and is the only tensor exported for this oracle.
+            handles.append(
+                module.register_forward_pre_hook(
+                    capture_input("layers.4.ffn_input", exactly_one=False)
+                )
             )
     try:
         yield records
@@ -830,6 +843,194 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
     }
 
 
+def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Select actual layer-four MoE inputs, choices, outputs and encodings.
+
+    This is a compact projection of a completed source capture.  It does not
+    evaluate the gate or experts: expected values remain the hook records from
+    the source's own ``layers.4.ffn`` execution.
+    """
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError("MoE fixture export requires a completed source capture")
+    coverage = receipt.get("coverage_status")
+    source = receipt.get("source")
+    runtime = receipt.get("runtime")
+    encoded = receipt.get("encoded_parameters")
+    model_args = receipt.get("model_args")
+    steps = receipt.get("steps")
+    manifest_sha = receipt.get("manifest_canonical_sha256")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("pending") != []
+        or not isinstance(source, dict)
+        or not isinstance(runtime, dict)
+        or not isinstance(encoded, dict)
+        or not isinstance(model_args, dict)
+        or not isinstance(steps, list)
+        or not isinstance(manifest_sha, str)
+    ):
+        raise TypeError("complete capture has an invalid MoE-fixture shape")
+
+    parameters = {
+        name: record
+        for name, record in encoded.items()
+        if isinstance(name, str) and name.startswith("layers.4.ffn.")
+    }
+    routed = tuple(f"layers.4.ffn.experts.{index}" for index in range(4))
+    expert_prefixes = (*routed, "layers.4.ffn.shared_experts")
+    required_names = {
+        "layers.4.ffn.gate.weight",
+        "layers.4.ffn.gate.bias",
+        *(
+            f"{prefix}.{projection}.{field}"
+            for prefix in expert_prefixes
+            for projection in ("w1", "w2", "w3")
+            for field in ("weight", "scale")
+        ),
+    }
+    if set(parameters) != required_names:
+        missing = sorted(required_names - set(parameters))
+        unexpected = sorted(set(parameters) - required_names)
+        raise RuntimeError(
+            "complete capture layer-four MoE parameter set differs: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if not all(
+        isinstance(record, dict) and "storage_hex" in record
+        for record in parameters.values()
+    ):
+        raise TypeError("MoE fixture requires complete encoded parameter storage")
+
+    expected_model = {
+        "dim": 128,
+        "moe_inter_dim": 128,
+        "n_routed_experts": 4,
+        "n_activated_experts": 2,
+        "n_shared_experts": 1,
+    }
+    if any(model_args.get(name) != value for name, value in expected_model.items()):
+        raise RuntimeError("MoE fixture requires the fixed reduced MoE dimensions")
+    if runtime.get("storage_byteorder") != "little":
+        raise RuntimeError("MoE fixture export requires little-endian tensor storage")
+
+    expected_tensor_layouts = {
+        "layers.4.ffn.gate.weight": ([4, 128], "torch.bfloat16"),
+        "layers.4.ffn.gate.bias": ([4], "torch.float32"),
+    }
+    for prefix in routed:
+        for projection in ("w1", "w2", "w3"):
+            expected_tensor_layouts[f"{prefix}.{projection}.weight"] = (
+                [128, 64],
+                "torch.float4_e2m1fn_x2",
+            )
+            expected_tensor_layouts[f"{prefix}.{projection}.scale"] = (
+                [128, 4],
+                "torch.float8_e8m0fnu",
+            )
+    for projection in ("w1", "w2", "w3"):
+        expected_tensor_layouts[f"layers.4.ffn.shared_experts.{projection}.weight"] = (
+            [128, 128],
+            "torch.float8_e4m3fn",
+        )
+        expected_tensor_layouts[f"layers.4.ffn.shared_experts.{projection}.scale"] = (
+            [4, 4],
+            "torch.float8_e8m0fnu",
+        )
+    for name, (shape, dtype) in expected_tensor_layouts.items():
+        record = parameters[name]
+        if record.get("shape") != shape or record.get("dtype") != dtype:
+            raise RuntimeError(f"MoE parameter {name} has an unexpected shape or dtype")
+
+    cases: list[dict[str, object]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            raise TypeError("complete capture includes an invalid step")
+        start_pos = step.get("start_pos")
+        intermediates = step.get("intermediates")
+        if not isinstance(start_pos, int) or not isinstance(intermediates, dict):
+            raise TypeError("complete capture step lacks MoE boundaries")
+        ffn_input = intermediates.get("layers.4.ffn_input")
+        ffn_output = intermediates.get("layers.4.ffn")
+        gate = intermediates.get("layers.4.ffn.gate")
+        if (
+            not isinstance(ffn_input, dict)
+            or not isinstance(ffn_output, dict)
+            or not isinstance(gate, list)
+            or len(gate) != 2
+            or not all(isinstance(value, dict) for value in gate)
+        ):
+            raise TypeError("complete capture step lacks layer-four MoE hook records")
+        if (
+            ffn_input.get("shape") != ffn_output.get("shape")
+            or ffn_input.get("dtype") != "torch.bfloat16"
+            or ffn_output.get("dtype") != "torch.bfloat16"
+            or gate[0].get("dtype") != "torch.float32"
+            or gate[1].get("dtype") != "torch.int64"
+        ):
+            raise RuntimeError(
+                "layer-four MoE hook storage has unexpected dtype or shape"
+            )
+        cases.append(
+            {
+                "start_pos": start_pos,
+                "input": ffn_input,
+                "gate_weights": gate[0],
+                "gate_indices": gate[1],
+                "output": ffn_output,
+            }
+        )
+    if [case["start_pos"] for case in cases] != [0, 5, 6]:
+        raise RuntimeError("MoE fixture requires the pinned prefill/decode trace")
+
+    moe_args = {
+        name: model_args[name]
+        for name in (
+            "dim",
+            "moe_inter_dim",
+            "n_routed_experts",
+            "n_activated_experts",
+            "n_shared_experts",
+            "score_func",
+            "gate_temp",
+            "norm_topk_prob",
+            "route_scale",
+            "swiglu_limit",
+            "expert_dtype",
+        )
+    }
+    return {
+        "schema_version": 1,
+        "scope": "layer-four complete source MoE only; not Rust acceptance or full-model parity",
+        "source": {
+            "revision": source.get("revision"),
+            "model_sha256": source.get("model_sha256"),
+            "engram_sha256": source.get("engram_sha256"),
+            "kernel_source_sha256": source.get("kernel_source_sha256"),
+            "cpu_backend_sha256": source.get("cpu_backend_sha256"),
+            "loader_sha256": source.get("loader_sha256"),
+            "runner_sha256": source.get("runner_sha256"),
+            "complete_capture_sha256": _sha256_bytes(serialized_capture(receipt)),
+            "manifest_canonical_sha256": manifest_sha,
+            "storage_byteorder": runtime.get("storage_byteorder"),
+        },
+        "model": moe_args,
+        "encoded_parameters": parameters,
+        "cases": cases,
+        "comparison_policy": {
+            "output_bf16": "exact storage bits",
+            "selected_expert_ids": (
+                "exact IDs; compare route weights by expert ID because source score "
+                "order and a native sorted-ID traversal may differ"
+            ),
+            "route_weight_abs_error_max": 2**-20,
+            "fixed_before_candidate_execution": True,
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -841,6 +1042,14 @@ def main() -> int:
         help=(
             "write the compact final-norm/FP32-head fixture derived from a "
             "complete source capture"
+        ),
+    )
+    parser.add_argument(
+        "--moe-fixture-output",
+        type=Path,
+        help=(
+            "write the compact layer-four MoE fixture derived from a complete "
+            "source capture"
         ),
     )
     args = parser.parse_args()
@@ -893,7 +1102,38 @@ def main() -> int:
                 sort_keys=True,
             )
         )
-    if args.output is None and args.head_fixture_output is None:
+    if args.moe_fixture_output is not None:
+        fixture = moe_fixture(receipt)
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_MOE_FIXTURE_BYTES:
+            raise RuntimeError(
+                f"MoE fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_MOE_FIXTURE_BYTES} bytes"
+            )
+        args.moe_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.moe_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "complete_capture_sha256": fixture["source"][
+                        "complete_capture_sha256"
+                    ],
+                    "path": str(args.moe_fixture_output),
+                    "status": "source_forward_moe_fixture",
+                },
+                sort_keys=True,
+            )
+        )
+    if (
+        args.output is None
+        and args.head_fixture_output is None
+        and args.moe_fixture_output is None
+    ):
         print(artifact_bytes.decode("utf-8"), end="")
     return 0
 

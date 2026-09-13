@@ -7,6 +7,12 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Bounded native V4.1 MoE sublayer combining BF16 gate routing, packed FP4
+  routed experts, the FP8 shared expert and source-order FP32 accumulation.
+  A source-forward fixture checks exact BF16 outputs at seven positions;
+  inputs are still source-provided, so this is not full-model execution.
+- Shrinking property tests for MoE expert renaming and SwiGLU up-sign
+  symmetry, plus BF16 finite-limit rounding regressions.
 - CPU V4.1 index-score reference with bounded scalar work, explicit FP32
   reduction order and overflow rejection. Tests join scoring to causal
   masking, CSA2 candidates and final selection without requiring Metal.
