@@ -90,6 +90,31 @@ pub enum HcProjectionError {
     Coefficients(#[from] HcError),
 }
 
+/// Raw normalized mixes and their derived Hyper-Connection coefficients.
+///
+/// `mixes` contains the finite FP32 scalar dot products after reciprocal-RMS
+/// scaling and before the affine coefficient split. It is a diagnostic view of
+/// this scalar reference, not a checkpoint layout or GPU-parity interface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HcProjectionDiagnostics {
+    mixes: Vec<f32>,
+    coefficients: HcCoefficients,
+}
+
+impl HcProjectionDiagnostics {
+    /// Returns the raw normalized projection mixes in coefficient-split order.
+    #[must_use]
+    pub fn mixes(&self) -> &[f32] {
+        &self.mixes
+    }
+
+    /// Returns the coefficients derived from the same raw normalized mixes.
+    #[must_use]
+    pub const fn coefficients(&self) -> &HcCoefficients {
+        &self.coefficients
+    }
+}
+
 /// Derives V4.1 Hyper-Connection coefficients from a BF16 residual and FP32 projection.
 ///
 /// `residual` is row-major `[copies, width]` BF16 storage and `projection` is
@@ -117,6 +142,46 @@ pub fn project_hc_coefficients(
     sinkhorn_iterations: usize,
     hc_epsilon: f32,
 ) -> Result<HcCoefficients, HcProjectionError> {
+    Ok(project_hc_diagnostics(
+        residual,
+        projection,
+        scale,
+        base,
+        copies,
+        norm_epsilon,
+        sinkhorn_iterations,
+        hc_epsilon,
+    )?
+    .coefficients)
+}
+
+/// Projects a BF16 residual into raw normalized FP32 mixes and coefficients.
+///
+/// `residual` is row-major `[copies, width]` BF16 storage and `projection` is
+/// row-major FP32 `[(2 + copies) * copies, copies * width]`. `mixes()` exposes
+/// each scalar FP32 dot after reciprocal-RMS scaling, before the existing
+/// coefficient split. The operation order is the same as
+/// [`project_hc_coefficients`]; this diagnostic API does not recompute mixes.
+///
+/// # Errors
+///
+/// Returns [`HcProjectionError`] before diagnostics are returned if shape,
+/// scalar-control, finite-input, normalization, projection, or coefficient
+/// split invariants fail.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the direct residual, projection, and coefficient roles remain explicit"
+)]
+pub fn project_hc_diagnostics(
+    residual: &[u16],
+    projection: &[f32],
+    scale: &[f32; 3],
+    base: &[f32],
+    copies: usize,
+    norm_epsilon: f32,
+    sinkhorn_iterations: usize,
+    hc_epsilon: f32,
+) -> Result<HcProjectionDiagnostics, HcProjectionError> {
     if !norm_epsilon.is_finite() || norm_epsilon <= 0.0 {
         return Err(HcProjectionError::InvalidNormEpsilon);
     }
@@ -159,14 +224,12 @@ pub fn project_hc_coefficients(
         finite(mix, "post_dot_norm", row)?;
         mixes.push(mix);
     }
-    Ok(split_hc_coefficients(
-        &mixes,
-        scale,
-        base,
-        copies,
-        sinkhorn_iterations,
-        hc_epsilon,
-    )?)
+    let coefficients =
+        split_hc_coefficients(&mixes, scale, base, copies, sinkhorn_iterations, hc_epsilon)?;
+    Ok(HcProjectionDiagnostics {
+        mixes,
+        coefficients,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -294,11 +357,28 @@ fn finite(value: f32, stage: &'static str, index: usize) -> Result<(), HcProject
 
 #[cfg(test)]
 mod tests {
-    use super::{HcProjectionError, project_hc_coefficients};
+    use super::{HcProjectionError, project_hc_coefficients, project_hc_diagnostics};
     use crate::hc::split_hc_coefficients;
 
     fn assert_close(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn diagnostics_expose_raw_mixes_and_preserve_coefficient_results() {
+        let residual = [0x3f80_u16]; // BF16 [1], reciprocal RMS = 1 / sqrt(1 + 3) = 1 / 2.
+        let projection = [2.0_f32, -4.0, 6.0];
+        let scale = [1.0_f32; 3];
+        let base = [0.0_f32; 3];
+        let diagnostics =
+            project_hc_diagnostics(&residual, &projection, &scale, &base, 1, 3.0, 1, 0.1)
+                .expect("finite diagnostic projection");
+        assert_eq!(diagnostics.mixes(), &[1.0, -2.0, 3.0]);
+
+        let coefficients =
+            project_hc_coefficients(&residual, &projection, &scale, &base, 1, 3.0, 1, 0.1)
+                .expect("finite coefficient projection");
+        assert_eq!(diagnostics.coefficients(), &coefficients);
     }
 
     #[test]

@@ -66,6 +66,12 @@ the synthetic configuration separately from the released checkpoint.
 references. Its encoded synthetic-weight oracle is extracted from actual
 source-forward hooks by `scripts/v41-forward-reference.py`.
 
+`crates/models/deepseek/src/ffn.rs` follows the same revision's `Block.forward`
+FFN ordering: derive fresh HC coefficients, collapse with the incoming
+attention pre-mix, normalize, execute the MoE, then apply the fresh HC post-mix.
+The capture retains the source block's HC inputs, coefficients and residuals
+to diagnose numerical differences; this is not a full-block parity claim.
+
 [Source and license](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/LICENSE)
 
 ```text

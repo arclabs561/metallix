@@ -143,3 +143,95 @@ The API is a bounded scalar diagnostic over runtime-encoded weight views, not
 a checkpoint loader, scheduler, or optimized serving path. MoE input still
 comes from the source block. Attention, cache ownership and complete block
 composition remain necessary before native full-graph parity can be claimed.
+
+## Native FFN composition and numerical contract
+
+`deepseek::ffn::FfnSublayerReference` joins HC projection, incoming pre-mixing,
+RMSNorm, the native MoE and HC post-mixing. Fresh FFN coefficients come from
+the residual; the attention sublayer's incoming coefficients select the FFN
+input. A 64-case shrinking property test varies positive incoming weights
+and checks that this handoff affects execution without changing the freshly
+derived coefficients.
+
+The extended source fixture includes layer-four block inputs, attention
+outputs, raw HC projection mixes, split coefficients and intermediate BF16
+residuals. These are observations from the pinned source graph, not values
+recomputed by the exporter. Repeated captures reproduce both fixture files
+byte for byte.
+
+The original block-tail exact-storage comparison found a rounding crossing.
+With captured source
+coefficients, native HC pre/post mixing reproduces all seven captured
+positions exactly. Native coefficient derivation instead changes element 117
+of the attention residual at decode start 6 from BF16 bits `16600` to `16599`.
+Using the captured pre-mix afterward retains this discrepancy, so the first
+BF16 divergence precedes the FFN. Source raw mixes also expose FP32-bit
+differences in scalar coefficient splitting before projection is involved.
+The coefficient diagnostics do not claim exact transcendental parity. The
+source-fed exact checks remain; native coefficient propagation now uses the
+explicit arithmetic-envelope contract below. This is neither native attention
+execution nor full-block qualification.
+
+A follow-up isolation separates benign coefficient differences from the
+observed rounding crossing. At decode start 6, splitting the captured raw
+mixes produces one differing combination coefficient but still reproduces
+the BF16 residual with captured post coefficients. The combination matrix
+derived through native projection differs in three entries and reproduces
+the element-117 failure even with captured post coefficients. Conversely,
+scalar-split post coefficients with the captured combination matrix produce
+the exact residual. Thus the extra projection-derived combination drift is
+necessary for this observed crossing; sigmoid drift alone is not its cause.
+
+The numerical contract distinguishes source CPU bits from portable arithmetic.
+The scalar projection declares ascending FP32 reductions, whereas the source
+graph uses Torch `F.linear` and `rsqrt`. Even the CPU replacement's
+`torch.softmax` uses reciprocal multiplication in
+[PyTorch 2.13.0](https://github.com/pytorch/pytorch/blob/v2.13.0/aten/src/ATen/native/cpu/SoftMaxKernel.cpp#L62),
+while the retained DeepSeek HC kernel expresses division by the row sum.
+Matching a particular Torch CPU execution bitwise and validating independent
+source-mathematical implementations are different acceptance targets. The
+oracle arithmetic remains unchanged. Native composition is now checked using
+input-derived arithmetic envelopes rather than requiring Torch CPU bit identity.
+The fixture retains its original exact-storage policy fields as capture
+provenance; those fields are not the acceptance thresholds for native-derived
+HC propagation. The native policy is implemented in the test's `support/`
+interval helpers, while source-fed HC replay continues to require exact bits.
+
+### What the new comparison establishes
+
+`tests/forward_moe.rs` derives independent intervals from the encoded weights,
+input magnitudes and operation counts. It propagates HC projection and
+coefficient uncertainty through attention post-mixing, FFN collapse and
+RMSNorm, checking whether each source and native BF16 value's round-to-nearest,
+ties-to-even cell intersects the permitted interval. It propagates the full
+BF16 rounded enclosure, not just the two observed values. Signed zero,
+subnormals and midpoint parity have dedicated tests.
+
+The target model uses FP32 unit roundoff `2^-24`, reduction bounds based on
+`gamma(2n)`, and absolute gradual-underflow terms. It rejects overflow-capable
+reductions, including a signed dot whose absolute total could overflow under
+regrouping even when ascending partial sums remain finite. Normalization uses
+a correctly rounded square root followed by a rounded reciprocal. Coefficient
+splitting declares an exponential relative-error assumption of at most `2u`
+over its bounded domain; outward interval evaluation includes a Taylor
+remainder and the softmax/Sinkhorn operation sequence.
+
+These are explicit target-arithmetic assumptions, **not proofs of Torch's
+`rsqrt`, platform exponentials, fast-math or GPU accuracy**. Both observed
+executions must fit the same independently derived envelopes. No measured
+error is used to set their widths.
+
+At the MoE boundary, native/source selected expert IDs and observed BF16
+outputs must still agree exactly. Only then does that observed output enter
+the final HC post-mix comparison. This qualifies the paired captured
+executions; it is not a theorem that every input inside the propagated
+interval produces the same routes or MoE output. Wrong-HC-handoff and
+omitted-attention controls must fail the contract. Full-model composition and
+native attention remain separate gates.
+
+Run the boundary probes with:
+
+```sh
+cargo test -p deepseek --test forward_moe -- --nocapture
+cargo test -p deepseek ffn:: --lib
+```

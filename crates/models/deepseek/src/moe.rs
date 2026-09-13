@@ -185,6 +185,12 @@ pub struct MoEReference<'a> {
 }
 
 impl<'a> MoEReference<'a> {
+    /// Returns the validated one-token hidden width.
+    #[must_use]
+    pub const fn hidden_width(&self) -> usize {
+        self.config.hidden_width
+    }
+
     /// Validates geometry, buffer lengths and the logical expert-work budget.
     /// Numerical gate validation occurs in [`Self::forward_token`].
     pub fn new(

@@ -273,6 +273,10 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
     """Record selected real source submodule outputs, capped at a fixed bound."""
     records: dict[str, object] = {}
     handles: list[torch.utils.hooks.RemovableHandle] = []
+    layer_four = model.layers[4]
+    had_hc_mixes_instance_attr = "hc_mixes" in layer_four.__dict__
+    prior_hc_mixes = layer_four.__dict__.get("hc_mixes")
+    original_hc_mixes = layer_four.hc_mixes
 
     def capture(name: str):
         def hook(
@@ -297,6 +301,22 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
             records[name] = object_record(inputs[0], include_storage=True)
 
         return hook
+
+    def capture_block_input(
+        _module: torch.nn.Module, inputs: tuple[object, ...]
+    ) -> None:
+        """Capture Block.forward's residual and incoming HC pre-mix unchanged."""
+        if len(records) >= MAX_HOOK_RECORDS:
+            raise RuntimeError("hook receipt cap reached")
+        # Pinned Block.forward(x, start_pos, pre_mix, image_mask, *attn_args).
+        if len(inputs) != 4:
+            raise RuntimeError(
+                f"expected four source inputs for layers.4 Block.forward, got {len(inputs)}"
+            )
+        records["layers.4.block_input"] = {
+            "residual": object_record(inputs[0], include_storage=True),
+            "incoming_pre": object_record(inputs[2], include_storage=True),
+        }
 
     for name, module in model.named_modules():
         pieces = name.split(".")
@@ -340,11 +360,51 @@ def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
                     capture_input("layers.4.ffn_input", exactly_one=False)
                 )
             )
+        if name == "layers.4.attn":
+            handles.append(
+                module.register_forward_pre_hook(
+                    capture_input("layers.4.attention_input", exactly_one=False)
+                )
+            )
+        if name == "layers.4.ffn_norm":
+            handles.append(
+                module.register_forward_pre_hook(
+                    capture_input("layers.4.ffn_collapsed", exactly_one=True)
+                )
+            )
+        if name == "layers.4":
+            handles.append(module.register_forward_pre_hook(capture_block_input))
+
+    def observed_hc_mixes(
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Observe the source residual entering layer four's FFN HC mix only."""
+        if hc_fn is layer_four.hc_ffn_fn:
+            if "layers.4.after_attention_residual" in records:
+                raise RuntimeError("layer-four FFN HC residual was observed twice")
+            if len(records) >= MAX_HOOK_RECORDS:
+                raise RuntimeError("hook receipt cap reached")
+            records["layers.4.after_attention_residual"] = object_record(
+                x, include_storage=True
+            )
+        return original_hc_mixes(x, hc_fn, hc_scale, hc_base)
+
+    # This instance-level observer calls the original bound method unchanged.
+    # Restoration below removes it entirely when the instance did not own an
+    # attribute before capture, so it cannot leak into later source forwards.
+    layer_four.hc_mixes = observed_hc_mixes
     try:
         yield records
     finally:
         for handle in handles:
             handle.remove()
+        if had_hc_mixes_instance_attr:
+            layer_four.hc_mixes = prior_hc_mixes
+        else:
+            delattr(layer_four, "hc_mixes")
 
 
 def cache_snapshots(graph: ModuleType, model: torch.nn.Module) -> dict[str, object]:
@@ -944,6 +1004,39 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
         if record.get("shape") != shape or record.get("dtype") != dtype:
             raise RuntimeError(f"MoE parameter {name} has an unexpected shape or dtype")
 
+    block_parameter_names = (
+        "layers.4.hc_attn_fn",
+        "layers.4.hc_attn_base",
+        "layers.4.hc_attn_scale",
+        "layers.4.hc_ffn_fn",
+        "layers.4.hc_ffn_base",
+        "layers.4.hc_ffn_scale",
+        "layers.4.attn_norm.weight",
+        "layers.4.ffn_norm.weight",
+    )
+    block_parameters = {name: encoded.get(name) for name in block_parameter_names}
+    if set(block_parameters) != set(block_parameter_names) or not all(
+        isinstance(record, dict) and "storage_hex" in record
+        for record in block_parameters.values()
+    ):
+        raise RuntimeError("complete capture lacks exact layer-four block parameters")
+    expected_block_layouts = {
+        "layers.4.hc_attn_fn": ([8, 256], "torch.float32"),
+        "layers.4.hc_attn_base": ([8], "torch.float32"),
+        "layers.4.hc_attn_scale": ([3], "torch.float32"),
+        "layers.4.hc_ffn_fn": ([8, 256], "torch.float32"),
+        "layers.4.hc_ffn_base": ([8], "torch.float32"),
+        "layers.4.hc_ffn_scale": ([3], "torch.float32"),
+        "layers.4.attn_norm.weight": ([128], "torch.bfloat16"),
+        "layers.4.ffn_norm.weight": ([128], "torch.bfloat16"),
+    }
+    for name, (shape, dtype) in expected_block_layouts.items():
+        record = block_parameters[name]
+        if record.get("shape") != shape or record.get("dtype") != dtype:
+            raise RuntimeError(
+                f"block parameter {name} has an unexpected shape or dtype"
+            )
+
     cases: list[dict[str, object]] = []
     for step in steps:
         if not isinstance(step, dict):
@@ -955,24 +1048,86 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
         ffn_input = intermediates.get("layers.4.ffn_input")
         ffn_output = intermediates.get("layers.4.ffn")
         gate = intermediates.get("layers.4.ffn.gate")
+        block_input = intermediates.get("layers.4.block_input")
+        attention_input = intermediates.get("layers.4.attention_input")
+        attention_output = intermediates.get("layers.4.attn")
+        after_attention_residual = intermediates.get(
+            "layers.4.after_attention_residual"
+        )
+        ffn_collapsed = intermediates.get("layers.4.ffn_collapsed")
+        block_result = intermediates.get("layers.4")
+        hc_kernel_calls = step.get("hyper_connection_mixes")
         if (
             not isinstance(ffn_input, dict)
             or not isinstance(ffn_output, dict)
             or not isinstance(gate, list)
             or len(gate) != 2
             or not all(isinstance(value, dict) for value in gate)
+            or not isinstance(block_input, dict)
+            or not isinstance(attention_input, dict)
+            or not isinstance(attention_output, dict)
+            or not isinstance(after_attention_residual, dict)
+            or not isinstance(ffn_collapsed, dict)
+            or not isinstance(block_result, list)
+            or len(block_result) != 2
+            or not all(isinstance(value, dict) for value in block_result)
+            or not isinstance(hc_kernel_calls, list)
         ):
             raise TypeError("complete capture step lacks layer-four MoE hook records")
+        block_residual = block_input.get("residual")
+        incoming_pre = block_input.get("incoming_pre")
+        block_output, block_next_pre = block_result
         if (
             ffn_input.get("shape") != ffn_output.get("shape")
             or ffn_input.get("dtype") != "torch.bfloat16"
             or ffn_output.get("dtype") != "torch.bfloat16"
             or gate[0].get("dtype") != "torch.float32"
             or gate[1].get("dtype") != "torch.int64"
+            or not isinstance(block_residual, dict)
+            or not isinstance(incoming_pre, dict)
+            or block_residual.get("dtype") != "torch.bfloat16"
+            or incoming_pre.get("dtype") != "torch.float32"
+            or attention_input.get("dtype") != "torch.bfloat16"
+            or attention_output.get("dtype") != "torch.bfloat16"
+            or after_attention_residual.get("dtype") != "torch.bfloat16"
+            or ffn_collapsed.get("dtype") != "torch.bfloat16"
+            or block_output.get("dtype") != "torch.bfloat16"
+            or block_next_pre.get("dtype") != "torch.float32"
         ):
             raise RuntimeError(
                 "layer-four MoE hook storage has unexpected dtype or shape"
             )
+        layer_four_hc_calls = [
+            call
+            for call in hc_kernel_calls
+            if isinstance(call, dict) and call.get("layer_id") == 4
+        ]
+        if len(layer_four_hc_calls) != 2:
+            raise RuntimeError("complete capture must retain two layer-four HC calls")
+        coefficients = {
+            call.get("sublayer"): call.get("outputs") for call in layer_four_hc_calls
+        }
+        raw_hc_mixes = {
+            call.get("sublayer"): call.get("inputs", {}).get("mixes")
+            for call in layer_four_hc_calls
+        }
+        if set(coefficients) != {"attention", "ffn"} or not all(
+            isinstance(value, dict)
+            and set(value) == {"pre", "post", "comb"}
+            and all(
+                isinstance(record, dict) and "storage_hex" in record
+                for record in value.values()
+            )
+            for value in coefficients.values()
+        ):
+            raise RuntimeError("complete capture lacks layer-four HC coefficients")
+        if set(raw_hc_mixes) != {"attention", "ffn"} or not all(
+            isinstance(value, dict)
+            and value.get("dtype") == "torch.float32"
+            and "storage_hex" in value
+            for value in raw_hc_mixes.values()
+        ):
+            raise RuntimeError("complete capture lacks layer-four raw HC mixes")
         cases.append(
             {
                 "start_pos": start_pos,
@@ -980,6 +1135,18 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "gate_weights": gate[0],
                 "gate_indices": gate[1],
                 "output": ffn_output,
+                "block_input": block_residual,
+                "block_incoming_pre": incoming_pre,
+                "attention_input": attention_input,
+                "attention_output": attention_output,
+                "after_attention_residual": after_attention_residual,
+                "ffn_collapsed": ffn_collapsed,
+                "block_output": block_output,
+                "block_next_pre": block_next_pre,
+                "attention_coefficients": coefficients["attention"],
+                "ffn_coefficients": coefficients["ffn"],
+                "attention_hc_mixes": raw_hc_mixes["attention"],
+                "ffn_hc_mixes": raw_hc_mixes["ffn"],
             }
         )
     if [case["start_pos"] for case in cases] != [0, 5, 6]:
@@ -1003,7 +1170,11 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
     }
     return {
         "schema_version": 1,
-        "scope": "layer-four complete source MoE only; not Rust acceptance or full-model parity",
+        "scope": (
+            "layer-four source MoE plus native block composition with captured "
+            "source attention output; not native attention, Rust acceptance, or "
+            "full-model parity"
+        ),
         "source": {
             "revision": source.get("revision"),
             "model_sha256": source.get("model_sha256"),
@@ -1018,9 +1189,21 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
         },
         "model": moe_args,
         "encoded_parameters": parameters,
+        "block_parameters": block_parameters,
+        "block_config": {
+            "copies": model_args["hc_mult"],
+            "hc_sinkhorn_iters": model_args["hc_sinkhorn_iters"],
+            "hc_eps": model_args["hc_eps"],
+            "norm_eps": model_args["norm_eps"],
+        },
         "cases": cases,
         "comparison_policy": {
             "output_bf16": "exact storage bits",
+            "attention_input_bf16": "exact storage bits",
+            "after_attention_residual_bf16": "exact storage bits",
+            "ffn_collapsed_bf16": "exact storage bits",
+            "block_output_bf16": "exact storage bits",
+            "block_next_pre_abs_error_max": 2**-20,
             "selected_expert_ids": (
                 "exact IDs; compare route weights by expert ID because source score "
                 "order and a native sorted-ID traversal may differ"

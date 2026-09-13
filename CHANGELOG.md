@@ -7,6 +7,12 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native V4.1 FFN composition joining HC coefficient projection, incoming
+  residual mixing, RMSNorm, routed/shared experts and HC post-mixing.
+  Synthetic source comparisons use input-derived arithmetic envelopes and
+  explicit BF16 rounding cells, with exact observed MoE checkpoints and
+  wrong-handoff/omitted-attention controls. Attention output remains
+  source-provided; this is not complete native block or model execution.
 - Bounded native V4.1 MoE sublayer combining BF16 gate routing, packed FP4
   routed experts, the FP8 shared expert and source-order FP32 accumulation.
   A source-forward fixture checks exact BF16 outputs at seven positions;

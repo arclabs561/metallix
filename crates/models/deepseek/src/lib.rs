@@ -5,6 +5,7 @@ pub mod checkpoint;
 pub mod compressor;
 pub mod csa2;
 pub mod engram;
+pub mod ffn;
 pub mod hc;
 pub mod indexer;
 pub mod manifest;
