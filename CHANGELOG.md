@@ -134,6 +134,8 @@ published release; reference operators do not imply full-model support.
 
 ### Fixed
 
+- Index-key rotary narrowing errors report the full key-buffer element, not
+  the offset within one rotary tail. A late-row overflow regression covers it.
 - New Metal composition tests serialize process-global MLX device use,
   matching the library tests' guard convention.
 - Qwen checkpoint discovery accepts Hugging Face cache shard symlinks that

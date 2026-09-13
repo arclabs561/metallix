@@ -9,6 +9,30 @@ use deepseek::{
 use proptest::prelude::*;
 
 #[test]
+fn late_rotary_narrowing_overflow_reports_full_key_element() {
+    use deepseek::indexer::key::IndexKeyError;
+
+    let latent = [0x3f80_u16; 2];
+    let original = latent;
+    let result = prepare_index_keys(
+        &latent,
+        &[
+            RotaryFrequency::new(1.0, 0.0).expect("identity"),
+            RotaryFrequency::new(1.003_906_3, 0.0).expect("finite scale"),
+        ],
+        IndexKeyWeights::new(&[0x3f80; 32], &[0x7f7f; 32]),
+        IndexKeyLayout::new(nz(1), nz(1), nz(32), nz(1), 1e-20).expect("bounded layout"),
+    );
+    // The first row stays finite; the second row's first rotary component is
+    // flat element 32 + 30. Its FP32 product is finite but BF16 rounding overflows.
+    assert!(
+        matches!(result, Err(IndexKeyError::NonFiniteRotary { element: 62 })),
+        "{result:?}"
+    );
+    assert_eq!(latent, original);
+}
+
+#[test]
 fn key_preparation_rejects_bad_boundaries_and_excessive_scalar_work() {
     use deepseek::indexer::key::IndexKeyError;
 

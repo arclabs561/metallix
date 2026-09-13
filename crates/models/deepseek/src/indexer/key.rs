@@ -196,7 +196,10 @@ pub enum IndexKeyError {
         position: usize,
     },
     #[error("index-key rotary result could not narrow to finite BF16 at element {element}")]
-    NonFiniteRotary { element: usize },
+    NonFiniteRotary {
+        /// Flat element in `[batch, compressed_position, key_dimension]` storage.
+        element: usize,
+    },
     #[error("could not allocate {elements} index-key {field} elements")]
     AllocationFailed {
         field: &'static str,
@@ -375,14 +378,17 @@ fn rotate_key_tail(
         frequencies,
         RotaryDirection::Forward,
     )?;
-    for (key, rotated_tail) in output
+    for (row, (key, rotated_tail)) in output
         .chunks_exact_mut(layout.key_dimension.get())
         .zip(tail.chunks_exact(layout.rope_pairs.get() * 2))
+        .enumerate()
     {
         for (offset, &value) in rotated_tail.iter().enumerate() {
             let bits = f32_to_bf16_rne(value);
             if !bf16_to_f32(bits).is_finite() {
-                return Err(IndexKeyError::NonFiniteRotary { element: offset });
+                return Err(IndexKeyError::NonFiniteRotary {
+                    element: row * layout.key_dimension.get() + prefix + offset,
+                });
             }
             key[prefix + offset] = bits;
         }
