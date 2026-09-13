@@ -18,6 +18,7 @@ use thiserror::Error;
 
 pub mod bf16;
 pub mod cache;
+pub mod compressed_kv;
 pub mod key;
 pub mod owner;
 pub mod query;

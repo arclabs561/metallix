@@ -348,8 +348,9 @@ per-batch prefix, compared byte-for-byte with the source cache after each call.
 Replaying position-zero frequencies during decode changes the result.
 `forward_index_attention` feeds this native prefix into the BF16 scorer and
 selector, then passes their selected indices to native layer attention.
-Owner-layer input, candidate masks and compressed KV still come from the
-capture. The ratio-one compressor executes natively through the atomic owner;
+Owner-layer input and candidate masks still come from the capture. Compressed
+KV comes from the coupled native owner described below. The ratio-one compressor
+executes natively through the atomic owner;
 these checks do not establish arbitrary Torch/GPU reduction parity. The captured
 weights are from the synthetic reduced model, not the released checkpoint.
 
@@ -418,17 +419,58 @@ ratio one, not grouped compression or candidate selection. Its transaction ends
 at key publication: downstream attention or FFN failure does not roll back the
 owner, and a complete model runner still needs a broader transaction boundary.
 
-The next missing owner product is compressed attention KV, distinct from the
+### Coupled index-key and compressed-KV publication
+
+The second owner product is compressed attention KV, distinct from the
 index keys used to select positions. The [source compressed-KV path](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L739)
 rotates the original compressor latent and uses G16/E4M3 reconstruction; index
-keys instead use `wk`, key normalization and G32/E8M0 reconstruction. The G16
-primitive already exists. A test-only composition now rotates the native owner
-latent and reconstructs G16/E4M3 values, matching each captured consumer-prefix
-append region exactly at starts zero, five and six. G32/E8M0 substitution and
+keys instead use `wk`, key normalization and G32/E8M0 reconstruction.
+`prepare_compressed_kv` rotates the original native owner latent and reconstructs
+G16/E4M3 values. `RatioOneCompressedOwner` retains these values in a distinct
+`CompressedKvState`; the attention integration consumes its complete native
+prefix, matching the captured consumer prefix exactly at starts zero, five and
+six. G32/E8M0 substitution and
 position-zero frequencies during decode produce detectable differences. The
 captured consumer prefix suffices as the final-byte oracle; no new intermediate
 capture was needed for this check.
 
-Compressed-KV cache ownership and joint key/KV publication remain unimplemented.
-The attention call still receives its captured KV prefix, not a native cache.
-Candidate production remains a separate subsequent boundary.
+The combined owner derives and validates its KV layout before allocation.
+It stages the small compressor state and both numerical products, then prepares
+both cache appends before committing either. Each pending append holds an
+exclusive cache borrow and an immutable values borrow; commit performs only
+validated per-batch copies and metadata assignments. A rejected second append
+cannot publish the first. Reset similarly validates both epoch transitions
+before clearing either cache. No capacity-sized cache clone is needed per call.
+
+`IndexKeyState` and `CompressedKvState` remain separate public types over a
+private bounded prefix store. Sharing storage mechanics does not make their
+precision formats or consumer roles interchangeable. The existing key-only
+owner retains its narrower contract and valid latent geometries; only the
+combined owner requires the G16-compatible latent width and rotary tail.
+
+The transaction ends at the coupled owner publication. A subsequent attention
+or FFN failure still requires a broader model-runner transaction. Candidate
+production remains the next separate execution boundary; this reduced scalar
+reference is not released-checkpoint generation or a GPU performance result.
+
+### Next boundary: candidate production
+
+Layer three produces the candidate mask consumed by layer four. The pinned
+[indexer path](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L550)
+prepares its query, reduces weighted scores, masks future compressed positions,
+then selects candidate blocks. The existing `csa2::candidate_mask` implements
+the block-selection rule; the missing work is its native producer chain, not
+another selection algorithm.
+
+The next capture should observe layer-three `wq_a`, `q_norm`, and indexer query,
+weight and score stages, alongside the final candidate mask. Keep it separate
+from historical fixtures rather than changing their capture identities.
+Candidate composition can then reuse index-query preparation, BF16 scoring and
+the coupled key prefix. Before extracting shared query preparation, compare
+the candidate producer's contract with the existing attention adapter's
+`wq_a`/RMSNorm prefix; sharing must preserve its precision and shape checks.
+
+The gate is exact source-stage and candidate-mask parity at starts zero, five
+and six, followed by unchanged layer-four selected IDs and attention results.
+Wrong-layer weights, future-position masking and candidate-bit perturbations
+must expose errors. Whole-block transaction work follows this producer edge.

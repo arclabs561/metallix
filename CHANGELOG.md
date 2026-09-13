@@ -7,14 +7,17 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
-- Existing rotary and G16/E4M3 primitives reproduce the captured compressed-KV
-  append regions from native owner latents. Wrong-mode and wrong-position
-  controls distinguish this path from index-key preparation. This is numerical
-  qualification; compressed-KV cache ownership remains unimplemented.
+- A ratio-one DeepSeek owner now publishes separate index-key and compressed-KV
+  caches atomically with compressor progress. Prepared appends validate both
+  caches before either commits, without cloning capacity-sized buffers.
+  Native KV prefixes drive the captured attention sequence and match the source
+  byte-for-byte; wrong-format and wrong-position controls guard the comparison.
+  The existing key-only API remains available. Full-model execution is still open.
 - Atomic owner output now drives the V4.1 selection-to-attention capture test:
   raw owner input → compressor → prepared key cache → scores → selected indices
   → attention. Exact stage checks connect the supplementary compressor capture
-  to the older attention oracle. Candidates and compressed KV remain supplied.
+  to the older attention oracle. Candidate masks remain supplied; compressed KV
+  now comes from the coupled native owner.
 - Atomic ratio-one index-key owner calls compose BF16 compressor projection,
   normalization, key preparation and cache append. Failed key preparation does
   not advance compressor or cache state; explicit reset starts a new epoch.

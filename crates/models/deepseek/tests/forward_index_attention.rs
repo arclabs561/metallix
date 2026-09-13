@@ -1,8 +1,8 @@
 //! Source-captured index-selection to layer-attention integration for V4.1.
 //!
 //! This test joins the production index-query prefix, BF16 scorer, strict
-//! selector, atomic compressor/key owner, and attention adapter. The source QR,
-//! owner-layer input, candidate mask, and compressed KV remain fixture boundaries.
+//! selector, atomic compressor/key/KV owner, and attention adapter. The source QR,
+//! owner-layer input, and candidate mask remain fixture boundaries.
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -15,17 +15,17 @@ use attention_capture::{
     weights as attention_weights,
 };
 use deepseek::{
-    RotaryDirection, RotaryFrequency, RotaryTailLayout,
     attention::layer::{LayerAttentionError, LayerAttentionState},
     indexer::{
         bf16::index_scores_bf16_reference,
         cache::IndexKeyPublicationId,
+        compressed_kv::{CompressedKvLayout, prepare_compressed_kv},
         key::{IndexKeyLayout, IndexKeyWeights},
-        owner::{RatioOneIndexKeyOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
+        owner::{RatioOneCompressedOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
         query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
     },
     precision::{Fp4ActivationMode, requantize_bf16_activations_e2m1},
-    rotate_tail, select_indices,
+    select_indices,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -172,39 +172,6 @@ fn bf16_from_f32(value: f32) -> u16 {
 
 fn f32_from_bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
-}
-
-// Test-only composition of existing primitives; no compressed-KV cache owner.
-fn compressed_kv_rows(
-    latent: &[u16],
-    frequencies: &[RotaryFrequency],
-    mode: Fp4ActivationMode,
-) -> Vec<u16> {
-    assert!(!latent.is_empty() && latent.len().is_multiple_of(64));
-    let positions = latent.len() / 64;
-    let mut tails: Vec<f32> = latent
-        .chunks_exact(64)
-        .flat_map(|row| row[32..].iter().copied().map(f32_from_bf16))
-        .collect();
-    rotate_tail(
-        &mut tails,
-        RotaryTailLayout::new(nonzero(1), nonzero(positions), nonzero(1), nonzero(16))
-            .expect("owner tails"),
-        frequencies,
-        RotaryDirection::Forward,
-    )
-    .expect("compressed rotary");
-    let mut rotated = latent.to_vec();
-    for (row, tail) in rotated.chunks_exact_mut(64).zip(tails.chunks_exact(32)) {
-        for (output, &value) in row[32..].iter_mut().zip(tail) {
-            assert!(value.is_finite());
-            *output = bf16_from_f32(value);
-        }
-    }
-    let mut output = vec![0; latent.len()];
-    requantize_bf16_activations_e2m1(&rotated, positions, 64, mode, &mut output)
-        .expect("compressed activation reconstruction");
-    output
 }
 
 fn source_frequencies(
@@ -462,7 +429,7 @@ fn native_index_selection_drives_captured_attention_calls() {
     let wkv = bf16(field(compressor_weights, "wkv"));
     let compressor_norm = bf16(field(compressor_weights, "norm"));
     let weights = RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &norm));
-    let mut key_owner = RatioOneIndexKeyOwner::new(
+    let mut key_owner = RatioOneCompressedOwner::new(
         key_layout,
         nonzero(128),
         nonzero(usize_field(owner_model, "cache_capacity")),
@@ -504,16 +471,19 @@ fn native_index_selection_drives_captured_attention_calls() {
             ))
             .expect("native atomic owner call");
         assert_eq!(
-            prepared.projected,
+            prepared.owner.projected,
             bf16(field(compressor_case, "projected"))
         );
-        assert_eq!(prepared.latent, bf16(field(compressor_case, "latent")));
         assert_eq!(
-            prepared.latent,
+            prepared.owner.latent,
+            bf16(field(compressor_case, "latent"))
+        );
+        assert_eq!(
+            prepared.owner.latent,
             bf16(field(owner_case, "latent")),
             "cross-capture latent gate"
         );
-        let keys = key_owner.prefix(0).expect("batch zero");
+        let keys = key_owner.key_prefix(0).expect("batch zero keys");
         assert_eq!(keys, bf16(field(owner_case, "index_cache_after")));
         let indices = generated_indices(
             &raw,
@@ -523,29 +493,32 @@ fn native_index_selection_drives_captured_attention_calls() {
             index_weights,
             keys,
         );
-        let compressed = attention_case.compressed_kv.bf16();
-        let owner_frequencies = source_frequencies(&raw, attention_case.start_pos, positions, 16);
-        let native_kv = compressed_kv_rows(
-            &prepared.latent,
-            &owner_frequencies,
-            Fp4ActivationMode::CompressedKv16E4m3,
-        );
+        let compressed = key_owner.kv_prefix(0).expect("batch zero compressed KV");
         assert_eq!(
-            native_kv,
-            compressed[attention_case.start_pos * 64..],
-            "native compressed-KV append region at call {call_id}"
+            compressed,
+            attention_case.compressed_kv.bf16(),
+            "entire native compressed-KV prefix at call {call_id}"
         );
-        wrong_group_detected |= compressed_kv_rows(
-            &prepared.latent,
-            &owner_frequencies,
+        let mut wrong_group = vec![0; prepared.compressed_kv.post_rope.len()];
+        requantize_bf16_activations_e2m1(
+            &prepared.compressed_kv.post_rope,
+            positions,
+            64,
             Fp4ActivationMode::Index32E8m0,
-        ) != native_kv;
+            &mut wrong_group,
+        )
+        .expect("wrong-group control");
+        wrong_group_detected |= wrong_group != prepared.compressed_kv.post_fp4;
         if attention_case.start_pos != 0 {
-            wrong_frequency_detected |= compressed_kv_rows(
-                &prepared.latent,
+            wrong_frequency_detected |= prepare_compressed_kv(
+                &prepared.owner.latent,
                 &source_frequencies(&raw, 0, positions, 16),
-                Fp4ActivationMode::CompressedKv16E4m3,
-            ) != native_kv;
+                CompressedKvLayout::new(nonzero(1), nonzero(64), nonzero(16))
+                    .expect("source KV layout"),
+            )
+            .expect("wrong-frequency control")
+            .post_fp4
+                != prepared.compressed_kv.post_fp4;
         }
         let diagnostic = forward_with_publication(
             &mut state,
@@ -554,7 +527,7 @@ fn native_index_selection_drives_captured_attention_calls() {
             0,
             u64::try_from(call_id).expect("three calls"),
             SOURCE_LAYER,
-            &compressed,
+            compressed,
             &indices,
             call_frequencies(&all_frequencies, attention_case),
             attention_weights.borrowed(),

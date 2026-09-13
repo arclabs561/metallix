@@ -118,6 +118,12 @@ impl IndexKeyLayout {
     pub(crate) const fn key_dimension(self) -> NonZeroUsize {
         self.key_dimension
     }
+
+    /// Rotary complex-pair count shared with the owner compressed-KV path.
+    #[must_use]
+    pub(crate) const fn rope_pairs(self) -> NonZeroUsize {
+        self.rope_pairs
+    }
 }
 
 /// Borrowed BF16 weights used by [`prepare_index_keys`].

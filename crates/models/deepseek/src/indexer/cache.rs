@@ -1,26 +1,37 @@
-//! Per-request ownership of V4.1 prepared index keys.
+//! Per-request ownership of V4.1 owner-layer prefixes.
 //!
 //! The upstream indexer keeps one key cache at the layer which owns compressed
-//! KV.  This type represents that narrow, model-local responsibility: append
-//! already prepared BF16 keys at contiguous *compressed-position* offsets and
-//! lend valid prefixes to a consumer.  It deliberately does not decide when a
-//! token group completes, prepare keys, choose candidates, select indices, or
-//! coordinate another cache.
+//! KV. [`IndexKeyState`] and [`CompressedKvState`] represent the two distinct,
+//! model-local prefixes: prepared index keys and compressed KV values. They
+//! deliberately do not decide when a token group completes, prepare values,
+//! choose candidates, or select indices. Their crate-private pending operations
+//! let one owner validate both publications before either cache mutates.
 
 use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
-use crate::precision::bf16_to_f32;
+mod storage;
+
+use storage::{PrefixStore, StorePendingAppend, StorePendingReset};
 
 /// Largest bounded index-key cache allocation, in BF16 elements.
 pub const MAX_INDEX_KEY_CACHE_ELEMENTS: usize = 1 << 20;
 
-/// Identifies one source publication in a request-local index-key stream.
+/// Largest bounded compressed-KV cache allocation, in BF16 elements.
+///
+/// This has the same model-local storage ceiling as index keys. It is a
+/// separate constant so a caller need not infer a compressed-KV limit from an
+/// index-key type.
+pub const MAX_COMPRESSED_KV_CACHE_ELEMENTS: usize = MAX_INDEX_KEY_CACHE_ELEMENTS;
+
+/// Identifies one source publication in a request-local owner-prefix stream.
 ///
 /// These values are grouped because an epoch or successful-call ordinal is not
 /// an interchangeable position. `source_layer` is the layer that owns the key
-/// projection, not a candidate or selection producer.
+/// projection and compressed-KV preparation, not a candidate or selection
+/// producer. The name is retained because it was already the public identity
+/// type for the index-key cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct IndexKeyPublicationId {
@@ -40,7 +51,7 @@ impl IndexKeyPublicationId {
         }
     }
 
-    /// The owner layer that prepared these keys.
+    /// The owner layer that prepared these prefixes.
     #[must_use]
     pub const fn source_layer(self) -> u16 {
         self.source_layer
@@ -69,14 +80,7 @@ impl IndexKeyPublicationId {
 /// groups to the `start_position` and prepared key slice supplied here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexKeyState {
-    batches: NonZeroUsize,
-    key_dimension: NonZeroUsize,
-    capacity_positions: NonZeroUsize,
-    expected_source_layer: u16,
-    keys: Vec<u16>,
-    valid_positions: usize,
-    epoch: u64,
-    next_call_id: u64,
+    store: PrefixStore,
 }
 
 impl IndexKeyState {
@@ -90,29 +94,14 @@ impl IndexKeyState {
         capacity_positions: NonZeroUsize,
         expected_source_layer: u16,
     ) -> Result<Self, IndexKeyStateError> {
-        let elements = product(
-            &[batches.get(), capacity_positions.get(), key_dimension.get()],
-            "index-key cache",
-        )?;
-        if elements > MAX_INDEX_KEY_CACHE_ELEMENTS {
-            return Err(IndexKeyStateError::ElementLimit {
-                elements,
-                maximum: MAX_INDEX_KEY_CACHE_ELEMENTS,
-            });
-        }
-        let mut keys = Vec::new();
-        keys.try_reserve_exact(elements)
-            .map_err(|_| IndexKeyStateError::AllocationFailed { elements })?;
-        keys.resize(elements, 0);
         Ok(Self {
-            batches,
-            key_dimension,
-            capacity_positions,
-            expected_source_layer,
-            keys,
-            valid_positions: 0,
-            epoch: 0,
-            next_call_id: 0,
+            store: PrefixStore::new(
+                batches,
+                key_dimension,
+                capacity_positions,
+                expected_source_layer,
+                "index-key cache",
+            )?,
         })
     }
 
@@ -129,192 +118,254 @@ impl IndexKeyState {
         start_position: usize,
         keys: &[u16],
     ) -> Result<(), IndexKeyStateError> {
-        self.validate_publication(publication)?;
-        if start_position != self.valid_positions {
-            return Err(IndexKeyStateError::PositionDiscontinuity {
-                actual: start_position,
-                expected: self.valid_positions,
-            });
-        }
-
-        let batch_stride = product(
-            &[self.batches.get(), self.key_dimension.get()],
-            "prepared index-key row",
-        )?;
-        if !keys.len().is_multiple_of(batch_stride) {
-            return Err(IndexKeyStateError::PreparedLength {
-                actual: keys.len(),
-                stride: batch_stride,
-            });
-        }
-        let positions = keys.len() / batch_stride;
-        let end_position = start_position
-            .checked_add(positions)
-            .ok_or(IndexKeyStateError::PositionOverflow)?;
-        if end_position > self.capacity_positions.get() {
-            return Err(IndexKeyStateError::CapacityExceeded {
-                end_position,
-                capacity: self.capacity_positions.get(),
-            });
-        }
-        if let Some(position) = keys.iter().position(|&bits| !bf16_to_f32(bits).is_finite()) {
-            return Err(IndexKeyStateError::NonFinitePrepared { position });
-        }
-        let next_call_id = self
-            .next_call_id
-            .checked_add(1)
-            .ok_or(IndexKeyStateError::CallIdOverflow)?;
-
-        let position_width = product(&[positions, self.key_dimension.get()], "prepared key span")?;
-        let destination_width = product(
-            &[self.capacity_positions.get(), self.key_dimension.get()],
-            "index-key cache batch",
-        )?;
-        let destination_offset = product(
-            &[start_position, self.key_dimension.get()],
-            "prepared key offset",
-        )?;
-        for batch in 0..self.batches.get() {
-            let source_start = batch * position_width;
-            let destination_start = batch * destination_width + destination_offset;
-            self.keys[destination_start..destination_start + position_width]
-                .copy_from_slice(&keys[source_start..source_start + position_width]);
-        }
-        self.valid_positions = end_position;
-        self.next_call_id = next_call_id;
+        self.prepare_append(publication, start_position, keys)?
+            .commit();
         Ok(())
+    }
+
+    /// Validates an append and holds an exclusive cache borrow until commit.
+    ///
+    /// This is crate-private so an owner can prepare one index-key append and
+    /// one compressed-KV append before committing either. Its commit
+    /// performs only bounded copies and scalar assignments.
+    pub(crate) fn prepare_append<'state, 'values>(
+        &'state mut self,
+        publication: IndexKeyPublicationId,
+        start_position: usize,
+        keys: &'values [u16],
+    ) -> Result<PendingAppend<'state, 'values>, IndexKeyStateError> {
+        Ok(PendingAppend {
+            pending: self
+                .store
+                .prepare_append(publication, start_position, keys)?,
+        })
     }
 
     /// Invalidates borrowed prefixes and begins a new checked epoch.
     pub fn reset(&mut self) -> Result<(), IndexKeyStateError> {
-        let epoch = self
-            .epoch
-            .checked_add(1)
-            .ok_or(IndexKeyStateError::EpochOverflow)?;
-        self.keys.fill(0);
-        self.valid_positions = 0;
-        self.epoch = epoch;
-        self.next_call_id = 0;
+        self.prepare_reset()?.commit();
         Ok(())
+    }
+
+    /// Validates a reset before mutating this cache.
+    pub(crate) fn prepare_reset(&mut self) -> Result<PendingReset<'_>, IndexKeyStateError> {
+        Ok(PendingReset {
+            pending: self.store.prepare_reset()?,
+        })
     }
 
     /// Borrows one batch's exact valid `[compressed_position, key_dimension]` prefix.
     pub fn prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
-        if batch >= self.batches.get() {
-            return Err(IndexKeyStateError::BatchOutOfRange {
-                batch,
-                batches: self.batches.get(),
-            });
-        }
-        let batch_width = product(
-            &[self.capacity_positions.get(), self.key_dimension.get()],
-            "index-key cache batch",
-        )?;
-        let valid_width = product(
-            &[self.valid_positions, self.key_dimension.get()],
-            "valid index-key prefix",
-        )?;
-        let start = batch * batch_width;
-        Ok(&self.keys[start..start + valid_width])
+        self.store.prefix(batch)
     }
 
     /// The only source layer accepted by [`append_prepared`](Self::append_prepared).
     #[must_use]
     pub const fn expected_source_layer(&self) -> u16 {
-        self.expected_source_layer
+        self.store.expected_source_layer()
     }
 
     /// The current request-local epoch.
     #[must_use]
     pub const fn epoch(&self) -> u64 {
-        self.epoch
+        self.store.epoch()
     }
 
     /// The successful-call ordinal required by the next append.
     #[must_use]
     pub const fn next_call_id(&self) -> u64 {
-        self.next_call_id
+        self.store.next_call_id()
     }
 
     /// Number of valid compressed positions in each batch prefix.
     #[must_use]
     pub const fn valid_positions(&self) -> usize {
-        self.valid_positions
+        self.store.valid_positions()
     }
 
-    fn validate_publication(
-        &self,
-        publication: IndexKeyPublicationId,
-    ) -> Result<(), IndexKeyStateError> {
-        if publication.source_layer != self.expected_source_layer {
-            return Err(IndexKeyStateError::UnexpectedSourceLayer {
-                actual: publication.source_layer,
-                expected: self.expected_source_layer,
-            });
-        }
-        if publication.epoch != self.epoch {
-            return Err(IndexKeyStateError::UnexpectedEpoch {
-                actual: publication.epoch,
-                expected: self.epoch,
-            });
-        }
-        if publication.call_id != self.next_call_id {
-            return Err(IndexKeyStateError::UnexpectedCallId {
-                actual: publication.call_id,
-                expected: self.next_call_id,
-            });
-        }
-        Ok(())
+    #[cfg(test)]
+    fn set_counters_for_test(&mut self, epoch: u64, next_call_id: u64) {
+        self.store.set_counters_for_test(epoch, next_call_id);
     }
 }
 
-/// Rejected construction, publication, or prefix access for [`IndexKeyState`].
+/// A bounded, per-request owner of prepared V4.1 compressed KV values.
+///
+/// Storage and publication metadata are intentionally parallel to
+/// [`IndexKeyState`] while the values remain a separate cache: key and KV
+/// widths, contents, and consumers are not interchangeable. The shared
+/// [`IndexKeyStateError`] names a storage invariant, not an assertion that the
+/// failed values were index keys.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompressedKvState {
+    store: PrefixStore,
+}
+
+impl CompressedKvState {
+    /// Creates an empty epoch-zero compressed-KV prefix with fixed source identity.
+    pub fn new(
+        batches: NonZeroUsize,
+        value_dimension: NonZeroUsize,
+        capacity_positions: NonZeroUsize,
+        expected_source_layer: u16,
+    ) -> Result<Self, IndexKeyStateError> {
+        Ok(Self {
+            store: PrefixStore::new(
+                batches,
+                value_dimension,
+                capacity_positions,
+                expected_source_layer,
+                "compressed-KV cache",
+            )?,
+        })
+    }
+
+    /// Appends prepared BF16 `[batch, compressed_position, value_dimension]` values.
+    ///
+    /// An empty slice advances the successful source call ordinal without
+    /// exposing capacity padding, matching [`IndexKeyState::append_prepared`].
+    pub fn append_prepared(
+        &mut self,
+        publication: IndexKeyPublicationId,
+        start_position: usize,
+        values: &[u16],
+    ) -> Result<(), IndexKeyStateError> {
+        self.prepare_append(publication, start_position, values)?
+            .commit();
+        Ok(())
+    }
+
+    /// Validates a compressed-KV append without mutating the prefix.
+    pub(crate) fn prepare_append<'state, 'values>(
+        &'state mut self,
+        publication: IndexKeyPublicationId,
+        start_position: usize,
+        values: &'values [u16],
+    ) -> Result<PendingAppend<'state, 'values>, IndexKeyStateError> {
+        Ok(PendingAppend {
+            pending: self
+                .store
+                .prepare_append(publication, start_position, values)?,
+        })
+    }
+
+    /// Begins a new checked epoch and invalidates all borrowed prefixes.
+    pub fn reset(&mut self) -> Result<(), IndexKeyStateError> {
+        self.prepare_reset()?.commit();
+        Ok(())
+    }
+
+    /// Validates a compressed-KV reset without mutating the prefix.
+    pub(crate) fn prepare_reset(&mut self) -> Result<PendingReset<'_>, IndexKeyStateError> {
+        Ok(PendingReset {
+            pending: self.store.prepare_reset()?,
+        })
+    }
+
+    /// Borrows one batch's exact valid `[compressed_position, value_dimension]` prefix.
+    pub fn prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
+        self.store.prefix(batch)
+    }
+
+    /// The owner layer this cache accepts.
+    #[must_use]
+    pub const fn expected_source_layer(&self) -> u16 {
+        self.store.expected_source_layer()
+    }
+
+    /// Current request-local epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.store.epoch()
+    }
+
+    /// Successful-call ordinal required by the next append.
+    #[must_use]
+    pub const fn next_call_id(&self) -> u64 {
+        self.store.next_call_id()
+    }
+
+    /// Valid compressed positions in each batch prefix.
+    #[must_use]
+    pub const fn valid_positions(&self) -> usize {
+        self.store.valid_positions()
+    }
+}
+
+/// A validated append that remains invisible until commit.
+///
+/// Constructed only inside this module; it borrows its cache mutably and its
+/// input immutably, preventing an owner from changing either between prepare
+/// and the infallible commit.
+pub(crate) struct PendingAppend<'state, 'values> {
+    pending: StorePendingAppend<'state, 'values>,
+}
+
+impl PendingAppend<'_, '_> {
+    /// Copies validated values into their already-bounded destination and advances metadata.
+    pub(crate) fn commit(self) {
+        self.pending.commit();
+    }
+}
+
+/// A validated reset that remains invisible until commit.
+pub(crate) struct PendingReset<'state> {
+    pending: StorePendingReset<'state>,
+}
+
+impl PendingReset<'_> {
+    /// Clears the bounded prefix and advances its already-checked epoch.
+    pub(crate) fn commit(self) {
+        self.pending.commit();
+    }
+}
+
+/// Rejected construction, publication, or prefix access for a bounded owner prefix.
+///
+/// Kept under its original public name for compatibility. Both
+/// [`IndexKeyState`] and [`CompressedKvState`] use these storage invariants.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IndexKeyStateError {
-    #[error("index-key cache shape arithmetic overflowed for {field}")]
+    #[error("owner-prefix cache shape arithmetic overflowed for {field}")]
     ShapeOverflow { field: &'static str },
-    #[error("index-key cache has {elements} BF16 elements, maximum is {maximum}")]
+    #[error("owner-prefix cache has {elements} BF16 elements, maximum is {maximum}")]
     ElementLimit { elements: usize, maximum: usize },
-    #[error("could not allocate {elements} BF16 index-key cache elements")]
+    #[error("could not allocate {elements} BF16 owner-prefix cache elements")]
     AllocationFailed { elements: usize },
-    #[error("index-key publication source layer {actual} is not expected source layer {expected}")]
+    #[error(
+        "owner-prefix publication source layer {actual} is not expected source layer {expected}"
+    )]
     UnexpectedSourceLayer { actual: u16, expected: u16 },
-    #[error("index-key publication epoch {actual} is not expected epoch {expected}")]
+    #[error("owner-prefix publication epoch {actual} is not expected epoch {expected}")]
     UnexpectedEpoch { actual: u64, expected: u64 },
-    #[error("index-key publication call {actual} is not expected call {expected}")]
+    #[error("owner-prefix publication call {actual} is not expected call {expected}")]
     UnexpectedCallId { actual: u64, expected: u64 },
     #[error(
-        "prepared index-key start position {actual} is not contiguous with valid prefix {expected}"
+        "prepared owner-prefix start position {actual} is not contiguous with valid prefix {expected}"
     )]
     PositionDiscontinuity { actual: usize, expected: usize },
-    #[error("prepared index-key length {actual} is not a multiple of batch/key stride {stride}")]
+    #[error(
+        "prepared owner-prefix length {actual} is not a multiple of batch/value stride {stride}"
+    )]
     PreparedLength { actual: usize, stride: usize },
-    #[error("prepared index-key position count overflowed usize")]
+    #[error("prepared owner-prefix position count overflowed usize")]
     PositionOverflow,
     #[error(
-        "prepared index keys end at compressed position {end_position}, capacity is {capacity}"
+        "prepared owner-prefix values end at compressed position {end_position}, capacity is {capacity}"
     )]
     CapacityExceeded {
         end_position: usize,
         capacity: usize,
     },
-    #[error("prepared BF16 index key at flat input position {position} is not finite")]
+    #[error("prepared BF16 owner-prefix value at flat input position {position} is not finite")]
     NonFinitePrepared { position: usize },
-    #[error("index-key publication call ordinal overflowed")]
+    #[error("owner-prefix publication call ordinal overflowed")]
     CallIdOverflow,
-    #[error("index-key epoch counter overflowed")]
+    #[error("owner-prefix epoch counter overflowed")]
     EpochOverflow,
-    #[error("batch {batch} is outside index-key cache batch count {batches}")]
+    #[error("batch {batch} is outside owner-prefix cache batch count {batches}")]
     BatchOutOfRange { batch: usize, batches: usize },
-}
-
-fn product(values: &[usize], field: &'static str) -> Result<usize, IndexKeyStateError> {
-    values.iter().try_fold(1_usize, |total, &value| {
-        total
-            .checked_mul(value)
-            .ok_or(IndexKeyStateError::ShapeOverflow { field })
-    })
 }
 
 #[cfg(test)]
@@ -322,7 +373,8 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{
-        IndexKeyPublicationId, IndexKeyState, IndexKeyStateError, MAX_INDEX_KEY_CACHE_ELEMENTS,
+        CompressedKvState, IndexKeyPublicationId, IndexKeyState, IndexKeyStateError,
+        MAX_INDEX_KEY_CACHE_ELEMENTS,
     };
 
     fn nz(value: usize) -> NonZeroUsize {
@@ -506,7 +558,7 @@ mod tests {
     #[test]
     fn counter_overflows_are_atomic() {
         let mut epoch_state = state();
-        epoch_state.epoch = u64::MAX;
+        epoch_state.set_counters_for_test(u64::MAX, 0);
         let epoch_before = epoch_state.clone();
         assert_eq!(epoch_state.reset(), Err(IndexKeyStateError::EpochOverflow));
         assert_eq!(epoch_state.epoch(), u64::MAX);
@@ -515,7 +567,7 @@ mod tests {
         assert_eq!(epoch_state, epoch_before);
 
         let mut call_state = state();
-        call_state.next_call_id = u64::MAX;
+        call_state.set_counters_for_test(0, u64::MAX);
         let call_before = call_state.clone();
         assert_eq!(
             call_state.append_prepared(publication(0, u64::MAX), 0, &[1, 2, 3, 4]),
@@ -525,5 +577,76 @@ mod tests {
         assert_eq!(call_state.next_call_id(), u64::MAX);
         assert!(call_state.prefix(0).expect("unchanged prefix").is_empty());
         assert_eq!(call_state, call_before);
+    }
+
+    #[test]
+    fn compressed_kv_prefixes_are_distinct_but_follow_the_same_stream_contract() {
+        let mut state =
+            CompressedKvState::new(nz(2), nz(3), nz(3), 3).expect("bounded compressed KV state");
+        state
+            .append_prepared(
+                publication(0, 0),
+                0,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            )
+            .expect("two batch-major positions");
+        assert_eq!(state.prefix(0).expect("first KV batch"), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            state.prefix(1).expect("second KV batch"),
+            [7, 8, 9, 10, 11, 12]
+        );
+        state
+            .append_prepared(publication(0, 1), 2, &[])
+            .expect("incomplete call");
+        assert_eq!(state.next_call_id(), 2);
+        state.reset().expect("checked reset");
+        assert_eq!(state.epoch(), 1);
+        assert!(state.prefix(0).expect("reset prefix").is_empty());
+    }
+
+    #[test]
+    fn paired_append_can_reject_second_cache_without_publishing_first() {
+        let mut keys = state();
+        let mut kv =
+            CompressedKvState::new(nz(2), nz(3), nz(3), 3).expect("bounded compressed KV state");
+        let key_before = keys.clone();
+        let kv_before = kv.clone();
+
+        {
+            let _pending_keys = keys
+                .prepare_append(publication(0, 0), 0, &[1, 2, 3, 4])
+                .expect("key append is fully prepared");
+            assert!(matches!(
+                kv.prepare_append(publication(0, 0), 0, &[1, 2, 3, 4, 5, 0x7f80]),
+                Err(IndexKeyStateError::NonFinitePrepared { position: 5 })
+            ));
+        }
+
+        assert_eq!(keys, key_before);
+        assert_eq!(kv, kv_before);
+    }
+
+    #[test]
+    fn paired_prepared_appends_commit_without_a_second_validation_step() {
+        let mut keys = state();
+        let mut kv =
+            CompressedKvState::new(nz(2), nz(3), nz(3), 3).expect("bounded compressed KV state");
+        let pending_keys = keys
+            .prepare_append(publication(0, 0), 0, &[1, 2, 3, 4])
+            .expect("validated key append");
+        let pending_kv = kv
+            .prepare_append(
+                publication(0, 0),
+                0,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            )
+            .expect("validated KV append");
+
+        pending_keys.commit();
+        pending_kv.commit();
+        assert_eq!(keys.next_call_id(), 1);
+        assert_eq!(kv.next_call_id(), 1);
+        assert_eq!(keys.prefix(0).expect("key prefix"), [1, 2]);
+        assert_eq!(kv.prefix(1).expect("KV prefix"), [7, 8, 9, 10, 11, 12]);
     }
 }
