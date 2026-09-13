@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import struct
 import unittest
 from pathlib import Path
 
@@ -194,6 +196,42 @@ class AttentionFixtureTest(unittest.TestCase):
                 "torch.int32",
                 4,
             )
+
+    def test_masked_score_previews_match_exact_bf16_storage(self) -> None:
+        self.assert_masked_previews(self.read_fixture())
+
+    def assert_masked_previews(self, fixture: dict[str, object]) -> None:
+        saw_masked_value = False
+        for case in fixture["cases"]:
+            record = case["indexer"]["operations"]["scores_after_candidate_mask"]
+            raw = bytes.fromhex(record["storage_hex"])
+            previews = record["sample_f32"]
+            self.assertEqual(len(previews), min(record["numel"], 8))
+            for position, preview in enumerate(previews):
+                word = raw[2 * position : 2 * position + 2]
+                value = struct.unpack("<f", b"\x00\x00" + word)[0]
+                if math.isfinite(value):
+                    self.assertEqual(preview, value)
+                else:
+                    # The pinned masks contain negative infinity, not NaN or
+                    # positive infinity. Its JSON preview must retain that sign.
+                    self.assertEqual(value, -math.inf)
+                    self.assertEqual(preview, "-inf")
+                    saw_masked_value = True
+            json.dumps(record, allow_nan=False)
+        self.assertTrue(saw_masked_value, "exercise a real source-masked score")
+
+    def test_nonfinite_numeric_and_wrong_sign_previews_are_rejected(self) -> None:
+        fixture = self.read_fixture()
+        previews = fixture["cases"][0]["indexer"]["operations"][
+            "scores_after_candidate_mask"
+        ]["sample_f32"]
+        masked_position = previews.index("-inf")
+        for replacement in (-math.inf, "inf"):
+            with self.subTest(replacement=replacement):
+                previews[masked_position] = replacement
+                with self.assertRaises(AssertionError):
+                    self.assert_masked_previews(fixture)
 
     def test_changed_tensor_bytes_fail_integrity_check(self) -> None:
         fixture = self.read_fixture()

@@ -7,6 +7,12 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Source-fixture composition of native V4.1 queries, BF16 score stages,
+  causal/candidate masks and final index selection across prefill and decode.
+  Every captured score stage and selected index matches exactly. Shared keys
+  and candidates remain source-supplied; this test is not a production BF16
+  scorer or a complete indexer. Masked-score previews are checked against
+  their exact storage, including invalid-JSON and wrong-sign negative controls.
 - Native V4.1 source-fixture index-query preparation through FP4-reconstructed
   rotary queries and projected, scaled BF16 head weights at prefill/decode
   starts 0, 5 and 6. The source observer captures the projection boundary and
