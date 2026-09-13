@@ -7,10 +7,14 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Atomic ratio-one index-key owner calls compose BF16 compressor projection,
+  normalization, key preparation and cache append. Failed key preparation does
+  not advance compressor or cache state; explicit reset starts a new epoch.
+  Captured-stage comparisons and randomized retry tests cover the adapter.
 - Native ratio-one owner compressor projection and RMSNorm match exact
   source-captured BF16 stages and now feed the owner-key/cache test. A
   supplementary capture preserves the earlier attention oracle's identity;
-  full owner-call transactions and model generation remain open.
+  full-model transactions and generation remain open.
 - Bounded, per-request V4.1 index-key cache ownership with atomic prepared-key
   append/reset, source/epoch/call checks and borrowed per-batch prefixes.
   Source-capture tests join native owner-key preparation and cache retention

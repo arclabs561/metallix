@@ -100,6 +100,24 @@ impl IndexKeyLayout {
             norm_epsilon,
         })
     }
+
+    /// Number of independent batch prefixes in this key layout.
+    #[must_use]
+    pub(crate) const fn batches(self) -> NonZeroUsize {
+        self.batches
+    }
+
+    /// Width of one compressor latent consumed by `wk`.
+    #[must_use]
+    pub(crate) const fn latent_dimension(self) -> NonZeroUsize {
+        self.latent_dimension
+    }
+
+    /// Width of one prepared key cached by the owner.
+    #[must_use]
+    pub(crate) const fn key_dimension(self) -> NonZeroUsize {
+        self.key_dimension
+    }
 }
 
 /// Borrowed BF16 weights used by [`prepare_index_keys`].

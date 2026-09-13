@@ -400,7 +400,18 @@ are not assumed numerically interchangeable just because the model is unchanged.
 The latest compressor fixture gates the live observer hash; the older attention
 fixture pins its historical observer hash.
 
-This remains test-level composition. A production owner call must stage
-compressor and key-cache state together so a later key-preparation failure does
-not advance only the compressor. Ratio-greater-than-one scheduling and complete
-model execution are not established by this ratio-one capture.
+`RatioOneIndexKeyOwner` composes these production primitives in one atomic
+owner call. Projection and compressor progress are staged first; key preparation
+then operates on the staged latent. Only after the cache accepts the complete
+append does the owner replace its compressor state. This avoids cloning the
+capacity-sized key cache on each call. A malformed rotary input after successful
+compression leaves both states unchanged; retrying the same call reproduces
+the captured projection, latent and key prefix. Randomized batch/input tests
+also compare failed-then-retried calls with clean runs.
+
+Reset is explicit and advances the epoch. Unlike the source compressor's
+implicit restart at token zero, the owner rejects a second prefill until reset;
+an accidental replay cannot replace a live prefix. This API deliberately covers
+ratio one, not grouped compression or candidate selection. Its transaction ends
+at key publication: downstream attention or FFN failure does not roll back the
+owner, and a complete model runner still needs a broader transaction boundary.

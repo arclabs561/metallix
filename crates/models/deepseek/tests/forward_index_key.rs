@@ -9,6 +9,10 @@ use deepseek::{
     indexer::{
         cache::{IndexKeyPublicationId, IndexKeyState},
         key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
+        owner::{
+            RatioOneIndexKeyOwner, RatioOneIndexKeyOwnerError, RatioOneOwnerCall,
+            RatioOneOwnerWeights,
+        },
     },
     precision::bf16_linear_reference,
 };
@@ -98,7 +102,7 @@ struct CompressorCase {
     latent: Tensor,
 }
 
-fn native_compressor_latents() -> Vec<(usize, Vec<u16>)> {
+fn compressor_fixture() -> CompressorFixture {
     let fixture: CompressorFixture = serde_json::from_str(include_str!(
         "../../../../fixtures/deepseek-v41/forward-compressor-reference.json"
     ))
@@ -114,7 +118,7 @@ fn native_compressor_latents() -> Vec<(usize, Vec<u16>)> {
     );
     assert_eq!(fixture.weights.wkv.shape, [64, 128]);
     assert_eq!(fixture.weights.norm.shape, [64]);
-    let model = fixture.model;
+    let model = &fixture.model;
     assert_eq!(
         (
             model.batches,
@@ -135,6 +139,11 @@ fn native_compressor_latents() -> Vec<(usize, Vec<u16>)> {
             .collect::<Vec<_>>(),
         model.expected_start_positions
     );
+    fixture
+}
+
+fn native_compressor_latents() -> Vec<(usize, Vec<u16>)> {
+    let fixture = compressor_fixture();
     let wkv = fixture.weights.wkv.bf16();
     let norm = fixture.weights.norm.bf16();
     let mut compressor =
@@ -368,5 +377,95 @@ fn native_owner_keys_match_captured_cache_append_regions() {
     assert!(
         wrong_frequency_detected,
         "decode oracle detects replaying position-zero rotary frequencies"
+    );
+}
+
+#[test]
+fn atomic_owner_calls_match_source_and_retry_after_key_failure() {
+    let keys = fixture();
+    let compressor = compressor_fixture();
+    assert_eq!(keys.cases.len(), compressor.cases.len());
+    let wkv = compressor.weights.wkv.bf16();
+    let norm = compressor.weights.norm.bf16();
+    let wk = keys.weights.wk.bf16();
+    let key_norm = keys.weights.norm.bf16();
+    let weights = RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &key_norm));
+    let layout = IndexKeyLayout::new(nz(1), nz(64), nz(64), nz(16), 1e-20).expect("layout");
+    let mut owner =
+        RatioOneIndexKeyOwner::new(layout, nz(128), nz(8), 3, &norm, 1e-20).expect("bounded owner");
+    let frequencies = keys.frequencies.frequencies();
+    for (call_id, (key_case, compressor_case)) in
+        keys.cases.iter().zip(&compressor.cases).enumerate()
+    {
+        let start = compressor_case.start_pos;
+        assert_eq!(start, key_case.start_pos);
+        let positions = compressor_case.attention_input.shape[1];
+        let input = compressor_case.attention_input.bf16();
+        let publication =
+            IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID"));
+        let before = owner.prefix(0).expect("prefix").to_vec();
+        let before_position = owner.next_position();
+        let before_call = owner.next_call_id();
+        // The compressor can finish this input; key preparation rejects missing RoPE.
+        assert!(matches!(
+            owner.forward(RatioOneOwnerCall::new(
+                publication,
+                start,
+                nz(positions),
+                &input,
+                &[],
+                weights
+            )),
+            Err(RatioOneIndexKeyOwnerError::Key(_))
+        ));
+        assert_eq!(owner.prefix(0).expect("unchanged prefix"), before);
+        assert_eq!(owner.next_position(), before_position);
+        assert_eq!(owner.next_call_id(), before_call);
+        assert_eq!(owner.epoch(), 0);
+        let diagnostic = owner
+            .forward(RatioOneOwnerCall::new(
+                publication,
+                start,
+                nz(positions),
+                &input,
+                &frequencies[start * 16..(start + positions) * 16],
+                weights,
+            ))
+            .expect("same call retries successfully");
+        assert_eq!(diagnostic.projected, compressor_case.projected.bf16());
+        assert_eq!(diagnostic.latent, compressor_case.latent.bf16());
+        assert_eq!(
+            diagnostic.latent,
+            key_case.latent.bf16(),
+            "cross-capture identity gate"
+        );
+        let expected = key_case.index_cache_after.bf16();
+        assert_eq!(diagnostic.keys.post_fp4, expected[start * 64..]);
+        assert_eq!(owner.prefix(0).expect("published prefix"), expected);
+        assert_eq!(owner.next_position(), start + positions);
+        assert_eq!(
+            owner.next_call_id(),
+            u64::try_from(call_id + 1).expect("next call")
+        );
+    }
+    owner.reset().expect("atomic explicit reset");
+    assert_eq!(owner.epoch(), 1);
+    assert_eq!(owner.next_position(), 0);
+    assert_eq!(owner.next_call_id(), 0);
+    assert!(owner.prefix(0).expect("reset prefix").is_empty());
+    let input = compressor.cases[0].attention_input.bf16();
+    owner
+        .forward(RatioOneOwnerCall::new(
+            IndexKeyPublicationId::new(3, 1, 0),
+            0,
+            nz(5),
+            &input,
+            &frequencies[..80],
+            weights,
+        ))
+        .expect("new epoch prefill");
+    assert_eq!(
+        owner.prefix(0).expect("new epoch prefix"),
+        keys.cases[0].index_cache_after.bf16()
     );
 }

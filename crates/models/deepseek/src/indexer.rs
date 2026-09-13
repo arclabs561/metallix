@@ -19,6 +19,7 @@ use thiserror::Error;
 pub mod bf16;
 pub mod cache;
 pub mod key;
+pub mod owner;
 pub mod query;
 
 /// Largest permitted `[heads, positions]` core score matrix for this diagnostic.
