@@ -68,6 +68,60 @@ a vision encoder, and trained multi-token prediction. Dense versus MoE and
 attention versus recurrence are independent architecture choices. Neither
 model is implemented or newly acquired by this research pass.
 
+## Verified recurrent mixers: state, order, and numerical boundary
+
+The following notation fixes the state orientation used by the verified FLA
+reference implementations: for each batch, recurrent/value head, and layer,
+`S` has shape `[K, V]`; keys and queries have `K` components, values have `V`,
+and the output is `o = Sᵀq`. This is a persistent, ordered state: a decode
+step consumes and replaces it; it is not an append-only KV cache.
+
+### Gated DeltaNet
+
+The recurrent reference in FLA applies scalar decay before predicting the
+current value:
+
+$$
+D_t = \alpha_t S_{t-1},\qquad
+e_t=\beta_t(v_t-k_t^\top D_t),\qquad
+S_t=D_t+k_t e_t^\top,\qquad o_t=S_t^\top q_t.
+$$
+
+Equivalently, $S_t=\alpha_t(I-\beta_tk_tk_t^\top)S_{t-1}+\beta_tk_tv_t^\top$.
+The placement of $\alpha_t$ inside the prediction is load-bearing: using
+`v - kᵀS_prev` without the preceding decay is a different recurrence. Here
+$\alpha_t=\exp(\mathrm{logg}_t)$; the reference supplies $q$ already scaled
+by $1/\sqrt K$. The recurrent path maintains FP32 state;
+projection/output storage precision is a separate contract.
+
+### Kimi Delta Attention
+
+KDA retains the same `[K,V]` state but replaces GDN's scalar retention with a
+per-key-coordinate gate. With `g_t` shaped `[K]`, let
+$D_t=\operatorname{Diag}(\exp(g_t))S_{t-1}$, then apply the delta write
+$S_t=D_t+k_t[\beta_t(v_t-k_t^\top D_t)]^\top$. Thus “left multiplication”
+means row-wise key-coordinate decay in this orientation, not value-coordinate
+decay. In grouped-value attention, the implementation distinguishes query
+heads from value heads: the state is `[B, H_v, K, V]`, and the gate is
+`[B,T,H_v,K]`; callers must not assume one state matrix per query head.
+
+### Prefill, decode, and speculative state
+
+Decode executes the recurrence in token order. Prefill may use the chunked
+algorithms: their causal triangular/WY-like factors summarize within-chunk
+rank-one updates, then propagate the terminal state between chunks. They are
+not permission to reorder tokens. A speculative branch therefore needs an
+independent state snapshot, replay, or a proven append-only update journal.
+The last option is only safe if the stored gate domain and its noncommuting
+row-wise/rank-one update order are retained; a generic “truncate updates” claim
+is not established by these implementations.
+
+The equations and shapes above were verified against the FLA naive recurrence
+implementations, not a full-paper reread. FLA is pinned at
+`516143e31fce09925e6c39ac37148444bad176c4`:
+[GDN naive recurrence](https://github.com/fla-org/flash-linear-attention/blob/516143e31fce09925e6c39ac37148444bad176c4/fla/ops/gated_delta_rule/naive.py) and
+[KDA naive recurrence](https://github.com/fla-org/flash-linear-attention/blob/516143e31fce09925e6c39ac37148444bad176c4/fla/ops/kda/naive.py).
+
 ### Diffusion and probabilistic control
 
 [LLaDA](https://github.com/ML-GSAI/LLaDA) and

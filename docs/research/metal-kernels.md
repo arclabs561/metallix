@@ -114,6 +114,75 @@ documents that flow and binary archives. Consider persisted binary archives
 only after in-process cache keys are correct and cold-start traces show a real
 pipeline-creation cost.
 
+## Packed Gated DeltaNet: a qualified recurrent-kernel pattern
+
+MLX-LM contains a useful, narrowly-qualified Metal specialization for scalar
+Gated DeltaNet prefill. The pinned source is
+[`gated_delta.py` at `dcbcf786`](https://github.com/ml-explore/mlx-lm/blob/dcbcf786c0cf56f9a12fabe9468c887781431ae2/mlx_lm/models/gated_delta.py#L233-L480),
+not a Metallix implementation or performance result.
+
+Its packed path is eligible only when all of these hold:
+
+- no padding mask;
+- scalar gate storage (`g.ndim == 3`), not the vector-gate path;
+- `Dk == 128` and `Dv` divisible by 8; and
+- gate and recurrent state are FP32.
+
+For state layout `[B, Hv, Dv, Dk]`, one 32-lane SIMD group owns eight `Dv`
+rows. Four adjacent lanes own one row; each lane owns 32 contiguous FP32
+elements of its row (128 bytes). The dispatch is `grid=(32, Dv/8, B*Hv)` and
+`threadgroup=(32, 2, 1)`. It loads that per-lane state into a local `float[32]`,
+advances it over the full token loop, then writes it once at the end. This
+removes repeated state traffic for that kernel invocation, but does not promise
+physical register residency: compile output and counters still decide spilling
+and occupancy on a particular pipeline/device.
+
+The numerical contract is also shape-specific. The kernel casts state, gate,
+keys, values, and queries to FP32 for its recurrence arithmetic, uses a fixed
+pairwise accumulation tree, performs the final cross-lane row reduction with
+`simd_shuffle_xor(1)` then `simd_shuffle_xor(2)`, and narrows the output to the
+input element type. Its source compares this tree against an explicit
+32-lane comparator; a candidate adaptation should keep a reference test that
+catches reduction-order and state-update differences. Masked, vector-gated, or
+other-key-width models must retain a separately tested mapping rather than
+silently reusing this one.
+
+This suggests an experiment for compatible recurrent layers: first reproduce
+the state layout, FP32 update order, and output narrowing exactly; then compare
+the packed and generic mappings with identical inputs and state. Retain it only
+with numerical parity and a warmed GPU-time gain. It is not evidence that
+matrix hardware is preferable for recurrent decode.
+
+## TensorOps: cooperative storage is layout-conditional
+
+Apple's TensorOps example uses cooperative tensors to keep an intermediate tile
+distributed in participating threads' private storage. For tiled attention it
+maps complete rows to a SIMD group, performs row reductions for SoftMax, and
+can pass the cooperative `QK` tile directly into the subsequent `SV` matmul.
+[Apple's TensorOps session](https://developer.apple.com/videos/play/wwdc2026/330/)
+requires checking `is_compatible_as_left_input` or
+`is_compatible_as_right_input` first: element type and operation layout may
+make direct reuse invalid. The required fallback is store to threadgroup memory,
+barrier, load with the target operation's cooperative layout, then run.
+
+Treat direct reuse as a qualified prefill/attention optimization, not as a
+general register-passing primitive or a GDN substitute. A correct probe must
+cover its exact tile shape, types, SIMD-group mapping, compatibility result,
+fallback output, and end-to-end numerical result.
+
+M3 Max's Apple-family-9 capabilities clear the documented Metal-4/Apple-7
+hardware floor for tensors and machine-learning encoding, but API availability
+still depends on the deployed SDK and runtime. Apple says TensorOps can select
+available acceleration across Apple-silicon generations; the dedicated neural
+accelerator is specifically an M5 feature. Do not infer M5 prefill gains,
+cooperative-layout support, or an M5-style benchmark from an M3 device. Gate
+the exact API and compiled pipeline at runtime, then measure the target Mac.
+
+Resource residency, sparse placement, and file I/O are intentionally covered
+by [Metal memory](metal-memory.md); command ownership and cross-queue ordering
+are covered by [Metal execution](metal-execution.md). Neither concern is a
+shader-side consequence of cooperative tensors or the GDN state layout.
+
 ## Measurement protocol
 
 Use a fixed prompt and deterministic sampler; warm both model and pipeline;
@@ -166,6 +235,8 @@ resource backpressure. A counter is a hypothesis discriminator, not a score.
 | [Optimize Metal apps and games with GPU counters](https://developer.apple.com/videos/play/wwdc2020/10603/) | Complete transcript | Buffer/vectorization/locality and limiter methodology. |
 | [Optimize GPU renderers with Metal](https://developer.apple.com/videos/play/wwdc2023/10127/) | Complete transcript | Function-constant specialization and pipeline compilation workflow. |
 | [Build GPU binaries with Metal](https://developer.apple.com/videos/play/wwdc2020/10615/) | Complete transcript | AIR-to-device pipeline compilation and binary archives. |
+| [MLX-LM packed Gated DeltaNet source](https://github.com/ml-explore/mlx-lm/blob/dcbcf786c0cf56f9a12fabe9468c887781431ae2/mlx_lm/models/gated_delta.py#L233-L480) | Revision-pinned source | Scalar, unmasked `Dk=128`/FP32 packed state mapping and its explicit reduction contract. |
+| [Optimize custom ML operations with Metal tensors](https://developer.apple.com/videos/play/wwdc2026/330/) | Complete transcript | Cooperative-tensor compatibility check, direct reuse, and threadgroup fallback. |
 | [Metal resources](https://developer.apple.com/metal/resources/) | Complete page | Official MSL-specification link; linked PDF could not be read in this research environment. |
 
 No external MLX or llama.cpp source was copied or adapted here. No GPU build,

@@ -307,6 +307,74 @@ contents. Regenerate with:
 uv run scripts/v41-compressed-publication-reference.py > artifacts/compressed-publication-reference.json
 ```
 
+## Next CSA2 graph invariants
+
+The source has no `Full` / `Reindex` / `Reuse` enum. Those names are an
+effective classification of the configured source sets and must not become a
+second scheduling mechanism:
+
+- A layer in both `kv_source_layers` and `index_source_layers` is a **Full**
+  producer: it may publish main compressed KV, indexer K and a new Top-K
+  result.
+- A layer in `index_source_layers` but not `kv_source_layers` is a **Reindex**
+  consumer: it must read the last published main KV/indexer K, calculate its
+  own score and replace only the published Top-K result.
+- A compressed-attention layer in neither set is a **Reuse** consumer: it must
+  read the latest published KV and Top-K result without generating either.
+
+This is a call-generation contract, not merely a cache-generation contract.
+On a source layer an incomplete pooling group leaves `latent=None`, but an
+index-source still calls its indexer when an existing compressed prefix makes
+`compress_len > 0`; only an empty compressed prefix skips it. A native plan
+therefore needs separate readiness/version fields for main KV, indexer K,
+Top-K and candidate masks. Do not infer that a missing newly emitted latent
+means index selection is absent, and do not carry a Top-K result across a
+different producer, request, batch identity or visible-prefix length.
+
+The current source's one-slot `SharedAttentionRuntime` is valid only because
+layers run in source order and every producer writes before its consumer reads.
+It is process-global, rather than request-owned. A serving implementation must
+replace it with request-local state while retaining the source's dependency
+order; a global mutable cache would let unrelated sequences borrow pointers or
+selections.
+
+### Frequency, storage and position domains
+
+`Attention.__init__` selects its `freqs_cis` table from the **layer's
+`compress_ratio`**, not from which cache `_window_kv` happens to write. Thus a
+CSA layer (`compress_ratio > 0`) gives both its local SWA KV and its compressed
+KV the compressed-layer frequency table (`compress_rope_theta` and configured
+YaRN settings); only a pure-SWA layer (`compress_ratio == 0`) uses base
+`rope_theta` with YaRN disabled. `_window_kv` receives that same per-layer
+frequency slice. Native code must not assign a separate base-RoPE policy to
+the local branch of a compressed layer.
+
+The source applies **numerical** FP8/FP4 activation quantization in place and
+then stores reconstructed values in tensors of the source/default dtype. This
+applies to `window_kv_cache`, `compress_kv_cache` and the indexer `k_cache`;
+their tensor allocation is not evidence of a packed FP8/FP4 physical cache.
+Any native packed representation needs an explicit layout, scale-plane
+ownership, consumer path and allocation measurement. Until then, its
+acceptance criterion is reconstructed-value parity at the named quantization
+boundary, not a claimed cache-byte reduction.
+
+There are three incompatible index domains which must remain explicit:
+
+1. The window branch selects physical ring-buffer slots; decode order is
+   materialized separately by `get_window_topk_idxs`.
+2. The indexer scores compact global compressed positions. A position becomes
+   visible only after its final source token, with visible length
+   `(start_pos + seqlen) // ratio`; completed decode groups write at
+   `start_pos // ratio`.
+3. `sparse_attn` receives a concatenated KV tensor. Compressed selection
+   indices are shifted by the current raw-window length (`offset`), which is
+   prompt-chunk length during prefill and the fixed window length during
+   decode.
+
+The source chooses Top-K by score and then sorts the chosen compact positions
+before returning them. A locality-oriented reorder is therefore a new
+numerical and positional contract, not an interchangeable cache optimization.
+
 Next consumer: replace the projection stubs with qualified weight execution,
 then join pre-RoPE index-key production, compressed-cache publication, sparse
 attention, and the block harness. Full reduced logits remain the acceptance
