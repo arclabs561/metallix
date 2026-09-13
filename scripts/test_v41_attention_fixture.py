@@ -70,11 +70,18 @@ class AttentionFixtureTest(unittest.TestCase):
             "cpu_backend_sha256",
             "loader_sha256",
             "runner_sha256",
+            "forward_observers_sha256",
             "attention_helper_sha256",
             "complete_capture_sha256",
             "manifest_canonical_sha256",
         ):
             self.assertRegex(source.get(name, ""), r"^[0-9a-f]{64}$", name)
+        self.assertEqual(
+            source["forward_observers_sha256"],
+            hashlib.sha256(
+                (ROOT / "scripts" / "v41_forward_observers.py").read_bytes()
+            ).hexdigest(),
+        )
         self.assertEqual(source.get("storage_byteorder"), "little")
 
         model = fixture.get("model")
@@ -127,6 +134,66 @@ class AttentionFixtureTest(unittest.TestCase):
         for case in cases:
             for name, (dtype, width) in CASE_TENSORS.items():
                 self.assert_tensor(case.get(name), name, dtype, width)
+
+    def test_indexer_boundaries_retain_exact_source_storage(self) -> None:
+        fixture = self.read_fixture()
+        cases = fixture["cases"]
+        for case in cases:
+            start_pos = case["start_pos"]
+            indexer = case.get("indexer")
+            self.assertIsInstance(indexer, dict, start_pos)
+            inputs = indexer.get("inputs")
+            operations = indexer.get("operations")
+            self.assertIsInstance(inputs, dict, start_pos)
+            self.assertIsInstance(operations, dict, start_pos)
+            self.assertIsNone(inputs.get("latent"), start_pos)
+            self.assertEqual(inputs.get("start_pos"), start_pos)
+            self.assert_tensor(inputs.get("x"), "indexer x", "torch.bfloat16", 2)
+            self.assert_tensor(inputs.get("qr"), "indexer qr", "torch.bfloat16", 2)
+            self.assert_tensor(
+                inputs.get("shared_index_k_prefix"),
+                "source-published index K prefix",
+                "torch.bfloat16",
+                2,
+            )
+            self.assert_tensor(
+                inputs.get("candidate_mask"),
+                "source candidate mask",
+                "torch.bool",
+                1,
+            )
+            prefix_shape = inputs["shared_index_k_prefix"]["shape"]
+            self.assertEqual(prefix_shape[-1], 64)
+            candidate_shape = inputs["candidate_mask"]["shape"]
+            self.assertEqual(candidate_shape[0], 1)
+            self.assertEqual(candidate_shape[-1], prefix_shape[1])
+            for name in (
+                "weights_proj_output",
+                "scaled_weights",
+                "q_after_rope_fp4",
+                "scores_einsum",
+                "scores_after_relu",
+                "scores_weighted_per_head",
+                "scores_after_head_sum",
+                "scores_after_candidate_mask",
+            ):
+                self.assert_tensor(operations.get(name), name, "torch.bfloat16", 2)
+            if start_pos == 0:
+                self.assert_tensor(
+                    operations.get("scores_after_causal_mask"),
+                    "scores_after_causal_mask",
+                    "torch.bfloat16",
+                    2,
+                )
+            else:
+                self.assertNotIn("scores_after_causal_mask", operations)
+            self.assertFalse(operations["scores_after_candidate_mask"]["finite"])
+            self.assert_tensor(
+                indexer.get("output_indices"),
+                "source Indexer output indices",
+                "torch.int32",
+                4,
+            )
 
     def test_changed_tensor_bytes_fail_integrity_check(self) -> None:
         fixture = self.read_fixture()

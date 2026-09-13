@@ -158,7 +158,12 @@ def attention_fixture(
             raise TypeError("layer-four sparse observation lacks inputs")
         window = intermediate.get("layers.4.attn.window")
         compressed = intermediate.get("layers.4.attn.compressed")
-        if not isinstance(window, dict) or not isinstance(compressed, dict):
+        indexer = intermediate.get("layers.4.attn.indexer_observation")
+        if (
+            not isinstance(window, dict)
+            or not isinstance(compressed, dict)
+            or not isinstance(indexer, dict)
+        ):
             raise TypeError("complete capture lacks prepared layer-four source caches")
         cases.append(
             {
@@ -233,6 +238,7 @@ def attention_fixture(
                     "layers.4.attn output",
                     dtype="torch.bfloat16",
                 ),
+                "indexer": indexer,
             }
         )
     if [case["start_pos"] for case in cases] != [0, 5, 6]:
@@ -284,6 +290,7 @@ def attention_fixture(
             "cpu_backend_sha256": source.get("cpu_backend_sha256"),
             "loader_sha256": source.get("loader_sha256"),
             "runner_sha256": source.get("runner_sha256"),
+            "forward_observers_sha256": source.get("forward_observers_sha256"),
             "attention_helper_sha256": _sha256_bytes(helper_path.read_bytes()),
             "complete_capture_sha256": _sha256_bytes(_serialized_capture(receipt)),
             "manifest_canonical_sha256": manifest_sha,

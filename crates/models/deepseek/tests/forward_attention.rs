@@ -320,6 +320,6 @@ fn attention_harness_rejects_a_reordered_call_schedule() {
     ];
     native_outputs_from_inputs(
         &inputs,
-        "5b4ec6ef18ddee9ca1a91cfd656f66c177aeebff2e8f0dc47b8bc05e070e021c",
+        "e27dde6ead409c74f7bb2c9e08d4cd5a2b0cfc3c9505c7d6b8908b1cd78b1cc6",
     );
 }

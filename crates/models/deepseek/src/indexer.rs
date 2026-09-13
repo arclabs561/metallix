@@ -12,6 +12,8 @@ use std::num::NonZeroUsize;
 use mlx_rs::{Array, StreamOrDevice, ops};
 use thiserror::Error;
 
+pub mod query;
+
 /// Largest permitted `[heads, positions]` core score matrix for this diagnostic.
 ///
 /// Shared logical geometry cap. On Metal this bounds the 64 MiB FP32 matrix

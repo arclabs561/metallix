@@ -22,11 +22,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import platform
 import struct
 import sys
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -60,6 +59,7 @@ sys.path.insert(0, str(SCRIPTS))
 import v41_attention_capture
 import v41_cpu_kernels as kernels
 import v41_forward_manifest as forward_manifest
+import v41_forward_observers
 import v41_source_loader as source_loader
 
 
@@ -109,6 +109,16 @@ def serialized_capture(receipt: dict[str, object]) -> bytes:
     ).encode("utf-8")
 
 
+def _json_preview_f32(value: torch.Tensor) -> float | str:
+    """Keep JSON previews valid; exact nonfinite values remain in storage bytes."""
+    number = float(value)
+    if math.isfinite(number):
+        return number
+    if math.isnan(number):
+        return "nan"
+    return "inf" if number > 0 else "-inf"
+
+
 def tensor_record(
     value: torch.Tensor, *, include_storage: bool = False
 ) -> dict[str, Any]:
@@ -124,7 +134,10 @@ def tensor_record(
         flat = torch.view_as_real(tensor).reshape(-1)
     else:
         flat = tensor.float().reshape(-1)
-    sample = [float(item) for item in flat[:SAMPLE_VALUES]]
+    # Masked source scores deliberately contain -inf.  JSON's nonfinite
+    # literals are invalid under allow_nan=False, so only the diagnostic
+    # preview uses explicit strings; storage_hex remains the exact oracle.
+    sample = [_json_preview_f32(item) for item in flat[:SAMPLE_VALUES]]
     receipt = {
         "dtype": str(tensor.dtype),
         "shape": list(tensor.shape),
@@ -149,89 +162,6 @@ def object_record(value: object, *, include_storage: bool = False) -> object:
     if isinstance(value, list):
         return [object_record(item, include_storage=include_storage) for item in value]
     raise TypeError(f"unrecordable hook output {type(value)!r}")
-
-
-def tracing_kernel_bundle() -> tuple[
-    ModuleType, list[dict[str, object]], list[dict[str, object]]
-]:
-    """Expose the CPU backend while observing HC and sparse-attention calls."""
-    bundle = ModuleType("_metallix_v41_tracing_kernels")
-    hc_records: list[dict[str, object]] = []
-    sparse_records: list[dict[str, object]] = []
-    for name in source_loader.KERNEL_NAMES:
-        setattr(bundle, name, getattr(kernels, name))
-
-    def traced_hc_split_sinkhorn(
-        mixes: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-        hc_mult: int = 4,
-        sinkhorn_iters: int = 20,
-        eps: float = 1e-6,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Deliberately delegate before recording.  This is an observation
-        # interceptor, not a numerical replacement or a source-body patch.
-        output = kernels.hc_split_sinkhorn(
-            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
-        )
-        pre, post, comb = output
-        identity = torch.eye(hc_mult, dtype=comb.dtype, device=comb.device)
-        hc_records.append(
-            {
-                "inputs": {
-                    "mixes": tensor_record(mixes, include_storage=True),
-                    "hc_scale": tensor_record(hc_scale, include_storage=True),
-                    "hc_base": tensor_record(hc_base, include_storage=True),
-                    "hc_mult": hc_mult,
-                    "sinkhorn_iters": sinkhorn_iters,
-                    "eps": eps,
-                },
-                "outputs": {
-                    "pre": tensor_record(pre, include_storage=True),
-                    "post": tensor_record(post, include_storage=True),
-                    "comb": tensor_record(comb, include_storage=True),
-                },
-                "nontrivial": {
-                    "pre_varies": bool((pre.float().amax() - pre.float().amin()) > 0),
-                    "post_varies": bool(
-                        (post.float().amax() - post.float().amin()) > 0
-                    ),
-                    "comb_not_identity": not bool((comb == identity).all()),
-                },
-            }
-        )
-        return output
-
-    def traced_sparse_attn(
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        sink: torch.Tensor,
-        idxs: torch.Tensor,
-        scale: float,
-    ) -> torch.Tensor:
-        """Record actual prepared attention operands without changing the call."""
-        output = kernels.sparse_attn(q, kv, sink, idxs, scale)
-        # ``Attention.forward`` inverse-rotates this result in place. Clone
-        # before returning so this remains the real kernel output boundary.
-        sparse_records.append(
-            {
-                "inputs": {
-                    "q_after_rope": tensor_record(q, include_storage=True),
-                    "kv": tensor_record(kv, include_storage=True),
-                    "sink": tensor_record(sink, include_storage=True),
-                    "indices": tensor_record(idxs, include_storage=True),
-                    "softmax_scale": scale,
-                },
-                "output_pre_inverse_rope": tensor_record(
-                    output.clone(), include_storage=True
-                ),
-            }
-        )
-        return output
-
-    bundle.hc_split_sinkhorn = traced_hc_split_sinkhorn
-    bundle.sparse_attn = traced_sparse_attn
-    return bundle, hc_records, sparse_records
 
 
 def deterministic_values(shape: tuple[int, ...], ordinal: int) -> torch.Tensor:
@@ -304,225 +234,6 @@ def executable_args(
     tokenizer = SyntheticTokenizer(spec["decoded_tokens"], spec["raw_token_strings"])
     args = graph.ModelArgs(**forward_manifest.model_args(candidate))
     return args, tokenizer
-
-
-@contextmanager
-def hooks_for(model: torch.nn.Module) -> Iterator[dict[str, object]]:
-    """Record selected real source submodule outputs, capped at a fixed bound."""
-    records: dict[str, object] = {}
-    handles: list[torch.utils.hooks.RemovableHandle] = []
-    layer_four = model.layers[4]
-    had_hc_mixes_instance_attr = "hc_mixes" in layer_four.__dict__
-    prior_hc_mixes = layer_four.__dict__.get("hc_mixes")
-    original_hc_mixes = layer_four.hc_mixes
-    layer_four_attention = layer_four.attn
-    had_window_instance_attr = "_window_kv" in layer_four_attention.__dict__
-    prior_window_kv = layer_four_attention.__dict__.get("_window_kv")
-    original_window_kv = layer_four_attention._window_kv
-    had_compress_instance_attr = "_compress_kv" in layer_four_attention.__dict__
-    prior_compress_kv = layer_four_attention.__dict__.get("_compress_kv")
-    original_compress_kv = layer_four_attention._compress_kv
-
-    def capture(name: str):
-        def hook(
-            _module: torch.nn.Module, _inputs: tuple[object, ...], output: object
-        ) -> None:
-            if len(records) >= MAX_HOOK_RECORDS:
-                raise RuntimeError("hook receipt cap reached")
-            records[name] = object_record(output, include_storage=True)
-
-        return hook
-
-    def capture_input(name: str, *, exactly_one: bool):
-        """Capture a selected module's source input without recomputing it."""
-
-        def hook(_module: torch.nn.Module, inputs: tuple[object, ...]) -> None:
-            if len(records) >= MAX_HOOK_RECORDS:
-                raise RuntimeError("hook receipt cap reached")
-            if not inputs or (exactly_one and len(inputs) != 1):
-                raise RuntimeError(
-                    f"unexpected source inputs for {name}: got {len(inputs)}"
-                )
-            records[name] = object_record(inputs[0], include_storage=True)
-
-        return hook
-
-    def capture_block_input(
-        _module: torch.nn.Module, inputs: tuple[object, ...]
-    ) -> None:
-        """Capture Block.forward's residual and incoming HC pre-mix unchanged."""
-        if len(records) >= MAX_HOOK_RECORDS:
-            raise RuntimeError("hook receipt cap reached")
-        # Pinned Block.forward(x, start_pos, pre_mix, image_mask, *attn_args).
-        if len(inputs) != 4:
-            raise RuntimeError(
-                f"expected four source inputs for layers.4 Block.forward, got {len(inputs)}"
-            )
-        records["layers.4.block_input"] = {
-            "residual": object_record(inputs[0], include_storage=True),
-            "incoming_pre": object_record(inputs[2], include_storage=True),
-        }
-
-    for name, module in model.named_modules():
-        pieces = name.split(".")
-        selected = (
-            name in {"embed", "engram_hash", "norm", "head"}
-            or (len(pieces) == 2 and pieces[0] == "layers")
-            or (
-                len(pieces) == 3
-                and pieces[0] == "layers"
-                and pieces[2] in {"engram", "attn", "ffn"}
-            )
-            or (
-                len(pieces) == 4
-                and pieces[:3] == ["layers", pieces[1], "attn"]
-                and pieces[3] in {"compressor", "indexer"}
-            )
-            or (
-                len(pieces) == 4
-                and pieces[:3] == ["layers", pieces[1], "ffn"]
-                and pieces[3] == "gate"
-            )
-        )
-        if selected:
-            # Source block, Engram, attention, compressor/indexer and routing
-            # boundaries are sufficient to reconstruct this bounded graph trace.
-            handles.append(module.register_forward_hook(capture(name)))
-        if name == "norm":
-            # The final HC collapse is passed directly to RMSNorm.  Retain the
-            # source-produced input rather than reimplementing either operation
-            # while exporting a test fixture.
-            handles.append(
-                module.register_forward_pre_hook(
-                    capture_input("norm_input", exactly_one=True)
-                )
-            )
-        if name == "layers.4.ffn":
-            # MoE.forward receives (x, image_mask); x is the actual source
-            # hidden state and is the only tensor exported for this oracle.
-            handles.append(
-                module.register_forward_pre_hook(
-                    capture_input("layers.4.ffn_input", exactly_one=False)
-                )
-            )
-        if name == "layers.4.attn":
-            handles.append(
-                module.register_forward_pre_hook(
-                    capture_input("layers.4.attention_input", exactly_one=False)
-                )
-            )
-        if name in {
-            "layers.4.attn.wq_a",
-            "layers.4.attn.q_norm",
-            "layers.4.attn.wq_b",
-        }:
-            handles.append(module.register_forward_hook(capture(name)))
-        if name == "layers.4.attn.wo_b":
-            handles.append(
-                module.register_forward_pre_hook(
-                    capture_input("layers.4.attn.wo_b_input", exactly_one=True)
-                )
-            )
-        if name == "layers.4.ffn_norm":
-            handles.append(
-                module.register_forward_pre_hook(
-                    capture_input("layers.4.ffn_collapsed", exactly_one=True)
-                )
-            )
-        if name == "layers.4":
-            handles.append(module.register_forward_pre_hook(capture_block_input))
-
-    def observed_hc_mixes(
-        x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Observe the source residual entering layer four's FFN HC mix only."""
-        if hc_fn is layer_four.hc_ffn_fn:
-            if "layers.4.after_attention_residual" in records:
-                raise RuntimeError("layer-four FFN HC residual was observed twice")
-            if len(records) >= MAX_HOOK_RECORDS:
-                raise RuntimeError("hook receipt cap reached")
-            records["layers.4.after_attention_residual"] = object_record(
-                x, include_storage=True
-            )
-        return original_hc_mixes(x, hc_fn, hc_scale, hc_base)
-
-    def observed_window_kv(
-        x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Observe source's newly prepared KV, returned read, and ring after write."""
-        if "layers.4.attn.window" in records:
-            raise RuntimeError("layer-four window KV was observed twice")
-        if len(records) >= MAX_HOOK_RECORDS:
-            raise RuntimeError("hook receipt cap reached")
-        window_kv, window_indices = original_window_kv(x, freqs_cis, start_pos)
-        # On decode the source returns the entire ring, whereas the newly
-        # prepared publication is only the slot it wrote.  Retain both source
-        # views without re-quantizing or otherwise reconstructing either one.
-        prepared_window_kv = (
-            window_kv
-            if start_pos == 0
-            else layer_four_attention.window_kv_cache[
-                : x.size(0),
-                start_pos % layer_four_attention.window_size : start_pos
-                % layer_four_attention.window_size
-                + 1,
-            ]
-        )
-        records["layers.4.attn.window"] = {
-            "prepared_window_kv": object_record(
-                prepared_window_kv, include_storage=True
-            ),
-            "window_kv": object_record(window_kv, include_storage=True),
-            "indices": object_record(window_indices, include_storage=True),
-            "ring_after": object_record(
-                layer_four_attention.window_kv_cache, include_storage=True
-            ),
-        }
-        return window_kv, window_indices
-
-    def observed_compress_kv(
-        x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Observe actual layer-three shared KV and source-produced indices."""
-        if "layers.4.attn.compressed" in records:
-            raise RuntimeError("layer-four compressed KV was observed twice")
-        if len(records) >= MAX_HOOK_RECORDS:
-            raise RuntimeError("hook receipt cap reached")
-        compressed_kv, compressed_indices = original_compress_kv(
-            x, qr, start_pos, offset
-        )
-        records["layers.4.attn.compressed"] = {
-            "borrowed_kv": object_record(compressed_kv, include_storage=True),
-            "indices": object_record(compressed_indices, include_storage=True),
-        }
-        return compressed_kv, compressed_indices
-
-    # This instance-level observer calls the original bound method unchanged.
-    # Restoration below removes it entirely when the instance did not own an
-    # attribute before capture, so it cannot leak into later source forwards.
-    layer_four.hc_mixes = observed_hc_mixes
-    layer_four_attention._window_kv = observed_window_kv
-    layer_four_attention._compress_kv = observed_compress_kv
-    try:
-        yield records
-    finally:
-        for handle in handles:
-            handle.remove()
-        if had_hc_mixes_instance_attr:
-            layer_four.hc_mixes = prior_hc_mixes
-        else:
-            delattr(layer_four, "hc_mixes")
-        if had_window_instance_attr:
-            layer_four_attention._window_kv = prior_window_kv
-        else:
-            delattr(layer_four_attention, "_window_kv")
-        if had_compress_instance_attr:
-            layer_four_attention._compress_kv = prior_compress_kv
-        else:
-            delattr(layer_four_attention, "_compress_kv")
 
 
 def cache_snapshots(graph: ModuleType, model: torch.nn.Module) -> dict[str, object]:
@@ -716,7 +427,11 @@ def run_capture() -> dict[str, object]:
         raise RuntimeError(
             "retained upstream kernel hash differs from the capture contract"
         )
-    kernel_bundle, hc_records, sparse_records = tracing_kernel_bundle()
+    kernel_bundle, hc_records, sparse_records = (
+        v41_forward_observers.tracing_kernel_bundle(
+            kernels, source_loader.KERNEL_NAMES, tensor_record
+        )
+    )
     graph = source_loader.load_text_graph(kernel_bundle)
     graph.shared_attn = graph.SharedAttentionRuntime()
     # The source expects BF16 default execution results from its replacement
@@ -749,7 +464,9 @@ def run_capture() -> dict[str, object]:
         steps: list[dict[str, object]] = []
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(941)
-            with hooks_for(model) as intermediate:
+            with v41_forward_observers.hooks_for(
+                model, graph, tensor_record, object_record, MAX_HOOK_RECORDS
+            ) as intermediate:
                 for start_pos, chunk in calls:
                     intermediate.clear()
                     hc_records.clear()
@@ -769,10 +486,10 @@ def run_capture() -> dict[str, object]:
                             if main_hidden is None
                             else tensor_record(main_hidden),
                             "intermediates": dict(intermediate),
-                            "hyper_connection_mixes": hc_step_receipt(
+                            "hyper_connection_mixes": v41_forward_observers.hc_step_receipt(
                                 hc_records, len(model.layers)
                             ),
-                            "sparse_attention_calls": sparse_step_receipt(
+                            "sparse_attention_calls": v41_forward_observers.sparse_step_receipt(
                                 sparse_records, len(model.layers)
                             ),
                             "caches_after": cache_snapshots(graph, model),
@@ -814,6 +531,9 @@ def run_capture() -> dict[str, object]:
             "runner_sha256": _sha256_bytes(Path(__file__).read_bytes()),
             "attention_helper_sha256": _sha256_bytes(
                 (SCRIPTS / "v41_attention_capture.py").read_bytes()
+            ),
+            "forward_observers_sha256": _sha256_bytes(
+                (SCRIPTS / "v41_forward_observers.py").read_bytes()
             ),
         },
         "runtime": {

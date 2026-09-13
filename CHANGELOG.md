@@ -7,6 +7,13 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native V4.1 source-fixture index-query preparation through FP4-reconstructed
+  rotary queries and projected, scaled BF16 head weights at prefill/decode
+  starts 0, 5 and 6. The source observer captures the projection boundary and
+  serializes nonfinite preview values as strict-JSON strings while retaining
+  exact storage bytes. Index scores, candidate filtering/top-k, shared index
+  cache publication and full reindexing remain open; this is not full-model
+  execution.
 - Joined native V4.1 attention, HC residual mixing and FFN comparison. Native
   HC/normalization input feeds one cache-continuous attention sequence, whose
   output now feeds the existing numerical-envelope checks. Capture-identity,

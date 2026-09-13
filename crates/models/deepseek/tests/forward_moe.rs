@@ -189,11 +189,11 @@ fn assert_source_provenance(f: &Fixture) {
     );
     assert_eq!(
         f.source.complete_capture_sha256,
-        "5b4ec6ef18ddee9ca1a91cfd656f66c177aeebff2e8f0dc47b8bc05e070e021c"
+        "e27dde6ead409c74f7bb2c9e08d4cd5a2b0cfc3c9505c7d6b8908b1cd78b1cc6"
     );
     assert_eq!(
         f.source.runner_sha256,
-        "48f015db4bbf9bac950cec252d219ee0073b7d91e1fe885cb2b7d01bc280790d"
+        "bc1a1cca7c3570831152cd98b829b41905c50b9d0485c1354268a647c3e5dff8"
     );
     assert_eq!(f.source.storage_byteorder, "little");
     assert_eq!(
