@@ -470,6 +470,9 @@ enum Command {
         /// Embedding row/token ID.
         #[arg(long, default_value_t = 0)]
         row: usize,
+        /// Decode every row for the bounded layer-zero `wq_a` matrix.
+        #[arg(long)]
+        all_rows: bool,
         /// Row family to decode: `embedding` or `layer0-wq-a`.
         #[arg(long, default_value = "embedding")]
         kind: String,
@@ -654,9 +657,12 @@ pub fn run() -> ExitCode {
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
         Command::InspectV41Shard { shard } => inspect_v41_shard(&shard),
-        Command::InspectV41EmbeddingRow { shard, row, kind } => {
-            inspect_v41_embedding_row(&shard, row, &kind)
-        }
+        Command::InspectV41EmbeddingRow {
+            shard,
+            row,
+            kind,
+            all_rows,
+        } => inspect_v41_embedding_row(&shard, row, &kind, all_rows),
         #[cfg(feature = "metal")]
         Command::SmokeQwenMetal => smoke_qwen_metal(),
         #[cfg(feature = "metal")]
@@ -1177,7 +1183,11 @@ fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
     }
 }
 
-fn inspect_v41_embedding_row(shard: &PathBuf, row: usize, kind: &str) -> ExitCode {
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded CLI artifact inspection keeps its I/O phases explicit"
+)]
+fn inspect_v41_embedding_row(shard: &PathBuf, row: usize, kind: &str, all_rows: bool) -> ExitCode {
     let file_bytes = match fs::metadata(shard) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
@@ -1240,34 +1250,57 @@ fn inspect_v41_embedding_row(shard: &PathBuf, row: usize, kind: &str) -> ExitCod
             return ExitCode::FAILURE;
         }
     };
-    match read_affine_row_from_shard(
-        shard, &header, weight, scales, biases, row, width, 8, group_size,
-    ) {
-        Ok(values) => {
-            let checksum = values.iter().fold(0_u64, |hash, value| {
-                hash.wrapping_mul(1_099_511_628_211)
-                    .wrapping_add(u64::from(value.to_bits()))
-            });
-            println!("DeepSeek MLX affine row");
-            println!("kind: {kind}");
-            println!("row: {row}");
-            println!("width: {}", values.len());
-            println!("fp32_checksum: {checksum:016x}");
-            #[cfg(feature = "metal")]
-            if let Err(error) = deepseek::checkpoint::mlx::decode_affine_row_mlx(&values) {
-                eprintln!("MLX embedding evaluation failed: {error}");
+    let row_count = if all_rows {
+        if kind != "layer0-wq-a" {
+            eprintln!("--all-rows is only supported for layer0-wq-a");
+            return ExitCode::FAILURE;
+        }
+        1024
+    } else {
+        1
+    };
+    let mut matrix = Vec::new();
+    for current_row in 0..row_count {
+        let decoded = match read_affine_row_from_shard(
+            shard,
+            &header,
+            weight,
+            scales,
+            biases,
+            if all_rows { current_row } else { row },
+            width,
+            8,
+            group_size,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("affine row decode failed: {error}");
                 return ExitCode::FAILURE;
             }
-            #[cfg(feature = "metal")]
-            println!("metal_eval: passed");
-            println!("scope: one affine row decoded; no model execution");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("embedding row decode failed: {error}");
-            ExitCode::FAILURE
+        };
+        matrix.extend(decoded);
+        if !all_rows {
+            break;
         }
     }
+    let checksum = matrix.iter().fold(0_u64, |hash, value| {
+        hash.wrapping_mul(1_099_511_628_211)
+            .wrapping_add(u64::from(value.to_bits()))
+    });
+    #[cfg(feature = "metal")]
+    if let Err(error) = deepseek::checkpoint::mlx::decode_affine_row_mlx(&matrix) {
+        eprintln!("MLX affine evaluation failed: {error}");
+        return ExitCode::FAILURE;
+    }
+    println!("DeepSeek MLX affine tensor");
+    println!("kind: {kind}");
+    println!("rows: {row_count}");
+    println!("width: {width}");
+    println!("fp32_checksum: {checksum:016x}");
+    #[cfg(feature = "metal")]
+    println!("metal_eval: passed");
+    println!("scope: bounded affine tensor decoded; no model execution");
+    ExitCode::SUCCESS
 }
 
 fn inspect_qwen(config: &PathBuf) -> ExitCode {

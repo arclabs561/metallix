@@ -77,3 +77,8 @@ The row gate also decodes layer-zero attention `wq_a` row 0 from shard one:
 width `3072`, checksum `e965ea9adea61000`, with `metal_eval: passed`. This is a
 real attention projection tensor crossing the native device boundary; the full
 projection and block graph remain next.
+
+The bounded tensor mode now decodes all 1,024 rows of layer-zero `wq_a`:
+`1024 × 3072` logical FP32 values, checksum `f21d39db440e1f00`, with
+`metal_eval: passed`. This validates the first complete native attention
+projection tensor; the next step is applying it to the decoded hidden state.

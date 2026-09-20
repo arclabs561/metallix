@@ -20,6 +20,8 @@ published release; reference operators do not imply full-model support.
   Metal, proving the first real MLX tensor crosses the native device boundary.
 - The same native gate now decodes layer-zero attention `wq_a` rows (3,072
   logical values) and evaluates them on Metal.
+- The row gate can now decode all 1,024 layer-zero `wq_a` rows as a bounded
+  3,072-wide affine tensor and evaluate the assembled matrix on Metal.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
   Codex profile path, including the direct API smoke result and the measured
   full-Codex prefill limitation.
