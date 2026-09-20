@@ -1297,6 +1297,7 @@ name = "qwen"
 version = "0.1.0"
 dependencies = [
  "mlx-rs",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",

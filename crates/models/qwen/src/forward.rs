@@ -14,6 +14,34 @@ use thiserror::Error;
 /// The largest prompt accepted by the uncached qualification forward path.
 pub const MAX_DENSE_DEBUG_TOKENS: usize = 512;
 
+/// Largest separately qualified resident-chat context. This does not expand
+/// the 512-token uncached diagnostic forward path.
+pub const MAX_RESIDENT_CHAT_TOKENS: usize = 2_048;
+
+/// Default logical K/V budget for the resident-chat control path.
+pub const DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// A checked resident-chat context and its final logical K/V estimate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen3ResidentChatPlan {
+    maximum_context_tokens: usize,
+    planned_kv_bytes: u64,
+}
+
+impl Qwen3ResidentChatPlan {
+    /// Maximum prompt-plus-generated tokens admitted by this executor.
+    #[must_use]
+    pub const fn maximum_context_tokens(self) -> usize {
+        self.maximum_context_tokens
+    }
+
+    /// Logical f32 K/V bytes estimated for that maximum context.
+    #[must_use]
+    pub const fn planned_kv_bytes(self) -> u64 {
+        self.planned_kv_bytes
+    }
+}
+
 /// Dense Qwen3 configuration needed to build a reference forward graph.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen3ForwardConfig {
@@ -140,6 +168,36 @@ impl Qwen3ForwardConfig {
     pub(crate) fn maximum_cached_tokens(&self) -> usize {
         MAX_DENSE_DEBUG_TOKENS.min(self.max_position_embeddings)
     }
+
+    /// Validates a resident-chat context before checkpoint payloads are loaded.
+    ///
+    /// The K/V budget covers only the estimated retained f32 cache arrays. It
+    /// excludes model weights, activations, operator scratch, and allocator
+    /// headroom; it does not preallocate or reserve MLX memory.
+    pub fn resident_chat_plan(
+        &self,
+        maximum_context_tokens: usize,
+        maximum_kv_bytes: u64,
+    ) -> Result<Qwen3ResidentChatPlan, Qwen3ForwardError> {
+        let maximum = MAX_RESIDENT_CHAT_TOKENS.min(self.max_position_embeddings);
+        if maximum_context_tokens == 0 || maximum_context_tokens > maximum {
+            return Err(Qwen3ForwardError::ResidentChatContextLimit {
+                requested: maximum_context_tokens,
+                maximum,
+            });
+        }
+        let planned_kv_bytes = self.cached_kv_bytes(maximum_context_tokens)?;
+        if planned_kv_bytes > maximum_kv_bytes {
+            return Err(Qwen3ForwardError::ResidentChatKvBudget {
+                required: planned_kv_bytes,
+                maximum: maximum_kv_bytes,
+            });
+        }
+        Ok(Qwen3ResidentChatPlan {
+            maximum_context_tokens,
+            planned_kv_bytes,
+        })
+    }
 }
 
 /// Runs a complete uncached Qwen3 forward pass and reads back the last-token
@@ -154,7 +212,7 @@ pub fn forward_last_logits<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     input_ids: &[i32],
 ) -> Result<Vec<f32>, Qwen3ForwardError> {
-    validate_input_ids(config, input_ids, 0)?;
+    validate_input_ids(config, input_ids, 0, config.maximum_cached_tokens())?;
 
     let stream = StreamOrDevice::gpu();
     let seq_len = i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
@@ -254,6 +312,8 @@ pub struct Qwen3ForwardExecutor<'a, S: BuildHasher> {
     weights: &'a HashMap<String, Array, S>,
     cache: Vec<Option<Qwen3LayerKv>>,
     cached_tokens: usize,
+    maximum_context_tokens: usize,
+    resident_chat_plan: Option<Qwen3ResidentChatPlan>,
 }
 
 /// Adapter-local Qwen3 KV state.
@@ -274,6 +334,26 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             weights,
             cache: (0..config.hidden_layers).map(|_| None).collect(),
             cached_tokens: 0,
+            maximum_context_tokens: config.maximum_cached_tokens(),
+            resident_chat_plan: None,
+        }
+    }
+
+    /// Creates a separately bounded resident-chat executor from a preflighted
+    /// plan. The normal constructor remains on the 512-token diagnostic cap.
+    #[must_use]
+    pub(crate) fn new_for_resident_chat(
+        config: &'a Qwen3ForwardConfig,
+        weights: &'a HashMap<String, Array, S>,
+        plan: Qwen3ResidentChatPlan,
+    ) -> Self {
+        Self {
+            config,
+            weights,
+            cache: (0..config.hidden_layers).map(|_| None).collect(),
+            cached_tokens: 0,
+            maximum_context_tokens: plan.maximum_context_tokens,
+            resident_chat_plan: Some(plan),
         }
     }
 
@@ -287,6 +367,30 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     #[must_use]
     pub const fn cached_tokens(&self) -> usize {
         self.cached_tokens
+    }
+
+    /// Maximum prompt-plus-generated tokens accepted by this executor.
+    #[must_use]
+    pub const fn maximum_context_tokens(&self) -> usize {
+        self.maximum_context_tokens
+    }
+
+    /// The explicit resident-chat plan, when this was created for chat.
+    #[must_use]
+    pub const fn resident_chat_plan(&self) -> Option<Qwen3ResidentChatPlan> {
+        self.resident_chat_plan
+    }
+
+    /// Estimated final logical f32 K/V bytes for a resident-chat executor.
+    ///
+    /// This is absent on the 512-token diagnostic executor and does not
+    /// represent an MLX allocation or reservation.
+    #[must_use]
+    pub const fn planned_kv_bytes(&self) -> Option<u64> {
+        match self.resident_chat_plan {
+            Some(plan) => Some(plan.planned_kv_bytes),
+            None => None,
+        }
     }
 
     /// Returns the byte total of resident K and V arrays, excluding allocator
@@ -328,7 +432,12 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     fn append_inner(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
-        validate_input_ids(self.config, input_ids, self.cached_tokens)?;
+        validate_input_ids(
+            self.config,
+            input_ids,
+            self.cached_tokens,
+            self.maximum_context_tokens,
+        )?;
         if self.cached_tokens != 0 && input_ids.len() != 1 {
             return Err(Qwen3ForwardError::CachedAppendRequiresOneToken);
         }
@@ -531,6 +640,7 @@ fn validate_input_ids(
     config: &Qwen3ForwardConfig,
     input_ids: &[i32],
     existing_tokens: usize,
+    maximum: usize,
 ) -> Result<(), Qwen3ForwardError> {
     if input_ids.is_empty() {
         return Err(Qwen3ForwardError::EmptyInput);
@@ -538,7 +648,6 @@ fn validate_input_ids(
     let total = existing_tokens
         .checked_add(input_ids.len())
         .ok_or(Qwen3ForwardError::ShapeOverflow)?;
-    let maximum = MAX_DENSE_DEBUG_TOKENS.min(config.max_position_embeddings);
     if total > maximum {
         return Err(Qwen3ForwardError::PromptTooLong {
             actual: total,
@@ -864,6 +973,22 @@ pub enum Qwen3ForwardError {
         /// Checkpoint vocabulary size.
         vocab_size: usize,
     },
+    /// A resident-chat request exceeds its configured or qualified limit.
+    #[error("Qwen3 resident chat context {requested} exceeds maximum {maximum}")]
+    ResidentChatContextLimit {
+        /// Requested prompt-plus-generated token capacity.
+        requested: usize,
+        /// Smaller of the model and resident-chat caps.
+        maximum: usize,
+    },
+    /// A resident-chat K/V estimate exceeds the caller's logical budget.
+    #[error("Qwen3 resident chat K/V requires {required} bytes, above budget {maximum}")]
+    ResidentChatKvBudget {
+        /// Logical final K/V bytes required.
+        required: u64,
+        /// Caller-provided logical K/V ceiling.
+        maximum: u64,
+    },
     /// A required checkpoint tensor was absent.
     #[error("Qwen3 checkpoint is missing {0}")]
     MissingWeight(String),
@@ -920,6 +1045,56 @@ mod tests {
         let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
         // 28 layers * (K + V) * 8 KV heads * 3 positions * 128 values * f32.
         assert_eq!(config.cached_kv_bytes(3).unwrap(), 688_128);
+    }
+
+    #[test]
+    fn resident_chat_plan_is_separate_from_the_512_token_diagnostic_limit() {
+        let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
+        let plan = config
+            .resident_chat_plan(2_048, super::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES)
+            .expect("512 MiB admits Qwen3-0.6B K/V at 2048 tokens");
+        assert_eq!(plan.maximum_context_tokens(), 2_048);
+        assert_eq!(plan.planned_kv_bytes(), 469_762_048);
+        assert!(matches!(
+            config.resident_chat_plan(2_049, u64::MAX),
+            Err(Qwen3ForwardError::ResidentChatContextLimit {
+                requested: 2_049,
+                maximum: 2_048,
+            })
+        ));
+        assert!(matches!(
+            config.resident_chat_plan(2_048, plan.planned_kv_bytes() - 1),
+            Err(Qwen3ForwardError::ResidentChatKvBudget {
+                required: 469_762_048,
+                maximum: 469_762_047,
+            })
+        ));
+        let smaller_model = QWEN3_06B.replace(
+            "\"max_position_embeddings\":40960",
+            "\"max_position_embeddings\":1024",
+        );
+        let smaller_model = Qwen3ForwardConfig::parse(&smaller_model).expect("smaller context");
+        assert!(matches!(
+            smaller_model.resident_chat_plan(2_048, u64::MAX),
+            Err(Qwen3ForwardError::ResidentChatContextLimit {
+                requested: 2_048,
+                maximum: 1_024,
+            })
+        ));
+    }
+
+    #[test]
+    fn default_executor_still_rejects_513_tokens_before_gpu_work() {
+        let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
+        let weights = HashMap::new();
+        let mut executor = Qwen3ForwardExecutor::new(&config, &weights);
+        assert!(matches!(
+            executor.prefill_last_logits(&vec![0; 513]),
+            Err(Qwen3ForwardError::PromptTooLong {
+                actual: 513,
+                maximum: 512,
+            })
+        ));
     }
 
     #[test]
@@ -1017,6 +1192,55 @@ mod tests {
         ));
 
         executor.reset();
+        assert_eq!(executor.cached_tokens(), 0);
+        assert_eq!(executor.kv_bytes(), 0);
+    }
+
+    #[test]
+    fn resident_chat_cached_decode_matches_fresh_prefill_beyond_512_tokens() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = long_small_config();
+        let weights = deterministic_weights();
+        let plan = config
+            .resident_chat_plan(600, u64::MAX)
+            .expect("long tiny-model resident plan");
+        let mut cached = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        let mut prefix = vec![1; 513];
+        let _ = cached.prefill_last_logits(&prefix).expect("long prefill");
+        assert_eq!(cached.maximum_context_tokens(), 600);
+        assert_eq!(cached.resident_chat_plan(), Some(plan));
+        assert_eq!(cached.planned_kv_bytes(), Some(plan.planned_kv_bytes()));
+
+        for token in [2, 3, 4] {
+            let cached_logits = cached.decode_last_logits(token).expect("cached decode");
+            prefix.push(token);
+            let mut fresh = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+            let fresh_logits = fresh
+                .prefill_last_logits(&prefix)
+                .expect("fresh long prefill");
+            assert_logits_match(fresh_logits, cached_logits);
+        }
+    }
+
+    #[test]
+    fn resident_chat_context_error_resets_cached_kv() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = long_small_config();
+        let weights = deterministic_weights();
+        let plan = config
+            .resident_chat_plan(513, u64::MAX)
+            .expect("exact long tiny-model resident plan");
+        let mut executor = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        executor
+            .prefill_last_logits(&vec![1; 513])
+            .expect("exact-limit prefill");
+        assert!(matches!(
+            executor.decode_last_logits(2),
+            Err(Qwen3ForwardError::PromptTooLong {
+                actual: 514,
+                maximum: 513,
+            })
+        ));
         assert_eq!(executor.cached_tokens(), 0);
         assert_eq!(executor.kv_bytes(), 0);
     }
@@ -1122,6 +1346,29 @@ mod tests {
                 "cached logit {cached} differs from full logit {full}"
             );
         }
+    }
+
+    fn long_small_config() -> Qwen3ForwardConfig {
+        Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen3",
+              "num_hidden_layers":1,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "head_dim":4,
+              "max_position_embeddings":1024,
+              "rms_norm_eps":0.000001,
+              "rope_theta":1000000,
+              "hidden_act":"silu",
+              "tie_word_embeddings":true,
+              "attention_bias":false,
+              "mlp_bias":false
+            }"#,
+        )
+        .expect("long tiny-model config")
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {

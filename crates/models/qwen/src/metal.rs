@@ -191,6 +191,26 @@ impl Qwen3MlxWeights {
         crate::forward::Qwen3ForwardExecutor::new(&self.forward_config, &self.tensors)
     }
 
+    /// Starts a resident-chat executor after validating its context and logical
+    /// K/V estimate against this checkpoint's decoder configuration.
+    pub fn resident_chat_executor(
+        &self,
+        maximum_context_tokens: usize,
+        maximum_kv_bytes: u64,
+    ) -> Result<
+        crate::forward::Qwen3ForwardExecutor<'_, std::collections::hash_map::RandomState>,
+        crate::forward::Qwen3ForwardError,
+    > {
+        let plan = self
+            .forward_config
+            .resident_chat_plan(maximum_context_tokens, maximum_kv_bytes)?;
+        Ok(crate::forward::Qwen3ForwardExecutor::new_for_resident_chat(
+            &self.forward_config,
+            &self.tensors,
+            plan,
+        ))
+    }
+
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
     /// This increases resident weight memory relative to the BF16 checkpoint.
     pub fn prepare_float32(&mut self) -> Result<(), Qwen3MetalLoadError> {
