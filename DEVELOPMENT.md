@@ -476,6 +476,21 @@ prefill, and decode costs; `session_load_ms` is the same one-time setup repeated
 in each turn and must not be summed. Reported process wall time includes fresh
 model loading. No model is downloaded.
 
+A separate Responses replay qualifier uses an already-running local server:
+
+```sh
+uv run scripts/qualify-responses-tools.py --run \
+  --url http://127.0.0.1:18321/v1 --model-id metallix-qwen3-4b \
+  --output artifacts/responses-tools-run
+```
+
+Omit `--run` to inspect its dry run. Use a new output directory. By default it
+runs three JSON and three SSE trials, validates native function-call output,
+and replays a matching call ID with a fresh synthetic result. It records raw
+responses and distinguishes model, protocol, and transport failures. The client
+supplies the tool result; this does not execute filesystem tools or establish
+Codex readiness. See [measured results](docs/experiments/chat-performance.md#native-responses-tool-replay).
+
 The separate native Codex command-tool qualifier is dry-run first. Start the
 4B server with the exact resident limits under test, then use an empty output
 directory:

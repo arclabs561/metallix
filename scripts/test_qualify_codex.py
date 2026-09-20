@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import itertools
 import json
 import subprocess
 import sys
@@ -81,6 +82,33 @@ class QualifyCodexTests(unittest.TestCase):
                         self.value,
                         self.marker,
                     )["passed"]
+                )
+
+    def test_evidence_must_precede_answer_for_every_command_order(self) -> None:
+        items = {
+            "unrelated": {
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": "unrelated output",
+            },
+            "evidence": {
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": f"qualification_value={self.value}\n",
+            },
+            "answer": {"type": "agent_message", "text": self.marker},
+        }
+        for order in itertools.permutations(items):
+            with self.subTest(order=order):
+                result = module.assess(
+                    0,
+                    False,
+                    events(*(items[name] for name in order)),
+                    self.value,
+                    self.marker,
+                )
+                self.assertEqual(
+                    result["passed"], order.index("evidence") < order.index("answer")
                 )
 
     def test_malformed_json_and_unknown_completed_shape_fail(self) -> None:

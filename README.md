@@ -286,11 +286,21 @@ checks the BF16 latent and its owned compressed-KV and index-key publications,
 native index query and score stages, and causal selected IDs at captured starts
 0, 5, and 6. The pinned source's partial decode still scores against a captured
 layer-three shared score-key prefix, distinct from that unchanged layer-one
-owner prefix. A source-only layer-two attention fixture proves that layer two
-borrows the current layer-one KV/index publication and retains its exact
-historical FFN handoff. A standalone native layer-two attention check consumes
-the native layer-one KV/IDs, rejects a non-owner publication, and shows that a
-legal but wrong layer-one ID changes the result.
+owner prefix. A six-check source fixture pins layer-one attention
+operands and outputs at SHA-256
+`a13bb6cd53406f04e436f119aa8dec2184ca43a4d4f4969205bff8bdf26ac31b`.
+Its three focused Rust checks run `LayerAttentionState` from the native ratio-two
+owner KV/IDs at all three calls, compare diagnostics and final output, reject a
+non-owner publication, and show that a legal wrong index changes output. This
+standalone attention boundary does not yet join layer-one HC/FFN into layer two.
+The partial score operand is derived from a strict prior layer-three candidate
+capture, rather than relabelled as layer-one score state.
+
+A source-only layer-two attention fixture proves that layer two borrows the
+current layer-one KV/index publication and retains its exact historical FFN
+handoff. A standalone native layer-two attention check consumes the native
+layer-one KV/IDs, rejects a non-owner publication, and shows that a legal but
+wrong layer-one ID changes the result.
 
 A focused joined test derives the layer-two normalized attention input from
 captured layer-one residual/pre-mix state, runs native layer-two attention and
@@ -307,7 +317,11 @@ production API or full-model execution.
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
 tokens, short requests after long ones, and process-scoped CPU profiling. The
 maintained `scripts/qualify-chat.py` runner repeats these checks against an
-already-running local server.
+already-running local server. A test-only fixed-capacity cache experiment reduced
+long-prompt decode time by 18.18% across ten paired trials, with matching logits;
+production cache behavior is unchanged. Separate 4B Responses tool-result replay
+passed three JSON and three SSE trials using `scripts/qualify-responses-tools.py`.
+See the measurement ledger for memory results and qualification limits.
 
 [Qwen experiments](docs/experiments/qwen-metal.md) record independent CPU
 logit comparisons and measured decode changes.

@@ -1,6 +1,6 @@
 # Delivery roadmap
 
-Status: proposal. Scope: existing-model completion, measured performance, useful
+Status: active sequence; API choices remain proposals. Scope: existing-model completion, measured performance, useful
 local agents, then broader MLX capabilities. Grounded in
 [architecture](architecture.md), [current progress](progress.md),
 [adapter/config direction](model-adapters.md),
@@ -11,6 +11,19 @@ Baseline: `d92c70d`. Review this sequence after each milestone, a failed
 feasibility gate, a materially better upstream runtime, or a change to the
 pinned MLX binding. This proposal records sequencing; it does not declare new
 interfaces stable or turn synthetic parity into model support.
+
+## Current checkpoint
+
+The fixed-capacity feasibility experiment passed ten paired timing rows per
+context and isolated memory probes, with 18.18% lower long-context decode time.
+Production adoption remains gated on stepped growth, real requests and 4B
+qualification. Native layer-one attention now has a source-matched standalone
+gate; layer-one HC/FFN composition and full previous-call shared state remain
+next. Native Responses tool-result replay passed three JSON and three SSE
+trials. See the [measurement ledger](experiments/chat-performance.md) and
+[current progress](progress.md) for the evidence and limits. The metadata-only
+[DeepSeek traffic sensitivity](research/host-memory.md) does not yet establish a
+feasible checkpoint-serving envelope.
 
 ## Position and constraints
 
@@ -54,7 +67,7 @@ measurements; competing GPU workloads invalidate performance comparisons.
 
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
-| Qwen performance | A private capacity-buffer KV update candidate for resident chat. Compare fixed capacity first; investigate stepped capacity only if measurements justify it. | Preserve full-logit/token and branch/EOS replay; improve repeated real request measurements within memory limits. Otherwise retain concatenation. | Reversible experiment; no public tuning flag. |
+| Qwen performance | Extend the passing private fixed-capacity probe with stepped capacity and growth-boundary properties, then compare real resident requests. | Preserve full-logit/token and branch/EOS replay; improve repeated real request measurements within memory limits. Otherwise retain concatenation. | Reversible experiment; no public tuning flag. |
 | DeepSeek completion | Native layer-one attention/HC/FFN feeding the existing layer-two suffix, then earlier block/embedding composition. Consumer: the complete reduced text oracle. | Each replaced boundary preserves source-derived numerical bounds, exact discrete routes and failure/retry behavior; the joined token-to-logit trace passes. | Reversible implementation; source semantics must not be silently changed. |
 | Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
 
@@ -129,7 +142,7 @@ existing product boundary.
 
 | Decision / governing surface | Options and tradeoff | Recommended next move |
 | --- | --- | --- |
-| KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Measure the smallest fixed-capacity experiment. Decide before replacing the production cache. |
+| KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Fixed-capacity feasibility passed. Measure stepped growth and real requests before replacing the production cache. |
 | DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Reproduce the pinned source for the parity baseline. Never silently substitute owner keys. Decide before claiming complete model parity. |
 | Native runtime versus upstream integration | Continue the specialized executor; or retain qualification/adapter work and integrate a runtime that demonstrably meets the same target. | Apply the existing architecture pivot using matched evidence, not popularity. |
 | MLX binding upgrade | Keep the qualified pinned stack; or upgrade to unlock a demonstrated blocking operation/performance gain. | Avoid combining an upgrade with a cache-layout change. Qualify an upgrade as its own change before depending on new semantics. |

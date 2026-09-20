@@ -93,6 +93,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_qualify_chat.py"], False),
         ([sys.executable, "scripts/test_qualify_agent.py"], False),
         ([sys.executable, "scripts/test_qualify_codex.py"], False),
+        ([sys.executable, "scripts/test_qualify_responses_tools.py"], False),
         (["node", "--test", "scripts/benchmark-openai.test.mjs"], False),
         (["ruff", "check", "scripts"], False),
         (["ruff", "format", "--check", "scripts"], False),

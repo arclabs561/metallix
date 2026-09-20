@@ -529,3 +529,94 @@ justified. These numbers cannot be subtracted from normal decode time or added
 to predict a speedup: graph scheduling, allocation and dependencies differ.
 Any cache-layout candidate must preserve parent/branch replay and full-logit
 parity, then improve the repeated real CLI/HTTP workload before adoption.
+
+## Fixed-capacity KV feasibility
+
+A test-only Qwen3-0.6B FP32 executor now compares exact-length concatenation
+with a 2048-token capacity buffer updated through the pinned binding's public
+slice-update operation. Attention sees only the populated prefix. This leaves
+the production cache unchanged and makes no claim about buffer donation.
+
+On the same M3 Max/128-GiB host, the release test ran one warmup and ten paired
+measurements per prompt length, each with 64 teacher-forced decode steps.
+Baseline/candidate order alternated by row and token. Each timed call includes
+evaluated full-logit readback; comparisons and trace hashing are outside the
+timer. Both executors coexist, so this is not an isolated serving comparison.
+
+| Prompt tokens | Concat decode median / sample stdev, ms | Capacity decode median / sample stdev, ms | Median reduction |
+| --- | ---: | ---: | ---: |
+| 128 | 610.771 / 3.399 | 601.593 / 3.461 | 1.50% |
+| 512 | 670.400 / 8.850 | 630.989 / 11.729 | 5.88% |
+| 1983 | 870.325 / 15.047 | 712.076 / 17.267 | 18.18% |
+
+All 30 pairs matched full-logit trace fingerprints and greedy choices; every
+position also passed the `5e-5` numerical bound. A non-ignored tiny-model gate
+checks invalid-token and capacity-overflow rejection without changing cached
+content. Sixteen generated cases compare divergent branches to fresh full
+forwards and retain an unchanged EOS snapshot. The experimental fork explicitly
+materializes independent storage; its cost is outside the decode timing.
+
+Fixed storage retains 448 MiB of logical K/V throughout. At the end of the
+128/512/1983-plus-64 workloads, concatenation retains 42/126/447.78 MiB. The
+combined ten-pair process reported maximum RSS 876,429,312 bytes and macOS peak
+memory footprint 26,790,201,528 bytes. These process measurements cover both
+executors, warmups and forks, and cannot attribute peak allocation to either
+cache design; RSS alone would conceal the larger footprint.
+
+This passes the long-context feasibility screen, not the production adoption
+gate. Next test stepped allocation and its growth
+boundaries before a matched CLI/HTTP comparison and 4B qualification. Do not
+advertise an 18% serving speedup from this teacher-forced test.
+
+Reproduce the numerical/timing workload with:
+
+```sh
+METALLIX_CAPACITY_ROWS=10 METALLIX_QWEN_MODEL=/path/to/Qwen3-0.6B \
+  cargo test -p qwen --release --features metal \
+  fixed_capacity_slice_update_matches_concat_and_preserves_fork_ancestry \
+  -- --ignored --nocapture
+```
+
+The measured executable SHA-256 was
+`349c1cd9e0ad41eba5eb7894d60026e447016e22f17fe2d3143dccd2c873f8e7`.
+The timed invocation used the built test executable directly under
+`/usr/bin/time -l`, excluding Cargo from the process-memory measurement.
+Raw logs, process metrics, row data and source identity are retained in
+`artifacts/qwen-capacity-profile/ten-pair{.log,.time,-summary.json}`. The initial
+three-pair screen is retained separately in that directory.
+
+Fresh-process memory qualification ran each design separately, without forks,
+for three trials per prompt length. All twelve runs matched the corresponding
+whole-logit trace above. Median macOS peak footprint was:
+
+| Prompt tokens | Concat, GiB | Capacity, GiB |
+| --- | ---: | ---: |
+| 128 | 4.900 | 4.012 |
+| 1983 | 18.123 | 5.418 |
+
+These are whole-process peaks, including model loading, prefill, and decode;
+they are not live KV sizes. Trials ran serially in grouped order, without cache
+purging. RSS varied substantially and does not represent total Metal allocation.
+The separate probe strengthens the memory feasibility evidence but does not
+replace the production workload gate. Its executable SHA-256 was
+`4b10e224fc0b9aa341f9e69b2f757db59eeddd7c54e3740c375fea18aac1150e`.
+Logs and metrics are retained as `memory-*.{log,time}` and
+`isolated-memory-summary.json` alongside the timing receipts.
+
+## Native Responses tool replay
+
+The reusable `scripts/qualify-responses-tools.py` qualifier passed three JSON
+and three SSE trials on the native Qwen3-4B-Instruct-2507 server, revision
+`cdbee75f17c01a7cc42f958dc650907174af0554`, with a 2048-token context and
+1024-MiB KV budget. Each trial requires an actual model-generated function call,
+replays its call ID with a fresh synthetic value, and checks the exact final
+answer. SSE validation includes event order, identities, argument assembly,
+and keepalive comments. This tests client-supplied tool-result replay; it does
+not execute filesystem tools or qualify general Codex coding.
+
+The final six-trial receipt and raw requests/responses are retained in
+`artifacts/responses-tool-replay-verified/`. The server executable SHA-256 was
+`aec65da2f2d1168a07009a7db87f707656f14b243079f18810d537650b589634`.
+The Codex assessor now requires the value-bearing command output to precede
+the final marker; all six permutations have regression coverage. Three earlier
+Codex traces also pass this stricter check, without constituting a new live run.

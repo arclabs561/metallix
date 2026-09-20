@@ -235,8 +235,9 @@ def assess(
                     unsupported_shape = "unsupported agent_message shape"
                     break
                 assistant_messages.append(text)
-                if text == marker and command_outputs:
-                    command_before_final_marker = True
+                command_before_final_marker = text == marker and any(
+                    value in output for output in command_outputs
+                )
             elif item["type"] not in {"reasoning", "error", "todo_list"}:
                 unsupported_shape = "unsupported completed item type"
                 break
