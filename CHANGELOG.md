@@ -7,6 +7,9 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- A source-grounded DeepSeek layer-zero token-embedding fixture now rebuilds
+  exact BF16 rows for the captured prefill/decode calls and rejects changed or
+  out-of-vocabulary token IDs.
 - DeepSeek's test-only reduced forward now qualifies Engram1 output into the
   native layer-one attention/HC/FFN path and onward to the existing layer-two
   suffix, with exact output hashes and corrupted-entry rejection. The Codex

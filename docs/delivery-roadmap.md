@@ -18,7 +18,8 @@ The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
 about 1% short-prompt regression. Matched real 2048-token requests for Qwen3-
 0.6B and 4B preserved output/token parity, so bounded stepped storage is now
-the resident production path. Native layer-one attention/HC/FFN now feeds
+the resident production path. DeepSeek's source gates now cover Engram1,
+layer-one, and exact layer-zero token embeddings; native layer-one attention/HC/FFN now feeds
 the layer-two-to-logits reduced suffix; Engram1 now feeds the native layer-one
 path through the reduced suffix with corruption rejection. Layer zero and
 embeddings, then real previous-call shared state remain next. Native
