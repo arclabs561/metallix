@@ -1,6 +1,9 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 #[cfg(feature = "metal")]
+use std::time::Duration;
+
+#[cfg(feature = "metal")]
 mod chat_cli;
 #[cfg(feature = "metal")]
 mod chat_generation;
@@ -178,6 +181,9 @@ enum Command {
         /// Total prompt plus output budget for each request.
         #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
         context_tokens: u32,
+        /// Cooperative generation budget per request, in milliseconds.
+        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=120_000))]
+        generation_timeout_ms: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]
@@ -467,7 +473,14 @@ pub fn run() -> ExitCode {
             model_id,
             listen,
             context_tokens,
-        } => responses::serve(&model, &model_id, listen, context_tokens as usize),
+            generation_timeout_ms,
+        } => responses::serve(
+            &model,
+            &model_id,
+            listen,
+            context_tokens as usize,
+            Duration::from_millis(u64::from(generation_timeout_ms)),
+        ),
         #[cfg(feature = "metal")]
         Command::CheckV41RotaryMetal { fixture, repeats } => v41_rotary::run(&fixture, repeats),
         #[cfg(feature = "metal")]
@@ -1279,6 +1292,33 @@ mod tests {
             super::generation_max_tokens(super::GenerationMemoryMode::Streamed, Some(29)),
             29
         );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn serve_generation_timeout_is_bounded_and_defaults_to_one_minute() {
+        let default =
+            Cli::try_parse_from(["mx", "serve", "--model", "model"]).expect("serve defaults");
+        assert!(matches!(
+            default.command,
+            super::Command::Serve {
+                generation_timeout_ms: 60_000,
+                ..
+            }
+        ));
+        for value in ["0", "120001"] {
+            assert!(
+                Cli::try_parse_from([
+                    "mx",
+                    "serve",
+                    "--model",
+                    "model",
+                    "--generation-timeout-ms",
+                    value,
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[cfg(feature = "metal")]

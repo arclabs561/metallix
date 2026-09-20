@@ -6,6 +6,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::Path,
     process::ExitCode,
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -14,7 +15,8 @@ use serde_json::{Value, json};
 use crate::{
     chat_cli::message,
     chat_generation::{
-        ChatFinishReason, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
+        ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession,
+        ChatToolCall,
     },
     chat_tools,
     http_transport::{Connection, TransportLimits},
@@ -222,8 +224,9 @@ pub(crate) fn serve(
     model_id: &str,
     address: SocketAddr,
     context_tokens: usize,
+    generation_timeout: Duration,
 ) -> ExitCode {
-    match serve_inner(model, model_id, address, context_tokens) {
+    match serve_inner(model, model_id, address, context_tokens, generation_timeout) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mx serve: {error}");
@@ -237,6 +240,7 @@ fn serve_inner(
     model_id: &str,
     address: SocketAddr,
     context_tokens: usize,
+    generation_timeout: Duration,
 ) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
@@ -311,7 +315,15 @@ fn serve_inner(
             }
         };
         let id = format!("resp_{}_{}", std::process::id(), index);
-        if let Err(error) = respond(connection, &parsed, &messages, &tools, &mut session, &id) {
+        if let Err(error) = respond(
+            connection,
+            &parsed,
+            &messages,
+            &tools,
+            &mut session,
+            &id,
+            generation_timeout,
+        ) {
             eprintln!("response failed: {error}");
         }
     }
@@ -329,6 +341,7 @@ fn respond(
     tools: &[Value],
     session: &mut ChatSession,
     id: &str,
+    generation_timeout: Duration,
 ) -> Result<(), String> {
     let mut sequence = 0;
     let mut writer = if parsed.stream {
@@ -342,7 +355,15 @@ fn respond(
         )?;
         Some(writer)
     } else {
-        respond_json(request, parsed, messages, tools, session, id);
+        respond_json(
+            request,
+            parsed,
+            messages,
+            tools,
+            session,
+            id,
+            generation_timeout,
+        );
         return Ok(());
     };
     let message_id = format!("msg_{id}");
@@ -360,7 +381,7 @@ fn respond(
             json!({"type":"response.content_part.added","item_id":message_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
         )?;
     }
-    let generated = session.generate(ChatRequest {messages,tools,max_tokens:parsed.max_output_tokens.unwrap_or(128),enable_thinking:false}, &mut |delta| {
+    let generated = session.generate_with_timeout(ChatRequest {messages,tools,max_tokens:parsed.max_output_tokens.unwrap_or(128),enable_thinking:false}, generation_timeout, &mut |delta| {
         if stream_text {
             event(writer.as_mut().expect("stream writer"),&mut sequence,json!({"type":"response.output_text.delta","item_id":message_id,"output_index":0,"content_index":0,"delta":delta}))?;
         } else {
@@ -373,11 +394,19 @@ fn respond(
     });
     let generated = match generated {
         Ok(generated) => generated,
+        Err(ChatGenerationError::DeadlineExceeded) => {
+            event(
+                writer.as_mut().expect("stream writer"),
+                &mut sequence,
+                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"generation_timeout","message":"generation time budget exceeded"}}}),
+            )?;
+            return Ok(());
+        }
         Err(error) => {
             event(
                 writer.as_mut().expect("stream writer"),
                 &mut sequence,
-                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"generation_failed","message":error}}}),
+                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"generation_failed","message":error.to_string()}}}),
             )?;
             return Ok(());
         }
@@ -473,21 +502,34 @@ fn respond_json(
     tools: &[Value],
     session: &mut ChatSession,
     id: &str,
+    generation_timeout: Duration,
 ) {
     let result = session
-        .generate(
+        .generate_with_timeout(
             ChatRequest {
                 messages,
                 tools,
                 max_tokens: parsed.max_output_tokens.unwrap_or(128),
                 enable_thinking: false,
             },
+            generation_timeout,
             &mut |_| Ok(()),
         )
-        .and_then(|generated| response_value(parsed, &generated, id));
+        .and_then(|generated| {
+            response_value(parsed, &generated, id).map_err(ChatGenerationError::Message)
+        });
     match result {
         Ok(response) => json_response(request, 200, &response),
-        Err(error) => json_response(request, 400, &json!({"error":{"message":error}})),
+        Err(ChatGenerationError::DeadlineExceeded) => json_response(
+            request,
+            408,
+            &json!({"error":{"code":"generation_timeout","message":"generation time budget exceeded"}}),
+        ),
+        Err(error) => json_response(
+            request,
+            400,
+            &json!({"error":{"message":error.to_string()}}),
+        ),
     }
 }
 

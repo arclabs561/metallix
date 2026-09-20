@@ -6,7 +6,7 @@
 //! the diagnostic forward cap remains unchanged.
 
 use std::{
-    fs,
+    fmt, fs,
     path::Path,
     time::{Duration, Instant},
 };
@@ -158,6 +158,77 @@ pub(crate) struct ChatGeneration {
     pub(crate) metrics: ChatGenerationMetrics,
 }
 
+/// A cooperative wall-clock budget for one complete chat turn.
+///
+/// This can only stop work at explicit host-side checkpoints. It deliberately
+/// cannot interrupt an in-flight Metal evaluation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GenerationDeadline {
+    deadline: Option<Instant>,
+}
+
+impl GenerationDeadline {
+    #[must_use]
+    pub(crate) const fn unlimited() -> Self {
+        Self { deadline: None }
+    }
+
+    #[must_use]
+    pub(crate) fn after(timeout: Duration) -> Self {
+        Self {
+            // An unrepresentable deadline must fail closed, never become unlimited.
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .or_else(|| Some(Instant::now())),
+        }
+    }
+
+    fn check(self) -> Result<(), ChatGenerationError> {
+        self.check_at(Instant::now())
+    }
+
+    fn check_at(self, now: Instant) -> Result<(), ChatGenerationError> {
+        if self.expired_at(now) {
+            Err(ChatGenerationError::DeadlineExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[must_use]
+    fn expired_at(self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
+/// A typed generation failure so protocol adapters can retain error semantics.
+#[derive(Debug)]
+pub(crate) enum ChatGenerationError {
+    DeadlineExceeded,
+    Message(String),
+}
+
+impl ChatGenerationError {
+    fn message(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+}
+
+impl From<String> for ChatGenerationError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl fmt::Display for ChatGenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeadlineExceeded => formatter.write_str("generation time budget exceeded"),
+            Self::Message(message) => formatter.write_str(message),
+        }
+    }
+}
+
 /// A resident model and tokenizer for serial Qwen chat turns.
 pub(crate) struct ChatSession {
     weights: Qwen3MlxWeights,
@@ -214,38 +285,67 @@ impl ChatSession {
         request: ChatRequest<'_>,
         on_token: &mut dyn FnMut(&str) -> Result<(), String>,
     ) -> Result<ChatGeneration, String> {
+        self.generate_with_deadline(request, GenerationDeadline::unlimited(), on_token)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Generates with a budget that is checked between host-visible phases.
+    pub(crate) fn generate_with_timeout(
+        &mut self,
+        request: ChatRequest<'_>,
+        timeout: Duration,
+        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+    ) -> Result<ChatGeneration, ChatGenerationError> {
+        // Start before validation and rendering so the caller budgets the full turn.
+        self.generate_with_deadline(request, GenerationDeadline::after(timeout), on_token)
+    }
+
+    fn generate_with_deadline(
+        &mut self,
+        request: ChatRequest<'_>,
+        deadline: GenerationDeadline,
+        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+    ) -> Result<ChatGeneration, ChatGenerationError> {
+        deadline.check()?;
         validate_request(request)?;
         let turn_started = Instant::now();
         let render_started = Instant::now();
         let prompt = self.render(request)?;
         let render_ms = elapsed_ms(render_started.elapsed());
+        deadline.check()?;
         let input_ids = self.tokenizer.encode_prompt(&prompt)?;
+        deadline.check()?;
         validate_ids(&input_ids, self.eos_token_id, self.vocabulary_size)?;
         let total_tokens = input_ids
             .len()
             .checked_add(request.max_tokens as usize)
-            .ok_or_else(|| String::from("chat prompt plus generation budget overflows"))?;
+            .ok_or_else(|| {
+                ChatGenerationError::message("chat prompt plus generation budget overflows")
+            })?;
         if total_tokens > self.context_limit {
-            return Err(format!(
+            return Err(ChatGenerationError::message(format!(
                 "chat requires prompt_tokens + max_tokens <= {}; received {} + {} = {total_tokens}",
                 self.context_limit,
                 input_ids.len(),
                 request.max_tokens,
-            ));
+            )));
         }
 
+        deadline.check()?;
         let mut executor = self
             .weights
             .resident_chat_executor(
                 self.context_limit,
                 qwen::forward::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES,
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+        deadline.check()?;
         let prefill_started = Instant::now();
         let mut logits = executor
             .prefill_last_logits(&input_ids)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
         let prefill_ms = elapsed_ms(prefill_started.elapsed());
+        deadline.check()?;
         let mut generated = Vec::with_capacity(request.max_tokens as usize);
         let mut emitted = String::new();
         let mut text_decoder = QwenTokenizer::generated_decoder();
@@ -254,6 +354,7 @@ impl ChatSession {
         let mut finish_reason = ChatFinishReason::Length;
 
         for step in 0..request.max_tokens {
+            deadline.check()?;
             let token = greedy_token(&logits)?;
             generated.push(token);
             if token == self.eos_token_id {
@@ -268,24 +369,30 @@ impl ChatSession {
             }
 
             if step + 1 < request.max_tokens {
+                deadline.check()?;
                 let decode_started = Instant::now();
                 logits = executor
                     .decode_last_logits(token)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| ChatGenerationError::message(error.to_string()))?;
                 decode_ms.push(elapsed_ms(decode_started.elapsed()));
+                deadline.check()?;
             }
         }
 
         let visible_generated = generated
             .strip_suffix(&[self.eos_token_id])
             .unwrap_or(&generated);
+        deadline.check()?;
         let text = self.tokenizer.decode_generated(visible_generated)?;
         let remaining = text.strip_prefix(&emitted).ok_or_else(|| {
-            String::from("incremental tokenizer decoder diverged from complete generated text")
+            ChatGenerationError::message(
+                "incremental tokenizer decoder diverged from complete generated text",
+            )
         })?;
         emit_delta(remaining, &mut emitted, on_token, &mut ttft, turn_started)?;
         let decode_total_ms = decode_ms.iter().sum();
         let generated_tokens = generated.len();
+        deadline.check()?;
         Ok(ChatGeneration {
             text,
             generated_token_ids: generated,
@@ -503,11 +610,17 @@ fn elapsed_ms(duration: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use minijinja::context;
+    use proptest::prelude::*;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
-    use super::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, parse_template};
+    use super::{
+        ChatGenerationError, ChatMessage, ChatRole, ChatToolCall, ChatToolResult,
+        GenerationDeadline, parse_template,
+    };
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
     const MANIFEST: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.manifest.json");
@@ -544,6 +657,54 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(TEMPLATE.as_bytes()));
         assert_eq!(digest, TEMPLATE_SHA256);
         assert_eq!(manifest["source"]["template_sha256"], TEMPLATE_SHA256);
+    }
+
+    #[test]
+    fn generation_deadline_is_absolute_and_expires_at_its_boundary() {
+        let now = Instant::now();
+        let unlimited = GenerationDeadline::unlimited();
+        assert!(!unlimited.expired_at(now));
+        assert!(unlimited.check().is_ok());
+
+        let expired = GenerationDeadline {
+            deadline: Some(now),
+        };
+        assert!(expired.expired_at(now));
+        assert!(matches!(
+            expired.check(),
+            Err(ChatGenerationError::DeadlineExceeded)
+        ));
+
+        let stage_deadline = GenerationDeadline {
+            deadline: now.checked_add(Duration::from_millis(10)),
+        };
+        assert!(stage_deadline.check_at(now).is_ok());
+        // Checking again does not extend the absolute deadline.
+        assert!(matches!(
+            stage_deadline.check_at(now + Duration::from_millis(10)),
+            Err(ChatGenerationError::DeadlineExceeded)
+        ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn generation_deadline_expiry_is_monotone(
+            earlier_ms in 0_u64..10_000,
+            extension_ms in 0_u64..10_000,
+            probe_ms in 0_u64..20_000,
+        ) {
+            let origin = Instant::now();
+            let earlier = GenerationDeadline {
+                deadline: origin.checked_add(Duration::from_millis(earlier_ms)),
+            };
+            let later = GenerationDeadline {
+                deadline: origin.checked_add(Duration::from_millis(earlier_ms + extension_ms)),
+            };
+            let probe = origin + Duration::from_millis(probe_ms);
+            prop_assert!(!later.expired_at(probe) || earlier.expired_at(probe));
+        }
     }
 
     #[test]
