@@ -10,6 +10,8 @@ published release; reference operators do not imply full-model support.
 - Native `mx inspect-v41-index` now recognizes the real MLX/Hugging Face
   weight-map index format when `metadata.total_size` is absent, reporting its
   2,757 tensors and 18 shards while keeping the scope explicitly metadata-only.
+- Added `mx inspect-v41-shard` to validate a real DeepSeek/MLX safetensors
+  header with bounded I/O before any tensor payload is read.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
   Codex profile path, including the direct API smoke result and the measured
   full-Codex prefill limitation.

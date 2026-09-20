@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, process::ExitCode};
+use std::{fs, io::Read, path::PathBuf, process::ExitCode};
 
 #[cfg(feature = "metal")]
 use std::time::Duration;
@@ -457,6 +457,11 @@ enum Command {
         #[arg(long)]
         index: PathBuf,
     },
+    /// Validate one real DeepSeek/MLX safetensors shard header without reading payloads.
+    InspectV41Shard {
+        /// Path to a safetensors shard.
+        shard: PathBuf,
+    },
 }
 
 /// Runs the shared CLI, preserving the invoked executable name in help output.
@@ -636,6 +641,7 @@ pub fn run() -> ExitCode {
         Command::InspectQwen { config } => inspect_qwen(&config),
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
+        Command::InspectV41Shard { shard } => inspect_v41_shard(&shard),
         #[cfg(feature = "metal")]
         Command::SmokeQwenMetal => smoke_qwen_metal(),
         #[cfg(feature = "metal")]
@@ -1096,6 +1102,63 @@ fn inspect_v41_index(index: &PathBuf) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+    }
+}
+
+fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
+    let file_bytes = match fs::metadata(shard) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            eprintln!("could not stat {}: {error}", shard.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut file = match fs::File::open(shard) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("could not open {}: {error}", shard.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut prefix = [0_u8; 8];
+    if let Err(error) = file.read_exact(&mut prefix) {
+        eprintln!("could not read safetensors prefix: {error}");
+        return ExitCode::FAILURE;
+    }
+    let header_bytes = u64::from_le_bytes(prefix);
+    let header_len = match usize::try_from(header_bytes) {
+        Ok(length) if length <= 100 * 1024 * 1024 => length,
+        _ => {
+            eprintln!("safetensors header exceeds the bounded 100 MiB inspection limit");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut prefixed_header = Vec::with_capacity(8 + header_len);
+    prefixed_header.extend_from_slice(&prefix);
+    prefixed_header.resize(8 + header_len, 0);
+    if let Err(error) = file.read_exact(&mut prefixed_header[8..]) {
+        eprintln!("could not read safetensors header: {error}");
+        return ExitCode::FAILURE;
+    }
+    match deepseek::V41SafetensorsHeader::parse_prefixed_header(&prefixed_header, file_bytes) {
+        Ok(header) => {
+            println!("DeepSeek safetensors shard header");
+            println!("file bytes: {file_bytes}");
+            println!("tensors: {}", header.tensors().len());
+            println!(
+                "embedding present: {}",
+                header.tensor("model.embed_tokens").is_some()
+            );
+            println!("scope: header validation only; tensor payloads were not read");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!(
+                "{} is not a supported safetensors shard: {error}",
+                shard.display()
+            );
+            ExitCode::FAILURE
+        }
     }
 }
 
