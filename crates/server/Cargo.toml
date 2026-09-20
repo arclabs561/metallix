@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib", "dep:tiny_http", "dep:jsonschema", "dep:rustix"]
+metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib", "dep:httparse", "dep:jsonschema", "dep:rustix"]
 structured-output = ["dep:engine", "engine/structured-output"]
 
 [dependencies]
@@ -32,7 +32,7 @@ rand_core = { workspace = true, optional = true }
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 minijinja = { version = "=2.24.0", features = ["json", "fuel"], optional = true }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"], optional = true }
-tiny_http = { version = "=0.12.0", optional = true }
+httparse = { version = "=1.10.1", optional = true }
 jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 rustix = { version = "=1.1.4", features = ["fs"], optional = true }
 

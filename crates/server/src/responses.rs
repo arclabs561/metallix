@@ -2,8 +2,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::{Read, Write},
-    net::SocketAddr,
+    io::{BufWriter, Write},
+    net::{SocketAddr, TcpListener},
     path::Path,
     process::ExitCode,
 };
@@ -17,9 +17,8 @@ use crate::{
         ChatFinishReason, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
     },
     chat_tools,
+    http_transport::{Connection, TransportLimits},
 };
-
-const MAX_BODY: u64 = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Request {
@@ -94,6 +93,7 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
     }
     let mut messages = Vec::new();
     let mut pending_calls = HashMap::new();
+    let mut seen_call_ids = HashSet::new();
     if let Some(instructions) = &request.instructions {
         messages.push(message(ChatRole::System, instructions.clone()));
     }
@@ -130,19 +130,15 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
                 let call_id = item["call_id"]
                     .as_str()
                     .ok_or("function requires call_id")?;
-                if call_id.is_empty() || pending_calls.insert(call_id, name).is_some() {
+                if call_id.is_empty() || !seen_call_ids.insert(call_id) {
                     return Err("function call IDs must be nonempty and unique".into());
                 }
+                pending_calls.insert(call_id, name);
                 call.tool_calls.push(ChatToolCall {
                     name: name.into(),
                     arguments,
                 });
-                call.tool_call_id = Some(
-                    item["call_id"]
-                        .as_str()
-                        .ok_or("function requires call_id")?
-                        .into(),
-                );
+                call.tool_call_id = Some(call_id.into());
                 messages.push(call);
             }
             "function_call_output" => {
@@ -186,14 +182,26 @@ fn tools(request: &Request) -> Result<Vec<Value>, String> {
     }).collect()
 }
 
-fn json_response(request: tiny_http::Request, status: u16, value: &Value) {
-    let response = tiny_http::Response::from_string(value.to_string())
-        .with_status_code(status)
-        .with_header(
-            tiny_http::Header::from_bytes("Content-Type", "application/json")
-                .expect("static header"),
-        );
-    let _ = request.respond(response);
+fn json_response(mut connection: Connection, status: u16, value: &Value) {
+    connection.begin_response();
+    let mut writer = BufWriter::new(connection);
+    let body = value.to_string();
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        413 => "Content Too Large",
+        417 => "Expectation Failed",
+        431 => "Request Header Fields Too Large",
+        _ => "Error",
+    };
+    let _ = write!(
+        writer,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = writer.flush();
 }
 
 fn event(writer: &mut dyn Write, sequence: &mut u64, mut value: Value) -> Result<(), String> {
@@ -234,20 +242,33 @@ fn serve_inner(
         return Err("this experimental server binds only to loopback".into());
     }
     let mut session = ChatSession::load(model, context_tokens)?;
-    let server = tiny_http::Server::http(address).map_err(|e| e.to_string())?;
+    let server = TcpListener::bind(address).map_err(|e| e.to_string())?;
     eprintln!(
         "mx listening on http://{address}; model={model_id}; single request; {context_tokens} total tokens; load_ms={:.2}",
         session.load_ms()
     );
-    for (index, mut request) in server.incoming_requests().enumerate() {
-        match (request.method().as_str(), request.url()) {
+    for (index, socket) in server.incoming().enumerate() {
+        let socket = socket.map_err(|error| error.to_string())?;
+        let mut connection = Connection::accept(socket, TransportLimits::default());
+        let request = match connection.read_request() {
+            Ok(request) => request,
+            Err(error) => {
+                json_response(
+                    connection,
+                    error.status,
+                    &json!({"error":{"message":error.message}}),
+                );
+                continue;
+            }
+        };
+        match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
-                json_response(request, 200, &json!({"status":"ready"}));
+                json_response(connection, 200, &json!({"status":"ready"}));
                 continue;
             }
             ("GET", "/v1/models") => {
                 json_response(
-                    request,
+                    connection,
                     200,
                     &json!({"object":"list","data":[{"id":model_id,"object":"model","owned_by":"local"}]}),
                 );
@@ -256,38 +277,25 @@ fn serve_inner(
             ("POST", "/v1/responses") => {}
             _ => {
                 json_response(
-                    request,
+                    connection,
                     404,
                     &json!({"error":{"message":"unknown endpoint"}}),
                 );
                 continue;
             }
         }
-        if request.body_length().is_none_or(|n| n as u64 > MAX_BODY) {
-            json_response(
-                request,
-                413,
-                &json!({"error":{"message":"Content-Length required, maximum 1 MiB"}}),
-            );
-            continue;
-        }
-        let mut body = Vec::new();
-        let parsed = request
-            .as_reader()
-            .take(MAX_BODY + 1)
-            .read_to_end(&mut body)
-            .map_err(|e| e.to_string())
-            .and_then(|_| serde_json::from_slice::<Request>(&body).map_err(|e| e.to_string()));
+        let parsed =
+            serde_json::from_slice::<Request>(&request.body).map_err(|error| error.to_string());
         let parsed = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
-                json_response(request, 400, &json!({"error":{"message":error}}));
+                json_response(connection, 400, &json!({"error":{"message":error}}));
                 continue;
             }
         };
         if parsed.model != model_id {
             json_response(
-                request,
+                connection,
                 404,
                 &json!({"error":{"message":"model is not loaded"}}),
             );
@@ -298,12 +306,12 @@ fn serve_inner(
         let (messages, tools) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                json_response(request, 400, &json!({"error":{"message":error}}));
+                json_response(connection, 400, &json!({"error":{"message":error}}));
                 continue;
             }
         };
         let id = format!("resp_{}_{}", std::process::id(), index);
-        if let Err(error) = respond(request, &parsed, &messages, &tools, &mut session, &id) {
+        if let Err(error) = respond(connection, &parsed, &messages, &tools, &mut session, &id) {
             eprintln!("response failed: {error}");
         }
     }
@@ -315,7 +323,7 @@ fn serve_inner(
     reason = "one ordered response event lifecycle"
 )]
 fn respond(
-    request: tiny_http::Request,
+    request: Connection,
     parsed: &Request,
     messages: &[ChatMessage],
     tools: &[Value],
@@ -324,7 +332,8 @@ fn respond(
 ) -> Result<(), String> {
     let mut sequence = 0;
     let mut writer = if parsed.stream {
-        let mut writer = request.into_writer();
+        let mut writer = BufWriter::new(request);
+        writer.get_mut().begin_response();
         write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
         event(
             &mut writer,
@@ -458,7 +467,7 @@ fn respond(
 }
 
 fn respond_json(
-    request: tiny_http::Request,
+    request: Connection,
     parsed: &Request,
     messages: &[ChatMessage],
     tools: &[Value],
@@ -516,6 +525,71 @@ fn response_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn function_history_rejects_reused_completed_call_ids(
+            id in "[a-zA-Z0-9_]{1,24}",
+            output in any::<String>(),
+        ) {
+            let call = json!({"type":"function_call","name":"read_file","call_id":id,"arguments":"{}"});
+            let result = json!({"type":"function_call_output","call_id":id,"output":output});
+            let request: Request = serde_json::from_value(json!({"model":"control","input":[call.clone(),result.clone(),call,result]})).unwrap();
+            prop_assert!(messages(&request).is_err());
+        }
+
+        #[test]
+        fn function_results_follow_call_identity_not_completion_order(
+            outputs in prop::collection::vec(any::<String>(), 1..=8),
+        ) {
+            let mut items: Vec<_> = (0..outputs.len()).map(|index| {
+                json!({"type":"function_call","name":format!("tool_{index}"),"call_id":format!("call_{index}"),"arguments":"{}"})
+            }).collect();
+            for (index, output) in outputs.iter().enumerate().rev() {
+                items.push(json!({"type":"function_call_output","call_id":format!("call_{index}"),"output":output}));
+            }
+            let request: Request = serde_json::from_value(json!({"model":"control","input":items})).unwrap();
+            let history = messages(&request).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(history.len(), 2 * outputs.len());
+            for (offset, output) in history[outputs.len()..].iter().enumerate() {
+                let index = outputs.len() - 1 - offset;
+                let expected_name = format!("tool_{index}");
+                let expected_id = format!("call_{index}");
+                prop_assert_eq!(output.name.as_deref(), Some(expected_name.as_str()));
+                prop_assert_eq!(&output.content, &outputs[index]);
+                prop_assert_eq!(output.tool_call_id.as_deref(), Some(expected_id.as_str()));
+            }
+        }
+
+        #[test]
+        fn sse_payloads_cannot_inject_events_or_change_sequence(
+            deltas in prop::collection::vec(any::<String>(), 0..24),
+        ) {
+            let mut wire = Vec::new();
+            let mut sequence = 0;
+            for delta in &deltas {
+                event(&mut wire, &mut sequence, json!({"type":"response.output_text.delta","delta":delta})).unwrap();
+            }
+            event(&mut wire, &mut sequence, json!({"type":"response.completed"})).unwrap();
+            let wire = String::from_utf8(wire).unwrap();
+            let frames: Vec<_> = wire.split("\n\n").filter(|frame| !frame.is_empty()).collect();
+            prop_assert_eq!(frames.len(), deltas.len() + 1);
+            for (index, frame) in frames.iter().enumerate() {
+                let lines: Vec<_> = frame.lines().collect();
+                prop_assert_eq!(lines.len(), 2);
+                let value: Value = serde_json::from_str(lines[1].strip_prefix("data: ").unwrap()).unwrap();
+                prop_assert_eq!(value["sequence_number"].as_u64(), Some(index as u64));
+                if index < deltas.len() {
+                    prop_assert_eq!(value["delta"].as_str(), Some(deltas[index].as_str()));
+                } else {
+                    prop_assert_eq!(value["type"].as_str(), Some("response.completed"));
+                }
+            }
+        }
+    }
 
     #[test]
     fn reconstructs_function_round_trip_and_rejects_nontext() {

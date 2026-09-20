@@ -7,6 +7,8 @@ mod chat_generation;
 #[cfg(feature = "metal")]
 mod chat_tools;
 #[cfg(feature = "metal")]
+mod http_transport;
+#[cfg(feature = "metal")]
 mod responses;
 
 #[cfg(feature = "metal")]
