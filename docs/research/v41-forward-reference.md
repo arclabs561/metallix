@@ -717,10 +717,33 @@ remain as diagnostics. The Engram continuation above extends that boundary to
 the pre-Engram residual and incoming coefficients; earlier blocks and
 full-model generation remain unfinished.
 
-The next bounded seam is layer two's FFN tail: `FfnSublayerReference` can
-produce both the pre-Engram3 residual and the incoming HC coefficients from
-a new post-attention capture. Its source output matches the observed Engram3
-input at all three starts. Full layer-two attention is a wider step: layer two
-uses ratio-two compression but consumes layer one's shared KV publication,
-so it requires the earlier layer-one owner/compressor/index chain. The tail
-fixture and connection remain unimplemented.
+### Layer-two FFN through final logits
+
+`fixtures/deepseek-v41/layer2-ffn-reference.json` captures the post-attention
+residual, attention pre-mix, FFN parameters, intermediates, and both outgoing
+boundaries. Its pinned SHA-256 is
+`d92f3c1578baa205d6100febc100e62b9a26017622a32d53e484bf4ed3e62786`.
+The exporter checks exact storage continuity into Engram3 and the layer-three
+incoming HC pre-mix for starts 0, 5, and 6.
+
+`native_layer_two_ffn_engram_through_final_suffix_matches_source_logits` now
+computes those states with `FfnSublayerReference`. The native BF16 residual
+feeds the native Engram lookup, WKV projection, and gate. Native FP32 pre-mix
+coefficients feed layer-three HC collapse and RMSNorm; captured values are
+used only for comparison. Per-token projection and coefficient intervals
+bound native and source rounding without calibrating to observed differences.
+The resulting BF16 attention input must match exactly before the existing
+owner-attention, layer-three/four FFN, and final-logit checks run. Mutating the
+layer-two residual or zeroing its pre-mix fails the corresponding handoff.
+
+The source exporter gate is `uv run scripts/test_v41_layer2_ffn_fixture.py`;
+the connected Rust gate remains `cargo test -p deepseek --test forward_moe`.
+The earlier Engram fixture stays byte-for-byte unchanged. Its regeneration
+test permits only additive observer/capture provenance changes while checking
+the preserved numerical payload and upstream source identity.
+
+Layer-two post-attention state still comes from capture. Full layer-two
+attention requires the earlier layer-one owner/compressor/index chain:
+layer two uses ratio-two compression and consumes layer one's shared KV
+publication. That dependency and the remaining earlier blocks precede
+full-model generation.

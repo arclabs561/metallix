@@ -108,6 +108,15 @@ fn fixture() -> Value {
 
 /// Produces exact gated layer-three block entries keyed by source start position.
 pub(super) fn native_layer_three_block_entries() -> Vec<(usize, Vec<u16>)> {
+    native_layer_three_block_entries_from_streams(None)
+}
+
+/// Recomputes the Engram gate from native upstream residuals.  The supplied
+/// streams must agree bit-for-bit with the captured boundary before the gate
+/// runs, so a later fixture cannot silently replace a layer-two result.
+pub(super) fn native_layer_three_block_entries_from_streams(
+    supplied_streams: Option<&[(usize, Vec<u16>)]>,
+) -> Vec<(usize, Vec<u16>)> {
     let root = fixture();
     let model = field(&root, "model");
     let engram = field(&root, "engram");
@@ -151,9 +160,13 @@ pub(super) fn native_layer_three_block_entries() -> Vec<(usize, Vec<u16>)> {
         .into_iter()
         .map(f32_from_bf16)
         .collect();
+    if let Some(streams) = supplied_streams {
+        assert_eq!(streams.len(), cases.len(), "native layer-two stream count");
+    }
     cases
         .iter()
-        .map(|case| {
+        .enumerate()
+        .map(|(case_index, case)| {
             let positions = shape(field(case, "input_ids"))[1];
             let start = usize_field(case, "start_pos");
             let tokens: Vec<_> = i64s(field(case, "input_ids"))
@@ -171,21 +184,7 @@ pub(super) fn native_layer_three_block_entries() -> Vec<(usize, Vec<u16>)> {
             engram_embedding_bf16_reference(&ids, &embed_codes, &embed_scales, embed, &mut looked)
                 .unwrap();
             assert_eq!(looked, bf16(field(case, "embedding")));
-            let mut wrong_ids = ids.clone();
-            wrong_ids[0] = -1;
-            let mut wrong_lookup = vec![0; looked.len()];
-            engram_embedding_bf16_reference(
-                &wrong_ids,
-                &embed_codes,
-                &embed_scales,
-                embed,
-                &mut wrong_lookup,
-            )
-            .unwrap();
-            assert_ne!(
-                wrong_lookup, looked,
-                "masked hash must change native embedding"
-            );
+            check_masked_lookup(&ids, &embed_codes, &embed_scales, embed, &looked);
             let wkv = project_wkv(
                 &looked,
                 positions,
@@ -195,18 +194,52 @@ pub(super) fn native_layer_three_block_entries() -> Vec<(usize, Vec<u16>)> {
                 &wkv_scales,
             );
             assert_eq!(wkv, bf16(field(case, "wkv_output")));
-            let mut key = Vec::new();
-            let mut value = Vec::new();
-            for row in wkv.chunks_exact(usize_field(model, "wkv_width")) {
-                key.extend_from_slice(&row[..256]);
-                value.extend_from_slice(&row[256..]);
-            }
-            assert_eq!(key, bf16(field(case, "key")));
-            assert_eq!(value, bf16(field(case, "value")));
-            let output = gate_output(case, model, &key, &value, &q, &k);
+            let (key, value) = split_wkv(case, model, &wkv);
+            let captured_stream = bf16(field(case, "stream"));
+            let stream = if let Some(streams) = supplied_streams {
+                let (supplied_start, supplied) = &streams[case_index];
+                assert_eq!(*supplied_start, start, "native layer-two stream start");
+                assert_eq!(
+                    supplied, &captured_stream,
+                    "native layer-two FFN residual at Engram boundary"
+                );
+                supplied.as_slice()
+            } else {
+                captured_stream.as_slice()
+            };
+            let output = gate_output(case, model, stream, &key, &value, &q, &k);
             (start, output)
         })
         .collect()
+}
+
+fn split_wkv(case: &Value, model: &Value, wkv: &[u16]) -> (Vec<u16>, Vec<u16>) {
+    let mut key = Vec::new();
+    let mut value = Vec::new();
+    for row in wkv.chunks_exact(usize_field(model, "wkv_width")) {
+        key.extend_from_slice(&row[..256]);
+        value.extend_from_slice(&row[256..]);
+    }
+    assert_eq!(key, bf16(field(case, "key")));
+    assert_eq!(value, bf16(field(case, "value")));
+    (key, value)
+}
+
+fn check_masked_lookup(
+    ids: &[i64],
+    codes: &[u8],
+    scales: &[u8],
+    layout: EngramEmbeddingLayout,
+    expected: &[u16],
+) {
+    let mut wrong_ids = ids.to_vec();
+    wrong_ids[0] = -1;
+    let mut wrong_lookup = vec![0; expected.len()];
+    engram_embedding_bf16_reference(&wrong_ids, codes, scales, layout, &mut wrong_lookup).unwrap();
+    assert_ne!(
+        wrong_lookup, expected,
+        "masked hash must change native embedding"
+    );
 }
 
 fn project_wkv(
@@ -247,17 +280,17 @@ fn project_wkv(
 fn gate_output(
     case: &Value,
     model: &Value,
+    stream: &[u16],
     key: &[u16],
     value: &[u16],
     q: &[f32],
     k: &[f32],
 ) -> Vec<u16> {
     let positions = shape(field(case, "input_ids"))[1];
-    let stream = bf16(field(case, "stream"));
     let mut output = vec![0; stream.len()];
     engram_residual_gate_bf16_reference(
         EngramGateInputs {
-            stream: &stream,
+            stream,
             key,
             value,
             q_weight: q,

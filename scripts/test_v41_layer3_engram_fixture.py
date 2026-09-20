@@ -42,8 +42,32 @@ class LayerThreeEngramFixtureTest(unittest.TestCase):
         cls.receipt = cls.runner.run_capture()
         cls.fixture = cls.exporter.engram_fixture(cls.receipt)
 
-    def test_committed_fixture_matches_current_source_capture(self) -> None:
-        self.assertEqual(json.loads(FIXTURE.read_text()), self.fixture)
+    def test_committed_fixture_matches_current_source_values(self) -> None:
+        """The historical fixture pins values, not later additive hook hashes."""
+        committed = json.loads(FIXTURE.read_text())
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        stable = (
+            "revision",
+            "model_sha256",
+            "engram_sha256",
+            "kernel_source_sha256",
+            "cpu_backend_sha256",
+            "loader_sha256",
+            "runner_sha256",
+            "storage_byteorder",
+        )
+        self.assertEqual(
+            {key: committed["source"][key] for key in stable},
+            {key: self.fixture["source"][key] for key in stable},
+        )
+        # Layer-two instrumentation intentionally changes both these receipt
+        # identities while preserving the historical Engram numerical oracle.
+        for key in ("forward_observers_sha256", "complete_capture_sha256"):
+            self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")
+            self.assertNotEqual(committed["source"][key], self.fixture["source"][key])
 
     def test_wkv_split_and_block_entry_are_exact(self) -> None:
         for case in self.fixture["cases"]:
