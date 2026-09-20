@@ -37,6 +37,7 @@ mod v41_rotary;
 use clap::{Parser, Subcommand};
 use deepseek::{
     V41TextContract,
+    checkpoint::mlx::read_affine_row_from_shard,
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
 use qwen::{
@@ -462,6 +463,14 @@ enum Command {
         /// Path to a safetensors shard.
         shard: PathBuf,
     },
+    /// Decode one bounded MLX DeepSeek embedding row from a real shard.
+    InspectV41EmbeddingRow {
+        /// Path to the embedding shard.
+        shard: PathBuf,
+        /// Embedding row/token ID.
+        #[arg(long, default_value_t = 0)]
+        row: usize,
+    },
 }
 
 /// Runs the shared CLI, preserving the invoked executable name in help output.
@@ -642,6 +651,7 @@ pub fn run() -> ExitCode {
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
         Command::InspectV41Shard { shard } => inspect_v41_shard(&shard),
+        Command::InspectV41EmbeddingRow { shard, row } => inspect_v41_embedding_row(&shard, row),
         #[cfg(feature = "metal")]
         Command::SmokeQwenMetal => smoke_qwen_metal(),
         #[cfg(feature = "metal")]
@@ -1157,6 +1167,79 @@ fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
                 "{} is not a supported safetensors shard: {error}",
                 shard.display()
             );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn inspect_v41_embedding_row(shard: &PathBuf, row: usize) -> ExitCode {
+    let file_bytes = match fs::metadata(shard) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            eprintln!("could not stat {}: {error}", shard.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut file = match fs::File::open(shard) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("could not open {}: {error}", shard.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut prefix = [0_u8; 8];
+    if file.read_exact(&mut prefix).is_err() {
+        eprintln!("could not read safetensors prefix");
+        return ExitCode::FAILURE;
+    }
+    let header_bytes = u64::from_le_bytes(prefix);
+    let Ok(header_len) = usize::try_from(header_bytes) else {
+        eprintln!("safetensors header length overflows usize");
+        return ExitCode::FAILURE;
+    };
+    if header_len > 100 * 1024 * 1024 {
+        eprintln!("safetensors header exceeds the bounded 100 MiB inspection limit");
+        return ExitCode::FAILURE;
+    }
+    let mut prefixed_header = vec![0_u8; 8 + header_len];
+    prefixed_header[..8].copy_from_slice(&prefix);
+    if file.read_exact(&mut prefixed_header[8..]).is_err() {
+        eprintln!("could not read safetensors header");
+        return ExitCode::FAILURE;
+    }
+    let header =
+        match deepseek::V41SafetensorsHeader::parse_prefixed_header(&prefixed_header, file_bytes) {
+            Ok(header) => header,
+            Err(error) => {
+                eprintln!("unsupported safetensors shard: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+    match read_affine_row_from_shard(
+        shard,
+        &header,
+        "model.embed_tokens.weight",
+        "model.embed_tokens.scales",
+        "model.embed_tokens.biases",
+        row,
+        4096,
+        8,
+        64,
+    ) {
+        Ok(values) => {
+            let checksum = values.iter().fold(0_u64, |hash, value| {
+                hash.wrapping_mul(1_099_511_628_211)
+                    .wrapping_add(u64::from(value.to_bits()))
+            });
+            println!("DeepSeek MLX embedding row");
+            println!("row: {row}");
+            println!("width: {}", values.len());
+            println!("fp32_checksum: {checksum:016x}");
+            println!("scope: one affine row decoded; no model execution");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("embedding row decode failed: {error}");
             ExitCode::FAILURE
         }
     }

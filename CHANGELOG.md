@@ -14,6 +14,8 @@ published release; reference operators do not imply full-model support.
   header with bounded I/O before any tensor payload is read.
 - Added the first native MLX affine-row decoder for packed 8-bit groups with
   BF16 scales and biases, including malformed-layout and non-finite guards.
+- Added `mx inspect-v41-embedding-row`, which decodes a real 4096-wide
+  DeepSeek MLX embedding row from a shard and emits a deterministic checksum.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
   Codex profile path, including the direct API smoke result and the measured
   full-Codex prefill limitation.

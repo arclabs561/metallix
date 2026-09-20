@@ -63,3 +63,7 @@ The DeepSeek crate now contains a bounded CPU decoder for the local embedding
 layout: packed 8-bit codes with BF16 scale/bias groups of 64. Its tests cover
 packing, shape rejection, and finite decoded values. It is a tensor primitive,
 not yet a full checkpoint loader or model executor.
+
+The native row gate now decodes the real token-0 embedding from shard two:
+width `4096`, checksum `9aa497cb4f7c9e00`. This is a bounded file-range read
+through Metallix's own header and affine decoder, with no full checkpoint load.
