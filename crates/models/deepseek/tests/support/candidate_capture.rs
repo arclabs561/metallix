@@ -16,11 +16,10 @@ use deepseek::{
     attention::layer::Fp8Projection,
     csa2::{CandidateError, candidate_mask},
     indexer::{
-        bf16::index_scores_bf16_reference,
         cache::IndexKeyPublicationId,
         query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
-            prepare_candidate_query, prepare_index_query,
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
+            IndexQueryWeights, prepare_index_query, prepare_scored_query,
         },
         selection::{CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates},
     },
@@ -349,7 +348,7 @@ pub(super) fn generated_candidates(
     let wq_a_scales = parameters["layers.3.attn.wq_a.scale"].fp8();
     let q_norm = parameters["layers.3.attn.q_norm.weight"].bf16();
     let positions = case.inputs.x.shape[1];
-    let prepared = prepare_candidate_query(
+    let prepared = prepare_scored_query(
         &case.inputs.x.bf16(),
         &call_frequencies(&fixture, start, positions),
         CandidateQueryWeights {
@@ -366,11 +365,21 @@ pub(super) fn generated_candidates(
         },
         CandidateQueryLayout::new(index_layout(&fixture.model), fixture.model.norm_epsilon)
             .expect("bounded candidate QR layout"),
+        IndexKeyView::new(native_keys, nonzero(fixture.model.index_head_dimension))
+            .expect("bounded native index-key view"),
     )
-    .expect("bounded candidate index query");
-    assert_eq!(prepared.wq_a, case.wq_a_output.bf16(), "start {start} wq_a");
-    assert_eq!(prepared.qr, case.q_norm_output.bf16(), "start {start} QR");
-    let query = prepared.index;
+    .expect("bounded candidate query and score");
+    assert_eq!(
+        prepared.query.wq_a,
+        case.wq_a_output.bf16(),
+        "start {start} wq_a"
+    );
+    assert_eq!(
+        prepared.query.qr,
+        case.q_norm_output.bf16(),
+        "start {start} QR"
+    );
+    let query = &prepared.query.index;
     assert_eq!(
         query.query_post_fp4,
         case.operations.q_after_rope_fp4.bf16(),
@@ -387,49 +396,28 @@ pub(super) fn generated_candidates(
         "start {start} scaled weights"
     );
 
-    let keys = native_keys;
     let key_count = case.inputs.shared_index_k_prefix.shape[1];
-    let heads = fixture.model.index_heads;
-    let dimension = fixture.model.index_head_dimension;
-    let mut dots = Vec::new();
-    let mut rectified = Vec::new();
-    let mut weighted = Vec::new();
-    let mut scores = Vec::new();
-    for position in 0..positions {
-        let query_start = position * heads * dimension;
-        let weight_start = position * heads;
-        let diagnostic = index_scores_bf16_reference(
-            &query.query_post_fp4[query_start..query_start + heads * dimension],
-            keys,
-            &query.scaled_head_weights[weight_start..weight_start + heads],
-            nonzero(dimension),
-        )
-        .expect("bounded candidate BF16 scorer");
-        dots.extend(diagnostic.dot_products);
-        rectified.extend(diagnostic.rectified);
-        weighted.extend(diagnostic.weighted);
-        scores.extend(diagnostic.scores);
-    }
     assert_eq!(
-        dots,
+        prepared.dot_products,
         case.operations.scores_einsum.bf16(),
         "start {start} dot scores"
     );
     assert_eq!(
-        rectified,
+        prepared.rectified,
         case.operations.scores_after_relu.bf16(),
         "start {start} relu scores"
     );
     assert_eq!(
-        weighted,
+        prepared.weighted,
         case.operations.scores_weighted_per_head.bf16(),
         "start {start} weighted scores"
     );
     assert_eq!(
-        scores,
+        prepared.scores,
         case.operations.scores_after_head_sum.bf16(),
         "start {start} head sum scores"
     );
+    let scores = prepared.scores;
     assert_eq!(scores.len(), positions * key_count, "score geometry");
     let candidates = produce_candidates(
         &scores,

@@ -514,9 +514,18 @@ The joined source test uses these production stages. Its isolated mask-bit
 perturbation control keeps test-local masking to change a single bit without
 providing a public constructor for arbitrary candidate results.
 
-Scoring orchestration remains in the test harness. The remaining runtime work
-joins prepared queries, owner key prefixes and these selection stages into
-the model runner, followed by whole-block transaction handling.
+`prepare_scored_query` now composes native query preparation and BF16 scoring
+for a single batch. Its `IndexKeyView` validates finite, bounded key storage and
+head width; the distinct type marks the caller's index-key intent but cannot
+authenticate a quantization format from reconstructed BF16 values alone.
+The adapter derives head geometry from the validated query layout and checks
+the aggregate position-by-head-by-key-by-dimension scoring workload before
+query preparation. This scoring cap does not replace projection-specific
+validation or claim to bound all model work. Both producer and consumer source
+tests use the adapter and retain exact intermediate comparisons.
+
+The remaining runtime work joins these stateless operators with owner-issued
+prefix provenance and whole-block transaction handling in the model runner.
 
 The earlier consumer-only observer could not simply be pointed at layer three:
 

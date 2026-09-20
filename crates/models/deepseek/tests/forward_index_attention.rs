@@ -21,14 +21,13 @@ use attention_capture::{
 use deepseek::{
     attention::layer::{Fp8Projection, LayerAttentionError, LayerAttentionState},
     indexer::{
-        bf16::index_scores_bf16_reference,
         cache::IndexKeyPublicationId,
         compressed_kv::{CompressedKvLayout, prepare_compressed_kv},
         key::{IndexKeyLayout, IndexKeyWeights},
         owner::{RatioOneCompressedOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
         query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
-            prepare_candidate_query,
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
+            IndexQueryWeights, prepare_scored_query,
         },
         selection::{SelectionCall, SelectionGeometry, select_from_candidates},
     },
@@ -274,7 +273,6 @@ fn generated_indices(
         "source indexer X is attention input at start {start}"
     );
     let positions = shape(field(inputs, "x"))[1];
-    let heads = usize_field(model, "index_n_heads");
     let head_dimension = usize_field(model, "index_head_dim");
     let parameters = field(root, "encoded_parameters");
     let projection_codes = fp8(field(parameters, "layers.4.attn.wq_a.weight"));
@@ -282,7 +280,7 @@ fn generated_indices(
     let norm = bf16(field(parameters, "layers.4.attn.q_norm.weight"));
     let epsilon: f32 = serde_json::from_value(field(model, "norm_eps").clone())
         .expect("source normalization epsilon");
-    let prepared = prepare_candidate_query(
+    let scored = prepare_scored_query(
         &x,
         &source_frequencies(
             root,
@@ -299,8 +297,10 @@ fn generated_indices(
             index: weights,
         },
         CandidateQueryLayout::new(layout, epsilon).expect("consumer QR layout"),
+        IndexKeyView::new(keys, nonzero(head_dimension)).expect("consumer index keys"),
     )
     .expect("bounded production index query");
+    let prepared = scored.query;
     assert_eq!(
         prepared.wq_a,
         attention_case.wq_a_output.bf16(),
@@ -319,19 +319,22 @@ fn generated_indices(
         "native owner prefix"
     );
     let keys_per_position = shape(field(inputs, "shared_index_k_prefix"))[1];
-    let mut score_bits = Vec::with_capacity(positions * keys_per_position);
-    for position in 0..positions {
-        let query_start = position * heads * head_dimension;
-        let weights_start = position * heads;
-        let scores = index_scores_bf16_reference(
-            &query.query_post_fp4[query_start..query_start + heads * head_dimension],
-            keys,
-            &query.scaled_head_weights[weights_start..weights_start + heads],
-            nonzero(head_dimension),
-        )
-        .expect("bounded production BF16 score chain");
-        score_bits.extend(scores.scores);
-    }
+    assert_eq!(
+        scored.dot_products,
+        bf16(field(operations, "scores_einsum")),
+        "consumer dots"
+    );
+    assert_eq!(
+        scored.rectified,
+        bf16(field(operations, "scores_after_relu")),
+        "consumer rectified scores"
+    );
+    assert_eq!(
+        scored.weighted,
+        bf16(field(operations, "scores_weighted_per_head")),
+        "consumer weighted scores"
+    );
+    let score_bits = scored.scores;
     assert_eq!(
         score_bits,
         bf16(field(operations, "scores_after_head_sum")),

@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- A single-batch DeepSeek scored-query adapter composes query preparation and
+  BF16 score reduction over a distinct borrowed index-key view. It checks the
+  aggregate scoring workload before preparing queries, rather than relying on
+  per-row limits. Source tests now use this production orchestration for both
+  producer and consumer scores.
 - A stateless DeepSeek selection adapter now applies causal masks, produces
   opaque candidate results and selects indices from BF16 scores. Validated
   geometry and publication/batch metadata prevent accidental cross-call reuse.

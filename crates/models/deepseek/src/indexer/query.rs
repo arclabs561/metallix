@@ -1,9 +1,11 @@
 //! Bounded query and signed-head-weight preparation for V4.1's indexer.
 //!
-//! This is the source-shaped prefix of `Indexer.forward`: it stops after the
-//! query's FP4 reconstruction and the BF16 `weights_proj` scale boundary. It
-//! intentionally does not score keys, apply causal masks, select candidates,
-//! or own an index-key cache.
+//! [`prepare_index_query`] and [`prepare_candidate_query`] are the source-shaped
+//! prefix of `Indexer.forward`: they stop after the query's FP4 reconstruction
+//! and BF16 `weights_proj` scale boundary. [`prepare_scored_query`] composes
+//! those established stages with the existing bounded BF16 row scorer. None of
+//! these functions applies causal masks, selects candidates, or owns an
+//! index-key cache.
 
 use std::num::NonZeroUsize;
 
@@ -21,6 +23,11 @@ use crate::{
         fp8_linear_runtime_f32, quantize_bf16_activations_e4m3fn, requantize_bf16_activations_e2m1,
     },
     rotate_tail,
+};
+
+use super::{
+    MAX_INDEX_REFERENCE_TERMS,
+    bf16::{Bf16IndexScoreError, index_scores_bf16_reference},
 };
 
 const MAX_INDEX_QUERY_ELEMENTS: usize = 1 << 20;
@@ -185,6 +192,72 @@ pub struct CandidateQueryDiagnostic {
     pub index: IndexQueryDiagnostic,
 }
 
+/// A validated numerical view of reconstructed owner-layer index keys.
+///
+/// Values are BF16 row-major `[key, head_dimension]`. This type only proves
+/// that this call received finite, bounded numerical rows. It cannot establish
+/// owner-cache or publication provenance, index-specific quantization or
+/// reconstruction semantics, or interchangeability with a KV payload; those
+/// are caller-owned boundaries.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexKeyView<'a> {
+    values: &'a [u16],
+    head_dimension: NonZeroUsize,
+    key_count: NonZeroUsize,
+}
+
+impl<'a> IndexKeyView<'a> {
+    /// Validates one bounded, finite BF16 key matrix.
+    pub fn new(values: &'a [u16], head_dimension: NonZeroUsize) -> Result<Self, ScoredQueryError> {
+        if values.is_empty() {
+            return Err(ScoredQueryError::EmptyKeys);
+        }
+        if values.len() > MAX_INDEX_QUERY_ELEMENTS {
+            return Err(ScoredQueryError::KeyElementLimit {
+                elements: values.len(),
+            });
+        }
+        let dimension = head_dimension.get();
+        if !values.len().is_multiple_of(dimension) {
+            return Err(ScoredQueryError::KeyShape {
+                actual: values.len(),
+                head_dimension: dimension,
+            });
+        }
+        let key_count =
+            NonZeroUsize::new(values.len() / dimension).ok_or(ScoredQueryError::EmptyKeys)?;
+        if let Some(position) = values
+            .iter()
+            .position(|&bits| !bf16_to_f32(bits).is_finite())
+        {
+            return Err(ScoredQueryError::NonFiniteKey { position });
+        }
+        Ok(Self {
+            values,
+            head_dimension,
+            key_count,
+        })
+    }
+}
+
+/// The prepared query and source-visible score stages for one batch.
+///
+/// `dot_products`, `rectified`, and `weighted` are row-major
+/// `[position, head, key]`; `scores` is `[position, key]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoredQueryDiagnostic {
+    /// Model-local QR and index-query preparation boundaries.
+    pub query: CandidateQueryDiagnostic,
+    /// BF16 query/key dot products before rectification.
+    pub dot_products: Vec<u16>,
+    /// BF16 rectified dot products.
+    pub rectified: Vec<u16>,
+    /// BF16 signed per-head score products.
+    pub weighted: Vec<u16>,
+    /// BF16 per-position scores after head reduction.
+    pub scores: Vec<u16>,
+}
+
 /// Invalid index-query geometry.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
@@ -257,6 +330,67 @@ pub enum CandidateQueryError {
     Index(#[from] IndexQueryError),
 }
 
+/// Rejected one-batch candidate-query scoring request.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ScoredQueryError {
+    /// This narrow adapter intentionally scores one explicit batch at a time.
+    #[error("scored index query requires exactly one batch, got {actual}")]
+    BatchCount { actual: usize },
+    /// The residual input was not a nonempty sequence of hidden rows.
+    #[error("scored index query x length {actual}; expected a nonempty multiple of {stride}")]
+    InputLength { actual: usize, stride: usize },
+    /// The residual input would exceed the bounded query diagnostic surface.
+    #[error("scored index query x has {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}")]
+    InputElementLimit { elements: usize },
+    /// No reconstructed key row was supplied.
+    #[error("scored index query requires at least one reconstructed key")]
+    EmptyKeys,
+    /// Reconstructed key storage did not contain complete key rows.
+    #[error("scored index key length {actual} is not divisible by head dimension {head_dimension}")]
+    KeyShape {
+        actual: usize,
+        head_dimension: usize,
+    },
+    /// Reconstructed key storage exceeded the explicit view bound.
+    #[error("scored index keys have {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}")]
+    KeyElementLimit { elements: usize },
+    /// A reconstructed key row contained NaN or infinity.
+    #[error("scored index key is nonfinite at position {position}")]
+    NonFiniteKey { position: usize },
+    /// The supplied key-row width differs from the source index-head width.
+    #[error(
+        "scored index key head dimension {actual} does not equal index head dimension {expected}"
+    )]
+    KeyHeadDimension { actual: usize, expected: usize },
+    /// Checked aggregate score shape arithmetic overflowed `usize`.
+    #[error("scored index query shape arithmetic overflowed for {field}")]
+    ShapeOverflow { field: &'static str },
+    /// The complete call's scalar BF16 score work exceeded its reference cap.
+    #[error("scored index query scalar score work exceeds {max_terms} terms")]
+    AggregateWorkloadTooLarge { max_terms: usize },
+    /// One source-visible score diagnostic matrix exceeded its explicit cap.
+    #[error(
+        "scored index query {field} has {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}"
+    )]
+    DiagnosticElementLimit {
+        field: &'static str,
+        elements: usize,
+    },
+    /// Candidate QR/query preparation rejected the preflighted request.
+    #[error(transparent)]
+    Candidate(#[from] CandidateQueryError),
+    /// One bounded BF16 score row rejected the preflighted request.
+    #[error(transparent)]
+    Score(#[from] Bf16IndexScoreError),
+    /// A bounded aggregate diagnostic buffer could not be reserved.
+    #[error("could not allocate {elements} BF16 scored index-query {field} elements")]
+    AllocationFailed {
+        field: &'static str,
+        elements: usize,
+    },
+}
+
 /// Derives QR from `x` and prepares the index-query precision boundaries.
 ///
 /// `x` is BF16 `[batch, position, hidden_dimension]`; `frequencies` is the
@@ -282,6 +416,134 @@ pub fn prepare_candidate_query(
         qr: attention.qr,
         index,
     })
+}
+
+/// Prepares and scores a source-shaped candidate query against reconstructed keys.
+///
+/// This is a one-batch numerical adapter. It validates aggregate *scoring* work
+/// before QR preparation, then reuses the existing source-shaped QR/index-query
+/// and BF16 scoring stages. Existing projection-work bounds remain those stages'
+/// own responsibility. It neither discovers key provenance nor mutates a cache,
+/// causal mask, or selection state.
+pub fn prepare_scored_query(
+    x: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: CandidateQueryWeights<'_>,
+    layout: CandidateQueryLayout,
+    keys: IndexKeyView<'_>,
+) -> Result<ScoredQueryDiagnostic, ScoredQueryError> {
+    let positions = validate_scored_request(x, layout, keys)?;
+    let query = prepare_candidate_query(x, frequencies, weights, layout)?;
+    let heads = layout.index.heads.get();
+    let query_width = checked_product(
+        &[heads, layout.index.head_dimension.get()],
+        "query row width",
+    )?;
+    let score_elements = positions * heads * keys.key_count.get();
+    let final_score_elements = positions * keys.key_count.get();
+    let mut dot_products = reserve_scored(score_elements, "dot-products")?;
+    let mut rectified = reserve_scored(score_elements, "rectified")?;
+    let mut weighted = reserve_scored(score_elements, "weighted")?;
+    let mut scores = reserve_scored(final_score_elements, "scores")?;
+    for position in 0..positions {
+        let query_start = position * query_width;
+        let weight_start = position * heads;
+        let score = index_scores_bf16_reference(
+            &query.index.query_post_fp4[query_start..query_start + query_width],
+            keys.values,
+            &query.index.scaled_head_weights[weight_start..weight_start + heads],
+            layout.index.head_dimension,
+        )?;
+        dot_products.extend(score.dot_products);
+        rectified.extend(score.rectified);
+        weighted.extend(score.weighted);
+        scores.extend(score.scores);
+    }
+    Ok(ScoredQueryDiagnostic {
+        query,
+        dot_products,
+        rectified,
+        weighted,
+        scores,
+    })
+}
+
+fn validate_scored_request(
+    x: &[u16],
+    layout: CandidateQueryLayout,
+    keys: IndexKeyView<'_>,
+) -> Result<usize, ScoredQueryError> {
+    if layout.index.batches.get() != 1 {
+        return Err(ScoredQueryError::BatchCount {
+            actual: layout.index.batches.get(),
+        });
+    }
+    let hidden = layout.index.hidden_dimension.get();
+    if x.is_empty() || !x.len().is_multiple_of(hidden) {
+        return Err(ScoredQueryError::InputLength {
+            actual: x.len(),
+            stride: hidden,
+        });
+    }
+    if x.len() > MAX_INDEX_QUERY_ELEMENTS {
+        return Err(ScoredQueryError::InputElementLimit { elements: x.len() });
+    }
+    if keys.head_dimension != layout.index.head_dimension {
+        return Err(ScoredQueryError::KeyHeadDimension {
+            actual: keys.head_dimension.get(),
+            expected: layout.index.head_dimension.get(),
+        });
+    }
+    let positions = x.len() / hidden;
+    let score_elements = checked_product(
+        &[positions, layout.index.heads.get(), keys.key_count.get()],
+        "score diagnostic matrix",
+    )?;
+    let final_score_elements = checked_product(
+        &[positions, keys.key_count.get()],
+        "final score diagnostic matrix",
+    )?;
+    for (field, elements) in [
+        ("dot-products", score_elements),
+        ("rectified", score_elements),
+        ("weighted", score_elements),
+        ("scores", final_score_elements),
+    ] {
+        if elements > MAX_INDEX_QUERY_ELEMENTS {
+            return Err(ScoredQueryError::DiagnosticElementLimit { field, elements });
+        }
+    }
+    let terms = checked_product(
+        &[
+            positions,
+            layout.index.heads.get(),
+            keys.key_count.get(),
+            layout.index.head_dimension.get(),
+        ],
+        "aggregate score work",
+    )?;
+    if terms > MAX_INDEX_REFERENCE_TERMS {
+        return Err(ScoredQueryError::AggregateWorkloadTooLarge {
+            max_terms: MAX_INDEX_REFERENCE_TERMS,
+        });
+    }
+    Ok(positions)
+}
+
+fn checked_product(values: &[usize], field: &'static str) -> Result<usize, ScoredQueryError> {
+    values.iter().try_fold(1_usize, |total, &value| {
+        total
+            .checked_mul(value)
+            .ok_or(ScoredQueryError::ShapeOverflow { field })
+    })
+}
+
+fn reserve_scored(elements: usize, field: &'static str) -> Result<Vec<u16>, ScoredQueryError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(elements)
+        .map_err(|_| ScoredQueryError::AllocationFailed { field, elements })?;
+    Ok(output)
 }
 
 /// Prepares the source indexer's FP4 query and scaled signed head weights.
@@ -533,9 +795,9 @@ fn bf16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateQueryError, CandidateQueryLayout, CandidateQueryWeights, IndexQueryError,
-        IndexQueryLayout, IndexQueryLayoutError, IndexQueryWeights, prepare_candidate_query,
-        prepare_index_query,
+        CandidateQueryError, CandidateQueryLayout, CandidateQueryWeights, IndexKeyView,
+        IndexQueryError, IndexQueryLayout, IndexQueryLayoutError, IndexQueryWeights,
+        ScoredQueryError, prepare_candidate_query, prepare_index_query, prepare_scored_query,
     };
     use crate::{
         RotaryFrequency,
@@ -560,6 +822,21 @@ mod tests {
             nonzero(1),
         )
         .expect("small index layout")
+    }
+
+    fn invalid_candidate_weights() -> CandidateQueryWeights<'static> {
+        CandidateQueryWeights {
+            wq_a: Fp8Projection {
+                codes: &[],
+                scales: &[],
+            },
+            q_norm: &[],
+            index: IndexQueryWeights {
+                wq_b_codes: &[],
+                wq_b_scales: &[],
+                weights_proj: &[],
+            },
+        }
     }
 
     #[test]
@@ -776,5 +1053,89 @@ mod tests {
             error,
             CandidateQueryError::AttentionQr(LayerAttentionError::InputLength { actual: 31, .. })
         ));
+    }
+
+    #[test]
+    fn aggregate_score_guard_precedes_candidate_weight_validation() {
+        let keys = vec![0_u16; super::MAX_INDEX_QUERY_ELEMENTS];
+        let keys = IndexKeyView::new(&keys, nonzero(32)).expect("bounded key view");
+        let error = prepare_scored_query(
+            &[0; 32 * 9],
+            &[],
+            invalid_candidate_weights(),
+            CandidateQueryLayout::new(layout(), 1.0e-20).expect("layout"),
+            keys,
+        )
+        .expect_err("aggregate scoring work rejects before bad candidate weights run");
+        assert!(matches!(
+            error,
+            ScoredQueryError::AggregateWorkloadTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_key_view_with_a_different_head_dimension_before_query_preparation() {
+        let key_values = [0; 64];
+        let keys = IndexKeyView::new(&key_values, nonzero(64)).expect("valid distinct key view");
+        let error = prepare_scored_query(
+            &[0; 32],
+            &[],
+            invalid_candidate_weights(),
+            CandidateQueryLayout::new(layout(), 1.0e-20).expect("layout"),
+            keys,
+        )
+        .expect_err("key width rejects before bad candidate weights run");
+        assert!(matches!(
+            error,
+            ScoredQueryError::KeyHeadDimension {
+                actual: 64,
+                expected: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn key_view_rejects_empty_misaligned_and_nonfinite_raw_bf16() {
+        assert!(matches!(
+            IndexKeyView::new(&[], nonzero(32)),
+            Err(ScoredQueryError::EmptyKeys)
+        ));
+        assert!(matches!(
+            IndexKeyView::new(&[0; 33], nonzero(32)),
+            Err(ScoredQueryError::KeyShape {
+                actual: 33,
+                head_dimension: 32
+            })
+        ));
+        let mut nonfinite = [0_u16; 32];
+        nonfinite[31] = 0x7f80;
+        assert!(matches!(
+            IndexKeyView::new(&nonfinite, nonzero(32)),
+            Err(ScoredQueryError::NonFiniteKey { position: 31 })
+        ));
+    }
+
+    #[test]
+    fn rejects_multibatch_scoring_before_input_or_weight_validation() {
+        let index = IndexQueryLayout::new(
+            nonzero(2),
+            nonzero(32),
+            nonzero(32),
+            nonzero(2),
+            nonzero(32),
+            nonzero(1),
+        )
+        .expect("two-batch index layout remains valid for prefix preparation");
+        let key_values = [0; 32];
+        let keys = IndexKeyView::new(&key_values, nonzero(32)).expect("one finite key");
+        let error = prepare_scored_query(
+            &[],
+            &[],
+            invalid_candidate_weights(),
+            CandidateQueryLayout::new(index, 1.0e-20).expect("candidate layout"),
+            keys,
+        )
+        .expect_err("one-batch scorer rejects multi-batch request first");
+        assert!(matches!(error, ScoredQueryError::BatchCount { actual: 2 }));
     }
 }
