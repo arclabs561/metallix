@@ -470,6 +470,9 @@ enum Command {
         /// Embedding row/token ID.
         #[arg(long, default_value_t = 0)]
         row: usize,
+        /// Row family to decode: `embedding` or `layer0-wq-a`.
+        #[arg(long, default_value = "embedding")]
+        kind: String,
     },
 }
 
@@ -651,7 +654,9 @@ pub fn run() -> ExitCode {
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
         Command::InspectV41Shard { shard } => inspect_v41_shard(&shard),
-        Command::InspectV41EmbeddingRow { shard, row } => inspect_v41_embedding_row(&shard, row),
+        Command::InspectV41EmbeddingRow { shard, row, kind } => {
+            inspect_v41_embedding_row(&shard, row, &kind)
+        }
         #[cfg(feature = "metal")]
         Command::SmokeQwenMetal => smoke_qwen_metal(),
         #[cfg(feature = "metal")]
@@ -1172,7 +1177,7 @@ fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
     }
 }
 
-fn inspect_v41_embedding_row(shard: &PathBuf, row: usize) -> ExitCode {
+fn inspect_v41_embedding_row(shard: &PathBuf, row: usize, kind: &str) -> ExitCode {
     let file_bytes = match fs::metadata(shard) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
@@ -1215,23 +1220,36 @@ fn inspect_v41_embedding_row(shard: &PathBuf, row: usize) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    let (weight, scales, biases, width, group_size) = match kind {
+        "embedding" => (
+            "model.embed_tokens.weight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.biases",
+            4096,
+            64,
+        ),
+        "layer0-wq-a" => (
+            "model.layers.0.attn.wq_a.weight",
+            "model.layers.0.attn.wq_a.scales",
+            "model.layers.0.attn.wq_a.biases",
+            3072,
+            96,
+        ),
+        _ => {
+            eprintln!("unknown row kind {kind:?}; expected embedding or layer0-wq-a");
+            return ExitCode::FAILURE;
+        }
+    };
     match read_affine_row_from_shard(
-        shard,
-        &header,
-        "model.embed_tokens.weight",
-        "model.embed_tokens.scales",
-        "model.embed_tokens.biases",
-        row,
-        4096,
-        8,
-        64,
+        shard, &header, weight, scales, biases, row, width, 8, group_size,
     ) {
         Ok(values) => {
             let checksum = values.iter().fold(0_u64, |hash, value| {
                 hash.wrapping_mul(1_099_511_628_211)
                     .wrapping_add(u64::from(value.to_bits()))
             });
-            println!("DeepSeek MLX embedding row");
+            println!("DeepSeek MLX affine row");
+            println!("kind: {kind}");
             println!("row: {row}");
             println!("width: {}", values.len());
             println!("fp32_checksum: {checksum:016x}");

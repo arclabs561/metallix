@@ -18,6 +18,8 @@ published release; reference operators do not imply full-model support.
   DeepSeek MLX embedding row from a shard and emits a deterministic checksum.
 - The all-features embedding-row command now evaluates that decoded row on
   Metal, proving the first real MLX tensor crosses the native device boundary.
+- The same native gate now decodes layer-zero attention `wq_a` rows (3,072
+  logical values) and evaluates them on Metal.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
   Codex profile path, including the direct API smoke result and the measured
   full-Codex prefill limitation.

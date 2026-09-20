@@ -72,3 +72,8 @@ With `--all-features`, the same row gate now evaluates the decoded 4096-wide
 embedding on Metal and reports `metal_eval: passed`. This is the first real
 DeepSeek tensor to cross Metallix's native device boundary; full block execution
 and logits remain the next gate.
+
+The row gate also decodes layer-zero attention `wq_a` row 0 from shard one:
+width `3072`, checksum `e965ea9adea61000`, with `metal_eval: passed`. This is a
+real attention projection tensor crossing the native device boundary; the full
+projection and block graph remain next.
