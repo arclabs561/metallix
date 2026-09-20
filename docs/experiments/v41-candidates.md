@@ -280,6 +280,79 @@ runs and does not isolate allocation from other transaction work. Changing
 allocation or copy semantics needs a source-grounded longer-prefix workload
 and a new matched measurement.
 
+### Synthetic prefix scaling
+
+The opt-in `owner_transaction --synthetic-scale` mode exercises prefixes 8,
+64, 512, and 2048 with the same batch/input/latent/key dimensions (1/128/64/64)
+and deterministic nonzero BF16 inputs. Identity-style weights and rotary
+frequencies make this a synthetic operator workload. Before timing each shape,
+it compares complete staged and direct prefixes and checks drop/retry behavior.
+Priming and owner cloning are outside the timed intervals. Preparation/drop
+use 200 samples; commit/direct publication use 40.
+
+Three serial processes on macOS 26.6.2, Mac15,9 (16 CPUs, 128 GiB), with no
+concurrent project builds or captures, produced the following phase medians:
+
+| Prefix | Complete staged key + KV bytes | Prepare μs, runs 1 / 2 / 3 | Direct publication μs, runs 1 / 2 / 3 |
+| --- | ---: | --- | --- |
+| 8 | 2,304 | 28.959 / 33.083 / 34.791 | 30.437 / 31.209 / 34.542 |
+| 64 | 16,640 | 30.584 / 32.750 / 34.146 | 30.375 / 32.938 / 32.792 |
+| 512 | 131,328 | 32.333 / 32.958 / 37.667 | 29.125 / 29.501 / 34.063 |
+| 2048 | 524,544 | 39.125 / 44.334 / 50.625 | 31.500 / 33.480 / 41.480 |
+
+The release executable SHA-256 was
+`b89d3bccb625f2c29798e5970827b9ffc4559d73ead55b55b5968ead3ad67fa1`,
+built from `10d95e5` plus the Engram lookup and benchmark working changes.
+Raw timings, including within-process sample standard deviations, remain in
+ignored `artifacts/owner-scaling/trial-{1,2,3}.txt`.
+
+Preparation grows with prefix length in this workload. At prefix 2048 its
+median exceeds direct publication by 7.625–10.854 μs within each process.
+The phases run in a fixed order and differ in cache/allocation conditions;
+this comparison does not isolate copy cost or establish a model speedup.
+Matched timing order and a representative staged-view consumer remain gates
+before changing the contiguous-prefix transaction interface.
+
+```sh
+RUSTC_WRAPPER= cargo bench -p deepseek --bench owner_transaction -- --synthetic-scale
+```
+
+The `--profile-synthetic` mode repeats prepare/drop 200,000 times at prefix
+2048. A headless Samply run of an optimized build with debug information
+recorded 7,444 unit-weight samples at nominal 1 ms intervals. The setup oracle
+appeared in 45 samples; 7,354 samples contained `RatioOneCompressedOwner::prepare`
+without the oracle. The remaining 45 samples are outside that selected stack
+population. Within those 7,354 preparation samples:
+
+| Leaf | Samples | Share |
+| --- | ---: | ---: |
+| BF16 linear projection | 3,107 | 42.25% |
+| BF16-to-FP4 requantization | 1,377 | 18.72% |
+| `_platform_memmove` | 1,336 | 18.17% |
+| FP4 scale calculation | 1,077 | 14.65% |
+| Index-key preparation | 273 | 3.71% |
+
+Copying is a secondary hotspot in this synthetic workload; projection and
+requantization account for more samples. Of the 1,336 copy samples, 1,335
+appear directly under `prepare`, consistent with its staged-prefix copies.
+`staged_prefixes` was inlined, so these stacks cannot uniquely identify that
+copy site. Allocator growth appeared in only 65 inclusive samples (0.88%);
+the profile does not establish allocation as the dominant cost. No runtime
+optimization or interface change is claimed from this diagnostic.
+
+The profiled binary SHA-256 was
+`2e930c14623c94e4e2996a7f68d861b331b110a3226adfcb083357f06b1abdc7`.
+The ignored `artifacts/owner-scaling/profile-2048.json.gz` and `.json.syms.json`
+retain the samples and resolved symbol ranges. The loop reported 7,399.315 ms
+under profiling; use the unprofiled measurements above for latency.
+
+```sh
+RUSTC_WRAPPER= CARGO_PROFILE_BENCH_DEBUG=1 cargo bench -p deepseek --bench owner_transaction --no-run
+samply record --save-only --unstable-presymbolicate \
+  -o artifacts/owner-scaling/profile-2048.json.gz -- \
+  target/release/deps/owner_transaction-<build-hash> --profile-synthetic
+```
+
 ## Packed FP4 runtime expansion
 
 `deepseek::precision` expands E2M1x2 bytes in low-nibble-first order and
