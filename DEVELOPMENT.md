@@ -405,9 +405,17 @@ reset instead. HTTP/1.1 requires one Host header. Socket writes have a
 five-second idle limit and a 120-second total
 response-write deadline. A failed streaming write stops generation at its next
 output callback; this does not interrupt a running prefill or GPU operation.
+`--generation-timeout-ms` sets a separate cooperative generation budget from
+1 to 120000 milliseconds (default 60000). It covers rendering and generation,
+with checks around prefill and every decode even when no visible text is
+emitted. After the current operation returns, an expired budget prevents more
+model work. JSON timeout errors use HTTP 408; SSE uses `response.failed` with
+`generation_timeout`, subject to the socket write limits. A client that
+half-closes its sending side may still read its response; EOF is not treated
+as cancellation.
 The 2048-token control bound and sequential admission are still insufficient
-evidence for a Codex profile. Concurrent admission and compute cancellation
-remain separate gates.
+evidence for a Codex profile. Concurrent admission and request cancellation
+under load remain separate gates.
 
 For the maintained longer-context qualification, start that server separately
 with its default 2048-token context and leave it resident; the runner never
@@ -435,6 +443,23 @@ five-second macOS CPU sample during the long request, add
 `--sample-pid <operator-owned-server-pid>` for that exact server process; do
 not supply another process ID. See the [chat performance ledger](docs/experiments/chat-performance.md)
 for the receipt contract and matched-performance procedure.
+
+The separate read-tool qualification runs synthetic search, two-file traversal,
+and long-file tasks through `mx agent`:
+
+```sh
+uv run scripts/qualify-agent.py --run --binary target/release/mx \
+  --model "$MODEL" --expected-model-revision "$REVISION" \
+  --output artifacts/agent-qualification-run
+```
+
+Without `--run` it only prints the workload. A live run uses a new or empty
+output directory, creates its own synthetic workspace, and retains stdout,
+stderr, binary/workspace hashes, and three trials per task. A successful
+process exit is insufficient: each trial must contain the expected answer and
+the required tool-call evidence. The tool log records names, not arguments;
+this gate does not prove arbitrary task completion or general coding ability.
+Reported wall time includes fresh model loading. No model is downloaded.
 
 Do not add a live Codex provider configuration while this protocol is still
 being qualified. The intended future shape is a user-level profile such as:

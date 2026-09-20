@@ -565,11 +565,12 @@ single-token decode does not. The final source index offset follows the window
 width (five, six, six for this trace), not the final token position.
 
 The earlier candidate fixture is preserved under its original capture identity.
-Use the HC capture command below for fresh exports.
+Fresh exports below go to ignored artifacts so historical fixture identities
+are not overwritten by newer instrumentation.
 
 The historical candidate capture has SHA-256
 `7c5cc8541da338fa3426d63e32b9a66e9132e07ab68ee26d86fbf9e29f62f48d`;
-a repeated capture is byte-identical. Its observer hash is
+a repeat at that instrumentation revision was byte-identical. Its observer hash is
 `0235926c7fbd884433021d5ddcef6731884123e0df867466845fb2b39bf33c16`.
 The opt-in runtime test executes the pinned graph with and without observers,
 compares outputs and cache bytes exactly, checks historical attention values,
@@ -594,6 +595,39 @@ the established arithmetic fixture without relabeling its capture identity.
 uv run scripts/v41-forward-reference.py --output artifacts/v41-candidate-hc-source.json
 uv run --python 3.13 python scripts/v41_candidate_capture.py \
   --input artifacts/v41-candidate-hc-source.json \
-  --output fixtures/deepseek-v41/forward-candidate-hc-reference.json
+  --output artifacts/forward-candidate-hc-reference.json
 cargo test -p deepseek --test forward_candidate_hc
 ```
+
+### Layer-three attention continuation
+
+The separate
+[`forward-layer3-attention-reference.json`](../../fixtures/deepseek-v41/forward-layer3-attention-reference.json)
+records layer three's window KV, compressed-prefix read, selected indices,
+sparse attention output, output projection input, and final attention output.
+Its rotary schedule comes from the captured `layers[3].attn.freqs_cis` tensor,
+with explicit provenance distinct from the older layer-four projection.
+The observer runtime gate checks that the extra observations preserve source
+outputs and cache bytes and restore patched methods after exceptions.
+
+`forward_layer3_attention` supplies the HC-derived input to the staged
+compressed owner, scores its complete native key prefix, selects native
+producer indices, and then feeds the committed native KV prefix into attention.
+The fixture tensors are expected results at those boundaries, rather than
+publication operands. Property tests reject wrong owner identities without
+advancing attention state and show that legal-but-wrong selected keys change
+the final output. Raw selection scores remain in test helpers; this join adds
+no allocation or copied score buffer to production candidate results.
+
+```sh
+uv run scripts/v41-forward-reference.py --output artifacts/v41-layer3-attention-source.json
+uv run --python 3.13 python scripts/v41_layer3_attention_capture.py \
+  --input artifacts/v41-layer3-attention-source.json \
+  --output artifacts/forward-layer3-attention-reference.json
+cargo test -p deepseek --test forward_layer3_attention
+```
+
+The fixtures keep separate historical capture identities. Comparisons across
+them must match actual tensor operands; renaming source metadata does not
+establish equivalence. This remains a reduced source graph, with block-entry
+residuals and incoming pre-mix captured from earlier layers.

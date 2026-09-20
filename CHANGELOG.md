@@ -7,6 +7,17 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- A source-grounded DeepSeek layer-three continuation joins native HC/RMSNorm,
+  compressed owner KV, producer selection, and attention output. It retains
+  layer-specific rotary provenance and property checks for publication identity
+  and selection sensitivity.
+- Responses generation has a configurable cooperative wall-clock budget checked
+  around prefill and each decode, including tokens that emit no visible text.
+  Timeout failures retain distinct JSON/SSE error semantics.
+- A read-tool qualification runner checks task answers and observed tool calls
+  independently of process exit status. Its synthetic multi-file task exposes
+  unfinished work from the current small control model.
+
 - Native layer-three HC pre-mix and RMSNorm now feed DeepSeek owner and
   candidate inputs in the connected suffix tests, using a new pinned source
   capture and exact cross-checks against the preserved historical fixtures.

@@ -144,8 +144,11 @@ and non-automatic tool choice are rejected. It is not ready to serve as a full
 Codex backend. A 2048-token control context is still insufficient evidence for
 that role. Accepted connections have a five-second total header/body read
 deadline and bounded writes; each connection handles one request. Transfer
-encoding, `Expect`, and duplicate body lengths are rejected. Model work during
-prefill is still synchronous, so compute cancellation remains unqualified.
+encoding, `Expect`, and duplicate body lengths are rejected. Generation has a
+separate cooperative 60-second budget (`--generation-timeout-ms`, 1–120000).
+Checks surround prefill and each decode, including tokens with no visible text.
+An in-flight Metal operation must return before the budget can stop further
+work; client disconnects are still detected through failed output writes.
 
 A future user-level Codex profile could target this endpoint only after an
 end-to-end compatibility and safety qualification. This is an example of that
@@ -223,7 +226,8 @@ execution parity.
 
 The [reduced V4.1 forward checks](docs/research/v41-forward-reference.md)
 derive the layer-three attention input through native HC pre-mix and RMSNorm,
-then connect compressed-owner KV and selected indices through final-layer
+then connect native owner KV and producer-selected indices to layer-three
+attention output. Separate checks connect owner KV through final-layer
 attention, HC, FFN, final normalization and logits. Fixed source-derived
 numerical bounds and wrong-index/omitted-norm controls guard this suffix.
 Block-entry residuals remain captured; full-model generation is still pending.

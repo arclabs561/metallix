@@ -14,7 +14,8 @@
   post-header failure, invalid requests, a function result round trip, and a
   disconnected client followed by another request. Socket intake now has one
   absolute read deadline, and live stalled-header/body cases recover to healthy
-  subsequent requests. Writes are bounded; model-compute cancellation is open.
+  subsequent requests. Writes are bounded; a separate cooperative generation
+  budget checks every decode boundary. In-flight Metal work cannot be interrupted.
 - DeepSeek compressed-owner transactions allow scoring/selection against staged
   key/KV prefixes before commit. A source fixture forces downstream scorer
   rejection, discards the transaction, checks unchanged state, and retries.
@@ -26,6 +27,11 @@
 - A new source capture supplies layer-three block-entry residual/pre-mix;
   native HC and RMSNorm now derive the owner/candidate attention input and
   cross-check it against preserved historical captures.
+- The layer-three continuation now consumes native staged owner keys/KV and
+  native producer-selected indices through attention output. Its separate
+  source fixture captures layer three's actual rotary schedule. Properties
+  check wrong-owner rejection with a valid retry and output sensitivity to
+  legal-but-wrong selected indices; production candidate storage is unchanged.
 - A reduced DeepSeek suffix connects owner-produced KV/indices through native
   final-layer attention, HC, FFN, final norm and logits. Fixed source-derived
   envelopes reject omitted normalization; earlier layer inputs remain captured.
@@ -49,15 +55,20 @@
    Measure longer prefixes before changing staged allocations. Prefix reuse,
    quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
-   forward through remaining text blocks to logits. Operator and transaction
-   parity do not establish full-model generation. Keep full checkpoint
+   forward through remaining text blocks to logits. The next join is layer-three
+   attention through its HC/FFN continuation into layer four's block entry;
+   the existing final-layer suffix still starts from captured block-entry state.
+   Operator and transaction parity do not establish full-model generation. Keep full checkpoint
    acquisition behind the existing reduced-forward numerical gate.
-3. **Agent owner: CLI lane.** Evaluate more than one read task, including longer
-   tool results and history growth. The 2048-token path passed repeated long
-   requests and a read-tool task with an 800-word result. Shell and write tools
+3. **Agent owner: CLI lane.** Improve multi-step task completion before claiming
+   coding-agent readiness. The maintained `scripts/qualify-agent.py` gate runs
+   three trials each of literal search, a two-file chain, and long-file reading.
+   The 0.6B control passed search and long reads in all trials but stopped after
+   the first file in all chain trials, despite returning exit code zero. The
+   qualification runner rejects these unfinished tasks. Shell and write tools
    need a separate execution policy; this delivery does not execute them.
 4. **Serving owner: Responses lane.** Socket read/write deadlines are bounded;
-   qualify concurrent admission, compute cancellation, longer context beyond
+   qualify concurrent admission, client-driven cancellation, longer context beyond
    the 2048-token control, custom-tool requirements, and real Codex task
    completion. Only then activate a personal Codex profile. The documentation's
    profile example is a qualification target; no live profile was changed.
@@ -66,6 +77,13 @@
    whether a new native model adapter is worth its implementation cost.
 
 ## Validation
+
+The cooperative budget's live probes covered JSON and SSE at 1 ms and 100 ms,
+followed by healthy requests. The warm 100 ms stream emitted ten text deltas
+before exactly one timeout failure. With the default budget, both JSON and SSE
+clients that half-closed their sending side received the expected 32-token
+response and matching text. A 1 ms budget still took 22–40 ms to return:
+the currently running synchronous phase must finish before expiry is observed.
 
 The canonical checks are `RUSTC_WRAPPER= uv run scripts/check.py` and
 `RUSTC_WRAPPER= uv run scripts/check.py --metal`. The wrapper override avoids a

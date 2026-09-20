@@ -276,6 +276,86 @@ and transfer encoding (400), expectation handling (417), body cap (413), and
 header cap (431). These are bounded live cases; general error-reply behavior
 still needs broader protocol qualification.
 
+## Read-tool task qualification
+
+`scripts/qualify-agent.py` ran three fresh-process trials for each of three
+synthetic tasks against the `2e07b39` release and Qwen3-0.6B snapshot
+`c1899de289a04d12100db370d81485cdf75e47ca`. The runner retained its binary and
+workspace hashes, model revision, stdout, stderr, exit status, and task checks
+under ignored `artifacts/agent-multitask/qualified-baseline/`.
+
+| Task | Passing trials | Observed result |
+| --- | ---: | --- |
+| Literal search | 3/3 | Used `search_file` and returned the expected color |
+| Two-file chain | 0/3 | Read the first file and repeated its pointer without finding the answer |
+| Long-file read | 3/3 | Read the file and returned its final marker |
+
+All nine processes exited successfully, but the task-level gate failed. Tool
+name logs and answer matching are bounded evidence for these synthetic tasks;
+they do not prove correct tool arguments or general coding capability. The
+current control model needs stronger multi-step qualification before it can
+support a Codex-readiness claim. Timing here includes model loading and is not
+a resident-inference benchmark.
+
+## Streaming disconnect recovery baseline
+
+This baseline used release binary `2e07b39`, before the new budget change, on
+an Apple M3 Max with 128 GiB unified memory running macOS 26.6.2. The host was
+not isolated. The resident `metallix-qwen3` server at `127.0.0.1:8321` used the
+default 2,048-token context limit; the Responses API default output budget is
+128 tokens, while this probe explicitly used 64 tokens for its long workload
+and 32 for its short recovery control.
+
+Three serial trials sent the same prompt (SHA-256
+`d5abe68ebfe8211f97636c9ecdf4ed03efa468da4bf9f27de192a0791d59e762`), waited
+for the first visible text delta, then closed the connection with RST. The
+first deltas arrived at 58.685, 24.180, and 25.045 ms. A following health check
+returned in 10.130, 9.372, and 9.372 ms (median 9.372 ms; sample standard
+deviation 0.438 ms). Each health check was followed by a fresh, capped 32-token
+control. All three controls reported 22 prompt tokens and 32 completion tokens,
+ended with expected `incomplete` status, emitted 39 events and 152 UTF-8 output
+bytes, and had text hash
+`9a2afc71ae542cc8d1dbc4b156d2fcd8e01d65dc6f2bfea6408e170c9aac9d6b`. Their
+total times were 313.325, 314.231, and 310.996 ms (median 313.325 ms; sample
+standard deviation 1.669 ms).
+
+Three serial uninterrupted 64-token controls used the same prompt and each
+reported 22 prompt tokens and 64 completion tokens, expected capped
+`incomplete` status, 71 events, 320 UTF-8 output bytes, and text hash
+`33a1a362600ec209d5f17a8af03a311a423d313bd11a212dd871b01d04b12466`. Their
+first-delta times were 24.396, 24.057, and 24.895 ms; total times were 606.650,
+604.340, and 605.125 ms (median 605.125 ms; sample standard deviation 1.175
+ms). The cap deliberately makes these controls incomplete, so their terminal
+status is a workload gate rather than a failure.
+
+The close-to-health interval is an upper bound across request-disconnect and
+recovery handling. Because the socket is reset after the first delta, it does
+not identify the decode phase in flight, establish GPU cancellation timing, or
+infer how many tokens were generated after disconnect. Repeat the identical
+three-trial protocol on a newly built resident server before comparing a budget
+change; retain the caps, model ID, prompt hash, and output identity gates.
+
+### Budget-change comparison
+
+The matched three-trial rerun used the resident server built from `2e07b39`
+plus the budget working diff. It preserved the origin, `metallix-qwen3` model
+ID, prompt hash, 64/32 caps, 22 prompt tokens, expected capped `incomplete`
+status, event and UTF-8-byte counts, and both output-text hashes from the
+baseline. Its recovery controls likewise reported 32 completion tokens and its
+uninterrupted controls reported 64.
+
+| Client-observed metric | Before budget diff | After budget diff |
+| --- | ---: | ---: |
+| RST close-to-health median / sample stdev | 9.372 / 0.438 ms | 8.368 / 0.393 ms |
+| Capped 32-token recovery-control wall median / sample stdev | 313.325 / 1.669 ms | 283.527 / 5.215 ms |
+| Capped 64-token uninterrupted-control wall median / sample stdev | 605.125 / 1.175 ms | 542.235 / 2.663 ms |
+
+The rerun occurred later on the same non-isolated host, with only three
+observations per side. The lower client wall times are a compatible regression
+check with preserved output and recovery behavior, not an attributed speedup
+from the budget change. The raw after-change receipt remains at
+`artifacts/cancellation/recovery-after-budget/receipt.json`.
+
 Use this baseline before an optimization, then repeat the identical workload
 after one change. For serving work, retain a tool-call workload beside this
 plain-text control and report task completion separately from latency.

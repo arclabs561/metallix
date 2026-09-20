@@ -40,9 +40,12 @@ header/body read deadline, a 16 KiB header limit, and a 1 MiB body limit.
 It accepts one HTTP/1 request per connection and closes after the response;
 transfer-encoded bodies and `Expect` are rejected. SSE frames are buffered and
 flushed per event. Writes have a five-second idle limit and a 120-second total
-response-write deadline. These bound socket work, not synchronous model
-compute: prefill cannot yet be interrupted, and a disconnect is observed at a
-subsequent write.
+response-write deadline. A separate cooperative generation budget defaults to
+60 seconds and checks around prefill and each decode, including buffered tokens
+that emit no text. An expired budget stops further work after the current
+synchronous operation returns. It cannot interrupt prefill or a Metal call;
+a disconnect is observed at a subsequent write. Request EOF is not an abandon
+signal because clients may half-close their sending side and keep reading.
 
 This boundary replaces a transport whose public API did not expose accepted
 sockets. Timing a receiver thread would leave its blocked read alive. An async
