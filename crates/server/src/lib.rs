@@ -476,6 +476,9 @@ enum Command {
         /// Row family to decode: `embedding` or `layer0-wq-a`.
         #[arg(long, default_value = "embedding")]
         kind: String,
+        /// Optional embedding shard to apply to a full layer-zero projection.
+        #[arg(long)]
+        input_shard: Option<PathBuf>,
     },
 }
 
@@ -662,7 +665,8 @@ pub fn run() -> ExitCode {
             row,
             kind,
             all_rows,
-        } => inspect_v41_embedding_row(&shard, row, &kind, all_rows),
+            input_shard,
+        } => inspect_v41_embedding_row(&shard, row, &kind, all_rows, input_shard.as_ref()),
         #[cfg(feature = "metal")]
         Command::SmokeQwenMetal => smoke_qwen_metal(),
         #[cfg(feature = "metal")]
@@ -1187,7 +1191,13 @@ fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
     clippy::too_many_lines,
     reason = "bounded CLI artifact inspection keeps its I/O phases explicit"
 )]
-fn inspect_v41_embedding_row(shard: &PathBuf, row: usize, kind: &str, all_rows: bool) -> ExitCode {
+fn inspect_v41_embedding_row(
+    shard: &PathBuf,
+    row: usize,
+    kind: &str,
+    all_rows: bool,
+    input_shard: Option<&PathBuf>,
+) -> ExitCode {
     let file_bytes = match fs::metadata(shard) {
         Ok(metadata) => metadata.len(),
         Err(error) => {
@@ -1299,6 +1309,109 @@ fn inspect_v41_embedding_row(shard: &PathBuf, row: usize, kind: &str, all_rows: 
     println!("fp32_checksum: {checksum:016x}");
     #[cfg(feature = "metal")]
     println!("metal_eval: passed");
+    if let Some(input_shard) = input_shard {
+        if kind != "layer0-wq-a" || !all_rows {
+            eprintln!("--input-shard requires --kind layer0-wq-a --all-rows");
+            return ExitCode::FAILURE;
+        }
+        #[cfg(feature = "metal")]
+        {
+            let input_bytes = match fs::metadata(input_shard) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    eprintln!("could not stat {}: {error}", input_shard.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut input_file = match fs::File::open(input_shard) {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!("could not open {}: {error}", input_shard.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut input_prefix = [0_u8; 8];
+            if input_file.read_exact(&mut input_prefix).is_err() {
+                eprintln!("could not read input safetensors prefix");
+                return ExitCode::FAILURE;
+            }
+            let input_header_len =
+                usize::try_from(u64::from_le_bytes(input_prefix)).unwrap_or(usize::MAX);
+            if input_header_len > 100 * 1024 * 1024 {
+                eprintln!("input safetensors header exceeds the bounded limit");
+                return ExitCode::FAILURE;
+            }
+            let mut input_header_bytes = vec![0_u8; 8 + input_header_len];
+            input_header_bytes[..8].copy_from_slice(&input_prefix);
+            if input_file.read_exact(&mut input_header_bytes[8..]).is_err() {
+                eprintln!("could not read input safetensors header");
+                return ExitCode::FAILURE;
+            }
+            let input_header = match deepseek::V41SafetensorsHeader::parse_prefixed_header(
+                &input_header_bytes,
+                input_bytes,
+            ) {
+                Ok(header) => header,
+                Err(error) => {
+                    eprintln!("unsupported input safetensors shard: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let input = match read_affine_row_from_shard(
+                input_shard,
+                &input_header,
+                "model.embed_tokens.weight",
+                "model.embed_tokens.scales",
+                "model.embed_tokens.biases",
+                0,
+                4096,
+                8,
+                64,
+            ) {
+                Ok(values) => values,
+                Err(error) => {
+                    eprintln!("input embedding decode failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let projected = match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(
+                &matrix,
+                1024,
+                3072,
+                if input.len() == 3072 {
+                    &input
+                } else {
+                    eprintln!(
+                        "layer0-wq-a expects a 3072-wide latent input; embedding row is {} wide",
+                        input.len()
+                    );
+                    return ExitCode::FAILURE;
+                },
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("native embedding projection failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let projected_checksum =
+                projected
+                    .as_slice::<f32>()
+                    .iter()
+                    .fold(0_u64, |hash, value| {
+                        hash.wrapping_mul(1_099_511_628_211)
+                            .wrapping_add(u64::from(value.to_bits()))
+                    });
+            println!("projected_width: 1024");
+            println!("projected_checksum: {projected_checksum:016x}");
+            println!("projection_metal_eval: passed");
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            eprintln!("--input-shard requires a Metal build");
+            return ExitCode::FAILURE;
+        }
+    }
     println!("scope: bounded affine tensor decoded; no model execution");
     ExitCode::SUCCESS
 }

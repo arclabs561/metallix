@@ -87,3 +87,8 @@ The DeepSeek crate now exposes a native Metal matrix projection primitive for
 applying decoded row-major affine weights to a hidden-state vector. Its device
 test validates a small independent projection; the next integration step is
 using it with the real embedding row and full layer-zero `wq_a` matrix.
+
+Attempting to apply the raw 4,096-wide embedding directly to `wq_a` correctly
+fails closed: layer-zero `wq_a` consumes a 3,072-wide latent. The missing native
+boundary is the preceding latent projection/normalization stage, now identified
+by a real artifact shape check rather than a guessed matrix multiply.

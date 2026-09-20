@@ -22,6 +22,9 @@ published release; reference operators do not imply full-model support.
   logical values) and evaluates them on Metal.
 - The row gate can now decode all 1,024 layer-zero `wq_a` rows as a bounded
   3,072-wide affine tensor and evaluate the assembled matrix on Metal.
+- The attempted embedding-to-`wq_a` application now reports the real latent
+  width mismatch explicitly: embeddings are 4,096-wide while this projection
+  consumes a 3,072-wide pre-attention latent.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
