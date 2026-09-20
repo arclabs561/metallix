@@ -174,6 +174,78 @@ pub struct RatioOneCompressedOwnerDiagnostic {
     pub compressed_kv: CompressedKvDiagnostic,
 }
 
+/// A validated coupled owner publication that is still invisible to live prefixes.
+///
+/// The transaction retains exclusive access to its owner, so callers can score
+/// and select from [`diagnostic`](Self::diagnostic) before deciding whether to
+/// publish it. Dropping the transaction performs no cache or compressor
+/// mutation. [`commit`](Self::commit) rechecks the already-validated bounded
+/// appends immediately before their infallible copies, then publishes both
+/// prefixes and compressor progress together.
+pub struct PendingRatioOneCompressedOwner<'owner> {
+    owner: &'owner mut RatioOneCompressedOwner,
+    compressor: CompressorState,
+    diagnostic: RatioOneCompressedOwnerDiagnostic,
+    key_prefixes: Vec<Vec<u16>>,
+    kv_prefixes: Vec<Vec<u16>>,
+    publication: IndexKeyPublicationId,
+    token_start: usize,
+}
+
+impl PendingRatioOneCompressedOwner<'_> {
+    /// Borrows the staged values for bounded scoring and candidate selection.
+    #[must_use]
+    pub const fn diagnostic(&self) -> &RatioOneCompressedOwnerDiagnostic {
+        &self.diagnostic
+    }
+
+    /// Borrows one complete staged index-key prefix, including prior decode rows.
+    pub fn key_prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
+        staged_prefix(&self.key_prefixes, batch)
+    }
+
+    /// Borrows one complete staged compressed-KV prefix, including prior decode rows.
+    pub fn kv_prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
+        staged_prefix(&self.kv_prefixes, batch)
+    }
+
+    /// Returns the source identity that will be published by [`commit`](Self::commit).
+    #[must_use]
+    pub const fn publication(&self) -> IndexKeyPublicationId {
+        self.publication
+    }
+
+    /// Atomically publishes the staged key, compressed-KV, and compressor progress.
+    ///
+    /// Preparation already validated both appends. The repeated validation is
+    /// retained at the publication point so the cache owns its invariant; the
+    /// transaction's exclusive owner borrow prevents intervening mutation.
+    pub fn commit(self) -> Result<RatioOneCompressedOwnerDiagnostic, RatioOneCompressedOwnerError> {
+        let Self {
+            owner,
+            compressor,
+            diagnostic,
+            publication,
+            token_start,
+            ..
+        } = self;
+        let key_append = owner.key_owner.keys.prepare_append(
+            publication,
+            token_start,
+            &diagnostic.owner.keys.post_fp4,
+        )?;
+        let kv_append = owner.compressed_kv.prepare_append(
+            publication,
+            token_start,
+            &diagnostic.compressed_kv.post_fp4,
+        )?;
+        key_append.commit();
+        kv_append.commit();
+        owner.key_owner.compressor = compressor;
+        Ok(diagnostic)
+    }
+}
+
 /// Rejected combined ratio-one owner construction, call, or reset.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -190,6 +262,14 @@ pub enum RatioOneCompressedOwnerError {
     /// Either coupled owner-prefix cache rejected the publication.
     #[error("combined ratio-one owner-prefix cache failed: {0}")]
     Cache(#[from] IndexKeyStateError),
+    /// A complete staged prefix could not reserve its bounded contiguous view.
+    #[error("could not allocate {elements} BF16 elements for staged {prefix} prefix")]
+    StagedPrefixAllocation {
+        /// The source-specific prefix being assembled.
+        prefix: &'static str,
+        /// Exact number of BF16 elements requested.
+        elements: usize,
+    },
 }
 
 /// Request-local owner for V4.1's coupled ratio-one key and compressed-KV prefixes.
@@ -247,17 +327,20 @@ impl RatioOneCompressedOwner {
         })
     }
 
-    /// Stages and atomically publishes source-coupled index keys and compressed KV.
+    /// Stages source-coupled index keys and compressed KV without publishing them.
     ///
     /// The input call and its source identity are shared verbatim by both
-    /// cache publications. A rejected key, compressed-KV, or cache stage leaves
-    /// both prefixes and the compressor position unchanged, so the same call ID
-    /// can be retried. As with [`RatioOneIndexKeyOwner`], starting a new prefill
-    /// at zero requires [`reset`](Self::reset) after a successful call.
-    pub fn forward(
+    /// cache publications. A rejected preparation, discarded transaction, or
+    /// failed commit leaves both prefixes and the compressor position unchanged,
+    /// so the same call ID can be retried. As with [`RatioOneIndexKeyOwner`],
+    /// starting a new prefill at zero requires [`reset`](Self::reset) after a
+    /// successful call. Preparing allocates one bounded contiguous key and KV
+    /// prefix per batch for pre-commit consumers; callers without one should
+    /// use [`forward`](Self::forward).
+    pub fn prepare(
         &mut self,
         call: RatioOneOwnerCall<'_>,
-    ) -> Result<RatioOneCompressedOwnerDiagnostic, RatioOneCompressedOwnerError> {
+    ) -> Result<PendingRatioOneCompressedOwner<'_>, RatioOneCompressedOwnerError> {
         let staged = self.key_owner.stage(call)?;
         let compressed_kv = prepare_compressed_kv(
             &staged.diagnostic.latent,
@@ -268,6 +351,60 @@ impl RatioOneCompressedOwner {
         // Both pending values hold exclusive borrows and have completed every
         // fallible validation. Their commits are bounded copies and metadata
         // assignments only, so neither prefix becomes visible on rejection.
+        {
+            let _key_append = self.key_owner.keys.prepare_append(
+                call.publication,
+                call.token_start,
+                &staged.diagnostic.keys.post_fp4,
+            )?;
+            let _kv_append = self.compressed_kv.prepare_append(
+                call.publication,
+                call.token_start,
+                &compressed_kv.post_fp4,
+            )?;
+        }
+        let key_prefixes = staged_prefixes(
+            self.key_owner.layout.batches().get(),
+            &staged.diagnostic.keys.post_fp4,
+            self.key_owner.layout.key_dimension().get(),
+            |batch| self.key_owner.prefix(batch),
+            "index-key",
+        )?;
+        let kv_prefixes = staged_prefixes(
+            self.key_owner.layout.batches().get(),
+            &compressed_kv.post_fp4,
+            self.key_owner.layout.latent_dimension().get(),
+            |batch| self.compressed_kv.prefix(batch),
+            "compressed-KV",
+        )?;
+        Ok(PendingRatioOneCompressedOwner {
+            owner: self,
+            compressor: staged.compressor,
+            diagnostic: RatioOneCompressedOwnerDiagnostic {
+                owner: staged.diagnostic,
+                compressed_kv,
+            },
+            key_prefixes,
+            kv_prefixes,
+            publication: call.publication,
+            token_start: call.token_start,
+        })
+    }
+
+    /// Stages and atomically publishes source-coupled index keys and compressed KV.
+    ///
+    /// This avoids allocating complete staged prefix views for callers that do
+    /// not need to score or select before publication.
+    pub fn forward(
+        &mut self,
+        call: RatioOneOwnerCall<'_>,
+    ) -> Result<RatioOneCompressedOwnerDiagnostic, RatioOneCompressedOwnerError> {
+        let staged = self.key_owner.stage(call)?;
+        let compressed_kv = prepare_compressed_kv(
+            &staged.diagnostic.latent,
+            call.frequencies,
+            self.compressed_kv_layout,
+        )?;
         let key_append = self.key_owner.keys.prepare_append(
             call.publication,
             call.token_start,
@@ -339,6 +476,57 @@ impl RatioOneCompressedOwner {
     pub const fn next_position(&self) -> usize {
         self.key_owner.next_position()
     }
+}
+
+fn staged_prefixes<'a>(
+    batches: usize,
+    appended: &[u16],
+    value_dimension: usize,
+    mut live_prefix: impl FnMut(usize) -> Result<&'a [u16], IndexKeyStateError>,
+    prefix: &'static str,
+) -> Result<Vec<Vec<u16>>, RatioOneCompressedOwnerError> {
+    let batch_stride =
+        batches
+            .checked_mul(value_dimension)
+            .ok_or(IndexKeyStateError::ShapeOverflow {
+                field: "staged owner-prefix row",
+            })?;
+    debug_assert!(appended.len().is_multiple_of(batch_stride));
+    let appended_per_batch = appended.len() / batches;
+    let mut prefixes = Vec::new();
+    prefixes.try_reserve_exact(batches).map_err(|_| {
+        RatioOneCompressedOwnerError::StagedPrefixAllocation {
+            prefix,
+            elements: batches,
+        }
+    })?;
+    for batch in 0..batches {
+        let live = live_prefix(batch)?;
+        let elements = live.len().checked_add(appended_per_batch).ok_or(
+            IndexKeyStateError::ShapeOverflow {
+                field: "staged owner-prefix",
+            },
+        )?;
+        let mut full = Vec::new();
+        full.try_reserve_exact(elements).map_err(|_| {
+            RatioOneCompressedOwnerError::StagedPrefixAllocation { prefix, elements }
+        })?;
+        full.extend_from_slice(live);
+        let appended_start = batch * appended_per_batch;
+        full.extend_from_slice(&appended[appended_start..appended_start + appended_per_batch]);
+        prefixes.push(full);
+    }
+    Ok(prefixes)
+}
+
+fn staged_prefix(prefixes: &[Vec<u16>], batch: usize) -> Result<&[u16], IndexKeyStateError> {
+    prefixes
+        .get(batch)
+        .map(Vec::as_slice)
+        .ok_or(IndexKeyStateError::BatchOutOfRange {
+            batch,
+            batches: prefixes.len(),
+        })
 }
 
 impl RatioOneIndexKeyOwner {

@@ -27,7 +27,7 @@ use deepseek::{
         owner::{RatioOneCompressedOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
         query::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
-            IndexQueryWeights, prepare_scored_query,
+            IndexQueryWeights, ScoredQueryError, prepare_scored_query,
         },
         selection::{SelectionCall, SelectionGeometry, select_from_candidates},
     },
@@ -398,6 +398,54 @@ fn generated_indices(
     output
 }
 
+/// A rejected scorer request must not make a staged owner publication visible.
+fn assert_truncated_staged_score_is_rejected(
+    root: &Value,
+    raw_case: &Value,
+    layout: IndexQueryLayout,
+    weights: IndexQueryWeights<'_>,
+    keys: &[u16],
+) {
+    let model = field(root, "model");
+    let inputs = field(field(raw_case, "indexer"), "inputs");
+    let start = usize_field(inputs, "start_pos");
+    let x = bf16(field(inputs, "x"));
+    let truncated = &x[..x.len() - 1];
+    let positions = shape(field(inputs, "x"))[1];
+    let parameters = field(root, "encoded_parameters");
+    let projection_codes = fp8(field(parameters, "layers.4.attn.wq_a.weight"));
+    let projection_scales = fp8(field(parameters, "layers.4.attn.wq_a.scale"));
+    let norm = bf16(field(parameters, "layers.4.attn.q_norm.weight"));
+    let epsilon: f32 = serde_json::from_value(field(model, "norm_eps").clone())
+        .expect("source normalization epsilon");
+    let error = prepare_scored_query(
+        truncated,
+        &source_frequencies(
+            root,
+            start,
+            positions,
+            usize_field(model, "rope_head_dim") / 2,
+        ),
+        CandidateQueryWeights {
+            wq_a: Fp8Projection {
+                codes: &projection_codes,
+                scales: &projection_scales,
+            },
+            q_norm: &norm,
+            index: weights,
+        },
+        CandidateQueryLayout::new(layout, epsilon).expect("consumer QR layout"),
+        IndexKeyView::new(keys, nonzero(usize_field(model, "index_head_dim")))
+            .expect("complete staged key view"),
+    )
+    .expect_err("shortened source input rejects before staged publication");
+    assert!(matches!(
+        error,
+        ScoredQueryError::InputLength { actual, stride }
+            if actual == truncated.len() && stride == usize_field(model, "dim")
+    ));
+}
+
 #[test]
 #[allow(
     clippy::too_many_lines,
@@ -502,16 +550,105 @@ fn native_index_selection_drives_captured_attention_calls() {
         let positions = shape(field(owner_case, "latent"))[1];
         let input = field(compressor_case, "attention_input");
         assert_eq!(shape(input), [1, positions, 128]);
-        let prepared = key_owner
-            .forward(RatioOneOwnerCall::new(
-                IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID")),
-                attention_case.start_pos,
-                nonzero(positions),
-                &bf16(input),
-                &source_frequencies(&raw, attention_case.start_pos, positions, 16),
-                weights,
-            ))
-            .expect("native atomic owner call");
+        let input = bf16(input);
+        let owner_frequencies = source_frequencies(&raw, attention_case.start_pos, positions, 16);
+        let publication =
+            IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID"));
+        let owner_call = RatioOneOwnerCall::new(
+            publication,
+            attention_case.start_pos,
+            nonzero(positions),
+            &input,
+            &owner_frequencies,
+            weights,
+        );
+        let clean = if call_id == 1 {
+            assert_eq!(
+                attention_case.start_pos, 5,
+                "captured first decode starts at five"
+            );
+            let key_before = key_owner.key_prefix(0).expect("live key prefix").to_vec();
+            let kv_before = key_owner.kv_prefix(0).expect("live KV prefix").to_vec();
+            let metadata = (
+                key_owner.epoch(),
+                key_owner.next_call_id(),
+                key_owner.next_position(),
+                key_owner.valid_positions(),
+            );
+            let discarded = key_owner
+                .prepare(owner_call)
+                .expect("staged decode publication");
+            assert_eq!(
+                discarded
+                    .key_prefix(0)
+                    .expect("complete staged decode keys"),
+                bf16(field(owner_case, "index_cache_after")),
+            );
+            assert_eq!(
+                discarded.kv_prefix(0).expect("complete staged decode KV"),
+                attention_case.compressed_kv.bf16(),
+            );
+            assert_truncated_staged_score_is_rejected(
+                &raw,
+                raw_case,
+                index_layout,
+                index_weights,
+                discarded
+                    .key_prefix(0)
+                    .expect("complete staged decode keys"),
+            );
+            drop(discarded);
+            assert_eq!(
+                key_owner.key_prefix(0).expect("discarded key prefix"),
+                key_before
+            );
+            assert_eq!(
+                key_owner.kv_prefix(0).expect("discarded KV prefix"),
+                kv_before
+            );
+            assert_eq!(
+                (
+                    key_owner.epoch(),
+                    key_owner.next_call_id(),
+                    key_owner.next_position(),
+                    key_owner.valid_positions(),
+                ),
+                metadata,
+                "discarded decode transaction is invisible",
+            );
+            let mut clean_owner = key_owner.clone();
+            Some(
+                clean_owner
+                    .prepare(owner_call)
+                    .expect("clean decode transaction")
+                    .commit()
+                    .expect("clean decode publication"),
+            )
+        } else {
+            None
+        };
+        let pending = key_owner
+            .prepare(owner_call)
+            .expect("staged atomic owner call");
+        assert_eq!(pending.publication(), publication, "staged source identity");
+        let indices = generated_indices(
+            &raw,
+            raw_case,
+            attention_case,
+            index_layout,
+            index_weights,
+            pending.key_prefix(0).expect("complete staged key prefix"),
+            pending.publication(),
+        );
+        assert_eq!(
+            pending.kv_prefix(0).expect("complete staged KV prefix"),
+            attention_case.compressed_kv.bf16(),
+            "complete staged compressed-KV prefix at call {call_id}"
+        );
+        let prepared = pending.commit().expect("native atomic owner call");
+        if let Some(clean) = clean {
+            assert_eq!(prepared, clean, "decode retry matches clean publication");
+        }
         assert_eq!(
             prepared.owner.projected,
             bf16(field(compressor_case, "projected"))
@@ -525,16 +662,10 @@ fn native_index_selection_drives_captured_attention_calls() {
             bf16(field(owner_case, "latent")),
             "cross-capture latent gate"
         );
-        let keys = key_owner.key_prefix(0).expect("batch zero keys");
-        assert_eq!(keys, bf16(field(owner_case, "index_cache_after")));
-        let indices = generated_indices(
-            &raw,
-            raw_case,
-            attention_case,
-            index_layout,
-            index_weights,
-            keys,
-            IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID")),
+        assert_eq!(
+            key_owner.key_prefix(0).expect("published batch zero keys"),
+            bf16(field(owner_case, "index_cache_after")),
+            "published complete index-key prefix at call {call_id}"
         );
         let compressed = key_owner.kv_prefix(0).expect("batch zero compressed KV");
         assert_eq!(
