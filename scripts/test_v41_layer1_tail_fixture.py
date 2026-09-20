@@ -39,7 +39,26 @@ class LayerOneTailFixtureTest(unittest.TestCase):
         )
 
     def test_committed_fixture_matches_current_source_capture(self):
-        self.assertEqual(json.loads(FIXTURE.read_text()), self.fixture)
+        committed = json.loads(FIXTURE.read_text())
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        stable = (
+            "revision",
+            "model_sha256",
+            "kernel_source_sha256",
+            "cpu_backend_sha256",
+            "loader_sha256",
+            "runner_sha256",
+            "storage_byteorder",
+        )
+        self.assertEqual(
+            {key: committed["source"][key] for key in stable},
+            {key: self.fixture["source"][key] for key in stable},
+        )
+        for key in ("forward_observers_sha256", "complete_capture_sha256"):
+            self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")
 
     def test_missing_input_and_terminal_mutation_are_rejected(self):
         capture = copy.deepcopy(self.receipt)

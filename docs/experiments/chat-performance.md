@@ -688,3 +688,34 @@ tests require unaffected ancestors and a fresh prefill before retrying a failed
 stream. Allocation episode counters remain test-only metadata. This
 does not change the successful-decode workload measured above, but these timing
 receipts do not establish failure-path equivalence.
+
+## Stepped resident-cache qualification
+
+The resident executor now stores K/V arrays at bounded growth points (128,
+512, then the admitted context ceiling) and slices only the valid prefix for
+attention. A failed append resets the whole request cache. The implementation
+is in the Metal Qwen path; it is not a general MLX buffer-donation claim.
+
+The source property gate passed the capacity bounds and overflow contract, and
+the full Metal Qwen suite passed 74 tests with 6 checkpoint-dependent tests
+ignored. The isolated experiment binary was
+`d3e4ec74389c39cb9d01cd483389a81ac8c7dd80e145c0ed33763bf517726feb`.
+
+Matched resident server runs used 2048 total context tokens, greedy decoding,
+three fresh CLI processes, and a 64-token cap. Every run preserved the exact
+output hash and generated token IDs between concatenation and stepped storage.
+The real Qwen3-4B control used revision
+`cdbee75f17c01a7cc42f958dc650907174af0554` and a requested 1024 MiB logical
+K/V budget:
+
+| Model | Decode median concat | Decode median stepped | Peak RSS median concat | Peak RSS median stepped |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3-0.6B | 904.64 ms | 695.69 ms | 966,180,864 bytes | 938,180,608 bytes |
+| Qwen3-4B | 3,796.67 ms | 3,600.29 ms | 1,116,962,816 bytes | 1,111,457,792 bytes |
+
+HTTP Responses controls also remained valid and incomplete at the cap. Their
+wall-time medians were 1126.29 ms versus 1142.64 ms for the 0.6B long prompt,
+and 4B short/long lifecycle checks completed without reset or output-shape
+errors. RSS is the fresh CLI process measurement; the HTTP client does not
+claim server RSS. These are local measurements and should be re-run when MLX,
+macOS, or the model revision changes.

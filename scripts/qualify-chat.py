@@ -222,6 +222,8 @@ def cli_trials(
                 str(args.max_tokens),
                 "--context-tokens",
                 str(args.context_tokens),
+                "--kv-budget-mib",
+                str(args.kv_budget_mib),
                 "--json",
             ],
             output,
@@ -323,16 +325,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs", type=positive, default=3)
     parser.add_argument("--max-tokens", type=positive, default=64)
     parser.add_argument("--context-tokens", type=positive, default=2048)
+    parser.add_argument("--kv-budget-mib", type=positive, default=512)
     parser.add_argument("--timeout-seconds", type=positive, default=120)
     parser.add_argument("--expected-model-revision")
     parser.add_argument("--sample-pid", type=positive)
     args = parser.parse_args(argv)
-    if args.runs < 3 or args.max_tokens > 256 or args.context_tokens > 2048:
-        parser.error("runs must be >=3; max tokens <=256; context tokens <=2048")
+    if (
+        args.runs < 3
+        or args.max_tokens > 256
+        or args.context_tokens > 2048
+        or args.kv_budget_mib > 8192
+    ):
+        parser.error(
+            "runs must be >=3; max tokens <=256; context tokens <=2048; "
+            "K/V budget MiB <=8192"
+        )
     dry = {
         "status": "dry_run",
         "runs": args.runs,
         "context_tokens": args.context_tokens,
+        "kv_budget_mib": args.kv_budget_mib,
         "long_prompt_sha256": hashlib.sha256(LONG_PROMPT.encode()).hexdigest(),
         "long_prompt_utf8_bytes": len(LONG_PROMPT.encode()),
         "sample": None
@@ -376,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
             "model_revision_from_path": revision,
             "preflight_prompt_tokens": prompt_tokens,
             "context_tokens": args.context_tokens,
+            "kv_budget_mib": args.kv_budget_mib,
             "long_total_tokens": prompt_tokens + args.max_tokens,
             "cli": [asdict(run) for run in cli],
             "cli_peak_rss_bytes": {
@@ -402,7 +415,11 @@ def main(argv: list[str] | None = None) -> int:
         json.JSONDecodeError,
         urllib.error.URLError,
     ) as error:
-        receipt = {"status": "failed", "error": f"{type(error).__name__}: {error}"}
+        receipt = {
+            "status": "failed",
+            "kv_budget_mib": args.kv_budget_mib,
+            "error": f"{type(error).__name__}: {error}",
+        }
         (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
         print(json.dumps(receipt, indent=2), file=sys.stderr)
         return 1

@@ -81,14 +81,33 @@ fn fixture() -> Fixture {
     fixture
 }
 
-fn native_inputs(fixture: &Fixture) -> Vec<(usize, Vec<u16>)> {
+pub(super) type BlockEntries = [(usize, Vec<u16>, Vec<f32>)];
+
+fn native_inputs(fixture: &Fixture, entries: Option<&BlockEntries>) -> Vec<(usize, Vec<u16>)> {
+    if let Some(entries) = entries {
+        assert_eq!(entries.len(), fixture.cases.len());
+    }
     let norm = fixture.block_parameters["layers.1.attn_norm.weight"].bf16();
     fixture
         .cases
         .iter()
-        .map(|case| {
-            let residual = case.residual.bf16();
-            let incoming = case.incoming_pre.fp32();
+        .enumerate()
+        .map(|(index, case)| {
+            let captured_residual = case.residual.bf16();
+            let captured_incoming = case.incoming_pre.fp32();
+            let (residual, incoming) = if let Some(entries) = entries {
+                let (start, residual, incoming) = &entries[index];
+                assert_eq!(*start, case.start_pos);
+                assert_eq!(
+                    residual, &captured_residual,
+                    "native Engram layer-one residual at block boundary"
+                );
+                assert_eq!(incoming.len(), captured_incoming.len());
+                assert!(incoming.iter().all(|value| value.is_finite()));
+                (residual.as_slice(), incoming.as_slice())
+            } else {
+                (captured_residual.as_slice(), captured_incoming.as_slice())
+            };
             let input = residual
                 .chunks_exact(256)
                 .enumerate()
@@ -450,8 +469,14 @@ fn assert_ffn_envelope(
 }
 
 pub(super) fn native_layer_one_entries() -> Vec<(usize, Vec<u16>, Vec<f32>)> {
+    native_layer_one_entries_from_block_entries(None)
+}
+
+pub(super) fn native_layer_one_entries_from_block_entries(
+    entries: Option<&BlockEntries>,
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let fixture = fixture();
-    let inputs = native_inputs(&fixture);
+    let inputs = native_inputs(&fixture, entries);
     let outputs = layer1_attention_capture::native_outputs_from_inputs(&inputs);
     native_ffn(&fixture, &attention_handoffs(&fixture, &outputs))
 }
@@ -466,7 +491,7 @@ fn native_layer_one_attention_hc_ffn_reaches_final_logits() {
 #[should_panic(expected = "native layer-one attention output")]
 fn discarded_native_layer_one_attention_fails_before_ffn() {
     let fixture = fixture();
-    let inputs = native_inputs(&fixture);
+    let inputs = native_inputs(&fixture, None);
     let mut outputs = layer1_attention_capture::native_outputs_from_inputs(&inputs);
     outputs[0].1.fill(0);
     attention_handoffs(&fixture, &outputs);

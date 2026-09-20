@@ -7,6 +7,13 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Resident Qwen chat now uses bounded stepped K/V storage with valid-prefix
+  attention and whole-request reset on append failure. The 2048-token real
+  server gate preserved exact output/token parity for Qwen3-0.6B and 4B; local
+  three-process measurements reduced 4B decode median from 3796.7 to 3600.3 ms.
+- A source-only DeepSeek V4.1 layer-one Engram fixture pins stream/hash shape,
+  layer binding, encoded parameter finiteness, and observer restoration with
+  negative controls for layer substitution and tampering.
 - The reduced DeepSeek continuation now starts at the native layer-two FFN,
   carrying its residual and HC pre-mix through Engram3 and layers three/four
   to final logits. Source-derived arithmetic bounds and mutated handoff tests

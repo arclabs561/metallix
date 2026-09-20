@@ -428,15 +428,33 @@ def hooks_for(
     def capture_engram_input(
         _module: torch.nn.Module, inputs: tuple[object, ...]
     ) -> None:
-        record_name = "layers.3.engram_input"
+        layer_id = next(
+            (
+                layer_id
+                for layer_id in (1, 3)
+                if _module is getattr(model.layers[layer_id], "engram", None)
+            ),
+            None,
+        )
+        if layer_id is None:
+            raise RuntimeError("source Engram observer received an unknown module")
+        record_name = f"layers.{layer_id}.engram_input"
         cap_guard(record_name)
         if len(inputs) != 3:
-            raise RuntimeError("layer-three Engram expected stream, hash IDs, and mask")
+            raise RuntimeError("source Engram expected stream, hash IDs, and mask")
         stream, hash_ids, mask = inputs
         if not isinstance(stream, torch.Tensor) or not isinstance(
             hash_ids, torch.Tensor
         ):
-            raise TypeError("layer-three Engram inputs must be tensors")
+            raise TypeError("source Engram inputs must be tensors")
+        if stream.dtype != torch.bfloat16 or tuple(stream.shape[2:]) != (2, 128):
+            raise RuntimeError("source Engram stream has an unexpected shape")
+        if hash_ids.dtype != torch.int64 or tuple(hash_ids.shape[2:]) != (6,):
+            raise RuntimeError("source Engram hash IDs must contain six columns")
+        if tuple(stream.shape[:2]) != tuple(hash_ids.shape[:2]):
+            raise RuntimeError(
+                "source Engram stream and hash IDs have different lengths"
+            )
         records[record_name] = {
             "stream": object_record(stream, include_storage=True),
             "hash_ids": object_record(hash_ids, include_storage=True),
@@ -528,9 +546,14 @@ def hooks_for(
                 )
 
             handles.append(module.register_forward_pre_hook(capture_layer_two_freqs))
-        if name == "layers.3.engram":
+        if name in {"layers.1.engram", "layers.3.engram"}:
             handles.append(module.register_forward_pre_hook(capture_engram_input))
-        if name in {"layers.3.engram.embed", "layers.3.engram.wkv"}:
+        if name in {
+            "layers.1.engram.embed",
+            "layers.1.engram.wkv",
+            "layers.3.engram.embed",
+            "layers.3.engram.wkv",
+        }:
             handles.append(module.register_forward_hook(capture(name)))
         if name in {
             "layers.1.attn.compressor.wkv",

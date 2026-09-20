@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -11,6 +13,8 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 SCRIPT = pathlib.Path(__file__).with_name("qualify-chat.py")
 SPEC = importlib.util.spec_from_file_location("qualify_chat", SCRIPT)
@@ -87,6 +91,42 @@ class QualifyChatTests(unittest.TestCase):
                 2048,
                 1983,
             )
+
+    def test_cli_trials_passes_requested_kv_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory)
+            args = argparse.Namespace(
+                binary="target/release/mx",
+                model="/models/checkpoint",
+                runs=3,
+                max_tokens=2,
+                context_tokens=2048,
+                kv_budget_mib=1024,
+                timeout_seconds=120,
+            )
+            completed = subprocess.CompletedProcess(
+                [], 0, cli_payload(), "123 maximum resident set size"
+            )
+            with patch.object(module, "command_run", return_value=completed) as run:
+                module.cli_trials(args, output, 1983)
+            for call in run.call_args_list:
+                command = call.args[0]
+                budget_index = command.index("--kv-budget-mib")
+                self.assertEqual(command[budget_index + 1], "1024")
+
+    def test_kv_budget_is_positive_and_recorded_in_dry_run(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            module.main(["--kv-budget-mib", "0"])
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(module.main([]), 0)
+        self.assertEqual(json.loads(stdout.getvalue())["kv_budget_mib"], 512)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(module.main(["--kv-budget-mib", "1024"]), 0)
+        plan = json.loads(stdout.getvalue())
+        self.assertEqual(plan["status"], "dry_run")
+        self.assertEqual(plan["kv_budget_mib"], 1024)
 
     def test_http_requires_explicit_incomplete_usage_and_stable_hash(self) -> None:
         sample = {

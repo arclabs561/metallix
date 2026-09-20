@@ -35,7 +35,10 @@ choices without expanding current support claims.
   all 50 whole-logit trace pairs, reduced the long-prompt median by 18.16%, and
   regressed short prompts by about 1%; 128-plus-64-token logical KV is 112 MiB rather
   than fixed capacity's 448 MiB. Production adoption still requires matched real
-  4B requests. See the [measurement ledger](experiments/chat-performance.md).
+  4B requests. The resident executor now uses the stepped storage path; matched
+  2048-token real-server requests preserved output hashes and 64 generated IDs
+  for Qwen3-0.6B and Qwen3-4B, with the 4B decode median moving from 3796.7 ms
+  to 3600.3 ms. See the [measurement ledger](experiments/chat-performance.md).
 - `mx agent` runs a bounded read-only workspace tool loop. Complete tool calls
   and surrounding assistant text survive history replay. Paths are opened
   relative to a pinned workspace descriptor without following symlinks.

@@ -1390,7 +1390,7 @@ fn native_layer_two_ffn_engram_through_final_suffix_matches_source_logits() {
 }
 
 #[test]
-#[should_panic(expected = "native layer-two FFN residual at Engram boundary")]
+#[should_panic(expected = "native Engram stream boundary")]
 fn native_layer_two_join_rejects_changed_ffn_residual() {
     let layer_two = native_layer_two_entries();
     let streams: Vec<_> = layer_two

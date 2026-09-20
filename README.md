@@ -319,11 +319,14 @@ previous-call layer-three state.
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
 tokens, short requests after long ones, and process-scoped CPU profiling. The
 maintained `scripts/qualify-chat.py` runner repeats these checks against an
-already-running local server. A private stepped-capacity cache experiment matched
+already-running local server. A stepped-capacity resident cache now backs the
+production chat executor. It matched
 whole-logit traces in 50 paired rows, reduced 1983-token decode time by 18.16%,
 and regressed short prompts by about 1%; 128-token prompts plus 64 decode steps retained 112 MiB of
-logical KV rather than fixed capacity's 448 MiB. Production cache behavior is
-unchanged, and matched real 4B requests remain the next gate. Separate 4B
+logical KV rather than fixed capacity's 448 MiB. Matched real 2048-token
+requests preserved output hashes and 64 generated token IDs for both Qwen3-0.6B
+and Qwen3-4B; the 4B decode median fell from 3796.7 to 3600.3 ms across three
+fresh CLI processes. These are local M3 Max measurements. Separate 4B
 Responses tool-result replay passed three JSON and three SSE trials; its stricter
 qualifier validates model, output-item, and content identities, and three live
 tool-stream disconnect recoveries also passed. See the measurement ledger for
