@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import subprocess
@@ -27,6 +28,7 @@ def call_response() -> dict:
     return {
         "id": "resp_1",
         "object": "response",
+        "model": "metallix-qwen3",
         "status": "completed",
         "usage": {"input_tokens": 5, "output_tokens": 4, "total_tokens": 9},
         "output": [
@@ -88,13 +90,167 @@ def sse(response: dict) -> str:
     )
 
 
+def message_response() -> dict:
+    return {
+        "id": "resp_2",
+        "object": "response",
+        "model": "metallix-qwen3",
+        "status": "completed",
+        "usage": {"input_tokens": 5, "output_tokens": 4, "total_tokens": 9},
+        "output": [
+            {
+                "id": "msg_2",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "QUALIFIED:fact"}],
+            }
+        ],
+    }
+
+
+def message_sse(response: dict) -> str:
+    item = response["output"][0]
+    part = item["content"][0]
+    events = [
+        {
+            "sequence_number": 0,
+            "type": "response.created",
+            "response": {
+                "id": response["id"],
+                "object": "response",
+                "status": "in_progress",
+                "output": [],
+            },
+        },
+        {
+            "sequence_number": 1,
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": item["id"]},
+        },
+        {
+            "sequence_number": 2,
+            "type": "response.content_part.added",
+            "item_id": item["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "part": {**part, "text": ""},
+        },
+        {
+            "sequence_number": 3,
+            "type": "response.output_text.delta",
+            "item_id": item["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "delta": part["text"],
+        },
+        {
+            "sequence_number": 4,
+            "type": "response.output_text.done",
+            "item_id": item["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "text": part["text"],
+        },
+        {
+            "sequence_number": 5,
+            "type": "response.content_part.done",
+            "item_id": item["id"],
+            "output_index": 0,
+            "content_index": 0,
+            "part": part,
+        },
+        {
+            "sequence_number": 6,
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item,
+        },
+        {"sequence_number": 7, "type": "response.completed", "response": response},
+    ]
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    )
+
+
 class ResponsesToolsTests(unittest.TestCase):
+    def test_answer_requires_assistant_output_text_and_message_identity(self) -> None:
+        response = call_response()
+        item = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "QUALIFIED:fact"}],
+        }
+        response["output"] = [item]
+        self.assertEqual(module.answer_text(response), "QUALIFIED:fact")
+        for field, value in (
+            ("role", "user"),
+            ("role", None),
+            ("id", ""),
+            ("id", None),
+            ("content", []),
+            ("content", [{"type": "input_text", "text": "QUALIFIED:fact"}]),
+            ("content", [{"type": "refusal", "text": "QUALIFIED:fact"}]),
+            ("content", [{"type": "output_text", "text": 123}]),
+        ):
+            malformed = copy.deepcopy(response)
+            malformed["output"][0][field] = value
+            with (
+                self.subTest(field=field, value=value),
+                self.assertRaises(module.ProtocolError),
+            ):
+                module.answer_text(malformed)
+
     def test_call_and_replay_contract(self) -> None:
         response = module.validate_response(call_response())
         call = module.call_from_response(response)
         replay = module.replay_input(call, "FACT-hidden")
         module.validate_replay_input(replay, "call_1")
         self.assertEqual(replay[-1]["call_id"], "call_1")
+
+    def test_response_model_and_function_item_identity_are_required(self) -> None:
+        response = call_response()
+        module.validate_expected_model(response, "metallix-qwen3")
+        for model in (None, "other-model"):
+            malformed = copy.deepcopy(response)
+            if model is None:
+                del malformed["model"]
+            else:
+                malformed["model"] = model
+            with self.assertRaises(module.ProtocolError):
+                module.validate_expected_model(malformed, "metallix-qwen3")
+        malformed = copy.deepcopy(response)
+        del malformed["output"][0]["id"]
+        with self.assertRaises(module.ProtocolError):
+            module.call_from_response(malformed)
+
+    def test_sse_binds_message_content_parts_and_completed_text(self) -> None:
+        response, events = module.parse_sse(message_sse(message_response()))
+        module.validate_stream_events(response, events)
+        malformed = [
+            event for event in events if event["type"] != "response.content_part.added"
+        ]
+        with self.assertRaises(module.ProtocolError):
+            module.validate_stream_events(response, malformed)
+        malformed = copy.deepcopy(events)
+        malformed[4]["text"] = "wrong"
+        with self.assertRaises(module.ProtocolError):
+            module.validate_stream_events(response, malformed)
+        malformed = copy.deepcopy(events)
+        malformed[5]["part"] = {"type": "output_text", "text": "wrong"}
+        with self.assertRaises(module.ProtocolError):
+            module.validate_stream_events(response, malformed)
+        malformed = copy.deepcopy(events)
+        malformed[2]["part"] = response["output"][0]["content"][0]
+        with self.assertRaises(module.ProtocolError):
+            module.validate_stream_events(response, malformed)
+        malformed = copy.deepcopy(events)
+        malformed[3]["content_index"] = 1
+        with self.assertRaises(module.ProtocolError):
+            module.validate_stream_events(response, malformed)
 
     def test_sse_validates_sequence_ids_and_argument_assembly(self) -> None:
         response, events = module.parse_sse(sse(call_response()))

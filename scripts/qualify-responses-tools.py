@@ -140,6 +140,13 @@ def validate_response(response: object) -> dict:
     return response
 
 
+def validate_expected_model(response: dict, expected_model: object) -> None:
+    if not isinstance(expected_model, str) or not expected_model:
+        raise ProtocolError("qualification request has no model identity")
+    if response.get("model") != expected_model:
+        raise ProtocolError("response model does not match qualification request")
+
+
 def parse_sse(raw: str) -> tuple[dict, list[dict]]:
     events: list[dict] = []
     event_name: str | None = None
@@ -232,6 +239,8 @@ def validate_stream_events(response: dict, events: list[dict]) -> None:
             "response.function_call_arguments.done",
             "response.output_text.delta",
             "response.output_text.done",
+            "response.content_part.added",
+            "response.content_part.done",
         }:
             item_id = event.get("item_id")
             output_index = event.get("output_index")
@@ -248,9 +257,17 @@ def validate_stream_events(response: dict, events: list[dict]) -> None:
                 event_type.startswith("response.function_call")
                 and item_type != "function_call"
             ) or (
-                event_type.startswith("response.output_text") and item_type != "message"
+                event_type.startswith(("response.output_text", "response.content_part"))
+                and item_type != "message"
             ):
                 raise ProtocolError("SSE event type does not match output item")
+            if event_type.startswith(
+                ("response.output_text", "response.content_part")
+            ) and (
+                type(event.get("content_index")) is not int
+                or event["content_index"] != 0
+            ):
+                raise ProtocolError("SSE text event has an invalid content index")
     done = [
         event.get("item")
         for event in events
@@ -321,18 +338,19 @@ def validate_stream_events(response: dict, events: list[dict]) -> None:
             ):
                 raise ProtocolError("SSE function-call arguments do not assemble")
         elif item.get("type") == "message":
-            content = item.get("content")
-            if not isinstance(content, list) or not all(
-                isinstance(part, dict) and isinstance(part.get("text"), str)
-                for part in content
-            ):
-                raise ProtocolError("message output content is invalid")
+            text = message_text(item)
+            content = item["content"]
+            if len(content) != 1:
+                raise ProtocolError("SSE message has unsupported content parts")
+            part = content[0]
+            initial_part = {**part, "text": ""}
             delta_events = [
                 (event_index, event)
                 for event_index, event in enumerate(events)
                 if event.get("type") == "response.output_text.delta"
                 and event.get("item_id") == item_id
                 and event.get("output_index") == index
+                and event.get("content_index") == 0
             ]
             deltas = [event.get("delta") for _, event in delta_events]
             text_done_events = [
@@ -341,16 +359,41 @@ def validate_stream_events(response: dict, events: list[dict]) -> None:
                 if event.get("type") == "response.output_text.done"
                 and event.get("item_id") == item_id
                 and event.get("output_index") == index
+                and event.get("content_index") == 0
+            ]
+            part_added_events = [
+                (event_index, event)
+                for event_index, event in enumerate(events)
+                if event.get("type") == "response.content_part.added"
+                and event.get("item_id") == item_id
+                and event.get("output_index") == index
+                and event.get("content_index") == 0
+            ]
+            part_done_events = [
+                (event_index, event)
+                for event_index, event in enumerate(events)
+                if event.get("type") == "response.content_part.done"
+                and event.get("item_id") == item_id
+                and event.get("output_index") == index
+                and event.get("content_index") == 0
             ]
             if (
                 not all(isinstance(delta, str) for delta in deltas)
-                or "".join(deltas) != "".join(part["text"] for part in content)
+                or "".join(deltas) != text
                 or len(text_done_events) != 1
+                or text_done_events[0][1].get("text") != text
+                or len(part_added_events) != 1
+                or part_added_events[0][1].get("part") != initial_part
+                or len(part_done_events) != 1
+                or part_done_events[0][1].get("part") != part
+                or not (added_index < part_added_events[0][0])
                 or not all(
-                    added_index < event_index < text_done_events[0][0]
+                    part_added_events[0][0] < event_index < text_done_events[0][0]
                     for event_index, _ in delta_events
                 )
-                or not (text_done_events[0][0] < item_done_index)
+                or not (
+                    text_done_events[0][0] < part_done_events[0][0] < item_done_index
+                )
             ):
                 raise ProtocolError("SSE text deltas do not assemble")
         else:
@@ -362,6 +405,8 @@ def call_from_response(response: dict) -> dict:
     if len(output) != 1 or not isinstance(output[0], dict):
         raise ModelError("expected exactly one function call")
     call = output[0]
+    if not isinstance(call.get("id"), str) or not call["id"]:
+        raise ProtocolError("function-call response item lacks an ID")
     if (
         call.get("type") != "function_call"
         or call.get("name") != TOOL["name"]
@@ -380,6 +425,26 @@ def call_from_response(response: dict) -> dict:
     return call
 
 
+def message_text(item: dict) -> str:
+    """Accept only assistant output-text parts, never echoed input or refusal data."""
+    content = item.get("content")
+    if (
+        not isinstance(item.get("id"), str)
+        or not item["id"]
+        or item.get("role") != "assistant"
+        or not isinstance(content, list)
+        or not content
+        or not all(
+            isinstance(part, dict)
+            and part.get("type") == "output_text"
+            and isinstance(part.get("text"), str)
+            for part in content
+        )
+    ):
+        raise ProtocolError("answer response message content or identity is invalid")
+    return "".join(part["text"] for part in content)
+
+
 def answer_text(response: dict) -> str:
     if not response["output"] or any(
         not isinstance(item, dict)
@@ -388,12 +453,7 @@ def answer_text(response: dict) -> str:
         for item in response["output"]
     ):
         raise ModelError("answer response contains a function call or no message")
-    try:
-        return "".join(
-            part["text"] for item in response["output"] for part in item["content"]
-        )
-    except (KeyError, TypeError) as error:
-        raise ProtocolError("answer response message content is invalid") from error
+    return "".join(message_text(item) for item in response["output"])
 
 
 def replay_input(call: dict, value: str) -> list[dict]:
@@ -469,11 +529,13 @@ def request(
     if payload["stream"]:
         response, events = parse_sse(text)
         validate_stream_events(response, events)
-        return response, events
-    try:
-        return validate_response(json.loads(text)), None
-    except json.JSONDecodeError as error:
-        raise ProtocolError("malformed JSON response") from error
+    else:
+        try:
+            response, events = validate_response(json.loads(text)), None
+        except json.JSONDecodeError as error:
+            raise ProtocolError("malformed JSON response") from error
+    validate_expected_model(response, payload.get("model"))
+    return response, events
 
 
 def classify(error: ModelError | ProtocolError | TransportError) -> str:
