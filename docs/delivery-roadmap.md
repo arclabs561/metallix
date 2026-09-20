@@ -16,8 +16,9 @@ interfaces stable or turn synthetic parity into model support.
 
 The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
-about 1% short-prompt regression. Production adoption remains gated on matched
-real requests and 4B qualification. Native layer-one attention/HC/FFN now feeds
+about 1% short-prompt regression. Matched real 2048-token requests for Qwen3-
+0.6B and 4B preserved output/token parity, so bounded stepped storage is now
+the resident production path. Native layer-one attention/HC/FFN now feeds
 the layer-two-to-logits reduced suffix; the earlier Engram/HC entry, layer zero
 and embeddings, then real previous-call shared state remain next. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
@@ -69,7 +70,7 @@ measurements; competing GPU workloads invalidate performance comparisons.
 
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
-| Qwen performance | Compare the qualified private stepped-capacity candidate on matched real resident requests, then the 4B control. | Preserve full-logit/token and branch/EOS replay; improve repeated real request measurements within memory limits. Otherwise retain concatenation. | Reversible experiment; no public tuning flag. |
+| Qwen performance | Profile the adopted stepped resident path across model sizes and repeated request shapes. | Preserve full-logit/token and branch/EOS replay; retain the concatenation receipt as a regression control. | Reversible implementation; no public tuning flag. |
 | DeepSeek completion | Earlier Engram/HC entry, then layer-zero/embedding composition and real previous-call layer-three state. Consumer: the complete reduced text oracle. | Each replaced boundary preserves source-derived numerical bounds, exact discrete routes and failure/retry behavior; the joined token-to-logit trace passes. | Reversible implementation; source semantics must not be silently changed. |
 | Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
 

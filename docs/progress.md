@@ -151,9 +151,10 @@ choices without expanding current support claims.
    Current profiling places context growth inside MLX evaluation while transpose
    construction is below 0.3% of decode time. Standalone component graphs show
    material cache-concatenation growth with prefix length. Test a bounded
-   capacity-buffer update candidate against exact logit/fork parity, short- and
-   long-context serving time, and memory before adoption. The pinned MLX binding
-   exposes functional slice updates, not guaranteed in-place buffer reuse.
+   The adopted stepped capacity-buffer path has exact logit/fork parity and
+   matched real 0.6B/4B request receipts. Continue profiling it across request
+   shapes; the pinned MLX binding exposes functional slice updates, not
+   guaranteed in-place buffer reuse.
    Prefix reuse, quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
    forward through the earlier text blocks. Layers three and four now connect
