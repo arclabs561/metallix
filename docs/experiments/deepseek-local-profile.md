@@ -92,3 +92,8 @@ Attempting to apply the raw 4,096-wide embedding directly to `wq_a` correctly
 fails closed: layer-zero `wq_a` consumes a 3,072-wide latent. The missing native
 boundary is the preceding latent projection/normalization stage, now identified
 by a real artifact shape check rather than a guessed matrix multiply.
+
+The next real layer-zero parameter gate is now covered: `attn_hc.fn` decodes as
+an F32 `24 × 16384` matrix and evaluates on Metal, checksum
+`6150937c7aee9697`. This anchors the hyper-connection parameter path before its
+latent mixing is implemented.

@@ -116,6 +116,36 @@ pub fn read_affine_row_from_shard(
     decode_affine_row(&packed, &scales, &biases, logical_width, bits, group_size)
 }
 
+/// Reads a bounded row-major F32 tensor from a validated shard.
+pub fn read_f32_tensor_from_shard(
+    shard: &Path,
+    header: &V41SafetensorsHeader,
+    name: &str,
+    rows: usize,
+    width: usize,
+) -> Result<Vec<f32>, MlxAffineRowError> {
+    let tensor = header
+        .tensor(name)
+        .ok_or_else(|| MlxAffineRowError::MissingTensor {
+            name: name.to_owned(),
+        })?;
+    if tensor.dtype() != V41StorageDtype::F32
+        || tensor.shape() != [rows as u64, width as u64]
+        || tensor.byte_length() != (rows * width * 4) as u64
+    {
+        return Err(MlxAffineRowError::TensorShape {
+            name: name.to_owned(),
+        });
+    }
+    let mut file = File::open(shard).map_err(|error| MlxAffineRowError::Io(error.to_string()))?;
+    let mut bytes = vec![0_u8; rows * width * 4];
+    read_range(&mut file, tensor.file_range().start, &mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
 fn read_range(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), MlxAffineRowError> {
     file.seek(SeekFrom::Start(offset))
         .and_then(|_| file.read_exact(bytes))

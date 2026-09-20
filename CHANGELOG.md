@@ -25,6 +25,8 @@ published release; reference operators do not imply full-model support.
 - The attempted embedding-to-`wq_a` application now reports the real latent
   width mismatch explicitly: embeddings are 4,096-wide while this projection
   consumes a 3,072-wide pre-attention latent.
+- Added native decoding and Metal evaluation for the real layer-zero
+  hyper-connection matrix (`24 × 16384`, checksum `6150937c7aee9697`).
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

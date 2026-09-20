@@ -37,7 +37,7 @@ mod v41_rotary;
 use clap::{Parser, Subcommand};
 use deepseek::{
     V41TextContract,
-    checkpoint::mlx::read_affine_row_from_shard,
+    checkpoint::mlx::{read_affine_row_from_shard, read_f32_tensor_from_shard},
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
 use qwen::{
@@ -1240,6 +1240,39 @@ fn inspect_v41_embedding_row(
                 return ExitCode::FAILURE;
             }
         };
+    if kind == "layer0-hc-fn" {
+        let values = match read_f32_tensor_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn_hc.fn",
+            24,
+            16_384,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("hyper-connection tensor decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let checksum = values.iter().fold(0_u64, |hash, value| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(value.to_bits()))
+        });
+        #[cfg(feature = "metal")]
+        if let Err(error) = deepseek::checkpoint::mlx::decode_affine_row_mlx(&values) {
+            eprintln!("MLX hyper-connection evaluation failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        println!("DeepSeek MLX hyper-connection tensor");
+        println!("kind: {kind}");
+        println!("rows: 24");
+        println!("width: 16384");
+        println!("fp32_checksum: {checksum:016x}");
+        #[cfg(feature = "metal")]
+        println!("metal_eval: passed");
+        println!("scope: hyper-connection parameter decode; no model execution");
+        return ExitCode::SUCCESS;
+    }
     let (weight, scales, biases, width, group_size) = match kind {
         "embedding" => (
             "model.embed_tokens.weight",
