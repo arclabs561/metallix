@@ -421,6 +421,53 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         self.append(&[input_id])
     }
 
+    /// Creates an independent decoder branch from this fully materialized KV
+    /// snapshot for the Qwen cache-replay qualification test. This is neither
+    /// a serving operation nor a cross-model cache API.
+    ///
+    /// The retained arrays are evaluated before their handles are cloned.
+    /// Later decode appends build replacement K/V arrays through concatenation;
+    /// they do not mutate the snapshot arrays owned by this executor.
+    #[cfg(test)]
+    pub(crate) fn fork_prefilled(&self) -> Result<Self, Qwen3ForwardError> {
+        if self.cached_tokens == 0 {
+            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+        }
+        if self.cache.len() != self.config.hidden_layers || self.cache.iter().any(Option::is_none) {
+            return Err(Qwen3ForwardError::CacheInconsistent);
+        }
+        let expected_shape = [
+            1,
+            as_i32(self.config.key_value_heads)?,
+            as_i32(self.cached_tokens)?,
+            as_i32(self.config.head_dim)?,
+        ];
+        for layer in self.cache.iter().flatten() {
+            if layer.keys.shape() != expected_shape || layer.values.shape() != expected_shape {
+                return Err(Qwen3ForwardError::CacheInconsistent);
+            }
+            layer.keys.eval()?;
+            layer.values.eval()?;
+        }
+        Ok(Self {
+            config: self.config,
+            weights: self.weights,
+            cache: self
+                .cache
+                .iter()
+                .map(|entry| {
+                    entry.as_ref().map(|layer| Qwen3LayerKv {
+                        keys: layer.keys.clone(),
+                        values: layer.values.clone(),
+                    })
+                })
+                .collect(),
+            cached_tokens: self.cached_tokens,
+            maximum_context_tokens: self.maximum_context_tokens,
+            resident_chat_plan: self.resident_chat_plan,
+        })
+    }
+
     fn append(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
         let result = self.append_inner(input_ids);
         if result.is_err() {
@@ -1284,6 +1331,8 @@ mod tests {
         assert_eq!(executor.kv_bytes(), 0);
     }
 
+    mod particle_replay;
+
     #[test]
     fn resident_chat_cached_decode_matches_fresh_prefill_beyond_512_tokens() {
         let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
@@ -1457,6 +1506,29 @@ mod tests {
             }"#,
         )
         .expect("long tiny-model config")
+    }
+
+    fn small_dense_config() -> Qwen3ForwardConfig {
+        Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen3",
+              "num_hidden_layers":1,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "head_dim":4,
+              "max_position_embeddings":16,
+              "rms_norm_eps":0.000001,
+              "rope_theta":1000000,
+              "hidden_act":"silu",
+              "tie_word_embeddings":true,
+              "attention_bias":false,
+              "mlp_bias":false
+            }"#,
+        )
+        .expect("small dense Qwen3 config")
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {

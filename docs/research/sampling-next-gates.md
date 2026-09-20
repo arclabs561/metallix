@@ -175,8 +175,24 @@ An independent FP64 CDF checks duplicated/discarded ancestors, absorbing EOS,
 post-resampling weight reset, normalization and ESS, and weighted terminal
 selection rather than MAP or equal-particle selection. This is a finite
 accounting gate, not a model-backed particle runtime, normalizer-unbiasedness
-proof, or convergence experiment. Physical prefix/cache branching remains
-unqualified.
+proof, or convergence experiment.
+
+The private Qwen cache-fork differential now exercises actual MLX K/V state:
+duplicate ancestor B, discard A, retain an EOS snapshot, then decode divergent
+children. Full-logit replay, complete parent/EOS cache contents and shapes, and
+malformed-cache rejection are checked. Sixteen generated tiny-model cases vary
+tokens and live ancestry. The checkpoint gate passed on Qwen3-0.6B revision
+`c1899de289a04d12100db370d81485cdf75e47ca` and Qwen3-4B-Instruct-2507 revision
+`cdbee75f17c01a7cc42f958dc650907174af0554`, using resident chat's FP32 preparation
+and the existing `5e-5` absolute full-logit tolerance. An initial raw-BF16 run
+did not meet that tolerance; this result does not qualify BF16 execution.
+
+Reproduce with `METALLIX_QWEN_MODEL=<snapshot> cargo test -p qwen --all-features
+checkpoint_particle_ancestry_fork_replays_next_logits -- --ignored --nocapture`.
+The implementation and harness remain test-only. Cloned array handles plus
+immutable concatenation pass this bounded replay gate; allocated/shared/resident
+memory, release behavior, fork latency and model-backed particle scheduling
+remain unmeasured. This is not a production cache-branch API or SMC runtime.
 
 **Question.** Can real decode state be forked/reindexed correctly and does any
 reported uncertainty mean more than a token statistic?
