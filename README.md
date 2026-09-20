@@ -291,9 +291,8 @@ operands and outputs at SHA-256
 `a13bb6cd53406f04e436f119aa8dec2184ca43a4d4f4969205bff8bdf26ac31b`.
 Its three focused Rust checks run `LayerAttentionState` from the native ratio-two
 owner KV/IDs at all three calls, compare diagnostics and final output, reject a
-non-owner publication, and show that a legal wrong index changes output. This
-standalone attention boundary does not yet join layer-one HC/FFN into layer two.
-The partial score operand is derived from a strict prior layer-three candidate
+non-owner publication, and show that a legal wrong index changes output. The
+partial score operand is derived from a strict prior layer-three candidate
 capture, rather than relabelled as layer-one score state.
 
 A source-only layer-two attention fixture proves that layer two borrows the
@@ -302,26 +301,33 @@ handoff. A standalone native layer-two attention check consumes the native
 layer-one KV/IDs, rejects a non-owner publication, and shows that a legal but
 wrong layer-one ID changes the result.
 
-A focused joined test derives the layer-two normalized attention input from
-captured layer-one residual/pre-mix state, runs native layer-two attention and
-HC post-mixing, then native FFN, Engram3, and the existing native layer-three/
-four suffix through final logits. BF16 boundaries remain exact and HC
+A source-only layer-one tail fixture, SHA-256
+`5f31036c71b797e7195a6b93cf2d656b8744b1e6a80a04dc68007d26e326b89b`,
+pins the attention-to-FFN tail and exact layer-two residual/pre-mix handoff.
+Its six source checks include layer identity and restoration after an injected
+failure. A focused `forward_moe` test now joins native layer-one attention, HC,
+and FFN into native layer two, then continues through Engram3 and the native
+layer-three/four suffix to final logits. BF16 boundaries remain exact and HC
 coefficients use fixed analytic bounds; discarded attention fails before FFN.
-A separate seven-check source-only HC fixture pins the layer-one-to-layer-two
-entry and its attention/FFN handoffs. Layer-one terminal residual/pre-mix,
-owner inputs, and the partial-call layer-three shared score keys remain captured
-boundaries. This is not a
-production API or full-model execution.
+The captured layer-one initial residual/pre-mix and the partial-call layer-three
+shared score keys remain boundaries. This is not a production API, whole graph,
+Metal path, or checkpoint execution. The next reduced-graph boundary is the
+earlier Engram/HC entry, followed by layer zero and token embeddings, then real
+previous-call layer-three state.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
 tokens, short requests after long ones, and process-scoped CPU profiling. The
 maintained `scripts/qualify-chat.py` runner repeats these checks against an
-already-running local server. A test-only fixed-capacity cache experiment reduced
-long-prompt decode time by 18.18% across ten paired trials, with matching logits;
-production cache behavior is unchanged. Separate 4B Responses tool-result replay
-passed three JSON and three SSE trials using `scripts/qualify-responses-tools.py`.
-See the measurement ledger for memory results and qualification limits.
+already-running local server. A private stepped-capacity cache experiment matched
+whole-logit traces in 50 paired rows, reduced 1983-token decode time by 18.16%,
+and regressed short prompts by about 1%; 128-token prompts plus 64 decode steps retained 112 MiB of
+logical KV rather than fixed capacity's 448 MiB. Production cache behavior is
+unchanged, and matched real 4B requests remain the next gate. Separate 4B
+Responses tool-result replay passed three JSON and three SSE trials; its stricter
+qualifier validates model, output-item, and content identities, and three live
+tool-stream disconnect recoveries also passed. See the measurement ledger for
+memory results and qualification limits.
 
 [Qwen experiments](docs/experiments/qwen-metal.md) record independent CPU
 logit comparisons and measured decode changes.

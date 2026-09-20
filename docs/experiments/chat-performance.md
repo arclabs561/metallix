@@ -551,8 +551,8 @@ timer. Both executors coexist, so this is not an isolated serving comparison.
 
 All 30 pairs matched full-logit trace fingerprints and greedy choices; every
 position also passed the `5e-5` numerical bound. A non-ignored tiny-model gate
-checks invalid-token and capacity-overflow rejection without changing cached
-content. Sixteen generated cases compare divergent branches to fresh full
+originally checked invalid-token and capacity-overflow rejection while retaining
+cached content; the later failure-parity correction below supersedes that policy. Sixteen generated cases compare divergent branches to fresh full
 forwards and retain an unchanged EOS snapshot. The experimental fork explicitly
 materializes independent storage; its cost is outside the decode timing.
 
@@ -620,3 +620,71 @@ The final six-trial receipt and raw requests/responses are retained in
 The Codex assessor now requires the value-bearing command output to precede
 the final marker; all six permutations have regression coverage. Three earlier
 Codex traces also pass this stricter check, without constituting a new live run.
+
+The Responses qualifier now additionally binds the returned model and output
+item identities, accepts only assistant output-text answers, and validates SSE
+content-part lifecycle and completed text. All twelve retained responses from
+the earlier six live replay trials pass the stricter checks. This reassessment
+is recorded separately and is not a new live model run.
+
+### Tool-stream disconnect recovery
+
+On the same 4B server executable and limits as the six replay trials above,
+three additional trials reset the TCP connection after observing the first
+`: generating` keepalive while the tool envelope was still withheld. Each
+trial then required a successful health request, a fresh native function call,
+and an exact answer from a newly generated synthetic tool result. All three
+passed. Client-observed reset-to-health times were 49.285, 49.993 and 50.481 ms
+(median 49.993 ms; sample standard deviation 0.601 ms).
+
+This checks serial-server recovery during tool generation, beyond the earlier
+plain-text disconnect control. It does not measure GPU cancellation latency,
+prove which decode step was interrupted, or determine how many tokens ran after
+the reset. Raw reset prefixes, recovery requests/responses, script identity and
+binary/model identity are retained in `artifacts/tool-disconnect-recovery/`.
+
+## Stepped-capacity growth experiment
+
+The same test-only 0.6B FP32 executor now offers a 128 → 512 → 2048-token
+allocation schedule. This remains a private experiment; production still uses
+concatenation. Ten paired rows at each of five prompt lengths include every
+growth operation inside the 64-step decode timer. One warmup precedes each
+shape, and execution order alternates by row and token. All 50 pairs matched
+whole-logit fingerprints, greedy choices, and the existing numerical bound.
+
+| Prompt tokens | Concat median / sample stdev, ms | Stepped median / sample stdev, ms | Median reduction |
+| --- | ---: | ---: | ---: |
+| 127 | 620.868 / 6.978 | 627.518 / 7.030 | -1.07% |
+| 128 | 608.719 / 2.144 | 614.469 / 3.801 | -0.94% |
+| 511 | 670.220 / 12.653 | 652.685 / 10.329 | 2.62% |
+| 512 | 663.574 / 9.976 | 643.154 / 11.808 | 3.08% |
+| 1983 | 873.126 / 14.750 | 714.527 / 9.990 | 18.16% |
+
+The 127/128-token cases cross the first growth boundary and finish with 112 MiB
+of logical KV instead of fixed capacity's 448 MiB. The 511/512-token cases grow
+to 448 MiB; the 1983-token case allocates that capacity during prefill. The
+short-context slowdown is within the proposed 5% regression budget, but this is
+not a useful speedup at short contexts. The long-context result justifies a
+matched real-request experiment; it does not establish a serving improvement.
+
+Three fresh processes per design and prompt, alternating design order across
+trials, measured median peak footprint of 4.906 GiB concat versus 3.709 GiB
+stepped at 128 tokens, and 18.409 versus 5.412 GiB at 1983 tokens. These peaks
+include model loading and prefill; logical KV is not process memory. Each
+process uses one cache with no forks, and all twelve output traces match.
+
+Reproduce with the prior timing command plus `METALLIX_CAPACITY_MODE=stepped`,
+`METALLIX_CAPACITY_ROWS=10`, and `METALLIX_CAPACITY_GROWTH_ROWS=1`. The isolated
+probe accepts `METALLIX_CAPACITY_MEMORY_MODE=stepped`; historical `capacity`
+remains an alias for `fixed`. The measured executable SHA-256 was
+`4c8c710dcaa1a6ca83d3f07e350a8e693a4a2f321320b83e0b33e627b63ab90a`.
+Raw rows, process metrics, source identity and summaries are retained in
+`artifacts/qwen-stepped-profile/`.
+
+A subsequent review identified that the experimental failure policy differed
+from production: failed appends retained old cache state. The experiment now follows production's reset-on-error contract, including an
+injected failure after an earlier layer has already updated KV. Generated fork
+tests require unaffected ancestors and a fresh prefill before retrying a failed
+stream. Allocation episode counters remain test-only metadata. This
+does not change the successful-decode workload measured above, but these timing
+receipts do not establish failure-path equivalence.

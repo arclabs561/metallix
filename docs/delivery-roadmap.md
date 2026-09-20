@@ -14,13 +14,15 @@ interfaces stable or turn synthetic parity into model support.
 
 ## Current checkpoint
 
-The fixed-capacity feasibility experiment passed ten paired timing rows per
-context and isolated memory probes, with 18.18% lower long-context decode time.
-Production adoption remains gated on stepped growth, real requests and 4B
-qualification. Native layer-one attention now has a source-matched standalone
-gate; layer-one HC/FFN composition and full previous-call shared state remain
-next. Native Responses tool-result replay passed three JSON and three SSE
-trials. See the [measurement ledger](experiments/chat-performance.md) and
+The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
+rows and isolated memory probes, with 18.16% lower 1983-token decode time and
+about 1% short-prompt regression. Production adoption remains gated on matched
+real requests and 4B qualification. Native layer-one attention/HC/FFN now feeds
+the layer-two-to-logits reduced suffix; the earlier Engram/HC entry, layer zero
+and embeddings, then real previous-call shared state remain next. Native
+Responses tool-result replay passed three JSON and three SSE trials, and three
+tool-stream disconnect recoveries passed. See the
+[measurement ledger](experiments/chat-performance.md) and
 [current progress](progress.md) for the evidence and limits. The metadata-only
 [DeepSeek traffic sensitivity](research/host-memory.md) does not yet establish a
 feasible checkpoint-serving envelope.
@@ -29,9 +31,9 @@ feasible checkpoint-serving envelope.
 
 Qwen is the usable vertical: resident chat, bounded read tools, experimental
 Responses, and qualified 0.6B/4B controls. DeepSeek's native reduced suffix now
-connects layer-two attention through final logits, using native layer-one KV
-and selected IDs. Earlier block state and the partial-call shared score keys
-still cross captured boundaries. Its scalar numerical oracle and bounded
+connects layer-one attention/HC/FFN through layer two and final logits. Layer-one
+initial residual/pre-mix and partial-call layer-three shared score keys still
+cross captured boundaries. Its scalar numerical oracle and bounded
 Metal operators are not a complete GPU decoder.
 
 Performance work has located a useful next experiment: cache concatenation
@@ -67,8 +69,8 @@ measurements; competing GPU workloads invalidate performance comparisons.
 
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
-| Qwen performance | Extend the passing private fixed-capacity probe with stepped capacity and growth-boundary properties, then compare real resident requests. | Preserve full-logit/token and branch/EOS replay; improve repeated real request measurements within memory limits. Otherwise retain concatenation. | Reversible experiment; no public tuning flag. |
-| DeepSeek completion | Native layer-one attention/HC/FFN feeding the existing layer-two suffix, then earlier block/embedding composition. Consumer: the complete reduced text oracle. | Each replaced boundary preserves source-derived numerical bounds, exact discrete routes and failure/retry behavior; the joined token-to-logit trace passes. | Reversible implementation; source semantics must not be silently changed. |
+| Qwen performance | Compare the qualified private stepped-capacity candidate on matched real resident requests, then the 4B control. | Preserve full-logit/token and branch/EOS replay; improve repeated real request measurements within memory limits. Otherwise retain concatenation. | Reversible experiment; no public tuning flag. |
+| DeepSeek completion | Earlier Engram/HC entry, then layer-zero/embedding composition and real previous-call layer-three state. Consumer: the complete reduced text oracle. | Each replaced boundary preserves source-derived numerical bounds, exact discrete routes and failure/retry behavior; the joined token-to-logit trace passes. | Reversible implementation; source semantics must not be silently changed. |
 | Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
 
 For each boundary, use existing operators and fixtures first. Add a capture only
@@ -76,14 +78,12 @@ when a specific missing operand blocks the next join. Once the complete reduced
 oracle passes, stop extending fixture infrastructure for its own sake and move
 the execution graph onto Metal.
 
-DeepSeek's next joins are specifically: make the previous-call shared index
-publication an explicit request-local state contract; connect native layer-one
-attention/HC/FFN to layer two; connect its earlier Engram/HC entry; then connect
-layer zero and token embeddings. Finally run the whole reduced graph in token
-order so layer three's real previous publication supplies the next partial
-layer-one call. That last gate removes the captured shared-key shortcut; an
-isolated layer-one test cannot close it. Exercise more than the fixed 5/1/1
-trace, including multiple compression boundaries and reset/retry sequences.
+DeepSeek's next joins are specifically: connect the earlier Engram/HC entry,
+then layer zero and token embeddings. Finally run the whole reduced graph in
+token order with a request-local previous-call shared index publication so layer
+three's real previous publication supplies the next partial layer-one call. That
+last gate removes the captured shared-key shortcut. Exercise more than the fixed
+5/1/1 trace, including multiple compression boundaries and reset/retry sequences.
 
 ### Performance adoption contract
 
@@ -142,7 +142,7 @@ existing product boundary.
 
 | Decision / governing surface | Options and tradeoff | Recommended next move |
 | --- | --- | --- |
-| KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Fixed-capacity feasibility passed. Measure stepped growth and real requests before replacing the production cache. |
+| KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Stepped growth and failure-parity probes passed. Measure real requests and the 4B control before replacing the production cache. |
 | DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Reproduce the pinned source for the parity baseline. Never silently substitute owner keys. Decide before claiming complete model parity. |
 | Native runtime versus upstream integration | Continue the specialized executor; or retain qualification/adapter work and integrate a runtime that demonstrably meets the same target. | Apply the existing architecture pivot using matched evidence, not popularity. |
 | MLX binding upgrade | Keep the qualified pinned stack; or upgrade to unlock a demonstrated blocking operation/performance gain. | Avoid combining an upgrade with a cache-layout change. Qualify an upgrade as its own change before depending on new semantics. |

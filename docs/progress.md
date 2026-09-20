@@ -28,12 +28,14 @@ choices without expanding current support claims.
   terminal completion; the controlled CLI was 0.153.4. It used fallback model
   metadata and controlled instructions/features, so no user profile was added.
 - The reusable Responses qualifier passed three JSON and three SSE native 4B
-  tool-result replay trials at 2048 tokens and 1024 MiB. Results are synthetic
-  client-provided values, not filesystem tool execution. The test-only Qwen
-  capacity-cache experiment also passed output/branch properties and showed
-  18.18% lower long-prompt decode time; production adoption still requires
-  stepped-growth and real-request gates. See the
-  [measurement ledger](experiments/chat-performance.md).
+  tool-result replay trials at 2048 tokens and 1024 MiB. It now validates model,
+  output-item, and content identities; three live tool-stream disconnect
+  recoveries also passed. Results are synthetic client-provided values, not
+  filesystem tool execution. The private stepped-capacity Qwen experiment passed
+  all 50 whole-logit trace pairs, reduced the long-prompt median by 18.16%, and
+  regressed short prompts by about 1%; 128-plus-64-token logical KV is 112 MiB rather
+  than fixed capacity's 448 MiB. Production adoption still requires matched real
+  4B requests. See the [measurement ledger](experiments/chat-performance.md).
 - `mx agent` runs a bounded read-only workspace tool loop. Complete tool calls
   and surrounding assistant text survive history replay. Paths are opened
   relative to a pinned workspace descriptor without following symlinks.
@@ -74,8 +76,16 @@ choices without expanding current support claims.
   Three focused Rust checks run `LayerAttentionState` from the native ratio-two
   owner KV/IDs, compare exposed adapter diagnostics and final output, reject a non-owner
   publication, and show that a legal wrong index changes output. The partial
-  score operand derives from a strict prior layer-three candidate capture. This
-  is standalone layer-one attention, not layer-one HC/FFN joined into layer two.
+  score operand derives from a strict prior layer-three candidate capture.
+- The six-check source fixture `layer1-tail-reference.json` pins layer-one's
+  attention-to-FFN tail and exact layer-two residual/pre-mix handoff at SHA-256
+  `5f31036c71b797e7195a6b93cf2d656b8744b1e6a80a04dc68007d26e326b89b`.
+  Its checks include source layer identity and HC binding restoration after an
+  injected failure. A focused `forward_moe` join now carries native layer-one
+  attention, HC, and FFN into native layer two and through the existing suffix
+  to final logits. Layer-one initial residual/pre-mix and the partial shared
+  layer-three score keys remain captured boundaries, so this is not whole-graph,
+  Metal, or checkpoint execution.
 - A source-only layer-two attention exporter/fixture captures exact source
   storage for the borrowed layer-one publication, local window state, attention
   boundaries, and the historical layer-two FFN handoff. Its nine checks pin
@@ -146,9 +156,9 @@ choices without expanding current support claims.
    forward through the earlier text blocks. Layers three and four now connect
    natively through final logits, preceded by native Engram3 and layer-two FFN.
    The native layer-two attention/HC/FFN suffix now consumes layer-one's native
-   KV/IDs, but layer-one residual/pre-mix remains captured at its entry. The next
-   boundary is native layer-one HC and FFN feeding layer two, then earlier
-   Engram/embed state and a full stateful runner, while preserving the
+   KV/IDs, and native layer-one attention/HC/FFN now feeds it. Layer-one initial
+   residual/pre-mix remains captured. The next boundary is the earlier Engram/HC
+   entry, then layer-zero/embed state and a full stateful runner, while preserving the
    source-grounded partial-call layer-three shared score keys and discrete
    routing gates. This pair does not use the layer-three/four candidate-mask
    path. Operator and joined-suffix parity do not establish full model generation.

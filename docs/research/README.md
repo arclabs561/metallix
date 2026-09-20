@@ -67,17 +67,16 @@ greedy sampling and grammar constraints with explicit weight/KV budgets.
 Long-running allocator behavior and larger contexts remain separate gates.
 The [V4.1 sparse-attention reference](../experiments/v41-attention.md) supplies
 a small CPU semantic oracle, not native BF16 or Metal-kernel parity.
-DeepSeek-V4.1 now has a small source-captured layer-two-to-logits reduced path:
-native layer-one KV and selected IDs feed native layer-two attention, HC, and
-FFN, then Engram3 and the native layer-three/four suffix through final HC,
-RMSNorm, and the FP32 head for the captured prefill/decode calls. The layer-one
-terminal residual/pre-mix remains a captured layer-two entry boundary, and the
-partial call's layer-three shared score keys remain captured. This is not
-full-model generation or Metal parity. Layer-one attention has a separate
-native ratio-two-owner KV/ID replay, but it is not yet joined through layer-one
-HC/FFN into layer two. Qwen correctness still does not establish DeepSeek
-support. Training techniques remain reference material, not an implemented
-training subsystem.
+DeepSeek-V4.1 now has a small source-captured layer-one-to-logits reduced path:
+native layer-one attention, HC, and FFN feed layer two, then Engram3 and the
+native layer-three/four suffix through final HC, RMSNorm, and the FP32 head for
+the captured prefill/decode calls. Layer one's initial residual/pre-mix and the
+partial call's layer-three shared score keys remain captured boundaries. This is
+not full-model generation, Metal parity, or checkpoint support. The next joins
+are the earlier Engram/HC entry, then layer zero and token embeddings, followed
+by real previous-call layer-three state. Qwen correctness still does not
+establish DeepSeek support. Training techniques remain reference material, not
+an implemented training subsystem.
 
 ## What each new finding records
 

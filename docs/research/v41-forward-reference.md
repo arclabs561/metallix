@@ -68,8 +68,7 @@ by the adapter; its projection is covered through the final-output comparison.
 
 At the partial call, the score-key operand is derived from the strict prior
 layer-three candidate capture. It remains a captured layer-three boundary, not
-a layer-one score operand or a native whole-graph result. This standalone native
-layer-one attention check does not yet join layer-one HC/FFN into layer two.
+a layer-one score operand or a native whole-graph result.
 
 The test-only native replay is separate from this source fixture:
 
@@ -82,9 +81,25 @@ projections, then checks exact BF16 latent storage, owned compressed-KV/index-ke
 publication, native index query, BF16 score stages, and causal selected IDs for
 starts 0, 5, and 6. It intentionally preserves the source distinction above: at
 start 6 the native scorer consumes the captured layer-three shared score-key
-prefix, not the retained layer-one owner prefix. It is a test-only native
-boundary, not a production interface, layer-one HC/FFN composition, or
-layer-one/two execution.
+prefix, not the retained layer-one owner prefix. It remains a test-only native
+component boundary, not a production interface or whole-graph execution.
+
+The source tail from native layer-one attention through HC and FFN has a
+separate six-check gate:
+
+```sh
+uv run scripts/test_v41_layer1_tail_fixture.py
+```
+
+`fixtures/deepseek-v41/layer1-tail-reference.json` has SHA-256
+`5f31036c71b797e7195a6b93cf2d656b8744b1e6a80a04dc68007d26e326b89b`.
+It pins the attention-to-FFN tail, source layer identity, exact layer-two
+residual/pre-mix handoff, and HC binding restoration after an injected failure.
+`native_layer_one_attention_hc_ffn_reaches_final_logits` in `forward_moe` uses
+the native attention output, HC, and FFN to feed the native layer-two suffix
+through final logits. Its initial layer-one residual/pre-mix remains captured,
+as do the partial-call layer-three shared score keys. This is still a reduced
+CPU test graph, not Metal parity, checkpoint execution, or a whole model.
 
 ## Layer-two borrowed-attention source boundary
 
@@ -867,8 +882,9 @@ The earlier Engram fixture stays byte-for-byte unchanged. Its regeneration
 test permits only additive observer/capture provenance changes while checking
 the preserved numerical payload and upstream source identity.
 
-Layer two now receives native layer-one KV/IDs but still receives captured
-layer-one residual/pre-mix at its block entry. Native earlier layer-one attention
-is standalone; native layer-one HC and FFN, earlier Engram/embed state, the
-captured partial-call layer-three shared score-key behavior, and a full stateful
-runner precede full-model generation.
+Layer two receives native layer-one KV/IDs and now native layer-one
+attention/HC/FFN. Layer one's initial residual/pre-mix remains captured at the
+earlier block entry. The earlier Engram/HC entry comes next, followed by layer
+zero and token embeddings, then a full stateful runner that replaces the
+captured partial-call layer-three shared score-key behavior before full-model
+generation can be claimed.
