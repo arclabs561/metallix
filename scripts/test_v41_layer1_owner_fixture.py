@@ -44,7 +44,27 @@ class LayerOneOwnerFixtureTest(unittest.TestCase):
         cls.fixture = cls.exporter.layer1_owner_fixture(cls.receipt)
 
     def test_committed_fixture_matches_current_source_capture(self) -> None:
-        self.assertEqual(json.loads(FIXTURE.read_text()), self.fixture)
+        """Additive observers may change capture provenance, never this oracle."""
+        committed = json.loads(FIXTURE.read_text())
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        changing = {"forward_observers_sha256", "complete_capture_sha256"}
+        self.assertEqual(
+            {
+                key: value
+                for key, value in committed["source"].items()
+                if key not in changing
+            },
+            {
+                key: value
+                for key, value in self.fixture["source"].items()
+                if key not in changing
+            },
+        )
+        for key in changing:
+            self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")
 
     def test_owner_schedule_preserves_ratio_two_partial_publication(self) -> None:
         self.assertEqual(

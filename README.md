@@ -278,6 +278,17 @@ the same native layer-three-to-logits suffix. Its pre-Engram residual and
 incoming HC pre-mix state remain captured from earlier blocks;
 full-model generation is still pending.
 
+Earlier, test-only layer-one owner replay executes the ratio-two compressor's
+FP32 WKV/wgate projections within a fixed IEEE dot-product envelope, then
+checks the BF16 latent and its owned compressed-KV and index-key publications,
+native index query and score stages, and causal selected IDs at captured starts
+0, 5, and 6. The pinned source's partial decode still scores against a captured
+layer-three shared score-key prefix, distinct from that unchanged layer-one
+owner prefix. A separate source-only layer-two attention
+fixture proves that layer two borrows the current layer-one KV/index publication
+and retains its exact historical FFN handoff. Neither fixture is native
+layer-two attention, a production API, or full-model execution.
+
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
 tokens, short requests after long ones, and process-scoped CPU profiling. The

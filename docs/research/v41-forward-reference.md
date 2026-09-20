@@ -47,6 +47,43 @@ one's unchanged owned key cache. Preserve both observations in the oracle.
 Native integration must resolve this source behavior explicitly; substituting
 the owned keys would silently change the existing reduced-forward reference.
 
+The test-only native replay is separate from this source fixture:
+
+```sh
+cargo test -p deepseek --test forward_layer1_owner
+```
+
+It runs the ratio-two `CompressorState` with fixed-IEEE-envelope FP32 WKV/wgate
+projections, then checks exact BF16 latent storage, owned compressed-KV/index-key
+publication, native index query, BF16 score stages, and causal selected IDs for
+starts 0, 5, and 6. It intentionally preserves the source distinction above: at
+start 6 the native scorer consumes the captured layer-three shared score-key
+prefix, not the retained layer-one owner prefix. It is a test-only native
+boundary, not a production interface, native layer-one attention, or
+layer-one/two execution.
+
+## Layer-two borrowed-attention source boundary
+
+```sh
+uv run scripts/test_v41_layer2_attention_fixture.py
+```
+
+`scripts/v41_layer2_attention_capture.py` projects the retained complete source
+capture into `fixtures/deepseek-v41/layer2-attention-reference.json`. Layer two
+has no Indexer in this configuration: its compressed KV and indices are the
+current layer-one ratio-two owner publication. The fixture captures exact source
+storage for that borrowed publication, layer two's local window/ring, attention
+operands and output, and its post-attention residual/pre-mix handoff to the
+historical layer-two FFN fixture.
+
+The nine source-backed checks regenerate the projection from the pinned source,
+validate source/helper hashes and raw finite storage, reject missing, altered,
+or paired-forged owner publication at the captured sparse boundary, reject an
+invalid source index schedule and Boolean dimensions, and compare the preserved
+FFN handoff. The exporter performs no attention arithmetic. This is a source
+boundary only, not native layer-two attention, a Rust acceptance test, or
+full-model parity.
+
 The default `just check` runs the dependency-free manifest, source-loader and
 attention-fixture integrity tests. Numerical kernel tests require Torch and
 are run explicitly above.

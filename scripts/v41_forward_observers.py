@@ -301,6 +301,7 @@ def hooks_for(
     layer_one_attention = layer_one.attn
     layer_one_indexer = layer_one_attention.indexer
     layer_two = model.layers[2]
+    layer_two_attention = layer_two.attn
     layer_three = model.layers[3]
     layer_three_attention = layer_three.attn
     layer_three_indexer = layer_three_attention.indexer
@@ -339,6 +340,12 @@ def hooks_for(
     )
     had_owner_compress, prior_owner_compress, original_owner_compress = instance_method(
         layer_one_attention, "_compress_kv"
+    )
+    had_layer_two_window, prior_layer_two_window, original_layer_two_window = (
+        instance_method(layer_two_attention, "_window_kv")
+    )
+    had_layer_two_compress, prior_layer_two_compress, original_layer_two_compress = (
+        instance_method(layer_two_attention, "_compress_kv")
     )
     had_window, prior_window, original_window = instance_method(
         layer_four_attention, "_window_kv"
@@ -495,7 +502,7 @@ def hooks_for(
                     capture_input(f"{name}_input", exactly_one=False)
                 )
             )
-        if name in {"layers.1.attn", "layers.3.attn", "layers.4.attn"}:
+        if name in {"layers.1.attn", "layers.2.attn", "layers.3.attn", "layers.4.attn"}:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(
@@ -504,6 +511,20 @@ def hooks_for(
                     )
                 )
             )
+        if name == "layers.2.attn":
+
+            def capture_layer_two_freqs(
+                module: torch.nn.Module, _inputs: tuple[object, ...]
+            ) -> None:
+                cap_guard("layers.2.attn.freqs_cis")
+                freqs = getattr(module, "freqs_cis", None)
+                if not isinstance(freqs, torch.Tensor):
+                    raise TypeError("layer-two attention has no frequency table")
+                records["layers.2.attn.freqs_cis"] = object_record(
+                    freqs, include_storage=True
+                )
+
+            handles.append(module.register_forward_pre_hook(capture_layer_two_freqs))
         if name == "layers.3.engram":
             handles.append(module.register_forward_pre_hook(capture_engram_input))
         if name in {"layers.3.engram.embed", "layers.3.engram.wkv"}:
@@ -518,6 +539,9 @@ def hooks_for(
             "layers.1.attn.wq_a",
             "layers.1.attn.q_norm",
             "layers.1.attn.wq_b",
+            "layers.2.attn.wq_a",
+            "layers.2.attn.q_norm",
+            "layers.2.attn.wq_b",
             "layers.3.attn.wq_a",
             "layers.3.attn.q_norm",
             "layers.3.attn.wq_b",
@@ -528,6 +552,7 @@ def hooks_for(
             handles.append(module.register_forward_hook(capture(name)))
         if name in {
             "layers.1.attn.wo_b",
+            "layers.2.attn.wo_b",
             "layers.3.attn.wo_b",
             "layers.4.attn.wo_b",
         }:
@@ -800,6 +825,12 @@ def hooks_for(
         layer_two.hc_mixes = observed_hc_mixes
         layer_three.hc_mixes = observed_hc_mixes
         layer_four.hc_mixes = observed_hc_mixes
+        layer_two_attention._window_kv = observed_window_kv_for(
+            2, layer_two_attention, original_layer_two_window
+        )
+        layer_two_attention._compress_kv = observed_compress_kv_for(
+            2, original_layer_two_compress
+        )
         layer_one_attention._window_kv = observed_window_kv_for(
             1, layer_one_attention, original_owner_window
         )
@@ -834,6 +865,18 @@ def hooks_for(
     finally:
         for handle in handles:
             handle.remove()
+        _restore_instance(
+            layer_two_attention,
+            "_window_kv",
+            had_layer_two_window,
+            prior_layer_two_window,
+        )
+        _restore_instance(
+            layer_two_attention,
+            "_compress_kv",
+            had_layer_two_compress,
+            prior_layer_two_compress,
+        )
         _restore_instance(
             layer_two,
             "hc_mixes",

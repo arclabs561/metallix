@@ -59,8 +59,14 @@ graph, not a released checkpoint or copied source file. The layer-two FFN
 export and `fixtures/deepseek-v41/layer2-ffn-reference.json` likewise record a
 synthetic source-forward boundary. The layer-one ratio-two owner export and
 `fixtures/deepseek-v41/layer1-ratio2-owner-reference.json` capture the same
-synthetic graph's compressed KV and direct index publication. These are reduced numerical captures, not
-full-model or serving artifacts.
+synthetic graph's compressed KV and direct index publication. The separate
+`scripts/v41_layer2_attention_capture.py` export and
+`fixtures/deepseek-v41/layer2-attention-reference.json` retain exact observed
+layer-two attention boundaries, including its borrowed layer-one KV/index
+publication, local window state, and FFN handoff. The exporter verifies pinned
+source/helper hashes, raw tensor storage and finite values; it performs no
+attention arithmetic. These are reduced numerical captures, not full-model,
+native-attention, or serving artifacts.
 The compressor and block composition captures and tests follow
 `Compressor.forward`, `Block.forward`, the block HC helpers and `RMSNorm.forward`
 at the same revision, with explicitly stubbed projections or sublayers.

@@ -50,12 +50,20 @@ choices without expanding current support claims.
   retained as operands. Fixed HC arithmetic bounds handle FP32 rounding, and
   exact BF16 attention-input checks reject corrupted handoffs. The layer-two
   post-attention input remains captured; this is still a reduced graph.
-- A layer-one ratio-two source fixture now preserves compressor projections,
-  owned cache contents, actual scoring operands and direct index selection.
-  Twelve source-backed tests reject changed provenance, invalid storage and
-  changed partial-group publications; earlier layer-two numerical captures
-  remain unchanged. This prepares the earlier native boundary without claiming
-  that layer-one/two execution is implemented.
+- Six test-only native layer-one owner checks execute the ratio-two compressor's
+  FP32 WKV/wgate projections, then check the BF16 latent plus owned compressed
+  KV/index-key publications, native index query and score stages, and causal
+  selected IDs at starts 0, 5, and 6. The twelve-check source suite preserves
+  the partial-start distinction: its score-key operand is a captured layer-three
+  shared prefix, not layer one's retained owner key/KV state. This is not a
+  production API, native layer-one attention, or layer-one/two execution.
+- A source-only layer-two attention exporter/fixture captures exact source
+  storage for the borrowed layer-one publication, local window state, attention
+  boundaries, and the historical layer-two FFN handoff. Its nine checks pin
+  source and helper provenance, storage hashes and raw finite values, reject a
+  missing, altered, or paired-forged owner publication at the sparse boundary,
+  and retain the FFN seam. It establishes neither native layer-two attention
+  nor full-model parity.
 - A source capture supplies layer-three block-entry residual/pre-mix;
   native HC and RMSNorm now derive the owner/candidate attention input and
   cross-check it against preserved historical captures.
@@ -94,16 +102,21 @@ choices without expanding current support claims.
    Keep output-token parity, cached/full-forward checks, and repeated
    wall-time measurements as gates. The source-checked owner benchmark separates prepare/drop/commit
    costs; captured prefixes five and six do not establish a scaling bottleneck.
-   Measure longer prefixes before changing staged allocations. Prefix reuse,
+   Current profiling places context growth inside MLX evaluation while transpose
+   construction is below 0.3% of decode time. Isolate attention-graph evaluation
+   from KV-update evaluation before changing either path. Prefix reuse,
    quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
    forward through the earlier text blocks. Layers three and four now connect
    natively through final logits, preceded by native Engram3 and layer-two FFN.
-   Layer-two post-attention state still comes from capture. The next boundary
-   is layer one's ratio-two compressed KV/index publication into layer two;
-   this pair does not use the layer-three/four candidate-mask path. Replace the
-   captured state with native earlier-block output while
-   preserving the source-grounded arithmetic and discrete routing gates.
+   Layer-two post-attention state still comes from capture. The test-only
+   layer-one ratio-two owner now establishes native compressor, owned
+   publication, query, score, and selection boundaries, while a source-only
+   layer-two fixture preserves the borrowed-publication and FFN seams. The next
+   boundary is native layer-two attention over that publication; this pair does
+   not use the layer-three/four candidate-mask path. Replace captured earlier-
+   block state while preserving the source-grounded arithmetic and discrete
+   routing gates.
    The partial-group source trace also distinguishes the unchanged owned index
    cache from the shared keys actually scored; the latter retain the preceding
    layer-three publication. Resolve that [source behavior](research/v41-forward-reference.md)
@@ -161,3 +174,12 @@ layer-two FFN and historical Engram suites passed seven tests. All 12 native
 Codex logs also passed the stricter ordered-event reassessment. The owned
 qualification server was stopped. These results extend the bounded controls;
 earlier DeepSeek blocks and general coding qualification remain open.
+
+The layer-one owner/layer-two capture batch passed both canonical checks,
+including all six new native owner/query/score/selection tests. Separate
+source-backed suites passed 12 layer-one owner, nine layer-two attention,
+seven historical layer-two FFN and seven Engram checks. The new source fixture
+preserves the historical numerical handoffs. An optimized Qwen3-0.6B phase
+probe passed five repeated rows at each of three prompt lengths with matching
+final logit bits and whole-trace fingerprints; its measured host intervals are
+recorded in the performance ledger. No production speedup follows from that probe.
