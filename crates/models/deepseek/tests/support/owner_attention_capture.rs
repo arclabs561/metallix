@@ -218,6 +218,7 @@ fn generated_indices(
     keys: &[u16],
     publication: IndexKeyPublicationId,
     producer_attention_input: &[u16],
+    consumer_attention_input: &[u16],
 ) -> Vec<i32> {
     let model = field(root, "model");
     let indexer = field(raw_case, "indexer");
@@ -237,6 +238,7 @@ fn generated_indices(
         attention_case.input.bf16(),
         "source indexer X is attention input at start {start}"
     );
+    assert_eq!(consumer_attention_input, x, "native consumer index input");
     let positions = shape(field(inputs, "x"))[1];
     let head_dimension = usize_field(model, "index_head_dim");
     let parameters = field(root, "encoded_parameters");
@@ -246,7 +248,7 @@ fn generated_indices(
     let epsilon: f32 = serde_json::from_value(field(model, "norm_eps").clone())
         .expect("source normalization epsilon");
     let scored = prepare_scored_query(
-        &x,
+        consumer_attention_input,
         &source_frequencies(
             root,
             start,
@@ -641,6 +643,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
             pending.key_prefix(0).expect("complete staged key prefix"),
             pending.publication(),
             owner_input,
+            supplied_input,
         );
         assert_eq!(
             pending.kv_prefix(0).expect("complete staged KV prefix"),

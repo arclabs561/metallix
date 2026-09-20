@@ -1,7 +1,7 @@
 //! Native complete `MoE` sublayer against encoded synthetic source-forward data.
-//! The layer-three continuation joins native owner/producer attention through
-//! HC/FFN; earlier block inputs and incoming coefficients remain captured.
-//! The separate layer-four suffix still starts from captured block-entry state.
+//! The connected layer-three/four suffix joins native owner/producer attention
+//! through HC/FFN and final logits; earlier block inputs remain captured.
+//! The isolated layer-four test retains its captured entry as a diagnostic.
 //! It is not complete native model execution.
 
 use std::collections::BTreeMap;
@@ -940,6 +940,18 @@ struct BlockTailPosition {
 }
 
 fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<BlockTailOutput> {
+    block_tail_from_entries(f, control, verify_contract, None)
+}
+
+fn block_tail_from_entries(
+    f: &Fixture,
+    control: BlockControl,
+    verify_contract: bool,
+    entries: Option<&[BlockTailOutput]>,
+) -> Vec<BlockTailOutput> {
+    if let Some(entries) = entries {
+        assert_eq!(entries.len(), f.cases.len());
+    }
     validate_block_tail_fixture(f);
     let parameters = block_tail_parameters(f);
     let config = &f.block_config;
@@ -947,7 +959,7 @@ fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<
         control,
         BlockControl::NativeAttention | BlockControl::NativeAttentionZeroed
     )
-    .then(|| native_block_attention_outputs(f, &parameters));
+    .then(|| native_block_attention_outputs(f, &parameters, entries));
     with_model(f, false, |model| {
         let ffn = FfnSublayerReference::new(
             model,
@@ -978,6 +990,7 @@ fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<
                     native_attention
                         .as_ref()
                         .map(|outputs| outputs[index].as_slice()),
+                    entries.map(|entries| &entries[index]),
                 )
             })
             .collect()
@@ -1034,11 +1047,11 @@ fn run_block_tail_case(
     context: &BlockTailContext<'_>,
     case: &Case,
     attention_override: Option<&[u16]>,
+    entry: Option<&BlockTailOutput>,
 ) -> BlockTailOutput {
     let positions = case.input.shape[1];
     assert_block_case_shapes(case, positions);
-    let block_input = case.block_input.bf16();
-    let incoming = case.block_incoming_pre.fp32();
+    let (block_input, incoming) = block_entry(case, entry);
     let attention =
         attention_override.map_or_else(|| case.attention_output.bf16(), <[u16]>::to_vec);
     assert_eq!(attention.len(), positions * 128);
@@ -1191,16 +1204,36 @@ fn derive_attention_input(
     normalized
 }
 
-fn native_block_attention_outputs(f: &Fixture, parameters: &BlockTailParameters) -> Vec<Vec<u16>> {
+fn block_entry(case: &Case, native: Option<&BlockTailOutput>) -> (Vec<u16>, Vec<f32>) {
+    if let Some(native) = native {
+        // The HC envelope treats this residual as an exact point. Verify its
+        // identity before using the envelope, but retain native operands.
+        assert_eq!(
+            native.residual,
+            case.block_input.bf16(),
+            "native entry residual"
+        );
+        assert_eq!(native.next_pre.len(), case.input.shape[1] * 2);
+        (native.residual.clone(), native.next_pre.clone())
+    } else {
+        (case.block_input.bf16(), case.block_incoming_pre.fp32())
+    }
+}
+
+fn native_block_attention_outputs(
+    f: &Fixture,
+    parameters: &BlockTailParameters,
+    entries: Option<&[BlockTailOutput]>,
+) -> Vec<Vec<u16>> {
     let inputs = f
         .cases
         .iter()
-        .map(|case| {
+        .enumerate()
+        .map(|(index, case)| {
             let positions = case.input.shape[1];
             assert_block_case_shapes(case, positions);
-            let residual = case.block_input.bf16();
-            let incoming = case.block_incoming_pre.fp32();
-            let input = (0..positions)
+            let (residual, incoming) = block_entry(case, entries.map(|entries| &entries[index]));
+            let input: Vec<u16> = (0..positions)
                 .flat_map(|position| {
                     derive_attention_input(
                         &residual[position * 256..(position + 1) * 256],
@@ -1210,6 +1243,11 @@ fn native_block_attention_outputs(f: &Fixture, parameters: &BlockTailParameters)
                     )
                 })
                 .collect();
+            assert_eq!(
+                input,
+                case.attention_input.bf16(),
+                "native layer-four attention input"
+            );
             (case.start_pos, input)
         })
         .collect::<Vec<_>>();
@@ -1250,11 +1288,15 @@ fn native_attention_hc_ffn_chain_matches_source_numerical_contract() {
 #[test]
 fn native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry() {
     let f = layer_three_fixture();
-    let parameters = block_tail_parameters_for(&f, 3);
+    assert_eq!(native_layer_three_block_tail(&f).len(), f.cases.len());
+}
+
+fn native_layer_three_block_tail(f: &Fixture) -> Vec<BlockTailOutput> {
+    let parameters = block_tail_parameters_for(f, 3);
     let config = &f.block_config;
     let attention = owner_attention_capture::native_layer_three_outputs_from_ownered_inputs();
     assert_eq!(attention.len(), f.cases.len());
-    with_model_for(&f, 3, false, |model| {
+    with_model_for(f, 3, false, |model| {
         let ffn = FfnSublayerReference::new(
             model,
             &parameters.ffn_norm,
@@ -1267,10 +1309,14 @@ fn native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry() {
             config.hc_eps,
         )
         .expect("layer-three FFN contract");
-        for (case, attention_output) in f.cases.iter().zip(attention) {
-            check_layer_three_case(&f, &parameters, &ffn, case, &attention_output);
-        }
-    });
+        f.cases
+            .iter()
+            .zip(attention)
+            .map(|(case, attention_output)| {
+                check_layer_three_case(f, &parameters, &ffn, case, &attention_output)
+            })
+            .collect()
+    })
 }
 
 fn check_layer_three_case(
@@ -1279,7 +1325,7 @@ fn check_layer_three_case(
     ffn: &FfnSublayerReference<'_>,
     case: &Case,
     attention_output: &[u16],
-) {
+) -> BlockTailOutput {
     let config = &f.block_config;
     let positions = case.input.shape[1];
     assert_eq!(
@@ -1300,6 +1346,8 @@ fn check_layer_three_case(
     assert_eq!(expected_terminal, next_residual, "source block continuity");
     assert_eq!(expected_pre, next_incoming, "source coefficient continuity");
     let mut terminal = Vec::with_capacity(expected_terminal.len());
+    let mut next_pre = Vec::with_capacity(expected_pre.len());
+    let mut envelopes = Vec::with_capacity(positions);
     for position in 0..positions {
         let residual = &block_input[position * 256..(position + 1) * 256];
         let attn_coefficients = project_hc_coefficients(
@@ -1363,12 +1411,19 @@ fn check_layer_three_case(
             );
         }
         terminal.extend_from_slice(result.output_bf16());
+        next_pre.extend_from_slice(result.coefficients().pre());
+        envelopes.push(envelope);
     }
     assert_eq!(
         terminal, expected_terminal,
         "layer-three native terminal residual at start {}",
         case.start_pos
     );
+    BlockTailOutput {
+        residual: terminal,
+        next_pre,
+        terminal_envelopes: Some(envelopes),
+    }
 }
 
 fn reject_zeroed_layer_three_attention(
@@ -1437,6 +1492,56 @@ fn final_norm_row(
 #[test]
 fn native_layer_four_final_suffix_matches_source_logits_with_propagated_input_bounds() {
     let f = fixture();
+    let native = block_tail(&f, BlockControl::NativeAttention, true);
+    assert_final_suffix(&f, native);
+}
+
+#[test]
+fn native_layer_three_through_final_suffix_matches_source_logits() {
+    let layer_three = layer_three_fixture();
+    let entries = native_layer_three_block_tail(&layer_three);
+    let layer_four = fixture();
+    assert_eq!(layer_three.cases.len(), layer_four.cases.len());
+    for (source, consumer) in layer_three.cases.iter().zip(&layer_four.cases) {
+        assert_eq!(
+            source.start_pos, consumer.start_pos,
+            "cross-capture position"
+        );
+        let entry = source.next_block_entry.as_ref().unwrap();
+        assert_eq!(
+            entry.residual.bf16(),
+            consumer.block_input.bf16(),
+            "cross-capture residual"
+        );
+        assert_eq!(
+            entry.incoming_pre.fp32(),
+            consumer.block_incoming_pre.fp32(),
+            "cross-capture coefficients"
+        );
+    }
+    let native = block_tail_from_entries(
+        &layer_four,
+        BlockControl::NativeAttention,
+        true,
+        Some(&entries),
+    );
+    assert_final_suffix(&layer_four, native);
+}
+
+#[test]
+#[should_panic(expected = "native layer-four attention input")]
+fn joined_suffix_rejects_corrupted_layer_three_coefficients() {
+    let mut entries = native_layer_three_block_tail(&layer_three_fixture());
+    entries[0].next_pre.fill(0.0);
+    block_tail_from_entries(
+        &fixture(),
+        BlockControl::NativeAttention,
+        true,
+        Some(&entries),
+    );
+}
+
+fn assert_final_suffix(f: &Fixture, native: Vec<BlockTailOutput>) {
     let head = head_fixture();
     assert_eq!(head.source.revision, f.source.revision);
     assert_eq!(head.source.model_sha256, f.source.model_sha256);
@@ -1455,7 +1560,7 @@ fn native_layer_four_final_suffix_matches_source_logits_with_propagated_input_bo
         .copied()
         .map(f32::from_bits)
         .collect();
-    let native = block_tail(&f, BlockControl::NativeAttention, true);
+    assert_eq!(native.len(), f.cases.len());
     for ((case, block), head_case) in f.cases.iter().zip(native).zip(&head.cases) {
         let positions = case.input.shape[1];
         assert_eq!(case.start_pos, head_case.start_pos);
