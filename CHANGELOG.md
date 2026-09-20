@@ -12,6 +12,8 @@ published release; reference operators do not imply full-model support.
   2,757 tensors and 18 shards while keeping the scope explicitly metadata-only.
 - Added `mx inspect-v41-shard` to validate a real DeepSeek/MLX safetensors
   header with bounded I/O before any tensor payload is read.
+- Added the first native MLX affine-row decoder for packed 8-bit groups with
+  BF16 scales and biases, including malformed-layout and non-finite guards.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
   Codex profile path, including the direct API smoke result and the measured
   full-Codex prefill limitation.

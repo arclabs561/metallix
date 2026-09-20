@@ -58,3 +58,8 @@ reading payload bytes:
 ```sh
 mx inspect-v41-shard /path/to/model-00001-of-00018.safetensors
 ```
+
+The DeepSeek crate now contains a bounded CPU decoder for the local embedding
+layout: packed 8-bit codes with BF16 scale/bias groups of 64. Its tests cover
+packing, shape rejection, and finite decoded values. It is a tensor primitive,
+not yet a full checkpoint loader or model executor.
