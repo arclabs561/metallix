@@ -18,6 +18,18 @@ SPEC.loader.exec_module(module)
 
 
 def completed_receipt(case: dict, *, final_text: str | None = None) -> dict:
+    metrics = {
+        "context_tokens": 32,
+        "planned_kv_bytes": 1,
+        "session_load_ms": 10.0,
+        "render_ms": 1.0,
+        "prefill_ms": 2.0,
+        "time_to_first_token_ms": None,
+        "decode_ms": [],
+        "decode_total_ms": 0.0,
+        "prompt_tokens": 4,
+        "generated_tokens": 1,
+    }
     return {
         "schema_version": 1,
         "status": "completed",
@@ -26,19 +38,21 @@ def completed_receipt(case: dict, *, final_text: str | None = None) -> dict:
             {
                 "turn_index": 0,
                 "finish_reason": "eos",
-                "metrics": {
-                    "session_load_ms": 10.0,
-                    "prefill_ms": 2.0,
-                    "decode_total_ms": 3.0,
-                    "prompt_tokens": 4,
-                    "generated_tokens": 5,
-                },
+                "metrics": metrics,
                 "generated_text_sha256": "0" * 64,
                 "generated_text_utf8_bytes": 0,
                 "calls": [
                     {**call, "outcome": "ok"} for call in module.expected_calls(case)
                 ],
-            }
+            },
+            {
+                "turn_index": 1,
+                "finish_reason": "eos",
+                "metrics": metrics.copy(),
+                "generated_text_sha256": "1" * 64,
+                "generated_text_utf8_bytes": 0,
+                "calls": [],
+            },
         ],
     }
 
@@ -163,7 +177,7 @@ class QualificationTests(unittest.TestCase):
         case = module.CASES[0]
         receipt = completed_receipt(case)
         receipt["status"] = "failed"
-        receipt["error"] = "generation_failure"
+        receipt["error"] = "execution_failed"
         result = self.assess_receipt(case, receipt)
         self.assertFalse(result["passed"])
         self.assertTrue(result["checks"]["process_success"])
@@ -174,27 +188,54 @@ class QualificationTests(unittest.TestCase):
         receipt = {
             "schema_version": 1,
             "status": "failed",
-            "turns": [
-                {
-                    "turn_index": 0,
-                    "finish_reason": "length",
-                    "metrics": {},
-                    "generated_text_sha256": "0" * 64,
-                    "generated_text_utf8_bytes": 0,
-                    "calls": [
-                        {
-                            "name": "read_file",
-                            "arguments_sha256": "0" * 64,
-                            "outcome": "error",
-                        }
-                    ],
-                }
-            ],
+            "turns": [],
         }
         result = self.assess_receipt(module.CASES[0], receipt)
         self.assertFalse(result["passed"])
         self.assertFalse(result["checks"]["answer_present"])
         self.assertFalse(result["checks"]["required_executions_observed"])
+
+    def test_malformed_completed_receipt_with_answer_and_calls_is_rejected(self):
+        mutations = {
+            "completed_error": lambda receipt: receipt.update(
+                {"error": "execution_failed"}
+            ),
+            "missing_metrics": lambda receipt: receipt["turns"][0].pop("metrics"),
+            "invalid_metric": lambda receipt: receipt["turns"][0]["metrics"].update(
+                {"context_tokens": 0}
+            ),
+            "bad_count_relation": lambda receipt: receipt["turns"][0]["metrics"].update(
+                {"generated_tokens": 2}
+            ),
+            "nonterminal_finish": lambda receipt: receipt["turns"][-1].update(
+                {"finish_reason": "length"}
+            ),
+            "terminal_call": lambda receipt: receipt["turns"][-1]["calls"].append(
+                {**module.expected_calls(module.CASES[0])[0], "outcome": "ok"}
+            ),
+            "earlier_length_with_call": lambda receipt: receipt["turns"][0].update(
+                {"finish_reason": "length"}
+            ),
+            "earlier_no_call": lambda receipt: receipt["turns"][0].update(
+                {"calls": []}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                receipt = json.loads(json.dumps(completed_receipt(module.CASES[0])))
+                mutate(receipt)
+                result = self.assess_receipt(module.CASES[0], receipt)
+                self.assertFalse(result["passed"])
+                self.assertFalse(result["checks"]["structured_receipt_valid"])
+
+    def test_failed_receipt_rejects_calls_after_a_length_turn(self):
+        receipt = completed_receipt(module.CASES[0])
+        receipt["status"] = "failed"
+        receipt["error"] = "execution_failed"
+        receipt["turns"][0]["finish_reason"] = "length"
+        result = self.assess_receipt(module.CASES[0], receipt)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["structured_receipt_valid"])
 
     def test_phase_costs_reject_nonfinite_or_boolean_metrics(self):
         receipt = completed_receipt(module.CASES[0])

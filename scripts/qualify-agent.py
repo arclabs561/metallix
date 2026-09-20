@@ -123,6 +123,56 @@ def case_plan(case: dict) -> dict:
     }
 
 
+def is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def is_nonnegative_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def valid_metrics(metrics: object) -> bool:
+    """Validate the emitted `ChatGenerationMetrics` shape and safe relations."""
+    if not isinstance(metrics, dict):
+        return False
+    count_fields = (
+        "context_tokens",
+        "planned_kv_bytes",
+        "prompt_tokens",
+        "generated_tokens",
+    )
+    time_fields = ("session_load_ms", "render_ms", "prefill_ms", "decode_total_ms")
+    if not all(is_nonnegative_count(metrics.get(field)) for field in count_fields):
+        return False
+    if metrics["context_tokens"] < 1 or metrics["prompt_tokens"] < 1:
+        return False
+    if (
+        metrics["prompt_tokens"] + metrics["generated_tokens"]
+        > metrics["context_tokens"]
+    ):
+        return False
+    if not all(
+        is_finite_number(metrics.get(field)) and metrics[field] >= 0
+        for field in time_fields
+    ):
+        return False
+    ttft = metrics.get("time_to_first_token_ms")
+    if ttft is not None and (not is_finite_number(ttft) or ttft < 0):
+        return False
+    decode_ms = metrics.get("decode_ms")
+    if not isinstance(decode_ms, list) or not all(
+        is_finite_number(value) and value >= 0 for value in decode_ms
+    ):
+        return False
+    # Generation emits a cached decode only between sampled tokens, never after
+    # the final token (including EOS).
+    return len(decode_ms) == metrics["generated_tokens"] - 1
+
+
 def parse_agent_receipt(stdout: str) -> dict | None:
     try:
         value = json.loads(stdout)
@@ -135,8 +185,13 @@ def parse_agent_receipt(stdout: str) -> dict | None:
     turns = value.get("turns")
     if not isinstance(turns, list):
         return None
+    completed = value["status"] == "completed"
     final_text = value.get("final_text")
-    if final_text is not None and not isinstance(final_text, str):
+    if completed and (not isinstance(final_text, str) or "error" in value or not turns):
+        return None
+    if not completed and final_text is not None and not isinstance(final_text, str):
+        return None
+    if not completed and value.get("error") not in {None, "execution_failed"}:
         return None
     for index, turn in enumerate(turns):
         if not isinstance(turn, dict):
@@ -145,7 +200,9 @@ def parse_agent_receipt(stdout: str) -> dict | None:
             return None
         if turn.get("finish_reason") not in {"eos", "length"}:
             return None
-        if not isinstance(turn.get("metrics"), dict):
+        if not valid_metrics(turn.get("metrics")):
+            return None
+        if not isinstance(turn.get("calls"), list):
             return None
         digest = turn.get("generated_text_sha256")
         if not isinstance(digest, str) or len(digest) != 64:
@@ -161,6 +218,14 @@ def parse_agent_receipt(stdout: str) -> dict | None:
             or byte_count < 0
         ):
             return None
+    if completed:
+        for turn in turns[:-1]:
+            if turn["finish_reason"] != "eos" or not turn["calls"]:
+                return None
+        if turns[-1]["finish_reason"] != "eos" or turns[-1]["calls"]:
+            return None
+    elif any(turn["finish_reason"] == "length" and turn["calls"] for turn in turns):
+        return None
     return value
 
 
@@ -211,13 +276,7 @@ def phase_costs(receipt: dict | None) -> dict | None:
         "generated_tokens",
     )
     if not all(
-        all(
-            isinstance(metric.get(key), (int, float))
-            and not isinstance(metric.get(key), bool)
-            and math.isfinite(metric[key])
-            for key in required
-        )
-        for metric in metrics
+        all(is_finite_number(metric.get(key)) for key in required) for metric in metrics
     ):
         return None
     return {
