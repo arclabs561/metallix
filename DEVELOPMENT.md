@@ -341,22 +341,28 @@ plain-text/raw-ID diagnostic interface. `chat`, `agent`, and `serve` render the
 checkpoint's own `tokenizer_config.json:chat_template`. Each `ChatSession`
 loads and prepares Qwen weights once; every turn or HTTP request creates fresh
 KV state. Only `chat`, `agent`, and `serve` accept `--context-tokens`; it is
-1 through 2048, defaults to 2048, and caps prompt-plus-generated tokens. Each
-command constrains `--max-tokens` or `max_output_tokens` to 1 through 256.
-Before checkpoint payloads load, the selected context must fit a fixed 512 MiB
-logical f32 KV budget. Qwen3-0.6B plans 448 MiB at 2048 tokens. This is an
-admission estimate for retained KV only, excluding weights, activations,
-operator scratch, and allocator headroom; it neither preallocates MLX memory
-nor bounds process RSS. `--context-tokens 512` is the compatibility check for
-the former chat control bound. The separate `gen` diagnostic remains capped at
-512, and streamed qualification remains capped at 32.
+1 through 16,384, defaults to 2048, and caps prompt-plus-generated tokens.
+`--kv-budget-mib` is 1 through 8192 and defaults to 512 MiB. Each command
+constrains `--max-tokens` or `max_output_tokens` to 1 through 256. Before
+checkpoint payloads load, the selected context and logical f32 K/V budget must
+both admit. Qwen3-0.6B plans 448 MiB at 2048 tokens. This is an admission
+estimate for retained KV only, excluding weights, activations, operator scratch,
+and allocator headroom; it neither preallocates MLX memory nor bounds process
+RSS. The expanded ceilings are experimental. The pinned 4B checkpoint revision
+`cdbee75f17c01a7cc42f958dc650907174af0554` passed the bounded agent workload
+at 2048 tokens and 1024 MiB; its 151,936 Metal logits matched CPU with maximum
+absolute difference 0.0000581741 and RMSE 0.00001409596. This is not an
+expanded-limit, coding-agent, or Codex-profile qualification.
+`--context-tokens 512` is the compatibility check for the former chat control
+bound. The separate `gen` diagnostic remains capped at 512, and streamed
+qualification remains capped at 32.
 
 For a short interactive control check:
 
 ```sh
 target/release/mx chat --model /path/to/Qwen3-0.6B \
   --prompt "Summarize this repository in one sentence." --max-tokens 64 \
-  --context-tokens 512
+  --context-tokens 512 --kv-budget-mib 512
 ```
 
 Without `--prompt`, `chat` retains conversation history until `/reset` or
@@ -413,9 +419,9 @@ model work. JSON timeout errors use HTTP 408; SSE uses `response.failed` with
 `generation_timeout`, subject to the socket write limits. A client that
 half-closes its sending side may still read its response; EOF is not treated
 as cancellation.
-The 2048-token control bound and sequential admission are still insufficient
-evidence for a Codex profile. Concurrent admission and request cancellation
-under load remain separate gates.
+The bounded Codex command-tool result and sequential admission are still
+insufficient evidence for a Codex profile. Concurrent admission and request
+cancellation under load remain separate gates.
 
 For the maintained longer-context qualification, start that server separately
 with its default 2048-token context and leave it resident; the runner never
@@ -450,7 +456,8 @@ factual joins across files, and long-file tasks through `mx agent --json`:
 ```sh
 uv run scripts/qualify-agent.py --run --binary target/release/mx \
   --model "$MODEL" --expected-model-revision "$REVISION" \
-  --output artifacts/agent-qualification-run
+  --output artifacts/agent-qualification-run \
+  --context-tokens 2048 --kv-budget-mib 512
 ```
 
 Without `--run` it only prints the workload. A live run uses a new or empty
@@ -469,23 +476,50 @@ prefill, and decode costs; `session_load_ms` is the same one-time setup repeated
 in each turn and must not be summed. Reported process wall time includes fresh
 model loading. No model is downloaded.
 
-Do not add a live Codex provider configuration while this protocol is still
-being qualified. The intended future shape is a user-level profile such as:
+The separate native Codex command-tool qualifier is dry-run first. Start the
+4B server with the exact resident limits under test, then use an empty output
+directory:
+
+```sh
+target/release/mx serve --model /path/to/Qwen3-4B --model-id metallix-qwen3-4b \
+  --listen 127.0.0.1:18321 --context-tokens 16384 --kv-budget-mib 8192
+
+uv run scripts/qualify-codex.py --run --url http://127.0.0.1:18321/v1 \
+  --model-id metallix-qwen3-4b --output artifacts/codex-qualification-run
+```
+
+The qualifier creates a unique fact per trial and requires native command
+execution before the exact final marker and turn completion. The recorded 4B
+run passed three trials under these limits. A strict reassessment verified
+command execution before the exact final marker and terminal completion in all
+three saved traces from Codex CLI 0.153.4. It uses fallback model metadata and
+does not qualify general coding, complete tool grammar, steady-state performance,
+or a Codex profile installation.
+
+An optional experimental user-level profile has this shape:
 
 ```toml
-# ~/.codex/metallix.config.toml — qualification target only
-model_provider = "metallix"
-model = "metallix-qwen3"
+# ~/.codex/config.toml — optional experimental profile
 
 [model_providers.metallix]
 name = "Local Metallix"
-base_url = "http://127.0.0.1:8321/v1"
+base_url = "http://127.0.0.1:18321/v1"
 wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[profiles.metallix]
+model_provider = "metallix"
+model = "metallix-qwen3-4b"
+model_context_window = 16384
 ```
 
-That example makes no configuration change. It needs a full client-compatibility
-and safety gate first. Codex provider and profile settings belong in the user's
-Codex configuration; project-local provider settings are ignored. The
+That example makes no configuration change. The bounded command-tool result is
+not a full client-compatibility qualification. Codex provider and profile
+settings belong in the user's Codex configuration; project-local provider
+settings are ignored. The controlled test used short model instructions and
+disabled hooks, apps, multi-agent features, remote plugins, shell snapshots,
+and web search; the manual profile is not equivalent. The
 [official configuration reference](https://developers.openai.com/docs/config-file/config-reference)
 documents the provider keys and `--profile` selection.
 

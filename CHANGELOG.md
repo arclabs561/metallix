@@ -7,6 +7,22 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- The reduced DeepSeek continuation now starts at the native layer-two FFN,
+  carrying its residual and HC pre-mix through Engram3 and layers three/four
+  to final logits. Source-derived arithmetic bounds and mutated handoff tests
+  preserve the distinction from complete model execution.
+- Resident chat, agent, and Responses commands accept an explicit logical K/V
+  budget and an experimental context ceiling of 16,384 tokens. Defaults remain
+  2048 tokens and 512 MiB. Loading and request admission share the same budget.
+- Sharded Qwen reference receipts bind the checkpoint index and exact shard set.
+  Qwen3-4B-Instruct-2507 passed full-logit and cached-forward comparisons and
+  all 12 bounded native read-tool trials.
+- A reproducible Codex qualification runner checks native command execution,
+  hidden fixture values, event ordering, terminal completion, and workspace
+  preservation. Three real client trials passed against the 4B Responses
+  endpoint; general coding and custom grammar tools remain unqualified.
+- Third-party notices explicitly inventory Qwen numerical extracts and newer
+  synthetic DeepSeek captures alongside the retained Apache-2.0 and MIT terms.
 - Profile-guided BF16 projection row iteration preserves scalar arithmetic and
   error semantics while improving the measured captured owner workload.
   Property tests cover row splitting, output permutation, and late-overflow

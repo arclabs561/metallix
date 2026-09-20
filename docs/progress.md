@@ -3,9 +3,21 @@
 ## Delivered in this lane
 
 - Native Qwen3 chat uses the checkpoint template and keeps model weights loaded
-  across turns. KV state is rebuilt per turn. Resident chat admits up to 2048
-  tokens after checking model limits and a 512 MiB logical KV budget; diagnostic
-  commands retain their 512-token limit.
+  across turns. KV state is rebuilt per turn. `--context-tokens` defaults to
+  2048 and `--kv-budget-mib` to 512 MiB, with experimental ceilings of 16,384
+  and 8192 MiB; diagnostic commands retain their 512-token limit. The pinned
+  4B checkpoint revision `cdbee75f17c01a7cc42f958dc650907174af0554` passed the
+  bounded four-case agent workload in all 12 trials at 2048 tokens and 1024 MiB.
+  Its 151,936 Metal logits matched the CPU reference, with maximum absolute
+  difference 0.0000581741 and RMSE 0.00001409596. Eight cached-versus-uncached
+  positions also matched across all 151,936 logits, with maximum absolute
+  difference 0.000020980835. This does not qualify the expanded ceilings,
+  general coding, or general Codex coding.
+- A separate native Codex command-tool check passed 3/3 fresh synthetic-fact
+  trials against the 4B server at 16,384 tokens and 8192 MiB. Strict
+  reassessment verified command execution before each exact final answer and
+  terminal completion; the controlled CLI was 0.153.4. It used fallback model
+  metadata and controlled instructions/features, so no user profile was added.
 - `mx agent` runs a bounded read-only workspace tool loop. Complete tool calls
   and surrounding assistant text survive history replay. Paths are opened
   relative to a pinned workspace descriptor without following symlinks.
@@ -27,7 +39,12 @@
   line numbers. A generated delimiter-in-string case found and fixed an actual
   tool parser bug. Further properties cover HTTP fragmentation, SSE framing,
   and function-result ordering; reused completed call IDs are now rejected.
-- A new source capture supplies layer-three block-entry residual/pre-mix;
+- Native layer-two FFN output now feeds Engram3 and the connected layer-three/
+  four suffix through final logits. Both native residual and HC pre-mix are
+  retained as operands. Fixed HC arithmetic bounds handle FP32 rounding, and
+  exact BF16 attention-input checks reject corrupted handoffs. The layer-two
+  post-attention input remains captured; this is still a reduced graph.
+- A source capture supplies layer-three block-entry residual/pre-mix;
   native HC and RMSNorm now derive the owner/candidate attention input and
   cross-check it against preserved historical captures.
 - The layer-three continuation now consumes native staged owner keys/KV and
@@ -65,8 +82,9 @@
    quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
    forward through the earlier text blocks. Layers three and four now connect
-   natively through final logits; layer three's entry still comes from capture.
-   Replace that upstream captured state with native earlier-block output while
+   natively through final logits, preceded by native Engram3 and layer-two FFN.
+   Layer-two post-attention state still comes from capture. Replace that state
+   with native earlier-block output while
    preserving the source-grounded arithmetic and discrete routing gates.
    Operator and transaction parity do not establish full-model generation. Keep full checkpoint
    acquisition behind the existing reduced-forward numerical gate.
@@ -81,10 +99,12 @@
    tasks. Shell and write tools
    need a separate execution policy; this delivery does not execute them.
 4. **Serving owner: Responses lane.** Socket read/write deadlines are bounded;
-   qualify concurrent admission, client-driven cancellation, longer context beyond
-   the 2048-token control, custom-tool requirements, and real Codex task
-   completion. Only then activate a personal Codex profile. The documentation's
-   profile example is a qualification target; no live profile was changed.
+   qualify concurrent admission, client-driven cancellation, the experimental
+   16,384-token/8192-MiB resident limits, custom-tool requirements, and broader
+   Codex tasks. A bounded native Codex command-tool run passed 3/3 fresh trials
+   against the 4B server at those limits, but used fallback model metadata and
+   does not establish general coding or complete tool grammar support.
+   No live profile was changed.
 5. **Runtime owner: comparison lane.** Run matched quality/tool/performance
    workloads on an independently owned current local runtime before deciding
    whether a new native model adapter is worth its implementation cost.
@@ -105,9 +125,17 @@ Both checks passed on the final implementation, followed by a release build
 and the live HTTP checks above. The owned test server was stopped after
 validation; use the README command to start a new one.
 
-The structured-agent and connected layer-three/four suffix batch passed both
+The earlier structured-agent and connected layer-three/four suffix batch passed both
 canonical checks, the 15 qualifier tests, the source exporter rejection tests,
 and observer restoration checks. Live JSON receipts also retain failure status
-when workspace initialization fails. The four-task qualification remains
+when workspace initialization fails. The earlier 0.6B four-task qualification remains
 partially failing as described above; no Codex-readiness claim follows from
 passing protocol and numerical checks.
+
+The subsequent 4B/layer-two batch passed both canonical checks, including
+the resident-budget properties and 17 Codex qualifier tests. Both source-backed
+layer-two FFN and historical Engram suites passed seven tests. All 12 native
+4B tool trials and three actual Codex command-tool trials passed; the preserved
+Codex logs also passed the stricter ordered-event reassessment. The owned
+qualification server was stopped. These results extend the bounded controls;
+earlier DeepSeek blocks and general coding qualification remain open.

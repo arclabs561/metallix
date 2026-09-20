@@ -338,6 +338,39 @@ is not an optimization. The join's long generated tool-call text and the
 long-file task's prefill cost are useful next measurement targets; reducing
 either must preserve the required evidence and answer.
 
+### Dense 4B tool qualification
+
+Qwen3-4B-Instruct-2507 revision
+`cdbee75f17c01a7cc42f958dc650907174af0554` passed the same four native read-tool
+tasks in three fresh processes each. This run used a 2048-token context,
+1024 MiB logical K/V budget, 256 output tokens per turn, and six turns maximum
+on the same M3 Max host. The admitted K/V plan was 576 MiB. The host was not
+isolated. Receipts are retained under ignored
+`artifacts/qwen4-agent-qualification/`; binary SHA-256:
+`aec65da2f2d1168a07009a7db87f707656f14b243079f18810d537650b589634`.
+
+| Task | Passing trials | Total prefill median / sample stdev | Total decode median / sample stdev | Generated tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Literal search | 3/3 | 647.08 / 32.24 ms | 1797.77 / 57.00 ms | 36 |
+| Two-file pointer chain | 3/3 | 998.51 / 79.62 ms | 2790.22 / 101.36 ms | 54 |
+| Long-file read | 3/3 | 1862.04 / 8.30 ms | 2287.24 / 19.72 ms | 42 |
+| Two-file factual join | 3/3 | 595.54 / 84.02 ms | 2574.99 / 66.45 ms | 50 |
+
+Session loading took 1650–1700 ms by task median and is excluded from these
+phase totals. The larger model completed the pointer chain that the 0.6B
+baseline did not, at substantially higher inference cost. This is bounded
+task-completion evidence, not a kernel speedup or general coding evaluation.
+
+An independent CPU float32 reference on raw IDs `[1, 2, 3]` also matched all
+151936 Metal final-token logits: maximum absolute error 0.0000581741 and RMSE
+0.0000140960, with zero mismatches under the existing absolute 0.0005 and
+relative 0.0001 tolerances. The receipt binds the index and all three checkpoint
+shard hashes. Raw evidence is under ignored `artifacts/qwen4-qualification/`.
+Eight cached generation positions also matched uncached full forwards over
+all logits, with maximum absolute error 0.0000209808 and zero mismatches.
+These short-context checks do not establish numerical parity at the experimental
+16384-token admission ceiling.
+
 ## Streaming disconnect recovery baseline
 
 This baseline used release binary `2e07b39`, before the new budget change, on

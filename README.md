@@ -8,7 +8,7 @@ A local inference engine for Apple Silicon, built around Rust and Metal.
 Generate JSON that follows your schema. Replay a sampled sequence. Inspect
 token probabilities and check the KV cache—all from `mx`.
 
-Qwen3-0.6B runs today. DeepSeek-V4.1-Flash is the main target; its
+Qwen3-0.6B and Qwen3-4B-Instruct-2507 run today. DeepSeek-V4.1-Flash is the main target; its
 configuration and isolated Metal operators work today, but it cannot generate
 yet.
 
@@ -85,14 +85,19 @@ general structured-output quality.
 locally available Qwen3 checkpoint. They use that checkpoint's
 `tokenizer_config.json` chat template. A resident session loads model weights
 once, then starts with fresh KV state for every chat turn or HTTP request.
-The `--context-tokens` control applies only to these three commands: it accepts 1
-through 2048 and defaults to 2048 total prompt-plus-generated tokens.
-`--max-tokens` reserves part of that total and accepts 1 through 256. Before
-checkpoint payloads load, the control path admits the selected context against
-a fixed 512 MiB *logical* f32 KV budget. At 2048 tokens, Qwen3-0.6B's plan is
-448 MiB. That estimate excludes weights, activations, scratch, and allocator
-headroom; it is not a process-RSS guarantee or an MLX allocation reservation.
-Use `--context-tokens 512` to retain the earlier compatibility bound.
+The `--context-tokens` control applies only to these three commands: it accepts
+1 through 16,384 and defaults to 2048 total prompt-plus-generated tokens.
+`--kv-budget-mib` sets the corresponding logical f32 K/V admission budget from
+1 through 8192 MiB and defaults to 512 MiB. `--max-tokens` reserves part of the
+context and accepts 1 through 256. Before checkpoint payloads load, the control
+path checks both limits. At 2048 tokens, Qwen3-0.6B's plan is 448 MiB. These
+are retained-K/V admission estimates, excluding weights, activations, scratch,
+and allocator headroom; they are neither process-RSS guarantees nor MLX
+allocation reservations. The expanded ceilings are experimental. A bounded 4B
+agent qualification passed 12/12 trials at 2048 tokens and 1024 MiB (checkpoint
+revision `cdbee75f17c01a7cc42f958dc650907174af0554`); it does not qualify the
+16,384-token or 8192-MiB ceilings, general coding work, or a Codex backend. Use
+`--context-tokens 512` to retain the earlier compatibility bound.
 
 Start a one-turn chat that streams text, or omit `--prompt` for the interactive
 loop (`/reset` clears history and `/quit` exits):
@@ -148,8 +153,8 @@ complete input history, function-call round trips, greedy sampling, JSON or
 SSE responses, and automatic tool choice are supported. Response storage,
 `previous_response_id`, images, nonzero temperature, seeds, top-p changes,
 and non-automatic tool choice are rejected. It is not ready to serve as a full
-Codex backend. A 2048-token control context is still insufficient evidence for
-that role. Accepted connections have a five-second total header/body read
+Codex backend. A bounded 4B Codex command-tool check is still insufficient
+evidence for that role. Accepted connections have a five-second total header/body read
 deadline and bounded writes; each connection handles one request. Transfer
 encoding, `Expect`, and duplicate body lengths are rejected. Generation has a
 separate cooperative 60-second budget (`--generation-timeout-ms`, 1–120000).
@@ -157,24 +162,44 @@ Checks surround prefill and each decode, including tokens with no visible text.
 An in-flight Metal operation must return before the budget can stop further
 work; client disconnects are still detected through failed output writes.
 
-A future user-level Codex profile could target this endpoint only after an
-end-to-end compatibility and safety qualification. This is an example of that
-future target, **not** a file to add today:
+A bounded native Codex command-tool check passed three fresh trials against a
+4B server configured with `--context-tokens 16384 --kv-budget-mib 8192`. Each
+trial read a distinct synthetic fact through Codex's command tool, returned its
+expected marker, and finished its turn. It used fallback model metadata and
+does not establish general coding, complete tool grammar, steady-state
+performance, or a production-ready Codex backend. A strict reassessment
+verified command execution before the exact answer and terminal completion in
+every saved trial. The test used Codex CLI 0.153.4. No user profile was installed.
+
+The corresponding server and optional user-level profile shape are:
+
+```sh
+mx serve --model /path/to/Qwen3-4B --model-id metallix-qwen3-4b \
+  --listen 127.0.0.1:18321 --context-tokens 16384 --kv-budget-mib 8192
+```
 
 ```toml
-# ~/.codex/metallix.config.toml — qualification target only
-model_provider = "metallix"
-model = "metallix-qwen3"
+# ~/.codex/config.toml — optional experimental profile
 
 [model_providers.metallix]
 name = "Local Metallix"
-base_url = "http://127.0.0.1:8321/v1"
+base_url = "http://127.0.0.1:18321/v1"
 wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+
+[profiles.metallix]
+model_provider = "metallix"
+model = "metallix-qwen3-4b"
+model_context_window = 16384
 ```
 
-Codex custom providers and profiles are user-level configuration, and a
-profile is selected with `--profile`; repository-local provider settings are
-ignored. See the
+This remains a qualification target, not a configuration change. Codex custom
+providers and profiles are user-level configuration, and a profile is selected
+with `--profile metallix`; repository-local provider settings are ignored. The
+controlled test additionally used short model instructions and disabled hooks,
+apps, multi-agent features, remote plugins, shell snapshots, and web search.
+An optional profile is therefore not equivalent to that test. See the
 [official Codex configuration reference](https://developers.openai.com/docs/config-file/config-reference).
 
 ## Sampling and diagnostics

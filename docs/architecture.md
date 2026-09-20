@@ -33,7 +33,15 @@ The current experimental control surface is intentionally narrower: one
 resident Qwen session supports local chat, a bounded read-only workspace agent,
 and loopback Responses text/function calls. Each turn starts with fresh KV
 state; it is not the planned multi-request scheduler or a general Codex
-backend.
+backend. `--context-tokens` defaults to 2048 and `--kv-budget-mib` to a 512 MiB
+logical K/V admission budget, with experimental ceilings of 16,384 and 8192
+MiB. The 4B checkpoint revision `cdbee75f17c01a7cc42f958dc650907174af0554`
+passed a bounded 12-trial read-tool qualification at 2048 tokens and 1024 MiB.
+That does not establish physical-memory use, the expanded ceilings, coding-agent
+ability, or Codex-backend readiness. A separate native Codex command-tool check
+passed three fresh synthetic-fact trials against the 4B server at the expanded
+resident limits. It relied on fallback model metadata and does not broaden those
+claims to general coding or complete tool grammar support.
 
 Agent JSON receipts record ordered executed calls and per-turn generation
 metrics without retaining raw tool-result payloads. Their completion status
