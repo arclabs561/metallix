@@ -209,8 +209,13 @@ fn event(writer: &mut dyn Write, sequence: &mut u64, mut value: Value) -> Result
     writer.flush().map_err(|e| e.to_string())
 }
 
-pub(crate) fn serve(model: &Path, model_id: &str, address: SocketAddr) -> ExitCode {
-    match serve_inner(model, model_id, address) {
+pub(crate) fn serve(
+    model: &Path,
+    model_id: &str,
+    address: SocketAddr,
+    context_tokens: usize,
+) -> ExitCode {
+    match serve_inner(model, model_id, address, context_tokens) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mx serve: {error}");
@@ -219,14 +224,19 @@ pub(crate) fn serve(model: &Path, model_id: &str, address: SocketAddr) -> ExitCo
     }
 }
 
-fn serve_inner(model: &Path, model_id: &str, address: SocketAddr) -> Result<(), String> {
+fn serve_inner(
+    model: &Path,
+    model_id: &str,
+    address: SocketAddr,
+    context_tokens: usize,
+) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
     }
-    let mut session = ChatSession::load(model)?;
+    let mut session = ChatSession::load(model, context_tokens)?;
     let server = tiny_http::Server::http(address).map_err(|e| e.to_string())?;
     eprintln!(
-        "mx listening on http://{address}; model={model_id}; single request; 512 total tokens; load_ms={:.2}",
+        "mx listening on http://{address}; model={model_id}; single request; {context_tokens} total tokens; load_ms={:.2}",
         session.load_ms()
     );
     for (index, mut request) in server.incoming_requests().enumerate() {
@@ -554,6 +564,8 @@ mod tests {
             generated_token_ids: vec![1],
             finish_reason: ChatFinishReason::Eos,
             metrics: ChatGenerationMetrics {
+                context_tokens: 2048,
+                planned_kv_bytes: 0,
                 session_load_ms: 0.0,
                 render_ms: 0.0,
                 prefill_ms: 0.0,

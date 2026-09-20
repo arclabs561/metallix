@@ -25,8 +25,15 @@ pub(crate) fn chat(
     prompt: Option<String>,
     max_tokens: u32,
     json_output: bool,
+    context_tokens: usize,
 ) -> ExitCode {
-    finish(chat_inner(model, prompt, max_tokens, json_output))
+    finish(chat_inner(
+        model,
+        prompt,
+        max_tokens,
+        json_output,
+        context_tokens,
+    ))
 }
 
 fn chat_inner(
@@ -34,8 +41,9 @@ fn chat_inner(
     prompt: Option<String>,
     max_tokens: u32,
     json_output: bool,
+    context_tokens: usize,
 ) -> Result<(), String> {
-    let mut session = ChatSession::load(model)?;
+    let mut session = ChatSession::load(model, context_tokens)?;
     let mut messages = Vec::new();
     if let Some(prompt) = prompt {
         messages.push(message(ChatRole::User, prompt));
@@ -57,7 +65,7 @@ fn chat_inner(
         return Ok(());
     }
     eprintln!(
-        "Native Qwen chat; /reset clears history, /quit exits. Context limit: 512 tokens including output budget."
+        "Native Qwen chat; /reset clears history, /quit exits. Context limit: {context_tokens} tokens including output budget."
     );
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -98,8 +106,16 @@ pub(crate) fn agent(
     prompt: String,
     max_tokens: u32,
     max_turns: u32,
+    context_tokens: usize,
 ) -> ExitCode {
-    finish(agent_inner(model, workspace, prompt, max_tokens, max_turns))
+    finish(agent_inner(
+        model,
+        workspace,
+        prompt,
+        max_tokens,
+        max_turns,
+        context_tokens,
+    ))
 }
 
 fn agent_inner(
@@ -108,9 +124,10 @@ fn agent_inner(
     prompt: String,
     max_tokens: u32,
     max_turns: u32,
+    context_tokens: usize,
 ) -> Result<(), String> {
     let workspace = WorkspaceTools::new(workspace)?;
-    let mut session = ChatSession::load(model)?;
+    let mut session = ChatSession::load(model, context_tokens)?;
     let tools = chat_tools::definitions();
     let mut messages = vec![message(ChatRole::User, prompt)];
     for turn_index in 0..max_turns {

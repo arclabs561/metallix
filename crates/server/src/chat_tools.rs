@@ -40,11 +40,17 @@ pub(crate) fn parse_turn(input: &str) -> Result<ParsedTurn, String> {
         }
         text.push_str(before);
         remaining = &remaining[start + "<tool_call>".len()..];
-        let end = remaining
-            .find("</tool_call>")
-            .ok_or("incomplete tool call")?;
-        let call: ToolCall = serde_json::from_str(remaining[..end].trim())
+        // The marker may occur inside a JSON string argument. Let JSON consume
+        // its complete value before checking the outer envelope delimiter.
+        let mut values = serde_json::Deserializer::from_str(remaining).into_iter::<ToolCall>();
+        let call = values
+            .next()
+            .ok_or("incomplete tool call")?
             .map_err(|error| format!("invalid tool call: {error}"))?;
+        remaining = remaining[values.byte_offset()..]
+            .trim_start()
+            .strip_prefix("</tool_call>")
+            .ok_or("incomplete tool call or trailing JSON data")?;
         if call.name.is_empty() || !call.arguments.is_object() {
             return Err("tool call requires a name and an arguments object".into());
         }
@@ -52,7 +58,6 @@ pub(crate) fn parse_turn(input: &str) -> Result<ParsedTurn, String> {
         if calls.len() > 8 {
             return Err("at most eight calls per turn".into());
         }
-        remaining = &remaining[end + "</tool_call>".len()..];
     }
     if remaining.contains("</tool_call>") {
         return Err("unmatched tool-call closing marker".into());
@@ -242,7 +247,9 @@ pub(crate) fn validator(schema: &Value) -> Result<jsonschema::Validator, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::{
+        fmt::Write as _,
         os::unix::fs::symlink,
         path::PathBuf,
         process::Command,
@@ -369,5 +376,126 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result["matches"][0]["text"], "name = \"server\"");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn json_arguments_and_unicode_text_survive_envelopes(
+            prefix in "[a-zA-Z0-9 \n🦀]{0,48}",
+            suffix in "[a-zA-Z0-9 \n🦀]{0,48}",
+            payloads in prop::collection::vec(prop_oneof![
+                any::<String>(),
+                Just("</tool_call>".to_owned()),
+                Just("<tool_call>".to_owned()),
+                Just("quotes \\\" and \\n and 🦀".to_owned()),
+            ], 1..=8),
+        ) {
+            let mut input = prefix.clone();
+            let expected: Vec<ToolCall> = payloads.into_iter().map(|payload| ToolCall {
+                name: "search_file".into(),
+                arguments: json!({"path":"README.md", "query":payload}),
+            }).collect();
+            for call in &expected {
+                let body = json!({"name":call.name,"arguments":call.arguments});
+                write!(input, "<tool_call>\n{body}\n</tool_call>").unwrap();
+            }
+            input.push_str(&suffix);
+            let parsed = parse_turn(&input).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(parsed.calls, expected);
+            prop_assert_eq!(parsed.text, prefix + &suffix);
+        }
+
+        #[test]
+        fn incomplete_batch_never_exposes_completed_prefix_calls(payload in any::<String>()) {
+            let body = json!({"name":"search_file","arguments":{"query":payload}});
+            let input = format!("<tool_call>{body}</tool_call><tool_call>{{");
+            prop_assert!(parse_turn(&input).is_err());
+        }
+
+        #[test]
+        fn call_limit_is_enforced_for_every_oversized_batch(count in 9_usize..32) {
+            let input = r#"<tool_call>{"name":"list_files","arguments":{"path":"."}}</tool_call>"#.repeat(count);
+            prop_assert!(parse_turn(&input).is_err());
+        }
+
+        #[test]
+        fn every_truncated_envelope_is_rejected(
+            payload in any::<String>(),
+            cut_seed in any::<usize>(),
+        ) {
+            let body = json!({"name":"read_file","arguments":{"path":payload}});
+            let input = format!("<tool_call>{body}</tool_call>");
+            let boundaries: Vec<_> = input.char_indices()
+                .map(|(offset, _)| offset)
+                .filter(|&offset| offset >= "<tool_call>".len())
+                .collect();
+            let cut = boundaries[cut_seed % boundaries.len()];
+            prop_assert!(parse_turn(&input[..cut]).is_err());
+        }
+
+        #[test]
+        fn extra_json_value_cannot_be_smuggled_inside_one_envelope(
+            payload in any::<String>(),
+            extra in prop_oneof![Just(json!(null)), Just(json!(false)), any::<i64>().prop_map(|x| json!(x)), any::<String>().prop_map(|x| json!(x))],
+        ) {
+            let body = json!({"name":"read_file","arguments":{"path":payload}});
+            let input = format!("<tool_call>{body} {extra}</tool_call>");
+            prop_assert!(parse_turn(&input).is_err());
+        }
+
+        #[test]
+        fn nested_argument_values_survive_json_and_envelope_roundtrip(
+            strings in prop::collection::vec(any::<String>(), 0..12),
+            number in any::<i64>(),
+            flag in any::<bool>(),
+        ) {
+            let arguments = json!({"nested":[{"strings":strings,"number":number,"flag":flag,"nothing":null}],"marker":"</tool_call>"});
+            let body = json!({"name":"custom","arguments":arguments});
+            let parsed = parse_turn(&format!("<tool_call>{body}</tool_call>")).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(parsed.calls.len(), 1);
+            prop_assert_eq!(&parsed.calls[0].arguments, &arguments);
+            prop_assert!(parsed.text.is_empty());
+        }
+
+        #[test]
+        fn literal_search_preserves_source_line_numbers_and_unicode(
+            rows in prop::collection::vec((any::<bool>(), "[a-z🦀]{0,24}"), 0..=140),
+        ) {
+            let root = TestRoot::new();
+            let workspace = root.workspace();
+            let lines: Vec<_> = rows.iter().map(|(hit, text)| {
+                if *hit { format!("{text}NEEDLE🦀") } else { text.clone() }
+            }).collect();
+            std::fs::write(workspace.join("rows.txt"), lines.join("\n") + "\n").unwrap();
+            let tools = WorkspaceTools::new(&workspace).unwrap();
+            let result = tools.execute(&ToolCall {
+                name: "search_file".into(),
+                arguments: json!({"path":"rows.txt","query":"NEEDLE🦀"}),
+            });
+            let expected: Vec<_> = rows.iter().enumerate().filter(|(_, (hit, _))| *hit)
+                .map(|(index, _)| json!({"line":index + 1,"text":lines[index]})).collect();
+            if expected.len() > 128 {
+                prop_assert!(result.is_err());
+            } else {
+                prop_assert_eq!(result.map_err(TestCaseError::fail)?, json!({"matches":expected}));
+            }
+        }
+
+        #[test]
+        fn utf8_file_limit_counts_bytes_not_characters(characters in 8188_usize..=8196) {
+            let root = TestRoot::new();
+            let workspace = root.workspace();
+            let text = "🦀".repeat(characters);
+            std::fs::write(workspace.join("unicode.txt"), &text).unwrap();
+            let tools = WorkspaceTools::new(&workspace).unwrap();
+            let result = tools.read(Path::new("unicode.txt"));
+            if characters <= 8192 {
+                prop_assert_eq!(result.map_err(TestCaseError::fail)?, text);
+            } else {
+                prop_assert!(result.is_err());
+            }
+        }
     }
 }

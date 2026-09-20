@@ -140,6 +140,9 @@ enum Command {
         prompt: Option<String>,
         #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=256))]
         max_tokens: u32,
+        /// Total prompt plus output budget for this resident session.
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
+        context_tokens: u32,
         /// Emit a structured receipt for a single prompt.
         #[arg(long, requires = "prompt")]
         json: bool,
@@ -157,6 +160,9 @@ enum Command {
         max_tokens: u32,
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
         max_turns: u32,
+        /// Total prompt plus output budget for each agent turn.
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
+        context_tokens: u32,
     },
     /// Serve the native Qwen control model through a local Responses endpoint.
     #[cfg(feature = "metal")]
@@ -167,6 +173,9 @@ enum Command {
         model_id: String,
         #[arg(long, default_value = "127.0.0.1:8321")]
         listen: std::net::SocketAddr,
+        /// Total prompt plus output budget for each request.
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
+        context_tokens: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]
@@ -432,7 +441,8 @@ pub fn run() -> ExitCode {
             prompt,
             max_tokens,
             json,
-        } => chat_cli::chat(&model, prompt, max_tokens, json),
+            context_tokens,
+        } => chat_cli::chat(&model, prompt, max_tokens, json, context_tokens as usize),
         #[cfg(feature = "metal")]
         Command::Agent {
             model,
@@ -440,13 +450,22 @@ pub fn run() -> ExitCode {
             prompt,
             max_tokens,
             max_turns,
-        } => chat_cli::agent(&model, &workspace, prompt, max_tokens, max_turns),
+            context_tokens,
+        } => chat_cli::agent(
+            &model,
+            &workspace,
+            prompt,
+            max_tokens,
+            max_turns,
+            context_tokens as usize,
+        ),
         #[cfg(feature = "metal")]
         Command::Serve {
             model,
             model_id,
             listen,
-        } => responses::serve(&model, &model_id, listen),
+            context_tokens,
+        } => responses::serve(&model, &model_id, listen, context_tokens as usize),
         #[cfg(feature = "metal")]
         Command::CheckV41RotaryMetal { fixture, repeats } => v41_rotary::run(&fixture, repeats),
         #[cfg(feature = "metal")]

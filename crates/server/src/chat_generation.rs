@@ -2,7 +2,8 @@
 //!
 //! This is deliberately a single-session, single-sequence core.  It retains
 //! model weights between calls but creates fresh KV state for each rendered
-//! conversation.  The qualified dense forward cap remains explicit.
+//! conversation. Resident chat has separate context and logical-KV admission;
+//! the diagnostic forward cap remains unchanged.
 
 use std::{
     fs,
@@ -131,6 +132,9 @@ pub(crate) enum ChatFinishReason {
 /// it is repeated here only to make individual receipts self-describing.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ChatGenerationMetrics {
+    pub(crate) context_tokens: usize,
+    /// Planned logical KV at the context limit, not allocated or process memory.
+    pub(crate) planned_kv_bytes: u64,
     pub(crate) session_load_ms: f64,
     pub(crate) render_ms: f64,
     /// Prefill through full vocabulary-logit readback; host greedy selection
@@ -162,6 +166,7 @@ pub(crate) struct ChatSession {
     eos_token_id: i32,
     vocabulary_size: usize,
     context_limit: usize,
+    planned_kv_bytes: u64,
     load_ms: f64,
 }
 
@@ -169,14 +174,13 @@ pub(crate) struct ChatSession {
 struct ChatConfig {
     eos_token_id: i32,
     vocab_size: usize,
-    max_position_embeddings: usize,
 }
 
 impl ChatSession {
     /// Loads and prepares a checkpoint once, including its template and tokenizer.
-    pub(crate) fn load(model: &Path) -> Result<Self, String> {
+    pub(crate) fn load(model: &Path, context_limit: usize) -> Result<Self, String> {
         let started = Instant::now();
-        let config = load_config(model)?;
+        let (config, plan) = load_config(model, context_limit)?;
         let tokenizer = QwenTokenizer::load(model)?;
         tokenizer.check_model_vocabulary(config.vocab_size, config.eos_token_id)?;
         let template_source = load_template(model)?;
@@ -186,12 +190,6 @@ impl ChatSession {
         weights
             .prepare_float32()
             .map_err(|error| error.to_string())?;
-        let context_limit = config
-            .max_position_embeddings
-            .min(qwen::forward::MAX_DENSE_DEBUG_TOKENS);
-        if context_limit == 0 {
-            return Err(String::from("model chat context limit is zero"));
-        }
         Ok(Self {
             weights,
             tokenizer,
@@ -199,6 +197,7 @@ impl ChatSession {
             eos_token_id: config.eos_token_id,
             vocabulary_size: config.vocab_size,
             context_limit,
+            planned_kv_bytes: plan.planned_kv_bytes(),
             load_ms: elapsed_ms(started.elapsed()),
         })
     }
@@ -235,7 +234,13 @@ impl ChatSession {
             ));
         }
 
-        let mut executor = self.weights.executor();
+        let mut executor = self
+            .weights
+            .resident_chat_executor(
+                self.context_limit,
+                qwen::forward::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES,
+            )
+            .map_err(|error| error.to_string())?;
         let prefill_started = Instant::now();
         let mut logits = executor
             .prefill_last_logits(&input_ids)
@@ -286,6 +291,8 @@ impl ChatSession {
             generated_token_ids: generated,
             finish_reason,
             metrics: ChatGenerationMetrics {
+                context_tokens: self.context_limit,
+                planned_kv_bytes: self.planned_kv_bytes,
                 session_load_ms: self.load_ms,
                 render_ms,
                 prefill_ms,
@@ -319,12 +326,25 @@ impl ChatSession {
     }
 }
 
-fn load_config(model: &Path) -> Result<ChatConfig, String> {
+fn load_config(
+    model: &Path,
+    context_limit: usize,
+) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan), String> {
     let path = model.join("config.json");
     let raw = fs::read_to_string(&path)
         .map_err(|_| String::from("local model config.json could not be read"))?;
-    serde_json::from_str(&raw)
-        .map_err(|_| String::from("local model config.json could not be parsed"))
+    let config = serde_json::from_str(&raw)
+        .map_err(|_| String::from("local model config.json could not be parsed"))?;
+    // Reject context/KV admission before checkpoint payload loading.
+    let plan = qwen::forward::Qwen3ForwardConfig::parse(&raw)
+        .and_then(|config| {
+            config.resident_chat_plan(
+                context_limit,
+                qwen::forward::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    Ok((config, plan))
 }
 
 fn load_template(model: &Path) -> Result<String, String> {
