@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 
 const defaults = {
+  api: "chat-completions",
   concurrency: 1,
   maxTokens: 64,
   requests: 3,
@@ -15,7 +16,7 @@ const cacheConditions = new Set(["cold-start", "warm", "mixed"]);
 function usage(message) {
   if (message) console.error(message);
   console.error(
-    "usage: node scripts/benchmark-openai.mjs --url URL --model MODEL --cache-condition cold-start|warm|mixed [--prompt TEXT] [--requests N] [--concurrency N] [--max-tokens N] [--warmup N] [--seed N] [--timeout-ms N]",
+    "usage: node scripts/benchmark-openai.mjs --url URL --model MODEL --cache-condition cold-start|warm|mixed [--api chat-completions|responses] [--prompt TEXT] [--requests N>=3] [--concurrency N] [--max-tokens N] [--warmup N] [--seed N] [--timeout-ms N]",
   );
   process.exitCode = 2;
 }
@@ -44,6 +45,7 @@ function parseArgs(arguments_) {
     if (!flag?.startsWith("--") || value === undefined) throw new Error(`invalid argument ${flag}`);
     switch (flag) {
       case "--url": options.url = value.replace(/\/+$/, ""); break;
+      case "--api": options.api = value; break;
       case "--model": options.model = value; break;
       case "--cache-condition": options.cacheCondition = value; break;
       case "--prompt": options.prompt = value; break;
@@ -67,6 +69,10 @@ function parseArgs(arguments_) {
   if (!cacheConditions.has(options.cacheCondition)) {
     throw new Error("--cache-condition must be one of cold-start, warm, or mixed");
   }
+  if (!["chat-completions", "responses"].includes(options.api)) {
+    throw new Error("--api must be chat-completions or responses");
+  }
+  if (options.requests < 3) throw new Error("--requests must be at least 3");
   if (options.cacheCondition === "cold-start" && options.warmup > 0) {
     throw new Error("--cache-condition cold-start requires --warmup 0");
   }
@@ -105,8 +111,9 @@ function createSseParser(onEvent) {
       }
     },
     finish() {
-      if (buffered.length > 0) processLine(buffered.replace(/\r$/, ""));
-      dispatch();
+      if (buffered.length > 0 || dataLines.length > 0) {
+        throw new Error("stream ended with an incomplete SSE event");
+      }
     },
   };
 }
@@ -115,18 +122,27 @@ async function runRequest(options) {
   const started = performance.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
-  const payload = {
-    model: options.model,
-    messages: [{ role: "user", content: options.prompt }],
-    temperature: 0,
-    max_tokens: options.maxTokens,
-    stream: true,
-    stream_options: { include_usage: true },
-  };
-  if (options.seed !== undefined) payload.seed = options.seed;
+  const payload = options.api === "responses"
+    ? {
+      model: options.model,
+      input: options.prompt,
+      temperature: 0,
+      max_output_tokens: options.maxTokens,
+      stream: true,
+    }
+    : {
+      model: options.model,
+      messages: [{ role: "user", content: options.prompt }],
+      temperature: 0,
+      max_tokens: options.maxTokens,
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+  if (options.seed !== undefined && options.api === "chat-completions") payload.seed = options.seed;
   let reader;
   try {
-    const response = await fetch(`${options.url}/v1/chat/completions`, {
+    const path = options.api === "responses" ? "/v1/responses" : "/v1/chat/completions";
+    const response = await fetch(`${options.url}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -140,8 +156,14 @@ async function runRequest(options) {
     let firstContentDelta;
     let lastContentDelta;
     let contentDeltaCount = 0;
+    let outputTextUtf8Bytes = 0;
+    let outputText = "";
+    let responseBytes = 0;
     let usage;
+    let serverMetrics = null;
     let receivedDone = false;
+    let terminalStatus = null;
+    let incompleteReason = null;
     const parser = createSseParser((data) => {
     const now = performance.now();
     firstEvent ??= now;
@@ -156,32 +178,95 @@ async function runRequest(options) {
       throw new Error("server returned an invalid JSON SSE data event");
     }
       if (event.error) throw new Error("server returned an SSE error event");
-    if (event.choices?.some((choice) => {
+    const chatContent = event.choices?.some((choice) => {
       const content = choice.delta?.content;
       return typeof content === "string" ? content.length > 0 : Array.isArray(content) && content.length > 0;
-    })) {
+    });
+    const responseText = event.type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length > 0;
+    if (event.type === "response.output_text.delta" && typeof event.delta !== "string") {
+      throw new Error("response.output_text.delta has a non-string delta");
+    }
+    if (chatContent || responseText) {
       firstContentDelta ??= now;
       lastContentDelta = now;
       contentDeltaCount += 1;
+      if (responseText) {
+        outputTextUtf8Bytes += Buffer.byteLength(event.delta, "utf8");
+        outputText += event.delta;
+      }
+      if (chatContent) {
+        for (const choice of event.choices) {
+          const content = choice.delta?.content;
+          if (typeof content === "string") {
+            outputTextUtf8Bytes += Buffer.byteLength(content, "utf8");
+            outputText += content;
+          }
+        }
+      }
     }
       if (event.usage) {
         tokenCount(event.usage.completion_tokens, "completion_tokens");
         tokenCount(event.usage.prompt_tokens, "prompt_tokens");
-        usage = event.usage;
+      usage = event.usage;
+    }
+    if (event.type === "response.completed") {
+      if (terminalStatus) throw new Error("server returned multiple terminal response events");
+      if (!event.response || typeof event.response !== "object") {
+        throw new Error("response.completed lacks a response object");
       }
+      const responseUsage = event.response.usage;
+      if (responseUsage !== undefined) {
+        tokenCount(responseUsage.input_tokens, "input_tokens");
+        tokenCount(responseUsage.output_tokens, "output_tokens");
+        usage = { prompt_tokens: responseUsage.input_tokens, completion_tokens: responseUsage.output_tokens };
+      }
+      if (event.response.metrics !== undefined) {
+        if (!event.response.metrics || typeof event.response.metrics !== "object" || Array.isArray(event.response.metrics)) {
+          throw new Error("response.completed metrics is not an object");
+        }
+        serverMetrics = event.response.metrics;
+      }
+      terminalStatus = "completed";
+    }
+    if (event.type === "response.incomplete") {
+      if (terminalStatus) throw new Error("server returned multiple terminal response events");
+      if (!event.response || typeof event.response !== "object") {
+        throw new Error("response.incomplete lacks a response object");
+      }
+      const responseUsage = event.response.usage;
+      if (responseUsage !== undefined) {
+        tokenCount(responseUsage.input_tokens, "input_tokens");
+        tokenCount(responseUsage.output_tokens, "output_tokens");
+        usage = { prompt_tokens: responseUsage.input_tokens, completion_tokens: responseUsage.output_tokens };
+      }
+      if (event.response.metrics !== undefined) {
+        if (!event.response.metrics || typeof event.response.metrics !== "object" || Array.isArray(event.response.metrics)) {
+          throw new Error("response.incomplete metrics is not an object");
+        }
+        serverMetrics = event.response.metrics;
+      }
+      incompleteReason = typeof event.response.incomplete_details?.reason === "string"
+        ? event.response.incomplete_details.reason
+        : null;
+      terminalStatus = "incomplete";
+    }
     });
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      responseBytes += value.byteLength;
       parser.push(decoder.decode(value, { stream: true }));
-      if (receivedDone) {
+      if (receivedDone || (options.api === "responses" && terminalStatus)) {
         await reader.cancel();
         break;
       }
     }
     parser.push(decoder.decode());
     parser.finish();
-    if (!receivedDone) throw new Error("stream ended without [DONE]");
+    if (options.api === "responses" && !terminalStatus) {
+      throw new Error("stream ended without a Responses terminal event");
+    }
+    if (options.api === "chat-completions" && !receivedDone) throw new Error("stream ended without [DONE]");
     const totalMs = performance.now() - started;
     const completionTokens = tokenCount(usage?.completion_tokens, "completion_tokens");
     const promptTokens = tokenCount(usage?.prompt_tokens, "prompt_tokens");
@@ -198,9 +283,16 @@ async function runRequest(options) {
       ? Math.round(((lastContentDelta - firstContentDelta) / (completionTokens - 1)) * 1000) / 1000
       : null,
     content_delta_count: contentDeltaCount,
+    output_text_utf8_bytes: outputTextUtf8Bytes,
+    output_text_sha256: createHash("sha256").update(outputText, "utf8").digest("hex"),
+    response_bytes: responseBytes,
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
       received_done: receivedDone,
+      received_completed: terminalStatus === "completed",
+      terminal_status: options.api === "responses" ? terminalStatus : "completed",
+      incomplete_reason: incompleteReason,
+      server_metrics: serverMetrics,
     };
   } catch (error) {
     await reader?.cancel(error).catch(() => {});
@@ -229,7 +321,17 @@ function median(values) {
 
 function medianPresent(samples, field) {
   const values = samples.map((sample) => sample[field]).filter((value) => value !== null);
-  return { sample_count: values.length, value: values.length > 0 ? median(values) : null };
+  const mean = values.length > 0
+    ? values.reduce((total, value) => total + value, 0) / values.length
+    : null;
+  return {
+    sample_count: values.length,
+    value: values.length > 0 ? median(values) : null,
+    mean,
+    sample_stdev: values.length > 1
+      ? Math.sqrt(values.reduce((total, value) => total + ((value - mean) ** 2), 0) / (values.length - 1))
+      : null,
+  };
 }
 
 async function main() {
@@ -247,14 +349,18 @@ async function main() {
   }
   await Promise.all(Array.from({ length: Math.min(options.concurrency, options.requests) }, worker));
   const wallMs = performance.now() - started;
+  const incompleteSamples = samples.filter((sample) => sample.terminal_status !== "completed");
   const samplesWithCompletionUsage = samples.filter((sample) => sample.completion_tokens !== null);
   const completionTokens = samplesWithCompletionUsage
     .reduce((total, sample) => total + sample.completion_tokens, 0);
   const promptDigest = createHash("sha256").update(options.prompt, "utf8").digest("hex");
   console.log(JSON.stringify({
-    schema_version: 2,
+    schema_version: 3,
+    status: incompleteSamples.length === 0 ? "completed" : "incomplete",
     workload: {
       endpoint: options.url,
+      endpoint_path: options.api === "responses" ? "/v1/responses" : "/v1/chat/completions",
+      api: options.api,
       model: options.model,
       prompt_sha256: promptDigest,
       prompt_utf8_bytes: Buffer.byteLength(options.prompt, "utf8"),
@@ -263,7 +369,11 @@ async function main() {
       max_tokens: options.maxTokens,
       timeout_ms: options.timeoutMs,
       warmup_requests_excluded: options.warmup,
-      sampling: { temperature: 0, seed: options.seed ?? null },
+      sampling: {
+        temperature: 0,
+        seed: options.api === "chat-completions" ? options.seed ?? null : null,
+        seed_scope: options.api === "chat-completions" ? "request" : "not supported by this client payload",
+      },
       streaming: { requested: true, include_usage: true },
       cache_condition: {
         declared: options.cacheCondition,
@@ -277,6 +387,8 @@ async function main() {
       median_total_ms: medianPresent(samples, "total_ms"),
       median_mean_inter_content_delta_latency_ms: medianPresent(samples, "mean_inter_content_delta_latency_ms"),
       median_estimated_mean_inter_token_latency_ms: medianPresent(samples, "estimated_mean_inter_token_latency_ms"),
+      response_bytes: medianPresent(samples, "response_bytes"),
+      output_text_utf8_bytes: medianPresent(samples, "output_text_utf8_bytes"),
       reported_completion_tokens: {
         total: completionTokens,
         sample_count: samplesWithCompletionUsage.length,
@@ -284,9 +396,21 @@ async function main() {
       aggregate_reported_completion_tokens_per_s: samplesWithCompletionUsage.length === samples.length
         ? Math.round((completionTokens / (wallMs / 1000)) * 1000) / 1000
         : null,
+      terminal_statuses: {
+        completed: samples.length - incompleteSamples.length,
+        incomplete: incompleteSamples.length,
+      },
     },
     samples,
+    memory: {
+      max_rss_bytes: null,
+      scope: "not measured: an HTTP client cannot claim remote server memory",
+    },
   }, null, 2));
+  if (incompleteSamples.length > 0) {
+    console.error("benchmark incomplete: one or more Responses requests ended incomplete");
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error) => usage(error.message));

@@ -1,6 +1,15 @@
 use std::{fs, path::PathBuf, process::ExitCode};
 
 #[cfg(feature = "metal")]
+mod chat_cli;
+#[cfg(feature = "metal")]
+mod chat_generation;
+#[cfg(feature = "metal")]
+mod chat_tools;
+#[cfg(feature = "metal")]
+mod responses;
+
+#[cfg(feature = "metal")]
 mod generation_preview;
 #[cfg(feature = "metal")]
 mod parity;
@@ -26,7 +35,7 @@ use qwen::{
     about = "Inspect model files and run experimental Metal inference",
     after_help = "\
 Scope:
-  No HTTP serving is implemented.
+  Experimental native chat, read-only agent, and loopback Responses serving require Metal.
   Inspect commands read model configuration or checkpoint headers; they do not load weights.
   Metal commands require an Apple-Silicon build with --features metal.
   Qwen forward uses raw token IDs; generate also accepts a local-tokenizer plain-text prompt for one sequence."
@@ -122,6 +131,43 @@ fn sampling_configuration(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Chat using the checkpoint template and one resident Qwen model.
+    #[cfg(feature = "metal")]
+    Chat {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=256))]
+        max_tokens: u32,
+        /// Emit a structured receipt for a single prompt.
+        #[arg(long, requires = "prompt")]
+        json: bool,
+    },
+    /// Run a bounded agent with workspace file-read and search tools.
+    #[cfg(feature = "metal")]
+    Agent {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=256))]
+        max_tokens: u32,
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
+        max_turns: u32,
+    },
+    /// Serve the native Qwen control model through a local Responses endpoint.
+    #[cfg(feature = "metal")]
+    Serve {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "metallix-qwen3")]
+        model_id: String,
+        #[arg(long, default_value = "127.0.0.1:8321")]
+        listen: std::net::SocketAddr,
+    },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]
     CheckV41RotaryMetal {
@@ -380,6 +426,27 @@ enum Command {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "metal")]
+        Command::Chat {
+            model,
+            prompt,
+            max_tokens,
+            json,
+        } => chat_cli::chat(&model, prompt, max_tokens, json),
+        #[cfg(feature = "metal")]
+        Command::Agent {
+            model,
+            workspace,
+            prompt,
+            max_tokens,
+            max_turns,
+        } => chat_cli::agent(&model, &workspace, prompt, max_tokens, max_turns),
+        #[cfg(feature = "metal")]
+        Command::Serve {
+            model,
+            model_id,
+            listen,
+        } => responses::serve(&model, &model_id, listen),
         #[cfg(feature = "metal")]
         Command::CheckV41RotaryMetal { fixture, repeats } => v41_rotary::run(&fixture, repeats),
         #[cfg(feature = "metal")]
@@ -1693,7 +1760,7 @@ mod tests {
         let help = root_help().split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(help.contains("Inspect model files and run experimental Metal inference"));
-        assert!(help.contains("No HTTP serving is implemented."));
+        assert!(help.contains("loopback Responses serving require Metal"));
         assert!(help.contains("Inspect commands read model configuration or checkpoint headers"));
         assert!(help.contains("--features metal"));
         assert!(help.contains("Qwen forward uses raw token IDs"));

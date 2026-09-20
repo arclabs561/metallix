@@ -334,6 +334,82 @@ and keep/reject decision. A checkout commit does not authenticate an arbitrary
 binary's build provenance. Retain raw receipts locally; publish concise results
 and caveats in `docs/experiments/`.
 
+## Experimental chat, agent, and Responses control
+
+These Metal-only commands are a Qwen3 control path, separate from `gen`'s
+plain-text/raw-ID diagnostic interface. `chat`, `agent`, and `serve` render the
+checkpoint's own `tokenizer_config.json:chat_template`. Each `ChatSession`
+loads and prepares Qwen weights once; every turn or HTTP request creates fresh
+KV state. The maximum is `min(model context, 512)` prompt-plus-generated
+tokens, and each command constrains `--max-tokens` or `max_output_tokens` to
+1 through 256. The cap is an explicit qualified implementation bound, not a
+claim about Qwen's full configured context.
+
+For a short interactive control check:
+
+```sh
+target/release/mx chat --model /path/to/Qwen3-0.6B \
+  --prompt "Summarize this repository in one sentence." --max-tokens 64
+```
+
+Without `--prompt`, `chat` retains conversation history until `/reset` or
+`/quit`. With `--json`, it returns one JSON receipt instead of writing text
+deltas. The receipt separates one-time `session_load_ms` from rendering,
+prefill, time-to-first-token, and per-token decode timings. Do not compare the
+first request against later requests without separating load time.
+
+`agent` is a bounded local-read loop, not a general autonomous executor:
+
+```sh
+target/release/mx agent --model /path/to/Qwen3-0.6B --workspace . \
+  --prompt "Locate the documented generated-token limits." \
+  --max-tokens 128 --max-turns 4
+```
+
+It exposes only `read_file`, `list_files`, and `search_file`. Files must be
+UTF-8 regular files below the opened workspace root and at most 32 KiB;
+directory listings and search results stop at 128 entries or matches. There
+are no write, shell, network, or process tools. The agent parses only complete
+tool-call envelopes, validates the JSON arguments, and skips all tool execution
+when the model reaches its output limit mid-call.
+
+Serve the same resident session locally:
+
+```sh
+target/release/mx serve --model /path/to/Qwen3-0.6B --model-id metallix-qwen3
+```
+
+It binds only to `127.0.0.1` by default and handles one request at a time. It
+offers `GET /healthz`, `GET /v1/models`, and `POST /v1/responses`; request
+bodies are limited to 1 MiB. The endpoint accepts text-only input, complete
+history, validated function definitions and function-call outputs, greedy
+sampling, and optional SSE. It rejects response storage, response-ID chaining,
+images, nondefault sampling controls, and forced tool choice. Treat it as a
+small Responses compatibility target, not a complete OpenAI or Codex service.
+The serial HTTP implementation has no application-level body-read deadline;
+a stalled local client can delay subsequent requests. Keep it an owned local
+test process until request deadlines and concurrent-client behavior are qualified.
+
+Do not add a live Codex provider configuration while this protocol is still
+being qualified. The intended future shape is a user-level profile such as:
+
+```toml
+# ~/.codex/metallix.config.toml — qualification target only
+model_provider = "metallix"
+model = "metallix-qwen3"
+
+[model_providers.metallix]
+name = "Local Metallix"
+base_url = "http://127.0.0.1:8321/v1"
+wire_api = "responses"
+```
+
+That example makes no configuration change. It needs a full client-compatibility
+and safety gate first. Codex provider and profile settings belong in the user's
+Codex configuration; project-local provider settings are ignored. The
+[official configuration reference](https://developers.openai.com/docs/config-file/config-reference)
+documents the provider keys and `--profile` selection.
+
 ## Instrument what is real
 
 Current tools emit local JSON receipts and explicit completion/failure status.

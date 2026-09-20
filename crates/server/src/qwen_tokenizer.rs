@@ -13,6 +13,15 @@ pub(crate) struct QwenTokenizer {
     tokenizer: Tokenizer,
 }
 
+/// Stateful decoder input retained until the tokenizer can emit a stable text
+/// suffix. The underlying decoder may need later token IDs to complete UTF-8
+/// or normalize a preceding token boundary.
+pub(crate) struct QwenIncrementalDecode {
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+}
+
 impl QwenTokenizer {
     pub(crate) fn load(model: &Path) -> Result<Self, String> {
         let bytes = read_regular_file(&model.join("tokenizer.json"), MAX_TOKENIZER_BYTES)?;
@@ -96,6 +105,40 @@ impl QwenTokenizer {
             String::from("generated token IDs could not be decoded by local tokenizer")
         })
     }
+
+    /// Starts a stateful generated-token decoder for one response stream.
+    #[must_use]
+    pub(crate) fn generated_decoder() -> QwenIncrementalDecode {
+        QwenIncrementalDecode {
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+        }
+    }
+
+    /// Decodes one token into a suffix that the tokenizer has established as
+    /// stable. `None` means the decoder is awaiting a later token, for example
+    /// to complete a multi-byte UTF-8 sequence.
+    pub(crate) fn decode_generated_token(
+        &self,
+        state: &mut QwenIncrementalDecode,
+        token_id: i32,
+    ) -> Result<Option<String>, String> {
+        let token_id =
+            u32::try_from(token_id).map_err(|_| String::from("generated token ID is negative"))?;
+        self.tokenizer
+            .id_to_token(token_id)
+            .ok_or_else(|| String::from("generated token ID is absent from local tokenizer"))?;
+        tokenizers::tokenizer::step_decode_stream(
+            &self.tokenizer,
+            vec![token_id],
+            false,
+            &mut state.ids,
+            &mut state.prefix,
+            &mut state.prefix_index,
+        )
+        .map_err(|_| String::from("generated token IDs could not be decoded by local tokenizer"))
+    }
 }
 
 /// Reads one local regular tokenizer file with a post-open bound check, keeping
@@ -144,7 +187,13 @@ fn read_regular_file(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, Strin
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, iter::FromIterator};
+
     use super::QwenTokenizer;
+    use tokenizers::{
+        TokenizerBuilder, decoders::byte_fallback::ByteFallback, models::bpe::BPE,
+        normalizers::unicode::NFC, pre_tokenizers::byte_level::ByteLevel,
+    };
 
     const TOKENIZER_JSON: &[u8] = br###"{
       "version": "1.0",
@@ -212,6 +261,42 @@ mod tests {
         assert_eq!(
             tokenizer.encode_prompt(""),
             Err(String::from("prompt must not be empty"))
+        );
+    }
+
+    #[test]
+    fn incremental_decode_waits_for_a_complete_utf8_suffix() {
+        let vocab = HashMap::from_iter([
+            (String::from("<0x20>"), 0),
+            (String::from("<0xC3>"), 1),
+            (String::from("<0xA9>"), 2),
+        ]);
+        let tokenizer = QwenTokenizer {
+            tokenizer: TokenizerBuilder::default()
+                .with_model(
+                    BPE::builder()
+                        .vocab_and_merges(vocab, Vec::new())
+                        .byte_fallback(true)
+                        .build()
+                        .expect("small byte fallback BPE"),
+                )
+                .with_decoder(Some(ByteFallback::default()))
+                .with_normalizer(Some(NFC))
+                .with_pre_tokenizer(Some(ByteLevel::default()))
+                .with_post_processor(Some(ByteLevel::default()))
+                .build()
+                .expect("small streaming tokenizer")
+                .into(),
+        };
+        let mut stream = QwenTokenizer::generated_decoder();
+        assert_eq!(
+            tokenizer.decode_generated_token(&mut stream, 0),
+            Ok(Some(String::from(" ")))
+        );
+        assert_eq!(tokenizer.decode_generated_token(&mut stream, 1), Ok(None));
+        assert_eq!(
+            tokenizer.decode_generated_token(&mut stream, 2),
+            Ok(Some(String::from("é")))
         );
     }
 }

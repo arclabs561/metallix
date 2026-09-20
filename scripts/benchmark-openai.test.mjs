@@ -26,7 +26,7 @@ function runCli(url, extra = []) {
       "--model", "mock-model",
       "--cache-condition", "warm",
       "--warmup", "0",
-      "--requests", "1",
+      "--requests", "3",
       "--concurrency", "1",
       "--max-tokens", "2",
       "--seed", "7",
@@ -74,17 +74,17 @@ test("records fragmented CRLF SSE content and reported usage", async () => {
     const result = await runCli(url);
     assert.equal(result.code, 0, result.stderr);
     const output = JSON.parse(result.stdout);
-    assert.equal(output.schema_version, 2);
+    assert.equal(output.schema_version, 3);
     assert.equal(output.workload.prompt_sha256.length, 64);
     assert.equal("prompt" in output.workload, false);
     assert.equal(output.workload.timeout_ms, 120_000);
-    assert.deepEqual(output.workload.sampling, { temperature: 0, seed: 7 });
+    assert.deepEqual(output.workload.sampling, { temperature: 0, seed: 7, seed_scope: "request" });
     assert.equal(output.samples[0].received_done, true);
     assert.equal(output.samples[0].content_delta_count, 2);
     assert.equal(output.samples[0].prompt_tokens, 4);
     assert.equal(output.samples[0].completion_tokens, 2);
     assert.notEqual(output.samples[0].ttft_ms, null);
-    assert.equal(output.summary.reported_completion_tokens.total, 2);
+    assert.equal(output.summary.reported_completion_tokens.total, 6);
     assert.equal(output.summary.aggregate_reported_completion_tokens_per_s !== null, true);
   });
   assert.deepEqual(receivedPayload, {
@@ -165,4 +165,76 @@ test("rejects a cold-start declaration with warmup requests", async () => {
   const result = await runCli("http://127.0.0.1:1", ["--cache-condition", "cold-start", "--warmup", "1"]);
   assert.notEqual(result.code, 0);
   assert.match(result.stderr, /cold-start requires --warmup 0/);
+});
+
+test("records a golden Responses stream, excluding tool arguments from text bytes", async () => {
+  let receivedPayload;
+  await withServer(async (request, response) => {
+    assert.equal(request.url, "/v1/responses");
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    receivedPayload = JSON.parse(body);
+    await stream(response, [
+      "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\r\n\r\n",
+      "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"path\\\":\\\"x\\\"}\"}\r\n\r\n",
+      "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\r\n\r\n",
+      "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\r\n\r\n",
+    ]);
+  }, async (url) => {
+    const result = await runCli(url, ["--api", "responses"]);
+    assert.equal(result.code, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.workload.api, "responses");
+    assert.equal(output.workload.endpoint_path, "/v1/responses");
+    assert.equal(output.samples[0].received_completed, true);
+    assert.equal(output.samples[0].received_done, false);
+    assert.equal(output.samples[0].output_text_utf8_bytes, 5);
+    assert.equal(output.samples[0].response_bytes > 5, true);
+    assert.equal(output.summary.output_text_utf8_bytes.sample_stdev, 0);
+    assert.equal(output.memory.max_rss_bytes, null);
+  });
+  assert.deepEqual(receivedPayload, {
+    model: "mock-model",
+    input: "a reproducible prompt",
+    temperature: 0,
+    max_output_tokens: 2,
+    stream: true,
+  });
+});
+
+test("rejects malformed or incomplete Responses SSE events", async () => {
+  for (const fragment of [
+    "data: {not json}\r\n\r\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\r\n\r\n",
+    "data: {\"type\":\"response.completed\",\"response\":{}",
+  ]) {
+    await withServer(async (_request, response) => {
+      await stream(response, [fragment]);
+    }, async (url) => {
+      const result = await runCli(url, ["--api", "responses"]);
+      assert.notEqual(result.code, 0);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /invalid JSON SSE data event|without a Responses terminal event|incomplete SSE event/);
+    });
+  }
+});
+
+test("retains response.incomplete as a non-success receipt", async () => {
+  await withServer(async (_request, response) => {
+    await stream(response, [
+      "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\r\n\r\n",
+      "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":4,\"output_tokens\":2},\"metrics\":{\"prefill_ms\":2.5}}}\r\n\r\n",
+    ]);
+  }, async (url) => {
+    const result = await runCli(url, ["--api", "responses"]);
+    assert.equal(result.code, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.status, "incomplete");
+    assert.deepEqual(output.summary.terminal_statuses, { completed: 0, incomplete: 3 });
+    assert.equal(output.samples[0].incomplete_reason, "max_output_tokens");
+    assert.equal(output.samples[0].prompt_tokens, 4);
+    assert.equal(output.samples[0].completion_tokens, 2);
+    assert.deepEqual(output.samples[0].server_metrics, { prefill_ms: 2.5 });
+    assert.match(result.stderr, /benchmark incomplete/);
+  });
 });

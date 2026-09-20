@@ -79,6 +79,78 @@ Excerpt from a local run:
 This demonstrates grammar completion and validation for the shown input, not
 general structured-output quality.
 
+## Experimental chat and local control plane
+
+`chat`, `agent`, and `serve` are experimental Metal-only controls for one
+locally available Qwen3 checkpoint. They use that checkpoint's
+`tokenizer_config.json` chat template. A resident session loads model weights
+once, then starts with fresh KV state for every chat turn or HTTP request. The
+hard limit is `min(model context, 512)` total prompt-plus-generated tokens;
+`--max-tokens` reserves part of that total and accepts 1 through 256.
+
+Start a one-turn chat that streams text, or omit `--prompt` for the interactive
+loop (`/reset` clears history and `/quit` exits):
+
+```sh
+mx chat --model "$MODEL" --prompt "Give a two sentence summary of Rust." \
+  --max-tokens 96
+```
+
+Add `--json` for a complete structured generation receipt instead of streamed
+text. Chat is a Qwen3 control path, not a general model API or a qualified
+serving claim.
+
+`agent` may ask the model to read files below one supplied workspace root. Its
+only tools are `read_file` (a UTF-8 regular file of at most 32 KiB),
+`list_files` (at most 128 entries), and `search_file` (literal text in the same
+file bound). Tool paths cannot escape the root, and the command has no write,
+shell, network, or process tool. It executes a completed, schema-valid tool
+call only; truncated model output runs no tools.
+
+```sh
+mx agent --model "$MODEL" --workspace . \
+  --prompt "Find where the chat context limit is documented." \
+  --max-tokens 128 --max-turns 4
+```
+
+`serve` keeps one Qwen session resident and exposes a loopback-only,
+single-request-at-a-time `/v1/responses` control endpoint, plus `/healthz` and
+`/v1/models`:
+
+```sh
+mx serve --model "$MODEL" --model-id metallix-qwen3
+curl http://127.0.0.1:8321/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"metallix-qwen3","input":"Say hello","max_output_tokens":32}'
+```
+
+The Responses surface is deliberately a subset: text input and text parts,
+complete input history, function-call round trips, greedy sampling, JSON or
+SSE responses, and automatic tool choice are supported. Response storage,
+`previous_response_id`, images, nonzero temperature, seeds, top-p changes,
+and non-automatic tool choice are rejected. It is not ready to serve as a full
+Codex backend.
+
+A future user-level Codex profile could target this endpoint only after an
+end-to-end compatibility and safety qualification. This is an example of that
+future target, **not** a file to add today:
+
+```toml
+# ~/.codex/metallix.config.toml — qualification target only
+model_provider = "metallix"
+model = "metallix-qwen3"
+
+[model_providers.metallix]
+name = "Local Metallix"
+base_url = "http://127.0.0.1:8321/v1"
+wire_api = "responses"
+```
+
+Codex custom providers and profiles are user-level configuration, and a
+profile is selected with `--profile`; repository-local provider settings are
+ignored. See the
+[official Codex configuration reference](https://developers.openai.com/docs/config-file/config-reference).
+
 ## Sampling and diagnostics
 
 `--input-ids` remains available for deterministic forward, cache, sampling,
@@ -164,11 +236,12 @@ seeded temperature sampling is opt-in, with or without a JSON schema.
 Resident mode allows at most `min(model context, 512)` total prompt-plus-generated tokens;
 streamed mode allows at most 32 total and separately checks weight/staging
 and retained-KV budgets.
-There is no checkpoint chat-template pipeline, messages API, V4.1 decoder,
-HTTP serving, continuous batching, execution-backed paged KV, quantization
-conversion, or tuning workflow yet. Beyond-RAM execution remains a goal,
-not a demonstrated capability. V4.1 weight download is gated on its own small
-text-forward numerical fixture.
+Experimental Qwen3 chat, a bounded read-only workspace agent, and a loopback
+Responses subset exist with the limits above. There is no V4.1 decoder,
+continuous batching, execution-backed paged KV, quantization conversion, or
+tuning workflow yet. Beyond-RAM execution remains a goal, not a demonstrated
+capability. V4.1 weight download is gated on its own small text-forward
+numerical fixture.
 
 ## License
 

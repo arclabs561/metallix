@@ -7,6 +7,14 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Experimental native Qwen chat, a bounded workspace-read agent, and a loopback
+  text/function Responses endpoint. Sessions retain weights, use checkpoint
+  chat templates, and report load/prefill/decode timings; the existing 512-token
+  control limit remains explicit.
+- DeepSeek compressed-owner prepare/commit transactions expose staged key/KV
+  prefixes to downstream consumers without publishing them on rejection.
+- Responses benchmark receipts distinguish text bytes, model tokens, first-token
+  latency, completion status, and sample variability.
 - A single-batch DeepSeek scored-query adapter composes query preparation and
   BF16 score reduction over a distinct borrowed index-key view. It checks the
   aggregate scoring workload before preparing queries, rather than relying on

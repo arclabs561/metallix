@@ -1,5 +1,13 @@
 # Third-party notices
 
+`fixtures/qwen3-0.6b/chat-template.jinja` reproduces the `chat_template`
+field from Qwen/Qwen3-0.6B revision
+`c1899de289a04d12100db370d81485cdf75e47ca` for local compatibility tests.
+It is provided under the Apache License 2.0; a copy is in
+`third_party/LICENSE-APACHE-2.0.txt`. The
+[source and license](https://huggingface.co/Qwen/Qwen3-0.6B/blob/c1899de289a04d12100db370d81485cdf75e47ca/LICENSE)
+identify the applicable notice: Copyright 2024 Alibaba Cloud.
+
 The candidate-block selection and FP32 index-score diagnostics in
 `crates/models/deepseek/src/csa2.rs`, `indexer.rs`, and `selection.rs` follow
 `select_candidate_blocks` and the score-reduction expressions in
