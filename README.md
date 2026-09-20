@@ -16,6 +16,8 @@ The longer-term direction includes broader MLX computation, multimodal models,
 SMC/sampling, and training/LoRA. See the [adapter/config proposal](docs/model-adapters.md)
 and [model landscape survey](docs/research/hf-trending-landscape.md); these are
 planned capabilities, separate from the working commands below.
+The [delivery roadmap](docs/delivery-roadmap.md) orders that work and
+defines the correctness, performance and resource gates.
 
 ## Setup
 

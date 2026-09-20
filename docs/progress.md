@@ -1,5 +1,8 @@
 # Metallix progress and next gates
 
+The [delivery roadmap](delivery-roadmap.md) proposes sequencing,
+adoption gates and decision points; this page records delivered evidence.
+
 The broader direction is recorded in [model adapters and MLX capabilities](model-adapters.md):
 compute API/CLI, multimodal execution, SMC/sampling, and training/LoRA support.
 Existing-model completion and profiling lead delivery. The
