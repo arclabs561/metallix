@@ -9,6 +9,9 @@
 - `mx agent` runs a bounded read-only workspace tool loop. Complete tool calls
   and surrounding assistant text survive history replay. Paths are opened
   relative to a pinned workspace descriptor without following symlinks.
+  `--json` records per-turn generation costs and executed tool names, valid
+  relative paths, argument hashes, and outcomes. Execution completion is
+  distinct from task success.
 - `mx serve` offers an experimental loopback text/function Responses subset.
   A live independent HTTP client checked JSON, SSE ordering, length limits,
   post-header failure, invalid requests, a function result round trip, and a
@@ -32,6 +35,10 @@
   source fixture captures layer three's actual rotary schedule. Properties
   check wrong-owner rejection with a valid retry and output sensitivity to
   legal-but-wrong selected indices; production candidate storage is unchanged.
+- Native layer-three attention now continues through HC and FFN to the
+  layer-four entry. Residuals match source storage; FP32 pre-mix coefficients
+  satisfy fixed source-derived bounds. Zeroed attention propagated through FFN
+  fails the same entry gate. The subsequent layer-four suffix is still separate.
 - A reduced DeepSeek suffix connects owner-produced KV/indices through native
   final-layer attention, HC, FFN, final norm and logits. Fixed source-derived
   envelopes reject omitted normalization; earlier layer inputs remain captured.
@@ -55,17 +62,20 @@
    Measure longer prefixes before changing staged allocations. Prefix reuse,
    quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
-   forward through remaining text blocks to logits. The next join is layer-three
-   attention through its HC/FFN continuation into layer four's block entry;
-   the existing final-layer suffix still starts from captured block-entry state.
+   forward through remaining text blocks to logits. Feed the native layer-three
+   terminal state into the existing layer-four suffix, propagating its fixed
+   numerical bounds; that suffix still starts from captured block-entry state.
    Operator and transaction parity do not establish full-model generation. Keep full checkpoint
    acquisition behind the existing reduced-forward numerical gate.
 3. **Agent owner: CLI lane.** Improve multi-step task completion before claiming
    coding-agent readiness. The maintained `scripts/qualify-agent.py` gate runs
-   three trials each of literal search, a two-file chain, and long-file reading.
-   The 0.6B control passed search and long reads in all trials but stopped after
-   the first file in all chain trials, despite returning exit code zero. The
-   qualification runner rejects these unfinished tasks. Shell and write tools
+   three trials each of literal search, a two-file chain, long-file reading,
+   and a factual join across two files, checking exact execution evidence.
+   The 0.6B control passed search, long reads, and the factual join in all trials
+   but stopped after the first file in all pointer-chain trials, despite
+   returning exit code zero. The join used two extra successful searches,
+   recorded as an efficiency cost. The qualification runner rejects unfinished
+   tasks. Shell and write tools
    need a separate execution policy; this delivery does not execute them.
 4. **Serving owner: Responses lane.** Socket read/write deadlines are bounded;
    qualify concurrent admission, client-driven cancellation, longer context beyond
@@ -91,3 +101,10 @@ local sccache startup failure and does not modify global compiler settings.
 Both checks passed on the final implementation, followed by a release build
 and the live HTTP checks above. The owned test server was stopped after
 validation; use the README command to start a new one.
+
+The structured-agent and layer-three HC/FFN continuation batch passed both
+canonical checks, the 13 qualifier tests, the source exporter rejection tests,
+and observer restoration checks. Live JSON receipts also retain failure status
+when workspace initialization fails. The four-task qualification remains
+partially failing as described above; no Codex-readiness claim follows from
+passing protocol and numerical checks.

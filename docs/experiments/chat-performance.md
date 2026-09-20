@@ -297,6 +297,47 @@ current control model needs stronger multi-step qualification before it can
 support a Codex-readiness claim. Timing here includes model loading and is not
 a resident-inference benchmark.
 
+The follow-through diagnostic at `b8b4b8a` repeated these three tasks through
+Responses, once without system instructions and once with a general read-only
+workspace policy to continue until the original request was answered or a
+concrete blocker was found. Both chain runs again stopped after the pointer;
+both search and long-read controls returned the expected answers. The six
+traces are retained under ignored `artifacts/agent-followthrough/`. This was
+a quality diagnostic with synthetic tool results, not a timing comparison.
+It did not justify changing the agent prompt or claiming improved completion.
+
+### Structured execution and phase costs
+
+The `465e95f` implementation was qualified with three fresh processes per task
+on the same Qwen3-0.6B revision and M3 Max host, using 256 output tokens per
+turn, at most six turns, and a 2048-token context. The host was not isolated.
+Receipts are retained under ignored `artifacts/agent-structured/qualified-final/`;
+the release binary SHA-256 is
+`e7346e3c961e41bfdda2b9a03ce58149b5a186448fc38470b79a9762295dbb8d`.
+Generated-text hashes and generated-token counts matched across all three trials
+of each task. These are an agent baseline, not a before/after speedup result.
+
+| Task | Passing trials | Total prefill median / sample stdev | Total decode median / sample stdev | Generated tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Literal search | 3/3 | 97.42 / 5.90 ms | 336.77 / 1.42 ms | 36 |
+| Two-file pointer chain | 0/3 | 95.51 / 0.40 ms | 320.06 / 5.28 ms | 34 |
+| Long-file read | 3/3 | 289.34 / 2.86 ms | 480.29 / 6.03 ms | 42 |
+| Two-file factual join | 3/3 | 111.10 / 0.83 ms | 1234.30 / 12.33 ms | 124 |
+
+All tasks ended after two model turns. Session load was approximately
+509–514 ms by task median and occurred once per process; it is excluded from
+the phase totals above. The factual join read both required files and then
+searched each, adding two successful tool calls. The qualifier requires exact
+names, paths, and argument hashes for the required ordered reads, but reports
+successful extra calls separately. An earlier exact-list gate falsely rejected
+that completed task; its raw receipts remain preserved.
+
+The pointer chain still only read the first file and repeated its instruction,
+so the overall qualification exits nonzero. A shorter or faster failed answer
+is not an optimization. The join's long generated tool-call text and the
+long-file task's prefill cost are useful next measurement targets; reducing
+either must preserve the required evidence and answer.
+
 ## Streaming disconnect recovery baseline
 
 This baseline used release binary `2e07b39`, before the new budget change, on

@@ -445,7 +445,7 @@ not supply another process ID. See the [chat performance ledger](docs/experiment
 for the receipt contract and matched-performance procedure.
 
 The separate read-tool qualification runs synthetic search, two-file traversal,
-and long-file tasks through `mx agent`:
+factual joins across files, and long-file tasks through `mx agent --json`:
 
 ```sh
 uv run scripts/qualify-agent.py --run --binary target/release/mx \
@@ -456,10 +456,15 @@ uv run scripts/qualify-agent.py --run --binary target/release/mx \
 Without `--run` it only prints the workload. A live run uses a new or empty
 output directory, creates its own synthetic workspace, and retains stdout,
 stderr, binary/workspace hashes, and three trials per task. A successful
-process exit is insufficient: each trial must contain the expected answer and
-the required tool-call evidence. The tool log records names, not arguments;
-this gate does not prove arbitrary task completion or general coding ability.
-Reported wall time includes fresh model loading. No model is downloaded.
+process exit is insufficient: each trial must contain a completed execution
+receipt, the expected final answer, and the required executed tool names,
+relative paths, and argument hashes in order. Successful extra calls are
+reported separately rather than rejected; every executed call must succeed.
+This gate does not prove arbitrary task
+completion or general coding ability. Per-turn metrics separate render,
+prefill, and decode costs; `session_load_ms` is the same one-time setup repeated
+in each turn and must not be summed. Reported process wall time includes fresh
+model loading. No model is downloaded.
 
 Do not add a live Codex provider configuration while this protocol is still
 being qualified. The intended future shape is a user-level profile such as:
@@ -483,7 +488,7 @@ documents the provider keys and `--profile` selection.
 
 ## Instrument what is real
 
-Current tools emit local JSON receipts and explicit completion/failure status.
+JSON and diagnostic modes emit local receipts and explicit completion/failure status.
 There is no remote telemetry exporter or HTTP metrics endpoint yet. Future
 runtime metrics must separate load, prefill, decode, queue wait, GPU wait,
 weights, KV, scratch, resident cache, and requested read bytes. Physical SSD

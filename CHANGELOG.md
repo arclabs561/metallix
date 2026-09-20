@@ -7,6 +7,15 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- The source-grounded DeepSeek layer-three continuation reaches layer-four
+  entry through native HC and FFN. Fixed propagated bounds check coefficient
+  rounding and reject an omitted-attention control through the same boundary.
+- `mx agent --json` reports execution status, final text, per-turn generation
+  metrics, and executed tool evidence without raw tool-result payloads. The
+  qualifier checks exact tool paths and argument hashes separately from answers.
+- Workspace tool properties cover pathname replacement after opening the root
+  and listing boundaries around 128 entries.
+
 - A source-grounded DeepSeek layer-three continuation joins native HC/RMSNorm,
   compressed owner KV, producer selection, and attention output. It retains
   layer-specific rotary provenance and property checks for publication identity

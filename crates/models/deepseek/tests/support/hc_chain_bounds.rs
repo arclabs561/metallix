@@ -18,7 +18,7 @@ use super::{Case, Coefficients, Fixture, Tensor};
 type Span = [f64; 2];
 const U: f64 = 1.0 / 16_777_216.0;
 
-/// Source-derived uncertainty for the final layer-four HC state.
+/// Source-derived uncertainty for one block's terminal HC state.
 ///
 /// Its spans are established before the candidate terminal BF16 values are
 /// checked, so they cannot expand to accommodate a candidate final norm.

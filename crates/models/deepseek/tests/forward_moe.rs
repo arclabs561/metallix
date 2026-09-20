@@ -1,6 +1,7 @@
 //! Native complete `MoE` sublayer against encoded synthetic source-forward data.
-//! The joined attention/HC/FFN test still supplies upstream block inputs,
-//! incoming coefficients, compressed KV and selected indices from the source.
+//! The layer-three continuation joins native owner/producer attention through
+//! HC/FFN; earlier block inputs and incoming coefficients remain captured.
+//! The separate layer-four suffix still starts from captured block-entry state.
 //! It is not complete native model execution.
 
 use std::collections::BTreeMap;

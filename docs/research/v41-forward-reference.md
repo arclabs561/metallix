@@ -631,3 +631,36 @@ The fixtures keep separate historical capture identities. Comparisons across
 them must match actual tensor operands; renaming source metadata does not
 establish equivalence. This remains a reduced source graph, with block-entry
 residuals and incoming pre-mix captured from earlier layers.
+
+### Layer-three HC and FFN continuation
+
+[`forward-layer3-moe-reference.json`](../../fixtures/deepseek-v41/forward-layer3-moe-reference.json)
+adds layer-three HC parameters, encoded MoE weights, intermediate observations,
+and the next block's entry state. The exporter requires the source block's
+terminal residual and pre-mix coefficient storage hashes to match layer four's
+incoming tensors before writing the fixture.
+
+The `forward_moe` test
+`native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry` takes the
+native owner/producer/attention output above through HC post-mix and the native
+FFN. Its BF16 terminal residual matches the source exactly. FP32 coefficients
+are checked inside fixed source-derived propagated intervals, since arithmetic
+rounding differs at that boundary. A zeroed attention output is carried through
+FFN and rejected by the same terminal-state interval check.
+
+```sh
+uv run scripts/v41-forward-reference.py \
+  --output artifacts/v41-layer3-block-source.json \
+  --layer3-moe-fixture-output artifacts/forward-layer3-moe-reference.json
+cargo test -p deepseek --test forward_moe
+uv run scripts/test_v41_layer3_moe_fixture.py
+```
+
+The Python gate runs the pinned source capture and its own declared dependencies;
+it is separate from the bounded default local check. It verifies that missing
+or mismatched next-block entry storage is rejected by the exporter.
+
+This gate reaches the layer-four entry; the separate layer-four-to-logits test
+still begins with captured entry state. Connecting those tests requires carrying
+the native residual and coefficient uncertainty forward, not replacing them
+with source tensors or declaring the full model complete.

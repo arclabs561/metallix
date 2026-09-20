@@ -35,6 +35,12 @@ and loopback Responses text/function calls. Each turn starts with fresh KV
 state; it is not the planned multi-request scheduler or a general Codex
 backend.
 
+Agent JSON receipts record ordered executed calls and per-turn generation
+metrics without retaining raw tool-result payloads. Their completion status
+describes the loop ending at EOS; independent task checks establish whether
+the requested answer and required tool evidence were obtained. Each turn's
+session-load metric refers to the same one-time setup, not a repeated load.
+
 The loopback transport owns accepted sockets and applies a five-second total
 header/body read deadline, a 16 KiB header limit, and a 1 MiB body limit.
 It accepts one HTTP/1 request per connection and closes after the response;

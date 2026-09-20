@@ -31,7 +31,7 @@ repeatable before/after measurement.
 
 The current [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
 uses the Responses wire API. The experimental Metallix endpoint implements a
-text/function subset, but its 512-token budget and lack of custom grammar tools
+text/function subset, but its 2048-token context ceiling and lack of custom grammar tools
 prevent calling it a general Codex backend. Qualify longer-context execution,
 actual client event consumption, tool execution/results, cancellation, and
 multi-turn task completion before enabling a personal profile.
