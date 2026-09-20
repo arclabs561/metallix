@@ -274,9 +274,9 @@ source-derived numerical bounds and wrong-index/omitted-norm controls guard
 this suffix.
 The focused Engram continuation decodes selected FP8 embedding rows with
 row-local E8M0 scales into BF16, projects WKV, and gates the residual before
-the same native layer-three-to-logits suffix. Its pre-Engram residual and
-incoming HC pre-mix state remain captured from earlier blocks;
-full-model generation is still pending.
+the same native layer-three-to-logits suffix. Its isolated diagnostic retains
+captured pre-Engram residual and incoming HC pre-mix state; the joined layer-two
+test below supplies both natively. Full-model generation is still pending.
 
 Earlier, test-only layer-one owner replay executes the ratio-two compressor's
 FP32 WKV/wgate projections within a fixed IEEE dot-product envelope, then
@@ -284,10 +284,22 @@ checks the BF16 latent and its owned compressed-KV and index-key publications,
 native index query and score stages, and causal selected IDs at captured starts
 0, 5, and 6. The pinned source's partial decode still scores against a captured
 layer-three shared score-key prefix, distinct from that unchanged layer-one
-owner prefix. A separate source-only layer-two attention
-fixture proves that layer two borrows the current layer-one KV/index publication
-and retains its exact historical FFN handoff. Neither fixture is native
-layer-two attention, a production API, or full-model execution.
+owner prefix. A source-only layer-two attention fixture proves that layer two
+borrows the current layer-one KV/index publication and retains its exact
+historical FFN handoff. A standalone native layer-two attention check consumes
+the native layer-one KV/IDs, rejects a non-owner publication, and shows that a
+legal but wrong layer-one ID changes the result.
+
+A focused joined test derives the layer-two normalized attention input from
+captured layer-one residual/pre-mix state, runs native layer-two attention and
+HC post-mixing, then native FFN, Engram3, and the existing native layer-three/
+four suffix through final logits. BF16 boundaries remain exact and HC
+coefficients use fixed analytic bounds; discarded attention fails before FFN.
+A separate seven-check source-only HC fixture pins the layer-one-to-layer-two
+entry and its attention/FFN handoffs. Layer-one terminal residual/pre-mix,
+owner inputs, and the partial-call layer-three shared score keys remain captured
+boundaries. This is not a
+production API or full-model execution.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

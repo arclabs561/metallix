@@ -84,6 +84,22 @@ FFN handoff. The exporter performs no attention arithmetic. This is a source
 boundary only, not native layer-two attention, a Rust acceptance test, or
 full-model parity.
 
+## Layer-one to layer-two HC source bridge
+
+```sh
+uv run scripts/test_v41_layer2_hc_fixture.py
+```
+
+`scripts/v41_layer2_hc_capture.py` projects the same retained source capture
+into `fixtures/deepseek-v41/layer2-hc-reference.json`. It pins the layer-one
+terminal residual/pre-mix boundary into layer-two block input, the layer-two
+attention HC mixes and coefficients, attention input/output, post-attention
+residual/pre, and the exact handoffs to the fixed layer-two attention and FFN
+fixtures. Its seven source-backed checks validate pinned and live source hashes,
+little-endian strict storage, HC configuration, and captured parameter identity.
+This fixture is a source bridge only. It does not establish native HC, native
+attention, or full-forward parity.
+
 The default `just check` runs the dependency-free manifest, source-loader and
 attention-fixture integrity tests. Numerical kernel tests require Torch and
 are run explicitly above.
@@ -780,7 +796,7 @@ remain as diagnostics. The Engram continuation above extends that boundary to
 the pre-Engram residual and incoming coefficients; earlier blocks and
 full-model generation remain unfinished.
 
-### Layer-two FFN through final logits
+### Layer-two attention, FFN, and final logits
 
 `fixtures/deepseek-v41/layer2-ffn-reference.json` captures the post-attention
 residual, attention pre-mix, FFN parameters, intermediates, and both outgoing
@@ -799,14 +815,35 @@ The resulting BF16 attention input must match exactly before the existing
 owner-attention, layer-three/four FFN, and final-logit checks run. Mutating the
 layer-two residual or zeroing its pre-mix fails the corresponding handoff.
 
+The standalone `forward_layer2_attention` check now supplies native layer-one
+ratio-two KV and selected IDs to native layer-two attention at starts 0, 5, and
+6. It rejects a non-owner publication, and a legal but wrong layer-one selected
+ID changes the native output. The source-only layer-two attention exporter above
+remains the storage oracle; it does not itself establish the native execution.
+
+`native_layer_two_attention_hc_ffn_reaches_final_logits` in `forward_moe`
+continues that native attention result through the layer-two block. Captured
+layer-one residual and incoming pre-mix are used only at the earlier block-entry
+boundary. Native HC collapse and RMSNorm derive the normalized attention input,
+which must exactly equal the captured BF16 input. Native attention then feeds
+native HC post-mixing and FFN, Engram3, and the existing native layer-three/
+four final-logit suffix. HC projection and coefficient comparisons use fixed
+analytic envelopes; they do not calibrate to an observed difference. A control
+that discards the native attention result fails before the FFN handoff.
+
 The source exporter gate is `uv run scripts/test_v41_layer2_ffn_fixture.py`;
-the connected Rust gate remains `cargo test -p deepseek --test forward_moe`.
+the standalone and joined Rust gates are:
+
+```sh
+cargo test -p deepseek --test forward_layer2_attention
+cargo test -p deepseek --test forward_moe
+```
+
 The earlier Engram fixture stays byte-for-byte unchanged. Its regeneration
 test permits only additive observer/capture provenance changes while checking
 the preserved numerical payload and upstream source identity.
 
-Layer-two post-attention state still comes from capture. Full layer-two
-attention requires the earlier layer-one owner/compressor/index chain:
-layer two uses ratio-two compression and consumes layer one's shared KV
-publication. That dependency and the remaining earlier blocks precede
-full-model generation.
+Layer two now receives native layer-one KV/IDs but still receives captured
+layer-one residual/pre-mix at its block entry. Native earlier layer-one attention
+and FFN, the captured partial-call layer-three shared score-key behavior, and
+the remaining earlier blocks precede full-model generation.

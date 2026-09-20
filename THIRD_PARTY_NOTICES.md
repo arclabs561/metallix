@@ -65,8 +65,11 @@ synthetic graph's compressed KV and direct index publication. The separate
 layer-two attention boundaries, including its borrowed layer-one KV/index
 publication, local window state, and FFN handoff. The exporter verifies pinned
 source/helper hashes, raw tensor storage and finite values; it performs no
-attention arithmetic. These are reduced numerical captures, not full-model,
-native-attention, or serving artifacts.
+attention arithmetic. `scripts/v41_layer2_hc_capture.py` and
+`fixtures/deepseek-v41/layer2-hc-reference.json` retain the same synthetic
+source graph's layer-one residual/pre into layer-two HC and attention boundaries,
+including the historical attention/FFN handoffs. These are reduced numerical
+captures, not full-model, native-attention, or serving artifacts.
 The compressor and block composition captures and tests follow
 `Compressor.forward`, `Block.forward`, the block HC helpers and `RMSNorm.forward`
 at the same revision, with explicitly stubbed projections or sublayers.

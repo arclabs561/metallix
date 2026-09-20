@@ -48,22 +48,37 @@ choices without expanding current support claims.
 - Native layer-two FFN output now feeds Engram3 and the connected layer-three/
   four suffix through final logits. Both native residual and HC pre-mix are
   retained as operands. Fixed HC arithmetic bounds handle FP32 rounding, and
-  exact BF16 attention-input checks reject corrupted handoffs. The layer-two
-  post-attention input remains captured; this is still a reduced graph.
+  exact BF16 attention-input checks reject corrupted handoffs. Its isolated FFN
+  control retains captured post-attention input; the joined attention test below
+  supplies that boundary natively. This is still a reduced graph.
 - Six test-only native layer-one owner checks execute the ratio-two compressor's
   FP32 WKV/wgate projections, then check the BF16 latent plus owned compressed
   KV/index-key publications, native index query and score stages, and causal
   selected IDs at starts 0, 5, and 6. The twelve-check source suite preserves
   the partial-start distinction: its score-key operand is a captured layer-three
   shared prefix, not layer one's retained owner key/KV state. This is not a
-  production API, native layer-one attention, or layer-one/two execution.
+  production API or complete native layer-one execution.
 - A source-only layer-two attention exporter/fixture captures exact source
   storage for the borrowed layer-one publication, local window state, attention
   boundaries, and the historical layer-two FFN handoff. Its nine checks pin
   source and helper provenance, storage hashes and raw finite values, reject a
   missing, altered, or paired-forged owner publication at the sparse boundary,
-  and retain the FFN seam. It establishes neither native layer-two attention
-  nor full-model parity.
+  and retain the FFN seam. This exporter remains source-only; native layer-two
+  attention and full-model parity are separate claims.
+- Standalone native layer-two attention consumes the native layer-one KV/IDs at
+  all captured calls. It rejects a non-owner publication and shows that a legal
+  but wrong layer-one index changes output. A focused joined suffix derives the
+  normalized layer-two attention input from captured layer-one residual/pre-mix,
+  then carries native attention through HC post-mixing, native FFN, Engram3,
+  native layer-three/four, and final logits. BF16 boundaries are exact and HC
+  coefficients satisfy fixed analytic bounds; discarded attention fails before
+  FFN. Layer-one terminal residual/pre-mix, owner inputs, and the partial shared
+  layer-three score keys remain captured. This is not full DeepSeek execution.
+- A seven-check source-only layer-two HC fixture pins the layer-one terminal
+  residual/pre into layer-two block input, HC mixes/coefficients, attention
+  boundaries, and exact attention/FFN handoffs. It validates pinned and live
+  source hashes, strict storage, HC configuration, and captured parameter
+  identity. It is not native HC, native attention, or full-forward parity.
 - A source capture supplies layer-three block-entry residual/pre-mix;
   native HC and RMSNorm now derive the owner/candidate attention input and
   cross-check it against preserved historical captures.
@@ -103,20 +118,22 @@ choices without expanding current support claims.
    wall-time measurements as gates. The source-checked owner benchmark separates prepare/drop/commit
    costs; captured prefixes five and six do not establish a scaling bottleneck.
    Current profiling places context growth inside MLX evaluation while transpose
-   construction is below 0.3% of decode time. Isolate attention-graph evaluation
-   from KV-update evaluation before changing either path. Prefix reuse,
-   quantization, and batching require separate evidence.
+   construction is below 0.3% of decode time. Standalone component graphs show
+   material cache-concatenation growth with prefix length. Test a bounded
+   capacity-buffer update candidate against exact logit/fork parity, short- and
+   long-context serving time, and memory before adoption. The pinned MLX binding
+   exposes functional slice updates, not guaranteed in-place buffer reuse.
+   Prefix reuse, quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
    forward through the earlier text blocks. Layers three and four now connect
    natively through final logits, preceded by native Engram3 and layer-two FFN.
-   Layer-two post-attention state still comes from capture. The test-only
-   layer-one ratio-two owner now establishes native compressor, owned
-   publication, query, score, and selection boundaries, while a source-only
-   layer-two fixture preserves the borrowed-publication and FFN seams. The next
-   boundary is native layer-two attention over that publication; this pair does
-   not use the layer-three/four candidate-mask path. Replace captured earlier-
-   block state while preserving the source-grounded arithmetic and discrete
-   routing gates.
+   The native layer-two attention/HC/FFN suffix now consumes layer-one's native
+   KV/IDs, but layer-one residual/pre-mix remains captured at its entry. The next
+   boundary is native earlier layer-one attention and FFN feeding layer two,
+   while preserving the source-grounded partial-call layer-three shared score
+   keys and discrete routing gates. This pair does not use the layer-three/four
+   candidate-mask path. Operator and joined-suffix parity do not establish full
+   model generation.
    The partial-group source trace also distinguishes the unchanged owned index
    cache from the shared keys actually scored; the latter retain the preceding
    layer-three publication. Resolve that [source behavior](research/v41-forward-reference.md)
@@ -183,3 +200,11 @@ preserves the historical numerical handoffs. An optimized Qwen3-0.6B phase
 probe passed five repeated rows at each of three prompt lengths with matching
 final logit bits and whole-trace fingerprints; its measured host intervals are
 recorded in the performance ledger. No production speedup follows from that probe.
+
+The subsequent native layer-two attention join passed both canonical checks,
+including three standalone attention tests and the 46-test FFN/suffix target.
+The join includes 16 generated nonempty subsets of trace positions whose
+attention outputs are discarded; each must fail at the HC post-mix boundary.
+The new HC source exporter passed seven checks. The standalone Qwen cache
+component probe passed a warmup and three measured rows at each prompt length,
+with unchanged ordinary-decoder logits before and after the component graphs.
