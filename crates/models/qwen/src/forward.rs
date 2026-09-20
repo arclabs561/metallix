@@ -1,11 +1,18 @@
-//! A deliberately small, dense Qwen3 forward path for numerical qualification.
+//! Qwen3 forward paths for an uncached numerical oracle and cached resident chat.
 //!
-//! This is not the serving path: it has no KV cache and bounds the prompt
-//! length so that a full causal-attention graph is safe to use as a parity
-//! oracle. It keeps Qwen3's Q/K normalization and GQA tensors separate; any
-//! kernel fusion belongs behind an equivalent numerical test.
+//! The uncached dense oracle remains bounded to 512 tokens so its full
+//! causal-attention graph is safe for parity checks. The adapter-local cached
+//! decoder has separate resident-context admission and retains Qwen3's Q/K
+//! normalization and GQA tensors; any kernel fusion belongs behind an
+//! equivalent numerical test.
 
 use std::{collections::HashMap, hash::BuildHasher};
+
+#[cfg(test)]
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 
 use mlx_rs::{Array, StreamOrDevice, fast, ops};
 use serde::Deserialize;
@@ -770,8 +777,18 @@ fn read_last_logits(
         .take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?
         .reshape_device(&[as_i32(vocab_size)?], &stream)?
         .as_type_device::<f32>(&stream)?;
+    #[cfg(test)]
+    let evaluation_started = Instant::now();
     last.eval()?;
-    Ok(last.as_slice::<f32>().to_vec())
+    #[cfg(test)]
+    record_decode_profile_evaluation(evaluation_started.elapsed());
+
+    #[cfg(test)]
+    let readback_started = Instant::now();
+    let output = last.as_slice::<f32>().to_vec();
+    #[cfg(test)]
+    record_decode_profile_readback(readback_started.elapsed());
+    Ok(output)
 }
 
 fn attention<S: BuildHasher>(
@@ -860,7 +877,103 @@ fn rms_norm(input: &Array, scale: &Array, eps: f32) -> Result<Array, Qwen3Forwar
 
 fn linear(input: &Array, weight: &Array) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
-    Ok(input.matmul_device(&weight.transpose_device(&stream)?, &stream)?)
+    #[cfg(test)]
+    let transpose_started = Instant::now();
+    let transposed = weight.transpose_device(&stream)?;
+    #[cfg(test)]
+    record_decode_profile_transpose_node(transpose_started.elapsed());
+    Ok(input.matmul_device(&transposed, &stream)?)
+}
+
+/// Per-thread, opt-in timings for the local checkpoint decode-profile test.
+///
+/// These durations are host-side intervals around MLX API calls. In
+/// particular, `evaluation` includes waiting for MLX work and is not GPU time.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(super) struct DecodeProfile {
+    pub(super) transpose_node: Duration,
+    pub(super) transpose_node_count: usize,
+    pub(super) evaluation: Duration,
+    pub(super) evaluation_count: usize,
+    pub(super) readback: Duration,
+    pub(super) readback_count: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DECODE_PROFILE: RefCell<Option<DecodeProfile>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_decode_profile_transpose_node(elapsed: Duration) {
+    DECODE_PROFILE.with(|profile| {
+        if let Some(profile) = profile.borrow_mut().as_mut() {
+            profile.transpose_node += elapsed;
+            profile.transpose_node_count += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_decode_profile_evaluation(elapsed: Duration) {
+    DECODE_PROFILE.with(|profile| {
+        if let Some(profile) = profile.borrow_mut().as_mut() {
+            profile.evaluation += elapsed;
+            profile.evaluation_count += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_decode_profile_readback(elapsed: Duration) {
+    DECODE_PROFILE.with(|profile| {
+        if let Some(profile) = profile.borrow_mut().as_mut() {
+            profile.readback += elapsed;
+            profile.readback_count += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) struct DecodeProfileScope {
+    active: bool,
+}
+
+#[cfg(test)]
+impl DecodeProfileScope {
+    pub(super) fn start() -> Self {
+        DECODE_PROFILE.with(|profile| {
+            assert!(
+                profile.borrow().is_none(),
+                "decode profile is already active"
+            );
+            *profile.borrow_mut() = Some(DecodeProfile::default());
+        });
+        Self { active: true }
+    }
+
+    pub(super) fn finish(mut self) -> DecodeProfile {
+        let profile = DECODE_PROFILE.with(|profile| {
+            profile
+                .borrow_mut()
+                .take()
+                .expect("decode profile scope remains active")
+        });
+        self.active = false;
+        profile
+    }
+}
+
+#[cfg(test)]
+impl Drop for DecodeProfileScope {
+    fn drop(&mut self) {
+        if self.active {
+            DECODE_PROFILE.with(|profile| {
+                profile.borrow_mut().take();
+            });
+        }
+    }
 }
 
 fn weight<'a, S: BuildHasher>(
@@ -1331,6 +1444,7 @@ mod tests {
         assert_eq!(executor.kv_bytes(), 0);
     }
 
+    mod decode_profile;
     mod particle_replay;
 
     #[test]

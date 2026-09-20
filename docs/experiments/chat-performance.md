@@ -433,3 +433,69 @@ from the budget change. The raw after-change receipt remains at
 Use this baseline before an optimization, then repeat the identical workload
 after one change. For serving work, retain a tool-call workload beside this
 plain-text control and report task completion separately from latency.
+
+
+## Static-transpose hypothesis: fresh baseline and profile
+
+A fresh 2026-09-20 run used source HEAD `c4d9d7e` and executable SHA-256
+`aec65da2f2d1168a07009a7db87f707656f14b243079f18810d537650b589634`.
+The checkpoint was Qwen3-0.6B revision
+`c1899de289a04d12100db370d81485cdf75e47ca`, with FP32 preparation, a
+2048-token context and configured 512 MiB logical KV budget. The qualifier
+ran five serial trials with 1,983 prompt tokens and 64 generated tokens;
+CLI token IDs/text and HTTP text matched, including short-request recovery.
+The host was not isolated from background activity.
+
+| Unprofiled metric | Median / sample standard deviation |
+| --- | --- |
+| Fresh CLI session load | 449.973 / 4.859 ms |
+| CLI prefill | 277.856 / 2.156 ms |
+| CLI completed decode total | 888.537 / 5.083 ms |
+| CLI first token | 280.226 / 2.186 ms |
+| Resident HTTP request total | 1113.829 / 37.452 ms |
+| Resident HTTP first text delta | 276.201 / 11.943 ms |
+
+Raw receipts and run identity are under ignored
+`artifacts/qwen-perf-transpose-baseline/`. A separate identical five-trial
+run under `artifacts/qwen-perf-transpose-profile/` retained a five-second CPU
+sample of the owned server. The server was stopped after collection.
+
+The sample contains 4,292 main-thread observations, of which 3,386 are idle
+accept and 905 handle requests. Of 673 observations under `read_last_logits`,
+512 enter MLX event waits. Direct transpose construction/evaluation appears
+only in isolated samples. These are sampled host stacks, not GPU durations,
+and the large idle fraction limits attribution. They do not justify a cached
+transpose sidecar or establish that concatenation is the dominant kernel.
+The following diagnostic separates lazy-node construction from evaluation/readback
+at fixed cache lengths. No speedup or new cache layout is claimed by this baseline.
+
+### Decode phase probe
+
+The ignored `resident_decode_phase_profile_is_repeatable_for_fixed_teacher_forcing`
+test ran in the optimized release test profile on the same checkpoint and host.
+It prepares FP32 weights and creates a fresh resident executor per row, with
+2048-token admission and a 512 MiB logical KV budget. Each prompt length has
+one warmup and five measured rows of 64 deterministic teacher-forced steps.
+The final logit bits and whole-trace fingerprints match each warmup exactly.
+Raw rows and their summary are retained in ignored
+`artifacts/qwen-decode-phase-profile/`.
+
+| Prompt tokens | Prefill median | Decode median / sample stdev | Decode eval median | Transpose construction median | Readback median |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 24.989 ms | 590.942 / 1.685 ms | 525.355 ms | 1.661 ms | 1.077 ms |
+| 512 | 59.040 ms | 642.483 / 2.855 ms | 575.910 ms | 1.708 ms | 0.764 ms |
+| 1983 | 252.653 ms | 816.354 / 1.330 ms | 749.617 ms | 1.746 ms | 0.767 ms |
+
+Each row checks 64 evaluations, 64 readbacks and 12,608 transpose-node
+constructions. Counters cover decode only. Evaluation is a host interval that
+includes dispatch and completion waits, not measured GPU kernel time. Total
+decode also includes full-logit hashing; checkpoint loading is excluded.
+These synthetic rows are not directly comparable to the CLI generation workload.
+
+Transpose construction accounts for less than 0.3% of total decode at each
+length. Its measured host cost does not justify a cached-transpose sidecar.
+The context-dependent increase occurs mainly inside evaluation: the next
+optimization investigation should isolate attention and KV-update evaluation
+costs while keeping the existing numerical and repeated serving gates.
+The current probe does not distinguish those kernels or establish their
+individual contribution. Instrumentation is test-only and absent from production builds.
