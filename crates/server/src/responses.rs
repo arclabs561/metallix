@@ -16,7 +16,7 @@ use crate::{
     chat_cli::message,
     chat_generation::{
         ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession,
-        ChatToolCall,
+        ChatToolCall, ResidentChatLimits,
     },
     chat_tools,
     http_transport::{Connection, TransportLimits},
@@ -223,10 +223,10 @@ pub(crate) fn serve(
     model: &Path,
     model_id: &str,
     address: SocketAddr,
-    context_tokens: usize,
+    limits: ResidentChatLimits,
     generation_timeout: Duration,
 ) -> ExitCode {
-    match serve_inner(model, model_id, address, context_tokens, generation_timeout) {
+    match serve_inner(model, model_id, address, limits, generation_timeout) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mx serve: {error}");
@@ -239,16 +239,18 @@ fn serve_inner(
     model: &Path,
     model_id: &str,
     address: SocketAddr,
-    context_tokens: usize,
+    limits: ResidentChatLimits,
     generation_timeout: Duration,
 ) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
     }
-    let mut session = ChatSession::load(model, context_tokens)?;
+    let mut session = ChatSession::load(model, limits)?;
     let server = TcpListener::bind(address).map_err(|e| e.to_string())?;
     eprintln!(
-        "mx listening on http://{address}; model={model_id}; single request; {context_tokens} total tokens; load_ms={:.2}",
+        "mx listening on http://{address}; model={model_id}; single request; {} total tokens; kv_budget_bytes={}; load_ms={:.2}",
+        limits.context_tokens(),
+        limits.kv_budget_bytes(),
         session.load_ms()
     );
     for (index, socket) in server.incoming().enumerate() {

@@ -1,6 +1,7 @@
 //! Numerical comparison for locally generated reference logits.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufReader, Read},
     path::Path,
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const CHECKPOINT_INDEX_FILENAME: &str = "model.safetensors.index.json";
 
 #[derive(Debug, Deserialize)]
 struct ReferenceManifest {
@@ -21,7 +23,23 @@ struct ReferenceManifest {
 #[derive(Debug, Deserialize)]
 struct ReferenceProvenance {
     config_sha256: String,
-    weights_sha256: String,
+    #[serde(default)]
+    weights_sha256: Option<String>,
+    #[serde(default)]
+    weights_index_sha256: Option<String>,
+    #[serde(default)]
+    weight_shards: Option<Vec<WeightShard>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeightShard {
+    filename: String,
+    sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SafetensorsIndex {
+    weight_map: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,11 +99,7 @@ pub(crate) fn read_reference(
         &manifest.reference.config_sha256,
         "reference manifest config",
     )?;
-    validate_hash(
-        &model_dir.join("model.safetensors"),
-        &manifest.reference.weights_sha256,
-        "reference manifest weights",
-    )?;
+    validate_weights(model_dir, &manifest.reference)?;
     validate_hash(
         path,
         &manifest.last_token_logits_f32le.sha256,
@@ -114,6 +128,103 @@ fn read_manifest(path: &Path) -> Result<ReferenceManifest, String> {
         return Err("reference manifest changed size while reading".into());
     }
     serde_json::from_slice(&bytes).map_err(|error| format!("invalid reference manifest: {error}"))
+}
+
+fn validate_weights(model_dir: &Path, provenance: &ReferenceProvenance) -> Result<(), String> {
+    match (
+        &provenance.weights_sha256,
+        &provenance.weights_index_sha256,
+        &provenance.weight_shards,
+    ) {
+        (Some(weights), None, None) => validate_hash(
+            &model_dir.join("model.safetensors"),
+            weights,
+            "reference manifest weights",
+        ),
+        (None, Some(index_hash), Some(shards)) => {
+            validate_sharded_weights(model_dir, index_hash, shards)
+        }
+        _ => Err(
+            "reference manifest must contain either weights_sha256 or indexed shard hashes".into(),
+        ),
+    }
+}
+
+fn validate_sharded_weights(
+    model_dir: &Path,
+    index_hash: &str,
+    shards: &[WeightShard],
+) -> Result<(), String> {
+    let index_path = model_dir.join(CHECKPOINT_INDEX_FILENAME);
+    validate_hash(
+        &index_path,
+        index_hash,
+        "reference manifest checkpoint index",
+    )?;
+    let required = required_index_shards(&index_path)?;
+    let mut recorded = BTreeMap::new();
+    for shard in shards {
+        if !is_safe_shard_filename(&shard.filename) {
+            return Err("reference manifest has an unsafe checkpoint shard filename".into());
+        }
+        if recorded
+            .insert(shard.filename.clone(), shard.sha256.clone())
+            .is_some()
+        {
+            return Err("reference manifest contains a duplicate checkpoint shard".into());
+        }
+    }
+    if recorded.is_empty() || recorded.keys().cloned().collect::<BTreeSet<_>>() != required {
+        return Err("reference manifest shard set does not match checkpoint index".into());
+    }
+    for (filename, hash) in recorded {
+        validate_hash(
+            &model_dir.join(&filename),
+            &hash,
+            "reference manifest checkpoint shard",
+        )?;
+    }
+    Ok(())
+}
+
+fn required_index_shards(index_path: &Path) -> Result<BTreeSet<String>, String> {
+    let metadata = fs::metadata(index_path).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "checkpoint index exceeds {MAX_MANIFEST_BYTES} byte limit"
+        ));
+    }
+    let bytes = fs::read(index_path).map_err(|error| error.to_string())?;
+    if bytes.len() > usize::try_from(MAX_MANIFEST_BYTES).map_err(|error| error.to_string())? {
+        return Err("checkpoint index changed size while reading".into());
+    }
+    let index: SafetensorsIndex = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid checkpoint index: {error}"))?;
+    if index.weight_map.is_empty() {
+        return Err("checkpoint index requires a nonempty weight_map".into());
+    }
+    let mut shards = BTreeSet::new();
+    for (tensor, filename) in index.weight_map {
+        if tensor.is_empty() || !is_safe_shard_filename(&filename) {
+            return Err("checkpoint index has an unsafe tensor or shard filename".into());
+        }
+        shards.insert(filename);
+    }
+    Ok(shards)
+}
+
+fn is_safe_shard_filename(filename: &str) -> bool {
+    let Some(stem) = filename.strip_suffix(".safetensors") else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_hash(path: &Path, expected: &str, label: &str) -> Result<(), String> {
@@ -237,6 +348,49 @@ mod tests {
         fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     }
 
+    fn write_sharded_manifest(
+        path: &Path,
+        model_dir: &Path,
+        reference: &Path,
+        input_ids: &[i32],
+        vocab_size: usize,
+        shard_names: &[&str],
+    ) {
+        let shards: Vec<_> = shard_names
+            .iter()
+            .map(|filename| {
+                json!({
+                    "filename": filename,
+                    "sha256": sha256_file(&model_dir.join(filename)).unwrap(),
+                })
+            })
+            .collect();
+        let manifest = json!({
+            "input_ids": input_ids,
+            "reference": {
+                "config_sha256": sha256_file(&model_dir.join("config.json")).unwrap(),
+                "weights_index_sha256": sha256_file(
+                    &model_dir.join("model.safetensors.index.json"),
+                ).unwrap(),
+                "weight_shards": shards,
+            },
+            "last_token_logits_f32le": {
+                "element_count": vocab_size,
+                "byte_count": vocab_size * 4,
+                "sha256": sha256_file(reference).unwrap(),
+            },
+        });
+        fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+
+    fn write_test_logits(path: &Path) {
+        fs::write(
+            path,
+            [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn comparison_catches_errors_outside_the_top_logits() {
         let reference = [12.0, 10.0, -1.0, -20.0];
@@ -264,11 +418,7 @@ mod tests {
         fs::write(model.join("config.json"), b"config").unwrap();
         fs::write(model.join("model.safetensors"), b"weights").unwrap();
         let logits = root.join("logits.f32");
-        fs::write(
-            &logits,
-            [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat(),
-        )
-        .unwrap();
+        write_test_logits(&logits);
         let manifest = root.join("reference.json");
         write_manifest(&manifest, &model, &logits, &[7, 8], 2);
 
@@ -287,16 +437,78 @@ mod tests {
         fs::write(model.join("config.json"), b"config").unwrap();
         fs::write(model.join("model.safetensors"), b"weights").unwrap();
         let logits = root.join("logits.f32");
-        fs::write(
-            &logits,
-            [1.0_f32.to_le_bytes(), 2.0_f32.to_le_bytes()].concat(),
-        )
-        .unwrap();
+        write_test_logits(&logits);
         let manifest = root.join("reference.json");
         write_manifest(&manifest, &model, &logits, &[7, 8], 2);
 
         assert!(read_reference(&logits, &manifest, &model, &[8, 7], 2).is_err());
         fs::write(model.join("config.json"), b"changed config").unwrap();
+        assert!(read_reference(&logits, &manifest, &model, &[7, 8], 2).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sharded_reference_binds_index_and_exact_required_shards() {
+        let root = temporary_directory();
+        let model = root.join("model");
+        fs::create_dir(&model).unwrap();
+        fs::write(model.join("config.json"), b"config").unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        fs::write(model.join(first), b"first weights").unwrap();
+        fs::write(model.join(second), b"second weights").unwrap();
+        fs::write(
+            model.join("model.safetensors.index.json"),
+            serde_json::to_vec(&json!({
+                "weight_map": {
+                    "model.embed_tokens.weight": first,
+                    "model.layers.0.weight": second,
+                    "model.layers.1.weight": second,
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let logits = root.join("logits.f32");
+        write_test_logits(&logits);
+        let manifest = root.join("reference.json");
+        write_sharded_manifest(&manifest, &model, &logits, &[7, 8], 2, &[first, second]);
+
+        assert_eq!(
+            read_reference(&logits, &manifest, &model, &[7, 8], 2).unwrap(),
+            vec![1.0, 2.0]
+        );
+
+        write_sharded_manifest(&manifest, &model, &logits, &[7, 8], 2, &[first]);
+        assert!(read_reference(&logits, &manifest, &model, &[7, 8], 2).is_err());
+
+        write_sharded_manifest(&manifest, &model, &logits, &[7, 8], 2, &[first, second]);
+        fs::write(model.join(second), b"changed weights").unwrap();
+        assert!(read_reference(&logits, &manifest, &model, &[7, 8], 2).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sharded_reference_rejects_invalid_index_shape_and_path() {
+        let root = temporary_directory();
+        let model = root.join("model");
+        fs::create_dir(&model).unwrap();
+        fs::write(model.join("config.json"), b"config").unwrap();
+        let logits = root.join("logits.f32");
+        write_test_logits(&logits);
+        let manifest = root.join("reference.json");
+        let index = model.join("model.safetensors.index.json");
+
+        fs::write(&index, b"[]").unwrap();
+        write_sharded_manifest(&manifest, &model, &logits, &[7, 8], 2, &[]);
+        assert!(read_reference(&logits, &manifest, &model, &[7, 8], 2).is_err());
+
+        fs::write(
+            &index,
+            br#"{"weight_map":{"model.weight":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        write_sharded_manifest(&manifest, &model, &logits, &[7, 8], 2, &[]);
         assert!(read_reference(&logits, &manifest, &model, &[7, 8], 2).is_err());
         fs::remove_dir_all(root).unwrap();
     }

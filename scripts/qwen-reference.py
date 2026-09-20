@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 import transformers
+from qwen_reference_checkpoint import checkpoint_weight_provenance
 
 
 def parse_input_ids(value: str) -> list[int]:
@@ -73,10 +74,11 @@ def capture(
     model_id: str = "Qwen/Qwen3-0.6B",
 ) -> dict[str, Any]:
     config_path = model_dir / "config.json"
-    weights_path = model_dir / "model.safetensors"
-    for path in (config_path, weights_path):
-        if not path.is_file():
-            raise FileNotFoundError(f"required local model artifact is missing: {path}")
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"required local model artifact is missing: {config_path}"
+        )
+    weight_provenance = checkpoint_weight_provenance(model_dir, sha256_file)
 
     # A single CPU thread and eager attention make this a reproducible
     # correctness oracle. They are intentionally not performance settings.
@@ -119,7 +121,7 @@ def capture(
             "runtime": f"torch {torch.__version__} CPU float32 eager, one thread",
             "platform": platform.platform(),
             "config_sha256": sha256_file(config_path),
-            "weights_sha256": sha256_file(weights_path),
+            **weight_provenance,
             "model_type": config.model_type,
             "vocab_size": config.vocab_size,
             "hidden_size": config.hidden_size,

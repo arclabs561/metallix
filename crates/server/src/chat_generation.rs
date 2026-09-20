@@ -25,6 +25,34 @@ const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
 const MAX_CHAT_TOOLS: usize = 64;
 const TEMPLATE_FUEL: u64 = 100_000;
+const MIB_BYTES: u64 = 1024 * 1024;
+
+/// One resident-chat admission contract shared by session loading and turns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResidentChatLimits {
+    context_tokens: usize,
+    kv_budget_bytes: u64,
+}
+
+impl ResidentChatLimits {
+    #[must_use]
+    pub(crate) const fn from_mib(context_tokens: usize, kv_budget_mib: u32) -> Self {
+        Self {
+            context_tokens,
+            kv_budget_bytes: (kv_budget_mib as u64) * MIB_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn context_tokens(self) -> usize {
+        self.context_tokens
+    }
+
+    #[must_use]
+    pub(crate) const fn kv_budget_bytes(self) -> u64 {
+        self.kv_budget_bytes
+    }
+}
 
 /// A checkpoint-template role with the spellings expected by Qwen's Jinja.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -237,6 +265,7 @@ pub(crate) struct ChatSession {
     eos_token_id: i32,
     vocabulary_size: usize,
     context_limit: usize,
+    kv_budget_bytes: u64,
     planned_kv_bytes: u64,
     load_ms: f64,
 }
@@ -249,9 +278,9 @@ struct ChatConfig {
 
 impl ChatSession {
     /// Loads and prepares a checkpoint once, including its template and tokenizer.
-    pub(crate) fn load(model: &Path, context_limit: usize) -> Result<Self, String> {
+    pub(crate) fn load(model: &Path, limits: ResidentChatLimits) -> Result<Self, String> {
         let started = Instant::now();
-        let (config, plan) = load_config(model, context_limit)?;
+        let (config, plan) = load_config(model, limits)?;
         let tokenizer = QwenTokenizer::load(model)?;
         tokenizer.check_model_vocabulary(config.vocab_size, config.eos_token_id)?;
         let template_source = load_template(model)?;
@@ -267,7 +296,8 @@ impl ChatSession {
             template,
             eos_token_id: config.eos_token_id,
             vocabulary_size: config.vocab_size,
-            context_limit,
+            context_limit: limits.context_tokens(),
+            kv_budget_bytes: limits.kv_budget_bytes(),
             planned_kv_bytes: plan.planned_kv_bytes(),
             load_ms: elapsed_ms(started.elapsed()),
         })
@@ -334,10 +364,7 @@ impl ChatSession {
         deadline.check()?;
         let mut executor = self
             .weights
-            .resident_chat_executor(
-                self.context_limit,
-                qwen::forward::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES,
-            )
+            .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
             .map_err(|error| ChatGenerationError::message(error.to_string()))?;
         deadline.check()?;
         let prefill_started = Instant::now();
@@ -435,7 +462,7 @@ impl ChatSession {
 
 fn load_config(
     model: &Path,
-    context_limit: usize,
+    limits: ResidentChatLimits,
 ) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan), String> {
     let path = model.join("config.json");
     let raw = fs::read_to_string(&path)
@@ -445,10 +472,7 @@ fn load_config(
     // Reject context/KV admission before checkpoint payload loading.
     let plan = qwen::forward::Qwen3ForwardConfig::parse(&raw)
         .and_then(|config| {
-            config.resident_chat_plan(
-                context_limit,
-                qwen::forward::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES,
-            )
+            config.resident_chat_plan(limits.context_tokens(), limits.kv_budget_bytes())
         })
         .map_err(|error| error.to_string())?;
     Ok((config, plan))
@@ -619,7 +643,7 @@ mod tests {
 
     use super::{
         ChatGenerationError, ChatMessage, ChatRole, ChatToolCall, ChatToolResult,
-        GenerationDeadline, parse_template,
+        GenerationDeadline, ResidentChatLimits, parse_template,
     };
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
@@ -657,6 +681,13 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(TEMPLATE.as_bytes()));
         assert_eq!(digest, TEMPLATE_SHA256);
         assert_eq!(manifest["source"]["template_sha256"], TEMPLATE_SHA256);
+    }
+
+    #[test]
+    fn resident_limits_preserve_context_and_mib_budget() {
+        let limits = ResidentChatLimits::from_mib(16_384, 8_192);
+        assert_eq!(limits.context_tokens(), 16_384);
+        assert_eq!(limits.kv_budget_bytes(), 8_192 * 1024 * 1024);
     }
 
     #[test]

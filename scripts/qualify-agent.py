@@ -135,6 +135,11 @@ def is_nonnegative_count(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def text_identity(text: str) -> tuple[str, int]:
+    encoded = text.encode()
+    return hashlib.sha256(encoded).hexdigest(), len(encoded)
+
+
 def valid_metrics(metrics: object) -> bool:
     """Validate the emitted `ChatGenerationMetrics` shape and safe relations."""
     if not isinstance(metrics, dict):
@@ -223,6 +228,12 @@ def parse_agent_receipt(stdout: str) -> dict | None:
             if turn["finish_reason"] != "eos" or not turn["calls"]:
                 return None
         if turns[-1]["finish_reason"] != "eos" or turns[-1]["calls"]:
+            return None
+        final_digest, final_bytes = text_identity(final_text)
+        if (
+            turns[-1]["generated_text_sha256"] != final_digest
+            or turns[-1]["generated_text_utf8_bytes"] != final_bytes
+        ):
             return None
     elif any(turn["finish_reason"] == "length" and turn["calls"] for turn in turns):
         return None
@@ -363,7 +374,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=positive, default=3)
     parser.add_argument("--timeout-seconds", type=positive, default=60)
+    parser.add_argument("--context-tokens", type=positive, default=2048)
+    parser.add_argument("--kv-budget-mib", type=positive, default=512)
     args = parser.parse_args()
+    if args.context_tokens > 16384 or args.kv_budget_mib > 8192:
+        parser.error("context tokens must be <=16384 and K/V budget MiB must be <=8192")
     plan = {
         "schema_version": 2,
         "scope": "Synthetic read-tool tasks, not general coding-agent qualification",
@@ -371,7 +386,8 @@ def main() -> int:
         "repeats": args.repeats,
         "max_tokens": 256,
         "max_turns": 6,
-        "context_tokens": 2048,
+        "context_tokens": args.context_tokens,
+        "kv_budget_mib": args.kv_budget_mib,
         "model_revision": args.expected_model_revision,
         "workspace_sha256": hashlib.sha256(
             json.dumps(FILES, sort_keys=True).encode()
@@ -417,7 +433,9 @@ def main() -> int:
                     "--max-turns",
                     "6",
                     "--context-tokens",
-                    "2048",
+                    str(args.context_tokens),
+                    "--kv-budget-mib",
+                    str(args.kv_budget_mib),
                 ]
                 started = time.monotonic()
                 status, stdout, stderr = execute(command, args.timeout_seconds)

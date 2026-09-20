@@ -12,7 +12,7 @@ use crate::{
     agent_receipt::{AgentCallOutcome, AgentReceipt, AgentTurnReceipt},
     chat_generation::{
         ChatFinishReason, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
-        ChatToolResult,
+        ChatToolResult, ResidentChatLimits,
     },
     chat_tools::{self, WorkspaceTools},
 };
@@ -26,15 +26,9 @@ pub(crate) fn chat(
     prompt: Option<String>,
     max_tokens: u32,
     json_output: bool,
-    context_tokens: usize,
+    limits: ResidentChatLimits,
 ) -> ExitCode {
-    finish(chat_inner(
-        model,
-        prompt,
-        max_tokens,
-        json_output,
-        context_tokens,
-    ))
+    finish(chat_inner(model, prompt, max_tokens, json_output, limits))
 }
 
 fn chat_inner(
@@ -42,9 +36,9 @@ fn chat_inner(
     prompt: Option<String>,
     max_tokens: u32,
     json_output: bool,
-    context_tokens: usize,
+    limits: ResidentChatLimits,
 ) -> Result<(), String> {
-    let mut session = ChatSession::load(model, context_tokens)?;
+    let mut session = ChatSession::load(model, limits)?;
     let mut messages = Vec::new();
     if let Some(prompt) = prompt {
         messages.push(message(ChatRole::User, prompt));
@@ -66,7 +60,8 @@ fn chat_inner(
         return Ok(());
     }
     eprintln!(
-        "Native Qwen chat; /reset clears history, /quit exits. Context limit: {context_tokens} tokens including output budget."
+        "Native Qwen chat; /reset clears history, /quit exits. Context limit: {} tokens including output budget.",
+        limits.context_tokens()
     );
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -105,7 +100,7 @@ fn chat_inner(
 struct AgentLimits {
     max_tokens: u32,
     max_turns: u32,
-    context_tokens: usize,
+    resident: ResidentChatLimits,
 }
 
 pub(crate) fn agent(
@@ -114,7 +109,7 @@ pub(crate) fn agent(
     prompt: String,
     max_tokens: u32,
     max_turns: u32,
-    context_tokens: usize,
+    resident: ResidentChatLimits,
     json_output: bool,
 ) -> ExitCode {
     let mut receipt = AgentReceipt::new();
@@ -125,7 +120,7 @@ pub(crate) fn agent(
         AgentLimits {
             max_tokens,
             max_turns,
-            context_tokens,
+            resident,
         },
         &mut receipt,
         !json_output,
@@ -168,10 +163,10 @@ fn agent_inner(
     let AgentLimits {
         max_tokens,
         max_turns,
-        context_tokens,
+        resident,
     } = limits;
     let workspace = WorkspaceTools::new(workspace)?;
-    let mut session = ChatSession::load(model, context_tokens)?;
+    let mut session = ChatSession::load(model, resident)?;
     let tools = chat_tools::definitions();
     let mut messages = vec![message(ChatRole::User, prompt)];
     for turn_index in 0..max_turns {

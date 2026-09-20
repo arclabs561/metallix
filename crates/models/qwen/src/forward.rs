@@ -14,9 +14,9 @@ use thiserror::Error;
 /// The largest prompt accepted by the uncached qualification forward path.
 pub const MAX_DENSE_DEBUG_TOKENS: usize = 512;
 
-/// Largest separately qualified resident-chat context. This does not expand
-/// the 512-token uncached diagnostic forward path.
-pub const MAX_RESIDENT_CHAT_TOKENS: usize = 2_048;
+/// Experimental resident-chat admission ceiling. This does not expand the
+/// 512-token uncached diagnostic forward path or qualify longer contexts.
+pub const MAX_RESIDENT_CHAT_TOKENS: usize = 16_384;
 
 /// Default logical K/V budget for the resident-chat control path.
 pub const DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
@@ -1005,6 +1005,7 @@ mod tests {
     use std::collections::HashMap;
 
     use mlx_rs::Array;
+    use proptest::prelude::*;
 
     use crate::GPU_TEST_LOCK;
 
@@ -1033,6 +1034,93 @@ mod tests {
       "use_sliding_window":false
     }"#;
 
+    fn qwen3_4b_kv_layout() -> Qwen3ForwardConfig {
+        let layout = QWEN3_06B
+            .replace("\"num_hidden_layers\":28", "\"num_hidden_layers\":36")
+            .replace("\"hidden_size\":1024", "\"hidden_size\":2560")
+            .replace("\"intermediate_size\":3072", "\"intermediate_size\":9728")
+            .replace("\"num_attention_heads\":16", "\"num_attention_heads\":32");
+        Qwen3ForwardConfig::parse(&layout).expect("Qwen3-4B K/V layout")
+    }
+
+    fn independent_kv_bytes(config: &Qwen3ForwardConfig, context_tokens: usize) -> u64 {
+        u64::try_from(config.hidden_layers).expect("test layer count fits u64")
+            * 2
+            * u64::try_from(config.key_value_heads).expect("test K/V head count fits u64")
+            * u64::try_from(context_tokens).expect("test context fits u64")
+            * u64::try_from(config.head_dim).expect("test head dimension fits u64")
+            * u64::try_from(size_of::<f32>()).expect("f32 byte width fits u64")
+    }
+
+    fn resident_production_layouts() -> [Qwen3ForwardConfig; 2] {
+        [
+            Qwen3ForwardConfig::parse(QWEN3_06B).expect("Qwen3-0.6B layout"),
+            qwen3_4b_kv_layout(),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Every admitted production-layout context uses exactly the logical
+        /// f32 K/V formula, including the exact one-byte budget boundary.
+        #[test]
+        fn resident_kv_admission_matches_production_layouts(
+            context_tokens in 1_usize..=super::MAX_RESIDENT_CHAT_TOKENS,
+        ) {
+            for config in resident_production_layouts() {
+                let required = independent_kv_bytes(&config, context_tokens);
+                let exact = config
+                    .resident_chat_plan(context_tokens, required)
+                    .expect("exact K/V budget admits a valid context");
+                prop_assert_eq!(exact.maximum_context_tokens(), context_tokens);
+                prop_assert_eq!(exact.planned_kv_bytes(), required);
+                prop_assert!(matches!(
+                    config.resident_chat_plan(context_tokens, required - 1),
+                    Err(Qwen3ForwardError::ResidentChatKvBudget {
+                        required: actual_required,
+                        maximum,
+                    }) if actual_required == required && maximum == required - 1
+                ), "one byte below the exact K/V requirement must fail admission");
+            }
+        }
+
+        /// One additional valid token must increase the retained K/V estimate
+        /// for both the 0.6B and 36-layer 4B K/V layouts.
+        #[test]
+        fn resident_kv_estimate_is_strictly_monotone_for_production_layouts(
+            context_tokens in 1_usize..super::MAX_RESIDENT_CHAT_TOKENS,
+        ) {
+            for config in resident_production_layouts() {
+                let current = config
+                    .resident_chat_plan(context_tokens, u64::MAX)
+                    .expect("valid production-layout context");
+                let next = config
+                    .resident_chat_plan(context_tokens + 1, u64::MAX)
+                    .expect("next valid production-layout context");
+                prop_assert_eq!(
+                    next.planned_kv_bytes() - current.planned_kv_bytes(),
+                    independent_kv_bytes(&config, 1),
+                );
+                prop_assert!(next.planned_kv_bytes() > current.planned_kv_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn resident_production_layouts_reject_the_token_after_the_admission_ceiling() {
+        for config in resident_production_layouts() {
+            assert!(matches!(
+                config.resident_chat_plan(super::MAX_RESIDENT_CHAT_TOKENS + 1, u64::MAX),
+                Err(Qwen3ForwardError::ResidentChatContextLimit {
+                    requested,
+                    maximum,
+                }) if requested == super::MAX_RESIDENT_CHAT_TOKENS + 1
+                    && maximum == super::MAX_RESIDENT_CHAT_TOKENS
+            ));
+        }
+    }
+
     #[test]
     fn accepts_qwen3_06b_expanded_query_width() {
         // Qwen3-0.6B deliberately has 16 * 128 = 2048 query features while
@@ -1056,10 +1144,10 @@ mod tests {
         assert_eq!(plan.maximum_context_tokens(), 2_048);
         assert_eq!(plan.planned_kv_bytes(), 469_762_048);
         assert!(matches!(
-            config.resident_chat_plan(2_049, u64::MAX),
+            config.resident_chat_plan(16_385, u64::MAX),
             Err(Qwen3ForwardError::ResidentChatContextLimit {
-                requested: 2_049,
-                maximum: 2_048,
+                requested: 16_385,
+                maximum: 16_384,
             })
         ));
         assert!(matches!(

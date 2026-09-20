@@ -30,10 +30,12 @@ def completed_receipt(case: dict, *, final_text: str | None = None) -> dict:
         "prompt_tokens": 4,
         "generated_tokens": 1,
     }
+    text = case["answer"] if final_text is None else final_text
+    digest, byte_count = module.text_identity(text)
     return {
         "schema_version": 1,
         "status": "completed",
-        "final_text": case["answer"] if final_text is None else final_text,
+        "final_text": text,
         "turns": [
             {
                 "turn_index": 0,
@@ -49,8 +51,8 @@ def completed_receipt(case: dict, *, final_text: str | None = None) -> dict:
                 "turn_index": 1,
                 "finish_reason": "eos",
                 "metrics": metrics.copy(),
-                "generated_text_sha256": "1" * 64,
-                "generated_text_utf8_bytes": 0,
+                "generated_text_sha256": digest,
+                "generated_text_utf8_bytes": byte_count,
                 "calls": [],
             },
         ],
@@ -219,6 +221,15 @@ class QualificationTests(unittest.TestCase):
             "earlier_no_call": lambda receipt: receipt["turns"][0].update(
                 {"calls": []}
             ),
+            "final_text_mismatch": lambda receipt: receipt.update(
+                {"final_text": "other answer"}
+            ),
+            "final_digest_mismatch": lambda receipt: receipt["turns"][-1].update(
+                {"generated_text_sha256": "0" * 64}
+            ),
+            "final_byte_count_mismatch": lambda receipt: receipt["turns"][-1].update(
+                {"generated_text_utf8_bytes": 0}
+            ),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name):
@@ -289,6 +300,30 @@ class QualificationTests(unittest.TestCase):
         plan = json.loads(result.stdout)
         self.assertEqual(plan["status"], "dry_run")
         self.assertEqual(plan["cases"][-1]["name"], "held_out_factual_join")
+
+    def test_dry_run_records_configured_resident_limits(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--model",
+                "/missing-model",
+                "--expected-model-revision",
+                "test",
+                "--output",
+                "/missing-output",
+                "--context-tokens",
+                "4096",
+                "--kv-budget-mib",
+                "1024",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["context_tokens"], 4096)
+        self.assertEqual(plan["kv_budget_mib"], 1024)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,9 @@ use std::{fs, path::PathBuf, process::ExitCode};
 use std::time::Duration;
 
 #[cfg(feature = "metal")]
+use crate::chat_generation::ResidentChatLimits;
+
+#[cfg(feature = "metal")]
 mod agent_receipt;
 #[cfg(feature = "metal")]
 mod chat_cli;
@@ -50,6 +53,11 @@ Scope:
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[cfg(feature = "metal")]
+const fn resident_chat_limits(context_tokens: u32, kv_budget_mib: u32) -> ResidentChatLimits {
+    ResidentChatLimits::from_mib(context_tokens as usize, kv_budget_mib)
 }
 
 /// Which Qwen weight residency contract a generation run uses.
@@ -148,8 +156,11 @@ enum Command {
         #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=256))]
         max_tokens: u32,
         /// Total prompt plus output budget for this resident session.
-        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
         context_tokens: u32,
+        /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        kv_budget_mib: u32,
         /// Emit a structured receipt for a single prompt.
         #[arg(long, requires = "prompt")]
         json: bool,
@@ -168,8 +179,11 @@ enum Command {
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
         max_turns: u32,
         /// Total prompt plus output budget for each agent turn.
-        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
         context_tokens: u32,
+        /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        kv_budget_mib: u32,
         /// Emit a structured execution receipt. Task success is assessed by the caller.
         #[arg(long)]
         json: bool,
@@ -184,8 +198,11 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8321")]
         listen: std::net::SocketAddr,
         /// Total prompt plus output budget for each request.
-        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
+        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
         context_tokens: u32,
+        /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        kv_budget_mib: u32,
         /// Cooperative generation budget per request, in milliseconds.
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=120_000))]
         generation_timeout_ms: u32,
@@ -455,7 +472,14 @@ pub fn run() -> ExitCode {
             max_tokens,
             json,
             context_tokens,
-        } => chat_cli::chat(&model, prompt, max_tokens, json, context_tokens as usize),
+            kv_budget_mib,
+        } => chat_cli::chat(
+            &model,
+            prompt,
+            max_tokens,
+            json,
+            resident_chat_limits(context_tokens, kv_budget_mib),
+        ),
         #[cfg(feature = "metal")]
         Command::Agent {
             model,
@@ -464,6 +488,7 @@ pub fn run() -> ExitCode {
             max_tokens,
             max_turns,
             context_tokens,
+            kv_budget_mib,
             json,
         } => chat_cli::agent(
             &model,
@@ -471,7 +496,7 @@ pub fn run() -> ExitCode {
             prompt,
             max_tokens,
             max_turns,
-            context_tokens as usize,
+            resident_chat_limits(context_tokens, kv_budget_mib),
             json,
         ),
         #[cfg(feature = "metal")]
@@ -480,12 +505,13 @@ pub fn run() -> ExitCode {
             model_id,
             listen,
             context_tokens,
+            kv_budget_mib,
             generation_timeout_ms,
         } => responses::serve(
             &model,
             &model_id,
             listen,
-            context_tokens as usize,
+            resident_chat_limits(context_tokens, kv_budget_mib),
             Duration::from_millis(u64::from(generation_timeout_ms)),
         ),
         #[cfg(feature = "metal")]
