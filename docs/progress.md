@@ -1,5 +1,11 @@
 # Metallix progress and next gates
 
+The broader direction is recorded in [model adapters and MLX capabilities](model-adapters.md):
+compute API/CLI, multimodal execution, SMC/sampling, and training/LoRA support.
+Existing-model completion and profiling lead delivery. The
+[100-page Hub survey](research/hf-trending-landscape.md) informs future adapter
+choices without expanding current support claims.
+
 ## Delivered in this lane
 
 - Native Qwen3 chat uses the checkpoint template and keeps model weights loaded
@@ -65,6 +71,10 @@
 - Performance receipts separate startup, prefill, decode, visible first-token
   latency, request time, and process RSS. See the
   [measurement ledger](experiments/chat-performance.md).
+- A private Qwen cache-fork gate passed full-logit replay on the pinned 0.6B and
+  4B checkpoints in FP32, plus 16 generated tiny-model ancestry cases. Duplicate
+  branches leave parent and EOS cache snapshots unchanged. Particle scheduling
+  and physical cache-sharing costs remain separate [sampling gates](research/sampling-next-gates.md).
 - The [model/runtime refresh](research/model-runtime-refresh.md) records primary
   sources for Qwen3.8, vLLM-Metal, and Whallm, with explicit qualification gates.
 
@@ -83,8 +93,10 @@
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
    forward through the earlier text blocks. Layers three and four now connect
    natively through final logits, preceded by native Engram3 and layer-two FFN.
-   Layer-two post-attention state still comes from capture. Replace that state
-   with native earlier-block output while
+   Layer-two post-attention state still comes from capture. The next boundary
+   is layer one's ratio-two compressed KV/index publication into layer two;
+   this pair does not use the layer-three/four candidate-mask path. Replace the
+   captured state with native earlier-block output while
    preserving the source-grounded arithmetic and discrete routing gates.
    Operator and transaction parity do not establish full-model generation. Keep full checkpoint
    acquisition behind the existing reduced-forward numerical gate.

@@ -179,9 +179,47 @@ units, scope, thread safety and measured enforcement tests, including temporary
 allocations and cache retention. Do not confuse memory, cache and wired-memory
 limits with each other or with a process-wide hard limit.
 
+## Binding capability gap and a Qwen measurement gate
+
+The active workspace constraint remains `mlx-rs =0.25.3`; its resolved
+`mlx-sys 0.2.0` embeds MLX `v0.25.1`. Upstream's current
+[mlx-rs 0.32.0 release](https://github.com/oxiglade/mlx-rs/releases/tag/v0.32.0)
+instead moves to `mlx-sys 0.6.0` and MLX 0.32.2. This is a version gap, not
+evidence that a newer MLX capability is safe in the checked-out binary.
+
+| Capability | Pinned binding | Qwen use today | Upgrade or wrapper implication |
+|---|---|---|---|
+| Graph compile, stateful compile, synchronous and asynchronous evaluation | `transforms::{compile, compile_with_state, eval, async_eval}` are exposed | No compile or async-eval call site | Available for a bounded experiment now. Compile closures must pass arrays as inputs rather than capture them; growing K/V shapes can recompile. |
+| Autograd, modules and optimizers | Exposed under `transforms`, `nn`, and `optimizers` | Not used by inference | Not a decode optimization by itself. |
+| Device and streams | CPU/GPU devices, default streams, explicit streams and scoped default-stream helper are exposed | Qwen uses the default GPU stream through `StreamOrDevice::gpu()` | An owned-stream/overlap design needs a completion and ownership experiment first. |
+| Fused inference operations | Fast RoPE, scaled-dot-product attention and RMS norm are exposed | Already used in the Qwen forward path | Do not replace these with a wrapper without a measured incompatibility or bottleneck. |
+| Quantized matrix operations | Quantize/dequantize and `quantized_matmul` are exposed | Not used by the current Qwen path | Requires checkpoint-layout and numerical qualification, not an API toggle. |
+| Allocator observability and limits | No high-level memory module in the pinned binding | No allocator telemetry or limits | 0.32.0 adds active/cache/peak metrics, limits and cache clearing; an upgrade needs its own compatibility and enforcement gate. |
+| GGUF, contiguous arrays and functional index updates | Not exposed by the pinned release | Not used | 0.32.0 adds these facilities. They may help a future fixed-capacity cache design, but do not justify an upgrade alone. |
+| Custom Metal extensions and distributed execution | Not exposed as a high-level pinned Rust API | Not used | MLX documents [custom extensions](https://ml-explore.github.io/mlx/build/html/dev/extensions.html) and [distributed communication](https://ml-explore.github.io/mlx/build/html/usage/distributed.html), but neither is an available current Qwen call. Treat either as wrapper/upgrade work with a separate FFI and lifecycle design. |
+
+The smallest current-binding performance experiment is to cache each static
+linear weight's transposed view at resident-session load, then compare it with
+the current `linear()` path, which invokes `transpose_device` for every linear
+operation in [the Qwen forward](../../crates/models/qwen/src/forward.rs). The
+experiment must retain exact logits and sampled token IDs, separate session load
+from repeated decode wall time, and report graph-construction time separately
+from completed GPU work. It needs no binding upgrade or custom wrapper. It has
+no expected speedup: a transpose may be a cheap view or may already be folded by
+MLX, so retain the current path if the repeated, matched measurement does not
+improve.
+
+The longer-context hypothesis is different. Cached decode currently builds
+replacement K/V arrays with `concatenate_axis_device` for every layer and token.
+That correlates cache growth with extra allocation/copy work, but is not a
+profiled bottleneck. A fixed-capacity K/V design would need exact cache-layout,
+mask, RoPE-offset, reset and parity tests. Functional index updates in the newer
+binding are a possible future mechanism, not a reason to add a wrapper before
+the concatenate path is measured.
+
 ## Source and coverage ledger
 
-Checked 2026-09-13. No GPU benchmark, binding extension or backend switch was
+Checked 2026-09-20. No GPU benchmark, binding extension or backend switch was
 performed by this research pass.
 
 | Source | Coverage and limit |

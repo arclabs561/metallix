@@ -12,6 +12,8 @@ explicit gaps, not retrospectively pinned evidence.
 | What does V4.1 require, and what do its optimizations actually mean? | [Efficiency requirements](efficiency-methods.md) |
 | What might let a model exceed a Mac's RAM? | [Host-memory investigation](host-memory.md) |
 | How does the runtime compare with existing systems and emerging model families? | [Architecture landscape](architecture-landscape.md) |
+| What does the current Hub landscape imply for future model support? | [100-page trending survey](hf-trending-landscape.md), [model/runtime refresh](model-runtime-refresh.md) |
+| How will compute, multimodal tasks and training fit together? | [MLX capabilities and model adapter proposal](../model-adapters.md) |
 | Which mathematical proposals survived checking, and what remains hypothetical? | [Math corrections and experiment gates](math-validation.md) |
 | Which precision and quantization ideas are faithful formats versus new quality experiments? | [Quantization and precision](quantization-precision.md) |
 | What gates separate categorical sampling, particle control, and calibrated uncertainty? | [Sampling implementation gates](sampling-next-gates.md) |

@@ -2,6 +2,13 @@
 
 ## Product boundary
 
+The longer-term scope includes a Rust-facing MLX compute API and CLI,
+multimodal adapters, SMC/sampling, and training/LoRA/fine-tuning. Existing Qwen
+and DeepSeek completion and measured performance remain the immediate work.
+The [adapter/config proposal](model-adapters.md) records that expansion and
+the contract gates; the serving design below describes the current vertical,
+not the limit of the whole project.
+
 Metallix v1 targets a single-Mac, macOS / Apple-Silicon / Metal serving runtime.
 It is designed around portable service contracts and model-specific Metal
 execution plug-ins, without a generic tensor or compute-backend abstraction.

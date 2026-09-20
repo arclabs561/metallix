@@ -12,6 +12,11 @@ Qwen3-0.6B and Qwen3-4B-Instruct-2507 run today. DeepSeek-V4.1-Flash is the main
 configuration and isolated Metal operators work today, but it cannot generate
 yet.
 
+The longer-term direction includes broader MLX computation, multimodal models,
+SMC/sampling, and training/LoRA. See the [adapter/config proposal](docs/model-adapters.md)
+and [model landscape survey](docs/research/hf-trending-landscape.md); these are
+planned capabilities, separate from the working commands below.
+
 ## Setup
 
 Requires Rust 1.87+, Apple Silicon, CMake and the Xcode Metal toolchain. From
