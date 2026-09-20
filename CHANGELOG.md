@@ -29,6 +29,8 @@ published release; reference operators do not imply full-model support.
   hyper-connection matrix (`24 × 16384`, checksum `6150937c7aee9697`).
 - Added the bounded HC input expansion primitive for repeating a hidden state
   across the model's four-way hyper-connection layout.
+- Added the checked HC coefficient mix bridge: RMS-normalized expanded hidden
+  state, `attn_hc.fn` row products, and existing Sinkhorn coefficient splitting.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

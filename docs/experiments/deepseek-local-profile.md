@@ -101,3 +101,8 @@ latent mixing is implemented.
 The DeepSeek crate now validates the `hc_mult=4` hidden-state expansion layout,
 repeating a 4,096-wide hidden state into the 16,384-wide `attn_hc.fn` input
 shape. The next gate is the native HC coefficient mix itself.
+
+The native crate now bridges the HC coefficient formula: RMS normalization of
+the four-way expanded hidden state, `attn_hc.fn` products, and the existing
+Sinkhorn coefficient splitter. The bridge has independent finite-coefficient
+coverage; real parameter/input integration remains the next step.

@@ -10,6 +10,7 @@ use std::{
 };
 
 use super::{V41SafetensorsHeader, V41StorageDtype};
+use crate::hc::{HcCoefficients, HcError, split_hc_coefficients};
 use thiserror::Error;
 
 /// A validated MLX affine row decoder error.
@@ -208,6 +209,58 @@ pub fn expand_hc_hidden(input: &[f32], copies: usize) -> Result<Vec<f32>, MlxAff
     Ok(expanded)
 }
 
+/// Computes one Hyper-Connection coefficient row from decoded MLX parameters.
+pub fn mix_hc_coefficients(
+    fn_matrix: &[f32],
+    base: &[f32],
+    scale: &[f32; 3],
+    hidden: &[f32],
+    copies: usize,
+    epsilon: f32,
+    sinkhorn_iterations: usize,
+) -> Result<HcCoefficients, HcError> {
+    let expanded = expand_hc_hidden(hidden, copies).map_err(|_| HcError::ShapeOverflow {
+        field: "expanded_hidden",
+    })?;
+    let width = expanded.len();
+    let rows = (2 + copies) * copies;
+    if fn_matrix.len() != rows * width {
+        return Err(HcError::ShapeOverflow { field: "fn_matrix" });
+    }
+    let width_u16 = u16::try_from(expanded.len()).map_err(|_| HcError::ShapeOverflow {
+        field: "expanded_hidden",
+    })?;
+    let norm = (expanded.iter().map(|value| value * value).sum::<f32>() / f32::from(width_u16)
+        + epsilon)
+        .sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(HcError::NonFiniteInput {
+            field: "hidden_norm",
+            index: 0,
+        });
+    }
+    let normalized = expanded
+        .iter()
+        .map(|value| *value / norm)
+        .collect::<Vec<_>>();
+    let mut mixes = Vec::with_capacity(rows);
+    for row in fn_matrix.chunks_exact(width) {
+        let value = row
+            .iter()
+            .zip(&normalized)
+            .map(|(weight, input)| weight * input)
+            .sum::<f32>();
+        if !value.is_finite() {
+            return Err(HcError::NonFiniteInput {
+                field: "fn_mix",
+                index: 0,
+            });
+        }
+        mixes.push(value);
+    }
+    split_hc_coefficients(&mixes, scale, base, copies, sinkhorn_iterations, epsilon)
+}
+
 /// Converts one decoded row to an MLX array and evaluates it on the device.
 #[cfg(feature = "metal")]
 pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
@@ -296,6 +349,22 @@ mod tests {
             super::expand_hc_hidden(&[], 4),
             Err(MlxAffineRowError::GroupShape)
         );
+    }
+
+    #[test]
+    fn mixes_hyperconnection_coefficients_from_decoded_parameters() {
+        let coefficients = super::mix_hc_coefficients(
+            &vec![0.01; 24 * 8],
+            &[0.0; 24],
+            &[1.0, 1.0, 1.0],
+            &[1.0, 2.0],
+            4,
+            1e-6,
+            2,
+        )
+        .expect("HC coefficients");
+        assert_eq!(coefficients.copies(), 4);
+        assert!(coefficients.pre().iter().all(|value| value.is_finite()));
     }
 
     #[cfg(feature = "metal")]
