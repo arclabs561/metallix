@@ -316,6 +316,9 @@ def hooks_for(
     had_hc_mixes, prior_hc_mixes, original_hc_mixes = instance_method(
         layer_four, "hc_mixes"
     )
+    had_producer_hc_mixes, prior_producer_hc_mixes, _ = instance_method(
+        layer_three, "hc_mixes"
+    )
     had_window, prior_window, original_window = instance_method(
         layer_four_attention, "_window_kv"
     )
@@ -440,10 +443,10 @@ def hooks_for(
                     capture_input("norm_input", exactly_one=True)
                 )
             )
-        if name == "layers.4.ffn":
+        if name in {"layers.3.ffn", "layers.4.ffn"}:
             handles.append(
                 module.register_forward_pre_hook(
-                    capture_input("layers.4.ffn_input", exactly_one=False)
+                    capture_input(f"{name}_input", exactly_one=False)
                 )
             )
         if name in {"layers.3.attn", "layers.4.attn"}:
@@ -475,10 +478,12 @@ def hooks_for(
                     )
                 )
             )
-        if name == "layers.4.ffn_norm":
+        if name in {"layers.3.ffn_norm", "layers.4.ffn_norm"}:
             handles.append(
                 module.register_forward_pre_hook(
-                    capture_input("layers.4.ffn_collapsed", exactly_one=True)
+                    capture_input(
+                        f"{name.removesuffix('_norm')}_collapsed", exactly_one=True
+                    )
                 )
             )
         if name == "layers.3.attn.indexer.weights_proj":
@@ -519,13 +524,21 @@ def hooks_for(
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if hc_fn is layer_four.hc_ffn_fn:
-            cap_guard("layers.4.after_attention_residual")
-            if "layers.4.after_attention_residual" in records:
-                raise RuntimeError("layer-four FFN HC residual was observed twice")
-            records["layers.4.after_attention_residual"] = object_record(
-                x, include_storage=True
-            )
+        layer_id = (
+            3
+            if hc_fn is layer_three.hc_ffn_fn
+            else 4
+            if hc_fn is layer_four.hc_ffn_fn
+            else None
+        )
+        if layer_id is not None:
+            record_name = f"layers.{layer_id}.after_attention_residual"
+            cap_guard(record_name)
+            if record_name in records:
+                raise RuntimeError(
+                    f"layer-{layer_id} FFN HC residual was observed twice"
+                )
+            records[record_name] = object_record(x, include_storage=True)
         return original_hc_mixes(x, hc_fn, hc_scale, hc_base)
 
     def observed_window_kv_for(
@@ -682,6 +695,7 @@ def hooks_for(
         return output
 
     try:
+        layer_three.hc_mixes = observed_hc_mixes
         layer_four.hc_mixes = observed_hc_mixes
         layer_three_attention._window_kv = observed_window_kv_for(
             3, layer_three_attention, original_producer_window
@@ -708,6 +722,12 @@ def hooks_for(
     finally:
         for handle in handles:
             handle.remove()
+        _restore_instance(
+            layer_three,
+            "hc_mixes",
+            had_producer_hc_mixes,
+            prior_producer_hc_mixes,
+        )
         _restore_instance(layer_four, "hc_mixes", had_hc_mixes, prior_hc_mixes)
         _restore_instance(layer_four_attention, "_window_kv", had_window, prior_window)
         _restore_instance(

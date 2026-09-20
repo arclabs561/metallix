@@ -185,6 +185,26 @@ fn norm(input: &[Span], weight: &[u16], epsilon: f32) -> Vec<Span> {
 }
 
 impl TerminalEnvelope {
+    /// Checks a terminal residual/pre pair against source-derived fixed spans.
+    pub(super) fn accepts(
+        &self,
+        native_block: &[u16],
+        native_pre: &[f32],
+        source_block: &[u16],
+        source_pre: &[f32],
+    ) -> bool {
+        accepts_bf16(&self.block, native_block)
+            && accepts_bf16(&self.block, source_block)
+            && self.pre.len() == native_pre.len()
+            && self.pre.len() == source_pre.len()
+            && self
+                .pre
+                .iter()
+                .zip(native_pre)
+                .zip(source_pre)
+                .all(|((&span, &native), &source)| contains(span, native) && contains(span, source))
+    }
+
     pub(super) fn final_norm_envelope(
         &self,
         norm_weight: &[u16],
@@ -278,6 +298,7 @@ fn norm_envelope_covers_subnormal_square_rounding() {
 #[allow(clippy::too_many_arguments)]
 fn coefficients(
     fixture: &Fixture,
+    layer: usize,
     prefix: &str,
     residual: &[Span],
     native_residual: &[u16],
@@ -288,12 +309,12 @@ fn coefficients(
 ) -> (Vec<Span>, Vec<Span>, Vec<Span>) {
     let c = &fixture.block_config;
     assert_eq!(c.copies, 2, "bounded reduced-graph contract");
-    let projection = fixture.block_parameters[&format!("layers.4.hc_{prefix}_fn")].fp32();
-    let scale: [f32; 3] = fixture.block_parameters[&format!("layers.4.hc_{prefix}_scale")]
+    let projection = fixture.block_parameters[&format!("layers.{layer}.hc_{prefix}_fn")].fp32();
+    let scale: [f32; 3] = fixture.block_parameters[&format!("layers.{layer}.hc_{prefix}_scale")]
         .fp32()
         .try_into()
         .unwrap();
-    let base = fixture.block_parameters[&format!("layers.4.hc_{prefix}_base")].fp32();
+    let base = fixture.block_parameters[&format!("layers.{layer}.hc_{prefix}_base")].fp32();
     let observed = project_hc_diagnostics(
         native_residual,
         &projection,
@@ -367,10 +388,31 @@ pub(super) fn check_position(
     after_attention: &[u16],
     result: &FfnDiagnostic,
 ) -> TerminalEnvelope {
+    check_position_for(
+        fixture,
+        case,
+        pos,
+        attention_coefficients,
+        after_attention,
+        result,
+        4,
+    )
+}
+
+pub(super) fn check_position_for(
+    fixture: &Fixture,
+    case: &Case,
+    pos: usize,
+    attention_coefficients: &HcCoefficients,
+    after_attention: &[u16],
+    result: &FfnDiagnostic,
+    layer: usize,
+) -> TerminalEnvelope {
     let block_input = row_bits(&case.block_input, pos, 256);
     let residual = points(&block_input);
     let (attn_pre, attn_post, attn_comb) = coefficients(
         fixture,
+        layer,
         "attn",
         &residual,
         &block_input,
@@ -389,6 +431,7 @@ pub(super) fn check_position(
     );
     let (next_pre, ffn_post, ffn_comb) = coefficients(
         fixture,
+        layer,
         "ffn",
         &residual,
         after_attention,
@@ -403,7 +446,7 @@ pub(super) fn check_position(
         result.collapsed_bf16(),
         &row_bits(&case.ffn_collapsed, pos, 128),
     );
-    let norm_weight = fixture.block_parameters["layers.4.ffn_norm.weight"].bf16();
+    let norm_weight = fixture.block_parameters[&format!("layers.{layer}.ffn_norm.weight")].bf16();
     cast_checked(
         "FFN norm",
         &norm(&collapse, &norm_weight, fixture.block_config.norm_eps),

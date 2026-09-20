@@ -110,6 +110,13 @@ struct Case {
     ffn_coefficients: Coefficients,
     block_output: Tensor,
     block_next_pre: Tensor,
+    next_block_entry: Option<BlockEntry>,
+}
+
+#[derive(Deserialize)]
+struct BlockEntry {
+    residual: Tensor,
+    incoming_pre: Tensor,
 }
 
 #[derive(Deserialize)]
@@ -199,13 +206,62 @@ impl Tensor {
 }
 
 fn fixture() -> Fixture {
-    let f: Fixture = serde_json::from_str(include_str!(
+    let f = fixture_from(include_str!(
         "../../../../fixtures/deepseek-v41/forward-moe-reference.json"
-    ))
-    .unwrap();
+    ));
     assert_eq!(f.schema_version, 1);
     assert_source_provenance(&f);
     assert_encoded_parameter_schema(&f);
+    assert_model_and_case_contract(&f);
+    f
+}
+
+fn fixture_from(source: &str) -> Fixture {
+    serde_json::from_str(source).expect("valid source MoE fixture")
+}
+
+fn layer_three_fixture() -> Fixture {
+    let f = fixture_from(include_str!(
+        "../../../../fixtures/deepseek-v41/forward-layer3-moe-reference.json"
+    ));
+    assert_eq!(f.schema_version, 1);
+    assert_eq!(
+        f.source.revision,
+        "dba1be0a40aa45a94ad051997016db3960a90277"
+    );
+    assert_eq!(
+        f.source.model_sha256,
+        "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+    );
+    assert_eq!(
+        f.source.complete_capture_sha256,
+        "7a6290921f79573e976aba42ec296f038adda2efc0d3d89b8583c6f58c79cb92"
+    );
+    assert_eq!(
+        f.source.cpu_backend_sha256,
+        "b1f1f3cfdb93b674a5f96a114cf45bf5be9ad3a555ae95ac24add567f9f5232e"
+    );
+    assert_eq!(
+        f.source.kernel_source_sha256,
+        "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455"
+    );
+    assert_eq!(
+        f.source.loader_sha256,
+        "359c4c961bdc8e200e2ccd13e7499974220a8d6942b5f6627316ab54210bef03"
+    );
+    assert_eq!(
+        f.source.engram_sha256,
+        "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897"
+    );
+    assert_eq!(
+        f.source.manifest_canonical_sha256,
+        "fd69a8fce4d5048f87db705603e05e3077c4f9bda402ec08be848aaa5cbdb92e"
+    );
+    assert_eq!(
+        f.source.runner_sha256,
+        "48f10d6a0ba0888580132a08e9821bf0f707ec5a0cc609a777c0a37c59666684"
+    );
+    assert_eq!(f.source.storage_byteorder, "little");
     assert_model_and_case_contract(&f);
     f
 }
@@ -352,6 +408,15 @@ fn coefficient_bit_differences(
 }
 
 fn with_model<R>(f: &Fixture, omit_shared: bool, body: impl FnOnce(MoEReference<'_>) -> R) -> R {
+    with_model_for(f, 4, omit_shared, body)
+}
+
+fn with_model_for<R>(
+    f: &Fixture,
+    layer: usize,
+    omit_shared: bool,
+    body: impl FnOnce(MoEReference<'_>) -> R,
+) -> R {
     let mut encoded: BTreeMap<String, Vec<u8>> = f
         .encoded_parameters
         .iter()
@@ -359,7 +424,7 @@ fn with_model<R>(f: &Fixture, omit_shared: bool, body: impl FnOnce(MoEReference<
         .collect();
     if omit_shared {
         encoded
-            .get_mut("layers.4.ffn.shared_experts.w2.weight")
+            .get_mut(&format!("layers.{layer}.ffn.shared_experts.w2.weight"))
             .unwrap()
             .fill(0);
     }
@@ -372,7 +437,7 @@ fn with_model<R>(f: &Fixture, omit_shared: bool, body: impl FnOnce(MoEReference<
             "w3.weight",
             "w3.scale",
         ]
-        .map(|suffix| encoded[&format!("layers.4.ffn.{prefix}.{suffix}")].as_slice())
+        .map(|suffix| encoded[&format!("layers.{layer}.ffn.{prefix}.{suffix}")].as_slice())
     };
     let routed: Vec<_> = (0..4)
         .map(|id| {
@@ -382,8 +447,8 @@ fn with_model<R>(f: &Fixture, omit_shared: bool, body: impl FnOnce(MoEReference<
         .collect();
     let [w1, s1, w2, s2, w3, s3] = expert_bytes("shared_experts");
     let shared = Fp8ExpertWeights::new(128, 128, w1, s1, w2, s2, w3, s3).unwrap();
-    let gate = f.encoded_parameters["layers.4.ffn.gate.weight"].bf16();
-    let bias = f.encoded_parameters["layers.4.ffn.gate.bias"].fp32();
+    let gate = f.encoded_parameters[&format!("layers.{layer}.ffn.gate.weight")].bf16();
+    let bias = f.encoded_parameters[&format!("layers.{layer}.ffn.gate.bias")].fp32();
     let c = &f.model;
     let config = MoEConfig::new(
         c.dim,
@@ -932,7 +997,11 @@ fn validate_block_tail_fixture(f: &Fixture) {
 }
 
 fn block_tail_parameters(f: &Fixture) -> BlockTailParameters {
-    let fp32 = |name: &str| f.block_parameters[&format!("layers.4.{name}")].fp32();
+    block_tail_parameters_for(f, 4)
+}
+
+fn block_tail_parameters_for(f: &Fixture, layer: usize) -> BlockTailParameters {
+    let fp32 = |name: &str| f.block_parameters[&format!("layers.{layer}.{name}")].fp32();
     BlockTailParameters {
         attn_projection: fp32("hc_attn_fn"),
         attn_scale: fp32("hc_attn_scale").try_into().unwrap(),
@@ -940,8 +1009,8 @@ fn block_tail_parameters(f: &Fixture) -> BlockTailParameters {
         ffn_projection: fp32("hc_ffn_fn"),
         ffn_scale: fp32("hc_ffn_scale").try_into().unwrap(),
         ffn_base: fp32("hc_ffn_base"),
-        attn_norm: f.block_parameters["layers.4.attn_norm.weight"].bf16(),
-        ffn_norm: f.block_parameters["layers.4.ffn_norm.weight"].bf16(),
+        attn_norm: f.block_parameters[&format!("layers.{layer}.attn_norm.weight")].bf16(),
+        ffn_norm: f.block_parameters[&format!("layers.{layer}.ffn_norm.weight")].bf16(),
     }
 }
 
@@ -1175,6 +1244,161 @@ fn native_attention_hc_ffn_chain_matches_source_numerical_contract() {
     let f = fixture();
     let output = block_tail(&f, BlockControl::NativeAttention, true);
     assert_eq!(output.len(), f.cases.len());
+}
+
+#[test]
+fn native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry() {
+    let f = layer_three_fixture();
+    let parameters = block_tail_parameters_for(&f, 3);
+    let config = &f.block_config;
+    let attention = owner_attention_capture::native_layer_three_outputs_from_ownered_inputs();
+    assert_eq!(attention.len(), f.cases.len());
+    with_model_for(&f, 3, false, |model| {
+        let ffn = FfnSublayerReference::new(
+            model,
+            &parameters.ffn_norm,
+            &parameters.ffn_projection,
+            &parameters.ffn_scale,
+            &parameters.ffn_base,
+            config.copies,
+            config.norm_eps,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+        )
+        .expect("layer-three FFN contract");
+        for (case, attention_output) in f.cases.iter().zip(attention) {
+            check_layer_three_case(&f, &parameters, &ffn, case, &attention_output);
+        }
+    });
+}
+
+fn check_layer_three_case(
+    f: &Fixture,
+    parameters: &BlockTailParameters,
+    ffn: &FfnSublayerReference<'_>,
+    case: &Case,
+    attention_output: &[u16],
+) {
+    let config = &f.block_config;
+    let positions = case.input.shape[1];
+    assert_eq!(
+        attention_output,
+        case.attention_output.bf16(),
+        "native layer-three attention"
+    );
+    let block_input = case.block_input.bf16();
+    let expected_after_attention = case.after_attention_residual.bf16();
+    let expected_terminal = case.block_output.bf16();
+    let expected_pre = case.block_next_pre.fp32();
+    let next = case
+        .next_block_entry
+        .as_ref()
+        .expect("source layer-four entry");
+    let next_residual = next.residual.bf16();
+    let next_incoming = next.incoming_pre.fp32();
+    assert_eq!(expected_terminal, next_residual, "source block continuity");
+    assert_eq!(expected_pre, next_incoming, "source coefficient continuity");
+    let mut terminal = Vec::with_capacity(expected_terminal.len());
+    for position in 0..positions {
+        let residual = &block_input[position * 256..(position + 1) * 256];
+        let attn_coefficients = project_hc_coefficients(
+            residual,
+            &parameters.attn_projection,
+            &parameters.attn_scale,
+            &parameters.attn_base,
+            config.copies,
+            config.norm_eps,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+        )
+        .expect("layer-three attention HC coefficients");
+        let mut after_attention = vec![0; 256];
+        hc_post_bf16_reference(
+            &attention_output[position * 128..(position + 1) * 128],
+            residual,
+            attn_coefficients.post(),
+            attn_coefficients.comb(),
+            &mut after_attention,
+        )
+        .expect("layer-three attention HC post-mix");
+        assert_eq!(
+            after_attention,
+            expected_after_attention[position * 256..(position + 1) * 256],
+            "layer-three native attention HC residual at start {} position {position}",
+            case.start_pos
+        );
+        let result = ffn
+            .forward_token(&after_attention, attn_coefficients.pre())
+            .expect("layer-three native FFN");
+        let envelope = hc_chain_bounds::check_position_for(
+            f,
+            case,
+            position,
+            &attn_coefficients,
+            &after_attention,
+            &result,
+            3,
+        );
+        let source_residual = &next_residual[position * 256..(position + 1) * 256];
+        let source_pre = &next_incoming[position * 2..(position + 1) * 2];
+        assert!(
+            envelope.accepts(
+                result.output_bf16(),
+                result.coefficients().pre(),
+                source_residual,
+                source_pre,
+            ),
+            "native layer-three state reaches layer-four entry at start {} position {position}",
+            case.start_pos
+        );
+        if position == 0 {
+            reject_zeroed_layer_three_attention(
+                ffn,
+                residual,
+                &attn_coefficients,
+                &envelope,
+                source_residual,
+                source_pre,
+            );
+        }
+        terminal.extend_from_slice(result.output_bf16());
+    }
+    assert_eq!(
+        terminal, expected_terminal,
+        "layer-three native terminal residual at start {}",
+        case.start_pos
+    );
+}
+
+fn reject_zeroed_layer_three_attention(
+    ffn: &FfnSublayerReference<'_>,
+    residual: &[u16],
+    attn_coefficients: &HcCoefficients,
+    envelope: &hc_chain_bounds::TerminalEnvelope,
+    source_residual: &[u16],
+    source_pre: &[f32],
+) {
+    let mut zeroed_attention = vec![0; 256];
+    hc_post_bf16_reference(
+        &[0; 128],
+        residual,
+        attn_coefficients.post(),
+        attn_coefficients.comb(),
+        &mut zeroed_attention,
+    )
+    .expect("zeroed layer-three attention control");
+    let wrong = ffn
+        .forward_token(&zeroed_attention, attn_coefficients.pre())
+        .expect("zeroed-attention FFN control");
+    assert!(
+        !envelope.accepts(
+            wrong.output_bf16(),
+            wrong.coefficients().pre(),
+            source_residual,
+            source_pre,
+        ),
+        "zeroed attention must fail the layer-four entry envelope"
+    );
 }
 
 fn final_head_logits(input: &[f32], weights: &[f32], vocabulary: usize) -> Vec<f32> {

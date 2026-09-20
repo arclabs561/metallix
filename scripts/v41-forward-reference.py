@@ -769,12 +769,12 @@ def head_fixture(receipt: dict[str, object]) -> dict[str, object]:
     }
 
 
-def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
+def moe_fixture(receipt: dict[str, object], *, layer: int = 4) -> dict[str, object]:
     """Select actual layer-four MoE inputs, choices, outputs and encodings.
 
     This is a compact projection of a completed source capture.  It does not
     evaluate the gate or experts: expected values remain the hook records from
-    the source's own ``layers.4.ffn`` execution.
+    the source's own selected-layer FFN execution.
     """
     if (
         receipt.get("capture_status")
@@ -800,16 +800,20 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
     ):
         raise TypeError("complete capture has an invalid MoE-fixture shape")
 
+    if layer not in (3, 4):
+        raise ValueError("MoE fixture supports only the captured layer-three/four seam")
+    layer_prefix = f"layers.{layer}"
+    ffn_prefix = f"{layer_prefix}.ffn"
     parameters = {
         name: record
         for name, record in encoded.items()
-        if isinstance(name, str) and name.startswith("layers.4.ffn.")
+        if isinstance(name, str) and name.startswith(f"{ffn_prefix}.")
     }
-    routed = tuple(f"layers.4.ffn.experts.{index}" for index in range(4))
-    expert_prefixes = (*routed, "layers.4.ffn.shared_experts")
+    routed = tuple(f"{ffn_prefix}.experts.{index}" for index in range(4))
+    expert_prefixes = (*routed, f"{ffn_prefix}.shared_experts")
     required_names = {
-        "layers.4.ffn.gate.weight",
-        "layers.4.ffn.gate.bias",
+        f"{ffn_prefix}.gate.weight",
+        f"{ffn_prefix}.gate.bias",
         *(
             f"{prefix}.{projection}.{field}"
             for prefix in expert_prefixes
@@ -821,7 +825,7 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
         missing = sorted(required_names - set(parameters))
         unexpected = sorted(set(parameters) - required_names)
         raise RuntimeError(
-            "complete capture layer-four MoE parameter set differs: "
+            f"complete capture layer-{layer} MoE parameter set differs: "
             f"missing={missing}, unexpected={unexpected}"
         )
     if not all(
@@ -843,8 +847,8 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
         raise RuntimeError("MoE fixture export requires little-endian tensor storage")
 
     expected_tensor_layouts = {
-        "layers.4.ffn.gate.weight": ([4, 128], "torch.bfloat16"),
-        "layers.4.ffn.gate.bias": ([4], "torch.float32"),
+        f"{ffn_prefix}.gate.weight": ([4, 128], "torch.bfloat16"),
+        f"{ffn_prefix}.gate.bias": ([4], "torch.float32"),
     }
     for prefix in routed:
         for projection in ("w1", "w2", "w3"):
@@ -857,11 +861,11 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "torch.float8_e8m0fnu",
             )
     for projection in ("w1", "w2", "w3"):
-        expected_tensor_layouts[f"layers.4.ffn.shared_experts.{projection}.weight"] = (
+        expected_tensor_layouts[f"{ffn_prefix}.shared_experts.{projection}.weight"] = (
             [128, 128],
             "torch.float8_e4m3fn",
         )
-        expected_tensor_layouts[f"layers.4.ffn.shared_experts.{projection}.scale"] = (
+        expected_tensor_layouts[f"{ffn_prefix}.shared_experts.{projection}.scale"] = (
             [4, 4],
             "torch.float8_e8m0fnu",
         )
@@ -871,14 +875,14 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
             raise RuntimeError(f"MoE parameter {name} has an unexpected shape or dtype")
 
     block_parameter_names = (
-        "layers.4.hc_attn_fn",
-        "layers.4.hc_attn_base",
-        "layers.4.hc_attn_scale",
-        "layers.4.hc_ffn_fn",
-        "layers.4.hc_ffn_base",
-        "layers.4.hc_ffn_scale",
-        "layers.4.attn_norm.weight",
-        "layers.4.ffn_norm.weight",
+        f"{layer_prefix}.hc_attn_fn",
+        f"{layer_prefix}.hc_attn_base",
+        f"{layer_prefix}.hc_attn_scale",
+        f"{layer_prefix}.hc_ffn_fn",
+        f"{layer_prefix}.hc_ffn_base",
+        f"{layer_prefix}.hc_ffn_scale",
+        f"{layer_prefix}.attn_norm.weight",
+        f"{layer_prefix}.ffn_norm.weight",
     )
     block_parameters = {name: encoded.get(name) for name in block_parameter_names}
     if set(block_parameters) != set(block_parameter_names) or not all(
@@ -887,14 +891,14 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
     ):
         raise RuntimeError("complete capture lacks exact layer-four block parameters")
     expected_block_layouts = {
-        "layers.4.hc_attn_fn": ([8, 256], "torch.float32"),
-        "layers.4.hc_attn_base": ([8], "torch.float32"),
-        "layers.4.hc_attn_scale": ([3], "torch.float32"),
-        "layers.4.hc_ffn_fn": ([8, 256], "torch.float32"),
-        "layers.4.hc_ffn_base": ([8], "torch.float32"),
-        "layers.4.hc_ffn_scale": ([3], "torch.float32"),
-        "layers.4.attn_norm.weight": ([128], "torch.bfloat16"),
-        "layers.4.ffn_norm.weight": ([128], "torch.bfloat16"),
+        f"{layer_prefix}.hc_attn_fn": ([8, 256], "torch.float32"),
+        f"{layer_prefix}.hc_attn_base": ([8], "torch.float32"),
+        f"{layer_prefix}.hc_attn_scale": ([3], "torch.float32"),
+        f"{layer_prefix}.hc_ffn_fn": ([8, 256], "torch.float32"),
+        f"{layer_prefix}.hc_ffn_base": ([8], "torch.float32"),
+        f"{layer_prefix}.hc_ffn_scale": ([3], "torch.float32"),
+        f"{layer_prefix}.attn_norm.weight": ([128], "torch.bfloat16"),
+        f"{layer_prefix}.ffn_norm.weight": ([128], "torch.bfloat16"),
     }
     for name, (shape, dtype) in expected_block_layouts.items():
         record = block_parameters[name]
@@ -911,17 +915,17 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
         intermediates = step.get("intermediates")
         if not isinstance(start_pos, int) or not isinstance(intermediates, dict):
             raise TypeError("complete capture step lacks MoE boundaries")
-        ffn_input = intermediates.get("layers.4.ffn_input")
-        ffn_output = intermediates.get("layers.4.ffn")
-        gate = intermediates.get("layers.4.ffn.gate")
-        block_input = intermediates.get("layers.4.block_input")
-        attention_input = intermediates.get("layers.4.attention_input")
-        attention_output = intermediates.get("layers.4.attn")
+        ffn_input = intermediates.get(f"{ffn_prefix}_input")
+        ffn_output = intermediates.get(ffn_prefix)
+        gate = intermediates.get(f"{ffn_prefix}.gate")
+        block_input = intermediates.get(f"{layer_prefix}.block_input")
+        attention_input = intermediates.get(f"{layer_prefix}.attention_input")
+        attention_output = intermediates.get(f"{layer_prefix}.attn")
         after_attention_residual = intermediates.get(
-            "layers.4.after_attention_residual"
+            f"{layer_prefix}.after_attention_residual"
         )
-        ffn_collapsed = intermediates.get("layers.4.ffn_collapsed")
-        block_result = intermediates.get("layers.4")
+        ffn_collapsed = intermediates.get(f"{layer_prefix}.ffn_collapsed")
+        block_result = intermediates.get(layer_prefix)
         hc_kernel_calls = step.get("hyper_connection_mixes")
         if (
             not isinstance(ffn_input, dict)
@@ -939,10 +943,15 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
             or not all(isinstance(value, dict) for value in block_result)
             or not isinstance(hc_kernel_calls, list)
         ):
-            raise TypeError("complete capture step lacks layer-four MoE hook records")
+            raise TypeError(
+                f"complete capture step lacks layer-{layer} MoE hook records"
+            )
         block_residual = block_input.get("residual")
         incoming_pre = block_input.get("incoming_pre")
         block_output, block_next_pre = block_result
+        next_block_input = (
+            intermediates.get("layers.4.block_input") if layer == 3 else None
+        )
         if (
             ffn_input.get("shape") != ffn_output.get("shape")
             or ffn_input.get("dtype") != "torch.bfloat16"
@@ -961,21 +970,40 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
             or block_next_pre.get("dtype") != "torch.float32"
         ):
             raise RuntimeError(
-                "layer-four MoE hook storage has unexpected dtype or shape"
+                f"layer-{layer} MoE hook storage has unexpected dtype or shape"
             )
-        layer_four_hc_calls = [
+        if layer == 3:
+            if not isinstance(next_block_input, dict):
+                raise TypeError(
+                    "layer-three fixture lacks layer-four block-entry cross-gate"
+                )
+            next_residual = next_block_input.get("residual")
+            next_pre = next_block_input.get("incoming_pre")
+            if not isinstance(next_residual, dict) or not isinstance(next_pre, dict):
+                raise TypeError(
+                    "layer-three fixture has malformed layer-four block entry"
+                )
+            if block_output.get("storage_sha256") != next_residual.get(
+                "storage_sha256"
+            ) or block_next_pre.get("storage_sha256") != next_pre.get("storage_sha256"):
+                raise RuntimeError(
+                    "layer-three terminal state does not match layer-four block entry"
+                )
+        layer_hc_calls = [
             call
             for call in hc_kernel_calls
-            if isinstance(call, dict) and call.get("layer_id") == 4
+            if isinstance(call, dict) and call.get("layer_id") == layer
         ]
-        if len(layer_four_hc_calls) != 2:
-            raise RuntimeError("complete capture must retain two layer-four HC calls")
+        if len(layer_hc_calls) != 2:
+            raise RuntimeError(
+                f"complete capture must retain two layer-{layer} HC calls"
+            )
         coefficients = {
-            call.get("sublayer"): call.get("outputs") for call in layer_four_hc_calls
+            call.get("sublayer"): call.get("outputs") for call in layer_hc_calls
         }
         raw_hc_mixes = {
             call.get("sublayer"): call.get("inputs", {}).get("mixes")
-            for call in layer_four_hc_calls
+            for call in layer_hc_calls
         }
         if set(coefficients) != {"attention", "ffn"} or not all(
             isinstance(value, dict)
@@ -986,35 +1014,36 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
             )
             for value in coefficients.values()
         ):
-            raise RuntimeError("complete capture lacks layer-four HC coefficients")
+            raise RuntimeError(f"complete capture lacks layer-{layer} HC coefficients")
         if set(raw_hc_mixes) != {"attention", "ffn"} or not all(
             isinstance(value, dict)
             and value.get("dtype") == "torch.float32"
             and "storage_hex" in value
             for value in raw_hc_mixes.values()
         ):
-            raise RuntimeError("complete capture lacks layer-four raw HC mixes")
-        cases.append(
-            {
-                "start_pos": start_pos,
-                "input": ffn_input,
-                "gate_weights": gate[0],
-                "gate_indices": gate[1],
-                "output": ffn_output,
-                "block_input": block_residual,
-                "block_incoming_pre": incoming_pre,
-                "attention_input": attention_input,
-                "attention_output": attention_output,
-                "after_attention_residual": after_attention_residual,
-                "ffn_collapsed": ffn_collapsed,
-                "block_output": block_output,
-                "block_next_pre": block_next_pre,
-                "attention_coefficients": coefficients["attention"],
-                "ffn_coefficients": coefficients["ffn"],
-                "attention_hc_mixes": raw_hc_mixes["attention"],
-                "ffn_hc_mixes": raw_hc_mixes["ffn"],
-            }
-        )
+            raise RuntimeError(f"complete capture lacks layer-{layer} raw HC mixes")
+        case: dict[str, object] = {
+            "start_pos": start_pos,
+            "input": ffn_input,
+            "gate_weights": gate[0],
+            "gate_indices": gate[1],
+            "output": ffn_output,
+            "block_input": block_residual,
+            "block_incoming_pre": incoming_pre,
+            "attention_input": attention_input,
+            "attention_output": attention_output,
+            "after_attention_residual": after_attention_residual,
+            "ffn_collapsed": ffn_collapsed,
+            "block_output": block_output,
+            "block_next_pre": block_next_pre,
+            "attention_coefficients": coefficients["attention"],
+            "ffn_coefficients": coefficients["ffn"],
+            "attention_hc_mixes": raw_hc_mixes["attention"],
+            "ffn_hc_mixes": raw_hc_mixes["ffn"],
+        }
+        if layer == 3:
+            case["next_block_entry"] = next_block_input
+        cases.append(case)
     if [case["start_pos"] for case in cases] != [0, 5, 6]:
         raise RuntimeError("MoE fixture requires the pinned prefill/decode trace")
 
@@ -1037,7 +1066,7 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
     return {
         "schema_version": 1,
         "scope": (
-            "layer-four source MoE plus native block composition with captured "
+            f"layer-{layer} source MoE plus native block composition with captured "
             "source attention output; not native attention, Rust acceptance, or "
             "full-model parity"
         ),
@@ -1076,6 +1105,11 @@ def moe_fixture(receipt: dict[str, object]) -> dict[str, object]:
             ),
             "route_weight_abs_error_max": 2**-20,
             "fixed_before_candidate_execution": True,
+            "next_block_entry": (
+                "exact source storage identity with layer-four block input"
+                if layer == 3
+                else "not applicable"
+            ),
         },
     }
 
@@ -1099,6 +1133,14 @@ def main() -> int:
         help=(
             "write the compact layer-four MoE fixture derived from a complete "
             "source capture"
+        ),
+    )
+    parser.add_argument(
+        "--layer3-moe-fixture-output",
+        type=Path,
+        help=(
+            "write the compact layer-three MoE/block-tail fixture derived from "
+            "the same complete source capture"
         ),
     )
     parser.add_argument(
@@ -1182,6 +1224,33 @@ def main() -> int:
                     ],
                     "path": str(args.moe_fixture_output),
                     "status": "source_forward_moe_fixture",
+                },
+                sort_keys=True,
+            )
+        )
+    if args.layer3_moe_fixture_output is not None:
+        fixture = moe_fixture(receipt, layer=3)
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_MOE_FIXTURE_BYTES:
+            raise RuntimeError(
+                f"layer-three MoE fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_MOE_FIXTURE_BYTES} bytes"
+            )
+        args.layer3_moe_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.layer3_moe_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "complete_capture_sha256": fixture["source"][
+                        "complete_capture_sha256"
+                    ],
+                    "path": str(args.layer3_moe_fixture_output),
+                    "status": "source_forward_layer_three_moe_fixture",
                 },
                 sort_keys=True,
             )
