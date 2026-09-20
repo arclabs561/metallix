@@ -18,6 +18,21 @@ use super::{Case, Coefficients, Fixture, Tensor};
 type Span = [f64; 2];
 const U: f64 = 1.0 / 16_777_216.0;
 
+/// Source-derived uncertainty for the final layer-four HC state.
+///
+/// Its spans are established before the candidate terminal BF16 values are
+/// checked, so they cannot expand to accommodate a candidate final norm.
+pub(super) struct TerminalEnvelope {
+    block: Vec<Span>,
+    pre: Vec<Span>,
+}
+
+/// Fixed final-HC and `RMSNorm` spans derived from a [`TerminalEnvelope`].
+pub(super) struct FinalNormEnvelope {
+    collapsed: Vec<Span>,
+    normalized: Vec<Span>,
+}
+
 fn point(value: f64) -> Span {
     assert!(value.is_finite());
     [value, value]
@@ -85,6 +100,14 @@ fn cast_checked(label: &str, spans: &[Span], native: &[u16], source: &[u16]) -> 
             bf16_rounded_enclosure(span[0], span[1]).unwrap()
         })
         .collect()
+}
+
+fn accepts_bf16(spans: &[Span], bits: &[u16]) -> bool {
+    spans.len() == bits.len()
+        && spans
+            .iter()
+            .zip(bits)
+            .all(|(&span, &bits)| bf16_rounding_cell_intersects(bits, span[0], span[1]).unwrap())
 }
 
 fn post_mix(sublayer: &[u16], residual: &[Span], post: &[Span], comb: &[Span]) -> Vec<Span> {
@@ -159,6 +182,84 @@ fn norm(input: &[Span], weight: &[u16], epsilon: f32) -> Vec<Span> {
         .zip(weight)
         .map(|(&x, &w)| rounded(mul(rounded(mul(x, inverse)), point(decoded(w)))))
         .collect()
+}
+
+impl TerminalEnvelope {
+    pub(super) fn final_norm_envelope(
+        &self,
+        norm_weight: &[u16],
+        epsilon: f32,
+    ) -> FinalNormEnvelope {
+        let collapsed: Vec<Span> = pre_mix(&self.block, &self.pre)
+            .iter()
+            .map(|span| bf16_rounded_enclosure(span[0], span[1]).unwrap())
+            .collect();
+        let normalized = norm(&collapsed, norm_weight, epsilon);
+        FinalNormEnvelope {
+            collapsed,
+            normalized,
+        }
+    }
+}
+
+impl FinalNormEnvelope {
+    /// Checks source and candidate terminal rows against fixed, source-derived
+    /// final-HC and `RMSNorm` intervals.
+    pub(super) fn accepts(
+        &self,
+        native_collapsed: &[u16],
+        source_collapsed: &[u16],
+        native_normalized: &[u16],
+        source_normalized: &[u16],
+    ) -> bool {
+        accepts_bf16(&self.collapsed, native_collapsed)
+            && accepts_bf16(&self.collapsed, source_collapsed)
+            && accepts_bf16(&self.normalized, native_normalized)
+            && accepts_bf16(&self.normalized, source_normalized)
+    }
+
+    /// Fixed output-head error bounds for the final normalized BF16 row.
+    ///
+    /// Both source and candidate rows must first satisfy [`Self::accepts`].
+    /// The input term is the largest possible difference inside the fixed
+    /// rounded-normalization enclosure, not an observed candidate delta.
+    pub(super) fn head_bounds(&self, source_normalized: &[u16], weights: &[f32]) -> Vec<f64> {
+        const DOT_OPERATIONS: f64 = 256.0;
+        let gamma = DOT_OPERATIONS * U / (1.0 - DOT_OPERATIONS * U);
+        assert_eq!(self.normalized.len(), source_normalized.len());
+        assert_eq!(weights.len() % self.normalized.len(), 0);
+        let rounded: Vec<_> = self
+            .normalized
+            .iter()
+            .map(|span| bf16_rounded_enclosure(span[0], span[1]).unwrap())
+            .collect();
+        weights
+            .chunks_exact(self.normalized.len())
+            .map(|row| {
+                let (candidate_magnitude, source_magnitude, propagated_delta) =
+                    rounded.iter().zip(source_normalized).zip(row).fold(
+                        (0.0, 0.0, 0.0),
+                        |(candidate_magnitude, source_magnitude, propagated_delta),
+                         ((span, &source_bits), &weight)| {
+                            let source = decoded(source_bits);
+                            let weight = f64::from(weight).abs();
+                            let maximum_input = span[0].abs().max(span[1].abs());
+                            let maximum_delta = (span[0] - source)
+                                .abs()
+                                .max((span[1] - source).abs())
+                                .next_up();
+                            (
+                                (candidate_magnitude + (maximum_input * weight).next_up())
+                                    .next_up(),
+                                (source_magnitude + (source.abs() * weight).next_up()).next_up(),
+                                (propagated_delta + (maximum_delta * weight).next_up()).next_up(),
+                            )
+                        },
+                    );
+                (gamma * (candidate_magnitude + source_magnitude) + propagated_delta).next_up()
+            })
+            .collect()
+    }
 }
 
 #[test]
@@ -265,7 +366,7 @@ pub(super) fn check_position(
     attention_coefficients: &HcCoefficients,
     after_attention: &[u16],
     result: &FfnDiagnostic,
-) {
+) -> TerminalEnvelope {
     let block_input = row_bits(&case.block_input, pos, 256);
     let residual = points(&block_input);
     let (attn_pre, attn_post, attn_comb) = coefficients(
@@ -330,7 +431,7 @@ pub(super) fn check_position(
         "observed route IDs remain exact"
     );
     let mixed = post_mix(&source_moe, &residual, &ffn_post, &ffn_comb);
-    cast_checked(
+    let block = cast_checked(
         "block output",
         &mixed,
         result.output_bf16(),
@@ -352,4 +453,8 @@ pub(super) fn check_position(
             .any(|s| !bf16_rounding_cell_intersects(0, s[0], s[1]).unwrap()),
         "output envelope must reject an omitted nonzero block"
     );
+    TerminalEnvelope {
+        block,
+        pre: next_pre,
+    }
 }

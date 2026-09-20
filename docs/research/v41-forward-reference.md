@@ -312,10 +312,24 @@ discards its output; the downstream exact MoE checkpoint must reject it.
 Separate controls reject a mismatched capture identity and reordered calls.
 
 Upstream block residuals and incoming coefficients, including upstream Engram
-effects, still come from the source graph. Compressed KV and the layer-four
-indexer results are also supplied. This establishes the joined arithmetic
+effects, still come from the source graph. The shared owner-attention harness
+derives compressed KV and selected layer-four IDs through the staged ratio-one
+owner, native scorer, and strict selector before attention. This establishes the joined arithmetic
 path for the captured executions, not end-to-end native model generation or
 block-level transactional state rollback if a later sublayer fails.
+
+`native_layer_four_final_suffix_matches_source_logits_with_propagated_input_bounds`
+extends that owner-backed native layer-four result through the final Hyper-Connection
+collapse, final RMSNorm, and FP32 head. The two checked fixture projections carry
+the same complete-capture identity, and their layer-four state/pre-mix boundary
+is shape-checked at every prefill and decode call. The source head values remain
+the exact suffix oracle. The final-head gate uses a fixed source-derived HC and
+RMSNorm interval from the terminal block/pre-mix envelope, followed by the fixed
+FP32 dot-product bound; it does not admit observed native/source differences as
+tolerance. A wrong final-norm wiring control must fail under the same oracle.
+This qualifies the native owner-to-layer-four suffix for the captured calls;
+upstream owner input, earlier residual state, and full-model generation remain
+outside the claim.
 
 ## Owner-layer index keys
 

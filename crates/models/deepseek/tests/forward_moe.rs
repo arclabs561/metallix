@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use deepseek::moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference};
+use deepseek::precision::fp32_linear_reference;
 use deepseek::{
     ffn::FfnSublayerReference,
     hc::{
@@ -20,12 +21,16 @@ use serde::Deserialize;
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
+#[path = "support/candidate_capture.rs"]
+mod candidate_capture;
 #[path = "support/hc_chain_bounds.rs"]
 mod hc_chain_bounds;
 #[path = "support/hc_coefficient_bounds.rs"]
 mod hc_coefficient_bounds;
 #[path = "support/hc_projection_bounds.rs"]
 mod hc_projection_bounds;
+#[path = "support/owner_attention_capture.rs"]
+mod owner_attention_capture;
 #[path = "support/rounding_interval.rs"]
 mod rounding_interval;
 
@@ -121,6 +126,37 @@ struct Tensor {
     storage_hex: String,
 }
 
+#[derive(Deserialize)]
+struct HeadFixture {
+    source: HeadSource,
+    weight_shape: [usize; 2],
+    weight_fp32_bits: Vec<u32>,
+    norm_weight_bf16: Vec<u16>,
+    norm_epsilon_bits: u32,
+    cases: Vec<HeadCase>,
+}
+
+#[derive(Deserialize)]
+struct HeadSource {
+    revision: String,
+    model_sha256: String,
+    complete_capture_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct HeadCase {
+    start_pos: usize,
+    input_shape: [usize; 3],
+    input_bf16: Vec<u16>,
+    logits_shape: [usize; 2],
+    logits_fp32_bits: Vec<u32>,
+    final_block_shape: [usize; 4],
+    final_block_bf16: Vec<u16>,
+    final_pre_shape: [usize; 3],
+    final_pre_fp32_bits: Vec<u32>,
+    collapsed_bf16: Vec<u16>,
+}
+
 impl Tensor {
     fn bytes(&self) -> Vec<u8> {
         assert_eq!(self.storage_hex.len() % 2, 0);
@@ -172,6 +208,13 @@ fn fixture() -> Fixture {
     assert_encoded_parameter_schema(&f);
     assert_model_and_case_contract(&f);
     f
+}
+
+fn head_fixture() -> HeadFixture {
+    serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/forward-head-reference.json"
+    ))
+    .expect("source-forward head fixture")
 }
 
 fn assert_source_provenance(f: &Fixture) {
@@ -818,7 +861,19 @@ struct BlockTailParameters {
     ffn_norm: Vec<u16>,
 }
 
-fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<Vec<u16>> {
+struct BlockTailOutput {
+    residual: Vec<u16>,
+    next_pre: Vec<f32>,
+    terminal_envelopes: Option<Vec<hc_chain_bounds::TerminalEnvelope>>,
+}
+
+struct BlockTailPosition {
+    residual: Vec<u16>,
+    next_pre: Vec<f32>,
+    terminal_envelope: Option<hc_chain_bounds::TerminalEnvelope>,
+}
+
+fn block_tail(f: &Fixture, control: BlockControl, verify_contract: bool) -> Vec<BlockTailOutput> {
     validate_block_tail_fixture(f);
     let parameters = block_tail_parameters(f);
     let config = &f.block_config;
@@ -909,7 +964,7 @@ fn run_block_tail_case(
     context: &BlockTailContext<'_>,
     case: &Case,
     attention_override: Option<&[u16]>,
-) -> Vec<u16> {
+) -> BlockTailOutput {
     let positions = case.input.shape[1];
     assert_block_case_shapes(case, positions);
     let block_input = case.block_input.bf16();
@@ -924,9 +979,26 @@ fn run_block_tail_case(
         attention: &attention,
         expected_attention_input: &expected_attention_input,
     };
-    (0..positions)
-        .flat_map(|position| run_block_tail_position(context, case, position, &data))
-        .collect()
+    let mut residual = Vec::with_capacity(positions * 256);
+    let mut next_pre = Vec::with_capacity(positions * 2);
+    let mut terminal_envelopes = Vec::with_capacity(positions);
+    for position in 0..positions {
+        let result = run_block_tail_position(context, case, position, &data);
+        residual.extend(result.residual);
+        next_pre.extend(result.next_pre);
+        if context.verify_contract {
+            terminal_envelopes.push(
+                result
+                    .terminal_envelope
+                    .expect("verified block position has a terminal envelope"),
+            );
+        }
+    }
+    BlockTailOutput {
+        residual,
+        next_pre,
+        terminal_envelopes: context.verify_contract.then_some(terminal_envelopes),
+    }
 }
 
 fn assert_block_case_shapes(case: &Case, positions: usize) {
@@ -944,7 +1016,7 @@ fn run_block_tail_position(
     case: &Case,
     position: usize,
     data: &BlockCaseData<'_>,
-) -> Vec<u16> {
+) -> BlockTailPosition {
     let parameters = context.parameters;
     let config = &context.fixture.block_config;
     let residual = &data.block_input[position * 256..(position + 1) * 256];
@@ -995,17 +1067,23 @@ fn run_block_tail_position(
         attn_coefficients.pre()
     };
     let result = context.ffn.forward_token(&after_attention, pre).unwrap();
-    if context.verify_contract {
-        hc_chain_bounds::check_position(
+    let terminal_envelope = if context.verify_contract {
+        Some(hc_chain_bounds::check_position(
             context.fixture,
             case,
             position,
             &attn_coefficients,
             &after_attention,
             &result,
-        );
+        ))
+    } else {
+        None
+    };
+    BlockTailPosition {
+        residual: result.output_bf16().to_vec(),
+        next_pre: result.coefficients().pre().to_vec(),
+        terminal_envelope,
     }
-    result.output_bf16().to_vec()
 }
 
 fn assert_attention_input(
@@ -1065,8 +1143,10 @@ fn native_block_attention_outputs(f: &Fixture, parameters: &BlockTailParameters)
             (case.start_pos, input)
         })
         .collect::<Vec<_>>();
-    let outputs =
-        attention_capture::native_outputs_from_inputs(&inputs, &f.source.complete_capture_sha256);
+    let outputs = owner_attention_capture::native_outputs_from_ownered_inputs(
+        &inputs,
+        &f.source.complete_capture_sha256,
+    );
     assert_eq!(outputs.len(), f.cases.len());
     for (output, case) in outputs.iter().zip(&f.cases) {
         // The HC envelope uses this source tensor as an exact point. Its
@@ -1097,6 +1177,138 @@ fn native_attention_hc_ffn_chain_matches_source_numerical_contract() {
     assert_eq!(output.len(), f.cases.len());
 }
 
+fn final_head_logits(input: &[f32], weights: &[f32], vocabulary: usize) -> Vec<f32> {
+    let mut output = vec![0.0; vocabulary];
+    fp32_linear_reference(input, weights, 1, 128, vocabulary, &mut output)
+        .expect("native finite FP32 output head");
+    output
+}
+
+fn agrees_with_head_oracle(actual: &[f32], expected: &[u32], bounds: &[f64]) -> bool {
+    actual
+        .iter()
+        .zip(expected)
+        .zip(bounds)
+        .all(|((&actual, &expected), &bound)| {
+            actual.is_finite()
+                && (f64::from(actual) - f64::from(f32::from_bits(expected))).abs() <= bound
+        })
+}
+
+fn final_norm_row(
+    residual: &[u16],
+    pre: &[f32],
+    weights: &[u16],
+    epsilon: f32,
+) -> (Vec<u16>, Vec<u16>) {
+    let mut collapsed = vec![0; 128];
+    hc_pre_bf16_reference(residual, pre, 128, &mut collapsed).expect("native final HC collapse");
+    let mut normalized = vec![0; 128];
+    rms_norm_bf16_reference(&collapsed, weights, epsilon, &mut normalized)
+        .expect("native final normalization");
+    (collapsed, normalized)
+}
+
+#[test]
+fn native_layer_four_final_suffix_matches_source_logits_with_propagated_input_bounds() {
+    let f = fixture();
+    let head = head_fixture();
+    assert_eq!(head.source.revision, f.source.revision);
+    assert_eq!(head.source.model_sha256, f.source.model_sha256);
+    assert_eq!(
+        head.source.complete_capture_sha256,
+        f.source.complete_capture_sha256
+    );
+    assert_eq!(head.cases.len(), f.cases.len());
+    assert_eq!(head.weight_shape[1], 128);
+    assert_eq!(head.weight_fp32_bits.len(), head.weight_shape[0] * 128);
+    assert_eq!(head.norm_weight_bf16.len(), 128);
+
+    let weights: Vec<f32> = head
+        .weight_fp32_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    let native = block_tail(&f, BlockControl::NativeAttention, true);
+    for ((case, block), head_case) in f.cases.iter().zip(native).zip(&head.cases) {
+        let positions = case.input.shape[1];
+        assert_eq!(case.start_pos, head_case.start_pos);
+        assert_eq!(head_case.input_shape, [1, positions, 128]);
+        assert_eq!(head_case.final_block_shape, [1, positions, 2, 128]);
+        assert_eq!(head_case.final_pre_shape, [1, positions, 2]);
+        assert_eq!(head_case.logits_shape, [1, head.weight_shape[0]]);
+        assert_eq!(head_case.collapsed_bf16.len(), positions * 128);
+        assert_eq!(head_case.final_block_bf16, case.block_output.bf16());
+        assert_eq!(
+            head_case.final_pre_fp32_bits,
+            case.block_next_pre
+                .fp32()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(block.residual.len(), positions * 256);
+        assert_eq!(block.next_pre.len(), positions * 2);
+
+        let last = positions - 1;
+        let residual = &block.residual[last * 256..(last + 1) * 256];
+        let pre = &block.next_pre[last * 2..(last + 1) * 2];
+        let (native_collapsed, native_normalized) = final_norm_row(
+            residual,
+            pre,
+            &head.norm_weight_bf16,
+            f32::from_bits(head.norm_epsilon_bits),
+        );
+        let source_collapsed = &head_case.collapsed_bf16[last * 128..(last + 1) * 128];
+        let source_normalized = &head_case.input_bf16[last * 128..(last + 1) * 128];
+        let terminal_envelope = block
+            .terminal_envelopes
+            .as_ref()
+            .and_then(|envelopes| envelopes.get(last))
+            .expect("verified native block has one terminal envelope per position");
+        let final_envelope = terminal_envelope.final_norm_envelope(
+            &head.norm_weight_bf16,
+            f32::from_bits(head.norm_epsilon_bits),
+        );
+        assert!(
+            final_envelope.accepts(
+                &native_collapsed,
+                source_collapsed,
+                &native_normalized,
+                source_normalized,
+            ),
+            "native final HC and RMSNorm rows must stay inside fixed source bounds at start {}",
+            case.start_pos
+        );
+        let zero_normalized = vec![0; 128];
+        assert!(
+            !final_envelope.accepts(
+                &native_collapsed,
+                source_collapsed,
+                &zero_normalized,
+                source_normalized,
+            ),
+            "zeroing final normalization must fail the fixed source bounds at start {}",
+            case.start_pos
+        );
+        let native_input: Vec<f32> = native_normalized
+            .iter()
+            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+            .collect();
+        let bounds = final_envelope.head_bounds(source_normalized, &weights);
+        assert!(
+            agrees_with_head_oracle(
+                &final_head_logits(&native_input, &weights, head.weight_shape[0]),
+                &head_case.logits_fp32_bits,
+                &bounds,
+            ),
+            "native layer-four suffix logits at start {}",
+            case.start_pos
+        );
+    }
+}
+
 #[test]
 #[should_panic(expected = "MoE checkpoint must agree exactly")]
 fn joined_contract_rejects_discarded_native_attention_output() {
@@ -1112,7 +1324,7 @@ fn block_tail_rejects_wrong_hc_handoff_and_unused_attention() {
             f.cases
                 .iter()
                 .zip(changed)
-                .any(|(case, actual)| actual != case.block_output.bf16()),
+                .any(|(case, actual)| actual.residual != case.block_output.bf16()),
             "counterexample must change the captured block output"
         );
     }
