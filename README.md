@@ -84,9 +84,15 @@ general structured-output quality.
 `chat`, `agent`, and `serve` are experimental Metal-only controls for one
 locally available Qwen3 checkpoint. They use that checkpoint's
 `tokenizer_config.json` chat template. A resident session loads model weights
-once, then starts with fresh KV state for every chat turn or HTTP request. The
-hard limit is `min(model context, 512)` total prompt-plus-generated tokens;
-`--max-tokens` reserves part of that total and accepts 1 through 256.
+once, then starts with fresh KV state for every chat turn or HTTP request.
+The `--context-tokens` control applies only to these three commands: it accepts 1
+through 2048 and defaults to 2048 total prompt-plus-generated tokens.
+`--max-tokens` reserves part of that total and accepts 1 through 256. Before
+checkpoint payloads load, the control path admits the selected context against
+a fixed 512 MiB *logical* f32 KV budget. At 2048 tokens, Qwen3-0.6B's plan is
+448 MiB. That estimate excludes weights, activations, scratch, and allocator
+headroom; it is not a process-RSS guarantee or an MLX allocation reservation.
+Use `--context-tokens 512` to retain the earlier compatibility bound.
 
 Start a one-turn chat that streams text, or omit `--prompt` for the interactive
 loop (`/reset` clears history and `/quit` exits):
@@ -97,8 +103,9 @@ mx chat --model "$MODEL" --prompt "Give a two sentence summary of Rust." \
 ```
 
 Add `--json` for a complete structured generation receipt instead of streamed
-text. Chat is a Qwen3 control path, not a general model API or a qualified
-serving claim.
+text. Its metrics include `context_tokens` and `planned_kv_bytes`, alongside
+load, render, prefill, time-to-first-token, and decode timings. Chat is a
+Qwen3 control path, not a general model API or a qualified serving claim.
 
 `agent` may ask the model to read files below one supplied workspace root. Its
 only tools are `read_file` (a UTF-8 regular file of at most 32 KiB),
@@ -109,7 +116,7 @@ call only; truncated model output runs no tools.
 
 ```sh
 mx agent --model "$MODEL" --workspace . \
-  --prompt "Find where the chat context limit is documented." \
+  --prompt 'Use list_files with path "." and summarize the result.' \
   --max-tokens 128 --max-turns 4
 ```
 
@@ -119,6 +126,11 @@ single-request-at-a-time `/v1/responses` control endpoint, plus `/healthz` and
 
 ```sh
 mx serve --model "$MODEL" --model-id metallix-qwen3
+```
+
+With the server running, send a request from another terminal:
+
+```sh
 curl http://127.0.0.1:8321/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{"model":"metallix-qwen3","input":"Say hello","max_output_tokens":32}'
@@ -129,7 +141,8 @@ complete input history, function-call round trips, greedy sampling, JSON or
 SSE responses, and automatic tool choice are supported. Response storage,
 `previous_response_id`, images, nonzero temperature, seeds, top-p changes,
 and non-automatic tool choice are rejected. It is not ready to serve as a full
-Codex backend.
+Codex backend. A 2048-token control context is still insufficient evidence for
+that role, and request-deadline qualification remains pending.
 
 A future user-level Codex profile could target this endpoint only after an
 end-to-end compatibility and safety qualification. This is an example of that
@@ -205,6 +218,18 @@ masks, final selection, index scores, and rotary tails against pinned official
 expressions on synthetic inputs. They do not establish full-model or BF16/FP4
 execution parity.
 
+The [reduced V4.1 forward checks](docs/research/v41-forward-reference.md)
+connect native compressed-owner KV and selected indices through final-layer
+attention, HC, FFN, final normalization and logits. Fixed source-derived
+numerical bounds and wrong-index/omitted-norm controls guard this suffix.
+Earlier layer inputs remain captured; full-model generation is still pending.
+
+[Resident chat measurements](docs/experiments/chat-performance.md) cover
+repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
+tokens, short requests after long ones, and process-scoped CPU profiling. The
+maintained `scripts/qualify-chat.py` runner repeats these checks against an
+already-running local server.
+
 [Qwen experiments](docs/experiments/qwen-metal.md) record independent CPU
 logit comparisons and measured decode changes.
 [Streamed loading checks](docs/experiments/loader-qualification.md) include
@@ -232,10 +257,12 @@ checks without downloading model weights. Run them sequentially.
 ## Limitations
 
 Generation is a single FP32 Qwen sequence. Selection defaults to greedy;
-seeded temperature sampling is opt-in, with or without a JSON schema.
-Resident mode allows at most `min(model context, 512)` total prompt-plus-generated tokens;
-streamed mode allows at most 32 total and separately checks weight/staging
-and retained-KV budgets.
+seeded temperature sampling is opt-in, with or without a JSON schema. The
+plain `gen` resident diagnostic allows at most `min(model context, 512)` total
+prompt-plus-generated tokens; streamed mode allows at most 32 total and
+separately checks weight/staging and retained-KV budgets. The experimental
+`chat`, `agent`, and `serve` controls have their separate 1–2048 context flag
+and fixed logical-KV admission described above.
 Experimental Qwen3 chat, a bounded read-only workspace agent, and a loopback
 Responses subset exist with the limits above. There is no V4.1 decoder,
 continuous batching, execution-backed paged KV, quantization conversion, or

@@ -65,8 +65,12 @@ greedy sampling and grammar constraints with explicit weight/KV budgets.
 Long-running allocator behavior and larger contexts remain separate gates.
 The [V4.1 sparse-attention reference](../experiments/v41-attention.md) supplies
 a small CPU semantic oracle, not native BF16 or Metal-kernel parity.
-DeepSeek-V4.1 still needs its own text-forward numerical fixture;
-Qwen correctness does not establish DeepSeek support. Training techniques
+DeepSeek-V4.1 now has a small source-captured layer-four-to-logits numerical
+suffix fixture: native owner-backed compressed KV and selected IDs feed native
+attention, HC, FFN, final HC/RMSNorm, and the FP32 head for the captured
+prefill/decode calls. Upstream owner input and block residual state remain
+fixture-fed, so this is not full-model generation or Metal parity. Qwen
+correctness still does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.
 
 ## What each new finding records

@@ -340,29 +340,38 @@ These Metal-only commands are a Qwen3 control path, separate from `gen`'s
 plain-text/raw-ID diagnostic interface. `chat`, `agent`, and `serve` render the
 checkpoint's own `tokenizer_config.json:chat_template`. Each `ChatSession`
 loads and prepares Qwen weights once; every turn or HTTP request creates fresh
-KV state. The maximum is `min(model context, 512)` prompt-plus-generated
-tokens, and each command constrains `--max-tokens` or `max_output_tokens` to
-1 through 256. The cap is an explicit qualified implementation bound, not a
-claim about Qwen's full configured context.
+KV state. Only `chat`, `agent`, and `serve` accept `--context-tokens`; it is
+1 through 2048, defaults to 2048, and caps prompt-plus-generated tokens. Each
+command constrains `--max-tokens` or `max_output_tokens` to 1 through 256.
+Before checkpoint payloads load, the selected context must fit a fixed 512 MiB
+logical f32 KV budget. Qwen3-0.6B plans 448 MiB at 2048 tokens. This is an
+admission estimate for retained KV only, excluding weights, activations,
+operator scratch, and allocator headroom; it neither preallocates MLX memory
+nor bounds process RSS. `--context-tokens 512` is the compatibility check for
+the former chat control bound. The separate `gen` diagnostic remains capped at
+512, and streamed qualification remains capped at 32.
 
 For a short interactive control check:
 
 ```sh
 target/release/mx chat --model /path/to/Qwen3-0.6B \
-  --prompt "Summarize this repository in one sentence." --max-tokens 64
+  --prompt "Summarize this repository in one sentence." --max-tokens 64 \
+  --context-tokens 512
 ```
 
 Without `--prompt`, `chat` retains conversation history until `/reset` or
 `/quit`. With `--json`, it returns one JSON receipt instead of writing text
 deltas. The receipt separates one-time `session_load_ms` from rendering,
-prefill, time-to-first-token, and per-token decode timings. Do not compare the
-first request against later requests without separating load time.
+prefill, time-to-first-token, and per-token decode timings. It also records
+`context_tokens` and `planned_kv_bytes`; the latter is the logical KV estimate,
+not allocated memory. Do not compare the first request against later requests
+without separating load time.
 
 `agent` is a bounded local-read loop, not a general autonomous executor:
 
 ```sh
 target/release/mx agent --model /path/to/Qwen3-0.6B --workspace . \
-  --prompt "Locate the documented generated-token limits." \
+  --prompt 'Use list_files with path "." and summarize the result.' \
   --max-tokens 128 --max-turns 4
 ```
 
@@ -389,6 +398,34 @@ small Responses compatibility target, not a complete OpenAI or Codex service.
 The serial HTTP implementation has no application-level body-read deadline;
 a stalled local client can delay subsequent requests. Keep it an owned local
 test process until request deadlines and concurrent-client behavior are qualified.
+The 2048-token control bound is still insufficient evidence for a Codex
+profile, even after the pending deadline work completes.
+
+For the maintained longer-context qualification, start that server separately
+with its default 2048-token context and leave it resident; the runner never starts a server or downloads a model.
+It defaults to a dry-run receipt. A live run needs a new or empty output
+directory, the release binary, the checkpoint directory, and the revision
+encoded by a Hugging Face snapshot path:
+
+```sh
+MODEL="/path/to/models--Qwen--Qwen3-0.6B/snapshots/<checkpoint-revision>"
+REVISION="<checkpoint-revision>"
+OUTPUT=artifacts/chat-qualification-run
+
+uv run scripts/qualify-chat.py --run --binary target/release/mx \
+  --model "$MODEL" --url http://127.0.0.1:8321 \
+  --model-id metallix-qwen3 --expected-model-revision "$REVISION" \
+  --output "$OUTPUT" --context-tokens 2048 --max-tokens 64
+```
+
+The runner calibrates its long prompt against the server's actual token count,
+then checks fresh CLI reproducibility, HTTP/CLI output agreement, and that the
+resident server's short response is unchanged before and after the long
+request. Its fresh-process RSS result does not measure the server. To capture a
+five-second macOS CPU sample during the long request, add
+`--sample-pid <operator-owned-server-pid>` for that exact server process; do
+not supply another process ID. See the [chat performance ledger](docs/experiments/chat-performance.md)
+for the receipt contract and matched-performance procedure.
 
 Do not add a live Codex provider configuration while this protocol is still
 being qualified. The intended future shape is a user-level profile such as:

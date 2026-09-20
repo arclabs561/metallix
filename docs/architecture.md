@@ -29,6 +29,12 @@ Cache identity includes the model revision, tokenizer and template revisions,
 adapter identity, media hashes when applicable, and a trust-domain salt.
 Prompt content is not logged by default.
 
+The current experimental control surface is intentionally narrower: one
+resident Qwen session supports local chat, a bounded read-only workspace agent,
+and loopback Responses text/function calls. Each turn starts with fresh KV
+state; it is not the planned multi-request scheduler or a general Codex
+backend.
+
 Model lifecycle is explicit: `unloaded`, `loading`, `warming`, `ready`, or
 `failed`. Only `ready` admits inference. Readiness is therefore not inferred
 from process startup, a listening port, or model discovery; it includes the
@@ -62,10 +68,10 @@ token IDs; its prompt limit is deliberately smaller than the model context.
    explicit memory accounting.
 3. Add paged KV, chunked prefill, continuous batching, fair admission, and
    automatic prefix caching.
-4. Expose health, model discovery, and OpenAI chat/completions with SSE,
-   cancellation, limits, and Prometheus metrics.
-5. Add constrained output and tool-call response shaping; calls are returned,
-   never executed.
+4. Extend the existing health, model discovery, and loopback Responses controls
+   with cancellation, admission limits, and metrics.
+5. Broaden constrained output and tool-call shaping only after its declared
+   tool and lifecycle semantics are tested.
 6. Measure and then add MTP / speculative decoding, kernel fusion, and
    tiered expert-pager policy.
 7. Prove a second text architecture before promising a general model runtime.

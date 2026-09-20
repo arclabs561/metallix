@@ -7,10 +7,20 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Resident context and tool-call property tests cover sizing overflow, budget
+  boundaries, malformed batches, nested JSON, and Unicode. JSON delimiters
+  inside tool arguments no longer terminate an envelope early.
+- A repeatable chat qualification runner checks CLI/HTTP output agreement,
+  context accounting, short-request recovery, timings, and optional process CPU
+  sampling.
+- A reduced DeepSeek owner-to-logits test connects native compressed KV and
+  selection through the final block and head, with fixed source-derived
+  HC/RMSNorm error bounds. Upstream activations remain captured inputs.
 - Experimental native Qwen chat, a bounded workspace-read agent, and a loopback
   text/function Responses endpoint. Sessions retain weights, use checkpoint
-  chat templates, and report load/prefill/decode timings; the existing 512-token
-  control limit remains explicit.
+  chat templates, and report load/prefill/decode timings. Resident chat supports
+  up to 2048 tokens with a checked logical KV budget; diagnostics retain their
+  512-token limit.
 - DeepSeek compressed-owner prepare/commit transactions expose staged key/KV
   prefixes to downstream consumers without publishing them on rejection.
 - Responses benchmark receipts distinguish text bytes, model tokens, first-token
