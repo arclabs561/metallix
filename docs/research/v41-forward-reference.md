@@ -21,6 +21,32 @@ writes encoded parameters, intermediate outputs, caches and final logits.
 The runner pins its Python dependencies and rejects source-hash mismatches.
 Neither command downloads model weights.
 
+The next earlier-block boundary has its own compact source capture:
+
+```sh
+uv run scripts/v41_layer1_owner_capture.py \
+  --input artifacts/v41-forward-reference.json \
+  --output artifacts/layer1-ratio2-owner-reference.json
+uv run scripts/test_v41_layer1_owner_fixture.py
+```
+
+`fixtures/deepseek-v41/layer1-ratio2-owner-reference.json` records layer one's
+FP32 compressor projections, ratio-two pooled latent, rotary/index operations,
+selected IDs and compressed KV publication for starts 0, 5 and 6. The retained
+compressed prefix grows from two to three entries, then stays at three during
+the partial group. This owner uses direct causal index selection, without the
+later candidate mask. The fixture is a source oracle for native layer-one/two
+work; it does not establish native execution of that pair.
+
+The partial-group trace exposes an important distinction in the pinned source.
+`Attention._compress_kv` selects its owned compressed KV cache on every owner
+call, while `Indexer.forward` updates `shared_attn.index_k` only when a new
+latent exists. At start 6, layer one's actual score-key operand therefore
+matches the first three keys left by layer three at start 5, rather than layer
+one's unchanged owned key cache. Preserve both observations in the oracle.
+Native integration must resolve this source behavior explicitly; substituting
+the owned keys would silently change the existing reduced-forward reference.
+
 The default `just check` runs the dependency-free manifest, source-loader and
 attention-fixture integrity tests. Numerical kernel tests require Torch and
 are run explicitly above.

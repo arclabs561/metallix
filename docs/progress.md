@@ -50,6 +50,12 @@ choices without expanding current support claims.
   retained as operands. Fixed HC arithmetic bounds handle FP32 rounding, and
   exact BF16 attention-input checks reject corrupted handoffs. The layer-two
   post-attention input remains captured; this is still a reduced graph.
+- A layer-one ratio-two source fixture now preserves compressor projections,
+  owned cache contents, actual scoring operands and direct index selection.
+  Twelve source-backed tests reject changed provenance, invalid storage and
+  changed partial-group publications; earlier layer-two numerical captures
+  remain unchanged. This prepares the earlier native boundary without claiming
+  that layer-one/two execution is implemented.
 - A source capture supplies layer-three block-entry residual/pre-mix;
   native HC and RMSNorm now derive the owner/candidate attention input and
   cross-check it against preserved historical captures.
@@ -98,6 +104,10 @@ choices without expanding current support claims.
    this pair does not use the layer-three/four candidate-mask path. Replace the
    captured state with native earlier-block output while
    preserving the source-grounded arithmetic and discrete routing gates.
+   The partial-group source trace also distinguishes the unchanged owned index
+   cache from the shared keys actually scored; the latter retain the preceding
+   layer-three publication. Resolve that [source behavior](research/v41-forward-reference.md)
+   explicitly before assuming every layer-one score reads its own keys.
    Operator and transaction parity do not establish full-model generation. Keep full checkpoint
    acquisition behind the existing reduced-forward numerical gate.
 3. **Agent owner: CLI lane.** Improve multi-step task completion before claiming

@@ -57,7 +57,9 @@ This is distinct from the bounded scalar selected-row lookup in
 FP8 embedding and WKV parameters and observations from the pinned source
 graph, not a released checkpoint or copied source file. The layer-two FFN
 export and `fixtures/deepseek-v41/layer2-ffn-reference.json` likewise record a
-synthetic source-forward boundary. These are reduced numerical captures, not
+synthetic source-forward boundary. The layer-one ratio-two owner export and
+`fixtures/deepseek-v41/layer1-ratio2-owner-reference.json` capture the same
+synthetic graph's compressed KV and direct index publication. These are reduced numerical captures, not
 full-model or serving artifacts.
 The compressor and block composition captures and tests follow
 `Compressor.forward`, `Block.forward`, the block HC helpers and `RMSNorm.forward`

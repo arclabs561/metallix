@@ -44,7 +44,26 @@ class LayerTwoFfnFixtureTest(unittest.TestCase):
         cls.fixture = cls.exporter.layer2_ffn_fixture(cls.receipt)
 
     def test_committed_fixture_matches_current_source_capture(self) -> None:
-        self.assertEqual(json.loads(FIXTURE.read_text()), self.fixture)
+        """Additive observer hooks cannot rewrite this historical numerical oracle."""
+        committed = json.loads(FIXTURE.read_text())
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        self.assertEqual(
+            {
+                key: value
+                for key, value in committed["source"].items()
+                if key not in {"forward_observers_sha256", "complete_capture_sha256"}
+            },
+            {
+                key: value
+                for key, value in self.fixture["source"].items()
+                if key not in {"forward_observers_sha256", "complete_capture_sha256"}
+            },
+        )
+        for key in ("forward_observers_sha256", "complete_capture_sha256"):
+            self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")
 
     def test_terminal_tail_has_both_layer_three_seams(self) -> None:
         for case in self.fixture["cases"]:

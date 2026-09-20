@@ -21,8 +21,9 @@ ObjectRecord = Callable[..., object]
 
 
 class IndexerRole(Enum):
-    """The two fixed source Indexers observed by this bounded capture."""
+    """Fixed source Indexers observed by this bounded capture."""
 
+    OWNER = auto()
     PRODUCER = auto()
     CONSUMER = auto()
 
@@ -86,10 +87,11 @@ class _IndexerState:
     def set_quantization_phase(self, phase: _QuantizationPhase) -> None:
         if not self.active:
             return
-        if phase is _QuantizationPhase.KEY and self.role is not IndexerRole.PRODUCER:
-            raise RuntimeError(
-                "only the fixed producer Indexer may quantize index keys"
-            )
+        if phase is _QuantizationPhase.KEY and self.role not in (
+            IndexerRole.OWNER,
+            IndexerRole.PRODUCER,
+        ):
+            raise RuntimeError("only a fixed index-key owner may quantize index keys")
         self.quantization_phase = phase
 
     def record_score_einsum(
@@ -108,10 +110,11 @@ class _IndexerState:
 
 
 class _IndexerStates:
-    """Fixed producer/consumer state registry for one graph proxy."""
+    """Fixed owner/producer/consumer state registry for one graph proxy."""
 
     def __init__(self, tensor_record: TensorRecord) -> None:
         self._states = {
+            IndexerRole.OWNER: _IndexerState(IndexerRole.OWNER, tensor_record),
             IndexerRole.PRODUCER: _IndexerState(IndexerRole.PRODUCER, tensor_record),
             IndexerRole.CONSUMER: _IndexerState(IndexerRole.CONSUMER, tensor_record),
         }
@@ -123,7 +126,7 @@ class _IndexerStates:
         active = [state for state in self._states.values() if state.active]
         if len(active) > 1:
             raise RuntimeError(
-                "fixed producer and consumer Indexer observers overlapped"
+                "fixed owner, producer, and consumer Indexer observers overlapped"
             )
         return active[0] if active else None
 
@@ -294,6 +297,9 @@ def hooks_for(
     """Capture selected source boundaries and restore all observer bindings."""
     records: dict[str, object] = {}
     handles: list[torch.utils.hooks.RemovableHandle] = []
+    layer_one = model.layers[1]
+    layer_one_attention = layer_one.attn
+    layer_one_indexer = layer_one_attention.indexer
     layer_two = model.layers[2]
     layer_three = model.layers[3]
     layer_three_attention = layer_three.attn
@@ -301,11 +307,16 @@ def hooks_for(
     layer_four = model.layers[4]
     layer_four_attention = layer_four.attn
     layer_four_indexer = layer_four_attention.indexer
-    if layer_three_indexer is None or layer_four_indexer is None:
+    if (
+        layer_one_indexer is None
+        or layer_three_indexer is None
+        or layer_four_indexer is None
+    ):
         raise RuntimeError(
-            "fixed layer three/four capture graph requires both Indexers"
+            "fixed layer one/three/four capture graph requires all Indexers"
         )
     states = _IndexerStates(tensor_record)
+    owner_state = states.for_role(IndexerRole.OWNER)
     producer_state = states.for_role(IndexerRole.PRODUCER)
     consumer_state = states.for_role(IndexerRole.CONSUMER)
 
@@ -322,6 +333,12 @@ def hooks_for(
     )
     had_layer_two_hc_mixes, prior_layer_two_hc_mixes, _ = instance_method(
         layer_two, "hc_mixes"
+    )
+    had_owner_window, prior_owner_window, original_owner_window = instance_method(
+        layer_one_attention, "_window_kv"
+    )
+    had_owner_compress, prior_owner_compress, original_owner_compress = instance_method(
+        layer_one_attention, "_compress_kv"
     )
     had_window, prior_window, original_window = instance_method(
         layer_four_attention, "_window_kv"
@@ -347,6 +364,11 @@ def hooks_for(
         prior_producer_indexer_forward,
         original_producer_indexer_forward,
     ) = instance_method(layer_three_indexer, "forward")
+    (
+        had_owner_indexer_forward,
+        prior_owner_indexer_forward,
+        original_owner_indexer_forward,
+    ) = instance_method(layer_one_indexer, "forward")
     original_torch = graph.torch
     original_rotary = graph.apply_rotary_emb
     original_fp4_quant = graph.fp4_act_quant
@@ -473,7 +495,7 @@ def hooks_for(
                     capture_input(f"{name}_input", exactly_one=False)
                 )
             )
-        if name in {"layers.3.attn", "layers.4.attn"}:
+        if name in {"layers.1.attn", "layers.3.attn", "layers.4.attn"}:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(
@@ -486,9 +508,16 @@ def hooks_for(
             handles.append(module.register_forward_pre_hook(capture_engram_input))
         if name in {"layers.3.engram.embed", "layers.3.engram.wkv"}:
             handles.append(module.register_forward_hook(capture(name)))
-        if name == "layers.3.attn.compressor.wkv":
+        if name in {
+            "layers.1.attn.compressor.wkv",
+            "layers.1.attn.compressor.wgate",
+            "layers.3.attn.compressor.wkv",
+        }:
             handles.append(module.register_forward_hook(capture(name)))
         if name in {
+            "layers.1.attn.wq_a",
+            "layers.1.attn.q_norm",
+            "layers.1.attn.wq_b",
             "layers.3.attn.wq_a",
             "layers.3.attn.q_norm",
             "layers.3.attn.wq_b",
@@ -497,7 +526,11 @@ def hooks_for(
             "layers.4.attn.wq_b",
         }:
             handles.append(module.register_forward_hook(capture(name)))
-        if name in {"layers.3.attn.wo_b", "layers.4.attn.wo_b"}:
+        if name in {
+            "layers.1.attn.wo_b",
+            "layers.3.attn.wo_b",
+            "layers.4.attn.wo_b",
+        }:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(
@@ -514,6 +547,10 @@ def hooks_for(
                     )
                 )
             )
+        if name == "layers.1.attn.indexer.weights_proj":
+            handles.append(
+                module.register_forward_hook(capture_weights_for(owner_state))
+            )
         if name == "layers.3.attn.indexer.weights_proj":
             handles.append(
                 module.register_forward_hook(capture_weights_for(producer_state))
@@ -522,10 +559,22 @@ def hooks_for(
             handles.append(
                 module.register_forward_hook(capture_weights_for(consumer_state))
             )
+        if name == "layers.1.attn.indexer.k_norm":
+            handles.append(
+                module.register_forward_hook(
+                    mark_quantization_phase(owner_state, _QuantizationPhase.KEY)
+                )
+            )
         if name == "layers.3.attn.indexer.k_norm":
             handles.append(
                 module.register_forward_hook(
                     mark_quantization_phase(producer_state, _QuantizationPhase.KEY)
+                )
+            )
+        if name == "layers.1.attn.indexer.wq_b":
+            handles.append(
+                module.register_forward_hook(
+                    mark_quantization_phase(owner_state, _QuantizationPhase.QUERY)
                 )
             )
         if name == "layers.3.attn.indexer.wq_b":
@@ -631,10 +680,15 @@ def hooks_for(
 
     def observed_indexer_forward_for(
         role: IndexerRole,
+        indexer: torch.nn.Module,
         original_forward: Callable[..., torch.Tensor],
     ) -> Callable[..., torch.Tensor]:
         state = states.for_role(role)
-        layer_id = 3 if role is IndexerRole.PRODUCER else 4
+        layer_id = {
+            IndexerRole.OWNER: 1,
+            IndexerRole.PRODUCER: 3,
+            IndexerRole.CONSUMER: 4,
+        }[role]
         observation_name = f"layers.{layer_id}.attn.indexer_observation"
 
         def observed_indexer_forward(
@@ -656,6 +710,12 @@ def hooks_for(
                 "start_pos": start_pos,
                 "offset": offset,
             }
+            frequencies = getattr(indexer, "freqs_cis", None)
+            if not isinstance(frequencies, torch.Tensor):
+                raise TypeError(
+                    f"fixed {role.name.lower()} Indexer has no frequency table"
+                )
+            inputs["frequency_table"] = object_record(frequencies, include_storage=True)
             if role is IndexerRole.CONSUMER:
                 candidate_mask = graph.shared_attn.candidates
                 if candidate_mask is None:
@@ -680,19 +740,31 @@ def hooks_for(
             # This receipt comes from the exact second operand at score-einsum
             # time, not from a predicted cache slice before the source call.
             inputs["shared_index_k_prefix"] = state.shared_index_k_prefix
-            candidate_mask_after = graph.shared_attn.candidates
-            if candidate_mask_after is None:
-                raise RuntimeError(
-                    f"fixed {role.name.lower()} Indexer did not publish a candidate mask"
+            if role is IndexerRole.OWNER:
+                key_cache = getattr(indexer, "k_cache", None)
+                ratio = getattr(indexer, "compress_ratio", None)
+                if not isinstance(key_cache, torch.Tensor) or not isinstance(
+                    ratio, int
+                ):
+                    raise TypeError("layer-one Indexer lacks an owned key cache")
+                end = start_pos + x.size(1)
+                inputs["owner_key_prefix"] = object_record(
+                    key_cache[: x.size(0), : end // ratio], include_storage=True
                 )
             observation = {
                 "inputs": inputs,
                 "operations": operations,
                 "output_indices": object_record(output, include_storage=True),
-                "candidate_mask_after": object_record(
-                    candidate_mask_after, include_storage=True
-                ),
             }
+            if role is not IndexerRole.OWNER:
+                candidate_mask_after = graph.shared_attn.candidates
+                if candidate_mask_after is None:
+                    raise RuntimeError(
+                        f"fixed {role.name.lower()} Indexer did not publish a candidate mask"
+                    )
+                observation["candidate_mask_after"] = object_record(
+                    candidate_mask_after, include_storage=True
+                )
             records[observation_name] = observation
             return output
 
@@ -728,6 +800,12 @@ def hooks_for(
         layer_two.hc_mixes = observed_hc_mixes
         layer_three.hc_mixes = observed_hc_mixes
         layer_four.hc_mixes = observed_hc_mixes
+        layer_one_attention._window_kv = observed_window_kv_for(
+            1, layer_one_attention, original_owner_window
+        )
+        layer_one_attention._compress_kv = observed_compress_kv_for(
+            1, original_owner_compress
+        )
         layer_three_attention._window_kv = observed_window_kv_for(
             3, layer_three_attention, original_producer_window
         )
@@ -740,11 +818,14 @@ def hooks_for(
         layer_four_attention._compress_kv = observed_compress_kv_for(
             4, original_compress
         )
+        layer_one_indexer.forward = observed_indexer_forward_for(
+            IndexerRole.OWNER, layer_one_indexer, original_owner_indexer_forward
+        )
         layer_three_indexer.forward = observed_indexer_forward_for(
-            IndexerRole.PRODUCER, original_producer_indexer_forward
+            IndexerRole.PRODUCER, layer_three_indexer, original_producer_indexer_forward
         )
         layer_four_indexer.forward = observed_indexer_forward_for(
-            IndexerRole.CONSUMER, original_indexer_forward
+            IndexerRole.CONSUMER, layer_four_indexer, original_indexer_forward
         )
         graph.torch = _GraphTorchProxy(original_torch, states)
         graph.apply_rotary_emb = observed_rotary
@@ -768,6 +849,18 @@ def hooks_for(
         _restore_instance(layer_four, "hc_mixes", had_hc_mixes, prior_hc_mixes)
         _restore_instance(layer_four_attention, "_window_kv", had_window, prior_window)
         _restore_instance(
+            layer_one_attention,
+            "_window_kv",
+            had_owner_window,
+            prior_owner_window,
+        )
+        _restore_instance(
+            layer_one_attention,
+            "_compress_kv",
+            had_owner_compress,
+            prior_owner_compress,
+        )
+        _restore_instance(
             layer_four_attention, "_compress_kv", had_compress, prior_compress
         )
         _restore_instance(
@@ -781,6 +874,12 @@ def hooks_for(
             "_compress_kv",
             had_producer_compress,
             prior_producer_compress,
+        )
+        _restore_instance(
+            layer_one_indexer,
+            "forward",
+            had_owner_indexer_forward,
+            prior_owner_indexer_forward,
         )
         _restore_instance(
             layer_three_indexer,
