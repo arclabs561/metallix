@@ -97,3 +97,7 @@ The next real layer-zero parameter gate is now covered: `attn_hc.fn` decodes as
 an F32 `24 × 16384` matrix and evaluates on Metal, checksum
 `6150937c7aee9697`. This anchors the hyper-connection parameter path before its
 latent mixing is implemented.
+
+The DeepSeek crate now validates the `hc_mult=4` hidden-state expansion layout,
+repeating a 4,096-wide hidden state into the 16,384-wide `attn_hc.fn` input
+shape. The next gate is the native HC coefficient mix itself.

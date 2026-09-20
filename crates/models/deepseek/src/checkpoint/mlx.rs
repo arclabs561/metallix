@@ -192,6 +192,22 @@ pub fn decode_affine_row(
     Ok(output)
 }
 
+/// Expands one hidden state into the repeated HC input layout.
+pub fn expand_hc_hidden(input: &[f32], copies: usize) -> Result<Vec<f32>, MlxAffineRowError> {
+    if input.is_empty() || copies == 0 {
+        return Err(MlxAffineRowError::GroupShape);
+    }
+    let total = input
+        .len()
+        .checked_mul(copies)
+        .ok_or(MlxAffineRowError::GroupShape)?;
+    let mut expanded = Vec::with_capacity(total);
+    for _ in 0..copies {
+        expanded.extend_from_slice(input);
+    }
+    Ok(expanded)
+}
+
 /// Converts one decoded row to an MLX array and evaluates it on the device.
 #[cfg(feature = "metal")]
 pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
@@ -266,6 +282,18 @@ mod tests {
         );
         assert_eq!(
             decode_affine_row(&[0], &[0], &[], 4, 8, 4),
+            Err(MlxAffineRowError::GroupShape)
+        );
+    }
+
+    #[test]
+    fn expands_hidden_state_for_hyper_connections() {
+        assert_eq!(
+            super::expand_hc_hidden(&[1.0, 2.0], 4).expect("expanded HC input"),
+            [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
+        );
+        assert_eq!(
+            super::expand_hc_hidden(&[], 4),
             Err(MlxAffineRowError::GroupShape)
         );
     }
