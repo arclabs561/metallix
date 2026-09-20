@@ -1613,6 +1613,7 @@ mod tests {
     mod cache_component_profile;
     mod capacity_cache_profile;
     mod decode_profile;
+    mod lora_micrograph;
     mod particle_replay;
 
     #[test]

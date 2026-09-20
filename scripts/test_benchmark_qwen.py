@@ -252,9 +252,14 @@ class SummarizeRunsTests(unittest.TestCase):
 
         self.assertEqual(summary["sample_count"], 6)
         self.assertEqual(summary["median_ms"], 5.0)
+        self.assertEqual(summary["median_tokens_per_second"], 200.0)
         self.assertEqual(summary["mean_ms"], 5.0)
         self.assertAlmostEqual(summary["sample_stdev_ms"], math.sqrt(4.4))
         self.assertEqual(summary["per_run_median_ms"], [3.0, 5.0, 7.0])
+        self.assertEqual(
+            summary["per_run_tokens_per_second"],
+            [1000.0 / 3.0, 200.0, 1000.0 / 7.0],
+        )
         self.assertEqual(tuple(summary["generated_ids"]), (3, 4, 5, 6))
         self.assertEqual(summary["backend"], "test")
 

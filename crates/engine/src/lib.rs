@@ -7,6 +7,7 @@ pub mod constraint;
 pub mod kv;
 pub mod lifecycle;
 pub mod sampling;
+pub mod smc;
 
 use std::num::NonZeroU32;
 

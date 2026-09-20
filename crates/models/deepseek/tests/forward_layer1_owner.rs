@@ -27,6 +27,11 @@ fn partial_owner_prefix_cannot_replace_the_source_score_key_boundary() {
 }
 
 #[test]
+fn request_local_layer_three_score_state_is_reset_between_requests() {
+    assert!(layer1_owner_capture::request_local_score_state_rejects_cross_request_reuse());
+}
+
+#[test]
 fn partial_owner_publication_is_not_relabelled_as_source_score_operand() {
     let outputs = layer1_owner_capture::native_publications();
     assert_ne!(outputs[2].key_prefix, outputs[2].source_score_key_prefix);

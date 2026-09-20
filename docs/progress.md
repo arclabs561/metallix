@@ -137,6 +137,10 @@ choices without expanding current support claims.
   and physical cache-sharing costs remain separate [sampling gates](research/sampling-next-gates.md).
 - The [model/runtime refresh](research/model-runtime-refresh.md) records primary
   sources for Qwen3.8, vLLM-Metal, and Whallm, with explicit qualification gates.
+- The engine now has a bounded SMC state primitive with deterministic
+  systematic resampling and absorbing particles. A Qwen test-only LoRA
+  micrograph checks gradient/update ownership and adapter export parity; neither
+  is a production training or particle-decoding API yet.
 
 ## Next, in dependency order
 

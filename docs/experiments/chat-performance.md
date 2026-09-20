@@ -19,6 +19,11 @@ receipts with identical endpoint, model, prompt hash, parameters, cache
 condition, and concurrency. The receipt records its full identity and sample
 standard deviation; it intentionally records no remote RSS claim.
 
+The Qwen benchmark receipt also reports `median_tokens_per_second` and
+`per_run_tokens_per_second` for retained one-token decode observations. These
+are derived from the same decode medians, so compare them only across identical
+model, prompt, cache, and discard settings.
+
 ## Resident qualification runner
 
 `scripts/qualify-chat.py` is the repeatable longer-context gate. It defaults to

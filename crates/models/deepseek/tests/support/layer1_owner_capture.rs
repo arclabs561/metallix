@@ -485,34 +485,66 @@ fn assert_native_score(
     indices
 }
 
-fn layer_three_score_keys(
-    case: &Case,
-    owned_keys: &[u16],
-    source_keys: &[u16],
-) -> Option<Vec<u16>> {
-    match case.start_pos {
-        6 => {
-            assert_ne!(
-                owned_keys, source_keys,
-                "partial layer-one owner prefix stays distinct"
-            );
-            let previous = prior_layer_three_prefix();
-            assert_eq!(
-                previous, source_keys,
-                "start six previous layer-three score prefix"
-            );
-            Some(previous)
-        }
-        0 | 5 => {
-            assert_eq!(
-                owned_keys, source_keys,
-                "start {} owned score prefix",
-                case.start_pos
-            );
-            None
-        }
-        other => panic!("unexpected layer-one source call start {other}"),
+#[derive(Default)]
+struct RequestScoreState {
+    layer_three_prefix: Option<Vec<u16>>,
+}
+
+impl RequestScoreState {
+    fn reset(&mut self) {
+        self.layer_three_prefix = None;
     }
+
+    fn publish_layer_three(&mut self, prefix: Vec<u16>) {
+        assert!(
+            self.layer_three_prefix.is_none(),
+            "layer-three score state already published"
+        );
+        self.layer_three_prefix = Some(prefix);
+    }
+
+    fn score_keys_for(&self, case: &Case, owned_keys: &[u16], source_keys: &[u16]) -> Vec<u16> {
+        match case.start_pos {
+            6 => {
+                assert_ne!(
+                    owned_keys, source_keys,
+                    "partial layer-one owner prefix stays distinct"
+                );
+                let previous = self
+                    .layer_three_prefix
+                    .as_ref()
+                    .expect("partial decode requires request-local layer-three publication");
+                assert_eq!(
+                    previous, source_keys,
+                    "start six previous layer-three score prefix"
+                );
+                previous.clone()
+            }
+            0 | 5 => {
+                assert_eq!(
+                    owned_keys, source_keys,
+                    "start {} owned score prefix",
+                    case.start_pos
+                );
+                owned_keys.to_vec()
+            }
+            other => panic!("unexpected layer-one source call start {other}"),
+        }
+    }
+}
+
+/// A partial decode may consume score keys published by an earlier layer call,
+/// but that publication belongs to one request and must not survive reset.
+pub(super) fn request_local_score_state_rejects_cross_request_reuse() -> bool {
+    let mut state = RequestScoreState::default();
+    let published = prior_layer_three_prefix();
+    state.publish_layer_three(published.clone());
+    assert_eq!(
+        state.layer_three_prefix.as_deref(),
+        Some(published.as_slice())
+    );
+    state.reset();
+    state.layer_three_prefix.is_none()
 }
 
 /// Replays source-owned KV/key publication through direct index selection.
@@ -542,8 +574,12 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         .expect("source compressed-KV layout");
     let mut keys = Vec::new();
     let mut kv = Vec::new();
+    let mut request_score_state = RequestScoreState::default();
     let mut outputs = Vec::new();
     for case in &fixture.cases {
+        if case.start_pos == 0 {
+            request_score_state.reset();
+        }
         let (projected, gate) = source_projections(case, &wkv, &wgate);
         let latent = compressor
             .forward(
@@ -597,9 +633,11 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         );
         assert_eq!(keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
-        let layer_three_score_keys = layer_three_score_keys(case, &keys, &source_score_keys);
-        let score_keys = layer_three_score_keys.as_deref().unwrap_or(&keys);
-        let selected_indices = assert_native_score(&fixture, case, &all_frequencies, score_keys);
+        if case.start_pos == 5 {
+            request_score_state.publish_layer_three(prior_layer_three_prefix());
+        }
+        let score_keys = request_score_state.score_keys_for(case, &keys, &source_score_keys);
+        let selected_indices = assert_native_score(&fixture, case, &all_frequencies, &score_keys);
         outputs.push(NativeCase {
             start_pos: case.start_pos,
             latent,

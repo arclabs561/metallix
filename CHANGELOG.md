@@ -7,6 +7,14 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Added a typed engine SMC primitive with finite log weights, ESS, deterministic
+  systematic resampling, absorbing particles, and fail-closed input checks.
+- Added a test-only MLX LoRA micrograph for Qwen: frozen base ownership,
+  `value_and_grad`, independent gradient checks, one SGD update, adapter-only
+  safetensors export, and exact reload output parity. No production training API
+  is implied yet.
+- Qwen benchmark receipts now report decode tokens per second per run and in
+  aggregate, alongside the existing millisecond measurements.
 - A source-grounded DeepSeek layer-zero token-embedding fixture now rebuilds
   exact BF16 rows for the captured prefill/decode calls and rejects changed or
   out-of-vocabulary token IDs.

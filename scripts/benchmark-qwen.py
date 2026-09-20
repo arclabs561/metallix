@@ -247,9 +247,13 @@ def summarize_runs(runs: list[Run], discard_decode: int) -> dict[str, object]:
     return {
         "sample_count": len(samples),
         "median_ms": statistics.median(samples),
+        "median_tokens_per_second": 1000.0 / statistics.median(samples),
         "mean_ms": statistics.mean(samples),
         "sample_stdev_ms": statistics.stdev(samples),
         "per_run_median_ms": [statistics.median(window) for window in windows],
+        "per_run_tokens_per_second": [
+            1000.0 / statistics.median(window) for window in windows
+        ],
         "generated_ids": runs[0].generated_ids,
         "backend": runs[0].backend,
         "memory_mode": runs[0].memory_mode,

@@ -19,8 +19,10 @@ Today the workspace pins `mlx-rs 0.25.3`. MLX arrays and graph execution live in
 the Qwen and DeepSeek crates. Qwen has the working decoder; DeepSeek has
 source-grounded scalar and bounded Metal operators plus a connected reduced
 suffix. `engine::sampling::sample_categorical` already supplies a stateless
-categorical policy. EOS/particle ancestry checks are test oracles, not an SMC
-runtime. See [sampling gates](research/sampling-next-gates.md).
+categorical policy. The shared engine now also exposes a bounded SMC primitive
+for log-weight normalization, ESS, deterministic systematic resampling, and
+absorbing particle state. Model/cache transitions remain adapter-owned; this
+does not claim particle-aware Qwen or DeepSeek serving. See [sampling gates](research/sampling-next-gates.md).
 
 Upstream MLX covers arrays, streams, transforms, compilation, serialization,
 and distributed operations; availability in upstream Python does not imply

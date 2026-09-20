@@ -54,7 +54,8 @@ fn source_lookup(root: &Value, ids: &[u64]) -> Result<Vec<u16>, &'static str> {
     if shape.len() != 2 || shape[1].as_u64() != Some(WIDTH as u64) {
         return Err("embedding parameter shape");
     }
-    let rows = shape[0].as_u64().ok_or("embedding row count")? as usize;
+    let rows = usize::try_from(shape[0].as_u64().ok_or("embedding row count")?)
+        .map_err(|_| "embedding row count overflow")?;
     let table = bf16_storage(parameter, "storage_hex");
     if table.len() != rows * WIDTH {
         return Err("embedding parameter storage length");
