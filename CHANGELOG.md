@@ -12,6 +12,11 @@ published release; reference operators do not imply full-model support.
 - Native DeepSeek layer-three terminal state now feeds layer four through final
   logits. Exact BF16 handoff checks preserve the existing arithmetic bounds,
   and corrupted incoming coefficients fail before attention execution.
+- A bounded scalar DeepSeek Engram lookup decodes selected supplied FP8 rows
+  with row-local E8M0 scales into BF16 and maps masked or out-of-table IDs to
+  zero rows. A source fixture records the layer-three hash, embedding, WKV,
+  residual-gate, and block-entry boundary. The focused native continuation
+  carries that entry through layer three, layer four, and the final logits.
 - The source-grounded DeepSeek layer-three continuation reaches layer-four
   entry through native HC and FFN. Fixed propagated bounds check coefficient
   rounding and reject an omitted-attention control through the same boundary.
@@ -255,7 +260,9 @@ published release; reference operators do not imply full-model support.
 
 ### Current limits
 
-- Full DeepSeek-V4.1-Flash generation is not implemented. Engram table decoding,
-  real `wkv` projection and Metal execution remain separate qualification work.
+- Full DeepSeek-V4.1-Flash generation is not implemented. The Engram scalar
+  reference decodes only selected rows of a supplied bounded, unsharded table.
+  Checkpoint table loading and sharding, full-model qualification, and Metal
+  execution remain separate work.
 - The new Engram references are scalar correctness tools, not performance
   improvements or evidence of larger-than-memory serving.

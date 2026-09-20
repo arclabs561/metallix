@@ -389,6 +389,26 @@ def hooks_for(
 
         return hook
 
+    def capture_engram_input(
+        _module: torch.nn.Module, inputs: tuple[object, ...]
+    ) -> None:
+        record_name = "layers.3.engram_input"
+        cap_guard(record_name)
+        if len(inputs) != 3:
+            raise RuntimeError("layer-three Engram expected stream, hash IDs, and mask")
+        stream, hash_ids, mask = inputs
+        if not isinstance(stream, torch.Tensor) or not isinstance(
+            hash_ids, torch.Tensor
+        ):
+            raise TypeError("layer-three Engram inputs must be tensors")
+        records[record_name] = {
+            "stream": object_record(stream, include_storage=True),
+            "hash_ids": object_record(hash_ids, include_storage=True),
+            "mask": (
+                object_record(mask, include_storage=True) if mask is not None else None
+            ),
+        }
+
     def capture_weights_for(state: _IndexerState):
         def capture_weights(
             _module: torch.nn.Module, _inputs: tuple[object, ...], output: object
@@ -458,6 +478,10 @@ def hooks_for(
                     )
                 )
             )
+        if name == "layers.3.engram":
+            handles.append(module.register_forward_pre_hook(capture_engram_input))
+        if name in {"layers.3.engram.embed", "layers.3.engram.wkv"}:
+            handles.append(module.register_forward_hook(capture(name)))
         if name == "layers.3.attn.compressor.wkv":
             handles.append(module.register_forward_hook(capture(name)))
         if name in {

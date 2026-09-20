@@ -736,14 +736,24 @@ pub(super) fn native_outputs_from_ownered_inputs(
 ///
 /// The remaining attention arithmetic stays independently constrained by the
 /// narrow source fixture; this closes only the owner/producer publication seam.
+pub(super) fn native_layer_three_outputs_from_ownered_inputs() -> Vec<Vec<u16>> {
+    let owner_inputs = candidate_hc_capture::derived_inputs();
+    native_layer_three_outputs_from_supplied_inputs(&owner_inputs)
+}
+
+/// Continues layer-three owner publication and attention from a caller-provided
+/// normalized layer input. The captured HC path remains the default wrapper;
+/// Engram integration supplies the HC/RMSNorm result derived from its native
+/// BF16 residual here.
 #[allow(
     clippy::too_many_lines,
     reason = "the source owner operands remain explicit"
 )]
-pub(super) fn native_layer_three_outputs_from_ownered_inputs() -> Vec<Vec<u16>> {
+pub(super) fn native_layer_three_outputs_from_supplied_inputs(
+    owner_inputs: &[(usize, Vec<u16>)],
+) -> Vec<Vec<u16>> {
     let raw = raw_fixture();
     let attention = attention_capture::layer_three_fixture();
-    let owner_inputs = candidate_hc_capture::derived_inputs();
     let owner: Value = serde_json::from_str(include_str!(
         "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
     ))

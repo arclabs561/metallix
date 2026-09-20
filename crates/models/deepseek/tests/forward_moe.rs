@@ -24,6 +24,8 @@ use serde::Deserialize;
 mod attention_capture;
 #[path = "support/candidate_capture.rs"]
 mod candidate_capture;
+#[path = "support/engram_capture.rs"]
+mod engram_capture;
 #[path = "support/hc_chain_bounds.rs"]
 mod hc_chain_bounds;
 #[path = "support/hc_coefficient_bounds.rs"]
@@ -1291,10 +1293,77 @@ fn native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry() {
     assert_eq!(native_layer_three_block_tail(&f).len(), f.cases.len());
 }
 
+#[test]
+fn native_layer_three_engram_through_final_suffix_matches_source_logits() {
+    let f = layer_three_fixture();
+    let entries = engram_capture::native_layer_three_block_entries();
+    let native = native_layer_three_block_tail_from_entries(&f, Some(&entries));
+    let layer_four = fixture();
+    let output = block_tail_from_entries(
+        &layer_four,
+        BlockControl::NativeAttention,
+        true,
+        Some(&native),
+    );
+    assert_final_suffix(&layer_four, output);
+}
+
+#[test]
+#[should_panic(expected = "native Engram layer-three entry")]
+fn joined_suffix_rejects_corrupted_engram_entry() {
+    let mut entries = engram_capture::native_layer_three_block_entries();
+    entries[0].1.fill(0);
+    native_layer_three_block_tail_from_entries(&layer_three_fixture(), Some(&entries));
+}
+
 fn native_layer_three_block_tail(f: &Fixture) -> Vec<BlockTailOutput> {
+    native_layer_three_block_tail_from_entries(f, None)
+}
+
+fn native_layer_three_block_tail_from_entries(
+    f: &Fixture,
+    entries: Option<&[(usize, Vec<u16>)]>,
+) -> Vec<BlockTailOutput> {
     let parameters = block_tail_parameters_for(f, 3);
     let config = &f.block_config;
-    let attention = owner_attention_capture::native_layer_three_outputs_from_ownered_inputs();
+    let attention = if let Some(entries) = entries {
+        assert_eq!(entries.len(), f.cases.len());
+        let inputs: Vec<_> = f
+            .cases
+            .iter()
+            .zip(entries)
+            .map(|(case, (start, residual))| {
+                assert_eq!(*start, case.start_pos);
+                assert_eq!(
+                    *residual,
+                    case.block_input.bf16(),
+                    "native Engram layer-three entry"
+                );
+                // Earlier-layer coefficients remain the explicit capture boundary;
+                // the residual supplied to both HC paths is the native Engram output.
+                let incoming = case.block_incoming_pre.fp32();
+                let input: Vec<_> = (0..case.input.shape[1])
+                    .flat_map(|position| {
+                        derive_attention_input(
+                            &residual[position * 256..(position + 1) * 256],
+                            &incoming[position * 2..(position + 1) * 2],
+                            &parameters.attn_norm,
+                            config.norm_eps,
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    input,
+                    case.attention_input.bf16(),
+                    "native Engram HC attention input"
+                );
+                (*start, input)
+            })
+            .collect();
+        owner_attention_capture::native_layer_three_outputs_from_supplied_inputs(&inputs)
+    } else {
+        owner_attention_capture::native_layer_three_outputs_from_ownered_inputs()
+    };
     assert_eq!(attention.len(), f.cases.len());
     with_model_for(f, 3, false, |model| {
         let ffn = FfnSublayerReference::new(
@@ -1312,11 +1381,39 @@ fn native_layer_three_block_tail(f: &Fixture) -> Vec<BlockTailOutput> {
         f.cases
             .iter()
             .zip(attention)
-            .map(|(case, attention_output)| {
-                check_layer_three_case(f, &parameters, &ffn, case, &attention_output)
+            .enumerate()
+            .map(|(index, (case, attention_output))| {
+                check_layer_three_case(
+                    f,
+                    &parameters,
+                    &ffn,
+                    case,
+                    &attention_output,
+                    entries.map(|entries| entries[index].1.as_slice()),
+                )
             })
             .collect()
     })
+}
+
+fn source_layer_four_entry(case: &Case) -> (Vec<u16>, Vec<f32>) {
+    let next = case
+        .next_block_entry
+        .as_ref()
+        .expect("source layer-four entry");
+    let residual = next.residual.bf16();
+    let incoming = next.incoming_pre.fp32();
+    assert_eq!(
+        case.block_output.bf16(),
+        residual,
+        "source block continuity"
+    );
+    assert_eq!(
+        case.block_next_pre.fp32(),
+        incoming,
+        "source coefficient continuity"
+    );
+    (residual, incoming)
 }
 
 fn check_layer_three_case(
@@ -1325,6 +1422,7 @@ fn check_layer_three_case(
     ffn: &FfnSublayerReference<'_>,
     case: &Case,
     attention_output: &[u16],
+    native_entry: Option<&[u16]>,
 ) -> BlockTailOutput {
     let config = &f.block_config;
     let positions = case.input.shape[1];
@@ -1333,18 +1431,16 @@ fn check_layer_three_case(
         case.attention_output.bf16(),
         "native layer-three attention"
     );
-    let block_input = case.block_input.bf16();
+    let captured_input = case.block_input.bf16();
+    let block_input = native_entry.unwrap_or(&captured_input);
+    assert_eq!(
+        block_input, captured_input,
+        "native Engram layer-three entry"
+    );
     let expected_after_attention = case.after_attention_residual.bf16();
     let expected_terminal = case.block_output.bf16();
     let expected_pre = case.block_next_pre.fp32();
-    let next = case
-        .next_block_entry
-        .as_ref()
-        .expect("source layer-four entry");
-    let next_residual = next.residual.bf16();
-    let next_incoming = next.incoming_pre.fp32();
-    assert_eq!(expected_terminal, next_residual, "source block continuity");
-    assert_eq!(expected_pre, next_incoming, "source coefficient continuity");
+    let (next_residual, next_incoming) = source_layer_four_entry(case);
     let mut terminal = Vec::with_capacity(expected_terminal.len());
     let mut next_pre = Vec::with_capacity(expected_pre.len());
     let mut envelopes = Vec::with_capacity(positions);

@@ -1,9 +1,11 @@
-//! Bounded scalar V4.1 Engram n-gram hash-address reference.
+//! Bounded scalar V4.1 Engram hash, embedding lookup, and residual-gate references.
 //!
 //! The caller supplies already-compressed token IDs and explicit, captured
-//! per-layer hash tensors. This deliberately does not normalize tokenizer text,
-//! generate primes or RNG multipliers, read embedding tables, or run a GPU.
+//! per-layer hash tensors. The [`embedding`] and [`gate`] modules compose the
+//! subsequent numerical boundaries. This does not normalize tokenizer text,
+//! generate primes or RNG multipliers, load checkpoints, or run a GPU.
 
+pub mod embedding;
 pub mod gate;
 
 use thiserror::Error;

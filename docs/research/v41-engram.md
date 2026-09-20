@@ -1,9 +1,9 @@
 # V4.1 Engram hash and residual-gate contracts
 
-These are narrow contracts for token-to-row addresses and the residual gate
-with supplied, preprojected tensors. They do not establish table payload
-layout, loader ranges, complete Engram parity, CED behavior, or a Metal
-implementation.
+These are narrow contracts for token-to-row addresses, a bounded scalar table
+lookup, and a residual gate with supplied projected tensors. They do not
+establish checkpoint table loading or sharding, complete Engram parity, CED
+behavior, or a Metal implementation.
 
 ## Provenance and reading coverage
 
@@ -67,8 +67,9 @@ Engram hashes are computed once per input chunk before embedding expansion.
 At configured layer IDs, `Engram.forward` fetches these rows, transforms them
 to per-HC-copy keys plus one value, and gates the value into the residual
 before that block executes. Image token types mask Engram; text-only calls pass
-no mask. This establishes placement and hash ownership, not row decoding or
-the gated residual's weights.
+no mask. The native references cover hash ownership and a scalar selected-row
+decode. The focused reduced continuation carries its WKV and residual-gate
+output through native layer three, layer four, and the final logits.
 
 ## Compressed-token reference
 
@@ -101,6 +102,29 @@ uv run scripts/v41-engram-reference.py > artifacts/v41-engram-reference.json
 cargo test -p deepseek engram
 ```
 
+## Bounded table lookup
+
+`crates/models/deepseek/src/engram/embedding.rs` implements a single-rank
+scalar lookup for a supplied FP8 table. `EngramEmbeddingLayout` accepts only
+complete 32-element scale groups and a bounded unsharded shape. The lookup
+decodes selected E4M3FN values with their row-local E8M0 scales, rounds to
+BF16, and writes zero rows for negative mask sentinels or IDs outside the
+table. It validates shapes and every selected value before writing the caller's
+output, so a failure leaves that output unchanged. It does not allocate or load
+a checkpoint table, reduce across ranks, or establish a serving layout.
+
+[`layer3-engram-reference.json`](../../fixtures/deepseek-v41/layer3-engram-reference.json)
+records source hash IDs, embedding rows, encoded embedding and WKV parameters,
+WKV output, split key/value tensors, and the gated layer-three block entry at
+prefill and two decode starts. The exporter and its integrity test reject a
+missing WKV observation, changed hash state, or a block entry that differs from
+the gate output. The focused
+`native_layer_three_engram_through_final_suffix_matches_source_logits` test
+then feeds that native hash-to-lookup-to-WKV-to-gate output through the native
+layer-three tail and the established layer-four-to-logits suffix. It uses the
+source-captured pre-Engram stream and incoming HC pre-mix state, so it is a
+reduced graph rather than full-model execution.
+
 ## Preprojected residual gate
 
 The source capture `scripts/v41-engram-gate-reference.py` now exercises the
@@ -126,8 +150,8 @@ Two source-order details matter: form `q_weight * k_weight` before multiplying
 the stream, and mask the gate rather than copying the residual. A masked row
 still computes `h + 0 * value`, which can change the sign of zero. The capture
 includes this signed-zero case. Per-copy reductions start from positive zero.
-This reference does not qualify FP8 rows/scales, table sharding, `wkv` weights
-or Metal.
+This independent gate reference does not by itself qualify FP8 lookup,
+checkpoint table sharding, WKV projection, or Metal.
 
 ## Remaining gates
 
@@ -135,6 +159,7 @@ The next fixture must cover the exact tokenizer backend/version and a
 small original-ID-to-decoded-text projection (including case, whitespace,
 accent, U+FFFD, pad, and image/dead cases), compressed IDs, explicit primes,
 multipliers, offsets, and final addresses. The existing explicit-map address
-fixture does not qualify these derivations. A separate fixture with fetched
-rows and `wkv`/gate weights is required before
-claiming Engram residual or full-forward parity.
+fixture does not qualify these derivations. The layer-three fixture has the
+encoded rows and WKV/gate operands, and its focused native continuation reaches
+the final logits. Full checkpoint loading, distributed table ownership, and
+full-forward parity remain open.

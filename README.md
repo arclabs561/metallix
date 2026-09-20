@@ -238,7 +238,10 @@ attention, HC, and FFN through the layer-four entry, then continue through
 final-layer attention, HC, FFN, final normalization and logits. Fixed
 source-derived numerical bounds and wrong-index/omitted-norm controls guard
 this suffix.
-Layer-three entry residuals remain captured from earlier blocks;
+The focused Engram continuation decodes selected FP8 embedding rows with
+row-local E8M0 scales into BF16, projects WKV, and gates the residual before
+the same native layer-three-to-logits suffix. Its pre-Engram residual and
+incoming HC pre-mix state remain captured from earlier blocks;
 full-model generation is still pending.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover

@@ -599,6 +599,46 @@ uv run --python 3.13 python scripts/v41_candidate_capture.py \
 cargo test -p deepseek --test forward_candidate_hc
 ```
 
+### Layer-three Engram continuation
+
+[`layer3-engram-reference.json`](../../fixtures/deepseek-v41/layer3-engram-reference.json)
+captures the layer-three hash IDs, selected embedding rows, encoded FP8
+embedding and WKV parameters, WKV output, split per-copy keys and values, and
+the residual-gate output. It requires the gate output's storage identity to
+match the source layer-three block entry at prefill and both decode starts. The
+fixture therefore fixes the Engram-to-block-entry observation boundary without
+relabelling an earlier residual capture as a native result.
+
+The native scalar lookup decodes selected E4M3FN rows with row-local E8M0
+scales into BF16; masked and out-of-table IDs become zero rows. The fixture's
+integrity gate rejects missing WKV observations, a changed hash state, and a
+changed gate output. The focused
+`native_layer_three_engram_through_final_suffix_matches_source_logits` test
+uses the native hash, lookup, FP8 WKV projection, and residual gate as the
+layer-three input, then runs the native layer-three tail and established
+layer-four-to-logits suffix. A corrupted native Engram entry is rejected before
+the layer-three tail runs.
+
+The prefill and first decode contain BF16 residual changes from Engram; the
+last decode's update rounds away. The omission control therefore checks
+sensitivity across the trace, while the intermediate lookup and WKV checks
+still run at every step.
+
+```sh
+uv run scripts/v41_layer3_engram_capture.py --output artifacts/layer3-engram-reference.json
+uv run scripts/test_v41_layer3_engram_fixture.py
+cargo test -p deepseek --test forward_moe
+```
+
+The source-backed Python gate uses its declared Torch dependencies and remains
+separate from the default offline check. The Rust continuation runs in that
+default check using the committed fixture.
+
+The boundary before Engram remains explicit: the pre-Engram layer-three
+residual and incoming HC pre-mix state come from the source graph's earlier
+blocks. This is neither checkpoint-table loading nor full-model or Metal
+execution.
+
 ### Layer-three attention continuation
 
 The separate
@@ -672,6 +712,7 @@ layer-three producer inputs remain separate.
 Replacing the native incoming coefficients with zero fails that attention-input
 gate. No coefficient is replaced with its captured counterpart.
 
-The original isolated layer-four test remains as a diagnostic. The connected
-test still begins at captured layer-three block-entry state, so earlier blocks
-and full-model generation remain unfinished.
+The original isolated layer-four test and captured layer-three entry test
+remain as diagnostics. The Engram continuation above extends that boundary to
+the pre-Engram residual and incoming coefficients; earlier blocks and
+full-model generation remain unfinished.
