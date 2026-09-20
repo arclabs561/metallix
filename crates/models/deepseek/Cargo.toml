@@ -28,5 +28,9 @@ harness = false
 name = "selection"
 harness = false
 
+[[bench]]
+name = "owner_transaction"
+harness = false
+
 [lints]
 workspace = true

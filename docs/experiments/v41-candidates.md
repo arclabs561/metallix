@@ -244,6 +244,42 @@ gate for downloading the full V4.1 checkpoint, and they are not a performance or
 model-quality result. Next are BF16/FP4 score qualification, Metal selection,
 and sparse attention with the same numerical and masking checks.
 
+## Ratio-one owner transaction microbenchmark
+
+At `bf4ebb1` plus the benchmark working diff, three serial release executions
+of `owner_transaction` measured the captured ratio-one owner fixture with
+default CPU features and no concurrent benchmark. The fixture asserts its
+pinned source revision, model hash, little-endian BF16 storage, and exact
+prefill latent/key/KV outputs before it times anything. Each execution gathered
+200 internal samples per phase; raw receipts are ignored under
+`artifacts/owner-transaction/`.
+
+The source capture contains only a five-token prefill and one-token decode
+continuations at valid prefixes five and six. Setup, reset, and pre-publication
+work are excluded where noted below. This is a bounded operator measurement,
+not a model-throughput or prefix-scaling benchmark.
+
+| Phase median (microseconds) | Run 1 | Run 2 | Run 3 |
+| --- | ---: | ---: | ---: |
+| Prefill-5 `prepare` | 109.333 | 109.250 | 109.708 |
+| Decode `prepare` at prefix 5 | 29.584 | 27.833 | 29.542 |
+| Decode `prepare` at prefix 6 | 29.666 | 27.896 | 29.562 |
+| Decode transaction `drop` at prefix 5 | 0.125 | 0.125 | 0.125 |
+| Decode transaction `commit` at prefix 5 | 0.125 | 0.125 | 0.125 |
+| Decode `forward` at prefix 5 | 27.708 | 27.708 | 27.791 |
+| Whole benchmark process wall time (milliseconds) | 91.710 | 89.244 | 90.226 |
+
+`prepare` includes the production projection/compressor/key/KV work and the
+transaction's complete staged key/KV prefix allocations. `drop` is timed after
+preparation; `commit` is timed with an already prepared transaction; `forward`
+is the production control that omits staged complete-prefix views. The
+prefix-five to prefix-six prepare difference is much smaller than cross-run
+variation, so this capture does not isolate prefix-copy cost as an optimization
+target. The difference between decode `prepare` and `forward` varies across
+runs and does not isolate allocation from other transaction work. Changing
+allocation or copy semantics needs a source-grounded longer-prefix workload
+and a new matched measurement.
+
 ## Packed FP4 runtime expansion
 
 `deepseek::precision` expands E2M1x2 bytes in low-nibble-first order and

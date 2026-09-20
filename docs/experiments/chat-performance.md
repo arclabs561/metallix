@@ -258,6 +258,24 @@ locate a later, separately qualified investigation. The separate live HTTP
 smoke passed JSON, streamed text, output-limit, post-header failure, invalid
 request, function round-trip, and disconnect-then-next-request checks.
 
+## Transport deadline regression check
+
+Five serial, warm Responses requests with one excluded warmup used the same
+32-token cap, prompt hash, output-text hash, and expected capped incomplete
+terminal state before and after the transport deadline change. The client saw
+median completion wall time move from 286.508 ms (sample standard deviation
+1.239 ms) to 277.508 ms (1.183 ms); median inter-text-delta latency moved from
+8.483 ms (0.024 ms) to 8.213 ms (0.023 ms). The requests occurred at different
+times on non-isolated hardware, so this is a regression check with preserved
+output, not an attributed speedup or a transport-performance claim.
+
+The final timeout receipt also exercised stalled headers and stalled bodies:
+each received HTTP 408 after about five seconds, and the next health request
+returned 200. It observed immediate best-effort rejection for duplicate length
+and transfer encoding (400), expectation handling (417), body cap (413), and
+header cap (431). These are bounded live cases; general error-reply behavior
+still needs broader protocol qualification.
+
 Use this baseline before an optimization, then repeat the identical workload
 after one change. For serving work, retain a tool-call workload beside this
 plain-text control and report task completion separately from latency.
