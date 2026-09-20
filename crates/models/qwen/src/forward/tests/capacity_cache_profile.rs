@@ -35,8 +35,39 @@ const QWEN3_06B_ATTENTION_HEADS: usize = 16;
 const QWEN3_06B_KEY_VALUE_HEADS: usize = 8;
 const QWEN3_06B_HEAD_DIM: usize = 128;
 const QWEN3_06B_MAX_POSITIONS: usize = 40_960;
+const STEPPED_CAPACITY_BOUNDARIES: [usize; 2] = [128, 512];
 
 type CapacitySnapshot = Vec<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapacityMode {
+    Fixed,
+    Stepped,
+}
+
+impl CapacityMode {
+    fn from_env() -> Self {
+        let value = match env::var("METALLIX_CAPACITY_MODE") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => return Self::Fixed,
+            Err(env::VarError::NotUnicode(_)) => {
+                panic!("METALLIX_CAPACITY_MODE must be valid Unicode")
+            }
+        };
+        match value.as_str() {
+            "fixed" => Self::Fixed,
+            "stepped" => Self::Stepped,
+            _ => panic!("METALLIX_CAPACITY_MODE must be fixed or stepped, got {value:?}"),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Stepped => "stepped",
+        }
+    }
+}
 
 struct CapacityLayerKv {
     keys: Array,
@@ -49,6 +80,9 @@ struct CapacityExecutor<'a> {
     cache: Vec<Option<CapacityLayerKv>>,
     cached_tokens: usize,
     capacity: usize,
+    maximum_capacity: usize,
+    mode: CapacityMode,
+    allocation_events: usize,
 }
 
 impl<'a> CapacityExecutor<'a> {
@@ -57,18 +91,41 @@ impl<'a> CapacityExecutor<'a> {
         weights: &'a HashMap<String, Array>,
         capacity: usize,
     ) -> Self {
+        Self::new_with_mode(config, weights, capacity, CapacityMode::Fixed)
+    }
+
+    fn new_stepped(
+        config: &'a Qwen3ForwardConfig,
+        weights: &'a HashMap<String, Array>,
+        maximum_capacity: usize,
+    ) -> Self {
+        Self::new_with_mode(config, weights, maximum_capacity, CapacityMode::Stepped)
+    }
+
+    fn new_with_mode(
+        config: &'a Qwen3ForwardConfig,
+        weights: &'a HashMap<String, Array>,
+        maximum_capacity: usize,
+        mode: CapacityMode,
+    ) -> Self {
         Self {
             config,
             weights,
             cache: (0..config.hidden_layers).map(|_| None).collect(),
             cached_tokens: 0,
-            capacity,
+            capacity: if mode == CapacityMode::Fixed {
+                maximum_capacity
+            } else {
+                0
+            },
+            maximum_capacity,
+            mode,
+            allocation_events: 0,
         }
     }
 
     fn prefill_last_logits(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
-        self.cache.iter_mut().for_each(|entry| *entry = None);
-        self.cached_tokens = 0;
+        self.reset();
         self.append(input_ids)
     }
 
@@ -79,7 +136,25 @@ impl<'a> CapacityExecutor<'a> {
         self.append(&[input_id])
     }
 
+    fn reset(&mut self) {
+        self.cache.iter_mut().for_each(|entry| *entry = None);
+        self.cached_tokens = 0;
+        // `allocation_events` counts test-only cache-allocation episodes in
+        // `ensure_capacity`, not retained K/V or allocator-reported bytes.
+        // Keep it across a failed request; fork materialization is excluded.
+    }
+
     fn append(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
+        let result = self.append_inner(input_ids);
+        if result.is_err() {
+            // Match `Qwen3ForwardExecutor`: later layers can fail after an
+            // earlier layer installed K/V, so no failed append may be reused.
+            self.reset();
+        }
+        result
+    }
+
+    fn append_inner(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
         if input_ids.is_empty() {
             return Err(Qwen3ForwardError::EmptyInput);
         }
@@ -87,10 +162,10 @@ impl<'a> CapacityExecutor<'a> {
             .cached_tokens
             .checked_add(input_ids.len())
             .ok_or(Qwen3ForwardError::ShapeOverflow)?;
-        if next_tokens > self.capacity {
+        if next_tokens > self.maximum_capacity {
             return Err(Qwen3ForwardError::PromptTooLong {
                 actual: next_tokens,
-                maximum: self.capacity,
+                maximum: self.maximum_capacity,
             });
         }
         for &id in input_ids {
@@ -105,6 +180,7 @@ impl<'a> CapacityExecutor<'a> {
                 });
             }
         }
+        self.ensure_capacity(next_tokens)?;
 
         let stream = StreamOrDevice::gpu();
         let seq_len = as_i32(input_ids.len())?;
@@ -148,12 +224,79 @@ impl<'a> CapacityExecutor<'a> {
             .sum()
     }
 
+    const fn allocation_events(&self) -> usize {
+        self.allocation_events
+    }
+
+    fn target_capacity(&self, next_tokens: usize) -> usize {
+        match self.mode {
+            CapacityMode::Fixed => self.maximum_capacity,
+            CapacityMode::Stepped => STEPPED_CAPACITY_BOUNDARIES
+                .into_iter()
+                .find(|&boundary| next_tokens <= boundary && boundary <= self.maximum_capacity)
+                .unwrap_or(self.maximum_capacity),
+        }
+    }
+
+    fn ensure_capacity(&mut self, next_tokens: usize) -> Result<(), Qwen3ForwardError> {
+        let target = self.target_capacity(next_tokens);
+        if target <= self.capacity {
+            if self.cache.iter().all(Option::is_none) {
+                self.allocation_events += 1;
+            }
+            return Ok(());
+        }
+        if self.cache.iter().all(Option::is_none) {
+            self.capacity = target;
+            self.allocation_events += 1;
+            return Ok(());
+        }
+        if self.cache.iter().any(Option::is_none) {
+            return Err(Qwen3ForwardError::CacheInconsistent);
+        }
+        let stream = StreamOrDevice::gpu();
+        let valid = as_i32(self.cached_tokens)?;
+        let current = as_i32(self.capacity)?;
+        let target = as_i32(target)?;
+        let kv_heads = as_i32(self.config.key_value_heads)?;
+        let head_dim = as_i32(self.config.head_dim)?;
+        let replacement = self
+            .cache
+            .iter()
+            .map(|entry| {
+                let source = entry.as_ref().ok_or(Qwen3ForwardError::CacheInconsistent)?;
+                let expected = [1, kv_heads, current, head_dim];
+                if source.keys.shape() != expected || source.values.shape() != expected {
+                    return Err(Qwen3ForwardError::CacheInconsistent);
+                }
+                let key_prefix = source.keys.index_device((.., .., 0..valid, ..), &stream);
+                let value_prefix = source.values.index_device((.., .., 0..valid, ..), &stream);
+                let mut keys =
+                    Array::zeros_device::<f32>(&[1, kv_heads, target, head_dim], &stream)?;
+                let mut values =
+                    Array::zeros_device::<f32>(&[1, kv_heads, target, head_dim], &stream)?;
+                keys.index_mut_device((.., .., 0..valid, ..), &key_prefix, &stream);
+                values.index_mut_device((.., .., 0..valid, ..), &value_prefix, &stream);
+                keys.eval()?;
+                values.eval()?;
+                Ok(Some(CapacityLayerKv { keys, values }))
+            })
+            .collect::<Result<Vec<_>, Qwen3ForwardError>>()?;
+        self.cache = replacement;
+        self.capacity = usize::try_from(target).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        self.allocation_events += 1;
+        Ok(())
+    }
+
     fn fork_prefilled(&self) -> Result<Self, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
-        let mut fork = Self::new(self.config, self.weights, self.capacity);
+        let mut fork =
+            Self::new_with_mode(self.config, self.weights, self.maximum_capacity, self.mode);
         fork.cached_tokens = self.cached_tokens;
+        fork.capacity = self.capacity;
+        fork.allocation_events = self.allocation_events;
         let stream = StreamOrDevice::gpu();
         let valid = as_i32(self.cached_tokens)?;
         let capacity = as_i32(self.capacity)?;
@@ -382,6 +525,7 @@ struct Row {
     capacity_trace_fnv1a64: u64,
     concat_kv_bytes: usize,
     capacity_kv_bytes: usize,
+    capacity_allocation_events: usize,
 }
 
 fn fixed_tokens(count: usize, offset: usize) -> Vec<i32> {
@@ -442,6 +586,25 @@ fn measurement_rows() -> usize {
     rows
 }
 
+fn measurement_prompt_tokens() -> Vec<usize> {
+    let enabled = match env::var("METALLIX_CAPACITY_GROWTH_ROWS") {
+        Err(env::VarError::NotPresent) => false,
+        Ok(value) => match value.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => panic!("METALLIX_CAPACITY_GROWTH_ROWS must be 0 or 1, got {value:?}"),
+        },
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("METALLIX_CAPACITY_GROWTH_ROWS must be valid Unicode")
+        }
+    };
+    if enabled {
+        vec![128, 512, 1_983, 127, 511]
+    } else {
+        vec![128, 512, 1_983]
+    }
+}
+
 fn greedy_token(logits: &[f32]) -> usize {
     logits
         .iter()
@@ -461,11 +624,23 @@ fn extend_fnv1a64(mut hash: u64, logits: &[f32]) -> u64 {
     hash
 }
 
-fn run_row(weights: &Qwen3MlxWeights, prompt: &[i32], capacity_first: bool) -> Row {
+fn run_row(
+    weights: &Qwen3MlxWeights,
+    prompt: &[i32],
+    capacity_first: bool,
+    mode: CapacityMode,
+) -> Row {
     let mut concat = weights
         .resident_chat_executor(MAXIMUM_CONTEXT_TOKENS, MAXIMUM_KV_BYTES)
         .expect("concat resident executor");
-    let mut capacity = CapacityExecutor::new(concat.config, concat.weights, MAXIMUM_CONTEXT_TOKENS);
+    let mut capacity = match mode {
+        CapacityMode::Fixed => {
+            CapacityExecutor::new(concat.config, concat.weights, MAXIMUM_CONTEXT_TOKENS)
+        }
+        CapacityMode::Stepped => {
+            CapacityExecutor::new_stepped(concat.config, concat.weights, MAXIMUM_CONTEXT_TOKENS)
+        }
+    };
     let concat_prefill = concat.prefill_last_logits(prompt).expect("concat prefill");
     let capacity_prefill = capacity
         .prefill_last_logits(prompt)
@@ -538,6 +713,7 @@ fn run_row(weights: &Qwen3MlxWeights, prompt: &[i32], capacity_first: bool) -> R
         capacity_trace_fnv1a64,
         concat_kv_bytes: concat.kv_bytes(),
         capacity_kv_bytes: capacity.capacity_kv_bytes(),
+        capacity_allocation_events: capacity.allocation_events(),
     }
 }
 
@@ -565,13 +741,29 @@ fn capacity_executor_matches_concat_rejects_overflow_and_isolates_forks() {
             .expect("platform byte count")
     );
 
-    let before_invalid = capacity_snapshot(&capacity);
+    assert!(matches!(
+        concat.decode_last_logits(8),
+        Err(Qwen3ForwardError::InvalidTokenId { .. })
+    ));
     assert!(matches!(
         capacity.decode_last_logits(8),
         Err(Qwen3ForwardError::InvalidTokenId { .. })
     ));
-    assert_eq!(capacity.cached_tokens, 2);
-    assert_eq!(capacity_snapshot(&capacity), before_invalid);
+    assert_eq!(concat.cached_tokens(), 0);
+    assert_eq!(concat.kv_bytes(), 0);
+    assert_eq!(capacity.cached_tokens, 0);
+    assert_eq!(capacity.capacity_kv_bytes(), 0);
+    assert!(capacity.cache.iter().all(Option::is_none));
+    assert!(matches!(
+        capacity.decode_last_logits(3),
+        Err(Qwen3ForwardError::DecodeWithoutPrefill)
+    ));
+    concat
+        .prefill_last_logits(&[1, 2])
+        .expect("concat retry prefill");
+    capacity
+        .prefill_last_logits(&[1, 2])
+        .expect("capacity retry prefill");
 
     let mut child = capacity
         .fork_prefilled()
@@ -592,7 +784,6 @@ fn capacity_executor_matches_concat_rejects_overflow_and_isolates_forks() {
     let mut full = CapacityExecutor::new(&config, &weights, 4);
     full.prefill_last_logits(&[1, 2, 3, 4])
         .expect("capacity-filling prefill");
-    let before_overflow = capacity_snapshot(&full);
     assert!(matches!(
         full.decode_last_logits(5),
         Err(Qwen3ForwardError::PromptTooLong {
@@ -600,8 +791,13 @@ fn capacity_executor_matches_concat_rejects_overflow_and_isolates_forks() {
             maximum: 4
         })
     ));
-    assert_eq!(full.cached_tokens, 4, "overflow must not alter cache state");
-    assert_eq!(capacity_snapshot(&full), before_overflow);
+    assert_eq!(full.cached_tokens, 0, "failed decode clears partial state");
+    assert_eq!(full.capacity_kv_bytes(), 0);
+    assert!(full.cache.iter().all(Option::is_none));
+    assert!(matches!(
+        full.decode_last_logits(1),
+        Err(Qwen3ForwardError::DecodeWithoutPrefill)
+    ));
 }
 
 proptest! {
@@ -646,6 +842,173 @@ proptest! {
         prop_assert_eq!(eos.cached_tokens, 2);
         prop_assert_eq!(capacity_snapshot(&eos), eos_snapshot);
     }
+
+    #[test]
+    fn stepped_capacity_crosses_boundaries_and_keeps_forks_independent(
+        boundary in prop_oneof![Just(128_usize), Just(512_usize)],
+        prompt_token in 0_i32..8,
+        tail in 0_i32..8,
+        next in 0_i32..8,
+        branch_token in 0_i32..8,
+    ) {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = super::long_small_config();
+        let weights = super::deterministic_weights();
+        let plan = config
+            .resident_chat_plan(1_024, u64::MAX)
+            .expect("long tiny resident plan");
+        let prompt = vec![prompt_token; boundary - 1];
+        let mut stepped = CapacityExecutor::new_stepped(&config, &weights, 1_024);
+        let mut reference = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        assert_logits_match(
+            &reference.prefill_last_logits(&prompt).expect("reference prefill"),
+            &stepped.prefill_last_logits(&prompt).expect("stepped prefill"),
+        );
+        prop_assert_eq!(stepped.capacity, boundary);
+        prop_assert_eq!(stepped.allocation_events(), 1);
+        assert!(matches!(
+            reference.decode_last_logits(8),
+            Err(Qwen3ForwardError::InvalidTokenId { .. })
+        ));
+        assert!(matches!(
+            stepped.decode_last_logits(8),
+            Err(Qwen3ForwardError::InvalidTokenId { .. })
+        ));
+        prop_assert_eq!(reference.cached_tokens(), 0);
+        prop_assert_eq!(reference.kv_bytes(), 0);
+        prop_assert_eq!(stepped.cached_tokens, 0);
+        prop_assert_eq!(stepped.capacity_kv_bytes(), 0);
+        prop_assert_eq!(stepped.allocation_events(), 1);
+        prop_assert!(stepped.cache.iter().all(Option::is_none));
+        assert!(matches!(
+            stepped.decode_last_logits(tail),
+            Err(Qwen3ForwardError::DecodeWithoutPrefill)
+        ));
+        reference
+            .prefill_last_logits(&prompt)
+            .expect("reference retry prefill");
+        stepped
+            .prefill_last_logits(&prompt)
+            .expect("stepped retry prefill");
+        prop_assert_eq!(stepped.capacity, boundary);
+        prop_assert_eq!(stepped.allocation_events(), 2);
+
+        let mut branch = stepped.fork_prefilled().expect("stepped branch fork");
+        let branch_snapshot = capacity_snapshot(&branch);
+        let parent_tail = stepped.decode_last_logits(tail).expect("stepped parent tail");
+        assert_logits_match(
+            &reference.decode_last_logits(tail).expect("reference parent tail"),
+            &parent_tail,
+        );
+        assert_eq!(stepped.capacity, boundary);
+        let parent_next = stepped.decode_last_logits(next).expect("stepped boundary growth");
+        assert_logits_match(
+            &reference.decode_last_logits(next).expect("reference boundary growth"),
+            &parent_next,
+        );
+        let expected_capacity = if boundary == 128 { 512 } else { 1_024 };
+        prop_assert_eq!(stepped.capacity, expected_capacity);
+        prop_assert_eq!(stepped.allocation_events(), 3);
+        prop_assert_eq!(capacity_snapshot(&branch), branch_snapshot);
+
+        let mut branch_reference = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        branch_reference
+            .prefill_last_logits(&prompt)
+            .expect("reference branch prefill");
+        let branch_logits = branch.decode_last_logits(branch_token).expect("branch decode");
+        assert_logits_match(
+            &branch_reference
+                .decode_last_logits(branch_token)
+                .expect("reference branch decode"),
+            &branch_logits,
+        );
+        prop_assert_eq!(branch.capacity, boundary);
+        prop_assert_eq!(branch.allocation_events(), 2);
+    }
+}
+
+#[test]
+fn stepped_capacity_decode_overflow_preserves_allocation_and_malformed_prefill_resets_like_production()
+ {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = super::long_small_config();
+    let weights = super::deterministic_weights();
+    let plan = config
+        .resident_chat_plan(512, u64::MAX)
+        .expect("bounded reference plan");
+    let mut reference = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+    let mut full = CapacityExecutor::new_stepped(&config, &weights, 512);
+    reference
+        .prefill_last_logits(&vec![1; 512])
+        .expect("reference capacity-filling prefill");
+    full.prefill_last_logits(&vec![1; 512])
+        .expect("capacity-filling stepped prefill");
+    assert!(matches!(
+        reference.decode_last_logits(2),
+        Err(Qwen3ForwardError::PromptTooLong {
+            actual: 513,
+            maximum: 512
+        })
+    ));
+    assert!(matches!(
+        full.decode_last_logits(2),
+        Err(Qwen3ForwardError::PromptTooLong {
+            actual: 513,
+            maximum: 512
+        })
+    ));
+    assert_eq!(reference.cached_tokens(), 0);
+    assert_eq!(reference.kv_bytes(), 0);
+    assert_eq!(full.cached_tokens, 0);
+    assert_eq!(full.capacity_kv_bytes(), 0);
+    assert!(full.cache.iter().all(Option::is_none));
+    assert_eq!(full.capacity, 512);
+    assert_eq!(full.allocation_events(), 1);
+    assert!(matches!(
+        full.decode_last_logits(2),
+        Err(Qwen3ForwardError::DecodeWithoutPrefill)
+    ));
+
+    // Production `prefill_last_logits` calls `reset` before validating input;
+    // the test-only stepped path deliberately follows that request boundary.
+    assert!(matches!(
+        full.prefill_last_logits(&[8]),
+        Err(Qwen3ForwardError::InvalidTokenId { .. })
+    ));
+    assert_eq!(full.cached_tokens, 0);
+    assert!(full.cache.iter().all(Option::is_none));
+    assert_eq!(full.capacity, 512);
+    assert_eq!(full.allocation_events(), 1);
+}
+
+#[test]
+fn stepped_capacity_late_layer_failure_clears_partial_kv_like_production() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let mut config = super::small_dense_config();
+    config.hidden_layers = 2;
+    let mut weights = super::deterministic_weights_for_layers(2);
+    weights.remove("model.layers.1.mlp.down_proj.weight");
+
+    let mut reference = Qwen3ForwardExecutor::new(&config, &weights);
+    let mut stepped = CapacityExecutor::new_stepped(&config, &weights, 4);
+    assert!(matches!(
+        reference.prefill_last_logits(&[1, 2]),
+        Err(Qwen3ForwardError::MissingWeight(_))
+    ));
+    assert!(matches!(
+        stepped.prefill_last_logits(&[1, 2]),
+        Err(Qwen3ForwardError::MissingWeight(_))
+    ));
+    assert_eq!(reference.cached_tokens(), 0);
+    assert_eq!(reference.kv_bytes(), 0);
+    assert_eq!(stepped.cached_tokens, 0);
+    assert_eq!(stepped.capacity_kv_bytes(), 0);
+    assert!(stepped.cache.iter().all(Option::is_none));
+    assert_eq!(stepped.allocation_events(), 1);
+    assert!(matches!(
+        stepped.decode_last_logits(3),
+        Err(Qwen3ForwardError::DecodeWithoutPrefill)
+    ));
 }
 
 fn assert_repeat_identity(reference: &Row, row: &Row) {
@@ -676,16 +1039,16 @@ fn memory_prompt_tokens() -> usize {
 
 fn memory_mode() -> String {
     let mode = env::var("METALLIX_CAPACITY_MEMORY_MODE")
-        .expect("METALLIX_CAPACITY_MEMORY_MODE must be concat or capacity");
+        .expect("METALLIX_CAPACITY_MEMORY_MODE must be concat, capacity, fixed, or stepped");
     assert!(
-        matches!(mode.as_str(), "concat" | "capacity"),
-        "METALLIX_CAPACITY_MEMORY_MODE must be concat or capacity"
+        matches!(mode.as_str(), "concat" | "capacity" | "fixed" | "stepped"),
+        "METALLIX_CAPACITY_MEMORY_MODE must be concat, capacity, fixed, or stepped"
     );
     mode
 }
 
 #[test]
-#[ignore = "requires METALLIX_QWEN_MODEL and METALLIX_CAPACITY_MEMORY_MODE=concat|capacity"]
+#[ignore = "requires METALLIX_QWEN_MODEL and METALLIX_CAPACITY_MEMORY_MODE=concat|capacity|fixed|stepped"]
 fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
     let model = env::var_os("METALLIX_QWEN_MODEL")
         .map(PathBuf::from)
@@ -701,7 +1064,9 @@ fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
         .expect("Qwen3-0.6B resident plan");
     assert_qwen3_06b_tied_embedding_layout(concat.config, concat.weights);
 
-    let (elapsed, logical_kv_bytes, trace_fnv1a64, final_logits_bits) = if mode == "concat" {
+    let (elapsed, logical_kv_bytes, trace_fnv1a64, final_logits_bits, allocation_events) = if mode
+        == "concat"
+    {
         let started = Instant::now();
         let prefill = concat.prefill_last_logits(&prompt).expect("concat prefill");
         let mut trace = extend_fnv1a64(0xcbf2_9ce4_8422_2325, &prefill);
@@ -716,12 +1081,18 @@ fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
             concat.kv_bytes(),
             trace,
             final_logits_bits,
+            0,
         )
     } else {
         let config = concat.config;
         let tensors = concat.weights;
         drop(concat);
-        let mut capacity = CapacityExecutor::new(config, tensors, MAXIMUM_CONTEXT_TOKENS);
+        let mut capacity = match mode.as_str() {
+            // `capacity` remains the historical fixed-capacity spelling.
+            "capacity" | "fixed" => CapacityExecutor::new(config, tensors, MAXIMUM_CONTEXT_TOKENS),
+            "stepped" => CapacityExecutor::new_stepped(config, tensors, MAXIMUM_CONTEXT_TOKENS),
+            _ => unreachable!("validated memory mode"),
+        };
         let started = Instant::now();
         let prefill = capacity
             .prefill_last_logits(&prompt)
@@ -738,14 +1109,17 @@ fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
             capacity.capacity_kv_bytes(),
             trace,
             final_logits_bits,
+            capacity.allocation_events(),
         )
     };
     assert_eq!(final_logits_bits.len(), QWEN3_06B_VOCAB);
     println!(
         "capacity_cache_memory mode={mode} prompt_tokens={prompt_tokens} decode_steps={DECODE_STEPS} \
          elapsed_ms={:.3} logical_kv_bytes={logical_kv_bytes} \
-         whole_trace_fnv1a64={trace_fnv1a64:016x} no_forks=true",
+         whole_trace_fnv1a64={trace_fnv1a64:016x} no_forks=true \
+         capacity_allocation_events={}",
         milliseconds(elapsed),
+        allocation_events,
     );
 }
 
@@ -763,28 +1137,35 @@ fn fixed_capacity_slice_update_matches_concat_and_preserves_fork_ancestry() {
         .expect("Qwen3-0.6B resident plan");
     assert_qwen3_06b_tied_embedding_layout(layout.config, layout.weights);
     let rows = measurement_rows();
+    let mode = CapacityMode::from_env();
+    let prompt_tokens = measurement_prompt_tokens();
     println!(
-        "capacity_cache_profile scope=test_only_fixed_capacity no_donation_claim \
+        "capacity_cache_profile scope=test_only_capacity_allocation no_donation_claim \
          alternating_paired_host_intervals context_tokens={MAXIMUM_CONTEXT_TOKENS} \
-         kv_budget_bytes={MAXIMUM_KV_BYTES} rows={rows}",
+         kv_budget_bytes={MAXIMUM_KV_BYTES} rows={rows} capacity_mode={} \
+         growth_rows={}",
+        mode.name(),
+        prompt_tokens.len() > 3,
     );
-    for prompt_tokens in [128_usize, 512, 1_983] {
+    for prompt_tokens in prompt_tokens {
         let prompt = fixed_tokens(prompt_tokens, 97);
-        let warmup = run_row(&weights, &prompt, false);
+        let warmup = run_row(&weights, &prompt, false, mode);
         for row in 1..=rows {
             let capacity_first = row.is_multiple_of(2);
-            let measurement = run_row(&weights, &prompt, capacity_first);
+            let measurement = run_row(&weights, &prompt, capacity_first, mode);
             assert_repeat_identity(&warmup, &measurement);
             println!(
                 "capacity_cache_profile prompt_tokens={prompt_tokens} row={row} \
                  concat_decode_ms={:.3} capacity_decode_ms={:.3} \
                  concat_kv_bytes={} capacity_kv_bytes={} capacity_first={} \
+                 capacity_allocation_events={} \
                  concat_trace_fnv1a64={:016x} capacity_trace_fnv1a64={:016x}",
                 milliseconds(measurement.concat_decode),
                 milliseconds(measurement.capacity_decode),
                 measurement.concat_kv_bytes,
                 measurement.capacity_kv_bytes,
                 capacity_first,
+                measurement.capacity_allocation_events,
                 measurement.concat_trace_fnv1a64,
                 measurement.capacity_trace_fnv1a64,
             );
@@ -795,7 +1176,14 @@ fn fixed_capacity_slice_update_matches_concat_and_preserves_fork_ancestry() {
     let base = weights
         .resident_chat_executor(MAXIMUM_CONTEXT_TOKENS, MAXIMUM_KV_BYTES)
         .expect("parent executor plan");
-    let mut parent = CapacityExecutor::new(base.config, base.weights, MAXIMUM_CONTEXT_TOKENS);
+    let mut parent = match mode {
+        CapacityMode::Fixed => {
+            CapacityExecutor::new(base.config, base.weights, MAXIMUM_CONTEXT_TOKENS)
+        }
+        CapacityMode::Stepped => {
+            CapacityExecutor::new_stepped(base.config, base.weights, MAXIMUM_CONTEXT_TOKENS)
+        }
+    };
     let mut concat_parent = weights
         .resident_chat_executor(MAXIMUM_CONTEXT_TOKENS, MAXIMUM_KV_BYTES)
         .expect("concat parent executor plan");
