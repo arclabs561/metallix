@@ -51,6 +51,84 @@ class QualifyCodexTests(unittest.TestCase):
         )
         self.assertTrue(result["passed"])
 
+    def test_pointer_chain_requires_two_ordered_command_results(self) -> None:
+        stdout = events(
+            {
+                "id": "pointer",
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": "The qualification value is in detail.txt.\n",
+            },
+            {
+                "id": "detail",
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": f"qualification_value={self.value}\n",
+            },
+            {"id": "message", "type": "agent_message", "text": self.marker},
+        )
+        result = module.assess(
+            0,
+            False,
+            stdout,
+            self.value,
+            self.marker,
+            required_command_evidence=("detail.txt", self.value),
+            minimum_command_executions=2,
+        )
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["command_execution_count"], 2)
+
+    def test_pointer_chain_rejects_one_command_even_with_both_values(self) -> None:
+        stdout = events(
+            {
+                "id": "combined",
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": f"detail.txt\nqualification_value={self.value}\n",
+            },
+            {"id": "message", "type": "agent_message", "text": self.marker},
+        )
+        result = module.assess(
+            0,
+            False,
+            stdout,
+            self.value,
+            self.marker,
+            required_command_evidence=("detail.txt", self.value),
+            minimum_command_executions=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["successful_command_execution"])
+
+    def test_pointer_chain_rejects_reordered_evidence(self) -> None:
+        stdout = events(
+            {
+                "id": "detail",
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": f"qualification_value={self.value}\n",
+            },
+            {
+                "id": "pointer",
+                "type": "command_execution",
+                "exit_code": 0,
+                "aggregated_output": "The qualification value is in detail.txt.\n",
+            },
+            {"id": "message", "type": "agent_message", "text": self.marker},
+        )
+        result = module.assess(
+            0,
+            False,
+            stdout,
+            self.value,
+            self.marker,
+            required_command_evidence=("detail.txt", self.value),
+            minimum_command_executions=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["required_command_evidence"])
+
     def test_answer_without_execution_does_not_pass(self) -> None:
         stdout = events({"id": "message", "type": "agent_message", "text": self.marker})
         result = module.assess(0, False, stdout, self.value, self.marker)
@@ -338,6 +416,12 @@ class QualifyCodexTests(unittest.TestCase):
         self.assertIn("facts.txt", prompt)
         self.assertIn("QUALIFIED:<the qualification_value you read>", prompt)
         self.assertNotIn(fixture_value, prompt)
+
+    def test_pointer_prompt_does_not_reveal_the_fixture_value(self) -> None:
+        prompt = module.qualification_prompt("pointer_chain")
+        self.assertIn("pointer.txt", prompt)
+        self.assertIn("file named by pointer.txt", prompt)
+        self.assertNotIn(self.value, prompt)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- DeepSeek's test-only reduced forward now qualifies Engram1 output into the
+  native layer-one attention/HC/FFN path and onward to the existing layer-two
+  suffix, with exact output hashes and corrupted-entry rejection. The Codex
+  qualifier also covers an ordered two-command pointer chain while retaining
+  its single-file control.
 - Resident Qwen chat now uses bounded stepped K/V storage with valid-prefix
   attention and whole-request reset on append failure. The 2048-token real
   server gate preserved exact output/token parity for Qwen3-0.6B and 4B; local

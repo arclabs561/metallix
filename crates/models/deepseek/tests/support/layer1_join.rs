@@ -481,6 +481,27 @@ pub(super) fn native_layer_one_entries_from_block_entries(
     native_ffn(&fixture, &attention_handoffs(&fixture, &outputs))
 }
 
+pub(super) fn native_layer_one_entries_from_engram_entries(
+    entries: &[(usize, Vec<u16>)],
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
+    let fixture = fixture();
+    assert_eq!(
+        entries.len(),
+        fixture.cases.len(),
+        "native Engram entry count"
+    );
+    let block_entries = fixture
+        .cases
+        .iter()
+        .zip(entries)
+        .map(|(case, (start, residual))| {
+            assert_eq!(*start, case.start_pos, "native Engram entry start");
+            (*start, residual.clone(), case.incoming_pre.fp32())
+        })
+        .collect::<Vec<_>>();
+    native_layer_one_entries_from_block_entries(Some(&block_entries))
+}
+
 #[test]
 fn native_layer_one_attention_hc_ffn_reaches_final_logits() {
     let entries = native_layer_one_entries();

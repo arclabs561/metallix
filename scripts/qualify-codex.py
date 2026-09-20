@@ -78,8 +78,14 @@ def toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def qualification_prompt() -> str:
+def qualification_prompt(case: str = "single_file") -> str:
     """Ask for the fixture's value without placing it in the request itself."""
+    if case == "pointer_chain":
+        return (
+            "Use the native command tool to read pointer.txt. Then use the same "
+            "tool to read the file named by pointer.txt. Find its qualification_value, "
+            "then reply exactly QUALIFIED:<the qualification_value you read> and no other text."
+        )
     return (
         "Read facts.txt with the native command tool. Find its qualification_value, "
         "then reply exactly QUALIFIED:<the qualification_value you read> and no other text."
@@ -179,13 +185,21 @@ def parse_events(stdout: str) -> tuple[list[dict], str | None]:
 
 
 def assess(
-    exit_code: int | None, timed_out: bool, stdout: str, value: str, marker: str
+    exit_code: int | None,
+    timed_out: bool,
+    stdout: str,
+    value: str,
+    marker: str,
+    required_command_evidence: tuple[str, ...] = (),
+    minimum_command_executions: int = 1,
 ) -> dict:
     """Require a completed native command execution and the final exact response."""
     events, parse_error = parse_events(stdout)
     command_outputs: list[str] = []
     assistant_messages: list[str] = []
     command_before_final_marker = False
+    required_evidence = required_command_evidence or (value,)
+    evidence_index = 0
     turn_completed = False
     terminal_event_is_last = False
     unsupported_shape = parse_error
@@ -229,14 +243,19 @@ def assess(
                     unsupported_shape = "unsupported command_execution shape"
                     break
                 command_outputs.append(output)
+                if (
+                    evidence_index < len(required_evidence)
+                    and required_evidence[evidence_index] in output
+                ):
+                    evidence_index += 1
             elif item["type"] == "agent_message":
                 text = item.get("text")
                 if not isinstance(text, str):
                     unsupported_shape = "unsupported agent_message shape"
                     break
                 assistant_messages.append(text)
-                command_before_final_marker = text == marker and any(
-                    value in output for output in command_outputs
+                command_before_final_marker = text == marker and evidence_index == len(
+                    required_evidence
                 )
             elif item["type"] not in {"reasoning", "error", "todo_list"}:
                 unsupported_shape = "unsupported completed item type"
@@ -245,9 +264,9 @@ def assess(
         "process_success": exit_code == 0 and not timed_out,
         "jsonl_valid": parse_error is None,
         "supported_event_shape": unsupported_shape is None,
-        "successful_command_execution": any(
-            value in output for output in command_outputs
-        ),
+        "successful_command_execution": len(command_outputs)
+        >= minimum_command_executions,
+        "required_command_evidence": evidence_index == len(required_evidence),
         "command_precedes_final_marker": command_before_final_marker,
         "final_assistant_marker": bool(assistant_messages)
         and assistant_messages[-1] == marker,
@@ -289,7 +308,8 @@ def main() -> int:
         "model_id": args.model_id,
         "repeats": args.repeats,
         "timeout_seconds": args.timeout_seconds,
-        "fixture": "unique facts.txt in a synthetic output-owned workspace",
+        "cases": ["single_file", "pointer_chain"],
+        "fixture": "unique synthetic files in an output-owned workspace",
     }
     if not args.run:
         print(json.dumps(plan, indent=2))
@@ -317,10 +337,16 @@ def main() -> int:
             workspace = Path(
                 tempfile.mkdtemp(prefix=f"trial-{repeat}-", dir=args.output)
             )
-            value = f"FACT-{os.urandom(16).hex()}"
-            marker = f"QUALIFIED:{value}"
+            facts_value = f"FACT-{os.urandom(16).hex()}"
+            detail_value = f"CHAIN-{os.urandom(16).hex()}"
             facts = workspace / "facts.txt"
-            facts.write_text(f"qualification_value={value}\n")
+            facts.write_text(f"qualification_value={facts_value}\n")
+            (workspace / "pointer.txt").write_text(
+                "The qualification value is in detail.txt. Read that file next.\n"
+            )
+            (workspace / "detail.txt").write_text(
+                f"qualification_value={detail_value}\n"
+            )
             instructions = workspace / "qualification-instructions.md"
             instructions.write_text(
                 "Use the native command tool when the request asks you to read a file.\n"
@@ -329,44 +355,65 @@ def main() -> int:
             if before is None:
                 raise RuntimeError(before_error or "could not snapshot workspace")
             input_sha256 = hashlib.sha256(facts.read_bytes()).hexdigest()
-            prompt = qualification_prompt()
-            command = codex_command(
-                args.codex_binary,
-                args.url,
-                args.model_id,
-                workspace,
-                instructions,
-                prompt,
-            )
-            started = time.monotonic()
-            exit_code, stdout, stderr, timed_out, launch_error = execute(
-                command, args.timeout_seconds
-            )
-            label = f"trial-{repeat}"
-            (args.output / f"{label}.stdout.log").write_text(stdout)
-            (args.output / f"{label}.stderr.log").write_text(stderr)
-            after, workspace_error = workspace_snapshot(workspace)
-            row = {
-                "repeat": repeat,
-                "workspace": workspace.name,
-                "exit_code": exit_code,
-                "timed_out": timed_out,
-                "launch_error": launch_error,
-                "wall_ms": (time.monotonic() - started) * 1000,
-                "input_sha256": input_sha256,
-                "argv_sha256": sha256_text(json.dumps(command, separators=(",", ":"))),
-                "cli_version_argv_sha256": sha256_text(
-                    version_stdout + "\0" + json.dumps(command, separators=(",", ":"))
-                ),
-                "workspace_unchanged": before == after and workspace_error is None,
-                "workspace_error": workspace_error,
-                "stdout_log": f"{label}.stdout.log",
-                "stderr_log": f"{label}.stderr.log",
-                **assess(exit_code, timed_out, stdout, value, marker),
-            }
-            receipt["trials"].append(row)
-            receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
-            print(f"trial {repeat}: {'pass' if row['passed'] else 'FAIL'}", flush=True)
+            for case, value, evidence, minimum in (
+                ("single_file", facts_value, (facts_value,), 1),
+                ("pointer_chain", detail_value, ("detail.txt", detail_value), 2),
+            ):
+                marker = f"QUALIFIED:{value}"
+                prompt = qualification_prompt(case)
+                command = codex_command(
+                    args.codex_binary,
+                    args.url,
+                    args.model_id,
+                    workspace,
+                    instructions,
+                    prompt,
+                )
+                started = time.monotonic()
+                exit_code, stdout, stderr, timed_out, launch_error = execute(
+                    command, args.timeout_seconds
+                )
+                label = f"trial-{repeat}-{case}"
+                (args.output / f"{label}.stdout.log").write_text(stdout)
+                (args.output / f"{label}.stderr.log").write_text(stderr)
+                after, workspace_error = workspace_snapshot(workspace)
+                row = {
+                    "repeat": repeat,
+                    "case": case,
+                    "workspace": workspace.name,
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                    "launch_error": launch_error,
+                    "wall_ms": (time.monotonic() - started) * 1000,
+                    "input_sha256": input_sha256,
+                    "argv_sha256": sha256_text(
+                        json.dumps(command, separators=(",", ":"))
+                    ),
+                    "cli_version_argv_sha256": sha256_text(
+                        version_stdout
+                        + "\0"
+                        + json.dumps(command, separators=(",", ":"))
+                    ),
+                    "workspace_unchanged": before == after and workspace_error is None,
+                    "workspace_error": workspace_error,
+                    "stdout_log": f"{label}.stdout.log",
+                    "stderr_log": f"{label}.stderr.log",
+                    **assess(
+                        exit_code,
+                        timed_out,
+                        stdout,
+                        value,
+                        marker,
+                        required_command_evidence=evidence,
+                        minimum_command_executions=minimum,
+                    ),
+                }
+                receipt["trials"].append(row)
+                receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+                print(
+                    f"trial {repeat} {case}: {'pass' if row['passed'] else 'FAIL'}",
+                    flush=True,
+                )
         receipt["status"] = (
             "passed"
             if all(

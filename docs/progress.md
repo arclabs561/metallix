@@ -161,8 +161,9 @@ choices without expanding current support claims.
    natively through final logits, preceded by native Engram3 and layer-two FFN.
    The native layer-two attention/HC/FFN suffix now consumes layer-one's native
    KV/IDs, and native layer-one attention/HC/FFN now feeds it. Layer-one initial
-   residual/pre-mix remains captured. The next boundary is the earlier Engram/HC
-   entry, then layer-zero/embed state and a full stateful runner, while preserving the
+   residual/pre-mix remains captured. Engram1 now feeds the native layer-one
+   path through the reduced suffix with exact fixture and corruption gates. The
+   next boundary is layer-zero/embed state and a full stateful runner, while preserving the
    source-grounded partial-call layer-three shared score keys and discrete
    routing gates. This pair does not use the layer-three/four candidate-mask
    path. Operator and joined-suffix parity do not establish full model generation.

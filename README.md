@@ -312,7 +312,9 @@ coefficients use fixed analytic bounds; discarded attention fails before FFN.
 The captured layer-one initial residual/pre-mix and the partial-call layer-three
 shared score keys remain boundaries. This is not a production API, whole graph,
 Metal path, or checkpoint execution. The next reduced-graph boundary is the
-earlier Engram/HC entry, followed by layer zero and token embeddings, then real
+Engram1 now feeds the native layer-one path through the reduced suffix with
+corruption rejection. The next DeepSeek boundary is layer zero and token
+embeddings, then real
 previous-call layer-three state.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover

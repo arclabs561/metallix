@@ -34,6 +34,8 @@ mod hc_coefficient_bounds;
 mod hc_projection_bounds;
 #[path = "support/layer1_attention_capture.rs"]
 mod layer1_attention_capture;
+#[path = "support/layer1_engram_capture.rs"]
+mod layer1_engram_capture;
 #[path = "support/layer1_join.rs"]
 mod layer1_join;
 #[allow(
@@ -1343,6 +1345,21 @@ fn native_attention_hc_ffn_chain_matches_source_numerical_contract() {
 fn native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry() {
     let f = layer_three_fixture();
     assert_eq!(native_layer_three_block_tail(&f).len(), f.cases.len());
+}
+
+#[test]
+fn native_layer_one_engram_reaches_layer_two_suffix() {
+    let engram_entries = layer1_engram_capture::native_layer_one_block_entries();
+    let layer_one = layer1_join::native_layer_one_entries_from_engram_entries(&engram_entries);
+    layer2_join::native_layer_two_from_entries(&layer_one);
+}
+
+#[test]
+#[should_panic(expected = "native Engram layer-one residual at block boundary")]
+fn native_layer_one_engram_rejects_corrupted_block_entry() {
+    let mut entries = layer1_engram_capture::native_layer_one_block_entries();
+    entries[0].1[0] ^= 1;
+    layer1_join::native_layer_one_entries_from_engram_entries(&entries);
 }
 
 #[test]
