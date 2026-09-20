@@ -499,3 +499,33 @@ optimization investigation should isolate attention and KV-update evaluation
 costs while keeping the existing numerical and repeated serving gates.
 The current probe does not distinguish those kernels or establish their
 individual contribution. Instrumentation is test-only and absent from production builds.
+
+### Standalone cache-update and attention graphs
+
+The optimized ignored test
+`cache_component_graphs_are_repeatable_without_mutating_resident_kv` uses
+materialized Qwen3-0.6B FP32 caches at the same three prompt lengths. Each
+length has one warmup and three measured rows on the same M3 Max host, without
+background isolation. A row evaluates three separate graphs: 56 K/V
+concatenations with synthetic zero-token updates, 28 attentions with a zero
+query over the existing caches, and 28 attentions over the appended caches.
+Each graph has exactly one terminal MLX evaluation. Construction and output
+fingerprinting happen outside the measured interval; initializing the lazy
+zero tensors is part of the graph. These are host evaluation intervals for
+standalone components, not per-kernel GPU timings or serving measurements.
+
+| Prompt tokens | K/V concatenation median / sample stdev | Attention median / sample stdev | Combined graph median / sample stdev |
+| ---: | ---: | ---: | ---: |
+| 128 | 0.452 / 0.017 ms | 0.305 / 0.011 ms | 0.559 / 0.023 ms |
+| 512 | 0.912 / 0.003 ms | 0.575 / 0.003 ms | 1.147 / 0.012 ms |
+| 1983 | 2.868 / 0.061 ms | 1.636 / 0.045 ms | 4.173 / 0.024 ms |
+
+All rows preserve cache metadata, repeated attention fingerprints, and exact
+full-logit equality from an ordinary decoder branch before and after the
+component graphs. Raw rows, executable identity and summaries are under ignored
+`artifacts/qwen-cache-component-profile/`. The standalone concatenation cost
+grows materially with prefix length, so a bounded cache-update experiment is
+justified. These numbers cannot be subtracted from normal decode time or added
+to predict a speedup: graph scheduling, allocation and dependencies differ.
+Any cache-layout candidate must preserve parent/branch replay and full-logit
+parity, then improve the repeated real CLI/HTTP workload before adoption.

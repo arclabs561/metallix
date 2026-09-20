@@ -1444,6 +1444,7 @@ mod tests {
         assert_eq!(executor.kv_bytes(), 0);
     }
 
+    mod cache_component_profile;
     mod decode_profile;
     mod particle_replay;
 
