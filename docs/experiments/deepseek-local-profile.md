@@ -106,3 +106,9 @@ The native crate now bridges the HC coefficient formula: RMS normalization of
 the four-way expanded hidden state, `attn_hc.fn` products, and the existing
 Sinkhorn coefficient splitter. The bridge has independent finite-coefficient
 coverage; real parameter/input integration remains the next step.
+
+The real parameter/input HC mix now runs through Metallix: token-0 embedding
+from shard two plus layer-zero `attn_hc.fn`, base, and scale from shard one
+produce four-copy coefficients with checksum `5fc4d375e7620dac`. Full block
+execution remains separate, but the real latent-preparation coefficient stage
+is now bound to the checkpoint.

@@ -31,6 +31,9 @@ published release; reference operators do not imply full-model support.
   across the model's four-way hyper-connection layout.
 - Added the checked HC coefficient mix bridge: RMS-normalized expanded hidden
   state, `attn_hc.fn` row products, and existing Sinkhorn coefficient splitting.
+- The native CLI now binds that bridge to the real token-0 embedding and
+  layer-zero HC parameters, producing four-copy coefficients from the local
+  checkpoint.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

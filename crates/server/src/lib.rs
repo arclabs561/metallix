@@ -37,7 +37,9 @@ mod v41_rotary;
 use clap::{Parser, Subcommand};
 use deepseek::{
     V41TextContract,
-    checkpoint::mlx::{read_affine_row_from_shard, read_f32_tensor_from_shard},
+    checkpoint::mlx::{
+        mix_hc_coefficients, read_affine_row_from_shard, read_f32_tensor_from_shard,
+    },
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
 use qwen::{
@@ -1240,6 +1242,132 @@ fn inspect_v41_embedding_row(
                 return ExitCode::FAILURE;
             }
         };
+    if kind == "layer0-hc-mix" {
+        let Some(input_shard) = input_shard else {
+            eprintln!("layer0-hc-mix requires --input-shard");
+            return ExitCode::FAILURE;
+        };
+        let input_bytes = match fs::metadata(input_shard) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                eprintln!("could not stat {}: {error}", input_shard.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut input_file = match fs::File::open(input_shard) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("could not open {}: {error}", input_shard.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut input_prefix = [0_u8; 8];
+        if input_file.read_exact(&mut input_prefix).is_err() {
+            eprintln!("could not read input safetensors prefix");
+            return ExitCode::FAILURE;
+        }
+        let input_header_len =
+            usize::try_from(u64::from_le_bytes(input_prefix)).unwrap_or(usize::MAX);
+        if input_header_len > 100 * 1024 * 1024 {
+            eprintln!("input safetensors header exceeds the bounded limit");
+            return ExitCode::FAILURE;
+        }
+        let mut input_header_bytes = vec![0_u8; 8 + input_header_len];
+        input_header_bytes[..8].copy_from_slice(&input_prefix);
+        if input_file.read_exact(&mut input_header_bytes[8..]).is_err() {
+            eprintln!("could not read input safetensors header");
+            return ExitCode::FAILURE;
+        }
+        let input_header = match deepseek::V41SafetensorsHeader::parse_prefixed_header(
+            &input_header_bytes,
+            input_bytes,
+        ) {
+            Ok(header) => header,
+            Err(error) => {
+                eprintln!("unsupported input safetensors shard: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let hidden = match read_affine_row_from_shard(
+            input_shard,
+            &input_header,
+            "model.embed_tokens.weight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.biases",
+            0,
+            4096,
+            8,
+            64,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("input embedding decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let fn_matrix = match read_f32_tensor_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn_hc.fn",
+            24,
+            16_384,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("hyper-connection fn decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let base = match read_f32_tensor_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn_hc.base",
+            1,
+            24,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("hyper-connection base decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let scale = match read_f32_tensor_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn_hc.scale",
+            1,
+            3,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("hyper-connection scale decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let scale: [f32; 3] = scale.try_into().expect("three HC scales");
+        let coefficients =
+            match mix_hc_coefficients(&fn_matrix, &base, &scale, &hidden, 4, 1e-6, 20) {
+                Ok(coefficients) => coefficients,
+                Err(error) => {
+                    eprintln!("hyper-connection coefficient mix failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let checksum = coefficients
+            .pre()
+            .iter()
+            .chain(coefficients.post())
+            .chain(coefficients.comb().iter())
+            .fold(0_u64, |hash, value| {
+                hash.wrapping_mul(1_099_511_628_211)
+                    .wrapping_add(u64::from(value.to_bits()))
+            });
+        println!("DeepSeek layer-zero HC mix");
+        println!("copies: {}", coefficients.copies());
+        println!("coefficients_checksum: {checksum:016x}");
+        println!("scope: real shard parameters and token-0 embedding; no block execution");
+        return ExitCode::SUCCESS;
+    }
     if kind == "layer0-hc-fn" {
         let values = match read_f32_tensor_from_shard(
             shard,

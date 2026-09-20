@@ -130,8 +130,10 @@ pub fn read_f32_tensor_from_shard(
         .ok_or_else(|| MlxAffineRowError::MissingTensor {
             name: name.to_owned(),
         })?;
+    let shape_matches = tensor.shape() == [rows as u64, width as u64]
+        || (rows == 1 && tensor.shape() == [width as u64]);
     if tensor.dtype() != V41StorageDtype::F32
-        || tensor.shape() != [rows as u64, width as u64]
+        || !shape_matches
         || tensor.byte_length() != (rows * width * 4) as u64
     {
         return Err(MlxAffineRowError::TensorShape {
