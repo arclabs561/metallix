@@ -5,6 +5,11 @@
 //! adapter. Owner/consumer layer inputs remain fixture boundaries; both producer
 //! and consumer QR are computed by the native candidate-query adapter.
 
+#![allow(
+    dead_code,
+    reason = "the layer-three and layer-four integration binaries use disjoint capture controls"
+)]
+
 use super::{attention_capture, candidate_capture};
 
 #[path = "candidate_hc_capture.rs"]
@@ -720,5 +725,142 @@ pub(super) fn native_outputs_from_ownered_inputs(
         wrong_frequency_detected,
         "oracle distinguishes decode rotary positions"
     );
+    outputs
+}
+
+/// Runs the layer-three source-attention fixture from its native HC input,
+/// native owner publication, and native producer-selected compressed IDs.
+///
+/// The remaining attention arithmetic stays independently constrained by the
+/// narrow source fixture; this closes only the owner/producer publication seam.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the source owner operands remain explicit"
+)]
+pub(super) fn native_layer_three_outputs_from_ownered_inputs() -> Vec<Vec<u16>> {
+    let raw = raw_fixture();
+    let attention = attention_capture::layer_three_fixture();
+    let owner_inputs = candidate_hc_capture::derived_inputs();
+    let owner: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+    ))
+    .expect("owner fixture");
+    let owner_model = field(&owner, "model");
+    let owner_cases = field(&owner, "cases").as_array().expect("owner calls");
+    assert_eq!(owner_cases.len(), attention.cases.len());
+    assert_eq!(owner_inputs.len(), attention.cases.len());
+    let owner_weights = field(&owner, "weights");
+    let wk = bf16(field(owner_weights, "wk"));
+    let norm = bf16(field(owner_weights, "norm"));
+    let compressor = compressor_fixture();
+    let compressor_cases = field(&compressor, "cases")
+        .as_array()
+        .expect("compressor calls");
+    let compressor_weights = field(&compressor, "weights");
+    let wkv = bf16(field(compressor_weights, "wkv"));
+    let compressor_norm = bf16(field(compressor_weights, "norm"));
+    let key_layout = IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
+        .expect("captured key layout");
+    let weights = RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &norm));
+    let mut key_owner = RatioOneCompressedOwner::new(
+        key_layout,
+        nonzero(128),
+        nonzero(usize_field(owner_model, "cache_capacity")),
+        3,
+        &compressor_norm,
+        1e-20,
+    )
+    .expect("bounded atomic owner");
+    let all_frequencies = frequencies(&attention);
+    let attention_weights = attention_capture::weights_for_layer(&attention.encoded_parameters, 3);
+    let mut state = LayerAttentionState::new(attention_layout(&attention.model));
+    let mut outputs = Vec::with_capacity(attention.cases.len());
+    for (call_id, ((attention_case, owner_case), compressor_case)) in attention
+        .cases
+        .iter()
+        .zip(owner_cases)
+        .zip(compressor_cases)
+        .enumerate()
+    {
+        let (start, owner_input) = &owner_inputs[call_id];
+        assert_eq!(*start, attention_case.start_pos, "HC attention start");
+        assert_eq!(
+            owner_input,
+            &attention_case.input.bf16(),
+            "HC input cross-gate"
+        );
+        assert_eq!(usize_field(owner_case, "start_pos"), *start, "owner start");
+        assert_eq!(
+            usize_field(compressor_case, "start_pos"),
+            *start,
+            "compressor start"
+        );
+        let positions = shape(field(owner_case, "latent"))[1];
+        assert_eq!(
+            owner_input,
+            &bf16(field(compressor_case, "attention_input")),
+            "owner input"
+        );
+        let publication =
+            IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID"));
+        let owner_frequencies = source_frequencies(&raw, *start, positions, 16);
+        let owner_call = RatioOneOwnerCall::new(
+            publication,
+            *start,
+            nonzero(positions),
+            owner_input,
+            &owner_frequencies,
+            weights,
+        );
+        let pending = key_owner
+            .prepare(owner_call)
+            .expect("staged owner publication");
+        let keys = pending.key_prefix(0).expect("complete staged key prefix");
+        let call = SelectionCall::new(
+            pending.publication(),
+            0,
+            SelectionGeometry::new(
+                *start,
+                nonzero(positions),
+                nonzero(keys.len() / 64),
+                nonzero(1),
+                attention_case.window_kv.shape[1],
+            )
+            .expect("native owner selection geometry"),
+        );
+        assert_eq!(
+            call,
+            candidate_capture::source_call(*start),
+            "producer call identity"
+        );
+        let indices =
+            candidate_capture::generated_producer_indices(*start, keys, call, owner_input);
+        assert_eq!(
+            indices,
+            attention_case.compressed_indices.i32(),
+            "native producer IDs"
+        );
+        assert_eq!(
+            pending.kv_prefix(0).expect("complete staged KV prefix"),
+            attention_case.compressed_kv.bf16(),
+            "native staged KV prefix"
+        );
+        pending.commit().expect("owner publication commit");
+        let diagnostic = forward_with_publication(
+            &mut state,
+            owner_input,
+            *start,
+            key_owner.epoch(),
+            u64::try_from(call_id).expect("call ID"),
+            SOURCE_LAYER,
+            key_owner.kv_prefix(0).expect("published KV prefix"),
+            &indices,
+            call_frequencies(&all_frequencies, attention_case),
+            attention_weights.borrowed(),
+        )
+        .expect("native owner and producer publication drives layer-three attention");
+        assert_diagnostic(attention_case, &diagnostic);
+        outputs.push(diagnostic.final_output);
+    }
     outputs
 }

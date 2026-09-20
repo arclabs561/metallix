@@ -497,9 +497,12 @@ def run_capture() -> dict[str, object]:
                     )
         candidates = candidate_receipt(graph, args.window_size)
         attention_static = {
+            "layer_3_freqs_cis": tensor_record(
+                model.layers[3].attn.freqs_cis, include_storage=True
+            ),
             "layer_4_freqs_cis": tensor_record(
                 model.layers[4].attn.freqs_cis, include_storage=True
-            )
+            ),
         }
     return {
         "schema_version": 1,

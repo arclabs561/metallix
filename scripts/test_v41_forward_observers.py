@@ -41,6 +41,19 @@ class SourceObserverPolicyTest(unittest.TestCase):
             '"incoming_pre": object_record(inputs[2], include_storage=True)', source
         )
 
+    def test_observer_records_layer_three_attention_cache_boundaries(self) -> None:
+        source = OBSERVERS.read_text()
+        self.assertIn("def observed_window_kv_for(", source)
+        self.assertIn("def observed_compress_kv_for(", source)
+        self.assertIn(
+            "layer_three_attention._window_kv = observed_window_kv_for(", source
+        )
+        self.assertIn(
+            "layer_three_attention._compress_kv = observed_compress_kv_for(", source
+        )
+        self.assertIn('record_name = f"layers.{layer_id}.attn.compressed"', source)
+        self.assertIn('name in {"layers.3.attn.wo_b", "layers.4.attn.wo_b"}', source)
+
 
 if __name__ == "__main__":
     unittest.main()

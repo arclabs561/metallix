@@ -21,7 +21,10 @@ use deepseek::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
             IndexQueryWeights, prepare_index_query, prepare_scored_query,
         },
-        selection::{CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates},
+        selection::{
+            CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates,
+            select_from_candidates,
+        },
     },
 };
 use serde::Deserialize;
@@ -333,16 +336,30 @@ pub(super) fn generated_candidates(
     generated_candidates_from_attention_input(start, native_keys, call, &case.inputs.x.bf16())
 }
 
+/// Runs the producer's final native selection over its own candidate scores.
+pub(super) fn generated_producer_indices(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+) -> Vec<i32> {
+    let (candidates, scores) = generated_candidates_and_scores_from_attention_input(
+        start,
+        native_keys,
+        call,
+        attention_input,
+    );
+    select_from_candidates(&scores, call, &candidates, 1)
+        .expect("producer final selection")
+        .indices
+}
+
 /// Generates candidates after an independently derived layer-three attention
 /// input has crossed the source-captured input boundary.
 ///
 /// The existing source fixture remains the arithmetic oracle: this seam only
 /// accepts a shaped native input and still verifies every captured projection,
 /// score, and selected mask below.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep source-stage parity assertions in execution order"
-)]
 #[allow(
     clippy::similar_names,
     reason = "retain source wq_a and wq_b projection names"
@@ -353,6 +370,24 @@ pub(super) fn generated_candidates_from_attention_input(
     call: SelectionCall,
     attention_input: &[u16],
 ) -> CandidateSelection {
+    generated_candidates_and_scores_from_attention_input(start, native_keys, call, attention_input)
+        .0
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep source-stage parity assertions in execution order"
+)]
+#[allow(
+    clippy::similar_names,
+    reason = "retain source wq_a and wq_b projection names"
+)]
+fn generated_candidates_and_scores_from_attention_input(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+) -> (CandidateSelection, Vec<u16>) {
     let fixture = fixture();
     let case = source_case(&fixture, start);
     assert_eq!(
@@ -479,7 +514,7 @@ pub(super) fn generated_candidates_from_attention_input(
         case.candidate_mask.bools(),
         "start {start} candidate mask"
     );
-    candidates
+    (candidates, scores)
 }
 
 pub(super) fn rejects_unmasked_future_candidate() {

@@ -134,7 +134,7 @@ impl Tensor {
             .collect()
     }
 
-    fn i32(&self) -> Vec<i32> {
+    pub(super) fn i32(&self) -> Vec<i32> {
         assert_eq!(self.dtype, "torch.int32");
         let bytes = self.bytes();
         assert_eq!(bytes.len(), self.shape.iter().product::<usize>() * 4);
@@ -162,6 +162,28 @@ pub(super) fn fixture() -> Fixture {
     );
     assert_source_provenance(&fixture.source);
     assert_fixture_contract(&fixture);
+    fixture
+}
+
+/// A new source capture for the producer layer; historical layer-four fixture
+/// identities remain intentionally separate.
+pub(super) fn layer_three_fixture() -> Fixture {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/forward-layer3-attention-reference.json"
+    ))
+    .expect("valid layer-three source attention fixture");
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(fixture.cases.len(), 3);
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 5, 6]
+    );
+    assert_source_provenance(&fixture.source);
+    assert_fixture_contract_for(&fixture, 3, false);
     fixture
 }
 
@@ -195,6 +217,10 @@ fn assert_source_provenance(source: &BTreeMap<String, String>) {
 }
 
 fn assert_fixture_contract(fixture: &Fixture) {
+    assert_fixture_contract_for(fixture, 4, true);
+}
+
+fn assert_fixture_contract_for(fixture: &Fixture, attention_layer: usize, historical: bool) {
     let model = &fixture.model;
     assert_eq!((model.dim, model.head_dim, model.n_heads), (128, 64, 2));
     assert_eq!((model.q_lora_rank, model.rope_head_dim), (32, 32));
@@ -213,29 +239,46 @@ fn assert_fixture_contract(fixture: &Fixture) {
         "exact Attention.forward output after source inverse RoPE and output projections"
     );
     assert!(fixture.comparison_policy.fixed_before_candidate_execution);
-    assert_eq!(
-        fixture.comparison_policy.compressed_kv_and_indices,
-        "source _compress_kv read from shared layer-three publication; indices retain source offset domain"
-    );
-    for name in [
-        "layers.4.attn.wq_a.weight",
-        "layers.4.attn.wq_a.scale",
-        "layers.4.attn.q_norm.weight",
-        "layers.4.attn.wq_b.weight",
-        "layers.4.attn.wq_b.scale",
-        "layers.4.attn.wkv.weight",
-        "layers.4.attn.wkv.scale",
-        "layers.4.attn.kv_norm.weight",
-        "layers.4.attn.attn_sink",
-        "layers.4.attn.wo_a.weight",
-        "layers.4.attn.wo_b.weight",
-        "layers.4.attn.wo_b.scale",
-        "layers.4.attn.indexer.wq_b.weight",
-        "layers.4.attn.indexer.wq_b.scale",
-        "layers.4.attn.indexer.weights_proj.weight",
-    ] {
+    if historical {
+        assert_eq!(
+            fixture.comparison_policy.compressed_kv_and_indices,
+            "source _compress_kv read from shared layer-three publication; indices retain source offset domain"
+        );
+        for name in [
+            "layers.4.attn.indexer.wq_b.weight",
+            "layers.4.attn.indexer.wq_b.scale",
+            "layers.4.attn.indexer.weights_proj.weight",
+        ] {
+            assert!(
+                fixture.encoded_parameters.contains_key(name),
+                "captured {name}"
+            );
+        }
+    } else {
         assert!(
-            fixture.encoded_parameters.contains_key(name),
+            fixture
+                .comparison_policy
+                .compressed_kv_and_indices
+                .contains("layer-three _compress_kv")
+        );
+    }
+    for name in [
+        "wq_a.weight",
+        "wq_a.scale",
+        "q_norm.weight",
+        "wq_b.weight",
+        "wq_b.scale",
+        "wkv.weight",
+        "wkv.scale",
+        "kv_norm.weight",
+        "attn_sink",
+        "wo_a.weight",
+        "wo_b.weight",
+        "wo_b.scale",
+    ] {
+        let name = format!("layers.{attention_layer}.attn.{name}");
+        assert!(
+            fixture.encoded_parameters.contains_key(&name),
             "captured {name}"
         );
     }
@@ -355,19 +398,27 @@ impl EncodedWeights {
 }
 
 pub(super) fn weights(parameters: &BTreeMap<String, Tensor>) -> EncodedWeights {
+    weights_for_layer(parameters, 4)
+}
+
+pub(super) fn weights_for_layer(
+    parameters: &BTreeMap<String, Tensor>,
+    layer: usize,
+) -> EncodedWeights {
+    let name = |suffix: &str| format!("layers.{layer}.attn.{suffix}");
     EncodedWeights {
-        wq_a_codes: fp8_codes(parameters, "layers.4.attn.wq_a.weight"),
-        wq_a_scales: fp8_scales(parameters, "layers.4.attn.wq_a.scale"),
-        q_norm: bf16(parameters, "layers.4.attn.q_norm.weight"),
-        wq_b_codes: fp8_codes(parameters, "layers.4.attn.wq_b.weight"),
-        wq_b_scales: fp8_scales(parameters, "layers.4.attn.wq_b.scale"),
-        wkv_codes: fp8_codes(parameters, "layers.4.attn.wkv.weight"),
-        wkv_scales: fp8_scales(parameters, "layers.4.attn.wkv.scale"),
-        kv_norm: bf16(parameters, "layers.4.attn.kv_norm.weight"),
-        attn_sink: fp32(parameters, "layers.4.attn.attn_sink"),
-        wo_a: bf16(parameters, "layers.4.attn.wo_a.weight"),
-        wo_b_codes: fp8_codes(parameters, "layers.4.attn.wo_b.weight"),
-        wo_b_scales: fp8_scales(parameters, "layers.4.attn.wo_b.scale"),
+        wq_a_codes: fp8_codes(parameters, &name("wq_a.weight")),
+        wq_a_scales: fp8_scales(parameters, &name("wq_a.scale")),
+        q_norm: bf16(parameters, &name("q_norm.weight")),
+        wq_b_codes: fp8_codes(parameters, &name("wq_b.weight")),
+        wq_b_scales: fp8_scales(parameters, &name("wq_b.scale")),
+        wkv_codes: fp8_codes(parameters, &name("wkv.weight")),
+        wkv_scales: fp8_scales(parameters, &name("wkv.scale")),
+        kv_norm: bf16(parameters, &name("kv_norm.weight")),
+        attn_sink: fp32(parameters, &name("attn_sink")),
+        wo_a: bf16(parameters, &name("wo_a.weight")),
+        wo_b_codes: fp8_codes(parameters, &name("wo_b.weight")),
+        wo_b_scales: fp8_scales(parameters, &name("wo_b.scale")),
     }
 }
 

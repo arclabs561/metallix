@@ -322,6 +322,16 @@ def hooks_for(
     had_compress, prior_compress, original_compress = instance_method(
         layer_four_attention, "_compress_kv"
     )
+    (
+        had_producer_window,
+        prior_producer_window,
+        original_producer_window,
+    ) = instance_method(layer_three_attention, "_window_kv")
+    (
+        had_producer_compress,
+        prior_producer_compress,
+        original_producer_compress,
+    ) = instance_method(layer_three_attention, "_compress_kv")
     had_indexer_forward, prior_indexer_forward, original_indexer_forward = (
         instance_method(layer_four_indexer, "forward")
     )
@@ -456,10 +466,13 @@ def hooks_for(
             "layers.4.attn.wq_b",
         }:
             handles.append(module.register_forward_hook(capture(name)))
-        if name == "layers.4.attn.wo_b":
+        if name in {"layers.3.attn.wo_b", "layers.4.attn.wo_b"}:
             handles.append(
                 module.register_forward_pre_hook(
-                    capture_input("layers.4.attn.wo_b_input", exactly_one=True)
+                    capture_input(
+                        f"{name.removesuffix('.wo_b')}.wo_b_input",
+                        exactly_one=True,
+                    )
                 )
             )
         if name == "layers.4.ffn_norm":
@@ -515,45 +528,63 @@ def hooks_for(
             )
         return original_hc_mixes(x, hc_fn, hc_scale, hc_base)
 
-    def observed_window_kv(
-        x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cap_guard("layers.4.attn.window")
-        if "layers.4.attn.window" in records:
-            raise RuntimeError("layer-four window KV was observed twice")
-        window_kv, window_indices = original_window(x, freqs_cis, start_pos)
-        prepared = (
-            window_kv
-            if start_pos == 0
-            else layer_four_attention.window_kv_cache[
-                : x.size(0),
-                start_pos % layer_four_attention.window_size : start_pos
-                % layer_four_attention.window_size
-                + 1,
-            ]
-        )
-        records["layers.4.attn.window"] = {
-            "prepared_window_kv": object_record(prepared, include_storage=True),
-            "window_kv": object_record(window_kv, include_storage=True),
-            "indices": object_record(window_indices, include_storage=True),
-            "ring_after": object_record(
-                layer_four_attention.window_kv_cache, include_storage=True
-            ),
-        }
-        return window_kv, window_indices
+    def observed_window_kv_for(
+        layer_id: int,
+        attention: torch.nn.Module,
+        original_window: Callable[..., object],
+    ) -> Callable[..., object]:
+        record_name = f"layers.{layer_id}.attn.window"
 
-    def observed_compress_kv(
-        x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cap_guard("layers.4.attn.compressed")
-        if "layers.4.attn.compressed" in records:
-            raise RuntimeError("layer-four compressed KV was observed twice")
-        compressed_kv, compressed_indices = original_compress(x, qr, start_pos, offset)
-        records["layers.4.attn.compressed"] = {
-            "borrowed_kv": object_record(compressed_kv, include_storage=True),
-            "indices": object_record(compressed_indices, include_storage=True),
-        }
-        return compressed_kv, compressed_indices
+        def observed_window_kv(
+            x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            cap_guard(record_name)
+            if record_name in records:
+                raise RuntimeError(f"layer-{layer_id} window KV was observed twice")
+            window_kv, window_indices = original_window(x, freqs_cis, start_pos)
+            prepared = (
+                window_kv
+                if start_pos == 0
+                else attention.window_kv_cache[
+                    : x.size(0),
+                    start_pos % attention.window_size : start_pos
+                    % attention.window_size
+                    + 1,
+                ]
+            )
+            records[record_name] = {
+                "prepared_window_kv": object_record(prepared, include_storage=True),
+                "window_kv": object_record(window_kv, include_storage=True),
+                "indices": object_record(window_indices, include_storage=True),
+                "ring_after": object_record(
+                    attention.window_kv_cache, include_storage=True
+                ),
+            }
+            return window_kv, window_indices
+
+        return observed_window_kv
+
+    def observed_compress_kv_for(
+        layer_id: int, original_compress: Callable[..., object]
+    ) -> Callable[..., object]:
+        record_name = f"layers.{layer_id}.attn.compressed"
+
+        def observed_compress_kv(
+            x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            cap_guard(record_name)
+            if record_name in records:
+                raise RuntimeError(f"layer-{layer_id} compressed KV was observed twice")
+            compressed_kv, compressed_indices = original_compress(
+                x, qr, start_pos, offset
+            )
+            records[record_name] = {
+                "borrowed_kv": object_record(compressed_kv, include_storage=True),
+                "indices": object_record(compressed_indices, include_storage=True),
+            }
+            return compressed_kv, compressed_indices
+
+        return observed_compress_kv
 
     def observed_indexer_forward_for(
         role: IndexerRole,
@@ -652,8 +683,18 @@ def hooks_for(
 
     try:
         layer_four.hc_mixes = observed_hc_mixes
-        layer_four_attention._window_kv = observed_window_kv
-        layer_four_attention._compress_kv = observed_compress_kv
+        layer_three_attention._window_kv = observed_window_kv_for(
+            3, layer_three_attention, original_producer_window
+        )
+        layer_three_attention._compress_kv = observed_compress_kv_for(
+            3, original_producer_compress
+        )
+        layer_four_attention._window_kv = observed_window_kv_for(
+            4, layer_four_attention, original_window
+        )
+        layer_four_attention._compress_kv = observed_compress_kv_for(
+            4, original_compress
+        )
         layer_three_indexer.forward = observed_indexer_forward_for(
             IndexerRole.PRODUCER, original_producer_indexer_forward
         )
@@ -671,6 +712,18 @@ def hooks_for(
         _restore_instance(layer_four_attention, "_window_kv", had_window, prior_window)
         _restore_instance(
             layer_four_attention, "_compress_kv", had_compress, prior_compress
+        )
+        _restore_instance(
+            layer_three_attention,
+            "_window_kv",
+            had_producer_window,
+            prior_producer_window,
+        )
+        _restore_instance(
+            layer_three_attention,
+            "_compress_kv",
+            had_producer_compress,
+            prior_producer_compress,
         )
         _restore_instance(
             layer_three_indexer,

@@ -131,6 +131,8 @@ class ObserverRuntimeTest(unittest.TestCase):
                 for name, module in modules.items()
             }
             targets = (
+                (model.layers[3].attn, "_window_kv"),
+                (model.layers[3].attn, "_compress_kv"),
                 (model.layers[3].attn.indexer, "forward"),
                 (model.layers[4].attn.indexer, "forward"),
                 (model.layers[4], "hc_mixes"),
