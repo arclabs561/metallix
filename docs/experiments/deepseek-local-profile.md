@@ -67,3 +67,8 @@ not yet a full checkpoint loader or model executor.
 The native row gate now decodes the real token-0 embedding from shard two:
 width `4096`, checksum `9aa497cb4f7c9e00`. This is a bounded file-range read
 through Metallix's own header and affine decoder, with no full checkpoint load.
+
+With `--all-features`, the same row gate now evaluates the decoded 4096-wide
+embedding on Metal and reports `metal_eval: passed`. This is the first real
+DeepSeek tensor to cross Metallix's native device boundary; full block execution
+and logits remain the next gate.

@@ -1235,6 +1235,13 @@ fn inspect_v41_embedding_row(shard: &PathBuf, row: usize) -> ExitCode {
             println!("row: {row}");
             println!("width: {}", values.len());
             println!("fp32_checksum: {checksum:016x}");
+            #[cfg(feature = "metal")]
+            if let Err(error) = deepseek::checkpoint::mlx::decode_affine_row_mlx(&values) {
+                eprintln!("MLX embedding evaluation failed: {error}");
+                return ExitCode::FAILURE;
+            }
+            #[cfg(feature = "metal")]
+            println!("metal_eval: passed");
             println!("scope: one affine row decoded; no model execution");
             ExitCode::SUCCESS
         }

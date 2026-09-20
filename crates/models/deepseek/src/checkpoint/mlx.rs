@@ -162,6 +162,19 @@ pub fn decode_affine_row(
     Ok(output)
 }
 
+/// Converts one decoded row to an MLX array and evaluates it on the device.
+#[cfg(feature = "metal")]
+pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "embedding rows are bounded to model widths"
+    )]
+    let array = mlx_rs::Array::from_slice(values, &[values.len() as i32]);
+    array.eval()?;
+    Ok(array)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MlxAffineRowError, decode_affine_row};
