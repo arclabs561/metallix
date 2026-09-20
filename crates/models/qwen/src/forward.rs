@@ -14,7 +14,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mlx_rs::{Array, StreamOrDevice, fast, ops};
+use mlx_rs::{
+    Array, StreamOrDevice, fast, ops,
+    ops::indexing::{IndexMutOp, IndexOp},
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -321,6 +324,7 @@ pub struct Qwen3ForwardExecutor<'a, S: BuildHasher> {
     cached_tokens: usize,
     maximum_context_tokens: usize,
     resident_chat_plan: Option<Qwen3ResidentChatPlan>,
+    resident_cache_capacity: Option<usize>,
 }
 
 /// Adapter-local Qwen3 KV state.
@@ -343,6 +347,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             cached_tokens: 0,
             maximum_context_tokens: config.maximum_cached_tokens(),
             resident_chat_plan: None,
+            resident_cache_capacity: None,
         }
     }
 
@@ -361,6 +366,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             cached_tokens: 0,
             maximum_context_tokens: plan.maximum_context_tokens,
             resident_chat_plan: Some(plan),
+            resident_cache_capacity: Some(plan.maximum_context_tokens),
         }
     }
 
@@ -443,10 +449,11 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         if self.cache.len() != self.config.hidden_layers || self.cache.iter().any(Option::is_none) {
             return Err(Qwen3ForwardError::CacheInconsistent);
         }
+        let stored_tokens = self.resident_cache_capacity.unwrap_or(self.cached_tokens);
         let expected_shape = [
             1,
             as_i32(self.config.key_value_heads)?,
-            as_i32(self.cached_tokens)?,
+            as_i32(stored_tokens)?,
             as_i32(self.config.head_dim)?,
         ];
         for layer in self.cache.iter().flatten() {
@@ -472,6 +479,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             cached_tokens: self.cached_tokens,
             maximum_context_tokens: self.maximum_context_tokens,
             resident_chat_plan: self.resident_chat_plan,
+            resident_cache_capacity: self.resident_cache_capacity,
         })
     }
 
@@ -509,7 +517,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         let rope_offset =
             i32::try_from(self.cached_tokens).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
         for layer in 0..self.config.hidden_layers {
-            hidden_states = forward_cached_layer(
+            hidden_states = forward_cached_layer_with_capacity(
                 self.config,
                 self.weights,
                 layer,
@@ -519,6 +527,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
                 &hidden_states,
                 seq_len,
                 rope_offset,
+                self.resident_cache_capacity,
             )?;
         }
 
@@ -549,6 +558,28 @@ pub(crate) fn forward_cached_layer<S: BuildHasher>(
     seq_len: i32,
     rope_offset: i32,
 ) -> Result<Array, Qwen3ForwardError> {
+    forward_cached_layer_with_capacity(
+        config,
+        weights,
+        layer,
+        cache,
+        hidden_states,
+        seq_len,
+        rope_offset,
+        None,
+    )
+}
+
+fn forward_cached_layer_with_capacity<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    layer: usize,
+    cache: &mut Option<Qwen3LayerKv>,
+    hidden_states: &Array,
+    seq_len: i32,
+    rope_offset: i32,
+    resident_cache_capacity: Option<usize>,
+) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
     let hidden = as_i32(config.hidden_size)?;
     let intermediate = as_i32(config.intermediate_size)?;
@@ -566,6 +597,7 @@ pub(crate) fn forward_cached_layer<S: BuildHasher>(
         &attention_input,
         seq_len,
         rope_offset,
+        resident_cache_capacity,
     )?;
     let residual = hidden_states.add_device(&attention, &stream)?;
     let mlp_input = rms_norm(
@@ -600,6 +632,7 @@ fn cached_attention<S: BuildHasher>(
     input: &Array,
     seq_len: i32,
     rope_offset: i32,
+    resident_cache_capacity: Option<usize>,
 ) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
     let heads = as_i32(config.attention_heads)?;
@@ -643,23 +676,39 @@ fn cached_attention<S: BuildHasher>(
         &stream,
     )?;
     let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
-    let (keys, values, causal) = if let Some(previous) = cache.take() {
-        (
-            ops::concatenate_axis_device(&[&previous.keys, &key], 2, &stream)?,
-            ops::concatenate_axis_device(&[&previous.values, &value], 2, &stream)?,
-            false,
-        )
-    } else {
-        (key, value, true)
+    let (keys, values, attention_keys, attention_values, causal) = match resident_cache_capacity {
+        Some(maximum_capacity) => stepped_cached_kv(
+            cache,
+            key,
+            value,
+            rope_offset,
+            maximum_capacity,
+            &stream,
+        )?,
+        None => {
+            if let Some(previous) = cache.take() {
+                (
+                    ops::concatenate_axis_device(&[&previous.keys, &key], 2, &stream)?,
+                    ops::concatenate_axis_device(&[&previous.values, &value], 2, &stream)?,
+                    None,
+                    None,
+                    false,
+                )
+            } else {
+                (key, value, None, None, true)
+            }
+        }
     };
+    let attention_keys = attention_keys.as_ref().unwrap_or(&keys);
+    let attention_values = attention_values.as_ref().unwrap_or(&values);
     // Keep KV as dependencies of attention. The final-logits readback evaluates
     // the complete graph, including these retained arrays, in one submission
     // instead of blocking twice per layer. Reset drops all request-owned KV.
     let output = if causal {
         fast::scaled_dot_product_attention_device(
             &query,
-            &keys,
-            &values,
+            attention_keys,
+            attention_values,
             attention_scale(config)?,
             Some(fast::ScaledDotProductAttentionMask::Causal),
             &stream,
@@ -667,8 +716,8 @@ fn cached_attention<S: BuildHasher>(
     } else {
         fast::scaled_dot_product_attention_device(
             &query,
-            &keys,
-            &values,
+            attention_keys,
+            attention_values,
             attention_scale(config)?,
             None::<fast::ScaledDotProductAttentionMask<'_>>,
             &stream,
@@ -688,6 +737,105 @@ fn cached_attention<S: BuildHasher>(
             &stream,
         )?;
     linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
+}
+
+fn stepped_cached_kv(
+    cache: &mut Option<Qwen3LayerKv>,
+    key: Array,
+    value: Array,
+    rope_offset: i32,
+    maximum_capacity: usize,
+    stream: &StreamOrDevice,
+) -> Result<(Array, Array, Option<Array>, Option<Array>, bool), Qwen3ForwardError> {
+    let appended = *key
+        .shape()
+        .get(2)
+        .ok_or(Qwen3ForwardError::CacheInconsistent)?;
+    let next = rope_offset
+        .checked_add(appended)
+        .ok_or(Qwen3ForwardError::ShapeOverflow)?;
+    let next_usize = usize::try_from(next).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    let capacity = stepped_capacity(next_usize, maximum_capacity)?;
+    let capacity_i32 = as_i32(capacity)?;
+    let key_shape = key.shape();
+    let value_shape = value.shape();
+    if key_shape.len() != 4 || value_shape != key_shape {
+        return Err(Qwen3ForwardError::CacheInconsistent);
+    }
+    let expected_storage_shape = [
+        key_shape[0],
+        key_shape[1],
+        capacity_i32,
+        key_shape[3],
+    ];
+    let (mut keys, mut values, causal) = match cache.take() {
+        Some(previous)
+            if previous.keys.shape() == expected_storage_shape
+                && previous.values.shape() == expected_storage_shape =>
+        {
+            (previous.keys, previous.values, false)
+        }
+        Some(previous) => {
+            let prior = previous
+                .keys
+                .shape()
+                .get(2)
+                .copied()
+                .ok_or(Qwen3ForwardError::CacheInconsistent)?;
+            if previous.keys.shape().len() != 4
+                || previous.values.shape() != previous.keys.shape()
+                || previous.keys.shape()[0] != key_shape[0]
+                || previous.keys.shape()[1] != key_shape[1]
+                || previous.keys.shape()[3] != key_shape[3]
+                || prior < rope_offset
+            {
+                return Err(Qwen3ForwardError::CacheInconsistent);
+            }
+            let key_prefix = previous
+                .keys
+                .index_device((.., .., 0..rope_offset, ..), stream);
+            let value_prefix = previous
+                .values
+                .index_device((.., .., 0..rope_offset, ..), stream);
+            let mut keys = ops::zeros_dtype_device(&expected_storage_shape, key.dtype(), stream)?;
+            let mut values =
+                ops::zeros_dtype_device(&expected_storage_shape, value.dtype(), stream)?;
+            keys.index_mut_device((.., .., 0..rope_offset, ..), &key_prefix, stream);
+            values.index_mut_device((.., .., 0..rope_offset, ..), &value_prefix, stream);
+            (keys, values, false)
+        }
+        None => {
+            (
+                ops::zeros_dtype_device(&expected_storage_shape, key.dtype(), stream)?,
+                ops::zeros_dtype_device(&expected_storage_shape, value.dtype(), stream)?,
+                true,
+            )
+        }
+    };
+    keys.index_mut_device((.., .., rope_offset..next, ..), &key, stream);
+    values.index_mut_device((.., .., rope_offset..next, ..), &value, stream);
+    let attention_keys = keys.index_device((.., .., 0..next, ..), stream);
+    let attention_values = values.index_device((.., .., 0..next, ..), stream);
+    Ok((
+        keys,
+        values,
+        Some(attention_keys),
+        Some(attention_values),
+        causal,
+    ))
+}
+
+fn stepped_capacity(next_tokens: usize, maximum_capacity: usize) -> Result<usize, Qwen3ForwardError> {
+    if next_tokens > maximum_capacity {
+        return Err(Qwen3ForwardError::PromptTooLong {
+            actual: next_tokens,
+            maximum: maximum_capacity,
+        });
+    }
+    Ok([128, 512]
+        .into_iter()
+        .find(|&boundary| next_tokens <= boundary && boundary <= maximum_capacity)
+        .unwrap_or(maximum_capacity))
 }
 
 fn validate_input_ids(
@@ -1171,7 +1319,7 @@ mod tests {
 
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, forward_last_logits,
-        forward_layer, linear, read_last_logits, rms_norm, weight,
+        forward_layer, linear, read_last_logits, rms_norm, stepped_capacity, weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -1221,6 +1369,29 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Stepped resident storage always admits the requested prefix without
+        /// exceeding the configured ceiling and only uses known growth points.
+        #[test]
+        fn stepped_capacity_preserves_prefix_bounds(
+            maximum in 1_usize..=4096,
+            next in 1_usize..=4096,
+        ) {
+            let result = stepped_capacity(next, maximum);
+            if next > maximum {
+                let rejected = matches!(
+                    result,
+                    Err(Qwen3ForwardError::PromptTooLong { actual, maximum: limit })
+                        if actual == next && limit == maximum
+                );
+                prop_assert!(rejected);
+            } else {
+                let capacity = result.expect("admitted prefix has a capacity");
+                prop_assert!(capacity >= next);
+                prop_assert!(capacity <= maximum);
+                prop_assert!(capacity == maximum || capacity == 128 || capacity == 512);
+            }
+        }
 
         /// Every admitted production-layout context uses exactly the logical
         /// f32 K/V formula, including the exact one-byte budget boundary.
