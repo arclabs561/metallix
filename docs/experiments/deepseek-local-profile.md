@@ -50,3 +50,11 @@ Metallix's native DeepSeek adapter remains separately gated on checkpoint-backed
 Rust loading, full stateful execution, Metal parity, and end-to-end Codex
 qualification. The oMLX profile gives us a usable external baseline while those
 native gates continue.
+
+The native header gate also accepts an individual shard. On the first local
+shard it validated a 3,956,262,156-byte file and 1,625 tensor headers without
+reading payload bytes:
+
+```sh
+mx inspect-v41-shard /path/to/model-00001-of-00018.safetensors
+```
