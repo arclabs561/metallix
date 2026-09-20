@@ -160,3 +160,50 @@ offsets; these are repeatability measurements, not independent file samples.
 KV offload, predictor-driven loading, speculative prefetch, and adaptive cache
 replacement remain separate experiments. Compare each against a simple exact
 baseline and retain it only with measured benefit and unchanged output semantics.
+
+## DeepSeek routed-expert traffic sensitivity
+
+The pinned V4.1 configuration and inspected shard metadata make one capacity
+constraint concrete before acquiring the checkpoint. These are metadata-derived
+estimates, not measured DeepSeek decode or a completed residency plan.
+
+At revision `dba1be0a40aa45a94ad051997016db3960a90277`, the configuration has
+40 backbone layers, 384 routed experts per layer, six selected per token,
+hidden width 5120 and expert intermediate width 2304. The inspected layer-six,
+expert-zero header contains three packed I8 matrices, each with 5,898,240
+payload bytes, and three E8M0 scale arrays, each with 368,640 bytes. This agrees
+with `3 × 5120 × 2304 × (1/2 + 1/32) = 18,800,640` bytes per routed expert.
+The [selected expert descriptor](../../crates/models/deepseek/src/checkpoint/source_fp4.rs)
+checks this packed-weight/scale relationship; it does not load or qualify those
+payloads.
+
+| Quantity | Derived bytes | Interpretation |
+| --- | ---: | --- |
+| One routed expert, weights plus scales | 18,800,640 | Three projections; excludes host/device expansion |
+| Backbone routed experts at this geometry | 288,777,830,400 | 268.95 GiB; excludes shared experts, Engram, attention and draft layers |
+| One token, all 240 selected backbone experts missing residency | 4,512,153,600 | Useful expert payload demand before read amplification |
+| Index-declared complete checkpoint payload | 510,286,023,000 | Metadata declaration, not verified shard sizes or acquired storage |
+
+Using the earlier 1-MiB probe's 2.909–3.042 GB/s as a **hypothetical sustained
+rate**, the all-miss expert payload alone would take 1.48–1.55 seconds per
+token. That probe does not establish sustained bandwidth for these ranges;
+this calculation is a sensitivity scenario, not a latency prediction.
+At the same assumed rate, even a compute-free budget of five tokens/s permits
+only 12.9–13.5% of selected expert bytes to miss residency; ten tokens/s permits
+6.4–6.7%. Actual compute, Engram lookup, other weights and read amplification
+tighten those budgets. Five and ten tokens/s are illustrative targets, not
+adopted product requirements.
+
+This makes measured routing locality and useful-byte residency prerequisites
+for an interactive-serving claim. It does not establish an attainable hit
+rate: a cache's fraction of stored experts is not its workload hit rate.
+The Engram tables and their lookup locality still require a separate budget.
+Next, replay source-derived routes against explicit RAM limits, measure reads
+of real selected ranges, and settle the intended latency/context target before
+choosing a pager or downloading the full checkpoint.
+
+Evidence: the [pinned config](README.md#v41-source-identity), existing local
+`v41-shard09-header-pinned.json` and `v41-index-pinned.json`; the calculation
+receipt is `artifacts/deepseek-feasibility-metadata.json`. Its input hashes bind
+the inspected metadata. The one inspected expert validates the arithmetic at
+that boundary; extrapolation does not validate every expert header.

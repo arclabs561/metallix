@@ -47,6 +47,30 @@ one's unchanged owned key cache. Preserve both observations in the oracle.
 Native integration must resolve this source behavior explicitly; substituting
 the owned keys would silently change the existing reduced-forward reference.
 
+The current layer-one attention source fixture has its own source gate:
+
+```sh
+uv run scripts/test_v41_layer1_attention_capture.py
+cargo test -p deepseek --test forward_layer1_attention
+```
+
+`fixtures/deepseek-v41/layer1-attention-reference.json` has SHA-256
+`a13bb6cd53406f04e436f119aa8dec2184ca43a4d4f4969205bff8bdf26ac31b`.
+Its six source checks pin exact layer-one attention storage, the source
+ratio-two owner publication, sparse operands, and final output at starts 0, 5,
+and 6. The three focused Rust checks run `LayerAttentionState` with the native
+owner KV/IDs, compare every exposed adapter diagnostic and final output, reject a
+non-owner publication, and demonstrate sensitivity to a legal wrong selected
+index. The source exporter does no attention arithmetic.
+The Rust gate also binds its input and assembled local/owner KV to exact BF16
+source operands. The captured grouped `wo_b` input is not separately exposed
+by the adapter; its projection is covered through the final-output comparison.
+
+At the partial call, the score-key operand is derived from the strict prior
+layer-three candidate capture. It remains a captured layer-three boundary, not
+a layer-one score operand or a native whole-graph result. This standalone native
+layer-one attention check does not yet join layer-one HC/FFN into layer two.
+
 The test-only native replay is separate from this source fixture:
 
 ```sh
@@ -59,7 +83,7 @@ publication, native index query, BF16 score stages, and causal selected IDs for
 starts 0, 5, and 6. It intentionally preserves the source distinction above: at
 start 6 the native scorer consumes the captured layer-three shared score-key
 prefix, not the retained layer-one owner prefix. It is a test-only native
-boundary, not a production interface, native layer-one attention, or
+boundary, not a production interface, layer-one HC/FFN composition, or
 layer-one/two execution.
 
 ## Layer-two borrowed-attention source boundary
@@ -845,5 +869,6 @@ the preserved numerical payload and upstream source identity.
 
 Layer two now receives native layer-one KV/IDs but still receives captured
 layer-one residual/pre-mix at its block entry. Native earlier layer-one attention
-and FFN, the captured partial-call layer-three shared score-key behavior, and
-the remaining earlier blocks precede full-model generation.
+is standalone; native layer-one HC and FFN, earlier Engram/embed state, the
+captured partial-call layer-three shared score-key behavior, and a full stateful
+runner precede full-model generation.

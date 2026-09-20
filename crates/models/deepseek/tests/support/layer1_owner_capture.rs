@@ -174,6 +174,47 @@ fn i32s(tensor: &Tensor) -> Vec<i32> {
         .collect()
 }
 
+fn prior_layer_three_prefix() -> Vec<u16> {
+    let root: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/forward-candidate-reference.json"
+    ))
+    .expect("layer-three candidate fixture");
+    assert_eq!(root["source"]["revision"].as_str(), Some(REVISION));
+    assert_eq!(
+        root["source"]["complete_capture_sha256"].as_str(),
+        Some("7c5cc8541da338fa3426d63e32b9a66e9132e07ab68ee26d86fbf9e29f62f48d")
+    );
+    let case = root["cases"]
+        .as_array()
+        .expect("candidate cases")
+        .iter()
+        .find(|case| case["start_pos"].as_u64() == Some(5))
+        .expect("layer-three start five");
+    let tensor = &case["inputs"]["shared_index_k_prefix"];
+    assert_eq!(tensor["dtype"].as_str(), Some("torch.bfloat16"));
+    assert_eq!(tensor["shape"], serde_json::json!([1, 6, 64]));
+    assert_eq!(tensor["numel"].as_u64(), Some(384));
+    let hex = tensor["storage_hex"].as_str().expect("storage hex");
+    assert!(
+        hex.len().is_multiple_of(2),
+        "candidate storage hex alignment"
+    );
+    let raw: Vec<_> = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16).expect("byte"))
+        .collect();
+    assert_eq!(raw.len(), 384 * 2, "candidate BF16 storage length");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&raw)),
+        tensor["storage_sha256"].as_str().expect("storage hash")
+    );
+    raw[..3 * 64 * 2]
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes(word.try_into().expect("BF16")))
+        .collect()
+}
+
 fn frequencies(tensor: &Tensor) -> Vec<RotaryFrequency> {
     assert_eq!(tensor.dtype, "torch.complex64");
     assert_eq!(tensor.shape, [8, 16]);
@@ -444,6 +485,36 @@ fn assert_native_score(
     indices
 }
 
+fn layer_three_score_keys(
+    case: &Case,
+    owned_keys: &[u16],
+    source_keys: &[u16],
+) -> Option<Vec<u16>> {
+    match case.start_pos {
+        6 => {
+            assert_ne!(
+                owned_keys, source_keys,
+                "partial layer-one owner prefix stays distinct"
+            );
+            let previous = prior_layer_three_prefix();
+            assert_eq!(
+                previous, source_keys,
+                "start six previous layer-three score prefix"
+            );
+            Some(previous)
+        }
+        0 | 5 => {
+            assert_eq!(
+                owned_keys, source_keys,
+                "start {} owned score prefix",
+                case.start_pos
+            );
+            None
+        }
+        other => panic!("unexpected layer-one source call start {other}"),
+    }
+}
+
 /// Replays source-owned KV/key publication through direct index selection.
 ///
 /// The final partial call deliberately exposes its captured score-key operand
@@ -526,14 +597,8 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         );
         assert_eq!(keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
-        let score_keys = if keys == source_score_keys {
-            keys.as_slice()
-        } else {
-            // The final partial call is a documented source boundary: layer
-            // three owns the global score keys, while layer one retains its
-            // publication prefix.  Do not silently substitute one for the other.
-            source_score_keys.as_slice()
-        };
+        let layer_three_score_keys = layer_three_score_keys(case, &keys, &source_score_keys);
+        let score_keys = layer_three_score_keys.as_deref().unwrap_or(&keys);
         let selected_indices = assert_native_score(&fixture, case, &all_frequencies, score_keys);
         outputs.push(NativeCase {
             start_pos: case.start_pos,
