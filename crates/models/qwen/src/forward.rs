@@ -1445,6 +1445,7 @@ mod tests {
     }
 
     mod cache_component_profile;
+    mod capacity_cache_profile;
     mod decode_profile;
     mod particle_replay;
 
