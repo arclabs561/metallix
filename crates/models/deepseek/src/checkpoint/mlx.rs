@@ -175,6 +175,33 @@ pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::er
     Ok(array)
 }
 
+/// Applies a decoded row-major affine matrix to one hidden-state vector on MLX.
+#[cfg(feature = "metal")]
+pub fn apply_affine_matrix_mlx(
+    matrix: &[f32],
+    rows: usize,
+    width: usize,
+    input: &[f32],
+) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+    assert_eq!(matrix.len(), rows * width, "matrix shape");
+    assert_eq!(input.len(), width, "input shape");
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "model dimensions are bounded"
+    )]
+    let matrix = mlx_rs::Array::from_slice(matrix, &[rows as i32, width as i32]);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "model dimensions are bounded"
+    )]
+    let input = mlx_rs::Array::from_slice(input, &[width as i32, 1]);
+    let output = mlx_rs::ops::matmul(&matrix, &input)?;
+    output.eval()?;
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MlxAffineRowError, decode_affine_row};
@@ -206,5 +233,14 @@ mod tests {
             decode_affine_row(&[0], &[0], &[], 4, 8, 4),
             Err(MlxAffineRowError::GroupShape)
         );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn applies_decoded_matrix_to_hidden_state_on_mlx() {
+        let output = super::apply_affine_matrix_mlx(&[1.0, 2.0, 3.0, 4.0], 2, 2, &[2.0, 3.0])
+            .expect("matrix projection");
+        assert_eq!(output.shape(), [2, 1]);
+        assert_eq!(output.as_slice::<f32>(), [8.0, 18.0]);
     }
 }

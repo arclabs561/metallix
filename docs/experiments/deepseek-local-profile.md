@@ -82,3 +82,8 @@ The bounded tensor mode now decodes all 1,024 rows of layer-zero `wq_a`:
 `1024 × 3072` logical FP32 values, checksum `f21d39db440e1f00`, with
 `metal_eval: passed`. This validates the first complete native attention
 projection tensor; the next step is applying it to the decoded hidden state.
+
+The DeepSeek crate now exposes a native Metal matrix projection primitive for
+applying decoded row-major affine weights to a hidden-state vector. Its device
+test validates a small independent projection; the next integration step is
+using it with the real embedding row and full layer-zero `wq_a` matrix.
