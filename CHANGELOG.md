@@ -7,6 +7,18 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Native layer-three HC pre-mix and RMSNorm now feed DeepSeek owner and
+  candidate inputs in the connected suffix tests, using a new pinned source
+  capture and exact cross-checks against the preserved historical fixtures.
+
+- Loopback Responses intake now owns its sockets, bounds header/body reads by
+  one absolute deadline, and limits response writes. Malformed framing is
+  rejected before generation; stalled clients no longer leave handler threads.
+- Function-call history rejects reused IDs even after prior results complete.
+  Properties cover reordered results, SSE payload framing, and fragmented HTTP.
+- A source-checked DeepSeek owner-transaction benchmark separates prepare,
+  discard, commit, and direct-forward costs at captured prefix lengths.
+
 - Resident context and tool-call property tests cover sizing overflow, budget
   boundaries, malformed batches, nested JSON, and Unicode. JSON delimiters
   inside tool arguments no longer terminate an envelope early.

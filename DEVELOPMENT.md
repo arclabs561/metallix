@@ -395,14 +395,23 @@ history, validated function definitions and function-call outputs, greedy
 sampling, and optional SSE. It rejects response storage, response-ID chaining,
 images, nondefault sampling controls, and forced tool choice. Treat it as a
 small Responses compatibility target, not a complete OpenAI or Codex service.
-The serial HTTP implementation has no application-level body-read deadline;
-a stalled local client can delay subsequent requests. Keep it an owned local
-test process until request deadlines and concurrent-client behavior are qualified.
-The 2048-token control bound is still insufficient evidence for a Codex
-profile, even after the pending deadline work completes.
+The serial HTTP transport accepts one request per connection and closes it
+following the response. Header and body intake share a five-second absolute
+deadline, with 16 KiB of headers, at most 64 headers, and at most 1 MiB of body.
+POST requires a single decimal `Content-Length`; transfer encoding, `Expect`,
+and duplicate lengths are rejected before generation. Transport error replies
+are best-effort before socket close; a peer that keeps sending may observe a
+reset instead. HTTP/1.1 requires one Host header. Socket writes have a
+five-second idle limit and a 120-second total
+response-write deadline. A failed streaming write stops generation at its next
+output callback; this does not interrupt a running prefill or GPU operation.
+The 2048-token control bound and sequential admission are still insufficient
+evidence for a Codex profile. Concurrent admission and compute cancellation
+remain separate gates.
 
 For the maintained longer-context qualification, start that server separately
-with its default 2048-token context and leave it resident; the runner never starts a server or downloads a model.
+with its default 2048-token context and leave it resident; the runner never
+starts a server or downloads a model.
 It defaults to a dry-run receipt. A live run needs a new or empty output
 directory, the release binary, the checkpoint directory, and the revision
 encoded by a Hugging Face snapshot path:

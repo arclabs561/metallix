@@ -142,7 +142,10 @@ SSE responses, and automatic tool choice are supported. Response storage,
 `previous_response_id`, images, nonzero temperature, seeds, top-p changes,
 and non-automatic tool choice are rejected. It is not ready to serve as a full
 Codex backend. A 2048-token control context is still insufficient evidence for
-that role, and request-deadline qualification remains pending.
+that role. Accepted connections have a five-second total header/body read
+deadline and bounded writes; each connection handles one request. Transfer
+encoding, `Expect`, and duplicate body lengths are rejected. Model work during
+prefill is still synchronous, so compute cancellation remains unqualified.
 
 A future user-level Codex profile could target this endpoint only after an
 end-to-end compatibility and safety qualification. This is an example of that
@@ -219,10 +222,11 @@ expressions on synthetic inputs. They do not establish full-model or BF16/FP4
 execution parity.
 
 The [reduced V4.1 forward checks](docs/research/v41-forward-reference.md)
-connect native compressed-owner KV and selected indices through final-layer
+derive the layer-three attention input through native HC pre-mix and RMSNorm,
+then connect compressed-owner KV and selected indices through final-layer
 attention, HC, FFN, final normalization and logits. Fixed source-derived
 numerical bounds and wrong-index/omitted-norm controls guard this suffix.
-Earlier layer inputs remain captured; full-model generation is still pending.
+Block-entry residuals remain captured; full-model generation is still pending.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

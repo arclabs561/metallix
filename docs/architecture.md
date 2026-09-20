@@ -35,6 +35,22 @@ and loopback Responses text/function calls. Each turn starts with fresh KV
 state; it is not the planned multi-request scheduler or a general Codex
 backend.
 
+The loopback transport owns accepted sockets and applies a five-second total
+header/body read deadline, a 16 KiB header limit, and a 1 MiB body limit.
+It accepts one HTTP/1 request per connection and closes after the response;
+transfer-encoded bodies and `Expect` are rejected. SSE frames are buffered and
+flushed per event. Writes have a five-second idle limit and a 120-second total
+response-write deadline. These bound socket work, not synchronous model
+compute: prefill cannot yet be interrupted, and a disconnect is observed at a
+subsequent write.
+
+This boundary replaces a transport whose public API did not expose accepted
+sockets. Timing a receiver thread would leave its blocked read alive. An async
+runtime remains an option when concurrent admission and scheduling are added;
+the present sequential transport needs neither handler threads nor a runtime.
+HTTP syntax parsing uses the pinned
+[`httparse` parser](https://github.com/seanmonstar/httparse/tree/v1.10.1).
+
 Model lifecycle is explicit: `unloaded`, `loading`, `warming`, `ready`, or
 `failed`. Only `ready` admits inference. Readiness is therefore not inferred
 from process startup, a listening port, or model discovery; it includes the
