@@ -4,6 +4,8 @@ use std::{fs, path::PathBuf, process::ExitCode};
 use std::time::Duration;
 
 #[cfg(feature = "metal")]
+mod agent_receipt;
+#[cfg(feature = "metal")]
 mod chat_cli;
 #[cfg(feature = "metal")]
 mod chat_generation;
@@ -168,6 +170,9 @@ enum Command {
         /// Total prompt plus output budget for each agent turn.
         #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=2048))]
         context_tokens: u32,
+        /// Emit a structured execution receipt. Task success is assessed by the caller.
+        #[arg(long)]
+        json: bool,
     },
     /// Serve the native Qwen control model through a local Responses endpoint.
     #[cfg(feature = "metal")]
@@ -459,6 +464,7 @@ pub fn run() -> ExitCode {
             max_tokens,
             max_turns,
             context_tokens,
+            json,
         } => chat_cli::agent(
             &model,
             &workspace,
@@ -466,6 +472,7 @@ pub fn run() -> ExitCode {
             max_tokens,
             max_turns,
             context_tokens as usize,
+            json,
         ),
         #[cfg(feature = "metal")]
         Command::Serve {

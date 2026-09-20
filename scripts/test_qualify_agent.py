@@ -1,4 +1,6 @@
-"""Task-level qualification must reject a successful process with an unfinished task."""
+"""Structured agent qualification must distinguish a finished task from exit success."""
+
+from __future__ import annotations
 
 import importlib.util
 import json
@@ -15,7 +17,36 @@ module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
 
+def completed_receipt(case: dict, *, final_text: str | None = None) -> dict:
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "final_text": case["answer"] if final_text is None else final_text,
+        "turns": [
+            {
+                "turn_index": 0,
+                "finish_reason": "eos",
+                "metrics": {
+                    "session_load_ms": 10.0,
+                    "prefill_ms": 2.0,
+                    "decode_total_ms": 3.0,
+                    "prompt_tokens": 4,
+                    "generated_tokens": 5,
+                },
+                "generated_text_sha256": "0" * 64,
+                "generated_text_utf8_bytes": 0,
+                "calls": [
+                    {**call, "outcome": "ok"} for call in module.expected_calls(case)
+                ],
+            }
+        ],
+    }
+
+
 class QualificationTests(unittest.TestCase):
+    def assess_receipt(self, case: dict, receipt: dict, status: int | None = 0) -> dict:
+        return module.assess(case, status, json.dumps(receipt), "agent diagnostics\n")
+
     def test_launch_failure_is_preserved_and_fake_snapshot_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -52,34 +83,139 @@ class QualificationTests(unittest.TestCase):
                     self.assertFalse(output.exists())
 
     def test_recorded_two_file_failure_is_not_process_success(self):
-        result = module.assess(
-            module.CASES[1],
-            0,
-            "The answer is in detail.txt. Read that file next.\n",
-            "tool: read_file\n",
+        case = module.CASES[1]
+        receipt = completed_receipt(
+            case,
+            final_text="The answer is in detail.txt. Read that file next.",
         )
+        receipt["turns"][0]["calls"] = [
+            {**module.expected_calls(case)[0], "outcome": "ok"}
+        ]
+        result = self.assess_receipt(case, receipt)
         self.assertFalse(result["passed"])
         self.assertTrue(result["checks"]["process_success"])
+        self.assertTrue(result["checks"]["execution_completed"])
         self.assertFalse(result["checks"]["answer_present"])
-        self.assertFalse(result["checks"]["required_tools_observed"])
+        self.assertFalse(result["checks"]["required_executions_observed"])
+        self.assertIsNone(result["extra_execution_count"])
 
-    def test_answer_alone_does_not_prove_tools_were_used(self):
-        self.assertFalse(module.assess(module.CASES[1], 0, "ORCHID-728", "")["passed"])
-        self.assertTrue(
-            module.assess(
-                module.CASES[1],
-                0,
-                "The code is ORCHID-728.",
-                "tool: read_file\ntool: read_file\n",
-            )["passed"]
+    def test_successful_process_with_unfinished_execution_evidence_fails(self):
+        case = module.CASES[1]
+        receipt = completed_receipt(case)
+        receipt["turns"][0]["calls"] = [
+            {**module.expected_calls(case)[0], "outcome": "ok"}
+        ]
+        result = self.assess_receipt(case, receipt)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["checks"]["process_success"])
+        self.assertTrue(result["checks"]["answer_present"])
+        self.assertTrue(result["checks"]["execution_completed"])
+        self.assertFalse(result["checks"]["required_executions_observed"])
+
+    def test_wrong_tool_path_or_arguments_never_proves_execution(self):
+        case = module.CASES[0]
+        receipt = completed_receipt(case)
+        receipt["turns"][0]["calls"][0]["relative_path"] = "detail.txt"
+        self.assertFalse(self.assess_receipt(case, receipt)["passed"])
+
+        receipt = completed_receipt(case)
+        receipt["turns"][0]["calls"][0]["arguments_sha256"] = "0" * 64
+        result = self.assess_receipt(case, receipt)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["required_executions_observed"])
+
+    def test_extra_successful_exploration_is_recorded_but_not_task_failure(self):
+        case = module.CASES[-1]
+        receipt = completed_receipt(case)
+        extra_search = {
+            "name": "search_file",
+            "relative_path": "cedar.txt",
+            "arguments_sha256": module.arguments_sha256(
+                {"path": "cedar.txt", "query": "CEDAR"}
+            ),
+            "outcome": "ok",
+        }
+        receipt["turns"][0]["calls"] = [
+            extra_search,
+            receipt["turns"][0]["calls"][0],
+            extra_search,
+            receipt["turns"][0]["calls"][1],
+        ]
+        result = self.assess_receipt(case, receipt)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["extra_execution_count"], 2)
+
+    def test_failed_extra_execution_never_passes(self):
+        receipt = completed_receipt(module.CASES[0])
+        receipt["turns"][0]["calls"].append(
+            {
+                "name": "search_file",
+                "relative_path": "inventory.txt",
+                "arguments_sha256": "0" * 64,
+                "outcome": "error",
+            }
+        )
+        result = self.assess_receipt(module.CASES[0], receipt)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["all_executions_succeeded"])
+
+    def test_failed_receipt_is_distinct_from_answer_and_process_exit(self):
+        case = module.CASES[0]
+        receipt = completed_receipt(case)
+        receipt["status"] = "failed"
+        receipt["error"] = "generation_failure"
+        result = self.assess_receipt(case, receipt)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["checks"]["process_success"])
+        self.assertTrue(result["checks"]["answer_present"])
+        self.assertFalse(result["checks"]["execution_completed"])
+
+    def test_missing_optional_failed_fields_do_not_crash_assessment(self):
+        receipt = {
+            "schema_version": 1,
+            "status": "failed",
+            "turns": [
+                {
+                    "turn_index": 0,
+                    "finish_reason": "length",
+                    "metrics": {},
+                    "generated_text_sha256": "0" * 64,
+                    "generated_text_utf8_bytes": 0,
+                    "calls": [
+                        {
+                            "name": "read_file",
+                            "arguments_sha256": "0" * 64,
+                            "outcome": "error",
+                        }
+                    ],
+                }
+            ],
+        }
+        result = self.assess_receipt(module.CASES[0], receipt)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["answer_present"])
+        self.assertFalse(result["checks"]["required_executions_observed"])
+
+    def test_phase_costs_reject_nonfinite_or_boolean_metrics(self):
+        receipt = completed_receipt(module.CASES[0])
+        receipt["turns"][0]["metrics"]["prefill_ms"] = float("nan")
+        self.assertIsNone(module.phase_costs(receipt))
+        receipt = completed_receipt(module.CASES[0])
+        receipt["turns"][0]["metrics"]["generated_tokens"] = True
+        self.assertIsNone(module.phase_costs(receipt))
+
+    def test_canonical_argument_hash_ignores_object_key_order(self):
+        self.assertEqual(
+            module.arguments_sha256({"path": "inventory.txt", "query": "beta"}),
+            module.arguments_sha256({"query": "beta", "path": "inventory.txt"}),
         )
 
-    def test_failure_or_timeout_never_passes_with_matching_partial_output(self):
+    def test_failure_or_timeout_never_passes_with_matching_receipt(self):
+        receipt = completed_receipt(module.CASES[0])
         for status in (None, 1, -9):
-            result = module.assess(
-                module.CASES[0], status, "indigo", "tool: search_file\n"
+            self.assertFalse(
+                self.assess_receipt(module.CASES[0], receipt, status)["passed"]
             )
-            self.assertFalse(result["passed"])
 
     def test_actual_child_timeout_preserves_partial_output(self):
         status, stdout, _ = module.execute(
@@ -109,7 +245,9 @@ class QualificationTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertEqual(json.loads(result.stdout)["status"], "dry_run")
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["status"], "dry_run")
+        self.assertEqual(plan["cases"][-1]["name"], "held_out_factual_join")
 
 
 if __name__ == "__main__":

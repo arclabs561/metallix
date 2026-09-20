@@ -484,6 +484,61 @@ mod tests {
         }
 
         #[test]
+        fn pinned_workspace_survives_pathname_replacement(
+            contents in "[a-zA-Z0-9 🦀]{0,96}",
+            replacement_is_symlink in any::<bool>(),
+        ) {
+            let root = TestRoot::new();
+            let workspace = root.workspace();
+            let original = format!("original:{contents}");
+            std::fs::write(workspace.join("note.txt"), &original).unwrap();
+            let tools = WorkspaceTools::new(&workspace).unwrap();
+            std::fs::rename(&workspace, root.0.join("retained")).unwrap();
+            let replacement = root.0.join("replacement");
+            std::fs::create_dir(&replacement).unwrap();
+            std::fs::write(replacement.join("note.txt"), "replacement").unwrap();
+            std::fs::write(replacement.join("extra.txt"), "replacement only").unwrap();
+            if replacement_is_symlink {
+                symlink(&replacement, &workspace).unwrap();
+            } else {
+                std::fs::rename(&replacement, &workspace).unwrap();
+            }
+            let read = tools.execute(&ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path":"note.txt"}),
+            }).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(read, json!({"text":original}));
+            let listed = tools.execute(&ToolCall {
+                name: "list_files".into(),
+                arguments: json!({"path":"."}),
+            }).map_err(TestCaseError::fail)?;
+            prop_assert_eq!(listed, json!({"entries":["note.txt"]}));
+        }
+
+        #[test]
+        fn listing_limit_counts_real_entries_and_returns_sorted_names(count in 124_usize..=132) {
+            let root = TestRoot::new();
+            let workspace = root.workspace();
+            let mut expected = Vec::new();
+            for index in (0..count).rev() {
+                let name = format!("entry-{index:03}");
+                std::fs::write(workspace.join(&name), "").unwrap();
+                expected.push(name);
+            }
+            expected.sort();
+            let tools = WorkspaceTools::new(&workspace).unwrap();
+            let result = tools.execute(&ToolCall {
+                name: "list_files".into(),
+                arguments: json!({"path":"."}),
+            });
+            if count <= 128 {
+                prop_assert_eq!(result.map_err(TestCaseError::fail)?, json!({"entries":expected}));
+            } else {
+                prop_assert!(result.is_err());
+            }
+        }
+
+        #[test]
         fn utf8_file_limit_counts_bytes_not_characters(characters in 8188_usize..=8196) {
             let root = TestRoot::new();
             let workspace = root.workspace();

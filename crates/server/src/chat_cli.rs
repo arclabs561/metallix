@@ -9,6 +9,7 @@ use std::{
 use serde_json::json;
 
 use crate::{
+    agent_receipt::{AgentCallOutcome, AgentReceipt, AgentTurnReceipt},
     chat_generation::{
         ChatFinishReason, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
         ChatToolResult,
@@ -100,6 +101,13 @@ fn chat_inner(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct AgentLimits {
+    max_tokens: u32,
+    max_turns: u32,
+    context_tokens: usize,
+}
+
 pub(crate) fn agent(
     model: &Path,
     workspace: &Path,
@@ -107,25 +115,61 @@ pub(crate) fn agent(
     max_tokens: u32,
     max_turns: u32,
     context_tokens: usize,
+    json_output: bool,
 ) -> ExitCode {
-    finish(agent_inner(
+    let mut receipt = AgentReceipt::new();
+    let result = agent_inner(
         model,
         workspace,
         prompt,
-        max_tokens,
-        max_turns,
-        context_tokens,
-    ))
+        AgentLimits {
+            max_tokens,
+            max_turns,
+            context_tokens,
+        },
+        &mut receipt,
+        !json_output,
+    );
+    match result {
+        Ok(final_text) => {
+            receipt.complete(final_text.clone());
+            if json_output {
+                print_agent_receipt(&receipt)
+            } else {
+                println!("{final_text}");
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => {
+            receipt.fail();
+            if json_output {
+                let output_status = print_agent_receipt(&receipt);
+                eprintln!("mx: {error}");
+                if output_status == ExitCode::SUCCESS {
+                    ExitCode::FAILURE
+                } else {
+                    output_status
+                }
+            } else {
+                finish(Err(error))
+            }
+        }
+    }
 }
 
 fn agent_inner(
     model: &Path,
     workspace: &Path,
     prompt: String,
-    max_tokens: u32,
-    max_turns: u32,
-    context_tokens: usize,
-) -> Result<(), String> {
+    limits: AgentLimits,
+    receipt: &mut AgentReceipt,
+    report_tools: bool,
+) -> Result<String, String> {
+    let AgentLimits {
+        max_tokens,
+        max_turns,
+        context_tokens,
+    } = limits;
     let workspace = WorkspaceTools::new(workspace)?;
     let mut session = ChatSession::load(model, context_tokens)?;
     let tools = chat_tools::definitions();
@@ -140,15 +184,24 @@ fn agent_inner(
             },
             &mut |_| Ok(()),
         )?;
-        let turn = chat_tools::parse_turn(&result.text)?;
+        let mut turn_receipt = AgentTurnReceipt::from_generation(turn_index, &result);
+        let turn = match chat_tools::parse_turn(&result.text) {
+            Ok(turn) => turn,
+            Err(error) => {
+                receipt.push_turn(turn_receipt);
+                return Err(error);
+            }
+        };
         if turn.calls.is_empty() {
             if result.finish_reason != ChatFinishReason::Eos {
+                receipt.push_turn(turn_receipt);
                 return Err("agent reached output limit before finishing a response".into());
             }
-            println!("{}", turn.text);
-            return Ok(());
+            receipt.push_turn(turn_receipt);
+            return Ok(turn.text);
         }
         if result.finish_reason != ChatFinishReason::Eos {
+            receipt.push_turn(turn_receipt);
             return Err("agent output was truncated; no tools executed".into());
         }
         let mut assistant = message(ChatRole::Assistant, turn.text);
@@ -161,11 +214,18 @@ fn agent_inner(
             })
             .collect();
         messages.push(assistant);
-        for (index, call) in turn.calls.iter().enumerate() {
-            eprintln!("tool: {}", call.name);
-            let output = workspace
-                .execute(call)
-                .unwrap_or_else(|error| json!({"error":error}));
+        let outputs = execute_calls(
+            &mut turn_receipt,
+            result.finish_reason,
+            &turn.calls,
+            |call| {
+                if report_tools {
+                    eprintln!("tool: {}", call.name);
+                }
+                workspace.execute(call)
+            },
+        );
+        for (index, (call, output)) in turn.calls.iter().zip(outputs).enumerate() {
             messages.push(
                 ChatToolResult {
                     tool_call_id: format!("call_{turn_index}_{index}"),
@@ -175,8 +235,51 @@ fn agent_inner(
                 .into_message(),
             );
         }
+        receipt.push_turn(turn_receipt);
     }
     Err(format!("agent stopped at the {max_turns}-turn limit"))
+}
+
+/// Executes calls only after a complete model turn, and records the precise
+/// execution order without retaining tool results in the receipt.
+fn execute_calls<F>(
+    receipt: &mut AgentTurnReceipt,
+    finish_reason: ChatFinishReason,
+    calls: &[chat_tools::ToolCall],
+    mut execute: F,
+) -> Vec<serde_json::Value>
+where
+    F: FnMut(&chat_tools::ToolCall) -> Result<serde_json::Value, String>,
+{
+    if finish_reason != ChatFinishReason::Eos {
+        return Vec::new();
+    }
+    calls
+        .iter()
+        .map(|call| match execute(call) {
+            Ok(output) => {
+                receipt.record_call(call.name.clone(), &call.arguments, AgentCallOutcome::Ok);
+                output
+            }
+            Err(error) => {
+                receipt.record_call(call.name.clone(), &call.arguments, AgentCallOutcome::Error);
+                json!({"error":error})
+            }
+        })
+        .collect()
+}
+
+fn print_agent_receipt(receipt: &AgentReceipt) -> ExitCode {
+    match serde_json::to_string(receipt) {
+        Ok(serialized) => {
+            println!("{serialized}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("mx: could not serialize agent receipt: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn finish(result: Result<(), String>) -> ExitCode {
@@ -185,6 +288,147 @@ fn finish(result: Result<(), String>) -> ExitCode {
         Err(error) => {
             eprintln!("mx: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    use super::{AgentTurnReceipt, execute_calls};
+    use crate::{
+        agent_receipt::hash_arguments,
+        chat_generation::{ChatFinishReason, ChatGeneration, ChatGenerationMetrics},
+        chat_tools::ToolCall,
+    };
+
+    fn turn_receipt() -> AgentTurnReceipt {
+        AgentTurnReceipt::from_generation(
+            0,
+            &ChatGeneration {
+                text: String::new(),
+                generated_token_ids: Vec::new(),
+                finish_reason: ChatFinishReason::Eos,
+                metrics: ChatGenerationMetrics {
+                    context_tokens: 1,
+                    planned_kv_bytes: 1,
+                    session_load_ms: 0.0,
+                    render_ms: 0.0,
+                    prefill_ms: 0.0,
+                    time_to_first_token_ms: None,
+                    decode_ms: Vec::new(),
+                    decode_total_ms: 0.0,
+                    prompt_tokens: 0,
+                    generated_tokens: 0,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn truncated_turn_executes_no_calls() {
+        let calls = vec![ToolCall {
+            name: "read_file".into(),
+            arguments: json!({"path":"note.txt"}),
+        }];
+        let mut receipt = turn_receipt();
+        let mut invoked = false;
+        let output = execute_calls(&mut receipt, ChatFinishReason::Length, &calls, |_| {
+            invoked = true;
+            Ok(json!({"text":"private"}))
+        });
+        assert!(output.is_empty());
+        assert!(!invoked);
+        assert!(
+            serde_json::to_value(receipt).unwrap()["calls"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completed_turn_records_calls_in_execution_order() {
+        let calls = vec![
+            ToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path":"first.txt"}),
+            },
+            ToolCall {
+                name: "search_file".into(),
+                arguments: json!({"path":"second.txt", "query":"private"}),
+            },
+        ];
+        let mut receipt = turn_receipt();
+        let output = execute_calls(&mut receipt, ChatFinishReason::Eos, &calls, |call| {
+            Ok(json!({"name":call.name}))
+        });
+        assert_eq!(
+            output,
+            vec![json!({"name":"read_file"}), json!({"name":"search_file"})]
+        );
+        let calls = serde_json::to_value(receipt).unwrap()["calls"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(calls[0]["name"], "read_file");
+        assert_eq!(calls[1]["name"], "search_file");
+        assert!(calls[1].get("query").is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn call_receipts_match_actual_execution_for_completed_turns(
+            outcomes in prop::collection::vec(any::<bool>(), 0..9),
+            complete in any::<bool>(),
+        ) {
+            let calls: Vec<_> = outcomes
+                .iter()
+                .enumerate()
+                .map(|(index, _)| ToolCall {
+                    name: format!("tool_{index}"),
+                    arguments: json!({"path":format!("nested/{index}.txt"), "query":format!("q{index}")}),
+                })
+                .collect();
+            let expected_names: Vec<_> = calls.iter().map(|call| call.name.clone()).collect();
+            let expected_hashes: Vec<_> = calls
+                .iter()
+                .map(|call| hash_arguments(&call.arguments))
+                .collect();
+            let mut receipt = turn_receipt();
+            let mut invoked = Vec::new();
+            let mut outcome_index = 0;
+            let finish_reason = if complete { ChatFinishReason::Eos } else { ChatFinishReason::Length };
+            let output = execute_calls(&mut receipt, finish_reason, &calls, |call| {
+                invoked.push(call.name.clone());
+                let succeeded = outcomes[outcome_index];
+                outcome_index += 1;
+                if succeeded { Ok(json!({"private":"result"})) } else { Err("tool failed".into()) }
+            });
+            let recorded = serde_json::to_value(receipt).unwrap()["calls"]
+                .as_array()
+                .unwrap()
+                .clone();
+            if complete {
+                prop_assert_eq!(invoked, expected_names);
+                prop_assert_eq!(output.len(), outcomes.len());
+                prop_assert_eq!(recorded.len(), outcomes.len());
+                for (index, call) in recorded.iter().enumerate() {
+                    let expected_name = format!("tool_{index}");
+                    let expected_path = format!("nested/{index}.txt");
+                    prop_assert_eq!(call["name"].as_str(), Some(expected_name.as_str()));
+                    prop_assert_eq!(call["relative_path"].as_str(), Some(expected_path.as_str()));
+                    prop_assert_eq!(call["arguments_sha256"].as_str(), Some(expected_hashes[index].as_str()));
+                    prop_assert_eq!(call["outcome"].as_str(), Some(if outcomes[index] { "ok" } else { "error" }));
+                    prop_assert!(call.get("private").is_none());
+                }
+            } else {
+                prop_assert!(invoked.is_empty());
+                prop_assert!(output.is_empty());
+                prop_assert!(recorded.is_empty());
+            }
         }
     }
 }
