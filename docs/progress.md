@@ -38,7 +38,9 @@
 - Native layer-three attention now continues through HC and FFN to the
   layer-four entry. Residuals match source storage; FP32 pre-mix coefficients
   satisfy fixed source-derived bounds. Zeroed attention propagated through FFN
-  fails the same entry gate. The subsequent layer-four suffix is still separate.
+  fails the same entry gate. That native state now feeds the layer-four suffix
+  through final logits: an exact BF16 attention-input check closes the handoff,
+  and corrupted incoming coefficients fail at that boundary.
 - A reduced DeepSeek suffix connects owner-produced KV/indices through native
   final-layer attention, HC, FFN, final norm and logits. Fixed source-derived
   envelopes reject omitted normalization; earlier layer inputs remain captured.
@@ -62,9 +64,10 @@
    Measure longer prefixes before changing staged allocations. Prefix reuse,
    quantization, and batching require separate evidence.
 2. **Model owner: DeepSeek forward lane.** Extend the source-grounded reduced
-   forward through remaining text blocks to logits. Feed the native layer-three
-   terminal state into the existing layer-four suffix, propagating its fixed
-   numerical bounds; that suffix still starts from captured block-entry state.
+   forward through the earlier text blocks. Layers three and four now connect
+   natively through final logits; layer three's entry still comes from capture.
+   Replace that upstream captured state with native earlier-block output while
+   preserving the source-grounded arithmetic and discrete routing gates.
    Operator and transaction parity do not establish full-model generation. Keep full checkpoint
    acquisition behind the existing reduced-forward numerical gate.
 3. **Agent owner: CLI lane.** Improve multi-step task completion before claiming
@@ -102,8 +105,8 @@ Both checks passed on the final implementation, followed by a release build
 and the live HTTP checks above. The owned test server was stopped after
 validation; use the README command to start a new one.
 
-The structured-agent and layer-three HC/FFN continuation batch passed both
-canonical checks, the 13 qualifier tests, the source exporter rejection tests,
+The structured-agent and connected layer-three/four suffix batch passed both
+canonical checks, the 15 qualifier tests, the source exporter rejection tests,
 and observer restoration checks. Live JSON receipts also retain failure status
 when workspace initialization fails. The four-task qualification remains
 partially failing as described above; no Codex-readiness claim follows from

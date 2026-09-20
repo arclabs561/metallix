@@ -7,6 +7,11 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Agent qualification rejects internally inconsistent completed receipts,
+  malformed generation metrics, and tool executions attributed to truncated turns.
+- Native DeepSeek layer-three terminal state now feeds layer four through final
+  logits. Exact BF16 handoff checks preserve the existing arithmetic bounds,
+  and corrupted incoming coefficients fail before attention execution.
 - The source-grounded DeepSeek layer-three continuation reaches layer-four
   entry through native HC and FFN. Fixed propagated bounds check coefficient
   rounding and reject an omitted-attention control through the same boundary.

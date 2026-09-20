@@ -234,12 +234,12 @@ execution parity.
 The [reduced V4.1 forward checks](docs/research/v41-forward-reference.md)
 derive the layer-three attention input through native HC pre-mix and RMSNorm,
 then connect native owner KV and producer-selected indices to layer-three
-attention, HC, and FFN through the layer-four entry. Separate checks connect
-owner KV through final-layer
-attention, HC, FFN, final normalization and logits. Fixed source-derived
-numerical bounds and wrong-index/omitted-norm controls guard this suffix.
-Earlier block-entry residuals remain captured, and the two continuations are
-not yet joined; full-model generation is still pending.
+attention, HC, and FFN through the layer-four entry, then continue through
+final-layer attention, HC, FFN, final normalization and logits. Fixed
+source-derived numerical bounds and wrong-index/omitted-norm controls guard
+this suffix.
+Layer-three entry residuals remain captured from earlier blocks;
+full-model generation is still pending.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

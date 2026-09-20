@@ -460,6 +460,9 @@ process exit is insufficient: each trial must contain a completed execution
 receipt, the expected final answer, and the required executed tool names,
 relative paths, and argument hashes in order. Successful extra calls are
 reported separately rather than rejected; every executed call must succeed.
+Receipt status, turn history, and generation metric shapes must also agree:
+completed histories end at EOS without pending calls, and truncated turns
+cannot claim executed tools.
 This gate does not prove arbitrary task
 completion or general coding ability. Per-turn metrics separate render,
 prefill, and decode costs; `session_load_ms` is the same one-time setup repeated

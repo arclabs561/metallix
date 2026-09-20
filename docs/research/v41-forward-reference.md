@@ -660,7 +660,18 @@ The Python gate runs the pinned source capture and its own declared dependencies
 it is separate from the bounded default local check. It verifies that missing
 or mismatched next-block entry storage is rejected by the exporter.
 
-This gate reaches the layer-four entry; the separate layer-four-to-logits test
-still begins with captured entry state. Connecting those tests requires carrying
-the native residual and coefficient uncertainty forward, not replacing them
-with source tensors or declaring the full model complete.
+The connected `native_layer_three_through_final_suffix_matches_source_logits`
+test now feeds those actual native residuals and coefficients into layer four.
+Cross-capture checks establish source identity at matching positions; runtime
+operands remain native. The incoming residual is bit-exact, and native HC
+collapse plus attention normalization must yield the source BF16 input exactly.
+That discrete identity closes the coefficient-rounding handoff before the
+existing layer-four attention, HC/FFN, final normalization, and head bounds run.
+The same native input feeds both consumer index scoring and attention execution;
+layer-three producer inputs remain separate.
+Replacing the native incoming coefficients with zero fails that attention-input
+gate. No coefficient is replaced with its captured counterpart.
+
+The original isolated layer-four test remains as a diagnostic. The connected
+test still begins at captured layer-three block-entry state, so earlier blocks
+and full-model generation remain unfinished.
