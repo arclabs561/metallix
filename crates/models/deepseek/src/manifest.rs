@@ -91,7 +91,7 @@ pub struct V41SafetensorsIndex {
 /// A validated MLX/Hugging Face index whose metadata omits `total_size`.
 ///
 /// This is placement metadata only. It does not establish that the affine
-/// quantized tensors are executable by the native DeepSeek adapter.
+/// quantized tensors are executable by the native `DeepSeek` adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MlxSafetensorsIndex {
     tensor_count: usize,
