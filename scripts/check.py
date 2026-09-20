@@ -88,6 +88,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_benchmark_qwen.py"], False),
         ([sys.executable, "scripts/test_compare_qwen.py"], False),
         ([sys.executable, "scripts/test_checkpoint_io.py"], False),
+        ([sys.executable, "scripts/test_qualify_chat.py"], False),
         (["node", "--test", "scripts/benchmark-openai.test.mjs"], False),
         (["ruff", "check", "scripts"], False),
         (["ruff", "format", "--check", "scripts"], False),
