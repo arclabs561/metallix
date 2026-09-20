@@ -463,7 +463,7 @@ enum Command {
         /// Path to a safetensors shard.
         shard: PathBuf,
     },
-    /// Decode one bounded MLX DeepSeek embedding row from a real shard.
+    /// Decode one bounded MLX `DeepSeek` embedding row from a real shard.
     InspectV41EmbeddingRow {
         /// Path to the embedding shard.
         shard: PathBuf,

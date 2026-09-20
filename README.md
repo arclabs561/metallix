@@ -38,6 +38,12 @@ MODEL=/path/to/Qwen3-0.6B
 accessible. Shards may be regular files or symlinks to regular files. `mx` and
 `metallix` are native executables with the same CLI; no shell alias is needed.
 
+DeepSeek-V4.1-Flash artifact work is currently native metadata and row
+qualification. `mx inspect-v41-index` validates the MLX weight map,
+`mx inspect-v41-shard` validates a shard header, and
+`mx inspect-v41-embedding-row <shard> --row 0` decodes one real embedding row.
+These commands do not claim full DeepSeek generation yet.
+
 ## Complete a prompt
 
 `mx gen --prompt` encodes plain text with the local `tokenizer.json` and
