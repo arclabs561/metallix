@@ -7,6 +7,9 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash
+  Codex profile path, including the direct API smoke result and the measured
+  full-Codex prefill limitation.
 - Added a typed engine SMC primitive with finite log weights, ESS, deterministic
   systematic resampling, absorbing particles, and fail-closed input checks.
 - Added a test-only MLX LoRA micrograph for Qwen: frozen base ownership,
