@@ -263,6 +263,34 @@ pub fn mix_hc_coefficients(
     split_hc_coefficients(&mixes, scale, base, copies, sinkhorn_iterations, epsilon)
 }
 
+/// Collapses repeated hidden streams with real HC pre coefficients.
+pub fn collapse_hc_hidden(
+    hidden: &[f32],
+    coefficients: &HcCoefficients,
+) -> Result<Vec<f32>, HcError> {
+    if hidden.is_empty() || coefficients.copies() == 0 {
+        return Err(HcError::InvalidCopies {
+            copies: coefficients.copies(),
+            max_copies: 16,
+        });
+    }
+    let mut output = vec![0.0; hidden.len()];
+    for (index, value) in output.iter_mut().enumerate() {
+        *value = coefficients
+            .pre()
+            .iter()
+            .map(|coefficient| coefficient * hidden[index])
+            .sum();
+        if !value.is_finite() {
+            return Err(HcError::NonFiniteInput {
+                field: "hc_collapse",
+                index,
+            });
+        }
+    }
+    Ok(output)
+}
+
 /// Converts one decoded row to an MLX array and evaluates it on the device.
 #[cfg(feature = "metal")]
 pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
@@ -367,6 +395,12 @@ mod tests {
         .expect("HC coefficients");
         assert_eq!(coefficients.copies(), 4);
         assert!(coefficients.pre().iter().all(|value| value.is_finite()));
+        assert_eq!(
+            super::collapse_hc_hidden(&[1.0, 2.0], &coefficients)
+                .expect("HC collapse")
+                .len(),
+            2
+        );
     }
 
     #[cfg(feature = "metal")]

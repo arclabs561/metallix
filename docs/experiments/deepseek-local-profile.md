@@ -112,3 +112,8 @@ from shard two plus layer-zero `attn_hc.fn`, base, and scale from shard one
 produce four-copy coefficients with checksum `5fc4d375e7620dac`. Full block
 execution remains separate, but the real latent-preparation coefficient stage
 is now bound to the checkpoint.
+
+The real HC mix now also performs the pre-collapse step: four-copy coefficients
+collapse back to a 4,096-wide hidden stream with checksum
+`b5e5dc3e838c352b`. The remaining gap is the model-specific latent conversion
+from that stream into the 3,072-wide `wq_a` input.

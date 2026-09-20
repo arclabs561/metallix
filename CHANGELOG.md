@@ -34,6 +34,8 @@ published release; reference operators do not imply full-model support.
 - The native CLI now binds that bridge to the real token-0 embedding and
   layer-zero HC parameters, producing four-copy coefficients from the local
   checkpoint.
+- The real HC mix gate now collapses those coefficients back to a 4,096-wide
+  hidden stream, checksum `b5e5dc3e838c352b`, before the remaining latent path.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

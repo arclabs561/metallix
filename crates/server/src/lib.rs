@@ -38,7 +38,8 @@ use clap::{Parser, Subcommand};
 use deepseek::{
     V41TextContract,
     checkpoint::mlx::{
-        mix_hc_coefficients, read_affine_row_from_shard, read_f32_tensor_from_shard,
+        collapse_hc_hidden, mix_hc_coefficients, read_affine_row_from_shard,
+        read_f32_tensor_from_shard,
     },
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
@@ -1362,9 +1363,22 @@ fn inspect_v41_embedding_row(
                 hash.wrapping_mul(1_099_511_628_211)
                     .wrapping_add(u64::from(value.to_bits()))
             });
+        let collapsed = match collapse_hc_hidden(&hidden, &coefficients) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("hyper-connection collapse failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let collapsed_checksum = collapsed.iter().fold(0_u64, |hash, value| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(value.to_bits()))
+        });
         println!("DeepSeek layer-zero HC mix");
         println!("copies: {}", coefficients.copies());
         println!("coefficients_checksum: {checksum:016x}");
+        println!("collapsed_hidden_width: {}", collapsed.len());
+        println!("collapsed_hidden_checksum: {collapsed_checksum:016x}");
         println!("scope: real shard parameters and token-0 embedding; no block execution");
         return ExitCode::SUCCESS;
     }
