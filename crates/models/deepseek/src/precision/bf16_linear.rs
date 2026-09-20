@@ -93,12 +93,11 @@ pub fn bf16_linear_reference(
         .map_err(|_| Bf16LinearError::AllocationFailed {
             elements: shape.output,
         })?;
-    for row in 0..rows {
-        for column in 0..outputs {
+    for (row, activation) in activations.chunks_exact(reduction).enumerate() {
+        for (column, weight) in weights.chunks_exact(reduction).enumerate() {
             let mut sum = 0.0_f32;
-            for reduction_index in 0..reduction {
-                let product = bf16_to_f32(activations[row * reduction + reduction_index])
-                    * bf16_to_f32(weights[column * reduction + reduction_index]);
+            for (&activation, &weight) in activation.iter().zip(weight) {
+                let product = bf16_to_f32(activation) * bf16_to_f32(weight);
                 if !product.is_finite() {
                     return Err(Bf16LinearError::ValueOverflow {
                         stage: "product",

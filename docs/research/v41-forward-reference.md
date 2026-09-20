@@ -716,3 +716,11 @@ The original isolated layer-four test and captured layer-three entry test
 remain as diagnostics. The Engram continuation above extends that boundary to
 the pre-Engram residual and incoming coefficients; earlier blocks and
 full-model generation remain unfinished.
+
+The next bounded seam is layer two's FFN tail: `FfnSublayerReference` can
+produce both the pre-Engram3 residual and the incoming HC coefficients from
+a new post-attention capture. Its source output matches the observed Engram3
+input at all three starts. Full layer-two attention is a wider step: layer two
+uses ratio-two compression but consumes layer one's shared KV publication,
+so it requires the earlier layer-one owner/compressor/index chain. The tail
+fixture and connection remain unimplemented.

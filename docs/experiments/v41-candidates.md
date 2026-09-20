@@ -353,6 +353,43 @@ samply record --save-only --unstable-presymbolicate \
   target/release/deps/owner_transaction-<build-hash> --profile-synthetic
 ```
 
+## Scalar BF16 projection iteration
+
+The owner profile above led to a small change in `bf16_linear_reference`:
+iterate over validated activation/weight row slices instead of repeatedly
+indexing the full matrices. Products, FP32 accumulation order, overflow checks,
+BF16 narrowing, and transactional output publication remain the same.
+
+At `309bd87` plus that working change, six alternating control/candidate pairs
+ran the synthetic scaling workload. At prefixes 8 and 512, preparation medians
+across processes changed from 28.917 to 26.813 μs and 31.031 to 27.615 μs.
+All six paired preparation ratios improved at these shapes; the 2048-prefix
+ratios ranged from 0.837 to 1.128, so the larger-prefix result is inconclusive.
+The earlier sequential before/after trial showed stronger changes but also
+large baseline drift; it is not used as the optimization result.
+
+Three additional alternating pairs ran the captured source fixture as a
+control. Values below are medians of process medians, with sample standard
+deviation across those three process medians:
+
+| Captured phase | Original μs | Row-slice iteration μs |
+| --- | ---: | ---: |
+| Prefill-5 preparation | 110.729 ± 0.626 | 100.500 ± 3.051 |
+| Decode preparation at prefix 5 | 29.625 ± 0.673 | 27.833 ± 1.517 |
+| Decode preparation at prefix 6 | 28.958 ± 0.804 | 25.730 ± 1.659 |
+| Direct decode publication | 27.667 ± 0.244 | 25.605 ± 0.280 |
+
+The control binary SHA-256 was
+`d18b223a9c3ec9c2508dcb482a67f831d053882064973234e47c55581684ff4b`;
+the candidate was
+`a20248d97da24865eda40a05a77ee7a213208e289a1b22883ade90f7eea18682`.
+Both used default release features on the same host as the profile, with no
+concurrent project builds or captures. Retained raw receipts and both binaries
+are under ignored `artifacts/owner-projection/`. This is an operator-level
+improvement, not a full-model throughput claim. Property tests additionally
+check row splitting, output-column permutation, and exact late-overflow
+coordinates with unchanged output.
+
 ## Packed FP4 runtime expansion
 
 `deepseek::precision` expands E2M1x2 bytes in low-nibble-first order and

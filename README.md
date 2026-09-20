@@ -231,6 +231,10 @@ masks, final selection, index scores, and rotary tails against pinned official
 expressions on synthetic inputs. They do not establish full-model or BF16/FP4
 execution parity.
 
+The same report records owner-transaction scaling, CPU profiles, and measured
+scalar projection improvements. These are operator measurements, not
+full-model throughput results.
+
 The [reduced V4.1 forward checks](docs/research/v41-forward-reference.md)
 derive the layer-three attention input through native HC pre-mix and RMSNorm,
 then connect native owner KV and producer-selected indices to layer-three

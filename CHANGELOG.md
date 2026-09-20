@@ -7,6 +7,10 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Profile-guided BF16 projection row iteration preserves scalar arithmetic and
+  error semantics while improving the measured captured owner workload.
+  Property tests cover row splitting, output permutation, and late-overflow
+  atomicity.
 - Agent qualification rejects internally inconsistent completed receipts,
   malformed generation metrics, and tool executions attributed to truncated turns.
 - Native DeepSeek layer-three terminal state now feeds layer four through final
