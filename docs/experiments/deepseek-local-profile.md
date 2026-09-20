@@ -33,6 +33,11 @@ returned `Ready.` from a 16-token greedy generation. The OpenAI-compatible
 `/v1/models`, `/v1/chat/completions`, and `/v1/responses` routes respond for
 `deepseek-v41-flash`.
 
+Metallix now accepts this snapshot's standard MLX weight-map index in its
+native `inspect-v41-index` command. The real artifact reports 2,757 tensors
+across 18 shards. This is the first native artifact gate; it deliberately does
+not claim tensor execution yet.
+
 The current server logs report 1.5 generated tokens/second for the short 16-token
 request after load. The native DSA indexer extension is not built, so oMLX falls
 back to MLX for index scoring and warns that long-context prefill is several

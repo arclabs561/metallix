@@ -88,6 +88,52 @@ pub struct V41SafetensorsIndex {
     weight_map: BTreeMap<String, String>,
 }
 
+/// A validated MLX/Hugging Face index whose metadata omits `total_size`.
+///
+/// This is placement metadata only. It does not establish that the affine
+/// quantized tensors are executable by the native DeepSeek adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlxSafetensorsIndex {
+    tensor_count: usize,
+    shard_paths: Vec<String>,
+    weight_map: BTreeMap<String, String>,
+}
+
+impl MlxSafetensorsIndex {
+    /// Parses the standard MLX weight-map index.
+    pub fn parse(json: &str) -> Result<Self, CheckpointManifestError> {
+        let index: RawMlxSafetensorsIndex =
+            serde_json::from_str(json).map_err(CheckpointManifestError::IndexJson)?;
+        if index.weight_map.is_empty() {
+            return Err(CheckpointManifestError::EmptyWeightMap);
+        }
+        let shard_paths = validate_weight_map(&index.weight_map)?;
+        Ok(Self {
+            tensor_count: index.weight_map.len(),
+            shard_paths,
+            weight_map: index.weight_map,
+        })
+    }
+
+    /// Returns the number of indexed tensors.
+    #[must_use]
+    pub const fn tensor_count(&self) -> usize {
+        self.tensor_count
+    }
+
+    /// Returns deduplicated shard paths in deterministic order.
+    #[must_use]
+    pub fn shard_paths(&self) -> &[String] {
+        &self.shard_paths
+    }
+
+    /// Returns the shard assigned to a tensor.
+    #[must_use]
+    pub fn shard_for_tensor(&self, tensor: &str) -> Option<&str> {
+        self.weight_map.get(tensor).map(String::as_str)
+    }
+}
+
 impl V41SafetensorsIndex {
     /// Parses a safetensors index document.
     ///
@@ -104,19 +150,7 @@ impl V41SafetensorsIndex {
             return Err(CheckpointManifestError::EmptyWeightMap);
         }
 
-        let mut shard_paths = BTreeSet::new();
-        for (tensor, shard_path) in &index.weight_map {
-            if tensor.trim().is_empty() {
-                return Err(CheckpointManifestError::BlankTensorName);
-            }
-            if shard_path.trim().is_empty() {
-                return Err(CheckpointManifestError::BlankPath);
-            }
-            if !is_safe_artifact_path(shard_path) {
-                return Err(CheckpointManifestError::UnsafePath(shard_path.clone()));
-            }
-            shard_paths.insert(shard_path.clone());
-        }
+        let shard_paths = validate_weight_map(&index.weight_map)?;
         Ok(Self {
             total_bytes,
             tensor_count: index.weight_map.len(),
@@ -159,6 +193,25 @@ impl V41SafetensorsIndex {
             .iter()
             .map(|(tensor, shard)| (tensor.as_str(), shard.as_str()))
     }
+}
+
+fn validate_weight_map(
+    weight_map: &BTreeMap<String, String>,
+) -> Result<Vec<String>, CheckpointManifestError> {
+    let mut shard_paths = BTreeSet::new();
+    for (tensor, shard_path) in weight_map {
+        if tensor.trim().is_empty() {
+            return Err(CheckpointManifestError::BlankTensorName);
+        }
+        if shard_path.trim().is_empty() {
+            return Err(CheckpointManifestError::BlankPath);
+        }
+        if !is_safe_artifact_path(shard_path) {
+            return Err(CheckpointManifestError::UnsafePath(shard_path.clone()));
+        }
+        shard_paths.insert(shard_path.clone());
+    }
+    Ok(shard_paths.into_iter().collect())
 }
 
 /// One required checkpoint artifact.
@@ -255,6 +308,13 @@ struct RawSafetensorsMetadata {
     total_size: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawMlxSafetensorsIndex {
+    #[serde(default)]
+    _metadata: serde_json::Value,
+    weight_map: BTreeMap<String, String>,
+}
+
 /// An invalid V4.1 checkpoint artifact manifest.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -297,7 +357,8 @@ pub enum CheckpointManifestError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckpointFile, CheckpointManifestError, V41CheckpointManifest, V41SafetensorsIndex,
+        CheckpointFile, CheckpointManifestError, MlxSafetensorsIndex, V41CheckpointManifest,
+        V41SafetensorsIndex,
     };
 
     #[test]
@@ -403,6 +464,23 @@ mod tests {
         assert_eq!(
             index.shard_paths(),
             ["model-00001.safetensors", "model-00002.safetensors"]
+        );
+    }
+
+    #[test]
+    fn parses_mlx_index_without_total_size() {
+        let index = MlxSafetensorsIndex::parse(
+            r#"{"metadata":{},"weight_map":{"model.embed_tokens":"model-00001.safetensors","lm_head":"model-00002.safetensors"}}"#,
+        )
+        .expect("valid MLX index");
+        assert_eq!(index.tensor_count(), 2);
+        assert_eq!(
+            index.shard_paths(),
+            ["model-00001.safetensors", "model-00002.safetensors"]
+        );
+        assert_eq!(
+            index.shard_for_tensor("lm_head"),
+            Some("model-00002.safetensors")
         );
     }
 

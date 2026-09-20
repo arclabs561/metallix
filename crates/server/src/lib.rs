@@ -35,7 +35,10 @@ mod v41_indexer;
 mod v41_rotary;
 
 use clap::{Parser, Subcommand};
-use deepseek::{V41TextContract, manifest::V41SafetensorsIndex};
+use deepseek::{
+    V41TextContract,
+    manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
+};
 use qwen::{
     Qwen3TextContract, checkpoint::Qwen3CheckpointInspection, preflight::Qwen3ExecutionPreflight,
 };
@@ -1068,22 +1071,32 @@ fn inspect_v41_index(index: &PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let index = match V41SafetensorsIndex::parse(&json) {
-        Ok(index) => index,
-        Err(error) => {
-            eprintln!(
-                "{} is not a valid V4.1 safetensors index: {error}",
-                index.display()
-            );
-            return ExitCode::FAILURE;
+    match V41SafetensorsIndex::parse(&json) {
+        Ok(index) => {
+            println!("V4.1 safetensors index");
+            println!("tensors: {}", index.tensor_count());
+            println!("shards: {}", index.shard_paths().len());
+            println!("declared total bytes: {}", index.total_bytes());
+            println!("next gate: resolve individual shard sizes before download planning");
+            ExitCode::SUCCESS
         }
-    };
-    println!("V4.1 safetensors index");
-    println!("tensors: {}", index.tensor_count());
-    println!("shards: {}", index.shard_paths().len());
-    println!("declared total bytes: {}", index.total_bytes());
-    println!("next gate: resolve individual shard sizes before download planning");
-    ExitCode::SUCCESS
+        Err(strict_error) => match MlxSafetensorsIndex::parse(&json) {
+            Ok(index) => {
+                println!("MLX safetensors index");
+                println!("tensors: {}", index.tensor_count());
+                println!("shards: {}", index.shard_paths().len());
+                println!("scope: tensor placement only; no native DeepSeek execution");
+                ExitCode::SUCCESS
+            }
+            Err(mlx_error) => {
+                eprintln!(
+                    "{} is not a supported V4.1 or MLX safetensors index: strict={strict_error}; mlx={mlx_error}",
+                    index.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+    }
 }
 
 fn inspect_qwen(config: &PathBuf) -> ExitCode {
