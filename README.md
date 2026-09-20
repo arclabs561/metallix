@@ -10,7 +10,9 @@ token probabilities and check the KV cache—all from `mx`.
 
 Qwen3-0.6B and Qwen3-4B-Instruct-2507 run today. DeepSeek-V4.1-Flash is the main target; its
 configuration and isolated Metal operators work today, but it cannot generate
-yet.
+yet through Metallix's native adapter. A separate machine-local oMLX smoke
+route can load the cached DeepSeek-V4.1-Flash MLX snapshot; see the [local
+profile ledger](docs/experiments/deepseek-local-profile.md).
 
 The longer-term direction includes broader MLX computation, multimodal models,
 SMC/sampling, and training/LoRA. See the [adapter/config proposal](docs/model-adapters.md)
