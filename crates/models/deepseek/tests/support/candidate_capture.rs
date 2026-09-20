@@ -311,10 +311,34 @@ pub(super) fn captured_keys(start: usize) -> Vec<u16> {
         .bf16()
 }
 
+/// Returns the historical source attention input that starts candidate query
+/// preparation. A new upstream boundary must equal these exact BF16 bits before
+/// this fixture can remain its arithmetic oracle.
+pub(super) fn captured_attention_input(start: usize) -> Vec<u16> {
+    let fixture = fixture();
+    source_case(&fixture, start).attention_input.bf16()
+}
+
 /// Generates one source-captured candidate mask from supplied native index keys.
 ///
 /// X remains a fixture-fed source boundary. `native_keys` must exactly
 /// equal the independently captured layer-three FP4 key prefix at `start`.
+pub(super) fn generated_candidates(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+) -> CandidateSelection {
+    let fixture = fixture();
+    let case = source_case(&fixture, start);
+    generated_candidates_from_attention_input(start, native_keys, call, &case.inputs.x.bf16())
+}
+
+/// Generates candidates after an independently derived layer-three attention
+/// input has crossed the source-captured input boundary.
+///
+/// The existing source fixture remains the arithmetic oracle: this seam only
+/// accepts a shaped native input and still verifies every captured projection,
+/// score, and selected mask below.
 #[expect(
     clippy::too_many_lines,
     reason = "keep source-stage parity assertions in execution order"
@@ -323,10 +347,11 @@ pub(super) fn captured_keys(start: usize) -> Vec<u16> {
     clippy::similar_names,
     reason = "retain source wq_a and wq_b projection names"
 )]
-pub(super) fn generated_candidates(
+pub(super) fn generated_candidates_from_attention_input(
     start: usize,
     native_keys: &[u16],
     call: SelectionCall,
+    attention_input: &[u16],
 ) -> CandidateSelection {
     let fixture = fixture();
     let case = source_case(&fixture, start);
@@ -348,8 +373,13 @@ pub(super) fn generated_candidates(
     let wq_a_scales = parameters["layers.3.attn.wq_a.scale"].fp8();
     let q_norm = parameters["layers.3.attn.q_norm.weight"].bf16();
     let positions = case.inputs.x.shape[1];
+    assert_eq!(
+        attention_input.len(),
+        positions * fixture.model.input_dimension,
+        "native attention input shape at start {start}"
+    );
     let prepared = prepare_scored_query(
-        &case.inputs.x.bf16(),
+        attention_input,
         &call_frequencies(&fixture, start, positions),
         CandidateQueryWeights {
             wq_a: Fp8Projection {

@@ -7,6 +7,9 @@
 
 use super::{attention_capture, candidate_capture};
 
+#[path = "candidate_hc_capture.rs"]
+mod candidate_hc_capture;
+
 use std::num::NonZeroUsize;
 
 use attention_capture::{
@@ -198,7 +201,8 @@ fn source_frequencies(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one source boundary is verified end-to-end"
+    clippy::too_many_arguments,
+    reason = "keep independently captured producer and consumer operands explicit"
 )]
 fn generated_indices(
     root: &Value,
@@ -208,6 +212,7 @@ fn generated_indices(
     weights: IndexQueryWeights<'_>,
     keys: &[u16],
     publication: IndexKeyPublicationId,
+    producer_attention_input: &[u16],
 ) -> Vec<i32> {
     let model = field(root, "model");
     let indexer = field(raw_case, "indexer");
@@ -314,7 +319,12 @@ fn generated_indices(
         )
         .expect("source consumer selection geometry"),
     );
-    let candidates = candidate_capture::generated_candidates(start, keys, call);
+    let candidates = candidate_capture::generated_candidates_from_attention_input(
+        start,
+        keys,
+        call,
+        producer_attention_input,
+    );
     assert_eq!(
         candidates.mask(),
         bools(field(inputs, "candidate_mask")),
@@ -413,6 +423,8 @@ pub(super) fn native_outputs_from_ownered_inputs(
     let attention = attention_fixture();
     assert_eq!(expected_capture_sha256, CAPTURE_SHA256);
     assert_eq!(supplied_inputs.len(), attention.cases.len());
+    let owner_inputs = candidate_hc_capture::derived_inputs();
+    assert_eq!(owner_inputs.len(), attention.cases.len());
     let model = field(&raw, "model");
     let parameters = field(&raw, "encoded_parameters");
     let heads = usize_field(model, "index_n_heads");
@@ -498,9 +510,14 @@ pub(super) fn native_outputs_from_ownered_inputs(
         .enumerate()
     {
         let (supplied_start, supplied_input) = &supplied_inputs[call_id];
+        let (owner_start, owner_input) = &owner_inputs[call_id];
         assert_eq!(
             *supplied_start, attention_case.start_pos,
             "supplied attention start"
+        );
+        assert_eq!(
+            *owner_start, attention_case.start_pos,
+            "derived owner start"
         );
         assert_eq!(
             supplied_input,
@@ -518,9 +535,18 @@ pub(super) fn native_outputs_from_ownered_inputs(
             attention_case.start_pos
         );
         let positions = shape(field(owner_case, "latent"))[1];
-        let input = field(compressor_case, "attention_input");
-        assert_eq!(shape(input), [1, positions, 128]);
-        let input = bf16(input);
+        let captured_owner_input = field(compressor_case, "attention_input");
+        assert_eq!(shape(captured_owner_input), [1, positions, 128]);
+        assert_eq!(
+            owner_input,
+            &bf16(captured_owner_input),
+            "derived HC owner input"
+        );
+        assert_eq!(
+            owner_input,
+            &candidate_capture::captured_attention_input(attention_case.start_pos),
+            "derived HC input crosses historical candidate boundary"
+        );
         let owner_frequencies = source_frequencies(&raw, attention_case.start_pos, positions, 16);
         let publication =
             IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID"));
@@ -528,7 +554,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
             publication,
             attention_case.start_pos,
             nonzero(positions),
-            &input,
+            owner_input,
             &owner_frequencies,
             weights,
         );
@@ -609,6 +635,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
             index_weights,
             pending.key_prefix(0).expect("complete staged key prefix"),
             pending.publication(),
+            owner_input,
         );
         assert_eq!(
             pending.kv_prefix(0).expect("complete staged KV prefix"),

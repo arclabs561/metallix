@@ -68,8 +68,9 @@ a small CPU semantic oracle, not native BF16 or Metal-kernel parity.
 DeepSeek-V4.1 now has a small source-captured layer-four-to-logits numerical
 suffix fixture: native owner-backed compressed KV and selected IDs feed native
 attention, HC, FFN, final HC/RMSNorm, and the FP32 head for the captured
-prefill/decode calls. Upstream owner input and block residual state remain
-fixture-fed, so this is not full-model generation or Metal parity. Qwen
+prefill/decode calls. Layer-three HC pre-mix and RMSNorm now derive the owner
+and candidate attention input. Block-entry residuals and incoming pre-mix state
+remain fixture-fed, so this is not full-model generation or Metal parity. Qwen
 correctness still does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.
 

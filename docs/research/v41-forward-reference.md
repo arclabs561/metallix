@@ -328,8 +328,9 @@ RMSNorm interval from the terminal block/pre-mix envelope, followed by the fixed
 FP32 dot-product bound; it does not admit observed native/source differences as
 tolerance. A wrong final-norm wiring control must fail under the same oracle.
 This qualifies the native owner-to-layer-four suffix for the captured calls;
-upstream owner input, earlier residual state, and full-model generation remain
-outside the claim.
+the owner attention input is now derived through the layer-three HC extension
+below, while earlier block-entry residual state and full-model generation
+remain outside the claim.
 
 ## Owner-layer index keys
 
@@ -502,8 +503,9 @@ projection; removing a selected candidate changes both selection and attention.
 The latter control holds captured consumer scores and KV fixed to isolate the
 mask effect; it does not replace the positive native-owner integration.
 
-Layer-three input activations remain captured operands; its `wq_a` and QR are
-now computed and checked against captured expectations before the native
+The earlier producer gate used captured layer-three input activations; the HC
+extension below now derives them from block-entry state. Its `wq_a` and QR are
+computed and checked against captured expectations before the native
 index-query path consumes them. The layer-four consumer now uses the same
 stateless adapter with its own captured weights and input, checking its native
 projection and QR against the attention oracle before scoring. Neither producer
@@ -562,15 +564,10 @@ the summed-score tensor identity: prefill has a causal-mask operation, while
 single-token decode does not. The final source index offset follows the window
 width (five, six, six for this trace), not the final token position.
 
-```sh
-uv run scripts/test_v41_observer_runtime.py
-uv run scripts/v41-forward-reference.py --output artifacts/v41-candidate-formatted-source.json
-uv run --python 3.13 python scripts/v41_candidate_capture.py \
-  --input artifacts/v41-candidate-formatted-source.json \
-  --output fixtures/deepseek-v41/forward-candidate-reference.json
-```
+The earlier candidate fixture is preserved under its original capture identity.
+Use the HC capture command below for fresh exports.
 
-The complete candidate capture has SHA-256
+The historical candidate capture has SHA-256
 `7c5cc8541da338fa3426d63e32b9a66e9132e07ab68ee26d86fbf9e29f62f48d`;
 a repeated capture is byte-identical. Its observer hash is
 `0235926c7fbd884433021d5ddcef6731884123e0df867466845fb2b39bf33c16`.
@@ -581,3 +578,22 @@ It also checks that the produced candidate mask equals the consumer's input.
 These runtime checks establish observation integrity. The Rust integration
 tests separately qualify the native candidate chain from captured input onward;
 neither establishes full-model generation.
+
+The separate layer-three HC capture records each block's two residual copies,
+incoming FP32 pre-mix state, and RMSNorm weight. Its complete-capture SHA-256
+is `8379042b0d90f09b4c5b3d91f781a8f67171bc93603925e891f0e4254870a9a9`;
+the bounded projection is
+[`forward-candidate-hc-reference.json`](../../fixtures/deepseek-v41/forward-candidate-hc-reference.json).
+The Rust gate derives native HC pre-mix and normalization from those operands,
+then feeds the result into the compressed owner and the historical candidate
+fixture's query, score, and selection oracle. The owner output continues through
+the existing final-layer attention/HC/FFN/logits qualification. This deliberately cross-gates the new input with
+the established arithmetic fixture without relabeling its capture identity.
+
+```sh
+uv run scripts/v41-forward-reference.py --output artifacts/v41-candidate-hc-source.json
+uv run --python 3.13 python scripts/v41_candidate_capture.py \
+  --input artifacts/v41-candidate-hc-source.json \
+  --output fixtures/deepseek-v41/forward-candidate-hc-reference.json
+cargo test -p deepseek --test forward_candidate_hc
+```

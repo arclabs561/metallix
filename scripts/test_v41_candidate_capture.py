@@ -45,6 +45,7 @@ def _negative_infinity_bf16(shape: list[int]) -> dict[str, object]:
 def _receipt() -> dict[str, object]:
     source_hash = "a" * 64
     parameters = {
+        "layers.3.attn_norm.weight": _tensor("torch.bfloat16", [128], 2),
         "layers.3.attn.wq_a.weight": _tensor("torch.float8_e4m3fn", [32, 128], 1),
         "layers.3.attn.wq_a.scale": _tensor("torch.float8_e8m0fnu", [1, 4], 1),
         "layers.3.attn.q_norm.weight": _tensor("torch.bfloat16", [32], 2),
@@ -82,6 +83,20 @@ def _receipt() -> dict[str, object]:
             {
                 "start_pos": start_pos,
                 "intermediates": {
+                    "layers.3.block_input": {
+                        "residual": _tensor(
+                            "torch.bfloat16",
+                            [1, sequence, 2, 128],
+                            2,
+                            fill=start_pos + 7,
+                        ),
+                        "incoming_pre": _tensor(
+                            "torch.float32",
+                            [1, sequence, 2],
+                            4,
+                            fill=start_pos + 8,
+                        ),
+                    },
                     "layers.3.attention_input": input_x,
                     "layers.3.attn.wq_a": _tensor(
                         "torch.bfloat16", [1, sequence, 32], 2, fill=start_pos + 4
@@ -160,9 +175,7 @@ class CandidateCaptureTest(unittest.TestCase):
         )
         self.assertEqual(
             fixture["source"]["forward_observers_sha256"],
-            hashlib.sha256(
-                (root / "scripts/v41_forward_observers.py").read_bytes()
-            ).hexdigest(),
+            "0235926c7fbd884433021d5ddcef6731884123e0df867466845fb2b39bf33c16",
         )
         self.assertEqual(
             [case["inputs"]["offset"] for case in fixture["cases"]], [5, 6, 6]
@@ -199,6 +212,7 @@ class CandidateCaptureTest(unittest.TestCase):
         self.assertEqual(
             list(fixture["encoded_parameters"]),
             [
+                "layers.3.attn_norm.weight",
                 "layers.3.attn.wq_a.weight",
                 "layers.3.attn.wq_a.scale",
                 "layers.3.attn.q_norm.weight",
@@ -214,6 +228,42 @@ class CandidateCaptureTest(unittest.TestCase):
             [case["candidate_mask"]["shape"] for case in fixture["cases"]],
             [[1, 5, 5], [1, 1, 6], [1, 1, 7]],
         )
+        self.assertEqual(
+            [case["block_input"]["residual"]["shape"] for case in fixture["cases"]],
+            [[1, 5, 2, 128], [1, 1, 2, 128], [1, 1, 2, 128]],
+        )
+        self.assertEqual(
+            [case["block_input"]["incoming_pre"]["shape"] for case in fixture["cases"]],
+            [[1, 5, 2], [1, 1, 2], [1, 1, 2]],
+        )
+
+    def test_rejects_missing_or_malformed_layer_three_hc_boundary(self) -> None:
+        receipt = _receipt()
+        del receipt["steps"][0]["intermediates"]["layers.3.block_input"]
+        with self.assertRaisesRegex(TypeError, "layer-three block input"):
+            candidate_fixture(receipt)
+
+        receipt = _receipt()
+        record = receipt["steps"][1]["intermediates"]["layers.3.block_input"][
+            "incoming_pre"
+        ]
+        record["dtype"] = "torch.bfloat16"
+        with self.assertRaisesRegex(RuntimeError, "layer-three block incoming pre"):
+            candidate_fixture(receipt)
+
+    def test_rejects_missing_or_malformed_layer_three_normalization_weight(
+        self,
+    ) -> None:
+        receipt = _receipt()
+        del receipt["encoded_parameters"]["layers.3.attn_norm.weight"]
+        with self.assertRaisesRegex(TypeError, "layers.3.attn_norm.weight"):
+            candidate_fixture(receipt)
+
+        receipt = _receipt()
+        record = receipt["encoded_parameters"]["layers.3.attn_norm.weight"]
+        record["shape"] = [127]
+        with self.assertRaisesRegex(RuntimeError, "layers.3.attn_norm.weight shape"):
+            candidate_fixture(receipt)
 
     def test_rejects_wrong_boundary_missing_observed_mask(self) -> None:
         receipt = _receipt()

@@ -358,18 +358,23 @@ def hooks_for(
 
         return hook
 
-    def capture_block_input(
-        _module: torch.nn.Module, inputs: tuple[object, ...]
-    ) -> None:
-        cap_guard("layers.4.block_input")
-        if len(inputs) != 4:
-            raise RuntimeError(
-                f"expected four source inputs for layers.4 Block.forward, got {len(inputs)}"
-            )
-        records["layers.4.block_input"] = {
-            "residual": object_record(inputs[0], include_storage=True),
-            "incoming_pre": object_record(inputs[2], include_storage=True),
-        }
+    def capture_block_input(layer_id: int):
+        """Retain the source operands whose HC pre-mix feeds attention norm."""
+        record_name = f"layers.{layer_id}.block_input"
+
+        def hook(_module: torch.nn.Module, inputs: tuple[object, ...]) -> None:
+            cap_guard(record_name)
+            if len(inputs) != 4:
+                raise RuntimeError(
+                    f"expected four source inputs for {record_name} Block.forward, "
+                    f"got {len(inputs)}"
+                )
+            records[record_name] = {
+                "residual": object_record(inputs[0], include_storage=True),
+                "incoming_pre": object_record(inputs[2], include_storage=True),
+            }
+
+        return hook
 
     def capture_weights_for(state: _IndexerState):
         def capture_weights(
@@ -489,8 +494,11 @@ def hooks_for(
                     mark_quantization_phase(consumer_state, _QuantizationPhase.QUERY)
                 )
             )
-        if name == "layers.4":
-            handles.append(module.register_forward_pre_hook(capture_block_input))
+        if name in {"layers.3", "layers.4"}:
+            layer_id = int(name.removeprefix("layers."))
+            handles.append(
+                module.register_forward_pre_hook(capture_block_input(layer_id))
+            )
 
     def observed_hc_mixes(
         x: torch.Tensor,

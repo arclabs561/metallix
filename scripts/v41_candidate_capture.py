@@ -25,6 +25,7 @@ MAX_FIXTURE_BYTES = 128 * 1024
 BF16_BYTES = 2
 FP8_BYTES = 1
 INT32_BYTES = 4
+FP32_BYTES = 4
 COMPLEX64_BYTES = 8
 LOWER_HEX_RE = re.compile(r"^[0-9a-f]*$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -253,6 +254,13 @@ def candidate_fixture(receipt: dict[str, object]) -> dict[str, object]:
         byte_width=COMPLEX64_BYTES,
     )
     encoded_parameters = {
+        "layers.3.attn_norm.weight": _tensor(
+            parameters.get("layers.3.attn_norm.weight"),
+            "layers.3.attn_norm.weight",
+            dtype="torch.bfloat16",
+            shape=[input_dimension],
+            byte_width=BF16_BYTES,
+        ),
         "layers.3.attn.wq_a.weight": _tensor(
             parameters.get("layers.3.attn.wq_a.weight"),
             "layers.3.attn.wq_a.weight",
@@ -312,6 +320,10 @@ def candidate_fixture(receipt: dict[str, object]) -> dict[str, object]:
         intermediate = _require_dict(
             item.get("intermediates"), f"step {start_pos} intermediates"
         )
+        block_input = _require_dict(
+            intermediate.get("layers.3.block_input"),
+            f"step {start_pos} layer-three block input",
+        )
         observation = _require_dict(
             intermediate.get("layers.3.attn.indexer_observation"),
             f"step {start_pos} layer-three indexer observation",
@@ -328,6 +340,20 @@ def candidate_fixture(receipt: dict[str, object]) -> dict[str, object]:
             dtype="torch.bfloat16",
             shape=[1, sequence, input_dimension],
             byte_width=BF16_BYTES,
+        )
+        block_residual = _tensor(
+            block_input.get("residual"),
+            f"step {start_pos} layer-three block residual",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, 2, input_dimension],
+            byte_width=BF16_BYTES,
+        )
+        block_incoming_pre = _tensor(
+            block_input.get("incoming_pre"),
+            f"step {start_pos} layer-three block incoming pre",
+            dtype="torch.float32",
+            shape=[1, sequence, 2],
+            byte_width=FP32_BYTES,
         )
         wq_a_output = _tensor(
             intermediate.get("layers.3.attn.wq_a"),
@@ -472,6 +498,10 @@ def candidate_fixture(receipt: dict[str, object]) -> dict[str, object]:
         cases.append(
             {
                 "start_pos": start_pos,
+                "block_input": {
+                    "residual": block_residual,
+                    "incoming_pre": block_incoming_pre,
+                },
                 "attention_input": attention_input,
                 "wq_a_output": wq_a_output,
                 "q_norm_output": q_norm_output,
@@ -496,7 +526,8 @@ def candidate_fixture(receipt: dict[str, object]) -> dict[str, object]:
     return {
         "schema_version": 1,
         "scope": (
-            "layer-three source candidate-producer inputs, exact operation boundaries, "
+            "layer-three HC block operands, attention-normalization weight, source "
+            "candidate-producer inputs, exact operation boundaries, "
             "candidate masks, and output indices; not native arithmetic, cache ownership, "
             "scheduler generalization, or full-model parity"
         ),

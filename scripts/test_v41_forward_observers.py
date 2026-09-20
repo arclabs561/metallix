@@ -33,6 +33,14 @@ class SourceObserverPolicyTest(unittest.TestCase):
         ):
             self.assertIn(name, source)
 
+    def test_observer_records_layer_three_block_hc_operands(self) -> None:
+        source = OBSERVERS.read_text()
+        self.assertIn('record_name = f"layers.{layer_id}.block_input"', source)
+        self.assertIn('name in {"layers.3", "layers.4"}', source)
+        self.assertIn(
+            '"incoming_pre": object_record(inputs[2], include_storage=True)', source
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
