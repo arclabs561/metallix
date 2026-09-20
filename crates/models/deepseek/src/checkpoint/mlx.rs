@@ -176,6 +176,11 @@ pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::er
 }
 
 /// Applies a decoded row-major affine matrix to one hidden-state vector on MLX.
+///
+/// # Panics
+///
+/// Panics when the supplied matrix or input dimensions do not match the
+/// declared `rows` and `width`.
 #[cfg(feature = "metal")]
 pub fn apply_affine_matrix_mlx(
     matrix: &[f32],
