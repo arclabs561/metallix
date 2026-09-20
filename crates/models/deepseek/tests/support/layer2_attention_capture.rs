@@ -9,12 +9,7 @@
     reason = "the standalone attention gate and layer-two HC/FFN join consume distinct helper entry points"
 )]
 
-#[allow(
-    dead_code,
-    reason = "the layer-one publication oracle has controls used only by its standalone binary"
-)]
-#[path = "layer1_owner_capture.rs"]
-mod layer1_owner_capture;
+use super::layer1_owner_capture;
 
 use std::num::NonZeroUsize;
 

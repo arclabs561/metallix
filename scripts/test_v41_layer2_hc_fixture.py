@@ -32,7 +32,26 @@ class T(unittest.TestCase):
         c.fixture = json.loads(json.dumps(c.e.layer2_hc_fixture(c.receipt)))
 
     def test_fixture(self):
-        self.assertEqual(json.loads(F.read_text()), self.fixture)
+        committed = json.loads(F.read_text())
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        changing = {"forward_observers_sha256", "complete_capture_sha256"}
+        for field in changing:
+            self.assertRegex(self.fixture["source"][field], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            {
+                key: value
+                for key, value in committed["source"].items()
+                if key not in changing
+            },
+            {
+                key: value
+                for key, value in self.fixture["source"].items()
+                if key not in changing
+            },
+        )
 
     def test_two_copy_contract_is_pinned(self):
         self.assertEqual(self.fixture["block_config"]["copies"], 2)

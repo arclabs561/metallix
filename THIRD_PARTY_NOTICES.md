@@ -66,6 +66,11 @@ synthetic graph's layer-one attention projections, local window, owned
 compressed KV/indices, sparse attention and output boundaries. They use the
 same pinned source and locally generated parameters; no checkpoint weights
 are included. The exporter checks source identity and exact tensor storage.
+`scripts/v41_layer1_tail_capture.py` and
+`fixtures/deepseek-v41/layer1-tail-reference.json` extend that synthetic
+capture through layer-one HC mixing and routed/shared FFN parameters to the
+layer-two residual and pre-mix entry. These also contain locally generated
+parameters and source observations, not released checkpoint weights.
 The separate
 `scripts/v41_layer2_attention_capture.py` export and
 `fixtures/deepseek-v41/layer2-attention-reference.json` retain exact observed

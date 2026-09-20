@@ -32,6 +32,16 @@ mod hc_chain_bounds;
 mod hc_coefficient_bounds;
 #[path = "support/hc_projection_bounds.rs"]
 mod hc_projection_bounds;
+#[path = "support/layer1_attention_capture.rs"]
+mod layer1_attention_capture;
+#[path = "support/layer1_join.rs"]
+mod layer1_join;
+#[allow(
+    dead_code,
+    reason = "standalone owner controls have a separate test binary"
+)]
+#[path = "support/layer1_owner_capture.rs"]
+mod layer1_owner_capture;
 #[path = "support/layer2_attention_capture.rs"]
 mod layer2_attention_capture;
 #[path = "support/layer2_ffn.rs"]

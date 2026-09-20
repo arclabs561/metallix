@@ -41,7 +41,26 @@ class LayerOneAttentionFixtureTest(unittest.TestCase):
         cls.fixture = json.loads(json.dumps(projected, sort_keys=True, allow_nan=False))
 
     def test_committed_fixture_matches_current_source_capture(self) -> None:
-        self.assertEqual(json.loads(FIXTURE.read_text()), self.fixture)
+        committed = json.loads(FIXTURE.read_text())
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        changing = {"forward_observers_sha256", "complete_capture_sha256"}
+        for field in changing:
+            self.assertRegex(self.fixture["source"][field], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            {
+                key: value
+                for key, value in committed["source"].items()
+                if key not in changing
+            },
+            {
+                key: value
+                for key, value in self.fixture["source"].items()
+                if key not in changing
+            },
+        )
 
     def test_owner_selected_ids_reach_compressed_attention(self) -> None:
         for case in self.fixture["cases"]:

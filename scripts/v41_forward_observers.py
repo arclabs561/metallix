@@ -332,6 +332,9 @@ def hooks_for(
     had_producer_hc_mixes, prior_producer_hc_mixes, _ = instance_method(
         layer_three, "hc_mixes"
     )
+    had_layer_one_hc_mixes, prior_layer_one_hc_mixes, _ = instance_method(
+        layer_one, "hc_mixes"
+    )
     had_layer_two_hc_mixes, prior_layer_two_hc_mixes, _ = instance_method(
         layer_two, "hc_mixes"
     )
@@ -496,7 +499,7 @@ def hooks_for(
                     capture_input("norm_input", exactly_one=True)
                 )
             )
-        if name in {"layers.2.ffn", "layers.3.ffn", "layers.4.ffn"}:
+        if name in {"layers.1.ffn", "layers.2.ffn", "layers.3.ffn", "layers.4.ffn"}:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(f"{name}_input", exactly_one=False)
@@ -564,7 +567,12 @@ def hooks_for(
                     )
                 )
             )
-        if name in {"layers.2.ffn_norm", "layers.3.ffn_norm", "layers.4.ffn_norm"}:
+        if name in {
+            "layers.1.ffn_norm",
+            "layers.2.ffn_norm",
+            "layers.3.ffn_norm",
+            "layers.4.ffn_norm",
+        }:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(
@@ -614,7 +622,7 @@ def hooks_for(
                     mark_quantization_phase(consumer_state, _QuantizationPhase.QUERY)
                 )
             )
-        if name in {"layers.2", "layers.3", "layers.4"}:
+        if name in {"layers.1", "layers.2", "layers.3", "layers.4"}:
             layer_id = int(name.removeprefix("layers."))
             handles.append(
                 module.register_forward_pre_hook(capture_block_input(layer_id))
@@ -627,7 +635,9 @@ def hooks_for(
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer_id = (
-            2
+            1
+            if hc_fn is model.layers[1].hc_ffn_fn
+            else 2
             if hc_fn is model.layers[2].hc_ffn_fn
             else 3
             if hc_fn is layer_three.hc_ffn_fn
@@ -822,6 +832,7 @@ def hooks_for(
         return output
 
     try:
+        layer_one.hc_mixes = observed_hc_mixes
         layer_two.hc_mixes = observed_hc_mixes
         layer_three.hc_mixes = observed_hc_mixes
         layer_four.hc_mixes = observed_hc_mixes
@@ -876,6 +887,12 @@ def hooks_for(
             "_compress_kv",
             had_layer_two_compress,
             prior_layer_two_compress,
+        )
+        _restore_instance(
+            layer_one,
+            "hc_mixes",
+            had_layer_one_hc_mixes,
+            prior_layer_one_hc_mixes,
         )
         _restore_instance(
             layer_two,

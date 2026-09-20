@@ -59,14 +59,33 @@ fn hc_fixture() -> HcFixture {
     fixture
 }
 
-fn native_inputs(fixture: &HcFixture) -> Vec<(usize, Vec<u16>)> {
+pub(super) type BlockEntries = [(usize, Vec<u16>, Vec<f32>)];
+
+fn native_inputs(fixture: &HcFixture, entries: Option<&BlockEntries>) -> Vec<(usize, Vec<u16>)> {
+    if let Some(entries) = entries {
+        assert_eq!(entries.len(), fixture.cases.len());
+    }
     let norm = fixture.block_parameters["layers.2.attn_norm.weight"].bf16();
     fixture
         .cases
         .iter()
-        .map(|case| {
-            let residual = case.residual.bf16();
-            let incoming = case.incoming_pre.fp32();
+        .enumerate()
+        .map(|(index, case)| {
+            let captured_residual = case.residual.bf16();
+            let captured_incoming = case.incoming_pre.fp32();
+            let (residual, incoming) = if let Some(entries) = entries {
+                let (start, residual, incoming) = &entries[index];
+                assert_eq!(*start, case.start_pos);
+                assert_eq!(
+                    residual, &captured_residual,
+                    "native layer-one terminal residual at layer-two boundary"
+                );
+                assert_eq!(incoming.len(), captured_incoming.len());
+                assert!(incoming.iter().all(|value| value.is_finite()));
+                (residual.as_slice(), incoming.as_slice())
+            } else {
+                (captured_residual.as_slice(), captured_incoming.as_slice())
+            };
             let input: Vec<_> = residual
                 .chunks_exact(256)
                 .enumerate()
@@ -242,10 +261,17 @@ fn through_final_suffix(entries: &layer2_ffn::AttentionEntries) {
     assert_final_suffix(&fourth, output);
 }
 
+pub(super) fn native_layer_two_from_entries(entries: &BlockEntries) {
+    let fixture = hc_fixture();
+    let inputs = native_inputs(&fixture, Some(entries));
+    let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
+    through_final_suffix(&handoffs(&fixture, &outputs));
+}
+
 #[test]
 fn native_layer_two_attention_hc_ffn_reaches_final_logits() {
     let fixture = hc_fixture();
-    let inputs = native_inputs(&fixture);
+    let inputs = native_inputs(&fixture, None);
     let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
     through_final_suffix(&handoffs(&fixture, &outputs));
 }
@@ -254,7 +280,7 @@ fn native_layer_two_attention_hc_ffn_reaches_final_logits() {
 #[should_panic(expected = "native layer-two attention post-mix residual")]
 fn discarded_native_attention_fails_before_ffn() {
     let fixture = hc_fixture();
-    let inputs = native_inputs(&fixture);
+    let inputs = native_inputs(&fixture, None);
     let mut outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
     outputs[0].1.fill(0);
     handoffs(&fixture, &outputs);
@@ -266,7 +292,7 @@ proptest::proptest! {
     #[test]
     fn dropping_selected_trace_token_attention_is_rejected(mask in 1_u8..128) {
         let fixture = hc_fixture();
-        let inputs = native_inputs(&fixture);
+        let inputs = native_inputs(&fixture, None);
         let mut outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
         for token in 0_usize..7 {
             if mask & (1 << token) != 0 {

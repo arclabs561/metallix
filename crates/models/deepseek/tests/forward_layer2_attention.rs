@@ -1,5 +1,11 @@
 //! Native layer-two attention using the source-captured layer-one publication.
 
+#[allow(
+    dead_code,
+    reason = "standalone owner controls have a separate test binary"
+)]
+#[path = "support/layer1_owner_capture.rs"]
+mod layer1_owner_capture;
 #[path = "support/layer2_attention_capture.rs"]
 mod layer2_attention_capture;
 

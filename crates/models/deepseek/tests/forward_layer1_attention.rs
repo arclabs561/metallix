@@ -2,6 +2,12 @@
 
 #[path = "support/layer1_attention_capture.rs"]
 mod layer1_attention_capture;
+#[allow(
+    dead_code,
+    reason = "standalone owner controls have a separate test binary"
+)]
+#[path = "support/layer1_owner_capture.rs"]
+mod layer1_owner_capture;
 
 #[test]
 fn layer_one_attention_consumes_native_owner_publications() {

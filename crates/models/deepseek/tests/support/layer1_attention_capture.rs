@@ -8,12 +8,7 @@
     reason = "the standalone attention gate and layer-one attention gate consume distinct helper entry points"
 )]
 
-#[allow(
-    dead_code,
-    reason = "the layer-one owner controls are used only by its standalone binary"
-)]
-#[path = "layer1_owner_capture.rs"]
-mod layer1_owner_capture;
+use super::layer1_owner_capture;
 
 use std::num::NonZeroUsize;
 

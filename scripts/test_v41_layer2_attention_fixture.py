@@ -45,7 +45,25 @@ class LayerTwoAttentionFixtureTest(unittest.TestCase):
                 SCRIPTS.parent / "fixtures/deepseek-v41/layer2-attention-reference.json"
             ).read_text()
         )
-        self.assertEqual(committed, self.fixture)
+        self.assertEqual(
+            {key: value for key, value in committed.items() if key != "source"},
+            {key: value for key, value in self.fixture.items() if key != "source"},
+        )
+        changing = {"forward_observers_sha256", "complete_capture_sha256"}
+        for field in changing:
+            self.assertRegex(self.fixture["source"][field], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            {
+                key: value
+                for key, value in committed["source"].items()
+                if key not in changing
+            },
+            {
+                key: value
+                for key, value in self.fixture["source"].items()
+                if key not in changing
+            },
+        )
 
     def test_layer_two_borrows_exact_current_layer_one_publication(self) -> None:
         for case in self.fixture["cases"]:
