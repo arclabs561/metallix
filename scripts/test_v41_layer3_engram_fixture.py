@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import json
 import unittest
@@ -78,6 +79,56 @@ class LayerThreeEngramFixtureTest(unittest.TestCase):
         receipt["engram"]["hash_state"]["primes"]["finite"] = False
         with self.assertRaisesRegex(RuntimeError, "invalid finite"):
             self.exporter.engram_fixture(receipt)
+
+    def test_consistently_hashed_nonfinite_parameter_is_rejected(self) -> None:
+        receipt = copy.deepcopy(self.receipt)
+        tensor = receipt["encoded_parameters"]["layers.3.engram.embed.weight"]
+        raw = bytearray.fromhex(tensor["storage_hex"])
+        raw[-1] = 0x7F
+        tensor["storage_hex"] = raw.hex()
+        tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+        self.assertTrue(tensor["finite"])
+        with self.assertRaisesRegex(RuntimeError, "nonfinite storage"):
+            self.exporter.engram_fixture(receipt)
+
+    def test_numeric_storage_rejects_nonfinite_encodings(self) -> None:
+        for dtype, invalid, valid in (
+            ("torch.float8_e4m3fn", ["7f", "ff"], ["00", "80", "01", "7e", "fe"]),
+            ("torch.float8_e8m0fnu", ["ff"], ["00", "01", "fe"]),
+            (
+                "torch.bfloat16",
+                ["807f", "80ff", "c07f"],
+                ["0000", "0080", "0100", "7f7f"],
+            ),
+            (
+                "torch.float32",
+                ["0000807f", "000080ff", "0100807f"],
+                ["00000000", "00000080", "01000000", "ffff7f7f"],
+            ),
+        ):
+            for storage in invalid + valid:
+                with self.subTest(dtype=dtype, storage=storage):
+                    raw = bytes.fromhex(storage)
+                    tensor = {
+                        "dtype": dtype,
+                        "shape": [1],
+                        "numel": 1,
+                        "finite": True,
+                        "storage_hex": storage,
+                        "storage_sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                    if storage in invalid:
+                        with self.assertRaisesRegex(RuntimeError, "nonfinite storage"):
+                            self.exporter._require_tensor(
+                                tensor, "control", dtype=dtype, shape=[1]
+                            )
+                    else:
+                        self.assertEqual(
+                            self.exporter._require_tensor(
+                                tensor, "control", dtype=dtype, shape=[1]
+                            ),
+                            tensor,
+                        )
 
 
 if __name__ == "__main__":

@@ -79,6 +79,21 @@ def _require_tensor(
     }
     if len(raw) != numel * widths[dtype] or _sha256(raw) != storage_sha256:
         raise RuntimeError(f"{label} exact storage does not match its receipt")
+    nonfinite = False
+    if dtype == "torch.float8_e4m3fn":
+        nonfinite = any(code in (0x7F, 0xFF) for code in raw)
+    elif dtype == "torch.float8_e8m0fnu":
+        nonfinite = 0xFF in raw
+    elif dtype in ("torch.bfloat16", "torch.float32"):
+        width = widths[dtype]
+        exponent_mask = 0x7F80 if width == 2 else 0x7F800000
+        nonfinite = any(
+            int.from_bytes(raw[offset : offset + width], "little") & exponent_mask
+            == exponent_mask
+            for offset in range(0, len(raw), width)
+        )
+    if nonfinite:
+        raise RuntimeError(f"{label} contains nonfinite storage despite its receipt")
     return record
 
 

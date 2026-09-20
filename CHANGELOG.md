@@ -249,6 +249,8 @@ published release; reference operators do not imply full-model support.
 
 ### Fixed
 
+- The Engram source exporter checks numeric storage for NaN and infinity,
+  including receipts with a consistent checksum and an incorrect finite flag.
 - The owner transaction benchmark accepts Cargo's injected `--bench` flag,
   so its documented default, scaling, and profiling commands run through
   `cargo bench` as well as directly.

@@ -118,7 +118,8 @@ records source hash IDs, embedding rows, encoded embedding and WKV parameters,
 WKV output, split key/value tensors, and the gated layer-three block entry at
 prefill and two decode starts. The exporter and its integrity test reject a
 missing WKV observation, changed hash state, or a block entry that differs from
-the gate output. The focused
+the gate output. Numeric storage is checked for nonfinite encodings even when
+the receipt's checksum and claimed finite flag agree. The focused
 `native_layer_three_engram_through_final_suffix_matches_source_logits` test
 then feeds that native hash-to-lookup-to-WKV-to-gate output through the native
 layer-three tail and the established layer-four-to-logits suffix. It uses the
