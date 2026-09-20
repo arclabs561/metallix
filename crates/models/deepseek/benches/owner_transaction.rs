@@ -800,7 +800,12 @@ fn captured_benchmark() {
 }
 
 fn main() {
-    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    // Cargo appends `--bench` even for harness=false executables. Accept that
+    // transport flag while keeping the workload selector explicit.
+    let arguments: Vec<_> = std::env::args_os()
+        .skip(1)
+        .filter(|argument| argument != std::ffi::OsStr::new("--bench"))
+        .collect();
     match arguments.as_slice() {
         [] => captured_benchmark(),
         [argument] if argument == std::ffi::OsStr::new("--synthetic-scale") => synthetic_scale(),

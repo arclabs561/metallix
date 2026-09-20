@@ -249,6 +249,9 @@ published release; reference operators do not imply full-model support.
 
 ### Fixed
 
+- The owner transaction benchmark accepts Cargo's injected `--bench` flag,
+  so its documented default, scaling, and profiling commands run through
+  `cargo bench` as well as directly.
 - Index-key rotary narrowing errors report the full key-buffer element, not
   the offset within one rotary tail. A late-row overflow regression covers it.
 - New Metal composition tests serialize process-global MLX device use,
