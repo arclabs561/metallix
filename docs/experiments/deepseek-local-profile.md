@@ -144,3 +144,11 @@ checksum. This is the first native Q path with a measured bounded I/O strategy.
 The Q chain now includes source-accurate unweighted per-head RMS normalization
 after all Q-B heads, before rotary. The normalized 32,768-output checksum is
 `dfa3530172fc18ba`; Metal evaluation still passes.
+
+The bounded KV gate now decodes all 512 rows of layer-zero `wkv` with the
+artifact's 6-bit/group-128 geometry, evaluates the full `512 × 4096` projection
+on Metal, applies learned `kv_norm`, and rotates only the trailing 64-value KV
+slice. The local receipt reports projected checksum `1a5bf283b2f505d4`,
+normalized checksum `4f3358d81790ce24`, and rotary-tail checksum
+`e51de85f62270c8e`. The input is deliberately a deterministic decoded row; this
+qualifies operator order and geometry, not token-state cache serving.
