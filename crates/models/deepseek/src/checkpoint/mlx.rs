@@ -101,15 +101,35 @@ pub fn read_affine_rows_from_shard(
         })?;
     let groups = logical_width.div_ceil(group_size);
     let packed_width = (logical_width * usize::from(bits.max(1))).div_ceil(32);
+    // MLX keeps any leading dimensions (for example `wo_a` is
+    // `[o_groups, rows, packed_width]`) while packing only the final logical
+    // dimension. Treat the product of the leading dimensions as a flat row
+    // stream, preserving the on-disk contiguous layout and allowing bounded
+    // reads without materializing the whole tensor.
+    let leading_shape = weight.shape().get(..weight.shape().len().saturating_sub(1));
+    let scale_shape = scales.shape();
+    let bias_shape = biases.shape();
+    let expected_scale_shape = leading_shape.map(|leading| {
+        leading
+            .iter()
+            .copied()
+            .chain(std::iter::once(groups as u64))
+            .collect::<Vec<_>>()
+    });
+    let rows = leading_shape.and_then(|leading| {
+        leading.iter().try_fold(1_usize, |product, dimension| {
+            usize::try_from(*dimension).ok()?.checked_mul(product)
+        })
+    });
     let valid = weight.dtype() == V41StorageDtype::U32
         && scales.dtype() == V41StorageDtype::Bf16
         && biases.dtype() == V41StorageDtype::Bf16
-        && weight.shape().len() == 2
-        && scales.shape() == [weight.shape()[0], groups as u64]
-        && biases.shape() == scales.shape()
-        && weight.shape()[1] == packed_width as u64
-        && usize::try_from(weight.shape()[0])
-            .is_ok_and(|rows| first_row <= rows && row_count <= rows.saturating_sub(first_row));
+        && weight.shape().len() >= 2
+        && weight.shape().last() == Some(&(packed_width as u64))
+        && expected_scale_shape.as_deref() == Some(scale_shape)
+        && scale_shape == bias_shape
+        && rows
+            .is_some_and(|rows| first_row <= rows && row_count <= rows.saturating_sub(first_row));
     if !valid {
         return Err(MlxAffineRowError::TensorShape {
             name: weight_name.to_owned(),
@@ -448,12 +468,82 @@ mod tests {
         fmt::Write as _,
         fs::{self, File},
         io::Write as _,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use proptest::prelude::*;
 
-    use super::{MlxAffineRowError, decode_affine_row};
+    use super::{MlxAffineRowError, decode_affine_row, read_affine_rows_from_shard};
+    use crate::checkpoint::V41SafetensorsHeader;
+
+    #[test]
+    fn reads_flattened_leading_dimensions_for_mlx_grouped_projection() {
+        // `wo_a` uses [o_groups, rows, packed_width] in the real checkpoint.
+        // A bounded read must flatten only the leading dimensions while keeping
+        // each row's scale and bias group aligned with its packed payload.
+        let logical_width = 128;
+        let packed_width = 24; // 128 values * 6 bits / 32 bits
+        let rows = 2 * 3;
+        let weight_bytes = (0..rows)
+            .flat_map(|row| {
+                let mut words = vec![0_u32; packed_width];
+                words[0] = u32::try_from(row + 1).expect("bounded row");
+                words.into_iter().flat_map(u32::to_le_bytes)
+            })
+            .collect::<Vec<_>>();
+        let scale_bytes = vec![0x80_u8, 0x3f_u8].repeat(rows);
+        let bias_bytes = vec![0_u8; rows * 2];
+        let header_json = format!(
+            r#"{{"weight":{{"dtype":"U32","shape":[2,3,24],"data_offsets":[0,{weight}] }},"scales":{{"dtype":"BF16","shape":[2,3,1],"data_offsets":[{weight},{scale_end}] }},"biases":{{"dtype":"BF16","shape":[2,3,1],"data_offsets":[{scale_end},{payload_end}] }}}}"#,
+            weight = weight_bytes.len(),
+            scale_end = weight_bytes.len() + scale_bytes.len(),
+            payload_end = weight_bytes.len() + scale_bytes.len() + bias_bytes.len(),
+        );
+        let header_len = u64::try_from(header_json.len()).expect("small test header");
+        let mut file_bytes = Vec::with_capacity(
+            8 + header_json.len() + weight_bytes.len() + scale_bytes.len() + bias_bytes.len(),
+        );
+        file_bytes.extend_from_slice(&header_len.to_le_bytes());
+        file_bytes.extend_from_slice(header_json.as_bytes());
+        file_bytes.extend_from_slice(&weight_bytes);
+        file_bytes.extend_from_slice(&scale_bytes);
+        file_bytes.extend_from_slice(&bias_bytes);
+        // Header offsets are payload-relative; the parser turns them into
+        // complete-file ranges.
+        let path = PathBuf::from(format!(
+            "/tmp/metallix-mlx-3d-{}.safetensors",
+            std::process::id()
+        ));
+        fs::write(&path, &file_bytes).expect("write bounded fixture");
+        let header_bytes = 8 + header_json.len();
+        let header = V41SafetensorsHeader::parse_prefixed_header(
+            &file_bytes[..header_bytes],
+            file_bytes.len() as u64,
+        )
+        .expect("parse grouped fixture");
+        let decoded = read_affine_rows_from_shard(
+            &path,
+            &header,
+            "weight",
+            "scales",
+            "biases",
+            1,
+            3,
+            logical_width,
+            6,
+            128,
+        )
+        .expect("decode flattened rows");
+        fs::remove_file(&path).expect("remove bounded fixture");
+        assert_eq!(decoded.len(), 3 * logical_width);
+        assert_eq!(&decoded[..3], &[2.0, 0.0, 0.0]);
+        assert_eq!(&decoded[logical_width..logical_width + 3], &[3.0, 0.0, 0.0]);
+        assert_eq!(
+            &decoded[2 * logical_width..2 * logical_width + 3],
+            &[4.0, 0.0, 0.0]
+        );
+    }
 
     fn sample_resident() -> super::LayerZeroQkvResident {
         super::LayerZeroQkvResident {
