@@ -677,14 +677,9 @@ fn cached_attention<S: BuildHasher>(
     )?;
     let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
     let (keys, values, attention_keys, attention_values, causal) = match resident_cache_capacity {
-        Some(maximum_capacity) => stepped_cached_kv(
-            cache,
-            key,
-            value,
-            rope_offset,
-            maximum_capacity,
-            &stream,
-        )?,
+        Some(maximum_capacity) => {
+            stepped_cached_kv(cache, key, value, rope_offset, maximum_capacity, &stream)?
+        }
         None => {
             if let Some(previous) = cache.take() {
                 (
@@ -762,12 +757,7 @@ fn stepped_cached_kv(
     if key_shape.len() != 4 || value_shape != key_shape {
         return Err(Qwen3ForwardError::CacheInconsistent);
     }
-    let expected_storage_shape = [
-        key_shape[0],
-        key_shape[1],
-        capacity_i32,
-        key_shape[3],
-    ];
+    let expected_storage_shape = [key_shape[0], key_shape[1], capacity_i32, key_shape[3]];
     let (mut keys, mut values, causal) = match cache.take() {
         Some(previous)
             if previous.keys.shape() == expected_storage_shape
@@ -804,13 +794,11 @@ fn stepped_cached_kv(
             values.index_mut_device((.., .., 0..rope_offset, ..), &value_prefix, stream);
             (keys, values, false)
         }
-        None => {
-            (
-                ops::zeros_dtype_device(&expected_storage_shape, key.dtype(), stream)?,
-                ops::zeros_dtype_device(&expected_storage_shape, value.dtype(), stream)?,
-                true,
-            )
-        }
+        None => (
+            ops::zeros_dtype_device(&expected_storage_shape, key.dtype(), stream)?,
+            ops::zeros_dtype_device(&expected_storage_shape, value.dtype(), stream)?,
+            true,
+        ),
     };
     keys.index_mut_device((.., .., rope_offset..next, ..), &key, stream);
     values.index_mut_device((.., .., rope_offset..next, ..), &value, stream);
@@ -825,7 +813,10 @@ fn stepped_cached_kv(
     ))
 }
 
-fn stepped_capacity(next_tokens: usize, maximum_capacity: usize) -> Result<usize, Qwen3ForwardError> {
+fn stepped_capacity(
+    next_tokens: usize,
+    maximum_capacity: usize,
+) -> Result<usize, Qwen3ForwardError> {
     if next_tokens > maximum_capacity {
         return Err(Qwen3ForwardError::PromptTooLong {
             actual: next_tokens,

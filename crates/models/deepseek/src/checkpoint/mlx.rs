@@ -492,7 +492,7 @@ mod tests {
                 words.into_iter().flat_map(u32::to_le_bytes)
             })
             .collect::<Vec<_>>();
-        let scale_bytes = vec![0x80_u8, 0x3f_u8].repeat(rows);
+        let scale_bytes = [0x80_u8, 0x3f_u8].repeat(rows);
         let bias_bytes = vec![0_u8; rows * 2];
         let header_json = format!(
             r#"{{"weight":{{"dtype":"U32","shape":[2,3,24],"data_offsets":[0,{weight}] }},"scales":{{"dtype":"BF16","shape":[2,3,1],"data_offsets":[{weight},{scale_end}] }},"biases":{{"dtype":"BF16","shape":[2,3,1],"data_offsets":[{scale_end},{payload_end}] }}}}"#,
