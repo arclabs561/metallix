@@ -171,3 +171,88 @@ Do not start Phase 6 until Phases 2–5 pass their parity gates. Do not start
 Phase 8 until the resident executor and capability-registry fork are recorded in
 an ADR. Do not report DeepSeek Codex readiness until Metallix itself owns the
 resident load, decode loop, tokenizer, logits, and tool protocol.
+
+## Detailed execution backlog
+
+The next sessions should consume the roadmap in these small, independently
+verifiable slices:
+
+### Loader and input slices
+
+- Add a shard-set loader that resolves the MLX index to concrete shard paths,
+  rejects missing or duplicate tensor ownership, and emits a stable artifact
+  identity before reading payloads.
+- Add resident byte accounting for packed weights, widened FP32 staging, MLX
+  device arrays, and temporary projection buffers.
+- Load layer-zero embedding, HC parameters, `attn_norm`, `wq_a`, `q_norm`,
+  `wq_b`, `wkv`, and `kv_norm` into one owned object. Keep output weights out of
+  this object until the attention input contract is proven.
+- Add a deterministic token-0 input fixture that is explicitly separate from
+  the real checkpoint path; use it to test lifecycle/reset behavior.
+
+### Real Q/KV activation slices
+
+- Decode the embedding row from the correct shard and widen it once.
+- Run HC expansion, coefficient mixing, collapse, and attention normalization
+  before either projection.
+- Run Q and KV projections from the same normalized hidden state.
+- Keep Q shaped `[heads, 512]` and KV shaped `[1, 512]` until attention itself
+  performs shared-head broadcast.
+- Apply Q per-head RMS, KV RMS, and the two trailing 64-value rotary slices;
+  retain pre- and post-rotation checksums in the receipt.
+
+### Attention/cache slices
+
+- Add a one-token attention call that consumes resident Q/KV and a fresh cache.
+- Add a two-token prefill followed by one decode step, proving position and
+  rotary-frequency slicing.
+- Join the existing window ring and sparse/index selection code only after the
+  dense one-token path is exact.
+- Add cache reset, repeated-request, discontinuous-position, and malformed-row
+  failure tests before any server route is exposed.
+
+### Output/block slices
+
+- Load one layer's `wo_a` grouped tensor and `wo_b` packed tensor, preserving
+  the eight output groups and 1,024 output rank.
+- Validate inverse rotary ordering before `wo_a`, then BF16 narrowing and
+  `wo_b` output shape.
+- Join HC post and the already-qualified FFN/MoE path for one complete layer.
+- Extend to the smallest source-shaped layer suffix that produces logits; only
+  then widen tensor loading to the remaining layers.
+
+### Serving/profile slices
+
+- Add a private DeepSeek executor trait only inside the DeepSeek adapter.
+- Add a deterministic greedy generation method before temperature/top-p or SMC
+  sampling integration.
+- Add tokenizer loading and vocabulary/hash receipts.
+- Reuse the existing Responses SSE, chat, and tool-call framing; do not create
+  a second protocol implementation.
+- Add a local Codex profile smoke test that proves the request reaches Metallix,
+  records the backend identity, completes one tool call, and terminates cleanly.
+
+### Performance slices
+
+- Measure resident load once, prefill, TTFT, each decode step, cache append,
+  and teardown separately.
+- Compare bulk-read and per-row-read baselines on the same shard and record
+  peak host/device staging bytes.
+- Add a resident-weight checksum cache so repeated requests do not reopen or
+  re-decode tensors.
+- Fuse only after parity receipts exist: Q/KV normalization, rotary tails,
+  activation quantization, and grouped output projection are the first likely
+  candidates.
+- Add a 32-token and 64-token decode benchmark with one excluded warmup;
+  report median and p95 decode tokens/sec, output hash, and token-ID hash.
+
+### Model and training expansion
+
+- Add Qwen regression jobs to ensure DeepSeek loader work does not change the
+  existing resident backend.
+- Keep the LoRA micrograph test-only while the resident adapter contract is
+  unsettled; next add checkpoint resume and optimizer-state parity tests.
+- After DeepSeek serving is stable, select one non-LLM MLX capability and build
+  a capability-specific adapter as the registry proof point.
+- Add uncensored/NSFW models only through the same manifest, license, tokenizer,
+  and safety metadata gates; model availability is not an execution contract.
