@@ -256,3 +256,12 @@ verifiable slices:
   a capability-specific adapter as the registry proof point.
 - Add uncensored/NSFW models only through the same manifest, license, tokenizer,
   and safety metadata gates; model availability is not an execution contract.
+
+### Progress update 2026-09-20
+
+Phase 0 is complete: native receipts, artifact-bound hashing, scope labels, and
+canonical checks are landed. Phase 1 is in progress: `LayerZeroQkvResident`
+now owns validated real Q/KV tensors and exposes a deterministic CPU
+`project_qkv` activation boundary. The next gate is loading the real embedding
+and HC/attention-normalized hidden state into that method, then comparing its Q
+and KV outputs with source intermediates.
