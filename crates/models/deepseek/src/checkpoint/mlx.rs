@@ -729,6 +729,63 @@ impl LayerZeroQkvResident {
         })
     }
 
+    /// Runs the resident HC-pre and attention-normalization boundary for one
+    /// hidden state. The result is the 4,096-wide activation consumed by Q/KV.
+    #[allow(clippy::cast_precision_loss, reason = "fixed model hidden width")]
+    pub fn prepare_attention_hidden(
+        &self,
+        hidden: &[f32],
+        epsilon: f32,
+        sinkhorn_iterations: usize,
+    ) -> Result<Vec<f32>, MlxAffineRowError> {
+        self.validate()?;
+        if hidden.len() != Self::HIDDEN_WIDTH || hidden.iter().any(|value| !value.is_finite()) {
+            return Err(MlxAffineRowError::TensorShape {
+                name: "layer-zero hidden activation".to_owned(),
+            });
+        }
+        let scale: [f32; 3] =
+            self.hc_scale
+                .as_slice()
+                .try_into()
+                .map_err(|_| MlxAffineRowError::TensorShape {
+                    name: "attn_hc.scale".to_owned(),
+                })?;
+        let coefficients = mix_hc_coefficients(
+            &self.hc_fn,
+            &self.hc_base,
+            &scale,
+            hidden,
+            4,
+            epsilon,
+            sinkhorn_iterations,
+        )
+        .map_err(|_| MlxAffineRowError::TensorShape {
+            name: "attn_hc coefficients".to_owned(),
+        })?;
+        let collapsed = collapse_hc_hidden(hidden, &coefficients).map_err(|_| {
+            MlxAffineRowError::TensorShape {
+                name: "attn_hc collapse".to_owned(),
+            }
+        })?;
+        let norm = (collapsed.iter().map(|value| value * value).sum::<f32>()
+            / Self::HIDDEN_WIDTH as f32
+            + epsilon)
+            .sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(MlxAffineRowError::NonFinite { column: 0 });
+        }
+        let output = collapsed
+            .iter()
+            .zip(&self.attn_norm)
+            .map(|(value, weight)| value / norm * weight)
+            .collect::<Vec<_>>();
+        if output.iter().any(|value| !value.is_finite()) {
+            return Err(MlxAffineRowError::NonFinite { column: 0 });
+        }
+        Ok(output)
+    }
+
     /// Projects one finite hidden state through resident Q/KV weights and
     /// applies the learned low-rank RMS boundaries. This CPU path is a
     /// deterministic activation contract used before wiring the Metal graph.
