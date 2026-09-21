@@ -7,6 +7,14 @@ published release; reference operators do not imply full-model support.
 
 ### Added
 
+- Added the bounded `layer0-kv-row` inspection path: real 6-bit/group-128
+  `wkv` rows are decoded, the full 512-row KV projection runs on Metal, the
+  learned 512-wide `kv_norm` is applied, and the final 64-value KV rotary tail
+  is qualified with a deterministic checksum.
+- Bulk contiguous MLX affine-row reads now perform three range reads per
+  tensor instead of one seek/read cycle per row, reducing staging overhead for
+  the 512-row KV and 32,768-row Q-B gates while preserving checked offsets.
+
 - Native `mx inspect-v41-index` now recognizes the real MLX/Hugging Face
   weight-map index format when `metadata.total_size` is absent, reporting its
   2,757 tensors and 18 shards while keeping the scope explicitly metadata-only.
