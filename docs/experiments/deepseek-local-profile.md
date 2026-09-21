@@ -73,13 +73,12 @@ embedding on Metal and reports `metal_eval: passed`. This is the first real
 DeepSeek tensor to cross Metallix's native device boundary; full block execution
 and logits remain the next gate.
 
-The row gate also decodes layer-zero attention `wq_a` row 0 from shard one:
-width `3072`, checksum `e965ea9adea61000`, with `metal_eval: passed`. This is a
-real attention projection tensor crossing the native device boundary; the full
-projection and block graph remain next.
+The early row gate decoded layer-zero attention `wq_a` with an incorrect
+8-bit interpretation and reported a 3,072-wide input. That result was retired
+after the shard header and MLX packing were checked.
 
-The bounded tensor mode now decodes all 1,024 rows of layer-zero `wq_a`:
-`1024 × 3072` logical FP32 values, checksum `f21d39db440e1f00`, with
+The corrected bounded tensor mode decodes all 1,024 rows of layer-zero `wq_a`:
+`1024 × 4096` logical FP32 values, checksum `f21d39db440e1f00`, with
 `metal_eval: passed`. This validates the first complete native attention
 projection tensor; the next step is applying it to the decoded hidden state.
 
@@ -88,10 +87,9 @@ applying decoded row-major affine weights to a hidden-state vector. Its device
 test validates a small independent projection; the next integration step is
 using it with the real embedding row and full layer-zero `wq_a` matrix.
 
-Attempting to apply the raw 4,096-wide embedding directly to `wq_a` correctly
-fails closed: layer-zero `wq_a` consumes a 3,072-wide latent. The missing native
-boundary is the preceding latent projection/normalization stage, now identified
-by a real artifact shape check rather than a guessed matrix multiply.
+The corrected path applies the 4,096-wide embedding directly to `wq_a`; there
+is no intermediate 3,072-wide latent. The model-specific HC collapse produces
+the 4,096-wide input consumed by attention.
 
 The next real layer-zero parameter gate is now covered: `attn_hc.fn` decodes as
 an F32 `24 × 16384` matrix and evaluates on Metal, checksum
@@ -115,8 +113,7 @@ is now bound to the checkpoint.
 
 The real HC mix now also performs the pre-collapse step: four-copy coefficients
 collapse back to a 4,096-wide hidden stream with checksum
-`b5e5dc3e838c352b`. The remaining gap is the model-specific latent conversion
-from that stream into the 3,072-wide `wq_a` input.
+`b5e5dc3e838c352b`. That stream is the native `wq_a` input.
 
 The apparent 4,096→3,072 blocker was a decoder bug: attention tensors use
 6-bit/group-128 packing, while embeddings use 8-bit/group-64. With the corrected

@@ -478,7 +478,7 @@ enum Command {
         /// Decode every row for the bounded layer-zero `wq_a` matrix.
         #[arg(long)]
         all_rows: bool,
-        /// Row family to decode: `embedding` or `layer0-wq-a`.
+        /// Row family to decode: `embedding`, `layer0-wq-a`, or `layer0-q-chain`.
         #[arg(long, default_value = "embedding")]
         kind: String,
         /// Optional embedding shard to apply to a full layer-zero projection.

@@ -18,13 +18,12 @@ published release; reference operators do not imply full-model support.
   DeepSeek MLX embedding row from a shard and emits a deterministic checksum.
 - The all-features embedding-row command now evaluates that decoded row on
   Metal, proving the first real MLX tensor crosses the native device boundary.
-- The same native gate now decodes layer-zero attention `wq_a` rows (3,072
-  logical values) and evaluates them on Metal.
-- The row gate can now decode all 1,024 layer-zero `wq_a` rows as a bounded
-  3,072-wide affine tensor and evaluate the assembled matrix on Metal.
-- The attempted embedding-to-`wq_a` application now reports the real latent
-  width mismatch explicitly: embeddings are 4,096-wide while this projection
-  consumes a 3,072-wide pre-attention latent.
+- Corrected the attention row decoder to use the artifact's contiguous
+  6-bit/group-128 packing; the earlier 3,072-wide interpretation was retired.
+- The row gate now decodes all 1,024 layer-zero `wq_a` rows as a bounded
+  1,024 × 4,096 affine tensor and evaluates the assembled matrix on Metal.
+- The embedding-to-`wq_a` application now consumes the real 4,096-wide HC
+  collapsed hidden stream directly; no intermediate 3,072-wide latent exists.
 - Added native decoding and Metal evaluation for the real layer-zero
   hyper-connection matrix (`24 × 16384`, checksum `6150937c7aee9697`).
 - Added the bounded HC input expansion primitive for repeating a hidden state
