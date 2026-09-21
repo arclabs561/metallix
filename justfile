@@ -14,3 +14,8 @@ check-metal:
 check-fixtures:
     uv run scripts/check_engram_fixtures.py
     uv run scripts/test_check_engram_fixtures.py
+
+# Compile a libFuzzer target with nightly sanitizers while preserving the
+# configured rustc wrapper and shared cache.
+fuzz-check target='decode_affine_row':
+    RUSTUP_TOOLCHAIN=nightly RUSTC="$(rustup which rustc --toolchain nightly)" cargo fuzz check --fuzz-dir fuzz {{target}}
