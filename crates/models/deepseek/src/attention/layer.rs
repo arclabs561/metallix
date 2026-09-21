@@ -1254,7 +1254,7 @@ mod tests {
     use super::{
         AttentionQrLayout, AttentionQrWeights, CompressedAttentionPublication, Fp8Projection,
         LayerAttentionError, LayerAttentionLayout, LayerAttentionLayoutError, LayerAttentionState,
-        WindowStep, prepare_attention_qr,
+        TailShape, WindowStep, f32_to_bf16_rne, prepare_attention_qr, rotate_bf16_tail,
     };
     use std::num::NonZeroUsize;
 
@@ -1303,6 +1303,73 @@ mod tests {
         assert_eq!(result.qr.len(), 32);
         assert!(result.wq_a.iter().all(|&bits| bits == 0x4200));
         assert!(result.qr.iter().all(|&bits| bits == 0x3f80));
+    }
+
+    #[test]
+    fn query_rotary_matches_source_tail_slice_reference() {
+        // DeepSeek splits each projected query head into a non-rotary prefix
+        // and a trailing qk_rope_head_dim slice. The source applies RoPE only
+        // to that trailing slice after wq_b, broadcasting frequencies by
+        // position and pair over heads.
+        let head_dimension = 8;
+        let rope_pairs = 2;
+        let batches = 1;
+        let positions = 2;
+        let heads = 2;
+        let values = (0..batches * positions * heads * head_dimension)
+            .map(|index| f32_to_bf16_rne(index as f32 + 1.0))
+            .collect::<Vec<_>>();
+        let frequencies = [
+            crate::RotaryFrequency::new(0.8, 0.6).expect("finite source frequency"),
+            crate::RotaryFrequency::new(-0.5, 0.25).expect("finite source frequency"),
+            crate::RotaryFrequency::new(0.25, -0.75).expect("finite source frequency"),
+            crate::RotaryFrequency::new(0.6, 0.2).expect("finite source frequency"),
+        ];
+        let actual = rotate_bf16_tail(
+            &values,
+            TailShape {
+                batches: nonzero(batches),
+                positions,
+                heads: nonzero(heads),
+                head_dimension: nonzero(head_dimension),
+                rope_pairs: nonzero(rope_pairs),
+            },
+            &frequencies,
+            crate::RotaryDirection::Forward,
+        )
+        .expect("source-shaped query tail rotation");
+
+        let prefix = head_dimension - rope_pairs * 2;
+        let mut expected = values.clone();
+        for position in 0..positions {
+            for head in 0..heads {
+                let row = (position * heads + head) * head_dimension;
+                for pair in 0..rope_pairs {
+                    let input = [
+                        f32::from_bits(u32::from(values[row + prefix + pair * 2]) << 16),
+                        f32::from_bits(u32::from(values[row + prefix + pair * 2 + 1]) << 16),
+                    ];
+                    let frequency = frequencies[position * rope_pairs + pair];
+                    let rotated = [
+                        input[0] * frequency.real() - input[1] * frequency.imaginary(),
+                        input[0] * frequency.imaginary() + input[1] * frequency.real(),
+                    ];
+                    expected[row + prefix + pair * 2] = f32_to_bf16_rne(rotated[0]);
+                    expected[row + prefix + pair * 2 + 1] = f32_to_bf16_rne(rotated[1]);
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        for position in 0..positions {
+            for head in 0..heads {
+                let row = (position * heads + head) * head_dimension;
+                assert_eq!(
+                    &actual[row..row + prefix],
+                    &values[row..row + prefix],
+                    "RoPE must preserve the non-rotary query prefix"
+                );
+            }
+        }
     }
 
     #[test]
