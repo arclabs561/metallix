@@ -251,7 +251,11 @@ def index_key_fixture(receipt: dict[str, object]) -> dict[str, object]:
     )
 
     cases: list[dict[str, object]] = []
-    for expected_start, step in zip(EXPECTED_START_POSITIONS, steps, strict=True):
+    if len(steps) != len(EXPECTED_START_POSITIONS):
+        raise RuntimeError(
+            f"index-key fixture expected {len(EXPECTED_START_POSITIONS)} steps, got {len(steps)}"
+        )
+    for expected_start, step in zip(EXPECTED_START_POSITIONS, steps):
         item = _require_dict(step, f"step {expected_start}")
         start_pos = _require_int(item.get("start_pos"), "step start_pos")
         if start_pos != expected_start:
@@ -376,7 +380,11 @@ def compressor_fixture(receipt: dict[str, object]) -> dict[str, object]:
     )
 
     cases: list[dict[str, object]] = []
-    for expected_start, step in zip(EXPECTED_START_POSITIONS, steps, strict=True):
+    if len(steps) != len(EXPECTED_START_POSITIONS):
+        raise RuntimeError(
+            f"compressor fixture expected {len(EXPECTED_START_POSITIONS)} steps, got {len(steps)}"
+        )
+    for expected_start, step in zip(EXPECTED_START_POSITIONS, steps):
         item = _require_dict(step, f"step {expected_start}")
         start_pos = _require_int(item.get("start_pos"), "step start_pos")
         if start_pos != expected_start:

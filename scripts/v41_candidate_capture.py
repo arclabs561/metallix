@@ -306,8 +306,12 @@ def candidate_fixture(receipt: dict[str, object]) -> dict[str, object]:
     }
 
     cases: list[dict[str, object]] = []
+    if len(steps) != len(EXPECTED_START_POSITIONS) or len(steps) != len(
+        EXPECTED_OFFSETS
+    ):
+        raise RuntimeError("candidate fixture has an unexpected step count")
     for expected_start, expected_offset, step in zip(
-        EXPECTED_START_POSITIONS, EXPECTED_OFFSETS, steps, strict=True
+        EXPECTED_START_POSITIONS, EXPECTED_OFFSETS, steps
     ):
         item = _require_dict(step, f"step {expected_start}")
         start_pos = _require_int(item.get("start_pos"), "step start_pos")
