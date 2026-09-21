@@ -149,6 +149,35 @@ pub fn read_f32_tensor_from_shard(
         .collect())
 }
 
+/// Reads a bounded BF16 tensor and widens it to FP32.
+pub fn read_bf16_tensor_from_shard(
+    shard: &Path,
+    header: &V41SafetensorsHeader,
+    name: &str,
+    width: usize,
+) -> Result<Vec<f32>, MlxAffineRowError> {
+    let tensor = header
+        .tensor(name)
+        .ok_or_else(|| MlxAffineRowError::MissingTensor {
+            name: name.to_owned(),
+        })?;
+    if tensor.dtype() != V41StorageDtype::Bf16
+        || (tensor.shape() != [width as u64] && tensor.shape() != [1, width as u64])
+        || tensor.byte_length() != (width * 2) as u64
+    {
+        return Err(MlxAffineRowError::TensorShape {
+            name: name.to_owned(),
+        });
+    }
+    let mut file = File::open(shard).map_err(|error| MlxAffineRowError::Io(error.to_string()))?;
+    let mut bytes = vec![0_u8; width * 2];
+    read_range(&mut file, tensor.file_range().start, &mut bytes)?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| f32::from_bits(u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16))
+        .collect())
+}
+
 fn read_range(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), MlxAffineRowError> {
     file.seek(SeekFrom::Start(offset))
         .and_then(|_| file.read_exact(bytes))
@@ -355,6 +384,7 @@ pub fn apply_affine_matrix_mlx(
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::{MlxAffineRowError, decode_affine_row};
 
@@ -370,19 +400,19 @@ mod tests {
 
     #[test]
     fn decodes_six_bit_contiguous_groups() {
-        let mut bytes = vec![0_u8; 96];
+        let mut bytes = [0_u8; 96];
         for column in 0..128 {
-            let code = (column % 64) as u32;
+            let code = u32::try_from(column % 64).unwrap();
             let bit_offset = column * 6;
             let byte_offset = bit_offset / 8;
             let shift = bit_offset % 8;
             let value = code << shift;
-            bytes[byte_offset] |= value as u8;
+            bytes[byte_offset] |= u8::try_from(value & 0xff).unwrap();
             if shift > 2 {
-                bytes[byte_offset + 1] |= (value >> 8) as u8;
+                bytes[byte_offset + 1] |= u8::try_from((value >> 8) & 0xff).unwrap();
             }
             if shift > 10 {
-                bytes[byte_offset + 2] |= (value >> 16) as u8;
+                bytes[byte_offset + 2] |= u8::try_from((value >> 16) & 0xff).unwrap();
             }
         }
         let packed = bytes
