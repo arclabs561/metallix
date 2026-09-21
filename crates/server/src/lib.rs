@@ -1297,7 +1297,86 @@ fn inspect_v41_embedding_row(
         println!("wkv_checksum: {:016x}", checksum(&resident.wkv));
         println!("q_norm_checksum: {:016x}", checksum(&resident.q_norm));
         println!("kv_norm_checksum: {:016x}", checksum(&resident.kv_norm));
-        println!("scope: resident layer-zero weights only; no attention or logits");
+        if let Some(input_shard) = input_shard {
+            let input_bytes = match fs::metadata(input_shard) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    eprintln!("could not stat {}: {error}", input_shard.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut input_file = match fs::File::open(input_shard) {
+                Ok(file) => file,
+                Err(error) => {
+                    eprintln!("could not open {}: {error}", input_shard.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut input_prefix = [0_u8; 8];
+            if input_file.read_exact(&mut input_prefix).is_err() {
+                eprintln!("could not read input safetensors prefix");
+                return ExitCode::FAILURE;
+            }
+            let input_header_len =
+                usize::try_from(u64::from_le_bytes(input_prefix)).unwrap_or(usize::MAX);
+            if input_header_len > 100 * 1024 * 1024 {
+                eprintln!("input safetensors header exceeds the bounded limit");
+                return ExitCode::FAILURE;
+            }
+            let mut input_header_bytes = vec![0_u8; 8 + input_header_len];
+            input_header_bytes[..8].copy_from_slice(&input_prefix);
+            if input_file.read_exact(&mut input_header_bytes[8..]).is_err() {
+                eprintln!("could not read input safetensors header");
+                return ExitCode::FAILURE;
+            }
+            let input_header = match deepseek::V41SafetensorsHeader::parse_prefixed_header(
+                &input_header_bytes,
+                input_bytes,
+            ) {
+                Ok(header) => header,
+                Err(error) => {
+                    eprintln!("unsupported input safetensors shard: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let embedding = match read_affine_row_from_shard(
+                input_shard,
+                &input_header,
+                "model.embed_tokens.weight",
+                "model.embed_tokens.scales",
+                "model.embed_tokens.biases",
+                row,
+                deepseek::checkpoint::mlx::LayerZeroQkvResident::HIDDEN_WIDTH,
+                8,
+                64,
+            ) {
+                Ok(values) => values,
+                Err(error) => {
+                    eprintln!("embedding decode failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let prepared = match resident.prepare_attention_hidden(&embedding, 1e-6, 4) {
+                Ok(values) => values,
+                Err(error) => {
+                    eprintln!("resident hidden preparation failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let (q, kv) = match resident.project_qkv(&prepared, 1e-6) {
+                Ok(values) => values,
+                Err(error) => {
+                    eprintln!("resident Q/KV projection failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            println!("token_row: {row}");
+            println!("prepared_hidden_checksum: {:016x}", checksum(&prepared));
+            println!("q_activation_checksum: {:016x}", checksum(&q));
+            println!("kv_activation_checksum: {:016x}", checksum(&kv));
+            println!("activation_scope: real embedding row through HC, attn_norm, Q/KV");
+        }
+        println!("scope: resident layer-zero weights; optional real embedding activation");
         return ExitCode::SUCCESS;
     }
     #[cfg(feature = "metal")]
