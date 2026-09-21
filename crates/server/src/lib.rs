@@ -1270,6 +1270,9 @@ fn inspect_v41_embedding_row(
         };
         let bytes = (resident.wq_a.len()
             + resident.attn_norm.len()
+            + resident.hc_fn.len()
+            + resident.hc_base.len()
+            + resident.hc_scale.len()
             + resident.q_norm.len()
             + resident.wkv.len()
             + resident.kv_norm.len())
@@ -1288,6 +1291,9 @@ fn inspect_v41_embedding_row(
         println!("resident_bytes: {bytes}");
         println!("wq_a_checksum: {:016x}", checksum(&resident.wq_a));
         println!("attn_norm_checksum: {:016x}", checksum(&resident.attn_norm));
+        println!("hc_fn_checksum: {:016x}", checksum(&resident.hc_fn));
+        println!("hc_base_checksum: {:016x}", checksum(&resident.hc_base));
+        println!("hc_scale_checksum: {:016x}", checksum(&resident.hc_scale));
         println!("wkv_checksum: {:016x}", checksum(&resident.wkv));
         println!("q_norm_checksum: {:016x}", checksum(&resident.q_norm));
         println!("kv_norm_checksum: {:016x}", checksum(&resident.kv_norm));

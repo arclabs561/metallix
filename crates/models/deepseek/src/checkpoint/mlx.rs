@@ -547,6 +547,9 @@ mod tests {
                     * super::LayerZeroQkvResident::HIDDEN_WIDTH
             ],
             attn_norm: vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH],
+            hc_fn: vec![1.0; 24 * 16_384],
+            hc_base: vec![1.0; 24],
+            hc_scale: vec![1.0; 3],
             q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
             wkv: vec![
                 0.0;
@@ -580,6 +583,9 @@ mod tests {
                     * super::LayerZeroQkvResident::HIDDEN_WIDTH
             ],
             attn_norm: vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH],
+            hc_fn: vec![1.0; 24 * 16_384],
+            hc_base: vec![1.0; 24],
+            hc_scale: vec![1.0; 3],
             q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
             wkv: vec![
                 0.0;
@@ -626,6 +632,11 @@ pub struct LayerZeroQkvResident {
     pub wq_a: Vec<f32>,
     /// Learned layer-zero attention normalization weights, widened from BF16.
     pub attn_norm: Vec<f32>,
+    /// Layer-zero hyper-connection coefficient projection, widened from F32.
+    pub hc_fn: Vec<f32>,
+    /// Layer-zero hyper-connection base and scale controls.
+    pub hc_base: Vec<f32>,
+    pub hc_scale: Vec<f32>,
     /// Learned Q normalization weights, widened from BF16.
     pub q_norm: Vec<f32>,
     /// Quantized compressed-KV projection, widened to FP32 row-major storage.
@@ -676,6 +687,12 @@ impl LayerZeroQkvResident {
             "model.layers.0.attn_norm.weight",
             Self::HIDDEN_WIDTH,
         )?;
+        let hc_fn =
+            read_f32_tensor_from_shard(shard, header, "model.layers.0.attn_hc.fn", 24, 16_384)?;
+        let hc_base =
+            read_f32_tensor_from_shard(shard, header, "model.layers.0.attn_hc.base", 1, 24)?;
+        let hc_scale =
+            read_f32_tensor_from_shard(shard, header, "model.layers.0.attn_hc.scale", 1, 3)?;
         let q_norm = read_bf16_tensor_from_shard(
             shard,
             header,
@@ -703,6 +720,9 @@ impl LayerZeroQkvResident {
         Ok(Self {
             wq_a,
             attn_norm,
+            hc_fn,
+            hc_base,
+            hc_scale,
             q_norm,
             wkv,
             kv_norm,
@@ -775,6 +795,9 @@ impl LayerZeroQkvResident {
     pub fn validate(&self) -> Result<(), MlxAffineRowError> {
         if self.wq_a.len() != Self::WQ_A_ROWS * Self::HIDDEN_WIDTH
             || self.attn_norm.len() != Self::HIDDEN_WIDTH
+            || self.hc_fn.len() != 24 * 16_384
+            || self.hc_base.len() != 24
+            || self.hc_scale.len() != 3
             || self.q_norm.len() != Self::Q_LORA_RANK
             || self.wkv.len() != Self::WKV_ROWS * Self::HIDDEN_WIDTH
             || self.kv_norm.len() != Self::KV_LORA_RANK
@@ -782,6 +805,9 @@ impl LayerZeroQkvResident {
                 .wq_a
                 .iter()
                 .chain(self.attn_norm.iter())
+                .chain(self.hc_fn.iter())
+                .chain(self.hc_base.iter())
+                .chain(self.hc_scale.iter())
                 .chain(self.q_norm.iter())
                 .chain(self.wkv.iter())
                 .chain(self.kv_norm.iter())
