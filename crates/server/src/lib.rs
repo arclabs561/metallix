@@ -1,6 +1,9 @@
 use std::{fs, io::Read, path::PathBuf, process::ExitCode};
 
 #[cfg(feature = "metal")]
+use std::num::NonZeroUsize;
+
+#[cfg(feature = "metal")]
 use std::time::Duration;
 
 #[cfg(feature = "metal")]
@@ -37,6 +40,8 @@ mod v41_rotary;
 use clap::{Parser, Subcommand};
 #[cfg(feature = "metal")]
 use deepseek::checkpoint::mlx::{read_affine_rows_from_shard, read_bf16_tensor_from_shard};
+#[cfg(feature = "metal")]
+use deepseek::{RotaryDirection, RotaryFrequencyParameters, RotaryTailLayout, rotate_tail};
 use deepseek::{
     V41TextContract,
     checkpoint::mlx::{
@@ -1318,10 +1323,42 @@ fn inspect_v41_embedding_row(
                     hash.wrapping_mul(1_099_511_628_211)
                         .wrapping_add(u64::from(value.to_bits()))
                 });
+                let mut rotary_tail = normalized[KV_RANK - 64..].to_vec();
+                let rotary_layout = RotaryTailLayout::new(
+                    NonZeroUsize::new(1).expect("nonzero batch"),
+                    NonZeroUsize::new(1).expect("nonzero position"),
+                    NonZeroUsize::new(1).expect("nonzero head"),
+                    NonZeroUsize::new(32).expect("nonzero rotary pairs"),
+                )
+                .expect("valid KV rotary layout");
+                let rotary_parameters = RotaryFrequencyParameters::new(
+                    NonZeroUsize::new(64).expect("nonzero rotary width"),
+                    65_536,
+                    10_000.0,
+                    16.0,
+                    32.0,
+                    1.0,
+                )
+                .expect("valid DeepSeek rotary parameters");
+                let frequencies = rotary_parameters
+                    .frequencies(1, NonZeroUsize::new(1).expect("nonzero position"))
+                    .expect("bounded KV rotary frequencies");
+                rotate_tail(
+                    &mut rotary_tail,
+                    rotary_layout,
+                    &frequencies,
+                    RotaryDirection::Forward,
+                )
+                .expect("KV rotary tail application");
+                let rotary_checksum = rotary_tail.iter().fold(0_u64, |hash, value| {
+                    hash.wrapping_mul(1_099_511_628_211)
+                        .wrapping_add(u64::from(value.to_bits()))
+                });
                 println!("metal_eval: passed");
                 println!("projected_width: {}", projected.len());
                 println!("projected_checksum: {projected_checksum:016x}");
                 println!("kv_norm_output_checksum: {normalized_checksum:016x}");
+                println!("kv_rotary_tail_checksum: {rotary_checksum:016x}");
                 true
             }
             Err(error) => {
