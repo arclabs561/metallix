@@ -116,35 +116,37 @@ pub fn read_affine_rows_from_shard(
         });
     }
     let mut file = File::open(shard).map_err(|error| MlxAffineRowError::Io(error.to_string()))?;
-    let mut packed_bytes = vec![0_u8; packed_width * 4];
-    let mut scale_bytes = vec![0_u8; groups * 2];
-    let mut bias_bytes = vec![0_u8; groups * 2];
+    let packed_row_bytes = packed_width * 4;
+    let scale_row_bytes = groups * 2;
+    let bias_row_bytes = groups * 2;
+    let packed_start = row_offset(weight.file_range().start, first_row, packed_row_bytes)?;
+    let scale_start = row_offset(scales.file_range().start, first_row, scale_row_bytes)?;
+    let bias_start = row_offset(biases.file_range().start, first_row, bias_row_bytes)?;
+    // The requested rows are contiguous in each MLX tensor. Read each range in
+    // one operation so a full projection pays three seeks instead of three per
+    // row. This matters for layer-zero KV/WQ matrices on network-backed shards.
+    let mut packed_bytes = vec![0_u8; row_count * packed_row_bytes];
+    let mut scale_bytes = vec![0_u8; row_count * scale_row_bytes];
+    let mut bias_bytes = vec![0_u8; row_count * bias_row_bytes];
+    if row_count != 0 {
+        read_range(&mut file, packed_start, &mut packed_bytes)?;
+        read_range(&mut file, scale_start, &mut scale_bytes)?;
+        read_range(&mut file, bias_start, &mut bias_bytes)?;
+    }
     let mut decoded = Vec::with_capacity(row_count * logical_width);
-    for row in first_row..first_row + row_count {
-        read_range(
-            &mut file,
-            weight.file_range().start + row as u64 * packed_bytes.len() as u64,
-            &mut packed_bytes,
-        )?;
-        read_range(
-            &mut file,
-            scales.file_range().start + row as u64 * scale_bytes.len() as u64,
-            &mut scale_bytes,
-        )?;
-        read_range(
-            &mut file,
-            biases.file_range().start + row as u64 * bias_bytes.len() as u64,
-            &mut bias_bytes,
-        )?;
-        let packed = packed_bytes
+    for row in 0..row_count {
+        let packed_row = &packed_bytes[row * packed_row_bytes..(row + 1) * packed_row_bytes];
+        let scale_row = &scale_bytes[row * scale_row_bytes..(row + 1) * scale_row_bytes];
+        let bias_row = &bias_bytes[row * bias_row_bytes..(row + 1) * bias_row_bytes];
+        let packed = packed_row
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
             .collect::<Vec<_>>();
-        let scales = scale_bytes
+        let scales = scale_row
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
-        let biases = bias_bytes
+        let biases = bias_row
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
@@ -219,6 +221,19 @@ pub fn read_bf16_tensor_from_shard(
         .chunks_exact(2)
         .map(|chunk| f32::from_bits(u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16))
         .collect())
+}
+
+fn row_offset(base: u64, first_row: usize, row_bytes: usize) -> Result<u64, MlxAffineRowError> {
+    let first_row = u64::try_from(first_row)
+        .map_err(|_| MlxAffineRowError::Io("row offset exceeds u64".to_owned()))?;
+    let row_bytes = u64::try_from(row_bytes)
+        .map_err(|_| MlxAffineRowError::Io("row byte size exceeds u64".to_owned()))?;
+    base.checked_add(
+        first_row.checked_mul(row_bytes).ok_or_else(|| {
+            MlxAffineRowError::Io("row offset multiplication overflow".to_owned())
+        })?,
+    )
+    .ok_or_else(|| MlxAffineRowError::Io("row offset addition overflow".to_owned()))
 }
 
 fn read_range(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), MlxAffineRowError> {
