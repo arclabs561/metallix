@@ -668,6 +668,65 @@ impl LayerZeroQkvResident {
         })
     }
 
+    /// Projects one finite hidden state through resident Q/KV weights and
+    /// applies the learned low-rank RMS boundaries. This CPU path is a
+    /// deterministic activation contract used before wiring the Metal graph.
+    #[allow(
+        clippy::items_after_statements,
+        clippy::cast_precision_loss,
+        reason = "the resident projection keeps its bounded helper local and uses fixed model widths"
+    )]
+    pub fn project_qkv(
+        &self,
+        hidden: &[f32],
+        epsilon: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>), MlxAffineRowError> {
+        self.validate()?;
+        if hidden.len() != Self::HIDDEN_WIDTH || !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(MlxAffineRowError::TensorShape {
+                name: "layer-zero hidden activation".to_owned(),
+            });
+        }
+        if hidden.iter().any(|value| !value.is_finite()) {
+            return Err(MlxAffineRowError::NonFinite { column: 0 });
+        }
+        fn project(rows: &[f32], row_count: usize, hidden: &[f32]) -> Vec<f32> {
+            rows.chunks_exact(hidden.len())
+                .take(row_count)
+                .map(|row| {
+                    row.iter()
+                        .zip(hidden)
+                        .map(|(weight, value)| weight * value)
+                        .sum()
+                })
+                .collect()
+        }
+        let q_raw = project(&self.wq_a, Self::WQ_A_ROWS, hidden);
+        let q_rms = (q_raw.iter().map(|value| value * value).sum::<f32>()
+            / Self::Q_LORA_RANK as f32
+            + epsilon)
+            .sqrt();
+        let q: Vec<f32> = q_raw
+            .into_iter()
+            .zip(&self.q_norm)
+            .map(|(value, weight)| value / q_rms * weight)
+            .collect();
+        let kv_raw = project(&self.wkv, Self::WKV_ROWS, hidden);
+        let kv_rms = (kv_raw.iter().map(|value| value * value).sum::<f32>()
+            / Self::KV_LORA_RANK as f32
+            + epsilon)
+            .sqrt();
+        let kv: Vec<f32> = kv_raw
+            .into_iter()
+            .zip(&self.kv_norm)
+            .map(|(value, weight)| value / kv_rms * weight)
+            .collect();
+        if q.iter().chain(&kv).any(|value| !value.is_finite()) {
+            return Err(MlxAffineRowError::NonFinite { column: 0 });
+        }
+        Ok((q, kv))
+    }
+
     /// Validates the shape of the resident arrays after loading or handoff.
     ///
     /// This catches accidental truncation or row-major transposition before a
