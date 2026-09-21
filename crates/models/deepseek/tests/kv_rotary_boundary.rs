@@ -4,7 +4,9 @@ use deepseek::{RotaryDirection, RotaryFrequencyParameters, RotaryTailLayout, rot
 
 #[test]
 fn kv_rotary_preserves_compressed_prefix_and_rotates_tail() {
-    let mut values = (0..512).map(|value| value as f32 + 1.0).collect::<Vec<_>>();
+    let mut values = (0..512)
+        .map(|value| f32::from(u16::try_from(value).unwrap()) + 1.0)
+        .collect::<Vec<_>>();
     let prefix = values[..448].to_vec();
     let before_tail = values[448..].to_vec();
     let layout = RotaryTailLayout::new(
