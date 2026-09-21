@@ -1294,8 +1294,23 @@ fn inspect_v41_embedding_row(
         println!("kv_norm_width: {}", kv_norm.len());
         println!("kv_norm_checksum: {norm_checksum:016x}");
         println!("quantization: bits=6 group=128");
-        println!("metal_eval: not-run (row and norm decode only)");
-        println!("scope: layer-zero wkv row and learned kv_norm");
+        let metal =
+            match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(&values, 1, HIDDEN, &values) {
+                Ok(output) => {
+                    let value = output.as_slice::<f32>()[0];
+                    println!("metal_eval: passed");
+                    println!("self_dot_checksum: {:016x}", u64::from(value.to_bits()));
+                    true
+                }
+                Err(error) => {
+                    eprintln!("wkv Metal projection failed: {error}");
+                    false
+                }
+            };
+        println!("scope: layer-zero wkv row and learned kv_norm; self-dot device smoke={metal}");
+        if !metal {
+            return ExitCode::FAILURE;
+        }
         return ExitCode::SUCCESS;
     }
     #[cfg(feature = "metal")]
