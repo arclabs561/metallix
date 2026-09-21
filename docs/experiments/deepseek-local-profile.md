@@ -152,3 +152,26 @@ slice. The local receipt reports projected checksum `1a5bf283b2f505d4`,
 normalized checksum `4f3358d81790ce24`, and rotary-tail checksum
 `e51de85f62270c8e`. The input is deliberately a deterministic decoded row; this
 qualifies operator order and geometry, not token-state cache serving.
+
+## Reproducibility receipt
+
+The native gates can be recorded without loading or executing the model. The
+operator-only helper hashes the index and any selected local files, records the
+artifact path and index identity, and preserves explicitly supplied gate
+checksums:
+
+```sh
+python scripts/v41_native_receipt.py \
+  --artifact-root /path/to/deepseek-v41-flash \
+  --index /path/to/deepseek-v41-flash/model.safetensors.index.json \
+  --file config.json \
+  --gate layer0_wq_a=f21d39db440e1f00 \
+  --gate kv_rotary_tail=e51de85f62270c8e \
+  --output /tmp/deepseek-v41-native-receipt.json
+```
+
+The helper reads only the selected regular files and refuses paths outside the
+artifact root. Its receipt is evidence of byte identity and bounded operator
+observations; it does not claim model execution, generation parity, licensing
+permission, or Codex readiness. It never reads credentials or contacts the
+network.
