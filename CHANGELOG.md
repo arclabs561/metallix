@@ -16,6 +16,9 @@ published release; reference operators do not imply full-model support.
 - Bulk contiguous MLX affine-row reads now perform three range reads per
   tensor instead of one seek/read cycle per row, reducing staging overhead for
   the 512-row KV and 32,768-row Q-B gates while preserving checked offsets.
+- The resident layer-zero Q/KV loader now includes real `attn_norm` and
+  hyper-connection function/base/scale tensors, with stable checksums and
+  resident-byte accounting for the full HC-collapse-to-projection boundary.
 
 - Native `mx inspect-v41-index` now recognizes the real MLX/Hugging Face
   weight-map index format when `metadata.total_size` is absent, reporting its

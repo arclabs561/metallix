@@ -175,3 +175,9 @@ artifact root. Its receipt is evidence of byte identity and bounded operator
 observations; it does not claim model execution, generation parity, licensing
 permission, or Codex readiness. It never reads credentials or contacts the
 network.
+
+The resident layer-zero loader now also owns `attn_norm` plus the HC projection,
+base, and scale tensors. The real shard gate reports resident bytes `26761324`,
+HC function checksum `6150937c7aee9697`, and stable normalization checksums.
+This closes weight ownership for the HC-collapse → attention-normalization →
+Q/KV activation boundary; it still does not claim full attention or logits.
