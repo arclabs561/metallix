@@ -1250,13 +1250,14 @@ fn inspect_v41_embedding_row(
         const KV_RANK: usize = 512;
         const HIDDEN: usize = 4096;
         let row = row.min(KV_RANK.saturating_sub(1));
-        let values = match read_affine_row_from_shard(
+        let matrix = match read_affine_rows_from_shard(
             shard,
             &header,
             "model.layers.0.attn.wkv.weight",
             "model.layers.0.attn.wkv.scales",
             "model.layers.0.attn.wkv.biases",
-            row,
+            0,
+            KV_RANK,
             HIDDEN,
             6,
             128,
@@ -1267,6 +1268,7 @@ fn inspect_v41_embedding_row(
                 return ExitCode::FAILURE;
             }
         };
+        let values = &matrix[row * HIDDEN..(row + 1) * HIDDEN];
         let kv_norm = match read_bf16_tensor_from_shard(
             shard,
             &header,
@@ -1294,20 +1296,42 @@ fn inspect_v41_embedding_row(
         println!("kv_norm_width: {}", kv_norm.len());
         println!("kv_norm_checksum: {norm_checksum:016x}");
         println!("quantization: bits=6 group=128");
-        let metal =
-            match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(&values, 1, HIDDEN, &values) {
-                Ok(output) => {
-                    let value = output.as_slice::<f32>()[0];
-                    println!("metal_eval: passed");
-                    println!("self_dot_checksum: {:016x}", u64::from(value.to_bits()));
-                    true
-                }
-                Err(error) => {
-                    eprintln!("wkv Metal projection failed: {error}");
-                    false
-                }
-            };
-        println!("scope: layer-zero wkv row and learned kv_norm; self-dot device smoke={metal}");
+        let metal = match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(
+            &matrix, KV_RANK, HIDDEN, values,
+        ) {
+            Ok(output) => {
+                let projected = output.as_slice::<f32>();
+                let rms = (projected.iter().map(|value| value * value).sum::<f32>()
+                    / KV_RANK as f32
+                    + 1e-6)
+                    .sqrt();
+                let normalized = projected
+                    .iter()
+                    .zip(kv_norm.iter())
+                    .map(|(value, weight)| value / rms * weight)
+                    .collect::<Vec<_>>();
+                let projected_checksum = projected.iter().fold(0_u64, |hash, value| {
+                    hash.wrapping_mul(1_099_511_628_211)
+                        .wrapping_add(u64::from(value.to_bits()))
+                });
+                let normalized_checksum = normalized.iter().fold(0_u64, |hash, value| {
+                    hash.wrapping_mul(1_099_511_628_211)
+                        .wrapping_add(u64::from(value.to_bits()))
+                });
+                println!("metal_eval: passed");
+                println!("projected_width: {}", projected.len());
+                println!("projected_checksum: {projected_checksum:016x}");
+                println!("kv_norm_output_checksum: {normalized_checksum:016x}");
+                true
+            }
+            Err(error) => {
+                eprintln!("wkv Metal projection failed: {error}");
+                false
+            }
+        };
+        println!(
+            "scope: full layer-zero wkv projection and learned kv_norm; bounded row self-input"
+        );
         if !metal {
             return ExitCode::FAILURE;
         }
