@@ -143,3 +143,7 @@ normalization, rotary query preparation, and KV construction.
 The all-head Q gate now streams contiguous `wq_b` row ranges through one shard
 handle, keeping staging bounded per head while producing the full 32,768-output
 checksum. This is the first native Q path with a measured bounded I/O strategy.
+
+The Q chain now includes source-accurate unweighted per-head RMS normalization
+after all Q-B heads, before rotary. The normalized 32,768-output checksum is
+`dfa3530172fc18ba`; Metal evaluation still passes.

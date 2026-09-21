@@ -1398,10 +1398,21 @@ fn inspect_v41_embedding_row(
             hash.wrapping_mul(1_099_511_628_211)
                 .wrapping_add(u64::from(value.to_bits()))
         });
+        let mut q_b_norm = Vec::with_capacity(q_b_outputs.len());
+        for head in q_b_outputs.chunks_exact(HEAD_DIMENSION) {
+            let norm =
+                (head.iter().map(|value| value * value).sum::<f32>() / 512.0_f32 + 1e-6).sqrt();
+            q_b_norm.extend(head.iter().map(|value| *value / norm));
+        }
+        let normalized_checksum = q_b_norm.iter().fold(0_u64, |hash, value| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(value.to_bits()))
+        });
         println!("DeepSeek native Q chain");
         println!("q_a_width: {}", q_a_values.len());
         println!("q_b_width: {}", q_b_outputs.len());
         println!("q_b_checksum: {checksum:016x}");
+        println!("q_b_norm_checksum: {normalized_checksum:016x}");
         println!("metal_eval: passed");
         println!("q_b_heads: {HEADS}");
         println!("scope: token-0 embedding through wq_a/q_norm/all wq_b heads");
