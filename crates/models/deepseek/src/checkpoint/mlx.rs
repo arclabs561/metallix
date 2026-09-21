@@ -614,6 +614,18 @@ mod tests {
             resident.project_qkv(&hidden, 0.0),
             Err(MlxAffineRowError::TensorShape { .. })
         ));
+
+        let mut weighted = resident.clone();
+        weighted.wq_a[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
+        weighted.wkv[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
+        let nonzero_hidden = vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
+        let (q_nonzero, kv_nonzero) = weighted
+            .project_qkv(&nonzero_hidden, 1e-6)
+            .expect("nonzero activation");
+        assert!(q_nonzero.iter().all(|value| value.is_finite()));
+        assert!(kv_nonzero.iter().all(|value| value.is_finite()));
+        assert!(q_nonzero[0] > 0.0);
+        assert!(kv_nonzero[0] > 0.0);
     }
 
     #[cfg(feature = "metal")]
