@@ -69,7 +69,7 @@ pub fn read_affine_row_from_shard(
             name: bias_name.to_owned(),
         })?;
     let groups = logical_width.div_ceil(group_size);
-    let packed_width = logical_width / (32 / usize::from(bits.max(1)));
+    let packed_width = (logical_width * usize::from(bits.max(1))).div_ceil(32);
     let valid = weight.dtype() == V41StorageDtype::U32
         && scales.dtype() == V41StorageDtype::Bf16
         && biases.dtype() == V41StorageDtype::Bf16
@@ -157,9 +157,9 @@ fn read_range(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), MlxA
 
 /// Decodes one packed MLX affine row into FP32 values.
 ///
-/// For the current `DeepSeek` embedding layout, `bits=8` and `group_size=64`:
-/// four 8-bit codes are packed into each little-endian `u32`, while one BF16
-/// scale and bias pair covers each group.
+/// MLX stores affine codes as a contiguous little-endian bitstream. The
+/// current `DeepSeek` embedding uses 8 bits/group 64; attention projections use
+/// 6 bits/group 128. Each BF16 scale and bias pair covers one group.
 pub fn decode_affine_row(
     packed: &[u32],
     scales_bf16: &[u16],
@@ -168,11 +168,14 @@ pub fn decode_affine_row(
     bits: u8,
     group_size: usize,
 ) -> Result<Vec<f32>, MlxAffineRowError> {
-    if bits != 8 || group_size == 0 {
+    if !matches!(bits, 6 | 8) || group_size == 0 {
         return Err(MlxAffineRowError::UnsupportedLayout { bits, group_size });
     }
-    let values_per_word = 32 / usize::from(bits);
-    if packed.len().checked_mul(values_per_word) != Some(logical_width) {
+    let packed_bits = packed
+        .len()
+        .checked_mul(32)
+        .ok_or(MlxAffineRowError::PackedShape)?;
+    if packed_bits / usize::from(bits) != logical_width || packed_bits % usize::from(bits) != 0 {
         return Err(MlxAffineRowError::PackedShape);
     }
     let groups = logical_width.div_ceil(group_size);
@@ -180,9 +183,24 @@ pub fn decode_affine_row(
         return Err(MlxAffineRowError::GroupShape);
     }
     let mut output = Vec::with_capacity(logical_width);
+    let packed_bytes = packed
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
     for column in 0..logical_width {
-        let code =
-            ((packed[column / values_per_word] >> ((column % values_per_word) * 8)) & 0xff) as u8;
+        let bit_offset = column * usize::from(bits);
+        let byte_offset = bit_offset / 8;
+        let intra_byte = bit_offset % 8;
+        let code = if bits == 8 {
+            packed_bytes[byte_offset]
+        } else {
+            // MLX stores six-bit codes as a contiguous little-endian bitstream:
+            // four codes occupy three bytes and may straddle byte boundaries.
+            let window = u32::from(packed_bytes[byte_offset])
+                | (u32::from(*packed_bytes.get(byte_offset + 1).unwrap_or(&0)) << 8)
+                | (u32::from(*packed_bytes.get(byte_offset + 2).unwrap_or(&0)) << 16);
+            ((window >> intra_byte) & 0x3f) as u8
+        };
         let group = column / group_size;
         let scale = f32::from_bits(u32::from(scales_bf16[group]) << 16);
         let offset = f32::from_bits(u32::from(biases_bf16[group]) << 16);
@@ -348,6 +366,35 @@ mod tests {
         let decoded = decode_affine_row(&packed, &[scale, scale], &[bias, bias], 8, 8, 4)
             .expect("affine row");
         assert_eq!(decoded, [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5]);
+    }
+
+    #[test]
+    fn decodes_six_bit_contiguous_groups() {
+        let mut bytes = vec![0_u8; 96];
+        for column in 0..128 {
+            let code = (column % 64) as u32;
+            let bit_offset = column * 6;
+            let byte_offset = bit_offset / 8;
+            let shift = bit_offset % 8;
+            let value = code << shift;
+            bytes[byte_offset] |= value as u8;
+            if shift > 2 {
+                bytes[byte_offset + 1] |= (value >> 8) as u8;
+            }
+            if shift > 10 {
+                bytes[byte_offset + 2] |= (value >> 16) as u8;
+            }
+        }
+        let packed = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("word")))
+            .collect::<Vec<_>>();
+        let decoded = super::decode_affine_row(&packed, &[0x3f80, 0x3f80], &[0, 0], 128, 6, 64)
+            .expect("six-bit affine row");
+        assert_eq!(decoded[0], 0.0);
+        assert_eq!(decoded[63], 63.0);
+        assert_eq!(decoded[64], 0.0);
+        assert_eq!(decoded[127], 63.0);
     }
 
     #[test]

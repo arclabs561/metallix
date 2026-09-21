@@ -117,3 +117,10 @@ The real HC mix now also performs the pre-collapse step: four-copy coefficients
 collapse back to a 4,096-wide hidden stream with checksum
 `b5e5dc3e838c352b`. The remaining gap is the model-specific latent conversion
 from that stream into the 3,072-wide `wq_a` input.
+
+The apparent 4,096→3,072 blocker was a decoder bug: attention tensors use
+6-bit/group-128 packing, while embeddings use 8-bit/group-64. With the corrected
+packing, the complete real layer-zero `wq_a` tensor applies to the 4,096-wide
+token embedding and evaluates on Metal, producing width `1024` with projection
+checksum `a1d46c0641124b5d`. The next native boundary is Q normalization and
+`wq_b` projection.

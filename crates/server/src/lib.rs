@@ -1427,8 +1427,8 @@ fn inspect_v41_embedding_row(
             "model.layers.0.attn.wq_a.weight",
             "model.layers.0.attn.wq_a.scales",
             "model.layers.0.attn.wq_a.biases",
-            3072,
-            96,
+            4096,
+            128,
         ),
         _ => {
             eprintln!("unknown row kind {kind:?}; expected embedding or layer0-wq-a");
@@ -1454,7 +1454,7 @@ fn inspect_v41_embedding_row(
             biases,
             if all_rows { current_row } else { row },
             width,
-            8,
+            if kind == "layer0-wq-a" { 6 } else { 8 },
             group_size,
         ) {
             Ok(values) => values,
@@ -1550,18 +1550,7 @@ fn inspect_v41_embedding_row(
                 }
             };
             let projected = match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(
-                &matrix,
-                1024,
-                3072,
-                if input.len() == 3072 {
-                    &input
-                } else {
-                    eprintln!(
-                        "layer0-wq-a expects a 3072-wide latent input; embedding row is {} wide",
-                        input.len()
-                    );
-                    return ExitCode::FAILURE;
-                },
+                &matrix, 1024, 4096, &input,
             ) {
                 Ok(output) => output,
                 Err(error) => {
