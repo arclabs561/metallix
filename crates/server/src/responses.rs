@@ -1,4 +1,4 @@
-//! Text-only Responses protocol boundary for the native Qwen control model.
+//! Text-only Responses protocol boundary shared by local model backends.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::{
     chat_cli::message,
     chat_generation::{
-        ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession,
-        ChatToolCall, ResidentChatLimits,
+        ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
+        ChatSession, ChatToolCall, ResidentChatLimits,
     },
     chat_tools,
     http_transport::{Connection, TransportLimits},
@@ -246,12 +246,13 @@ fn serve_inner(
         return Err("this experimental server binds only to loopback".into());
     }
     let mut session = ChatSession::load(model, limits)?;
+    let session_load_ms = (&session as &dyn ChatBackend).load_ms();
     let server = TcpListener::bind(address).map_err(|e| e.to_string())?;
     eprintln!(
         "mx listening on http://{address}; model={model_id}; single request; {} total tokens; kv_budget_bytes={}; load_ms={:.2}",
         limits.context_tokens(),
         limits.kv_budget_bytes(),
-        session.load_ms()
+        session_load_ms
     );
     for (index, socket) in server.incoming().enumerate() {
         let socket = socket.map_err(|error| error.to_string())?;
@@ -341,7 +342,7 @@ fn respond(
     parsed: &Request,
     messages: &[ChatMessage],
     tools: &[Value],
-    session: &mut ChatSession,
+    session: &mut dyn ChatBackend,
     id: &str,
     generation_timeout: Duration,
 ) -> Result<(), String> {
@@ -383,7 +384,7 @@ fn respond(
             json!({"type":"response.content_part.added","item_id":message_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
         )?;
     }
-    let generated = session.generate_with_timeout(ChatRequest {messages,tools,max_tokens:parsed.max_output_tokens.unwrap_or(128),enable_thinking:false}, generation_timeout, &mut |delta| {
+    let generated = session.generate_with_timeout(ChatRequest {messages,tools,max_tokens:parsed.max_output_tokens.unwrap_or(128),enable_thinking:false,reasoning_effort:None}, generation_timeout, &mut |delta| {
         if stream_text {
             event(writer.as_mut().expect("stream writer"),&mut sequence,json!({"type":"response.output_text.delta","item_id":message_id,"output_index":0,"content_index":0,"delta":delta}))?;
         } else {
@@ -502,7 +503,7 @@ fn respond_json(
     parsed: &Request,
     messages: &[ChatMessage],
     tools: &[Value],
-    session: &mut ChatSession,
+    session: &mut dyn ChatBackend,
     id: &str,
     generation_timeout: Duration,
 ) {
@@ -513,6 +514,7 @@ fn respond_json(
                 tools,
                 max_tokens: parsed.max_output_tokens.unwrap_or(128),
                 enable_thinking: false,
+                reasoning_effort: None,
             },
             generation_timeout,
             &mut |_| Ok(()),

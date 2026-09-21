@@ -22,13 +22,19 @@ the resident production path. DeepSeek's source gates now cover Engram1,
 layer-one, and exact layer-zero token embeddings; native layer-one attention/HC/FFN now feeds
 the layer-two-to-logits reduced suffix; Engram1 now feeds the native layer-one
 path through the reduced suffix with corruption rejection. Layer zero and
-embeddings, then real previous-call shared state remain next. Native
+embeddings now qualify through the resident CPU Q/KV boundary; Metal/full-graph
+execution and real previous-call shared state remain next. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
 [current progress](progress.md) for the evidence and limits. The metadata-only
 [DeepSeek traffic sensitivity](research/host-memory.md) does not yet establish a
 feasible checkpoint-serving envelope.
+
+The bounded `mx inspect deepseek artifact <directory>` gate now validates the
+DeepSeek config, tokenizer/template, index, referenced shard containment, and
+shard headers without loading tensor payloads. It is an artifact-admission
+check, not generation or Codex compatibility evidence.
 
 ## Position and constraints
 
@@ -73,7 +79,7 @@ measurements; competing GPU workloads invalidate performance comparisons.
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
 | Qwen performance | Profile the adopted stepped resident path across model sizes and repeated request shapes. | Preserve full-logit/token and branch/EOS replay; retain the concatenation receipt as a regression control. | Reversible implementation; no public tuning flag. |
-| DeepSeek completion | Layer-zero/embedding composition and real previous-call layer-three state. Consumer: the complete reduced text oracle. | Engram1→layer-one→layer-two suffix passes exact fixture and corruption gates; next boundaries preserve source-derived numerical bounds, routes, and retry behavior. | Reversible implementation; source semantics must not be silently changed. |
+| DeepSeek completion | Metal/full-graph execution and real previous-call layer-three state after qualified embedding-through-CPU-QKV composition. Consumer: the complete reduced text oracle. | Engram1→layer-one→layer-two suffix passes exact fixture and corruption gates; next boundaries preserve source-derived numerical bounds, routes, and retry behavior. | Reversible implementation; source semantics must not be silently changed. |
 | Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
 
 For each boundary, use existing operators and fixtures first. Add a capture only
@@ -81,9 +87,9 @@ when a specific missing operand blocks the next join. Once the complete reduced
 oracle passes, stop extending fixture infrastructure for its own sake and move
 the execution graph onto Metal.
 
-DeepSeek's next joins are specifically: connect layer zero and token embeddings
-after the now-qualified Engram1→layer-one entry. Finally run the whole reduced graph in
-token order with a request-local previous-call shared index publication so layer
+DeepSeek's embedding-through-CPU-QKV join is now qualified after the
+Engram1→layer-one entry. Next, execute the whole reduced graph on Metal in token
+order with a request-local previous-call shared index publication so layer
 three's real previous publication supplies the next partial layer-one call. That
 last gate removes the captured shared-key shortcut. Exercise more than the fixed
 5/1/1 trace, including multiple compression boundaries and reset/retry sequences.

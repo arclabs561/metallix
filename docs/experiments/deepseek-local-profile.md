@@ -184,5 +184,5 @@ Q/KV activation boundary; it still does not claim full attention or logits.
 
 The resident activation boundary now runs the decoded HC projection, coefficient
 mix, collapse, and layer-zero `attn_norm` before resident Q/KV projection. Its
-zero-input contract is covered by a focused test; real token embedding input and
-Metal execution remain the next activation gate.
+real token-embedding-through-CPU-QKV contract is now qualified. Metal execution,
+the full graph, and previous-call shared state remain separate gates.

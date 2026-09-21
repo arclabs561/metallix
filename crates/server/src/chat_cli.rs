@@ -176,6 +176,7 @@ fn agent_inner(
                 tools: &tools,
                 max_tokens,
                 enable_thinking: false,
+                reasoning_effort: None,
             },
             &mut |_| Ok(()),
         )?;

@@ -39,10 +39,35 @@ accessible. Shards may be regular files or symlinks to regular files. `mx` and
 `metallix` are native executables with the same CLI; no shell alias is needed.
 
 DeepSeek-V4.1-Flash artifact work is currently native metadata and row
-qualification. `mx inspect-v41-index` validates the MLX weight map,
-`mx inspect-v41-shard` validates a shard header, and
-`mx inspect-v41-embedding-row <shard> --row 0` decodes one real embedding row.
+qualification. The friendlier grouped commands are:
+
+```sh
+mx inspect deepseek artifact /path/to/deepseek
+mx inspect deepseek index /path/to/model.safetensors.index.json
+mx inspect deepseek shard /path/to/model-00001-of-00018.safetensors
+```
+
+They validate the local artifact, index, or shard without loading tensor
+payloads. The legacy `inspect-v41-*` spellings remain available. The bounded
+`mx inspect-v41-embedding-row <shard> --row 0` command decodes one real
+embedding row.
 These commands do not claim full DeepSeek generation yet.
+
+`mx` can acquire the ordinary Hugging Face artifact layout through the `hf`
+CLI; the per-artifact registry and pinned revisions live in
+[`config/artifacts/`](config/artifacts/):
+
+```sh
+mx fetch deepseek /path/to/deepseek
+mx fetch deepseek /path/to/deepseek --yes
+mx fetch deepseek /path/to/deepseek --metadata-only
+mx fetch deepseek /path/to/deepseek --dry-run
+```
+
+Weights are included by default; `--metadata-only` is the explicit opt-out.
+Because the full snapshot is large, noninteractive weight downloads require
+`--yes`. `--dry-run` shows the Hugging Face plan without downloading files.
+Metallix stores no credentials and introduces no custom container format.
 
 ## Complete a prompt
 

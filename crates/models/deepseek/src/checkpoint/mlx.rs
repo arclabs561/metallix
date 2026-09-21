@@ -444,7 +444,37 @@ pub fn apply_affine_matrix_mlx(
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
+    use std::{
+        fmt::Write as _,
+        fs::{self, File},
+        io::Write as _,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use proptest::prelude::*;
+
     use super::{MlxAffineRowError, decode_affine_row};
+
+    fn sample_resident() -> super::LayerZeroQkvResident {
+        super::LayerZeroQkvResident {
+            wq_a: vec![
+                0.0;
+                super::LayerZeroQkvResident::WQ_A_ROWS
+                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
+            ],
+            attn_norm: vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH],
+            hc_fn: vec![1.0; 24 * 16_384],
+            hc_base: vec![1.0; 24],
+            hc_scale: vec![1.0; 3],
+            q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
+            wkv: vec![
+                0.0;
+                super::LayerZeroQkvResident::WKV_ROWS
+                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
+            ],
+            kv_norm: vec![1.0; super::LayerZeroQkvResident::KV_LORA_RANK],
+        }
+    }
 
     #[test]
     fn decodes_packed_eight_bit_groups() {
@@ -516,6 +546,52 @@ mod tests {
         );
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn expansion_preserves_each_hidden_copy(
+            input in prop::collection::vec(-100.0_f32..100.0, 1..32),
+            copies in 1_usize..=8,
+        ) {
+            let expanded = super::expand_hc_hidden(&input, copies)
+                .expect("positive copies and non-empty input");
+            prop_assert_eq!(expanded.len(), input.len() * copies);
+            for chunk in expanded.chunks_exact(input.len()) {
+                prop_assert_eq!(chunk, input.as_slice());
+            }
+        }
+
+        #[test]
+        fn hc_pre_collapse_preserves_finite_shape(
+            hidden in prop::collection::vec(-10.0_f32..10.0, 1..16),
+            copies in 1_usize..=8,
+            sinkhorn_iterations in 1_usize..=8,
+        ) {
+            let rows = (2 + copies) * copies;
+            let fn_matrix = vec![0.01_f32; rows * hidden.len() * copies];
+            let base = vec![0.0_f32; rows];
+            let coefficients = super::mix_hc_coefficients(
+                &fn_matrix,
+                &base,
+                &[1.0, 1.0, 1.0],
+                &hidden,
+                copies,
+                1e-6,
+                sinkhorn_iterations,
+            )
+            .expect("bounded finite HC coefficients");
+            let collapsed = super::collapse_hc_hidden(&hidden, &coefficients)
+                .expect("bounded finite HC collapse");
+            prop_assert_eq!(coefficients.copies(), copies);
+            prop_assert_eq!(collapsed.len(), hidden.len());
+            prop_assert!(coefficients.pre().iter().all(|value| value.is_finite()));
+            prop_assert!(coefficients.post().iter().all(|value| value.is_finite()));
+            prop_assert!(coefficients.comb().iter().all(|value| value.is_finite()));
+            prop_assert!(collapsed.iter().all(|value| value.is_finite()));
+        }
+    }
+
     #[test]
     fn mixes_hyperconnection_coefficients_from_decoded_parameters() {
         let coefficients = super::mix_hc_coefficients(
@@ -530,6 +606,7 @@ mod tests {
         .expect("HC coefficients");
         assert_eq!(coefficients.copies(), 4);
         assert!(coefficients.pre().iter().all(|value| value.is_finite()));
+        assert!(super::collapse_hc_hidden(&[], &coefficients).is_err());
         assert_eq!(
             super::collapse_hc_hidden(&[1.0, 2.0], &coefficients)
                 .expect("HC collapse")
@@ -540,24 +617,7 @@ mod tests {
 
     #[test]
     fn validates_resident_layer_zero_qkv_geometry_and_finiteness() {
-        let resident = super::LayerZeroQkvResident {
-            wq_a: vec![
-                0.0;
-                super::LayerZeroQkvResident::WQ_A_ROWS
-                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
-            ],
-            attn_norm: vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH],
-            hc_fn: vec![1.0; 24 * 16_384],
-            hc_base: vec![1.0; 24],
-            hc_scale: vec![1.0; 3],
-            q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
-            wkv: vec![
-                0.0;
-                super::LayerZeroQkvResident::WKV_ROWS
-                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
-            ],
-            kv_norm: vec![1.0; super::LayerZeroQkvResident::KV_LORA_RANK],
-        };
+        let resident = sample_resident();
         resident.validate().expect("resident geometry");
 
         let mut malformed = resident.clone();
@@ -576,32 +636,15 @@ mod tests {
                 if name == "layer-zero resident Q/KV tensors"
         ));
 
-        let resident = super::LayerZeroQkvResident {
-            wq_a: vec![
-                0.0;
-                super::LayerZeroQkvResident::WQ_A_ROWS
-                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
-            ],
-            attn_norm: vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH],
-            hc_fn: vec![1.0; 24 * 16_384],
-            hc_base: vec![1.0; 24],
-            hc_scale: vec![1.0; 3],
-            q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
-            wkv: vec![
-                0.0;
-                super::LayerZeroQkvResident::WKV_ROWS
-                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
-            ],
-            kv_norm: vec![1.0; super::LayerZeroQkvResident::KV_LORA_RANK],
-        };
+        let resident = sample_resident();
         let hidden = vec![0.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
         let prepared = resident
-            .prepare_attention_hidden(&hidden, 1e-6, 4)
+            .prepare_attention_hidden(&hidden, 1e-6, 1e-20, 4)
             .expect("zero HC activation");
         assert_eq!(prepared.len(), super::LayerZeroQkvResident::HIDDEN_WIDTH);
         assert!(prepared.iter().all(|value| *value == 0.0));
         let (q, kv) = resident
-            .project_qkv(&prepared, 1e-6)
+            .project_qkv(&prepared, 1e-20)
             .expect("zero activation");
         assert_eq!(q.len(), super::LayerZeroQkvResident::Q_LORA_RANK);
         assert_eq!(kv.len(), super::LayerZeroQkvResident::KV_LORA_RANK);
@@ -614,18 +657,165 @@ mod tests {
             resident.project_qkv(&hidden, 0.0),
             Err(MlxAffineRowError::TensorShape { .. })
         ));
+        assert!(matches!(
+            resident.prepare_attention_hidden(&hidden, 0.0, 1e-20, 4),
+            Err(MlxAffineRowError::TensorShape { .. })
+        ));
+        assert!(matches!(
+            resident.prepare_attention_hidden(&hidden, 1e-6, 0.0, 4),
+            Err(MlxAffineRowError::TensorShape { .. })
+        ));
 
         let mut weighted = resident.clone();
         weighted.wq_a[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
         weighted.wkv[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
         let nonzero_hidden = vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
         let (q_nonzero, kv_nonzero) = weighted
-            .project_qkv(&nonzero_hidden, 1e-6)
+            .project_qkv(&nonzero_hidden, 1e-20)
             .expect("nonzero activation");
         assert!(q_nonzero.iter().all(|value| value.is_finite()));
         assert!(kv_nonzero.iter().all(|value| value.is_finite()));
         assert!(q_nonzero[0] > 0.0);
         assert!(kv_nonzero[0] > 0.0);
+    }
+
+    #[test]
+    fn prepares_nonzero_attention_hidden_with_hc_and_norm_epsilons() {
+        let mut resident = sample_resident();
+        resident.attn_norm[0] = 2.0;
+        resident.attn_norm[1] = 3.0;
+        let mut hidden = vec![0.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
+        hidden[0] = 3.0;
+        hidden[1] = 4.0;
+
+        let prepared = resident
+            .prepare_attention_hidden(&hidden, 1e-6, 1e-20, 4)
+            .expect("nonzero HC activation");
+
+        assert!(prepared.iter().all(|value| value.is_finite()));
+        assert!(prepared.iter().any(|value| *value != 0.0));
+        assert!((prepared[0] - 76.8).abs() < 1e-3);
+        assert!((prepared[1] - 153.6).abs() < 1e-3);
+        assert_ne!(&prepared[..2], &hidden[..2]);
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the synthetic shard keeps every tensor binding in one integration fixture"
+    )]
+    #[test]
+    fn loads_resident_tensor_bindings_from_a_synthetic_shard() {
+        let tensors = [
+            (
+                "model.layers.0.attn.wq_a.weight",
+                "U32",
+                vec![1024, 768],
+                3_145_728,
+            ),
+            (
+                "model.layers.0.attn.wq_a.scales",
+                "BF16",
+                vec![1024, 32],
+                65_536,
+            ),
+            (
+                "model.layers.0.attn.wq_a.biases",
+                "BF16",
+                vec![1024, 32],
+                65_536,
+            ),
+            ("model.layers.0.attn_norm.weight", "BF16", vec![4096], 8_192),
+            (
+                "model.layers.0.attn_hc.fn",
+                "F32",
+                vec![24, 16_384],
+                1_572_864,
+            ),
+            ("model.layers.0.attn_hc.base", "F32", vec![24], 96),
+            ("model.layers.0.attn_hc.scale", "F32", vec![3], 12),
+            (
+                "model.layers.0.attn.q_norm.weight",
+                "BF16",
+                vec![1024],
+                2_048,
+            ),
+            (
+                "model.layers.0.attn.wkv.weight",
+                "U32",
+                vec![512, 768],
+                1_572_864,
+            ),
+            (
+                "model.layers.0.attn.wkv.scales",
+                "BF16",
+                vec![512, 32],
+                32_768,
+            ),
+            (
+                "model.layers.0.attn.wkv.biases",
+                "BF16",
+                vec![512, 32],
+                32_768,
+            ),
+            (
+                "model.layers.0.attn.kv_norm.weight",
+                "BF16",
+                vec![512],
+                1_024,
+            ),
+        ];
+        let mut offset = 0_u64;
+        let mut header = String::from("{");
+        for (index, (name, dtype, shape, bytes)) in tensors.iter().enumerate() {
+            if index != 0 {
+                header.push(',');
+            }
+            let shape = shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let end = offset + *bytes;
+            write!(
+                header,
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{shape}],\"data_offsets\":[{offset},{end}]}}"
+            )
+            .expect("header entry");
+            offset = end;
+        }
+        header.push('}');
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("metallix-resident-{unique}.safetensors"));
+        let mut file = File::create(&path).expect("synthetic shard");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("header length");
+        file.write_all(header.as_bytes()).expect("header");
+        file.write_all(&vec![0_u8; usize::try_from(offset).expect("payload size")])
+            .expect("payload");
+        drop(file);
+
+        let metadata = [
+            (header.len() as u64).to_le_bytes().as_slice(),
+            header.as_bytes(),
+        ]
+        .concat();
+        let parsed = super::super::V41SafetensorsHeader::parse_prefixed_header(
+            &metadata,
+            8 + header.len() as u64 + offset,
+        )
+        .expect("synthetic header");
+        let resident = super::LayerZeroQkvResident::load(&path, &parsed).expect("resident load");
+        assert_eq!(resident.attn_norm.len(), 4096);
+        assert_eq!(resident.hc_fn.len(), 24 * 16_384);
+        assert_eq!(resident.hc_base.len(), 24);
+        assert_eq!(resident.hc_scale.len(), 3);
+        assert_eq!(resident.wkv.len(), 512 * 4096);
+        assert!(resident.validate().is_ok());
+        fs::remove_file(path).expect("remove synthetic shard");
     }
 
     #[cfg(feature = "metal")]
@@ -734,7 +924,7 @@ impl LayerZeroQkvResident {
             "model.layers.0.attn.kv_norm.weight",
             Self::KV_LORA_RANK,
         )?;
-        Ok(Self {
+        let resident = Self {
             wq_a,
             attn_norm,
             hc_fn,
@@ -743,7 +933,9 @@ impl LayerZeroQkvResident {
             q_norm,
             wkv,
             kv_norm,
-        })
+        };
+        resident.validate()?;
+        Ok(resident)
     }
 
     /// Runs the resident HC-pre and attention-normalization boundary for one
@@ -752,11 +944,18 @@ impl LayerZeroQkvResident {
     pub fn prepare_attention_hidden(
         &self,
         hidden: &[f32],
-        epsilon: f32,
+        hc_epsilon: f32,
+        norm_epsilon: f32,
         sinkhorn_iterations: usize,
     ) -> Result<Vec<f32>, MlxAffineRowError> {
         self.validate()?;
-        if hidden.len() != Self::HIDDEN_WIDTH || hidden.iter().any(|value| !value.is_finite()) {
+        if hidden.len() != Self::HIDDEN_WIDTH
+            || hidden.iter().any(|value| !value.is_finite())
+            || !hc_epsilon.is_finite()
+            || hc_epsilon <= 0.0
+            || !norm_epsilon.is_finite()
+            || norm_epsilon <= 0.0
+        {
             return Err(MlxAffineRowError::TensorShape {
                 name: "layer-zero hidden activation".to_owned(),
             });
@@ -774,7 +973,7 @@ impl LayerZeroQkvResident {
             &scale,
             hidden,
             4,
-            epsilon,
+            hc_epsilon,
             sinkhorn_iterations,
         )
         .map_err(|_| MlxAffineRowError::TensorShape {
@@ -787,7 +986,7 @@ impl LayerZeroQkvResident {
         })?;
         let norm = (collapsed.iter().map(|value| value * value).sum::<f32>()
             / Self::HIDDEN_WIDTH as f32
-            + epsilon)
+            + norm_epsilon)
             .sqrt();
         if !norm.is_finite() || norm <= 0.0 {
             return Err(MlxAffineRowError::NonFinite { column: 0 });
@@ -814,10 +1013,10 @@ impl LayerZeroQkvResident {
     pub fn project_qkv(
         &self,
         hidden: &[f32],
-        epsilon: f32,
+        norm_epsilon: f32,
     ) -> Result<(Vec<f32>, Vec<f32>), MlxAffineRowError> {
         self.validate()?;
-        if hidden.len() != Self::HIDDEN_WIDTH || !epsilon.is_finite() || epsilon <= 0.0 {
+        if hidden.len() != Self::HIDDEN_WIDTH || !norm_epsilon.is_finite() || norm_epsilon <= 0.0 {
             return Err(MlxAffineRowError::TensorShape {
                 name: "layer-zero hidden activation".to_owned(),
             });
@@ -839,7 +1038,7 @@ impl LayerZeroQkvResident {
         let q_raw = project(&self.wq_a, Self::WQ_A_ROWS, hidden);
         let q_rms = (q_raw.iter().map(|value| value * value).sum::<f32>()
             / Self::Q_LORA_RANK as f32
-            + epsilon)
+            + norm_epsilon)
             .sqrt();
         let q: Vec<f32> = q_raw
             .into_iter()
@@ -849,7 +1048,7 @@ impl LayerZeroQkvResident {
         let kv_raw = project(&self.wkv, Self::WKV_ROWS, hidden);
         let kv_rms = (kv_raw.iter().map(|value| value * value).sum::<f32>()
             / Self::KV_LORA_RANK as f32
-            + epsilon)
+            + norm_epsilon)
             .sqrt();
         let kv: Vec<f32> = kv_raw
             .into_iter()

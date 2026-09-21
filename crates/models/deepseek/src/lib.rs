@@ -1,5 +1,6 @@
 //! DeepSeek-V4.1 execution-contract parsing and bounded operator qualifications.
 
+pub mod artifact;
 pub mod attention;
 pub mod checkpoint;
 pub mod compressor;
@@ -16,6 +17,7 @@ pub mod rotary;
 pub mod routing;
 pub mod selection;
 
+pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
 pub use checkpoint::{
     V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection, V41SafetensorsHeader,

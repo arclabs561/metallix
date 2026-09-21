@@ -1,4 +1,9 @@
-use std::{fs, io::Read, path::PathBuf, process::ExitCode};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, ExitCode},
+};
 
 #[cfg(feature = "metal")]
 use std::num::NonZeroUsize;
@@ -19,6 +24,7 @@ mod chat_generation;
 mod chat_tools;
 #[cfg(feature = "metal")]
 mod http_transport;
+mod model_registry;
 #[cfg(feature = "metal")]
 mod responses;
 
@@ -160,6 +166,16 @@ fn sampling_configuration(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Acquire supported model artifacts through the Hugging Face CLI.
+    Fetch {
+        #[command(subcommand)]
+        command: FetchCommand,
+    },
+    /// Inspect local model and checkpoint artifacts without loading weights.
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommand,
+    },
     /// Chat using the checkpoint template and one resident Qwen model.
     #[cfg(feature = "metal")]
     Chat {
@@ -473,9 +489,9 @@ enum Command {
         /// Path to a safetensors shard.
         shard: PathBuf,
     },
-    /// Decode one bounded MLX `DeepSeek` embedding row from a real shard.
+    /// Decode one bounded MLX `DeepSeek` tensor or layer-zero Q/KV activation.
     InspectV41EmbeddingRow {
-        /// Path to the embedding shard.
+        /// Primary shard: embeddings for ordinary modes, or resident layer-zero Q/KV weights for `layer0-resident`.
         shard: PathBuf,
         /// Embedding row/token ID.
         #[arg(long, default_value_t = 0)]
@@ -483,12 +499,85 @@ enum Command {
         /// Decode every row for the bounded layer-zero `wq_a` matrix.
         #[arg(long)]
         all_rows: bool,
-        /// Row family to decode: `embedding`, `layer0-wq-a`, `layer0-q-chain`, `layer0-kv-row`, or `layer0-resident`.
+        /// Tensor or activation family: `embedding`, `layer0-wq-a`, `layer0-wq-b-head0`, `layer0-q-chain`, `layer0-kv-row`, `layer0-hc-fn`, `layer0-hc-mix`, or `layer0-resident`.
         #[arg(long, default_value = "embedding")]
         kind: String,
-        /// Optional embedding shard to apply to a full layer-zero projection.
+        /// Optional embedding shard for layer-zero activation modes; with `layer0-resident`, the positional shard remains the resident Q/KV shard.
         #[arg(long)]
         input_shard: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FetchCommand {
+    /// Fetch and validate a `DeepSeek` V4.1 artifact directory.
+    Deepseek {
+        /// Destination directory for ordinary Hugging Face-compatible files.
+        directory: PathBuf,
+        /// Opt out of checkpoint weight shards and fetch metadata only.
+        #[arg(long)]
+        metadata_only: bool,
+        /// Show the resolved plan without downloading files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm the large weight download.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InspectCommand {
+    /// Inspect a `DeepSeek` V4.1 configuration, artifact, index, shard, or tensor.
+    Deepseek {
+        #[command(subcommand)]
+        command: DeepseekInspectCommand,
+    },
+    /// Inspect a Qwen3 configuration or local checkpoint.
+    Qwen {
+        #[command(subcommand)]
+        command: QwenInspectCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DeepseekInspectCommand {
+    /// Validate config.json and the V4.1 execution contract.
+    Config {
+        /// Path to the `DeepSeek` V4.1 config.json file.
+        path: PathBuf,
+        /// Also validate dimensions and mode relationships needed for execution planning.
+        #[arg(long)]
+        execution_shape: bool,
+    },
+    /// Validate config, tokenizer/template, index, and shard headers without loading payloads.
+    Artifact {
+        /// Directory containing the complete local `DeepSeek` artifact.
+        model: PathBuf,
+    },
+    /// Validate a `DeepSeek` safetensors index without loading weights.
+    Index {
+        /// Path to the `DeepSeek` safetensors index JSON.
+        path: PathBuf,
+    },
+    /// Validate one `DeepSeek` safetensors shard header without reading payloads.
+    Shard {
+        /// Path to a `DeepSeek` safetensors shard.
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QwenInspectCommand {
+    /// Validate a Qwen3 configuration without loading weights.
+    Config {
+        /// Path to the Qwen3 config.json file.
+        path: PathBuf,
+    },
+    /// Validate a local Qwen3 checkpoint's safetensors headers.
+    Checkpoint {
+        /// Directory containing config.json and safetensors shard files.
+        model: PathBuf,
     },
 }
 
@@ -501,6 +590,15 @@ enum Command {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Fetch {
+            command:
+                FetchCommand::Deepseek {
+                    directory,
+                    metadata_only,
+                    dry_run,
+                    yes,
+                },
+        } => fetch_deepseek(&directory, metadata_only, dry_run, yes),
         #[cfg(feature = "metal")]
         Command::Chat {
             model,
@@ -670,6 +768,30 @@ pub fn run() -> ExitCode {
         Command::InspectQwenCheckpoint { model } => inspect_qwen_checkpoint(&model),
         Command::InspectV41Index { index } => inspect_v41_index(&index),
         Command::InspectV41Shard { shard } => inspect_v41_shard(&shard),
+        Command::Inspect { command } => match command {
+            InspectCommand::Deepseek {
+                command:
+                    DeepseekInspectCommand::Config {
+                        path,
+                        execution_shape,
+                    },
+            } => inspect_v41(&path, execution_shape),
+            InspectCommand::Deepseek {
+                command: DeepseekInspectCommand::Artifact { model },
+            } => inspect_v41_artifact(&model),
+            InspectCommand::Deepseek {
+                command: DeepseekInspectCommand::Index { path },
+            } => inspect_v41_index(&path),
+            InspectCommand::Deepseek {
+                command: DeepseekInspectCommand::Shard { path },
+            } => inspect_v41_shard(&path),
+            InspectCommand::Qwen {
+                command: QwenInspectCommand::Config { path },
+            } => inspect_qwen(&path),
+            InspectCommand::Qwen {
+                command: QwenInspectCommand::Checkpoint { model },
+            } => inspect_qwen_checkpoint(&model),
+        },
         Command::InspectV41EmbeddingRow {
             shard,
             row,
@@ -757,6 +879,181 @@ pub fn run() -> ExitCode {
             max_weight_bytes,
             candidate_only,
         ),
+    }
+}
+
+fn fetch_deepseek(directory: &Path, metadata_only: bool, dry_run: bool, yes: bool) -> ExitCode {
+    let weights = !metadata_only;
+    if weights && !dry_run && !yes {
+        eprintln!(
+            "weights are included by default; use --yes to download them or --metadata-only to opt out (try --dry-run first)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let source = match model_registry::deepseek() {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("cannot load model registry: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if weights && !dry_run {
+        let parent = directory.parent().unwrap_or_else(|| Path::new("."));
+        match free_space_bytes(parent) {
+            Some(available) if available < source.weight_bytes => {
+                eprintln!(
+                    "not enough free space for DeepSeek weights: need {}, have {}; use --metadata-only or choose another volume",
+                    format_bytes(source.weight_bytes),
+                    format_bytes(available)
+                );
+                return ExitCode::FAILURE;
+            }
+            None => {
+                eprintln!("could not determine free space for {}", parent.display());
+                return ExitCode::FAILURE;
+            }
+            Some(_) => {}
+        }
+    }
+    let mut model = ProcessCommand::new("hf");
+    model
+        .arg("download")
+        .arg(&source.model_repo)
+        .arg("--revision")
+        .arg(&source.model_revision)
+        .arg("--local-dir")
+        .arg(directory);
+    for pattern in &source.metadata_files {
+        model.arg("--include").arg(pattern);
+    }
+    if weights {
+        model.arg("--include").arg(&source.weight_pattern);
+    }
+    if dry_run {
+        model.arg("--dry-run");
+    }
+    if !run_hf(&mut model) {
+        return ExitCode::FAILURE;
+    }
+
+    // The official V4.1 tokenizer metadata does not embed a template. The
+    // registry pins the separately published compatible template explicitly.
+    let mut template = ProcessCommand::new("hf");
+    template
+        .arg("download")
+        .arg(&source.template_repo)
+        .arg("chat_template.jinja")
+        .arg("--revision")
+        .arg(&source.template_revision)
+        .arg("--local-dir")
+        .arg(directory);
+    if !run_hf(&mut template) {
+        return ExitCode::FAILURE;
+    }
+
+    if dry_run {
+        println!("DeepSeek fetch plan ready; no files downloaded");
+        println!("weights_included: {weights}");
+        return ExitCode::SUCCESS;
+    }
+
+    if !weights {
+        if metadata_ready(directory) {
+            println!("DeepSeek metadata ready");
+            println!("directory: {}", directory.display());
+            println!("weights_downloaded: false");
+            println!(
+                "next: run `mx fetch deepseek {} --yes`",
+                directory.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("metadata download completed but required files are missing");
+        return ExitCode::FAILURE;
+    }
+    match deepseek::V41ArtifactInspection::inspect(directory) {
+        Ok(inspection) => {
+            println!("DeepSeek artifact ready");
+            println!("directory: {}", directory.display());
+            println!("index: {:?}", inspection.index_kind());
+            println!("shards: {}", inspection.shard_count());
+            println!("weights_downloaded: {weights}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("download completed but artifact validation failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn metadata_ready(directory: &Path) -> bool {
+    [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    ]
+    .iter()
+    .all(|name| directory.join(name).is_file())
+        && fs::read_dir(directory)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".safetensors.index.json"))
+            })
+}
+
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    let output = ProcessCommand::new("df")
+        .args(["-Pk", path.to_str()?])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().last()?;
+    let available_kib = line.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+    available_kib.checked_mul(1024)
+}
+
+#[allow(clippy::cast_precision_loss, reason = "human-readable display only")]
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn run_hf(command: &mut ProcessCommand) -> bool {
+    match command.status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("Hugging Face download failed with status {status}");
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("Hugging Face CLI `hf` was not found; install it before fetching artifacts");
+            false
+        }
+        Err(error) => {
+            eprintln!("could not start Hugging Face CLI: {error}");
+            false
+        }
     }
 }
 
@@ -1140,6 +1437,29 @@ fn inspect_v41_index(index: &PathBuf) -> ExitCode {
     }
 }
 
+fn inspect_v41_artifact(model: &Path) -> ExitCode {
+    match deepseek::V41ArtifactInspection::inspect(model) {
+        Ok(inspection) => {
+            let text = inspection.text_contract();
+            println!("DeepSeek-V4.1 local artifact");
+            println!("index_kind: {:?}", inspection.index_kind());
+            println!("tensors: {}", inspection.tensor_count());
+            println!("shards: {}", inspection.shard_count());
+            println!("layers: {}", text.total_layers());
+            println!("routed_experts: {}", text.local_experts());
+            println!("scope: metadata, tokenizer/template, and shard headers; no payload load");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!(
+                "{} is not a valid bounded DeepSeek-V4.1 artifact: {error}",
+                model.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
     let file_bytes = match fs::metadata(shard) {
         Ok(metadata) => metadata.len(),
@@ -1199,7 +1519,8 @@ fn inspect_v41_shard(shard: &PathBuf) -> ExitCode {
 
 #[allow(
     clippy::too_many_lines,
-    reason = "bounded CLI artifact inspection keeps its I/O phases explicit"
+    clippy::cast_precision_loss,
+    reason = "bounded CLI artifact inspection keeps its I/O phases explicit and uses fixed model ranks"
 )]
 fn inspect_v41_embedding_row(
     shard: &PathBuf,
@@ -1356,14 +1677,14 @@ fn inspect_v41_embedding_row(
                     return ExitCode::FAILURE;
                 }
             };
-            let prepared = match resident.prepare_attention_hidden(&embedding, 1e-6, 4) {
+            let prepared = match resident.prepare_attention_hidden(&embedding, 1e-6, 1e-20, 4) {
                 Ok(values) => values,
                 Err(error) => {
                     eprintln!("resident hidden preparation failed: {error}");
                     return ExitCode::FAILURE;
                 }
             };
-            let (q, kv) = match resident.project_qkv(&prepared, 1e-6) {
+            let (q, kv) = match resident.project_qkv(&prepared, 1e-20) {
                 Ok(values) => values,
                 Err(error) => {
                     eprintln!("resident Q/KV projection failed: {error}");
@@ -2149,7 +2470,8 @@ fn inspect_v41(config: &PathBuf, execution_shape: bool) -> ExitCode {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::Cli;
+    use super::{Cli, Command, DeepseekInspectCommand, InspectCommand};
+    use std::path::Path;
 
     #[test]
     fn execution_shape_inspection_is_explicitly_opt_in() {
@@ -2804,6 +3126,27 @@ mod tests {
         assert!(help.contains("plain-text prompt for one sequence"));
         assert!(help.contains("inspect-v41"));
         assert!(help.contains("inspect-qwen"));
+    }
+
+    #[test]
+    fn grouped_deepseek_artifact_inspection_uses_a_positional_path() {
+        let cli = Cli::try_parse_from(["mx", "inspect", "deepseek", "artifact", "model"])
+            .expect("grouped artifact inspection");
+        assert!(matches!(
+            cli.command,
+            Command::Inspect {
+                command: InspectCommand::Deepseek {
+                    command: DeepseekInspectCommand::Artifact { model }
+                }
+            } if model == Path::new("model")
+        ));
+    }
+
+    #[test]
+    fn byte_messages_are_human_readable() {
+        assert_eq!(super::format_bytes(0), "0 B");
+        assert_eq!(super::format_bytes(1024), "1.0 KiB");
+        assert_eq!(super::format_bytes(144_509_558_784), "134.6 GiB");
     }
 
     #[cfg(not(feature = "metal"))]

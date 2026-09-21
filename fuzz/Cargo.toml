@@ -1,0 +1,21 @@
+[package]
+name = "metallix-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+deepseek = { path = "../crates/models/deepseek" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "decode_affine_row"
+path = "fuzz_targets/decode_affine_row.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

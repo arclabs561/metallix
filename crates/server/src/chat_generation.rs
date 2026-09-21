@@ -14,7 +14,7 @@ use std::{
 use minijinja::{Environment, context};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use qwen::metal::Qwen3MlxWeights;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
 
 use crate::qwen_tokenizer::QwenTokenizer;
@@ -65,10 +65,26 @@ pub(crate) enum ChatRole {
 }
 
 /// One completed assistant tool call retained in conversation history.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ChatToolCall {
     pub name: String,
     pub arguments: Value,
+}
+
+impl Serialize for ChatToolCall {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ChatToolCall", 3)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("arguments", &self.arguments)?;
+        state.serialize_field(
+            "function",
+            &serde_json::json!({"name": self.name, "arguments": self.arguments}),
+        )?;
+        state.end()
+    }
 }
 
 /// One tool result which can be converted into a template-ready tool message.
@@ -133,6 +149,8 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) tools: &'a [Value],
     pub(crate) max_tokens: u32,
     pub(crate) enable_thinking: bool,
+    /// Optional model-specific reasoning effort passed through to templates.
+    pub(crate) reasoning_effort: Option<&'a str>,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -144,6 +162,7 @@ impl<'a> ChatRequest<'a> {
             tools: &[],
             max_tokens,
             enable_thinking: false,
+            reasoning_effort: None,
         }
     }
 }
@@ -268,6 +287,24 @@ pub(crate) struct ChatSession {
     kv_budget_bytes: u64,
     planned_kv_bytes: u64,
     load_ms: f64,
+}
+
+/// Backend-neutral generation seam consumed by the Responses/Codex protocol.
+///
+/// Qwen remains the only implementation today. `DeepSeek` can implement this
+/// contract once checkpoint-backed token generation is available, without
+/// duplicating transport, streaming, timeout, or tool-call lifecycle logic.
+pub(crate) trait ChatBackend {
+    /// Returns the one-time backend load duration used in response metadata.
+    fn load_ms(&self) -> f64;
+
+    /// Generates one complete turn under the caller's cooperative deadline.
+    fn generate_with_timeout(
+        &mut self,
+        request: ChatRequest<'_>,
+        timeout: Duration,
+        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+    ) -> Result<ChatGeneration, ChatGenerationError>;
 }
 
 #[derive(serde::Deserialize)]
@@ -440,15 +477,22 @@ impl ChatSession {
     }
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
+        let messages = serde_json::to_value(request.messages)
+            .map_err(|_| String::from("chat messages could not be serialized"))?;
+        let tools = serde_json::to_value(request.tools)
+            .map_err(|_| String::from("chat tools could not be serialized"))?;
         let rendered = self
             .template
             .get_template("qwen_chat")
             .map_err(|error| format!("local chat template is unavailable: {error}"))?
             .render(context! {
-                messages => request.messages,
-                tools => request.tools,
+                messages => messages,
+                tools => tools,
                 add_generation_prompt => true,
                 enable_thinking => request.enable_thinking,
+                thinking_mode => if request.enable_thinking { "thinking" } else { "non-thinking" },
+                reasoning_effort => request.reasoning_effort.unwrap_or("low"),
+                drop_thinking => !request.enable_thinking,
             })
             .map_err(|error| format!("local chat template could not be rendered: {error}"))?;
         if rendered.len() > MAX_CHAT_RENDERED_BYTES {
@@ -457,6 +501,21 @@ impl ChatSession {
             ));
         }
         Ok(rendered)
+    }
+}
+
+impl ChatBackend for ChatSession {
+    fn load_ms(&self) -> f64 {
+        self.load_ms()
+    }
+
+    fn generate_with_timeout(
+        &mut self,
+        request: ChatRequest<'_>,
+        timeout: Duration,
+        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+    ) -> Result<ChatGeneration, ChatGenerationError> {
+        self.generate_with_timeout(request, timeout, on_token)
     }
 }
 
@@ -497,12 +556,31 @@ fn load_template(model: &Path) -> Result<String, String> {
     }
     let config: Value = serde_json::from_str(&raw)
         .map_err(|_| String::from("local tokenizer_config.json could not be parsed"))?;
-    config
+    if let Some(template) = config
         .get("chat_template")
         .and_then(Value::as_str)
         .filter(|template| !template.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| String::from("local tokenizer_config.json has no chat_template"))
+    {
+        return Ok(template.to_owned());
+    }
+
+    let external = model.join("chat_template.jinja");
+    let metadata = external.metadata().map_err(|_| {
+        String::from(
+            "local tokenizer_config.json has no chat_template and chat_template.jinja is absent",
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_CHAT_TEMPLATE_BYTES as u64 {
+        return Err(format!(
+            "local chat_template.jinja exceeds the {MAX_CHAT_TEMPLATE_BYTES}-byte limit or is not regular"
+        ));
+    }
+    let template = fs::read_to_string(external)
+        .map_err(|_| String::from("local chat_template.jinja could not be read"))?;
+    if template.trim().is_empty() {
+        return Err(String::from("local chat_template.jinja must not be empty"));
+    }
+    Ok(template)
 }
 
 fn parse_template(template_source: String) -> Result<Environment<'static>, String> {
@@ -634,7 +712,10 @@ fn elapsed_ms(duration: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
 
     use minijinja::context;
     use proptest::prelude::*;
@@ -643,7 +724,7 @@ mod tests {
 
     use super::{
         ChatGenerationError, ChatMessage, ChatRole, ChatToolCall, ChatToolResult,
-        GenerationDeadline, ResidentChatLimits, parse_template,
+        GenerationDeadline, ResidentChatLimits, load_template, parse_template,
     };
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
@@ -688,6 +769,21 @@ mod tests {
         let limits = ResidentChatLimits::from_mib(16_384, 8_192);
         assert_eq!(limits.context_tokens(), 16_384);
         assert_eq!(limits.kv_budget_bytes(), 8_192 * 1024 * 1024);
+    }
+
+    #[test]
+    fn external_chat_template_is_accepted_when_config_has_none() {
+        let root =
+            std::env::temp_dir().join(format!("metallix-chat-template-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("template test directory");
+        fs::write(root.join("tokenizer_config.json"), b"{}").expect("tokenizer config");
+        fs::write(root.join("chat_template.jinja"), b"{{ messages }}").expect("external template");
+
+        assert_eq!(
+            load_template(&root).expect("external template"),
+            "{{ messages }}"
+        );
+        fs::remove_dir_all(root).expect("remove template test directory");
     }
 
     #[test]
@@ -813,5 +909,48 @@ mod tests {
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n",
             )
         );
+    }
+
+    #[test]
+    fn tool_calls_expose_both_flat_and_function_views_for_templates() {
+        let call = ChatToolCall {
+            name: String::from("read_file"),
+            arguments: serde_json::json!({"path": "README.md"}),
+        };
+        let value = serde_json::to_value(call).expect("tool call JSON");
+        assert_eq!(value["name"], "read_file");
+        assert_eq!(value["function"]["name"], "read_file");
+        assert_eq!(value["function"]["arguments"]["path"], "README.md");
+    }
+
+    #[test]
+    fn deepseek_template_shape_renders_mapping_and_nested_tool_calls() {
+        let template = parse_template(
+            concat!(
+                "{% for message in messages %}{{ message.get('role') }}:{{ message.get('content') }};",
+                "{% for call in message.get('tool_calls') or [] %}{{ call.function.name }}={{ call.function.arguments.path }};{% endfor %}",
+                "{% endfor %}"
+            )
+            .to_owned(),
+        )
+        .expect("DeepSeek-shaped template parses");
+        let messages = serde_json::to_value([ChatMessage {
+            role: ChatRole::Assistant,
+            content: String::new(),
+            reasoning_content: None,
+            tool_calls: vec![ChatToolCall {
+                name: String::from("read_file"),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }],
+            tool_call_id: None,
+            name: None,
+        }])
+        .expect("DeepSeek-shaped messages");
+        let rendered = template
+            .get_template("qwen_chat")
+            .expect("template name")
+            .render(context! { messages => messages, tools => Vec::<Value>::new() })
+            .expect("DeepSeek-shaped context renders");
+        assert_eq!(rendered, "assistant:;read_file=README.md;");
     }
 }
