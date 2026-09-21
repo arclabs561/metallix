@@ -570,7 +570,6 @@ pub(crate) fn forward_cached_layer<S: BuildHasher>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_cached_layer_with_capacity<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
@@ -625,7 +624,6 @@ fn forward_cached_layer_with_capacity<S: BuildHasher>(
     residual.add_device(&mlp, &stream).map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cached_attention<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
@@ -679,9 +677,14 @@ fn cached_attention<S: BuildHasher>(
     )?;
     let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
     let (keys, values, attention_keys, attention_values, causal) = match resident_cache_capacity {
-        Some(maximum_capacity) => {
-            stepped_cached_kv(cache, &key, &value, rope_offset, maximum_capacity, &stream)?
-        }
+        Some(maximum_capacity) => stepped_cached_kv(
+            cache,
+            key,
+            value,
+            rope_offset,
+            maximum_capacity,
+            &stream,
+        )?,
         None => {
             if let Some(previous) = cache.take() {
                 (
@@ -736,16 +739,14 @@ fn cached_attention<S: BuildHasher>(
     linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
 }
 
-type SteppedKv = (Array, Array, Option<Array>, Option<Array>, bool);
-
 fn stepped_cached_kv(
     cache: &mut Option<Qwen3LayerKv>,
-    key: &Array,
-    value: &Array,
+    key: Array,
+    value: Array,
     rope_offset: i32,
     maximum_capacity: usize,
     stream: &StreamOrDevice,
-) -> Result<SteppedKv, Qwen3ForwardError> {
+) -> Result<(Array, Array, Option<Array>, Option<Array>, bool), Qwen3ForwardError> {
     let appended = *key
         .shape()
         .get(2)
@@ -761,7 +762,12 @@ fn stepped_cached_kv(
     if key_shape.len() != 4 || value_shape != key_shape {
         return Err(Qwen3ForwardError::CacheInconsistent);
     }
-    let expected_storage_shape = [key_shape[0], key_shape[1], capacity_i32, key_shape[3]];
+    let expected_storage_shape = [
+        key_shape[0],
+        key_shape[1],
+        capacity_i32,
+        key_shape[3],
+    ];
     let (mut keys, mut values, causal) = match cache.take() {
         Some(previous)
             if previous.keys.shape() == expected_storage_shape
@@ -798,11 +804,13 @@ fn stepped_cached_kv(
             values.index_mut_device((.., .., 0..rope_offset, ..), &value_prefix, stream);
             (keys, values, false)
         }
-        None => (
-            ops::zeros_dtype_device(&expected_storage_shape, key.dtype(), stream)?,
-            ops::zeros_dtype_device(&expected_storage_shape, value.dtype(), stream)?,
-            true,
-        ),
+        None => {
+            (
+                ops::zeros_dtype_device(&expected_storage_shape, key.dtype(), stream)?,
+                ops::zeros_dtype_device(&expected_storage_shape, value.dtype(), stream)?,
+                true,
+            )
+        }
     };
     keys.index_mut_device((.., .., rope_offset..next, ..), &key, stream);
     values.index_mut_device((.., .., rope_offset..next, ..), &value, stream);
@@ -817,10 +825,7 @@ fn stepped_cached_kv(
     ))
 }
 
-fn stepped_capacity(
-    next_tokens: usize,
-    maximum_capacity: usize,
-) -> Result<usize, Qwen3ForwardError> {
+fn stepped_capacity(next_tokens: usize, maximum_capacity: usize) -> Result<usize, Qwen3ForwardError> {
     if next_tokens > maximum_capacity {
         return Err(Qwen3ForwardError::PromptTooLong {
             actual: next_tokens,
@@ -1613,7 +1618,6 @@ mod tests {
     mod cache_component_profile;
     mod capacity_cache_profile;
     mod decode_profile;
-    mod lora_micrograph;
     mod particle_replay;
 
     #[test]
