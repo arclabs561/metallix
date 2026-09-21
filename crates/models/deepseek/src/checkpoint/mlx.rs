@@ -595,8 +595,13 @@ mod tests {
             kv_norm: vec![1.0; super::LayerZeroQkvResident::KV_LORA_RANK],
         };
         let hidden = vec![0.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
+        let prepared = resident
+            .prepare_attention_hidden(&hidden, 1e-6, 4)
+            .expect("zero HC activation");
+        assert_eq!(prepared.len(), super::LayerZeroQkvResident::HIDDEN_WIDTH);
+        assert!(prepared.iter().all(|value| *value == 0.0));
         let (q, kv) = resident
-            .project_qkv(&hidden, 1e-6)
+            .project_qkv(&prepared, 1e-6)
             .expect("zero activation");
         assert_eq!(q.len(), super::LayerZeroQkvResident::Q_LORA_RANK);
         assert_eq!(kv.len(), super::LayerZeroQkvResident::KV_LORA_RANK);
