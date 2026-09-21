@@ -478,7 +478,7 @@ enum Command {
         /// Decode every row for the bounded layer-zero `wq_a` matrix.
         #[arg(long)]
         all_rows: bool,
-        /// Row family to decode: `embedding`, `layer0-wq-a`, or `layer0-q-chain`.
+        /// Row family to decode: `embedding`, `layer0-wq-a`, `layer0-q-chain`, or `layer0-kv-row`.
         #[arg(long, default_value = "embedding")]
         kind: String,
         /// Optional embedding shard to apply to a full layer-zero projection.
@@ -1245,6 +1245,59 @@ fn inspect_v41_embedding_row(
                 return ExitCode::FAILURE;
             }
         };
+    #[cfg(feature = "metal")]
+    if kind == "layer0-kv-row" {
+        const KV_RANK: usize = 512;
+        const HIDDEN: usize = 4096;
+        let row = row.min(KV_RANK.saturating_sub(1));
+        let values = match read_affine_row_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn.wkv.weight",
+            "model.layers.0.attn.wkv.scales",
+            "model.layers.0.attn.wkv.biases",
+            row,
+            HIDDEN,
+            6,
+            128,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("wkv decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let kv_norm = match read_bf16_tensor_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn.kv_norm.weight",
+            KV_RANK,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("kv_norm decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let checksum = values.iter().fold(0_u64, |hash, value| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(value.to_bits()))
+        });
+        let norm_checksum = kv_norm.iter().fold(0_u64, |hash, value| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(*value))
+        });
+        println!("DeepSeek native KV projection row");
+        println!("row: {row}");
+        println!("wkv_width: {}", values.len());
+        println!("wkv_checksum: {checksum:016x}");
+        println!("kv_norm_width: {}", kv_norm.len());
+        println!("kv_norm_checksum: {norm_checksum:016x}");
+        println!("quantization: bits=6 group=128");
+        println!("metal_eval: decoded");
+        println!("scope: layer-zero wkv row and learned kv_norm");
+        return ExitCode::SUCCESS;
+    }
     #[cfg(feature = "metal")]
     if kind == "layer0-q-chain" {
         const HEADS: usize = 64;
