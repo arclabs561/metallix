@@ -139,3 +139,7 @@ The native Q chain now covers all 64 Q-B heads: token-0 embedding → full
 `wq_a` → BF16 `q_norm` → 32,768 Q-B outputs, with Metal evaluation passing and
 checksum `43a0197452b33b03`. The next attention boundary is per-head RMS
 normalization, rotary query preparation, and KV construction.
+
+The all-head Q gate now streams contiguous `wq_b` row ranges through one shard
+handle, keeping staging bounded per head while producing the full 32,768-output
+checksum. This is the first native Q path with a measured bounded I/O strategy.

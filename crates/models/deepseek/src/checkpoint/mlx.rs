@@ -53,6 +53,37 @@ pub fn read_affine_row_from_shard(
     bits: u8,
     group_size: usize,
 ) -> Result<Vec<f32>, MlxAffineRowError> {
+    read_affine_rows_from_shard(
+        shard,
+        header,
+        weight_name,
+        scale_name,
+        bias_name,
+        row,
+        1,
+        logical_width,
+        bits,
+        group_size,
+    )
+}
+
+/// Reads and decodes a contiguous bounded range of affine rows from one shard.
+///
+/// The file is opened once for the range so callers can stream a large matrix
+/// in model-shaped chunks without paying one open/close cycle per row.
+#[allow(clippy::too_many_arguments)]
+pub fn read_affine_rows_from_shard(
+    shard: &Path,
+    header: &V41SafetensorsHeader,
+    weight_name: &str,
+    scale_name: &str,
+    bias_name: &str,
+    first_row: usize,
+    row_count: usize,
+    logical_width: usize,
+    bits: u8,
+    group_size: usize,
+) -> Result<Vec<f32>, MlxAffineRowError> {
     let weight = header
         .tensor(weight_name)
         .ok_or_else(|| MlxAffineRowError::MissingTensor {
@@ -77,7 +108,8 @@ pub fn read_affine_row_from_shard(
         && scales.shape() == [weight.shape()[0], groups as u64]
         && biases.shape() == scales.shape()
         && weight.shape()[1] == packed_width as u64
-        && usize::try_from(weight.shape()[0]).is_ok_and(|rows| row < rows);
+        && usize::try_from(weight.shape()[0])
+            .is_ok_and(|rows| first_row <= rows && row_count <= rows.saturating_sub(first_row));
     if !valid {
         return Err(MlxAffineRowError::TensorShape {
             name: weight_name.to_owned(),
@@ -87,34 +119,45 @@ pub fn read_affine_row_from_shard(
     let mut packed_bytes = vec![0_u8; packed_width * 4];
     let mut scale_bytes = vec![0_u8; groups * 2];
     let mut bias_bytes = vec![0_u8; groups * 2];
-    read_range(
-        &mut file,
-        weight.file_range().start + row as u64 * packed_bytes.len() as u64,
-        &mut packed_bytes,
-    )?;
-    read_range(
-        &mut file,
-        scales.file_range().start + row as u64 * scale_bytes.len() as u64,
-        &mut scale_bytes,
-    )?;
-    read_range(
-        &mut file,
-        biases.file_range().start + row as u64 * bias_bytes.len() as u64,
-        &mut bias_bytes,
-    )?;
-    let packed = packed_bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect::<Vec<_>>();
-    let scales = scale_bytes
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-        .collect::<Vec<_>>();
-    let biases = bias_bytes
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-        .collect::<Vec<_>>();
-    decode_affine_row(&packed, &scales, &biases, logical_width, bits, group_size)
+    let mut decoded = Vec::with_capacity(row_count * logical_width);
+    for row in first_row..first_row + row_count {
+        read_range(
+            &mut file,
+            weight.file_range().start + row as u64 * packed_bytes.len() as u64,
+            &mut packed_bytes,
+        )?;
+        read_range(
+            &mut file,
+            scales.file_range().start + row as u64 * scale_bytes.len() as u64,
+            &mut scale_bytes,
+        )?;
+        read_range(
+            &mut file,
+            biases.file_range().start + row as u64 * bias_bytes.len() as u64,
+            &mut bias_bytes,
+        )?;
+        let packed = packed_bytes
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+        let scales = scale_bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let biases = bias_bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        decoded.extend(decode_affine_row(
+            &packed,
+            &scales,
+            &biases,
+            logical_width,
+            bits,
+            group_size,
+        )?);
+    }
+    Ok(decoded)
 }
 
 /// Reads a bounded row-major F32 tensor from a validated shard.

@@ -35,11 +35,13 @@ mod v41_indexer;
 mod v41_rotary;
 
 use clap::{Parser, Subcommand};
+#[cfg(feature = "metal")]
+use deepseek::checkpoint::mlx::{read_affine_rows_from_shard, read_bf16_tensor_from_shard};
 use deepseek::{
     V41TextContract,
     checkpoint::mlx::{
         collapse_hc_hidden, mix_hc_coefficients, read_affine_row_from_shard,
-        read_affine_rows_from_shard, read_bf16_tensor_from_shard, read_f32_tensor_from_shard,
+        read_f32_tensor_from_shard,
     },
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
@@ -1661,6 +1663,7 @@ fn inspect_v41_embedding_row(
     println!("fp32_checksum: {checksum:016x}");
     #[cfg(feature = "metal")]
     println!("metal_eval: passed");
+    #[cfg(feature = "metal")]
     if let Some(input_shard) = input_shard {
         if kind != "layer0-wq-a" || !all_rows {
             eprintln!("--input-shard requires --kind layer0-wq-a --all-rows");
