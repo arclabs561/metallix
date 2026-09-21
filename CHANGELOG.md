@@ -43,6 +43,8 @@ published release; reference operators do not imply full-model support.
   decoded from the real 6-bit shard and evaluated on Metal.
 - The native Q chain now runs token-0 embedding → full `wq_a` → real BF16
   `q_norm` → first 512-row `wq_b` head on Metal, checksum `9caf5173ef2cfb1c`.
+- The same native chain now decodes and evaluates all 64 Q-B heads (`32768`
+  outputs), checksum `43a0197452b33b03`.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

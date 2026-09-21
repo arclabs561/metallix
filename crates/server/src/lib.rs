@@ -39,7 +39,7 @@ use deepseek::{
     V41TextContract,
     checkpoint::mlx::{
         collapse_hc_hidden, mix_hc_coefficients, read_affine_row_from_shard,
-        read_bf16_tensor_from_shard, read_f32_tensor_from_shard,
+        read_affine_rows_from_shard, read_bf16_tensor_from_shard, read_f32_tensor_from_shard,
     },
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
@@ -1245,6 +1245,9 @@ fn inspect_v41_embedding_row(
         };
     #[cfg(feature = "metal")]
     if kind == "layer0-q-chain" {
+        const HEADS: usize = 64;
+        const HEAD_DIMENSION: usize = 512;
+        const Q_RANK: usize = 1024;
         let Some(input_shard) = input_shard else {
             eprintln!("layer0-q-chain requires --input-shard");
             return ExitCode::FAILURE;
@@ -1355,45 +1358,51 @@ fn inspect_v41_embedding_row(
             .zip(q_norm)
             .map(|(value, weight)| value / norm * weight)
             .collect::<Vec<_>>();
-        let mut wq_b = Vec::with_capacity(512 * 1024);
-        for row in 0..512 {
-            match read_affine_row_from_shard(
+        let mut q_b_outputs = Vec::with_capacity(HEADS * HEAD_DIMENSION);
+        for head in 0..HEADS {
+            let wq_b = match read_affine_rows_from_shard(
                 shard,
                 &header,
                 "model.layers.0.attn.wq_b.weight",
                 "model.layers.0.attn.wq_b.scales",
                 "model.layers.0.attn.wq_b.biases",
-                row,
-                1024,
+                head * HEAD_DIMENSION,
+                HEAD_DIMENSION,
+                Q_RANK,
                 6,
                 128,
             ) {
-                Ok(values) => wq_b.extend(values),
+                Ok(values) => values,
                 Err(error) => {
-                    eprintln!("wq_b decode failed: {error}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        let q_b =
-            match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(&wq_b, 512, 1024, &normalized)
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    eprintln!("wq_b Metal projection failed: {error}");
+                    eprintln!("wq_b head {head} decode failed: {error}");
                     return ExitCode::FAILURE;
                 }
             };
-        let checksum = q_b.as_slice::<f32>().iter().fold(0_u64, |hash, value| {
+            let q_b = match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(
+                &wq_b,
+                HEAD_DIMENSION,
+                Q_RANK,
+                &normalized,
+            ) {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("wq_b head {head} Metal projection failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            q_b_outputs.extend_from_slice(q_b.as_slice::<f32>());
+        }
+        let checksum = q_b_outputs.iter().fold(0_u64, |hash, value| {
             hash.wrapping_mul(1_099_511_628_211)
                 .wrapping_add(u64::from(value.to_bits()))
         });
         println!("DeepSeek native Q chain");
         println!("q_a_width: {}", q_a_values.len());
-        println!("q_b_width: 512");
+        println!("q_b_width: {}", q_b_outputs.len());
         println!("q_b_checksum: {checksum:016x}");
         println!("metal_eval: passed");
-        println!("scope: token-0 embedding through wq_a/q_norm/first wq_b head");
+        println!("q_b_heads: {HEADS}");
+        println!("scope: token-0 embedding through wq_a/q_norm/all wq_b heads");
         return ExitCode::SUCCESS;
     }
     if kind == "layer0-hc-mix" {

@@ -134,3 +134,8 @@ The first native query chain now runs end-to-end for token 0: real embedding →
 full `wq_a` → BF16 `q_norm` → first `wq_b` head block. Metal evaluation passes
 with Q-B checksum `9caf5173ef2cfb1c`. Remaining attention work is the other Q
 heads, rotary/norm details, KV path, and attention output projection.
+
+The native Q chain now covers all 64 Q-B heads: token-0 embedding → full
+`wq_a` → BF16 `q_norm` → 32,768 Q-B outputs, with Metal evaluation passing and
+checksum `43a0197452b33b03`. The next attention boundary is per-head RMS
+normalization, rotary query preparation, and KV construction.
