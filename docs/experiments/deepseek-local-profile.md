@@ -181,3 +181,8 @@ base, and scale tensors. The real shard gate reports resident bytes `26761324`,
 HC function checksum `6150937c7aee9697`, and stable normalization checksums.
 This closes weight ownership for the HC-collapse → attention-normalization →
 Q/KV activation boundary; it still does not claim full attention or logits.
+
+The resident activation boundary now runs the decoded HC projection, coefficient
+mix, collapse, and layer-zero `attn_norm` before resident Q/KV projection. Its
+zero-input contract is covered by a focused test; real token embedding input and
+Metal execution remain the next activation gate.

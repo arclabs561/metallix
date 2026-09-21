@@ -19,6 +19,9 @@ published release; reference operators do not imply full-model support.
 - The resident layer-zero Q/KV loader now includes real `attn_norm` and
   hyper-connection function/base/scale tensors, with stable checksums and
   resident-byte accounting for the full HC-collapse-to-projection boundary.
+- Added a resident CPU activation boundary that runs HC coefficient mixing,
+  collapse, attention normalization, and Q/KV projection with fail-closed
+  hidden-width and finite-value checks.
 
 - Native `mx inspect-v41-index` now recognizes the real MLX/Hugging Face
   weight-map index format when `metadata.total_size` is absent, reporting its
