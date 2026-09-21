@@ -483,7 +483,7 @@ enum Command {
         /// Decode every row for the bounded layer-zero `wq_a` matrix.
         #[arg(long)]
         all_rows: bool,
-        /// Row family to decode: `embedding`, `layer0-wq-a`, `layer0-q-chain`, or `layer0-kv-row`.
+        /// Row family to decode: `embedding`, `layer0-wq-a`, `layer0-q-chain`, `layer0-kv-row`, or `layer0-resident`.
         #[arg(long, default_value = "embedding")]
         kind: String,
         /// Optional embedding shard to apply to a full layer-zero projection.
@@ -1250,6 +1250,48 @@ fn inspect_v41_embedding_row(
                 return ExitCode::FAILURE;
             }
         };
+    if kind == "layer0-resident" {
+        let resident = match deepseek::checkpoint::mlx::LayerZeroQkvResident::load(shard, &header) {
+            Ok(resident) => resident,
+            Err(error) => {
+                eprintln!("resident layer-zero load failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(error) = resident.validate() {
+            eprintln!("resident layer-zero validation failed: {error}");
+            return ExitCode::FAILURE;
+        }
+        let checksum = |values: &[f32]| {
+            values.iter().fold(0_u64, |hash, value| {
+                hash.wrapping_mul(1_099_511_628_211)
+                    .wrapping_add(u64::from(value.to_bits()))
+            })
+        };
+        let bytes = (resident.wq_a.len()
+            + resident.q_norm.len()
+            + resident.wkv.len()
+            + resident.kv_norm.len())
+            * std::mem::size_of::<f32>();
+        println!("DeepSeek resident layer-zero Q/KV");
+        println!(
+            "wq_a: {}x{}",
+            deepseek::checkpoint::mlx::LayerZeroQkvResident::WQ_A_ROWS,
+            deepseek::checkpoint::mlx::LayerZeroQkvResident::HIDDEN_WIDTH
+        );
+        println!(
+            "wkv: {}x{}",
+            deepseek::checkpoint::mlx::LayerZeroQkvResident::WKV_ROWS,
+            deepseek::checkpoint::mlx::LayerZeroQkvResident::HIDDEN_WIDTH
+        );
+        println!("resident_bytes: {bytes}");
+        println!("wq_a_checksum: {:016x}", checksum(&resident.wq_a));
+        println!("wkv_checksum: {:016x}", checksum(&resident.wkv));
+        println!("q_norm_checksum: {:016x}", checksum(&resident.q_norm));
+        println!("kv_norm_checksum: {:016x}", checksum(&resident.kv_norm));
+        println!("scope: resident layer-zero weights only; no attention or logits");
+        return ExitCode::SUCCESS;
+    }
     #[cfg(feature = "metal")]
     if kind == "layer0-kv-row" {
         const KV_RANK: usize = 512;
