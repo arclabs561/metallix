@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::manifest::V41SafetensorsIndex;
 
 pub mod mlx;
+pub use mlx::LayerZeroQkvResident;
 mod source_fp4;
 pub use source_fp4::{V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection};
 

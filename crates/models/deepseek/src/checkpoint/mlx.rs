@@ -538,6 +538,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validates_resident_layer_zero_qkv_geometry_and_finiteness() {
+        let resident = super::LayerZeroQkvResident {
+            wq_a: vec![
+                0.0;
+                super::LayerZeroQkvResident::WQ_A_ROWS
+                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
+            ],
+            q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
+            wkv: vec![
+                0.0;
+                super::LayerZeroQkvResident::WKV_ROWS
+                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
+            ],
+            kv_norm: vec![1.0; super::LayerZeroQkvResident::KV_LORA_RANK],
+        };
+        resident.validate().expect("resident geometry");
+
+        let mut malformed = resident.clone();
+        malformed.q_norm.pop();
+        assert!(matches!(
+            malformed.validate(),
+            Err(MlxAffineRowError::TensorShape { name })
+                if name == "layer-zero resident Q/KV tensors"
+        ));
+
+        let mut non_finite = resident;
+        non_finite.kv_norm[0] = f32::NAN;
+        assert!(matches!(
+            non_finite.validate(),
+            Err(MlxAffineRowError::TensorShape { name })
+                if name == "layer-zero resident Q/KV tensors"
+        ));
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn applies_decoded_matrix_to_hidden_state_on_mlx() {
@@ -545,5 +580,115 @@ mod tests {
             .expect("matrix projection");
         assert_eq!(output.shape(), [2, 1]);
         assert_eq!(output.as_slice::<f32>(), [8.0, 18.0]);
+    }
+}
+
+/// Resident layer-zero Q/KV tensors decoded from one MLX shard.
+///
+/// This is deliberately adapter-private in scope: it owns only the tensors
+/// needed to prepare the first layer's query and compressed-KV state. It does
+/// not imply that attention, logits, or a complete model are resident.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerZeroQkvResident {
+    /// Quantized `wq_a`, widened to FP32 row-major storage.
+    pub wq_a: Vec<f32>,
+    /// Learned Q normalization weights, widened from BF16.
+    pub q_norm: Vec<f32>,
+    /// Quantized compressed-KV projection, widened to FP32 row-major storage.
+    pub wkv: Vec<f32>,
+    /// Learned compressed-KV normalization weights, widened from BF16.
+    pub kv_norm: Vec<f32>,
+}
+
+impl LayerZeroQkvResident {
+    /// Hidden-state width consumed by the layer-zero projections.
+    pub const HIDDEN_WIDTH: usize = 4096;
+    /// Low-rank query width emitted by `wq_a`.
+    pub const Q_LORA_RANK: usize = 1024;
+    /// Compressed-KV width emitted by `wkv`.
+    pub const KV_LORA_RANK: usize = 512;
+    /// Number of rows in the full `wq_a` projection.
+    pub const WQ_A_ROWS: usize = Self::Q_LORA_RANK;
+    /// Number of rows in the compressed-KV projection.
+    pub const WKV_ROWS: usize = Self::KV_LORA_RANK;
+
+    /// Loads and validates the resident layer-zero Q/KV tensors.
+    ///
+    /// The local MLX artifact uses contiguous six-bit affine storage with
+    /// group size 128 for these projections. The generic config's stale
+    /// quantization fields are intentionally not consulted here; the shard
+    /// header and this execution contract are the authority for the layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlxAffineRowError`] when a required tensor is absent, has an
+    /// unexpected shape or dtype, or cannot be read and decoded.
+    pub fn load(shard: &Path, header: &V41SafetensorsHeader) -> Result<Self, MlxAffineRowError> {
+        let wq_a = read_affine_rows_from_shard(
+            shard,
+            header,
+            "model.layers.0.attn.wq_a.weight",
+            "model.layers.0.attn.wq_a.scales",
+            "model.layers.0.attn.wq_a.biases",
+            0,
+            Self::WQ_A_ROWS,
+            Self::HIDDEN_WIDTH,
+            6,
+            128,
+        )?;
+        let q_norm = read_bf16_tensor_from_shard(
+            shard,
+            header,
+            "model.layers.0.attn.q_norm.weight",
+            Self::Q_LORA_RANK,
+        )?;
+        let wkv = read_affine_rows_from_shard(
+            shard,
+            header,
+            "model.layers.0.attn.wkv.weight",
+            "model.layers.0.attn.wkv.scales",
+            "model.layers.0.attn.wkv.biases",
+            0,
+            Self::WKV_ROWS,
+            Self::HIDDEN_WIDTH,
+            6,
+            128,
+        )?;
+        let kv_norm = read_bf16_tensor_from_shard(
+            shard,
+            header,
+            "model.layers.0.attn.kv_norm.weight",
+            Self::KV_LORA_RANK,
+        )?;
+        Ok(Self {
+            wq_a,
+            q_norm,
+            wkv,
+            kv_norm,
+        })
+    }
+
+    /// Validates the shape of the resident arrays after loading or handoff.
+    ///
+    /// This catches accidental truncation or row-major transposition before a
+    /// Metal operation receives the arrays.
+    pub fn validate(&self) -> Result<(), MlxAffineRowError> {
+        if self.wq_a.len() != Self::WQ_A_ROWS * Self::HIDDEN_WIDTH
+            || self.q_norm.len() != Self::Q_LORA_RANK
+            || self.wkv.len() != Self::WKV_ROWS * Self::HIDDEN_WIDTH
+            || self.kv_norm.len() != Self::KV_LORA_RANK
+            || self
+                .wq_a
+                .iter()
+                .chain(self.q_norm.iter())
+                .chain(self.wkv.iter())
+                .chain(self.kv_norm.iter())
+                .any(|value| !value.is_finite())
+        {
+            return Err(MlxAffineRowError::TensorShape {
+                name: "layer-zero resident Q/KV tensors".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
