@@ -41,6 +41,8 @@ published release; reference operators do not imply full-model support.
   evaluates on Metal, producing a 1,024-wide output.
 - Added a bounded first-head `wq_b` gate: 512 output rows × 1,024 Q-A inputs,
   decoded from the real 6-bit shard and evaluated on Metal.
+- The native Q chain now runs token-0 embedding → full `wq_a` → real BF16
+  `q_norm` → first 512-row `wq_b` head on Metal, checksum `9caf5173ef2cfb1c`.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

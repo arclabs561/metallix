@@ -129,3 +129,8 @@ The next attention tensor gate decodes the first `wq_b` head block from the
 real shard: `512 × 1024`, checksum `60c20b2f8354c400`, with `metal_eval:
 passed`. This matches the 1,024-wide Q-A output contract and bounds the next
 Q-normalization/Q-B integration step.
+
+The first native query chain now runs end-to-end for token 0: real embedding →
+full `wq_a` → BF16 `q_norm` → first `wq_b` head block. Metal evaluation passes
+with Q-B checksum `9caf5173ef2cfb1c`. Remaining attention work is the other Q
+heads, rotary/norm details, KV path, and attention output projection.

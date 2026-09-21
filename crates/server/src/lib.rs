@@ -39,7 +39,7 @@ use deepseek::{
     V41TextContract,
     checkpoint::mlx::{
         collapse_hc_hidden, mix_hc_coefficients, read_affine_row_from_shard,
-        read_f32_tensor_from_shard,
+        read_bf16_tensor_from_shard, read_f32_tensor_from_shard,
     },
     manifest::{MlxSafetensorsIndex, V41SafetensorsIndex},
 };
@@ -1243,6 +1243,159 @@ fn inspect_v41_embedding_row(
                 return ExitCode::FAILURE;
             }
         };
+    #[cfg(feature = "metal")]
+    if kind == "layer0-q-chain" {
+        let Some(input_shard) = input_shard else {
+            eprintln!("layer0-q-chain requires --input-shard");
+            return ExitCode::FAILURE;
+        };
+        let input_bytes = match fs::metadata(input_shard) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                eprintln!("could not stat {}: {error}", input_shard.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut input_file = match fs::File::open(input_shard) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("could not open {}: {error}", input_shard.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut prefix = [0_u8; 8];
+        if input_file.read_exact(&mut prefix).is_err() {
+            eprintln!("could not read input safetensors prefix");
+            return ExitCode::FAILURE;
+        }
+        let header_len = usize::try_from(u64::from_le_bytes(prefix)).unwrap_or(usize::MAX);
+        if header_len > 100 * 1024 * 1024 {
+            eprintln!("input safetensors header exceeds the bounded limit");
+            return ExitCode::FAILURE;
+        }
+        let mut input_header_bytes = vec![0_u8; 8 + header_len];
+        input_header_bytes[..8].copy_from_slice(&prefix);
+        if input_file.read_exact(&mut input_header_bytes[8..]).is_err() {
+            eprintln!("could not read input safetensors header");
+            return ExitCode::FAILURE;
+        }
+        let input_header = match deepseek::V41SafetensorsHeader::parse_prefixed_header(
+            &input_header_bytes,
+            input_bytes,
+        ) {
+            Ok(header) => header,
+            Err(error) => {
+                eprintln!("unsupported input safetensors shard: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let embedding = match read_affine_row_from_shard(
+            input_shard,
+            &input_header,
+            "model.embed_tokens.weight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.biases",
+            0,
+            4096,
+            8,
+            64,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("embedding decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut wq_a = Vec::with_capacity(1024 * 4096);
+        for row in 0..1024 {
+            match read_affine_row_from_shard(
+                shard,
+                &header,
+                "model.layers.0.attn.wq_a.weight",
+                "model.layers.0.attn.wq_a.scales",
+                "model.layers.0.attn.wq_a.biases",
+                row,
+                4096,
+                6,
+                128,
+            ) {
+                Ok(values) => wq_a.extend(values),
+                Err(error) => {
+                    eprintln!("wq_a decode failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let q_a =
+            match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(&wq_a, 1024, 4096, &embedding)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("wq_a Metal projection failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let q_a_values = q_a.as_slice::<f32>();
+        let norm =
+            (q_a_values.iter().map(|value| value * value).sum::<f32>() / 1024.0 + 1e-6).sqrt();
+        let q_norm = match read_bf16_tensor_from_shard(
+            shard,
+            &header,
+            "model.layers.0.attn.q_norm.weight",
+            1024,
+        ) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("q_norm decode failed: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let normalized = q_a_values
+            .iter()
+            .zip(q_norm)
+            .map(|(value, weight)| value / norm * weight)
+            .collect::<Vec<_>>();
+        let mut wq_b = Vec::with_capacity(512 * 1024);
+        for row in 0..512 {
+            match read_affine_row_from_shard(
+                shard,
+                &header,
+                "model.layers.0.attn.wq_b.weight",
+                "model.layers.0.attn.wq_b.scales",
+                "model.layers.0.attn.wq_b.biases",
+                row,
+                1024,
+                6,
+                128,
+            ) {
+                Ok(values) => wq_b.extend(values),
+                Err(error) => {
+                    eprintln!("wq_b decode failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let q_b =
+            match deepseek::checkpoint::mlx::apply_affine_matrix_mlx(&wq_b, 512, 1024, &normalized)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("wq_b Metal projection failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let checksum = q_b.as_slice::<f32>().iter().fold(0_u64, |hash, value| {
+            hash.wrapping_mul(1_099_511_628_211)
+                .wrapping_add(u64::from(value.to_bits()))
+        });
+        println!("DeepSeek native Q chain");
+        println!("q_a_width: {}", q_a_values.len());
+        println!("q_b_width: 512");
+        println!("q_b_checksum: {checksum:016x}");
+        println!("metal_eval: passed");
+        println!("scope: token-0 embedding through wq_a/q_norm/first wq_b head");
+        return ExitCode::SUCCESS;
+    }
     if kind == "layer0-hc-mix" {
         let Some(input_shard) = input_shard else {
             eprintln!("layer0-hc-mix requires --input-shard");
