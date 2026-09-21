@@ -571,6 +571,36 @@ mod tests {
             Err(MlxAffineRowError::TensorShape { name })
                 if name == "layer-zero resident Q/KV tensors"
         ));
+
+        let resident = super::LayerZeroQkvResident {
+            wq_a: vec![
+                0.0;
+                super::LayerZeroQkvResident::WQ_A_ROWS
+                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
+            ],
+            q_norm: vec![1.0; super::LayerZeroQkvResident::Q_LORA_RANK],
+            wkv: vec![
+                0.0;
+                super::LayerZeroQkvResident::WKV_ROWS
+                    * super::LayerZeroQkvResident::HIDDEN_WIDTH
+            ],
+            kv_norm: vec![1.0; super::LayerZeroQkvResident::KV_LORA_RANK],
+        };
+        let hidden = vec![0.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
+        let (q, kv) = resident
+            .project_qkv(&hidden, 1e-6)
+            .expect("zero activation");
+        assert_eq!(q.len(), super::LayerZeroQkvResident::Q_LORA_RANK);
+        assert_eq!(kv.len(), super::LayerZeroQkvResident::KV_LORA_RANK);
+        assert!(q.iter().chain(&kv).all(|value| *value == 0.0));
+        assert!(matches!(
+            resident.project_qkv(&hidden[..hidden.len() - 1], 1e-6),
+            Err(MlxAffineRowError::TensorShape { .. })
+        ));
+        assert!(matches!(
+            resident.project_qkv(&hidden, 0.0),
+            Err(MlxAffineRowError::TensorShape { .. })
+        ));
     }
 
     #[cfg(feature = "metal")]
