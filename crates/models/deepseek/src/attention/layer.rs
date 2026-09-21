@@ -1306,6 +1306,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "small deterministic fixture indices"
+    )]
     fn query_rotary_matches_source_tail_slice_reference() {
         // DeepSeek splits each projected query head into a non-rotary prefix
         // and a trailing qk_rope_head_dim slice. The source applies RoPE only
