@@ -39,6 +39,8 @@ published release; reference operators do not imply full-model support.
 - Corrected MLX attention quantization to contiguous 6-bit/group-128 packing;
   the full real `wq_a` tensor now applies to the 4,096-wide embedding and
   evaluates on Metal, producing a 1,024-wide output.
+- Added a bounded first-head `wq_b` gate: 512 output rows × 1,024 Q-A inputs,
+  decoded from the real 6-bit shard and evaluated on Metal.
 - Added the native Metal matrix-projection primitive that applies decoded
   affine weights to a hidden-state vector, with shape checks and a device test.
 - Documented and locally validated a machine-local oMLX DeepSeek-V4.1-Flash

@@ -1430,17 +1430,28 @@ fn inspect_v41_embedding_row(
             4096,
             128,
         ),
+        "layer0-wq-b-head0" => (
+            "model.layers.0.attn.wq_b.weight",
+            "model.layers.0.attn.wq_b.scales",
+            "model.layers.0.attn.wq_b.biases",
+            1024,
+            128,
+        ),
         _ => {
             eprintln!("unknown row kind {kind:?}; expected embedding or layer0-wq-a");
             return ExitCode::FAILURE;
         }
     };
     let row_count = if all_rows {
-        if kind != "layer0-wq-a" {
-            eprintln!("--all-rows is only supported for layer0-wq-a");
+        if !matches!(kind, "layer0-wq-a" | "layer0-wq-b-head0") {
+            eprintln!("--all-rows is only supported for layer0-wq-a or layer0-wq-b-head0");
             return ExitCode::FAILURE;
         }
-        1024
+        if kind == "layer0-wq-b-head0" {
+            512
+        } else {
+            1024
+        }
     } else {
         1
     };
@@ -1454,7 +1465,11 @@ fn inspect_v41_embedding_row(
             biases,
             if all_rows { current_row } else { row },
             width,
-            if kind == "layer0-wq-a" { 6 } else { 8 },
+            if matches!(kind, "layer0-wq-a" | "layer0-wq-b-head0") {
+                6
+            } else {
+                8
+            },
             group_size,
         ) {
             Ok(values) => values,

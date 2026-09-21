@@ -124,3 +124,8 @@ packing, the complete real layer-zero `wq_a` tensor applies to the 4,096-wide
 token embedding and evaluates on Metal, producing width `1024` with projection
 checksum `a1d46c0641124b5d`. The next native boundary is Q normalization and
 `wq_b` projection.
+
+The next attention tensor gate decodes the first `wq_b` head block from the
+real shard: `512 × 1024`, checksum `60c20b2f8354c400`, with `metal_eval:
+passed`. This matches the 1,024-wide Q-A output contract and bounds the next
+Q-normalization/Q-B integration step.
