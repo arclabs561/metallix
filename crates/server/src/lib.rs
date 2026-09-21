@@ -1285,7 +1285,7 @@ fn inspect_v41_embedding_row(
         });
         let norm_checksum = kv_norm.iter().fold(0_u64, |hash, value| {
             hash.wrapping_mul(1_099_511_628_211)
-                .wrapping_add(u64::from(*value))
+                .wrapping_add(u64::from(value.to_bits()))
         });
         println!("DeepSeek native KV projection row");
         println!("row: {row}");
@@ -1294,7 +1294,7 @@ fn inspect_v41_embedding_row(
         println!("kv_norm_width: {}", kv_norm.len());
         println!("kv_norm_checksum: {norm_checksum:016x}");
         println!("quantization: bits=6 group=128");
-        println!("metal_eval: decoded");
+        println!("metal_eval: not-run (row and norm decode only)");
         println!("scope: layer-zero wkv row and learned kv_norm");
         return ExitCode::SUCCESS;
     }
