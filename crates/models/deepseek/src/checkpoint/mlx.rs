@@ -789,6 +789,47 @@ mod tests {
         assert_ne!(&prepared[..2], &hidden[..2]);
     }
 
+    #[test]
+    fn hands_off_prepared_layer_one_activation_as_one_cpu_oracle_boundary() {
+        let mut resident = sample_resident();
+        resident.wq_a[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
+        resident.wkv[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
+        let mut hidden = vec![0.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
+        hidden[0] = 3.0;
+        hidden[1] = 4.0;
+
+        let activation = resident
+            .prepare_attention_activation(&hidden, 1e-6, 1e-20, 4)
+            .expect("layer-one activation handoff");
+        let prepared = resident
+            .prepare_attention_hidden(&hidden, 1e-6, 1e-20, 4)
+            .expect("CPU hidden oracle");
+        let (q, kv) = resident
+            .project_qkv(&prepared, 1e-20)
+            .expect("CPU Q/KV oracle");
+
+        assert_eq!(activation.hidden, prepared);
+        assert_eq!(activation.q, q);
+        assert_eq!(activation.kv, kv);
+        assert_eq!(
+            activation.hidden.len(),
+            super::LayerZeroQkvResident::HIDDEN_WIDTH
+        );
+        assert_eq!(activation.q.len(), super::LayerZeroQkvResident::Q_LORA_RANK);
+        assert_eq!(
+            activation.kv.len(),
+            super::LayerZeroQkvResident::KV_LORA_RANK
+        );
+        assert!(
+            activation
+                .hidden
+                .iter()
+                .chain(&activation.q)
+                .chain(&activation.kv)
+                .all(|value| value.is_finite())
+        );
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the synthetic shard keeps every tensor binding in one integration fixture"
@@ -970,6 +1011,24 @@ pub struct LayerZeroQkvResident {
     pub wkv: Vec<f32>,
     /// Learned compressed-KV normalization weights, widened from BF16.
     pub kv_norm: Vec<f32>,
+}
+
+/// CPU-owned activation handoff from layer one into native attention.
+///
+/// The buffers are deliberately kept in the source-shaped low-rank form:
+/// `q` is the normalized query prefix and `kv` is the normalized compressed
+/// value prefix. Native attention owns the later head expansion, rotary tail,
+/// cache publication, and output projection. Keeping this handoff separate
+/// from [`LayerZeroQkvResident`] prevents request state from leaking into the
+/// checkpoint owner while giving the next layer a single validated boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerZeroAttentionActivation {
+    /// The attention-normalized hidden state consumed by the projections.
+    pub hidden: Vec<f32>,
+    /// Normalized low-rank query prefix, length [`LayerZeroQkvResident::Q_LORA_RANK`].
+    pub q: Vec<f32>,
+    /// Normalized compressed-KV prefix, length [`LayerZeroQkvResident::KV_LORA_RANK`].
+    pub kv: Vec<f32>,
 }
 
 impl LayerZeroQkvResident {
@@ -1179,6 +1238,40 @@ impl LayerZeroQkvResident {
             return Err(MlxAffineRowError::NonFinite { column: 0 });
         }
         Ok((q, kv))
+    }
+
+    /// Produces the validated activation handoff consumed by native attention.
+    ///
+    /// [`Self::prepare_attention_hidden`] and [`Self::project_qkv`] remain the
+    /// independently testable CPU oracle stages. This method only composes
+    /// those stages and records the exact hidden activation used for the
+    /// projection, so a later device implementation can compare each side of
+    /// the handoff without reaching back into checkpoint state.
+    pub fn prepare_attention_activation(
+        &self,
+        hidden: &[f32],
+        hc_epsilon: f32,
+        norm_epsilon: f32,
+        sinkhorn_iterations: usize,
+    ) -> Result<LayerZeroAttentionActivation, MlxAffineRowError> {
+        let prepared =
+            self.prepare_attention_hidden(hidden, hc_epsilon, norm_epsilon, sinkhorn_iterations)?;
+        let (q, kv) = self.project_qkv(&prepared, norm_epsilon)?;
+        let activation = LayerZeroAttentionActivation {
+            hidden: prepared,
+            q,
+            kv,
+        };
+        if activation
+            .hidden
+            .iter()
+            .chain(&activation.q)
+            .chain(&activation.kv)
+            .any(|value| !value.is_finite())
+        {
+            return Err(MlxAffineRowError::NonFinite { column: 0 });
+        }
+        Ok(activation)
     }
 
     /// Projects one resident hidden state through the bounded MLX Metal graph.
