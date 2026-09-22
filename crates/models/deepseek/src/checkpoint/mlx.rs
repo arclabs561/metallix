@@ -916,6 +916,36 @@ mod tests {
         assert_eq!(output.shape(), [2, 1]);
         assert_eq!(output.as_slice::<f32>(), [8.0, 18.0]);
     }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn resident_qkv_metal_projection_matches_cpu_oracle() {
+        let mut resident = sample_resident();
+        resident.wq_a[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
+        resident.wkv[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
+        let hidden = vec![1.0; super::LayerZeroQkvResident::HIDDEN_WIDTH];
+        let expected = resident
+            .project_qkv(&hidden, 1e-20)
+            .expect("CPU projection");
+        let actual = resident
+            .project_qkv_mlx(&hidden, 1e-20)
+            .expect("Metal projection");
+
+        assert_eq!(actual.0.len(), super::LayerZeroQkvResident::Q_LORA_RANK);
+        assert_eq!(actual.1.len(), super::LayerZeroQkvResident::KV_LORA_RANK);
+        for (actual, expected) in actual.0.iter().zip(&expected.0) {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "q mismatch: {actual} vs {expected}"
+            );
+        }
+        for (actual, expected) in actual.1.iter().zip(&expected.1) {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "kv mismatch: {actual} vs {expected}"
+            );
+        }
+    }
 }
 
 /// Resident layer-zero Q/KV tensors decoded from one MLX shard.
@@ -1149,6 +1179,81 @@ impl LayerZeroQkvResident {
             return Err(MlxAffineRowError::NonFinite { column: 0 });
         }
         Ok((q, kv))
+    }
+
+    /// Projects one resident hidden state through the bounded MLX Metal graph.
+    ///
+    /// [`Self::project_qkv`] remains the independent CPU oracle. This method
+    /// only qualifies the real loaded layer-zero activation boundary; it does
+    /// not own attention cache or request state.
+    #[cfg(feature = "metal")]
+    #[allow(
+        clippy::items_after_statements,
+        reason = "the bounded MLX helper stays local to the device projection boundary"
+    )]
+    pub fn project_qkv_mlx(
+        &self,
+        hidden: &[f32],
+        norm_epsilon: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>), MlxAffineRowError> {
+        self.validate()?;
+        if hidden.len() != Self::HIDDEN_WIDTH
+            || !norm_epsilon.is_finite()
+            || norm_epsilon <= 0.0
+            || hidden.iter().any(|value| !value.is_finite())
+        {
+            return Err(MlxAffineRowError::TensorShape {
+                name: "layer-zero hidden activation".to_owned(),
+            });
+        }
+
+        fn project(
+            matrix: &[f32],
+            rows: usize,
+            hidden: &[f32],
+            norm: &[f32],
+            epsilon: f32,
+        ) -> Result<Vec<f32>, MlxAffineRowError> {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                reason = "validated model widths fit MLX dimensions"
+            )]
+            let rows_i32 = rows as i32;
+            let stream = mlx_rs::StreamOrDevice::gpu();
+            let raw = apply_affine_matrix_mlx(matrix, rows, hidden.len(), hidden)
+                .map_err(|error| MlxAffineRowError::Io(error.to_string()))?
+                .reshape_device(&[1, rows_i32], &stream)
+                .map_err(|error| MlxAffineRowError::Io(error.to_string()))?;
+            let scale = mlx_rs::Array::from_slice(norm, &[rows_i32]);
+            let output = mlx_rs::fast::rms_norm_device(&raw, &scale, epsilon, &stream)
+                .map_err(|error| MlxAffineRowError::Io(error.to_string()))?;
+            output
+                .eval()
+                .map_err(|error| MlxAffineRowError::Io(error.to_string()))?;
+            let values = output.as_slice::<f32>();
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(MlxAffineRowError::NonFinite { column: 0 });
+            }
+            Ok(values.to_vec())
+        }
+
+        Ok((
+            project(
+                &self.wq_a,
+                Self::WQ_A_ROWS,
+                hidden,
+                &self.q_norm,
+                norm_epsilon,
+            )?,
+            project(
+                &self.wkv,
+                Self::WKV_ROWS,
+                hidden,
+                &self.kv_norm,
+                norm_epsilon,
+            )?,
+        ))
     }
 
     /// Validates the shape of the resident arrays after loading or handoff.
