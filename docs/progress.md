@@ -49,8 +49,12 @@ choices without expanding current support claims.
   RMSNorm consumer matches the exact BF16 source attention input. These joined
   cases now compose one bounded prefill/decode partition through native Engram1,
   layer one and the existing final reduced suffix. The checked-in unified source
-  bundle feeds layer zero only; downstream parameters, numerical oracles, and
-  attention histories remain legacy fixture-fed. The previous-call layer-three
+  bundle feeds layer zero and the final L3 HC/FFN/MoE operands. The request
+  retains a typed L3 projection with matching bundle capture/revision/model
+  identity and unchanged numerical limits. Mixed-capture metadata is rejected;
+  zeroing a supplied L3 normalization weight fails the final numerical oracle.
+  L1/L2, L3 owner/attention capture inputs, and L4/head remain legacy fixture-fed;
+  this is an incremental migration, not a fully unified source trace. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
@@ -351,7 +355,15 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 
 ## Validation
 
-The current recovery batch passed all 58 DeepSeek `forward_moe` tests and strict
+The unified L3 operand migration passes all 60 DeepSeek `forward_moe` tests,
+including mixed-capture and changed-weight rejection. The exporter integrity
+suite passes seven checks; its opt-in source-regeneration check was not rerun
+because the exporter and fixture bytes are unchanged. The calibration-only
+Julia normalization replay reproduced the saved native and source embedding
+outputs exactly and found no improvement from scalar Welford. No Julia runtime
+arithmetic or acceptance limits changed.
+
+The recovery batch passed all 58 DeepSeek `forward_moe` tests and strict
 all-target/all-feature DeepSeek Clippy. Seven Julia diagnostic tests and all 22
 Codex assessor tests passed. The canonical `RUST_TEST_THREADS=1 just check-metal`
 run stops at the unchanged Julia full-encoder source-parity failure:

@@ -42,7 +42,7 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications and tested request invalidation/rebuild | Test-private fixture-backed operands remain; production recovery and native generation are unfinished |
+| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications, tested request invalidation/rebuild, and unified-bundle L0 and L3-tail operands | Test-private fixture-backed operands remain; production recovery and native generation are unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 

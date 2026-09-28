@@ -313,6 +313,60 @@ fn layer_three_fixture() -> Fixture {
     f
 }
 
+fn reduced_bundle_layer_three_fixture() -> Fixture {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("reduced runner bundle JSON");
+    layer_three_fixture_from_bundle(&bundle)
+}
+
+fn layer_three_fixture_from_bundle(bundle: &Value) -> Fixture {
+    assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+    let projection = &bundle["projections"]["layer3_moe"];
+    let fixture: Fixture = serde_json::from_value(projection.clone()).expect("typed bundle L3 MoE");
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(
+        fixture.source.revision,
+        bundle["source"]["revision"]
+            .as_str()
+            .expect("bundle revision")
+    );
+    assert_eq!(
+        fixture.source.model_sha256,
+        bundle["source"]["model_sha256"]
+            .as_str()
+            .expect("bundle model")
+    );
+    assert_eq!(
+        fixture.source.complete_capture_sha256,
+        bundle["source"]["complete_capture_sha256"]
+            .as_str()
+            .expect("bundle capture")
+    );
+    assert_eq!(
+        fixture.source.revision,
+        "dba1be0a40aa45a94ad051997016db3960a90277"
+    );
+    assert_eq!(
+        fixture.source.model_sha256,
+        "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+    );
+    assert_eq!(fixture.cases.len(), 3);
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 5, 6]
+    );
+    assert_encoded_parameter_schema_for(&fixture, 3);
+    assert_model_and_case_contract(&fixture);
+    validate_block_tail_fixture(&fixture);
+    fixture
+}
+
 fn head_fixture() -> HeadFixture {
     serde_json::from_str(include_str!(
         "../../../../fixtures/deepseek-v41/forward-head-reference.json"
@@ -361,6 +415,10 @@ fn assert_source_provenance(f: &Fixture) {
 }
 
 fn assert_encoded_parameter_schema(f: &Fixture) {
+    assert_encoded_parameter_schema_for(f, 4);
+}
+
+fn assert_encoded_parameter_schema_for(f: &Fixture, layer: usize) {
     assert_eq!(f.encoded_parameters.len(), 32);
     for expert in (0..4)
         .map(|id| format!("experts.{id}"))
@@ -368,7 +426,7 @@ fn assert_encoded_parameter_schema(f: &Fixture) {
     {
         let shared = expert == "shared_experts";
         for projection in ["w1", "w2", "w3"] {
-            let prefix = format!("layers.4.ffn.{expert}.{projection}");
+            let prefix = format!("layers.{layer}.ffn.{expert}.{projection}");
             let weight = &f.encoded_parameters[&format!("{prefix}.weight")];
             let scale = &f.encoded_parameters[&format!("{prefix}.scale")];
             assert_eq!(
@@ -1425,6 +1483,7 @@ struct ReducedLiveRequest {
     l1: layer1_join::NativeLayerOneSession,
     l2: layer2_join::NativeLayerTwoSession,
     engram3: engram_capture::NativeLayerThreeEngramSession,
+    l3_fixture: Fixture,
     l3: Option<owner_attention_capture::NativeLayerThreePublisher>,
     l2_entries: Vec<(usize, Vec<u16>, Vec<f32>)>,
     engram3_entries: Vec<(usize, Vec<u16>)>,
@@ -1438,6 +1497,7 @@ impl ReducedLiveRequest {
             l1: layer1_join::NativeLayerOneSession::new(),
             l2: layer2_join::NativeLayerTwoSession::new(),
             engram3: engram_capture::NativeLayerThreeEngramSession::new(),
+            l3_fixture: reduced_bundle_layer_three_fixture(),
             l3: None,
             l2_entries: Vec::new(),
             engram3_entries: Vec::new(),
@@ -1482,7 +1542,7 @@ impl ReducedLiveRequest {
                 .map(|(start, _, pre)| (*start, pre.clone()))
                 .collect::<Vec<_>>();
             let inputs = native_layer_three_attention_inputs_from_entries(
-                &layer_three_fixture(),
+                &self.l3_fixture,
                 &self.engram3_entries,
                 &pre,
             );
@@ -1530,9 +1590,8 @@ impl ReducedLiveRequest {
             .iter()
             .map(|(start, _, pre)| (*start, pre.clone()))
             .collect::<Vec<_>>();
-        let fixture_three = layer_three_fixture();
         let third = native_layer_three_block_tail_from_entries_with_attention(
-            &fixture_three,
+            &self.l3_fixture,
             Some(&self.engram3_entries),
             Some(&pre),
             Some(self.l3.as_ref().expect("complete L3 publisher").outputs()),
@@ -1547,6 +1606,48 @@ impl ReducedLiveRequest {
         self.lifecycle = ReducedRequestLifecycle::Finalized;
         output
     }
+}
+
+#[test]
+fn reduced_l3_bundle_rejects_mixed_capture() {
+    let mut bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .unwrap();
+    bundle["projections"]["layer3_moe"]["source"]["complete_capture_sha256"] =
+        Value::String("0".repeat(64));
+    assert!(std::panic::catch_unwind(|| layer_three_fixture_from_bundle(&bundle)).is_err());
+}
+
+#[test]
+fn reduced_l3_bundle_weight_is_consumed_by_final_suffix() {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .unwrap();
+    let entries = layer_zero::native_layer_zero_entries_from_projection(
+        &bundle["projections"]["layer0_to_layer1"],
+    );
+    let mut request = ReducedLiveRequest::new();
+    for (start, residual, pre) in &entries {
+        let prefix = (*start == 6).then(|| request.prior_l3_prefix().to_vec());
+        request.step(
+            &(*start, residual.clone()),
+            &(*start, pre.clone()),
+            prefix.as_deref(),
+        );
+    }
+    let weight = request
+        .l3_fixture
+        .block_parameters
+        .get_mut("layers.3.ffn_norm.weight")
+        .unwrap();
+    weight.storage_hex = "0".repeat(weight.storage_hex.len());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.finish())).is_err(),
+        "changed unified L3 weights must not be replaced by legacy operands"
+    );
+    assert_eq!(request.lifecycle, ReducedRequestLifecycle::Poisoned);
 }
 
 fn assert_finalization_failure_requires_restart(request: &mut ReducedLiveRequest) {
