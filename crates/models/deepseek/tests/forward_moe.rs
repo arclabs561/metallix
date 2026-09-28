@@ -320,7 +320,17 @@ fn layer_three_fixture_from_bundle(bundle: &Value) -> Fixture {
 
 fn moe_fixture_from_bundle(bundle: &Value, layer: usize) -> Fixture {
     assert_eq!(bundle["schema_version"].as_u64(), Some(1));
-    let projection = &bundle["projections"][format!("layer{layer}_moe")];
+    let name = format!("layer{layer}_moe");
+    let projection = &bundle["projections"][&name];
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned bundle metadata");
+    assert_eq!(bundle["source"], pinned["source"], "bundle source metadata");
+    assert_eq!(
+        projection["source"], pinned["projections"][&name]["source"],
+        "{name} source metadata"
+    );
     let fixture: Fixture = serde_json::from_value(projection.clone()).expect("typed bundle MoE");
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(
@@ -1527,7 +1537,7 @@ impl ReducedLiveRequest {
         Self {
             l1: layer1_join::NativeLayerOneSession::new(),
             l2: layer2_join::NativeLayerTwoSession::new(),
-            engram3: engram_capture::NativeLayerThreeEngramSession::new(),
+            engram3: engram_capture::NativeLayerThreeEngramSession::from_bundle(&bundle),
             l3_fixture: layer_three_fixture_from_bundle(&bundle),
             bundle,
             l3: None,
@@ -1563,8 +1573,12 @@ impl ReducedLiveRequest {
         self.engram3_entries.push(engram);
         self.cursor += 1;
         if self.cursor == 2 {
-            let (publisher, _) =
-                native_previous_layer_three_publisher(&self.l2_entries, &self.engram3_entries);
+            let (publisher, _) = native_previous_layer_three_publisher(
+                &self.l2_entries,
+                &self.engram3_entries,
+                &self.l3_fixture,
+                &self.bundle,
+            );
             self.l3 = Some(publisher);
         }
         if self.cursor == 3 {
@@ -1684,6 +1698,150 @@ fn completed_reduced_request() -> ReducedLiveRequest {
         );
     }
     request
+}
+
+fn unified_l3_publisher_fixture() -> (Value, Vec<(usize, Vec<u16>)>) {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("unified bundle");
+    let inputs = bundle["projections"]["layer3_attention"]["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|case| {
+            let tensor: Tensor = serde_json::from_value(case["input"].clone()).unwrap();
+            (
+                usize::try_from(case["start_pos"].as_u64().unwrap()).unwrap(),
+                tensor.bf16(),
+            )
+        })
+        .collect();
+    (bundle, inputs)
+}
+
+#[test]
+fn unified_l3_engram_rejects_changed_metadata_and_consumes_weights() {
+    let (bundle, _) = unified_l3_publisher_fixture();
+    let mut changed = bundle.clone();
+    changed["projections"]["layer3_engram"]["source"]["forward_observers_sha256"] =
+        Value::String("0".repeat(64));
+    assert!(
+        std::panic::catch_unwind(
+            || engram_capture::NativeLayerThreeEngramSession::from_bundle(&changed)
+        )
+        .is_err()
+    );
+    let mut changed = bundle;
+    let tensor = &mut changed["projections"]["layer3_engram"]["encoded_parameters"]["layers.3.engram.q_weight"];
+    let bytes = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
+    tensor["storage_hex"] = Value::String("0".repeat(bytes.len() * 2));
+    tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&bytes)));
+    let mut session = engram_capture::NativeLayerThreeEngramSession::from_bundle(&changed);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.step(None))).is_err(),
+        "changed supplied Engram3 weight bypassed"
+    );
+}
+
+#[test]
+fn unified_moe_rejects_changed_loader_provenance() {
+    let (bundle, _) = unified_l3_publisher_fixture();
+    for layer in [3, 4] {
+        let mut changed = bundle.clone();
+        changed["projections"][format!("layer{layer}_moe")]["source"]["loader_sha256"] =
+            Value::String("0".repeat(64));
+        assert!(
+            std::panic::catch_unwind(|| moe_fixture_from_bundle(&changed, layer)).is_err(),
+            "changed layer {layer} loader accepted"
+        );
+    }
+}
+
+#[test]
+fn unified_l3_publisher_rejects_changed_source_metadata() {
+    let (bundle, _) = unified_l3_publisher_fixture();
+    for name in [
+        "layer3_attention",
+        "layer3_index_key",
+        "layer3_compressor",
+        "layer3_candidate",
+    ] {
+        let mut changed = bundle.clone();
+        changed["projections"][name]["source"]["forward_observers_sha256"] =
+            Value::String("0".repeat(64));
+        assert!(
+            std::panic::catch_unwind(|| {
+                owner_attention_capture::NativeLayerThreePublisher::from_bundle(&changed)
+            })
+            .is_err(),
+            "changed source accepted: {name}"
+        );
+    }
+}
+
+#[test]
+fn unified_l3_publisher_consumes_supplied_weights() {
+    let (bundle, inputs) = unified_l3_publisher_fixture();
+    for (projection, container, weight) in [
+        ("layer3_index_key", "weights", "norm"),
+        ("layer3_compressor", "weights", "norm"),
+        (
+            "layer3_candidate",
+            "encoded_parameters",
+            "layers.3.attn.q_norm.weight",
+        ),
+        (
+            "layer3_attention",
+            "encoded_parameters",
+            "layers.3.attn.q_norm.weight",
+        ),
+    ] {
+        let mut changed = bundle.clone();
+        let tensor = &mut changed["projections"][projection][container][weight];
+        let bytes = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
+        tensor["storage_hex"] = Value::String("0".repeat(bytes.len() * 2));
+        tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&bytes)));
+        let mut publisher =
+            owner_attention_capture::NativeLayerThreePublisher::from_bundle(&changed);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publisher.step(&inputs[0])))
+                .is_err(),
+            "changed supplied weight bypassed: {projection}"
+        );
+        assert!(
+            publisher.publications().is_empty(),
+            "failed call published: {projection}"
+        );
+    }
+}
+
+#[test]
+fn unified_l3_publisher_reset_preserves_operands_and_advances_epoch() {
+    let (bundle, inputs) = unified_l3_publisher_fixture();
+    let mut publisher = owner_attention_capture::NativeLayerThreePublisher::from_bundle(&bundle);
+    for input in &inputs {
+        publisher.step(input);
+    }
+    let original = publisher.publications().to_vec();
+    let outputs = publisher.outputs().to_vec();
+    publisher.reset_and_retry(&inputs[0]);
+    for input in &inputs[1..] {
+        publisher.step(input);
+    }
+    assert_eq!(publisher.outputs(), outputs);
+    assert_eq!(publisher.publications().len(), original.len());
+    for (new, old) in publisher.publications().iter().zip(original) {
+        assert_eq!(new.publication.epoch(), old.publication.epoch() + 1);
+        assert_eq!(new.publication.call_id(), old.publication.call_id());
+        assert_eq!(
+            new.publication.source_layer(),
+            old.publication.source_layer()
+        );
+        assert_eq!(new.key_prefix, old.key_prefix);
+        assert_eq!(new.kv_prefix, old.kv_prefix);
+        assert_eq!(new.input, old.input);
+    }
 }
 
 #[test]
@@ -1982,6 +2140,7 @@ fn reduced_request_poison_blocks_retry_and_restart_is_fresh() {
 fn bootstrap_layer_three_inputs(
     layer_two: &[(usize, Vec<u16>, Vec<f32>)],
     engram: &[(usize, Vec<u16>)],
+    fixture: &Fixture,
 ) -> Vec<(usize, Vec<u16>)> {
     assert_eq!(layer_two.len(), 2, "two preceding native L2 calls");
     assert_eq!(
@@ -1997,15 +2156,17 @@ fn bootstrap_layer_three_inputs(
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    native_layer_three_attention_inputs_from_entries(&layer_three_fixture(), engram, &pre)
+    native_layer_three_attention_inputs_from_entries(fixture, engram, &pre)
 }
 
 fn native_previous_layer_three_publisher(
     layer_two: &[(usize, Vec<u16>, Vec<f32>)],
     engram: &[(usize, Vec<u16>)],
+    fixture: &Fixture,
+    bundle: &Value,
 ) -> (owner_attention_capture::NativeLayerThreePublisher, Vec<u16>) {
-    let inputs = bootstrap_layer_three_inputs(layer_two, engram);
-    let mut publisher = owner_attention_capture::NativeLayerThreePublisher::new();
+    let inputs = bootstrap_layer_three_inputs(layer_two, engram, fixture);
+    let mut publisher = owner_attention_capture::NativeLayerThreePublisher::from_bundle(bundle);
     publisher.step(&inputs[0]);
     publisher.step(&inputs[1]);
     let prefix = publisher.previous_call_key_prefix().to_vec();

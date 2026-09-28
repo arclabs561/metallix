@@ -137,7 +137,44 @@ pub(super) struct NativeLayerThreeEngramSession {
 
 impl NativeLayerThreeEngramSession {
     pub(super) fn new() -> Self {
-        let root = fixture();
+        Self::from_root(fixture())
+    }
+
+    /// Starts the persistent layer-three Engram from the unified reduced
+    /// bundle. Metadata remains pinned to the checked-in capture, while every
+    /// numerical operand comes from the caller's projection.
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
+        assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
+        let pinned: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+        ))
+        .expect("pinned reduced bundle metadata");
+        let source = field(bundle, "source");
+        assert_eq!(source, field(&pinned, "source"), "bundle source metadata");
+        let projection = field(field(bundle, "projections"), "layer3_engram");
+        assert_eq!(field(projection, "schema_version").as_u64(), Some(1));
+        assert_eq!(
+            field(projection, "source"),
+            field(&field(&pinned, "projections")["layer3_engram"], "source"),
+            "layer3 Engram source metadata"
+        );
+        Self::from_root(projection.clone())
+    }
+
+    fn from_root(root: Value) -> Self {
+        assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
+        assert_eq!(
+            field(field(&root, "source"), "revision").as_str(),
+            Some("dba1be0a40aa45a94ad051997016db3960a90277")
+        );
+        assert!(
+            field(&root, "cases")
+                .as_array()
+                .expect("layer-three Engram cases")
+                .iter()
+                .any(|case| bf16(field(case, "stream")) != bf16(field(case, "output"))),
+            "omitting Engram must fail at least one source trace boundary"
+        );
         let engram = field(&root, "engram");
         let state = field(engram, "hash_state");
         let layout = field(engram, "layout");

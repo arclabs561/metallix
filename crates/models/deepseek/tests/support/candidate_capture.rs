@@ -388,6 +388,33 @@ pub(super) fn generated_producer_indices_in_epoch(
         .indices
 }
 
+/// Runs the supplied reduced-runner producer through one request-local epoch.
+///
+/// The projection is bound to the caller's bundle capture before its source
+/// call geometry, score rows, and final selected indices are accepted.
+pub(super) fn generated_producer_indices_from_bundle_input(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    epoch: u64,
+    raw: &serde_json::Value,
+    expected_capture: &str,
+) -> Vec<i32> {
+    let fixture = supplied_fixture(raw, expected_capture);
+    let (candidates, scores) = generated_candidates_and_scores_from_fixture(
+        &fixture,
+        start,
+        native_keys,
+        call,
+        attention_input,
+        epoch,
+    );
+    select_from_candidates(&scores, call, &candidates, 1)
+        .expect("bundle producer final selection")
+        .indices
+}
+
 /// Generates candidates after an independently derived layer-three attention
 /// input has crossed the source-captured input boundary.
 ///
@@ -432,9 +459,7 @@ pub(super) fn generated_candidates_from_bundle_input(
     raw: &serde_json::Value,
     expected_capture: &str,
 ) -> CandidateSelection {
-    let fixture: Fixture =
-        serde_json::from_value(raw.clone()).expect("valid supplied layer-three candidate fixture");
-    validate_supplied_fixture(&fixture, expected_capture);
+    let fixture = supplied_fixture(raw, expected_capture);
     generated_candidates_and_scores_from_fixture(
         &fixture,
         start,
@@ -444,6 +469,13 @@ pub(super) fn generated_candidates_from_bundle_input(
         0,
     )
     .0
+}
+
+fn supplied_fixture(raw: &serde_json::Value, expected_capture: &str) -> Fixture {
+    let fixture: Fixture =
+        serde_json::from_value(raw.clone()).expect("valid supplied layer-three candidate fixture");
+    validate_supplied_fixture(&fixture, expected_capture);
+    fixture
 }
 
 #[expect(

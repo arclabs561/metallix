@@ -58,9 +58,11 @@ choices without expanding current support claims.
   key/KV prefixes and publication identities, then computes its own query and
   selection. It no longer reruns the L3 owner at finalization. Snapshots retain
   successfully consumed L3 inputs, and reset clears publication history.
-  Standalone legacy wrappers retain their original identity gates. L1/L2 and
-  the persistent L3 owner/attention path still use legacy captures; this remains
-  an incremental migration, not a fully unified source trace. The previous-call layer-three
+  The persistent L3 Engram, owner, compressor, candidate selection and attention now
+  retain caller-supplied unified-bundle operands. The bootstrap uses unified L3
+  HC parameters too. Standalone legacy wrappers retain their identity gates.
+  L1/L2 still use legacy captures; this remains an incremental
+  migration, not a fully unified source trace. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
@@ -360,6 +362,19 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
    whether a new native model adapter is worth its implementation cost.
 
 ## Validation
+
+The persistent L3 path now consumes unified-bundle Engram, owner/compressor,
+candidate and attention operands, with bootstrap HC from the same bundle.
+Changed weights fail the existing numerical oracles before a successful owner
+publication is retained; reset preserves operands and advances the epoch while
+reproducing the original outputs and key/KV prefixes. Exact source metadata
+checks cover these projections and both bundled MoE tails, including loader
+identity. Legacy standalone gates retain their original fixtures.
+All 67 DeepSeek `forward_moe` tests and strict all-target/all-feature Clippy
+pass. The canonical Metal check, run before the final MoE metadata tightening,
+passed its 66 DeepSeek tests and stopped at the unchanged Julia mismatch below.
+Validation receipts: `.agents/receipts/candidate-control/unified-persistent-l3-*`.
+
 
 The committed L3 publication handoff passes all 62 DeepSeek `forward_moe`
 tests and strict all-target/all-feature Clippy against the existing final-logit

@@ -1001,6 +1001,23 @@ pub(super) struct NativeLayerThreePublication {
     pub(super) kv_prefix: Vec<u16>,
 }
 
+/// Numerical operands for the persistent L3 producer.  The bundle variant is
+/// deliberately owned by the request publisher so every later `step` uses the
+/// same checked caller-provided projections rather than falling back to a
+/// legacy capture while the request is live.
+struct BundlePublisherOperands {
+    attention: Value,
+    owner: Value,
+    compressor: Value,
+    candidate: Value,
+    capture: String,
+}
+
+enum PublisherOperands {
+    Legacy,
+    Bundle(BundlePublisherOperands),
+}
+
 /// Test-private request owner for the source-shaped L3 producer and attention.
 /// Each `step` advances the same coupled production cache; it never recreates
 /// the preceding prefix while a later source partition is processed.
@@ -1012,6 +1029,7 @@ pub(super) struct NativeLayerThreePublisher {
     inputs: Vec<(usize, Vec<u16>)>,
     publications: Vec<NativeLayerThreePublication>,
     previous_call_key_prefix: Option<Vec<u16>>,
+    operands: PublisherOperands,
 }
 
 impl NativeLayerThreePublisher {
@@ -1020,22 +1038,8 @@ impl NativeLayerThreePublisher {
             "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
         ))
         .expect("owner fixture");
-        let owner_model = field(&owner, "model");
         let compressor = compressor_fixture();
-        let compressor_weights = field(&compressor, "weights");
-        let compressor_norm = bf16(field(compressor_weights, "norm"));
-        let key_layout =
-            IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
-                .expect("captured key layout");
-        let key_owner = RatioOneCompressedOwner::new(
-            key_layout,
-            nonzero(128),
-            nonzero(usize_field(owner_model, "cache_capacity")),
-            3,
-            &compressor_norm,
-            1e-20,
-        )
-        .expect("bounded atomic owner");
+        let key_owner = Self::key_owner(&owner, &compressor);
         let attention = attention_capture::layer_three_fixture();
         Self {
             key_owner,
@@ -1045,6 +1049,86 @@ impl NativeLayerThreePublisher {
             inputs: Vec::new(),
             publications: Vec::new(),
             previous_call_key_prefix: None,
+            operands: PublisherOperands::Legacy,
+        }
+    }
+
+    /// Starts the persistent L3 producer from the caller's unified reduced
+    /// bundle.  Source metadata is pinned only for identity; all arithmetic
+    /// operands retained below come from `bundle`.
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
+        let operands = Self::bundle_operands(bundle);
+        let attention: attention_capture::Fixture =
+            serde_json::from_value(operands.attention.clone()).expect("typed bundled L3 attention");
+        let key_owner = Self::key_owner(&operands.owner, &operands.compressor);
+        Self {
+            key_owner,
+            attention_state: LayerAttentionState::new(attention_layout(&attention.model)),
+            next_call: 0,
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            publications: Vec::new(),
+            previous_call_key_prefix: None,
+            operands: PublisherOperands::Bundle(operands),
+        }
+    }
+
+    fn key_owner(owner: &Value, compressor: &Value) -> RatioOneCompressedOwner {
+        let owner_model = field(owner, "model");
+        let compressor_weights = field(compressor, "weights");
+        let compressor_norm = bf16(field(compressor_weights, "norm"));
+        let key_layout =
+            IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
+                .expect("captured key layout");
+        RatioOneCompressedOwner::new(
+            key_layout,
+            nonzero(128),
+            nonzero(usize_field(owner_model, "cache_capacity")),
+            3,
+            &compressor_norm,
+            1e-20,
+        )
+        .expect("bounded atomic owner")
+    }
+
+    fn bundle_operands(bundle: &Value) -> BundlePublisherOperands {
+        assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
+        let pinned: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+        ))
+        .expect("pinned reduced bundle metadata");
+        let source = field(bundle, "source");
+        assert_eq!(source, field(&pinned, "source"), "bundle source metadata");
+        assert_eq!(field(source, "revision").as_str(), Some(REVISION));
+        let capture = field(source, "complete_capture_sha256")
+            .as_str()
+            .expect("bundle capture")
+            .to_owned();
+        let projections = field(bundle, "projections");
+        let projection = |name| {
+            let value = field(projections, name).clone();
+            let child_source = field(&value, "source");
+            assert_eq!(field(&value, "schema_version").as_u64(), Some(1));
+            assert_eq!(
+                child_source,
+                field(field(&pinned, "projections"), name)
+                    .get("source")
+                    .expect("pinned projection source"),
+                "{name} source metadata"
+            );
+            assert_eq!(
+                field(child_source, "complete_capture_sha256").as_str(),
+                Some(capture.as_str()),
+                "{name} capture"
+            );
+            value
+        };
+        BundlePublisherOperands {
+            attention: projection("layer3_attention"),
+            owner: projection("layer3_index_key"),
+            compressor: projection("layer3_compressor"),
+            candidate: projection("layer3_candidate"),
+            capture,
         }
     }
 
@@ -1053,13 +1137,29 @@ impl NativeLayerThreePublisher {
         reason = "keep the prepare, commit, attention and successful-publication sequence together"
     )]
     pub(super) fn step(&mut self, supplied: &(usize, Vec<u16>)) -> Vec<u16> {
-        let raw = raw_fixture();
-        let attention = attention_capture::layer_three_fixture();
-        let owner: Value = serde_json::from_str(include_str!(
-            "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
-        ))
-        .expect("owner fixture");
-        let compressor = compressor_fixture();
+        let (raw, attention, owner, compressor, candidate) = match &self.operands {
+            PublisherOperands::Legacy => {
+                let owner: Value = serde_json::from_str(include_str!(
+                    "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+                ))
+                .expect("owner fixture");
+                (
+                    raw_fixture(),
+                    attention_capture::layer_three_fixture(),
+                    owner,
+                    compressor_fixture(),
+                    None,
+                )
+            }
+            PublisherOperands::Bundle(operands) => (
+                operands.attention.clone(),
+                serde_json::from_value(operands.attention.clone())
+                    .expect("typed bundled L3 attention"),
+                operands.owner.clone(),
+                operands.compressor.clone(),
+                Some((operands.candidate.clone(), operands.capture.clone())),
+            ),
+        };
         let attention_case = &attention.cases[self.next_call];
         let owner_case = &field(&owner, "cases").as_array().expect("owner calls")[self.next_call];
         let compressor_case = &field(&compressor, "cases")
@@ -1126,18 +1226,30 @@ impl NativeLayerThreePublisher {
             )
             .expect("native owner selection geometry"),
         );
-        assert_eq!(
-            call,
-            candidate_capture::source_call_in_epoch(*start, epoch),
-            "producer call identity"
-        );
-        let indices = candidate_capture::generated_producer_indices_in_epoch(
-            *start,
-            keys,
-            call,
-            owner_input,
-            epoch,
-        );
+        let indices = if let Some((candidate, capture)) = candidate {
+            candidate_capture::generated_producer_indices_from_bundle_input(
+                *start,
+                keys,
+                call,
+                owner_input,
+                epoch,
+                &candidate,
+                &capture,
+            )
+        } else {
+            assert_eq!(
+                call,
+                candidate_capture::source_call_in_epoch(*start, epoch),
+                "producer call identity"
+            );
+            candidate_capture::generated_producer_indices_in_epoch(
+                *start,
+                keys,
+                call,
+                owner_input,
+                epoch,
+            )
+        };
         assert_eq!(
             indices,
             attention_case.compressed_indices.i32(),
