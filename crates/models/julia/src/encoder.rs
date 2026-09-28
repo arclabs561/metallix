@@ -105,6 +105,8 @@ struct AttentionTrace {
 
 pub(crate) struct Layer0Trace {
     pub qkv: Vec<f32>,
+    pub rotated_query: Vec<f32>,
+    pub rotated_key: Vec<f32>,
     pub logits: Vec<f32>,
     pub probabilities: Vec<f32>,
     pub attended: Vec<f32>,
@@ -135,6 +137,8 @@ impl EncoderBlock {
         }
         let mut trace = Layer0Trace {
             qkv: Vec::new(),
+            rotated_query: Vec::new(),
+            rotated_key: Vec::new(),
             logits: Vec::new(),
             probabilities: Vec::new(),
             attended: Vec::new(),
@@ -189,6 +193,8 @@ impl EncoderBlock {
         )?;
         if let Some(trace) = trace.as_deref_mut() {
             trace.qkv.clone_from(&qkv);
+            trace.rotated_query = rotated_part(&qkv, input.positions, 0);
+            trace.rotated_key = rotated_part(&qkv, input.positions, 1);
         }
         let mut attention_trace = trace.as_deref_mut().map(|_| AttentionTrace {
             logits: Vec::new(),
@@ -442,6 +448,20 @@ fn attention(
 
 fn qkv_index(position: usize, part: usize, head: usize, dim: usize) -> usize {
     position * 3 * WIDTH + part * WIDTH + head * HEAD_WIDTH + dim
+}
+
+fn rotated_part(qkv: &[f32], positions: usize, part: usize) -> Vec<f32> {
+    let mut rotated = vec![0.0; positions * WIDTH];
+    for position in 0..positions {
+        for head in 0..ATTENTION_HEADS {
+            for dim in 0..HEAD_WIDTH {
+                let value = rope(qkv[qkv_index(position, part, head, dim)], dim, position)
+                    + rope_rotation(qkv, position, part, head, dim);
+                rotated[position * WIDTH + head * HEAD_WIDTH + dim] = value;
+            }
+        }
+    }
+    rotated
 }
 
 // The source creates cos/sin in F32 and applies split-half rotation to Q/K.

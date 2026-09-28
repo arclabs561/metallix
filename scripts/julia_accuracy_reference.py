@@ -245,6 +245,8 @@ def f64_layer0_trace(case: dict[str, Any]) -> dict[str, torch.Tensor]:
     )
     return {
         "qkv": qkv.reshape(embedding.shape[0], 3 * WIDTH),
+        "rotated_query": query,
+        "rotated_key": key,
         "logits": scores,
         "probabilities": scores.softmax(dim=-1),
         "attended": attended,
@@ -260,6 +262,175 @@ def error(actual: torch.Tensor, reference: torch.Tensor) -> dict[str, Any]:
         "max_abs": maximum.item(),
         "flat_index": index.item(),
         "count": difference.numel(),
+    }
+
+
+def trace_tensor(
+    value: object,
+    shape: tuple[int, ...],
+    label: str,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    tensor = torch.tensor(value, dtype=dtype)
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{label} shape {tuple(tensor.shape)} does not equal {shape}")
+    if not torch.isfinite(tensor).all():
+        raise ValueError(f"{label} contains a non-finite value")
+    return tensor
+
+
+def serial_f32_scores(query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+    """Replay Rust's scalar F32 product/add order from captured rotated vectors."""
+    if query.dtype != torch.float32 or key.dtype != torch.float32:
+        raise TypeError("serial score replay requires F32 rotated vectors")
+    positions = query.shape[0]
+    scores = torch.empty((HEADS, positions, positions), dtype=torch.float32)
+    scale = torch.tensor(HEAD_DIM**-0.5, dtype=torch.float32)
+    for head in range(HEADS):
+        for query_index in range(positions):
+            for key_index in range(positions):
+                total = torch.tensor(0.0, dtype=torch.float32)
+                for dimension in range(HEAD_DIM):
+                    total = (
+                        total
+                        + query[query_index, head, dimension]
+                        * key[key_index, head, dimension]
+                    )
+                scores[head, query_index, key_index] = total * scale
+    return scores
+
+
+def balanced_f32_scores(query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+    """Replay the trial's fixed pairwise F32 reduction from captured vectors."""
+    if query.dtype != torch.float32 or key.dtype != torch.float32:
+        raise TypeError("balanced score replay requires F32 rotated vectors")
+    positions = query.shape[0]
+    scores = torch.empty((HEADS, positions, positions), dtype=torch.float32)
+    scale = torch.tensor(HEAD_DIM**-0.5, dtype=torch.float32)
+    for head in range(HEADS):
+        for query_index in range(positions):
+            for key_index in range(positions):
+                products = query[query_index, head] * key[key_index, head]
+                while products.numel() > 1:
+                    products = products[0::2] + products[1::2]
+                scores[head, query_index, key_index] = products[0] * scale
+    return scores
+
+
+def layer0_replay(
+    native_path: Path, source_path: Path, score_reduction: str = "serial_f32"
+) -> dict[str, Any]:
+    native = json.loads(native_path.read_text())
+    source = json.loads(source_path.read_text())
+    if (
+        native.get("schema_version") != 2
+        or native.get("attention_layout") != "head_query_key"
+    ):
+        raise ValueError("native replay trace must use schema 2 head/query/key layout")
+    if native.get("case") != "cal_len7" or source.get("case") != "cal_len7":
+        raise ValueError("layer-zero replay only accepts the frozen cal_len7 traces")
+    positions = len(native.get("qkv", []))
+    if positions != 7:
+        raise ValueError(f"cal_len7 trace has {positions} positions")
+    shape_qkv = (positions, 3 * WIDTH)
+    shape_rotated = (positions, HEADS, HEAD_DIM)
+    shape_scores = (HEADS, positions, positions)
+    native_qkv = trace_tensor(native.get("qkv"), shape_qkv, "native qkv")
+    native_query = trace_tensor(
+        native.get("rotated_query"), shape_rotated, "native rotated query"
+    )
+    native_key = trace_tensor(
+        native.get("rotated_key"), shape_rotated, "native rotated key"
+    )
+    native_logits = trace_tensor(native.get("logits"), shape_scores, "native logits")
+    source_values = source.get("source_f32")
+    if not isinstance(source_values, dict):
+        raise TypeError("source replay trace lacks source_f32 tensors")
+    source_qkv = trace_tensor(source_values.get("qkv"), shape_qkv, "source qkv")
+    source_query = trace_tensor(
+        source_values.get("rotated_query"), shape_rotated, "source rotated query"
+    )
+    source_key = trace_tensor(
+        source_values.get("rotated_key"), shape_rotated, "source rotated key"
+    )
+    source_logits = trace_tensor(
+        source_values.get("logits"), shape_scores, "source logits"
+    )
+
+    native_parts = native_qkv.reshape(positions, 3, HEADS, HEAD_DIM)
+    source_operator_query = FULL.ENCODER.rope(native_parts[:, 0])
+    source_operator_key = FULL.ENCODER.rope(native_parts[:, 1])
+    source_operator_native_qkv = (
+        torch.einsum("qhd,khd->hqk", source_operator_query, source_operator_key)
+        / HEAD_DIM**0.5
+    )
+    source_reconstructed = (
+        torch.einsum("qhd,khd->hqk", source_query, source_key) / HEAD_DIM**0.5
+    )
+    native_rotation_tensor = (
+        torch.einsum("qhd,khd->hqk", native_query, native_key) / HEAD_DIM**0.5
+    )
+    source_rotation_serial = serial_f32_scores(
+        source_operator_query, source_operator_key
+    )
+    native_reduction = {
+        "serial_f32": serial_f32_scores,
+        "balanced_f32": balanced_f32_scores,
+    }.get(score_reduction)
+    if native_reduction is None:
+        raise ValueError(f"unsupported replay reduction {score_reduction}")
+    native_rotation_replay = native_reduction(native_query, native_key)
+    native_query_f64 = native_parts[:, 0].to(torch.float64)
+    native_key_f64 = native_parts[:, 1].to(torch.float64)
+    source_coefficients_f64 = torch.einsum(
+        "qhd,khd->hqk",
+        rope(native_query_f64, True),
+        rope(native_key_f64, True),
+    ) / math.sqrt(HEAD_DIM)
+    ideal_coefficients_f64 = torch.einsum(
+        "qhd,khd->hqk",
+        rope(native_query_f64, False),
+        rope(native_key_f64, False),
+    ) / math.sqrt(HEAD_DIM)
+    return {
+        "case": "cal_len7",
+        "native_trace_schema": 2,
+        "native_score_reduction": score_reduction,
+        "source_trace": "explicit_source_qkv_reconstruction",
+        "comparisons": {
+            "source_tensor_reconstruction_identity": error(
+                source_logits, source_reconstructed.to(torch.float64)
+            ),
+            "raw_qkv_native_vs_source": error(native_qkv, source_qkv.to(torch.float64)),
+            "source_rotated_native_vs_source_qkv": error(
+                source_operator_native_qkv, source_logits.to(torch.float64)
+            ),
+            "native_rotation_vs_source_rotation_same_native_qkv": error(
+                native_rotation_tensor, source_operator_native_qkv.to(torch.float64)
+            ),
+            "source_tensor_vs_scalar_reduction_same_source_rotation": error(
+                source_operator_native_qkv, source_rotation_serial.to(torch.float64)
+            ),
+            "native_vs_source_rotation_same_native_qkv_serial": error(
+                serial_f32_scores(native_query, native_key),
+                source_rotation_serial.to(torch.float64),
+            ),
+            "native_reduction_vs_tensor_same_rotated": error(
+                native_logits, native_rotation_tensor.to(torch.float64)
+            ),
+            "native_reduction_replay_exactness": error(
+                native_logits, native_rotation_replay.to(torch.float64)
+            ),
+            "source_f32_vs_ideal_f64_rope_coefficients_same_native_qkv": error(
+                source_coefficients_f64, ideal_coefficients_f64
+            ),
+            "native_rotated_query_vs_source": error(
+                native_query, source_query.to(torch.float64)
+            ),
+            "native_rotated_key_vs_source": error(
+                native_key, source_key.to(torch.float64)
+            ),
+        },
     }
 
 
@@ -711,7 +882,25 @@ def main() -> None:
     parser.add_argument("--check-properties", action="store_true")
     parser.add_argument("--trace-case")
     parser.add_argument("--trace-output", type=Path)
+    parser.add_argument("--replay-native", type=Path)
+    parser.add_argument("--replay-source", type=Path)
+    parser.add_argument("--replay-output", type=Path)
+    parser.add_argument(
+        "--replay-reduction",
+        choices=("serial_f32", "balanced_f32"),
+        default="serial_f32",
+    )
     args = parser.parse_args()
+    replay_paths = (args.replay_native, args.replay_source, args.replay_output)
+    if any(replay_paths) and not all(replay_paths):
+        raise ValueError("layer-zero replay requires native, source, and output paths")
+    if all(replay_paths):
+        replay = layer0_replay(
+            args.replay_native, args.replay_source, args.replay_reduction
+        )
+        args.replay_output.parent.mkdir(parents=True, exist_ok=True)
+        args.replay_output.write_text(json.dumps(replay, indent=2) + "\n")
+        return
     if args.trace_case:
         if args.trace_case != "cal_len7" or args.trace_output is None:
             raise ValueError("only cal_len7 trace requires --trace-output")

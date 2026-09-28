@@ -193,3 +193,55 @@ uv run scripts/julia_accuracy_reference.py --trace-case cal_len7 \
 JULIA_DIAGNOSTIC_OUTPUT=/absolute/path/cal-len7-layer0-native-v2.json \
   cargo test -p julia write_cal_len7_layer0_trace -- --ignored
 ```
+
+### Same-input layer-zero replay
+
+The schema-2 `cal_len7` replay captures native post-RoPE Q and K in addition to
+QKV and scores, so each score comparison uses the same recorded inputs. Its
+owner-local report is `.agents/receipts/julia/cal-len7-layer0-replay.json`.
+Native scalar-F32 replay from those captured rotated vectors is bit-exact to
+the native scores. Against the explicit source-QKV reconstruction, raw QKV
+differs by at most `3.8147e-6`; applying the source F32 rotation and tensor
+score to native rather than source QKV changes scores by `9.1553e-5`; native
+captured rotation rather than source rotation on that same native QKV changes
+scores by `3.0518e-5`; and native scalar reduction rather than tensor reduction
+on those same captured rotated vectors changes scores by `6.1035e-5`.
+
+These maximum errors are non-additive. QKV propagation is the largest measured
+contribution, followed by scalar reduction and then native rotation. The
+source-tensor reconstruction from its captured rotated vectors and the native
+scalar-F32 replay from its captured rotated vectors are both zero-error
+identities. The source tensor result is an explicit F32 reconstruction, not a
+claim about the opaque CPU FlashAttention kernel or mathematical truth. F32
+versus ideal-F64 rotary coefficients on the same native QKV changes scores by
+only `5.2076e-6`. The prior isolated F64 QK accumulator trial failed the
+frozen all-calibration contract. These diagnostic comparisons locate error
+sources; they do not independently establish an acceptable runtime change.
+
+That common-QKV scalar replay is now complete: source rotation versus native
+rotation differs by `3.0518e-5` under the same scalar-F32 reducer, exactly the
+same maximum as under the tensor reducer. The source rotation's tensor versus
+scalar reduction difference is `4.5776e-5`; native rotation's scalar versus
+tensor reduction difference is `6.1035e-5`. Thus rotation is independently
+material, but changing coefficient precision alone remains unsupported. A
+bounded runtime experiment was a balanced F32 QK reduction: it targets the
+measured reduction seam without changing native rotation or introducing F64
+casts. Its predeclared falsifier was failure to move the same trace toward the
+source reconstruction or to pass all eight frozen calibration hidden, score,
+and probability boundaries without refitting.
+
+### Rejected balanced-F32 reduction experiment
+
+The balanced-F32 QK reduction trial retained F32 products and the
+existing F32 score scale, replacing only the 64-term serial addition with a
+fixed pairwise tree. It made the legacy strict source test pass, and its native
+balanced replay is exact, but it failed the frozen calibration contract. Six of
+eight calibration cases passed rather than the serial baseline's seven: it
+introduced a `cal_len5` final-normalization failure (`1.04277` times its frozen
+boundary), while `cal_len7` still failed layer 0 (`1.05789`) and layers 15–21
+plus final normalization. Its worst ratio was `1.39199` at `cal_len7` layer 21;
+scores and probabilities passed. The runtime trial was therefore reverted
+automatically. Owner-local artifacts are
+`.agents/receipts/julia/cal-len7-layer0-native-balanced-f32.json`,
+`.agents/receipts/julia/cal-len7-layer0-replay-balanced-f32.json`, and
+`.agents/receipts/julia/accuracy-calibration-native-balanced-f32.json`.

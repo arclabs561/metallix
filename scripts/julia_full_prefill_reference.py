@@ -195,6 +195,8 @@ def layer0_trace(case: dict[str, Any]) -> dict[str, torch.Tensor]:
     qkv = observed["qkv"].reshape(positions, 3, 6, 64)
     query, key, _ = qkv.unbind(dim=1)
     query, key = ENCODER.rope(query), ENCODER.rope(key)
+    observed["rotated_query"] = query
+    observed["rotated_key"] = key
     logits = torch.einsum("qhd,khd->hqk", query, key) / 64.0**0.5
     observed["logits"] = logits
     observed["probabilities"] = logits.softmax(dim=-1, dtype=torch.float32)

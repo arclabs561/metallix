@@ -457,6 +457,13 @@ fn write_cal_len7_layer0_trace() {
             .collect()
     }
 
+    fn positions_heads_dimensions(value: &[f32]) -> Vec<Vec<&[f32]>> {
+        value
+            .chunks_exact(WIDTH)
+            .map(|position| position.chunks_exact(WIDTH / ATTENTION_HEADS).collect())
+            .collect()
+    }
+
     let manifest: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/julia-1/accuracy-cases.json"
     ))
@@ -501,6 +508,8 @@ fn write_cal_len7_layer0_trace() {
             "case": "cal_len7",
             "attention_layout": "head_query_key",
             "qkv": rows(&trace.qkv, 3 * WIDTH),
+            "rotated_query": positions_heads_dimensions(&trace.rotated_query),
+            "rotated_key": positions_heads_dimensions(&trace.rotated_key),
             "logits": heads_queries_keys(&trace.logits, input.input_ids.len()),
             "probabilities": heads_queries_keys(&trace.probabilities, input.input_ids.len()),
             "attention_shape": [ATTENTION_HEADS, input.input_ids.len(), input.input_ids.len()],

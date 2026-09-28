@@ -70,6 +70,32 @@ class ReceiptValidationTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             REFERENCE.boundary_metrics(source, reference.float(), 1.0)
 
+    def test_layer_zero_replay_requires_finite_exact_trace_shapes(self) -> None:
+        with self.assertRaises(ValueError):
+            REFERENCE.trace_tensor([[0.0]], (1, 2), "wrong trace shape")
+        with self.assertRaises(ValueError):
+            REFERENCE.trace_tensor([[float("nan")]], (1, 1), "nonfinite trace")
+
+    def test_scalar_f32_score_replay_has_expected_scale_and_dtype_guard(self) -> None:
+        query = torch.ones(
+            (1, REFERENCE.HEADS, REFERENCE.HEAD_DIM), dtype=torch.float32
+        )
+        scores = REFERENCE.serial_f32_scores(query, query)
+        self.assertEqual(tuple(scores.shape), (REFERENCE.HEADS, 1, 1))
+        self.assertTrue(torch.allclose(scores, torch.full_like(scores, 8.0)))
+        with self.assertRaises(TypeError):
+            REFERENCE.serial_f32_scores(query.double(), query.double())
+
+    def test_balanced_f32_score_replay_has_expected_scale_and_dtype_guard(self) -> None:
+        query = torch.ones(
+            (1, REFERENCE.HEADS, REFERENCE.HEAD_DIM), dtype=torch.float32
+        )
+        scores = REFERENCE.balanced_f32_scores(query, query)
+        self.assertEqual(tuple(scores.shape), (REFERENCE.HEADS, 1, 1))
+        self.assertTrue(torch.allclose(scores, torch.full_like(scores, 8.0)))
+        with self.assertRaises(TypeError):
+            REFERENCE.balanced_f32_scores(query.double(), query.double())
+
 
 if __name__ == "__main__":
     unittest.main()
