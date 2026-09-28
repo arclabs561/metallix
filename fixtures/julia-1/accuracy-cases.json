@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"name":"cal_perm_pad","split":"calibration","input_ids":[4,3,2,1,0,0,0,0],"attention_mask":[true,true,true,true,false,false,false,false],"marker_pos":[0,3],"marker_mask":[true,true],"qtype":0},
+    {"name":"cal_perm_pad_rows","split":"calibration","input_ids":[4,3,2,1,5,6,7,0],"attention_mask":[true,true,true,true,false,false,false,false],"marker_pos":[0,3],"marker_mask":[true,true],"qtype":0},
+    {"name":"cal_len2","split":"calibration","input_ids":[6,1],"attention_mask":[true,true],"marker_pos":[0,1],"marker_mask":[true,true],"qtype":1},
+    {"name":"cal_len5","split":"calibration","input_ids":[7,1,6,2,5],"attention_mask":[true,true,true,true,true],"marker_pos":[1,4],"marker_mask":[true,true],"qtype":2},
+    {"name":"cal_len7","split":"calibration","input_ids":[2,4,6,1,3,5,7],"attention_mask":[true,true,true,true,true,true,true],"marker_pos":[0,5],"marker_mask":[true,true],"qtype":1},
+    {"name":"cal_sparse8","split":"calibration","input_ids":[7,0,6,0,5,0,4,0],"attention_mask":[true,false,true,false,true,false,true,false],"marker_pos":[0,4],"marker_mask":[true,true],"qtype":2},
+    {"name":"cal_random17","split":"calibration","generator":"lcg_seed_17_mod_8","input_ids":[1,0,7,2,5,4,3,6],"attention_mask":[true,true,true,true,true,true,true,true],"marker_pos":[2,7],"marker_mask":[true,true],"qtype":0},
+    {"name":"cal_repeat2","split":"calibration","input_ids":[2,2,2,2,2,2],"attention_mask":[true,true,true,true,true,true],"marker_pos":[1,4],"marker_mask":[true,true],"qtype":1},
+    {"name":"hold_perm_pad","split":"held_out","input_ids":[2,7,1,6,0,0,0,0],"attention_mask":[true,true,true,true,false,false,false,false],"marker_pos":[1,3],"marker_mask":[true,true],"qtype":2},
+    {"name":"hold_perm_pad_rows","split":"held_out","input_ids":[2,7,1,6,3,4,5,0],"attention_mask":[true,true,true,true,false,false,false,false],"marker_pos":[1,3],"marker_mask":[true,true],"qtype":2},
+    {"name":"hold_len3","split":"held_out","input_ids":[5,2,7],"attention_mask":[true,true,true],"marker_pos":[0,2],"marker_mask":[true,true],"qtype":0},
+    {"name":"hold_len6","split":"held_out","input_ids":[1,7,3,6,2,5],"attention_mask":[true,true,true,true,true,true],"marker_pos":[2,5],"marker_mask":[true,true],"qtype":1},
+    {"name":"hold_len8","split":"held_out","input_ids":[3,6,1,7,2,5,4,0],"attention_mask":[true,true,true,true,true,true,true,true],"marker_pos":[0,6],"marker_mask":[true,true],"qtype":0},
+    {"name":"hold_sparse8","split":"held_out","input_ids":[1,0,7,0,3,0,6,0],"attention_mask":[true,false,true,false,true,false,true,false],"marker_pos":[2,6],"marker_mask":[true,true],"qtype":1},
+    {"name":"hold_random29","split":"held_out","generator":"lcg_seed_29_mod_8","input_ids":[5,7,0,6,3,1,4,2],"attention_mask":[true,true,true,true,true,true,true,true],"marker_pos":[1,5],"marker_mask":[true,true],"qtype":2},
+    {"name":"hold_repeat5","split":"held_out","input_ids":[5,5,5,5,5],"attention_mask":[true,true,true,true,true],"marker_pos":[0,4],"marker_mask":[true,true],"qtype":0}
+  ]
+}
