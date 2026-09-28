@@ -207,3 +207,59 @@ Evidence: the [pinned config](README.md#v41-source-identity), existing local
 receipt is `artifacts/deepseek-feasibility-metadata.json`. Its input hashes bind
 the inspected metadata. The one inspected expert validates the arithmetic at
 that boundary; extrapolation does not validate every expert header.
+
+### Engram capacity and lookup traffic
+
+Header-only HTTP range reads of pinned shards
+[47](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/model-00047-of-00048.safetensors)
+and [48](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/model-00048-of-00048.safetensors)
+separate the Engram table budget from routed experts. Each request required
+HTTP 206 and an exact `Content-Range`; only the eight-byte length prefix and
+the declared header were read. No tensor payload was acquired.
+
+| Engram layer | FP8 embedding bytes | E8M0 scale bytes | Total table bytes |
+| --- | ---: | ---: | ---: |
+| 1 | 98,305,579,008 | 3,072,049,344 | 101,377,628,352 |
+| 14 | 98,308,270,592 | 3,072,133,456 | 101,380,404,048 |
+| Both | 196,613,849,600 | 6,144,182,800 | 202,758,032,400 |
+
+The two embedding tables occupy 188.83 GiB in the published encoding. Combined
+with the extrapolated 268.95 GiB backbone routed experts, this leaves
+18,750,160,200 bytes (17.46 GiB) of the index total for everything else. That
+remainder is a subtraction, not a validated resident-weight inventory: it also
+contains draft and vision parameters, shared experts, attention, projections
+and other tensors. The index lists all six weight/scale tensor names for every
+one of the 384 routed experts in each of the 40 backbone layers; their shapes
+have not all been header-checked.
+
+Capacity does not imply per-token table traffic. The pinned
+[hash source](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/dba1be0a40aa45a94ad051997016db3960a90277/inference/engram.py)
+selects three n-gram sizes times eight heads in each of two layers. Each row
+contains 256 FP8 bytes and eight scale bytes, so 48 row lookups require 12,672
+useful embedding bytes per token before reuse. This excludes Engram projections,
+decoding and physical read amplification. Separate weight and scale ranges can
+make small random reads expensive even though the useful byte count is small.
+Measure their page/range coalescing independently of routed-expert caching.
+
+For perspective, allocating 32, 64 or 96 GiB **solely to packed routed experts**
+would retain 11.9%, 23.8% or 35.7% of their payload. Under an explicitly
+hypothetical uniform-independent routing workload, those fractions would imply
+about 1.33, 1.15 or 0.97 seconds of expert reads per token at a sustained
+3 GB/s, before computation. These are sensitivity scenarios, not cache hit-rate
+or latency predictions; real skew and reuse could change them substantially.
+The 96 GiB allocation is not an admission recommendation on a 128 GiB machine.
+
+The immediate decision remains to measure source-derived routing locality and
+reserve OS, non-expert weights, mutable state and scratch separately. Do not
+equate table size with lookup traffic or stored expert fraction with observed
+hit rate. Full-checkpoint acquisition remains gated by a concrete resource plan.
+
+Reproduction identities: the unmodified shard-47 header is 656 bytes with
+SHA-256 `e5c5c7fc900caec400644bef07aa5d7e28fc6ca941c8c47592b393963b218242`;
+shard 48 is 664 bytes with SHA-256
+`5d8fa4697d7a071c31baeee6947d493c08ea3243261c5d0f79c355ad191b8222`.
+Read ranges are `0–7`, then `8–663` and `8–671`, respectively. The index hash is
+`74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8`;
+the inspected expert-header hash is
+`139eeea4664aba161a4b4cb82a60a86a2429467601ee6584a887825f8137adfd`.
+The fresh config and hash source matched the identities in the research index.
