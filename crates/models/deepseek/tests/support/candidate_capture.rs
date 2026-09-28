@@ -31,6 +31,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const CAPTURE_SHA256: &str = "7c5cc8541da338fa3426d63e32b9a66e9132e07ab68ee26d86fbf9e29f62f48d";
+const MODEL_SHA256: &str = "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65";
 const REVISION: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
 
 #[derive(Deserialize)]
@@ -47,6 +48,7 @@ struct Fixture {
 #[derive(Deserialize)]
 struct Source {
     revision: String,
+    model_sha256: String,
     complete_capture_sha256: String,
     storage_byteorder: String,
 }
@@ -177,9 +179,16 @@ fn fixture() -> Fixture {
         "../../../../../fixtures/deepseek-v41/forward-candidate-reference.json"
     ))
     .expect("valid candidate fixture JSON");
+    validate_supplied_fixture(&fixture, CAPTURE_SHA256);
+    assert!(fixture.scope.contains("not native arithmetic"));
+    fixture
+}
+
+fn validate_supplied_fixture(fixture: &Fixture, expected_capture: &str) {
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.source.revision, REVISION);
-    assert_eq!(fixture.source.complete_capture_sha256, CAPTURE_SHA256);
+    assert_eq!(fixture.source.model_sha256, MODEL_SHA256);
+    assert_eq!(fixture.source.complete_capture_sha256, expected_capture);
     assert_eq!(fixture.source.storage_byteorder, "little");
     assert_eq!(fixture.model.batches, 1);
     assert_eq!(fixture.model.expected_start_positions, [0, 5, 6]);
@@ -190,7 +199,6 @@ fn fixture() -> Fixture {
     assert_eq!(fixture.frequencies.shape, [8, 16]);
     assert_eq!(fixture.frequencies.numel, 128);
     assert!(fixture.frequencies.finite, "source frequencies finite");
-    assert!(fixture.scope.contains("not native arithmetic"));
     assert_eq!(fixture.cases.len(), 3);
     for (case, (&start, &offset)) in fixture.cases.iter().zip(
         fixture
@@ -224,7 +232,6 @@ fn fixture() -> Fixture {
         assert_eq!(case.candidate_mask.dtype, "torch.bool");
         assert_eq!(case.output_indices.dtype, "torch.int32");
     }
-    fixture
 }
 
 fn nonzero(value: usize) -> NonZeroUsize {
@@ -285,6 +292,10 @@ pub(super) fn source_call(start: usize) -> SelectionCall {
 /// Rebinds a source geometry and call ordinal to a live request epoch.
 pub(super) fn source_call_in_epoch(start: usize, epoch: u64) -> SelectionCall {
     let fixture = fixture();
+    source_call_from_fixture_in_epoch(&fixture, start, epoch)
+}
+
+fn source_call_from_fixture_in_epoch(fixture: &Fixture, start: usize, epoch: u64) -> SelectionCall {
     let (call_id, case) = fixture
         .cases
         .iter()
@@ -363,7 +374,9 @@ pub(super) fn generated_producer_indices_in_epoch(
     attention_input: &[u16],
     epoch: u64,
 ) -> Vec<i32> {
-    let (candidates, scores) = generated_candidates_and_scores_from_attention_input(
+    let fixture = fixture();
+    let (candidates, scores) = generated_candidates_and_scores_from_fixture(
+        &fixture,
         start,
         native_keys,
         call,
@@ -391,7 +404,39 @@ pub(super) fn generated_candidates_from_attention_input(
     call: SelectionCall,
     attention_input: &[u16],
 ) -> CandidateSelection {
-    generated_candidates_and_scores_from_attention_input(
+    generated_candidates_and_scores_from_fixture(
+        &fixture(),
+        start,
+        native_keys,
+        call,
+        attention_input,
+        0,
+    )
+    .0
+}
+
+/// Generates candidates from one supplied reduced-runner L3 projection.
+///
+/// This keeps the legacy fixture as a standalone oracle while binding the
+/// live bundle path to its own revision, model, capture identity, call
+/// geometry, projections, and source rows.
+#[allow(
+    clippy::similar_names,
+    reason = "retain source wq_a and wq_b projection names"
+)]
+pub(super) fn generated_candidates_from_bundle_input(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    raw: &serde_json::Value,
+    expected_capture: &str,
+) -> CandidateSelection {
+    let fixture: Fixture =
+        serde_json::from_value(raw.clone()).expect("valid supplied layer-three candidate fixture");
+    validate_supplied_fixture(&fixture, expected_capture);
+    generated_candidates_and_scores_from_fixture(
+        &fixture,
         start,
         native_keys,
         call,
@@ -409,18 +454,18 @@ pub(super) fn generated_candidates_from_attention_input(
     clippy::similar_names,
     reason = "retain source wq_a and wq_b projection names"
 )]
-fn generated_candidates_and_scores_from_attention_input(
+fn generated_candidates_and_scores_from_fixture(
+    fixture: &Fixture,
     start: usize,
     native_keys: &[u16],
     call: SelectionCall,
     attention_input: &[u16],
     epoch: u64,
 ) -> (CandidateSelection, Vec<u16>) {
-    let fixture = fixture();
-    let case = source_case(&fixture, start);
+    let case = source_case(fixture, start);
     assert_eq!(
         call,
-        source_call_in_epoch(start, epoch),
+        source_call_from_fixture_in_epoch(fixture, start, epoch),
         "source selection call at start {start}"
     );
     let expected_keys = case.inputs.shared_index_k_prefix.bf16();
@@ -443,7 +488,7 @@ fn generated_candidates_and_scores_from_attention_input(
     );
     let prepared = prepare_scored_query(
         attention_input,
-        &call_frequencies(&fixture, start, positions),
+        &call_frequencies(fixture, start, positions),
         CandidateQueryWeights {
             wq_a: Fp8Projection {
                 codes: &wq_a_codes,

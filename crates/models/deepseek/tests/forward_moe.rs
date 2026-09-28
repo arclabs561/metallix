@@ -20,6 +20,7 @@ use deepseek::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -313,18 +314,14 @@ fn layer_three_fixture() -> Fixture {
     f
 }
 
-fn reduced_bundle_layer_three_fixture() -> Fixture {
-    let bundle: Value = serde_json::from_str(include_str!(
-        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
-    ))
-    .expect("reduced runner bundle JSON");
-    layer_three_fixture_from_bundle(&bundle)
+fn layer_three_fixture_from_bundle(bundle: &Value) -> Fixture {
+    moe_fixture_from_bundle(bundle, 3)
 }
 
-fn layer_three_fixture_from_bundle(bundle: &Value) -> Fixture {
+fn moe_fixture_from_bundle(bundle: &Value, layer: usize) -> Fixture {
     assert_eq!(bundle["schema_version"].as_u64(), Some(1));
-    let projection = &bundle["projections"]["layer3_moe"];
-    let fixture: Fixture = serde_json::from_value(projection.clone()).expect("typed bundle L3 MoE");
+    let projection = &bundle["projections"][format!("layer{layer}_moe")];
+    let fixture: Fixture = serde_json::from_value(projection.clone()).expect("typed bundle MoE");
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(
         fixture.source.revision,
@@ -361,7 +358,7 @@ fn layer_three_fixture_from_bundle(bundle: &Value) -> Fixture {
             .collect::<Vec<_>>(),
         [0, 5, 6]
     );
-    assert_encoded_parameter_schema_for(&fixture, 3);
+    assert_encoded_parameter_schema_for(&fixture, layer);
     assert_model_and_case_contract(&fixture);
     validate_block_tail_fixture(&fixture);
     fixture
@@ -1061,6 +1058,16 @@ fn block_tail_from_entries(
     verify_contract: bool,
     entries: Option<&[BlockTailOutput]>,
 ) -> Vec<BlockTailOutput> {
+    block_tail_from_entries_with_bundle(f, control, verify_contract, entries, None)
+}
+
+fn block_tail_from_entries_with_bundle(
+    f: &Fixture,
+    control: BlockControl,
+    verify_contract: bool,
+    entries: Option<&[BlockTailOutput]>,
+    bundle: Option<&Value>,
+) -> Vec<BlockTailOutput> {
     if let Some(entries) = entries {
         assert_eq!(entries.len(), f.cases.len());
     }
@@ -1071,7 +1078,7 @@ fn block_tail_from_entries(
         control,
         BlockControl::NativeAttention | BlockControl::NativeAttentionZeroed
     )
-    .then(|| native_block_attention_outputs(f, &parameters, entries));
+    .then(|| native_block_attention_outputs(f, &parameters, entries, bundle));
     with_model(f, false, |model| {
         let ffn = FfnSublayerReference::new(
             model,
@@ -1336,6 +1343,7 @@ fn native_block_attention_outputs(
     f: &Fixture,
     parameters: &BlockTailParameters,
     entries: Option<&[BlockTailOutput]>,
+    bundle: Option<&Value>,
 ) -> Vec<Vec<u16>> {
     let inputs = f
         .cases
@@ -1363,10 +1371,18 @@ fn native_block_attention_outputs(
             (case.start_pos, input)
         })
         .collect::<Vec<_>>();
-    let outputs = owner_attention_capture::native_outputs_from_ownered_inputs(
-        &inputs,
-        &f.source.complete_capture_sha256,
-    );
+    let outputs = if let Some(bundle) = bundle {
+        assert_eq!(
+            Some(f.source.complete_capture_sha256.as_str()),
+            bundle["source"]["complete_capture_sha256"].as_str()
+        );
+        owner_attention_capture::native_outputs_from_bundle_inputs(&inputs, bundle)
+    } else {
+        owner_attention_capture::native_outputs_from_ownered_inputs(
+            &inputs,
+            &f.source.complete_capture_sha256,
+        )
+    };
     assert_eq!(outputs.len(), f.cases.len());
     for (output, case) in outputs.iter().zip(&f.cases) {
         // The HC envelope uses this source tensor as an exact point. Its
@@ -1484,6 +1500,7 @@ struct ReducedLiveRequest {
     l2: layer2_join::NativeLayerTwoSession,
     engram3: engram_capture::NativeLayerThreeEngramSession,
     l3_fixture: Fixture,
+    bundle: Value,
     l3: Option<owner_attention_capture::NativeLayerThreePublisher>,
     l2_entries: Vec<(usize, Vec<u16>, Vec<f32>)>,
     engram3_entries: Vec<(usize, Vec<u16>)>,
@@ -1493,11 +1510,16 @@ struct ReducedLiveRequest {
 
 impl ReducedLiveRequest {
     fn new() -> Self {
+        let bundle: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+        ))
+        .expect("unified reduced bundle");
         Self {
             l1: layer1_join::NativeLayerOneSession::new(),
             l2: layer2_join::NativeLayerTwoSession::new(),
             engram3: engram_capture::NativeLayerThreeEngramSession::new(),
-            l3_fixture: reduced_bundle_layer_three_fixture(),
+            l3_fixture: layer_three_fixture_from_bundle(&bundle),
+            bundle,
             l3: None,
             l2_entries: Vec::new(),
             engram3_entries: Vec::new(),
@@ -1596,13 +1618,21 @@ impl ReducedLiveRequest {
             Some(&pre),
             Some(self.l3.as_ref().expect("complete L3 publisher").outputs()),
         );
-        let output = block_tail_from_entries(
-            &fixture(),
+        let fourth = moe_fixture_from_bundle(&self.bundle, 4);
+        let output = block_tail_from_entries_with_bundle(
+            &fourth,
             BlockControl::NativeAttention,
             true,
             Some(&third),
+            Some(&self.bundle),
         );
-        assert_final_suffix(&fixture(), &output);
+        assert_eq!(
+            self.bundle["projections"]["head"]["schema_version"].as_u64(),
+            Some(1)
+        );
+        let head: HeadFixture = serde_json::from_value(self.bundle["projections"]["head"].clone())
+            .expect("unified head fixture");
+        assert_final_suffix_with_head(&fourth, &output, &head);
         self.lifecycle = ReducedRequestLifecycle::Finalized;
         output
     }
@@ -1619,8 +1649,7 @@ fn reduced_l3_bundle_rejects_mixed_capture() {
     assert!(std::panic::catch_unwind(|| layer_three_fixture_from_bundle(&bundle)).is_err());
 }
 
-#[test]
-fn reduced_l3_bundle_weight_is_consumed_by_final_suffix() {
+fn completed_reduced_request() -> ReducedLiveRequest {
     let bundle: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
     ))
@@ -1637,6 +1666,12 @@ fn reduced_l3_bundle_weight_is_consumed_by_final_suffix() {
             prefix.as_deref(),
         );
     }
+    request
+}
+
+#[test]
+fn reduced_l3_bundle_weight_is_consumed_by_final_suffix() {
+    let mut request = completed_reduced_request();
     let weight = request
         .l3_fixture
         .block_parameters
@@ -1648,6 +1683,60 @@ fn reduced_l3_bundle_weight_is_consumed_by_final_suffix() {
         "changed unified L3 weights must not be replaced by legacy operands"
     );
     assert_eq!(request.lifecycle, ReducedRequestLifecycle::Poisoned);
+}
+
+#[test]
+fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
+    for defect in [
+        "owner_capture",
+        "observer_identity",
+        "compressor_weight",
+        "candidate_weight",
+        "l4_norm",
+        "head_weight",
+    ] {
+        let mut request = completed_reduced_request();
+        let projections = &mut request.bundle["projections"];
+        match defect {
+            "owner_capture" => {
+                projections["layer3_compressor"]["source"]["complete_capture_sha256"] =
+                    Value::String("0".repeat(64));
+            }
+            "observer_identity" => {
+                projections["layer3_candidate"]["source"]["forward_observers_sha256"] =
+                    Value::String("0".repeat(64));
+            }
+            "compressor_weight" | "candidate_weight" => {
+                let tensor = if defect == "compressor_weight" {
+                    &mut projections["layer3_compressor"]["weights"]["norm"]
+                } else {
+                    &mut projections["layer3_candidate"]["encoded_parameters"]["layers.3.attn.q_norm.weight"]
+                };
+                let zeros = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
+                tensor["storage_hex"] = Value::String("0".repeat(zeros.len() * 2));
+                tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&zeros)));
+            }
+            "l4_norm" => {
+                let weight = &mut projections["layer4_moe"]["block_parameters"]["layers.4.ffn_norm.weight"]
+                    ["storage_hex"];
+                *weight = Value::String("0".repeat(weight.as_str().unwrap().len()));
+            }
+            "head_weight" => {
+                for weight in projections["head"]["weight_fp32_bits"]
+                    .as_array_mut()
+                    .unwrap()
+                {
+                    *weight = Value::from(0);
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.finish())).is_err(),
+            "unified L4/head defect escaped: {defect}"
+        );
+        assert_eq!(request.lifecycle, ReducedRequestLifecycle::Poisoned);
+    }
 }
 
 fn assert_finalization_failure_requires_restart(request: &mut ReducedLiveRequest) {
@@ -2305,7 +2394,10 @@ fn joined_suffix_rejects_corrupted_layer_three_coefficients() {
 }
 
 fn assert_final_suffix(f: &Fixture, native: &[BlockTailOutput]) {
-    let head = head_fixture();
+    assert_final_suffix_with_head(f, native, &head_fixture());
+}
+
+fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: &HeadFixture) {
     assert_eq!(head.source.revision, f.source.revision);
     assert_eq!(head.source.model_sha256, f.source.model_sha256);
     assert_eq!(

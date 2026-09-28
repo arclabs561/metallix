@@ -53,12 +53,13 @@ choices without expanding current support claims.
   retains a typed L3 projection with matching bundle capture/revision/model
   identity and unchanged numerical limits. Mixed-capture metadata is rejected;
   zeroing a supplied L3 normalization weight fails the final numerical oracle.
-  L1/L2, L3 owner/attention capture inputs, and L4/head remain legacy fixture-fed;
-  this is an incremental migration, not a fully unified source trace.
-  The bundle also now includes L3 candidate/HC, index-key and compressor
-  projections needed to migrate the L4 attention owner. Their input and latent
-  storage agree exactly across all three calls; the native L4 consumer has not
-  yet switched to them. The previous-call layer-three
+  L4 now uses the same bundle for attention, candidate selection, index-key and
+  compressor weights, MoE operands, and the final head. Standalone legacy
+  wrappers retain their original identity gates. L1/L2 and the persistent L3
+  owner/attention path still use legacy captures; this remains an incremental
+  migration, not a fully unified source trace. L4 also still reconstructs its
+  owner from captured L3 HC operands during finalization; bundle provenance
+  does not yet establish a live owner handoff from the persistent L3 session. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
@@ -358,6 +359,14 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
    whether a new native model adapter is worth its implementation cost.
 
 ## Validation
+
+The unified L4 attention/owner/MoE/head migration passes all 61 DeepSeek
+`forward_moe` tests and strict all-target/all-feature DeepSeek Clippy. Its controls
+reject mixed owner capture, changed observer metadata, and changed compressor,
+candidate, L4 normalization and head weights. The new path checks complete source
+metadata against the committed bundle while consuming caller-supplied numerical
+operands. The canonical Metal gate still stops at the unchanged Julia full-encoder
+parity failure below. Receipts: `.agents/receipts/candidate-control/bundle-l4-*`.
 
 The unified L3 operand migration passes all 60 DeepSeek `forward_moe` tests,
 including mixed-capture and changed-weight rejection. The expanded exporter

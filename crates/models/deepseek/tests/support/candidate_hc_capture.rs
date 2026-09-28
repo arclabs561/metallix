@@ -127,6 +127,28 @@ fn fixture() -> Fixture {
     fixture
 }
 
+fn derived_inputs_from_fixture(fixture: &Fixture) -> Vec<(usize, Vec<u16>)> {
+    assert_eq!(fixture.model.input_dimension, WIDTH);
+    assert_eq!(fixture.model.expected_start_positions, [0, 5, 6]);
+    assert_eq!(fixture.cases.len(), 3);
+    let norm_weight = fixture.encoded_parameters["layers.3.attn_norm.weight"].bf16();
+    assert_eq!(norm_weight.len(), WIDTH);
+    fixture
+        .cases
+        .iter()
+        .map(|case| {
+            let derived = attention_input(case, &norm_weight, fixture.model.norm_epsilon);
+            assert_eq!(
+                derived,
+                case.attention_input.bf16(),
+                "HC input at start {}",
+                case.start_pos
+            );
+            (case.start_pos, derived)
+        })
+        .collect()
+}
+
 fn attention_input(case: &Case, norm_weight: &[u16], epsilon: f32) -> Vec<u16> {
     let positions = case.attention_input.shape[1];
     assert_eq!(
@@ -158,22 +180,31 @@ fn attention_input(case: &Case, norm_weight: &[u16], epsilon: f32) -> Vec<u16> {
 /// Derives the layer-three candidate-producer input from source HC operands.
 pub(super) fn derived_inputs() -> Vec<(usize, Vec<u16>)> {
     let fixture = fixture();
-    let norm_weight = fixture.encoded_parameters["layers.3.attn_norm.weight"].bf16();
-    assert_eq!(norm_weight.len(), WIDTH);
-    fixture
-        .cases
-        .iter()
-        .map(|case| {
-            let derived = attention_input(case, &norm_weight, fixture.model.norm_epsilon);
-            assert_eq!(
-                derived,
-                case.attention_input.bf16(),
-                "HC input at start {}",
-                case.start_pos
-            );
-            (case.start_pos, derived)
-        })
-        .collect()
+    derived_inputs_from_fixture(&fixture)
+}
+
+/// Derives inputs from a supplied unified-bundle L3 projection. The caller
+/// binds the projection to its bundle capture; legacy observer identity stays
+/// enforced only by the pinned standalone wrapper above.
+#[allow(
+    dead_code,
+    reason = "the unified forward test consumes this shared helper"
+)]
+pub(super) fn derived_inputs_from_json(
+    raw: &str,
+    expected_capture: &str,
+) -> Vec<(usize, Vec<u16>)> {
+    let fixture: Fixture =
+        serde_json::from_str(raw).expect("valid supplied layer-three HC fixture");
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(
+        fixture.source.revision,
+        "dba1be0a40aa45a94ad051997016db3960a90277"
+    );
+    assert_eq!(fixture.source.model_sha256, MODEL_SHA256);
+    assert_eq!(fixture.source.complete_capture_sha256, expected_capture);
+    assert_eq!(fixture.source.storage_byteorder, "little");
+    derived_inputs_from_fixture(&fixture)
 }
 
 /// Mutation controls keep the HC/RMSNorm source boundary sensitive.

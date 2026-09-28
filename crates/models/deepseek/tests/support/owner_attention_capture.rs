@@ -220,6 +220,7 @@ fn generated_indices(
     publication: IndexKeyPublicationId,
     producer_attention_input: &[u16],
     consumer_attention_input: &[u16],
+    candidate_projection: Option<(&Value, &str)>,
 ) -> Vec<i32> {
     let model = field(root, "model");
     let indexer = field(raw_case, "indexer");
@@ -327,12 +328,22 @@ fn generated_indices(
         )
         .expect("source consumer selection geometry"),
     );
-    let candidates = candidate_capture::generated_candidates_from_attention_input(
-        start,
-        keys,
-        call,
-        producer_attention_input,
-    );
+    let candidates = match candidate_projection {
+        Some((projection, capture)) => candidate_capture::generated_candidates_from_bundle_input(
+            start,
+            keys,
+            call,
+            producer_attention_input,
+            projection,
+            capture,
+        ),
+        None => candidate_capture::generated_candidates_from_attention_input(
+            start,
+            keys,
+            call,
+            producer_attention_input,
+        ),
+    };
     assert_eq!(
         candidates.mask(),
         bools(field(inputs, "candidate_mask")),
@@ -419,20 +430,37 @@ fn assert_truncated_staged_score_is_rejected(
     ));
 }
 
+struct OwnerAttentionOperands<'a> {
+    raw: Value,
+    attention: attention_capture::Fixture,
+    owner: Value,
+    compressor: Value,
+    owner_inputs: Vec<(usize, Vec<u16>)>,
+    candidate_oracle_inputs: Vec<(usize, Vec<u16>)>,
+    candidate_projection: Option<(&'a Value, &'a str)>,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the source-capture join keeps owner and consumer evidence together"
 )]
-pub(super) fn native_outputs_from_ownered_inputs(
+fn native_outputs_from_parts(
     supplied_inputs: &[(usize, Vec<u16>)],
     expected_capture_sha256: &str,
+    operands: OwnerAttentionOperands<'_>,
 ) -> Vec<Vec<u16>> {
-    let raw = raw_fixture();
-    let attention = attention_fixture();
-    assert_eq!(expected_capture_sha256, CAPTURE_SHA256);
+    let OwnerAttentionOperands {
+        raw,
+        attention,
+        owner,
+        compressor,
+        owner_inputs,
+        candidate_oracle_inputs,
+        candidate_projection,
+    } = operands;
     assert_eq!(supplied_inputs.len(), attention.cases.len());
-    let owner_inputs = candidate_hc_capture::derived_inputs();
     assert_eq!(owner_inputs.len(), attention.cases.len());
+    assert_eq!(candidate_oracle_inputs.len(), attention.cases.len());
     let model = field(&raw, "model");
     let parameters = field(&raw, "encoded_parameters");
     let heads = usize_field(model, "index_n_heads");
@@ -464,13 +492,9 @@ pub(super) fn native_outputs_from_ownered_inputs(
     let all_frequencies = frequencies(&attention);
     let attention_weights = attention_weights(&attention.encoded_parameters);
     let mut state = LayerAttentionState::new(attention_layout(&attention.model));
-    let owner: Value = serde_json::from_str(include_str!(
-        "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
-    ))
-    .expect("owner fixture");
     assert_eq!(
         field(field(&owner, "source"), "complete_capture_sha256").as_str(),
-        Some(CAPTURE_SHA256)
+        Some(expected_capture_sha256)
     );
     assert_eq!(
         field(field(&owner, "source"), "revision").as_str(),
@@ -487,7 +511,6 @@ pub(super) fn native_outputs_from_ownered_inputs(
     let key_layout = IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
         .expect("captured key layout");
     assert_eq!(usize_field(owner_model, "key_dimension"), head_dimension);
-    let compressor = compressor_fixture();
     let compressor_cases = field(&compressor, "cases")
         .as_array()
         .expect("compressor calls");
@@ -519,6 +542,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
     {
         let (supplied_start, supplied_input) = &supplied_inputs[call_id];
         let (owner_start, owner_input) = &owner_inputs[call_id];
+        let (candidate_start, candidate_input) = &candidate_oracle_inputs[call_id];
         assert_eq!(
             *supplied_start, attention_case.start_pos,
             "supplied attention start"
@@ -551,9 +575,12 @@ pub(super) fn native_outputs_from_ownered_inputs(
             "derived HC owner input"
         );
         assert_eq!(
-            owner_input,
-            &candidate_capture::captured_attention_input(attention_case.start_pos),
-            "derived HC input crosses historical candidate boundary"
+            *candidate_start, attention_case.start_pos,
+            "candidate oracle start"
+        );
+        assert_eq!(
+            owner_input, candidate_input,
+            "derived HC input crosses candidate boundary"
         );
         let owner_frequencies = source_frequencies(&raw, attention_case.start_pos, positions, 16);
         let publication =
@@ -645,6 +672,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
             pending.publication(),
             owner_input,
             supplied_input,
+            candidate_projection,
         );
         assert_eq!(
             pending.kv_prefix(0).expect("complete staged KV prefix"),
@@ -730,6 +758,135 @@ pub(super) fn native_outputs_from_ownered_inputs(
         "oracle distinguishes decode rotary positions"
     );
     outputs
+}
+
+/// Legacy wrapper retaining the independently captured source gates.
+pub(super) fn native_outputs_from_ownered_inputs(
+    supplied_inputs: &[(usize, Vec<u16>)],
+    expected_capture_sha256: &str,
+) -> Vec<Vec<u16>> {
+    assert_eq!(expected_capture_sha256, CAPTURE_SHA256);
+    let raw = raw_fixture();
+    let attention = attention_fixture();
+    let owner: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+    ))
+    .expect("owner fixture");
+    let candidate_oracle_inputs = attention
+        .cases
+        .iter()
+        .map(|case| {
+            (
+                case.start_pos,
+                candidate_capture::captured_attention_input(case.start_pos),
+            )
+        })
+        .collect();
+    native_outputs_from_parts(
+        supplied_inputs,
+        expected_capture_sha256,
+        OwnerAttentionOperands {
+            raw,
+            attention,
+            owner,
+            compressor: compressor_fixture(),
+            owner_inputs: candidate_hc_capture::derived_inputs(),
+            candidate_oracle_inputs,
+            candidate_projection: None,
+        },
+    )
+}
+
+/// Runs the layer-four owner/attention consumer from one unified source bundle.
+pub(super) fn native_outputs_from_bundle_inputs(
+    supplied_inputs: &[(usize, Vec<u16>)],
+    bundle: &Value,
+) -> Vec<Vec<u16>> {
+    assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
+    // Pin every source field to the checked-in capture metadata, including
+    // observer and extractor identities. Numerical operands still come only
+    // from the caller's bundle, so weight-mutation controls remain meaningful.
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned reduced bundle metadata");
+    let source = field(bundle, "source");
+    assert_eq!(source, field(&pinned, "source"), "bundle source metadata");
+    assert_eq!(field(source, "revision").as_str(), Some(REVISION));
+    assert_eq!(
+        field(source, "model_sha256").as_str(),
+        Some("4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65")
+    );
+    let capture = field(source, "complete_capture_sha256")
+        .as_str()
+        .expect("bundle capture");
+    assert_eq!(capture.len(), 64);
+    let projections = field(bundle, "projections");
+    let projection = |name| {
+        let value = field(projections, name).clone();
+        assert_eq!(
+            field(&value, "schema_version").as_u64(),
+            Some(1),
+            "{name} schema"
+        );
+        let child = field(&value, "source");
+        assert_eq!(
+            child, &pinned["projections"][name]["source"],
+            "{name} source metadata"
+        );
+        assert_eq!(
+            field(child, "revision").as_str(),
+            Some(REVISION),
+            "{name} revision"
+        );
+        assert_eq!(
+            field(child, "model_sha256").as_str(),
+            field(source, "model_sha256").as_str(),
+            "{name} model"
+        );
+        assert_eq!(
+            field(child, "complete_capture_sha256").as_str(),
+            Some(capture),
+            "{name} capture"
+        );
+        value
+    };
+    let attention_raw = projection("layer4_attention");
+    assert_eq!(field(&attention_raw, "schema_version").as_u64(), Some(1));
+    let attention: attention_capture::Fixture = serde_json::from_value(attention_raw.clone())
+        .expect("typed bundle layer-four attention fixture");
+    assert_eq!(attention.cases.len(), 3);
+    let raw = attention_raw;
+    let owner = projection("layer3_index_key");
+    let compressor = projection("layer3_compressor");
+    let candidate = projection("layer3_candidate");
+    let candidate_raw =
+        serde_json::to_string(&candidate).expect("serialize bundle candidate projection");
+    let owner_inputs = candidate_hc_capture::derived_inputs_from_json(&candidate_raw, capture);
+    let candidate_oracle_inputs = field(&candidate, "cases")
+        .as_array()
+        .expect("bundle candidate cases")
+        .iter()
+        .map(|case| {
+            (
+                usize_field(case, "start_pos"),
+                bf16(field(case, "attention_input")),
+            )
+        })
+        .collect();
+    native_outputs_from_parts(
+        supplied_inputs,
+        capture,
+        OwnerAttentionOperands {
+            raw,
+            attention,
+            owner,
+            compressor,
+            owner_inputs,
+            candidate_oracle_inputs,
+            candidate_projection: Some((&candidate, capture)),
+        },
+    )
 }
 
 /// Runs the layer-three source-attention fixture from its native HC input,
