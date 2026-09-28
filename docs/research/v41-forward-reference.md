@@ -157,9 +157,15 @@ the attention input from the incoming residual and pre-mix, with exact source
 comparison. Startup now uses the same trace's `embed.weight` and token IDs,
 expands each embedding into HC copies, and initializes the pre-mix to select
 copy zero. Captured startup tensors serve only as exact oracles; unknown token
-IDs and changed embedding rows are negative controls. Layer-zero attention and
-FFN HC-coefficient production remain captured. This reduced CPU reference join
-does not establish native full-graph, Metal or checkpoint execution.
+IDs and changed embedding rows are negative controls. Attention and FFN HC
+coefficients now come from native projection of native residuals using the
+source parameters. F32 next-pre comparison uses the existing source-derived
+projection/coefficient envelopes; exact equality is retained at BF16
+post-attention, FFN and terminal boundaries. Native next-pre then feeds native
+layer-one Engram output through HC pre-mix and RMSNorm, reproducing the exact
+source attention input. Captured HC records are comparison oracles only.
+This reduced CPU reference join does not establish a full stateful graph,
+Metal or checkpoint execution.
 
 ```sh
 uv run scripts/test_v41_layer0_to_layer1_fixture.py

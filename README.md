@@ -48,15 +48,10 @@ defines the correctness, performance and resource gates.
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.
 This is [local adapter qualification](docs/typed-decisions.md#local-qualification-evidence),
-not an official JevBench score. A separate frozen schedule test did not show a
-full-task adherence benefit from the non-overlap verifier; its
-[results and limits](docs/candidate-control.md#fixed-synthetic-task-quality-check)
-are recorded separately. Explicit requirements safely rejected all eight
-plain-prompt 4B retry runs. Using the checkpoint's chat format on those same
-tasks reached 7/8 full-task successes with verified retries versus 6/8 for the
-schema-only baseline. A fresh, separately frozen same-family confirmation set
-reached 3/8 versus 2/8, using 1,606 versus 478 generated tokens. These small
-synthetic checks establish strict acceptance, not general quality or a speedup.
+not an official JevBench score. Optional verifier-guided retries have a small
+[synthetic interval-scheduling regression](docs/candidate-control.md#fixed-synthetic-task-quality-check);
+it tests acceptance and exhaustion, not model quality or inference-request scheduling.
+Retries are not required for ordinary model execution.
 
 ## Setup
 
@@ -482,9 +477,10 @@ window-only attention, HC mixing and RMSNorm/MoE FFN, passing the exact BF16
 residual to native Engram1 at starts 0, 5 and 6. Native HC pre-mix and RMSNorm
 now also reconstruct the attention input exactly. Token embedding, HC-copy
 expansion and identity pre-mix reconstruct the incoming block state from the
-same trace's token IDs and weights. HC-coefficient production remains captured;
-removing it and carrying real previous-call layer-three state are the next
-reduced-graph gates.
+same trace's token IDs and weights. HC coefficients now come from native
+projection: F32 values satisfy the existing analytic bounds, and their native
+layer-one consumer reproduces the exact BF16 attention input. A single stateful
+token-to-logits runner with real previous-call layer-three state is the next gate.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

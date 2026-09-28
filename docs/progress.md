@@ -43,8 +43,11 @@ choices without expanding current support claims.
   coefficients fail the source oracle; rejected out-of-order
   attention calls leave the state retryable, including reset and replay.
   Token embedding, HC-copy expansion and identity pre-mix now reconstruct the
-  incoming block state from the same trace's IDs and weights. HC-coefficient
-  production remains captured, so complete native layer-zero execution is open.
+  incoming block state from the same trace's IDs and weights. Both attention
+  and FFN HC coefficients now come from native projection; next-pre values use
+  the existing analytic F32 envelopes, while the native layer-one pre-mix and
+  RMSNorm consumer matches the exact BF16 source attention input. These joined
+  cases still require composition into one stateful token-to-logits runner.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -249,10 +252,9 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
    layer-zero token embedding now has an exact source fixture and OOV/mutation
    controls. Native layer-zero window-only attention, HC mixing, RMSNorm and
    MoE FFN now feed Engram1. Native embedding and identity HC initialization
-   supply the same-trace incoming block state. HC-coefficient production remains
-   captured. Remove that boundary,
-   then carry the trace through a full
-   stateful runner, while preserving the
+   supply the same-trace incoming block state. Native HC projection now supplies
+   coefficients under the existing F32 envelope policy and exact BF16 consumer
+   checks. Compose these joins into one stateful runner while preserving the
    source-grounded partial-call layer-three shared score keys and discrete
    routing gates. This pair does not use the layer-three/four candidate-mask
    path. Operator and joined-suffix parity do not establish full model generation.

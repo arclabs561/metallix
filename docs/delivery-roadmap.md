@@ -7,7 +7,7 @@ local agents, programmable inference, then broader MLX capabilities. Grounded in
 [performance evidence](experiments/chat-performance.md), and
 [sampling gates](research/sampling-next-gates.md).
 
-Baseline: `d92c70d`. Review this sequence after each milestone, a failed
+Review baseline: `ebf5ba3`. Review this sequence after each milestone, a failed
 feasibility gate, a materially better upstream runtime, or a change to the
 pinned MLX binding. This proposal records sequencing; it does not declare new
 interfaces stable or turn synthetic parity into model support.
@@ -17,11 +17,9 @@ interfaces stable or turn synthetic parity into model support.
 Qwen is the usable adapter: text/chat/tools and typed decisions execute on
 local 0.6B and 4B checkpoints. The public-task decision qualification reached
 35/72 and 65/72 respectively; this is not an official benchmark score.
-Exact schedule verification now accepts an explicit count/duration/window
-contract. Plain-prompt 4B retries exhausted all eight cases; using the checkpoint
-chat format reached 7/8 on the same observed tasks (schema-only baseline 6/8).
-A separately frozen confirmation set reached 3/8 versus 2/8, at 1,606 versus
-478 generated tokens. Strict acceptance holds; broad quality remains unqualified.
+The interval-scheduling example has qualified optional verification/retry
+mechanics. Keep it as a regression; its small synthetic results do not establish
+model quality and do not justify more task-specific features.
 SMC proposal
 correction and steering pass checkpoint mechanics tests; application quality
 and serving integration remain separate gates. Julia has source-pinned encoding
@@ -40,9 +38,11 @@ the layer-two-to-logits reduced suffix; Engram1 now feeds the native layer-one
 path through the reduced suffix with corruption rejection. Native layer-zero
 window-only attention, HC mixing and RMSNorm/MoE FFN now reproduce its residual
 into Engram1. Native token embedding, HC-copy expansion and identity pre-mix
-now supply the same-trace incoming state. HC-coefficient production remains
-captured; remove it before claiming a complete reduced oracle. Metal
-execution and real previous-call shared state follow those gates. Native
+now supply the same-trace incoming state. Native HC projection supplies both
+sublayers' coefficients under the existing F32 envelope policy; its native
+layer-one consumer matches the exact BF16 attention input. A single stateful
+runner and real previous-call shared state remain before a complete reduced
+oracle, followed by Metal execution. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
@@ -64,7 +64,8 @@ initial residual/pre-mix and partial-call layer-three shared score keys still
 cross captured boundaries. The new layer-zero bridge removes the captured FFN
 output; native window-only attention is also joined, with its input reconstructed
 by native HC pre-mix and RMSNorm. Native startup from token IDs supplies the
-incoming residual and identity pre-mix; coefficient synthesis remains open.
+incoming residual and identity pre-mix; native coefficient synthesis now reaches
+the exact downstream BF16 consumer boundary in the bounded source cases.
 Its scalar numerical oracle and bounded
 Metal operators are not a complete GPU decoder.
 
@@ -100,11 +101,12 @@ search. These are distinct mechanisms with distinct evidence classes. The
 [frontiers ledger](research/programmatic-inference-frontiers.md) define their
 shared boundary and limits.
 
-The first useful vertical should be one end-to-end controller over the working
-Qwen path: a declared specification, a transactional intervention or
-constraint, an independent verifier, accept/rollback behavior, and a receipt.
-Only after that should the same contract be exercised by a real DeepSeek
-adapter, recursive context handles, activation steering, or particles.
+The Qwen controller mechanism now has accept/reject, rollback and receipt
+evidence. Its interval example is not the product milestone. The next user-visible
+milestones are complete model execution: native DeepSeek generation and a native
+Julia typed-decision path. Preserve Qwen's working text, tools and decision
+commands while pursuing those consumers. SMC and steering remain research and
+regression surfaces until a concrete application needs them.
 
 **Open before expensive checkpoint work:** define the target context, acceptable
 first-token latency, minimum useful decode rate and SSD/RAM budget for the
@@ -114,29 +116,54 @@ concrete; an unspecified performance target cannot establish usable serving.
 
 ## Immediate parallel work
 
-Limit active implementation to two lanes. A third agent can review an
-independent boundary or update docs. One owner controls builds and device
-measurements; competing GPU workloads invalidate performance comparisons.
+Use two bounded implementation lanes plus one independent reviewer when useful.
+One owner integrates and runs Cargo/device checks. Research must resolve a named
+implementation uncertainty and produce a pin, contract correction, or executable
+gate; another broad model survey is not on the critical path.
 
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
-| Qwen performance | Profile the adopted stepped resident path across model sizes and repeated request shapes. | Preserve full-logit/token and branch/EOS replay; retain the concatenation receipt as a regression control. | Reversible implementation; no public tuning flag. |
-| DeepSeek completion | Remove remaining layer-zero HC-coefficient and previous-call state boundaries. Consumer: the complete reduced text oracle. | Preserve exact same-trace FFN/Engram1 handoff, source-derived numerical bounds, routes and retry behavior before Metal composition. | Reversible implementation; source semantics must not be silently changed. |
-| Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
+| DeepSeek primary | Compose the qualified layer-zero coefficients and joins into one request-local token-to-logits reduced runner. Consumer: the existing reduced text graph. | Existing numerical policy, exact discrete routing/BF16 boundaries, multiple prefill/decode partitions, previous-call state, reset and retry. | Reversible scalar implementation; no public decoder API yet. |
+| Julia secondary | One source-pinned ModernBERT block with global/local attention, RoPE, normalization and GEGLU; then bounded encoder prefill composed with the native head. Consumer: typed decisions. | Independent source comparison on padded and window-crossing inputs, followed by encoder-to-head scores. | Reversible CPU reference before Metal or checkpoint loading. |
+| Feasibility and review | Refine DeepSeek residency/selected-byte traffic from existing metadata and source routes in parallel. Consumer: the checkpoint acquisition decision. | Explicit RAM/SSD/context/latency budget; distinguish metadata sensitivity from measured hit rates. | Read-only estimates and bounded local probes. |
+| Qwen maintenance | Keep text/tools/typed decisions and optional controller behavior working. | Existing regression checks; new work needs a concrete bug or representative application requirement. | Reversible fixes; no further scheduling benchmark variants. |
 
-For each boundary, use existing operators and fixtures first. Add a capture only
-when a specific missing operand blocks the next join. Once the complete reduced
-oracle passes, stop extending fixture infrastructure for its own sake and move
-the execution graph onto Metal.
+### Dependency order and stopping gates
 
-DeepSeek now joins window-only layer-zero attention to its native FFN/Engram
-consumer, with native startup from token IDs. After removing the remaining
-HC-coefficient boundary,
-execute the reduced graph in token order with a request-local previous-call
-shared index publication so layer
-three's real previous publication supplies the next partial layer-one call. That
-last gate removes the captured shared-key shortcut. Exercise more than the fixed
-5/1/1 trace, including multiple compression boundaries and reset/retry sequences.
+1. **Close the current numerical uncertainties.** DeepSeek coefficient comparisons
+   must use the existing stage-specific policy, with exact downstream BF16 and
+   routing checks. Julia must follow the pinned Transformers implementation,
+   including actual RoPE behavior rather than inferring semantics from metadata.
+   Stop and diagnose any mismatch; do not widen tolerances to advance the checklist.
+2. **Compose execution.** DeepSeek gets one bounded stateful runner from tokens
+   to logits, with native previous-call layer-three publication. Julia gets one
+   complete encoder block and then encoder-to-head prefill. A new fixture is
+   justified only by a missing operand or independent oracle for these consumers.
+3. **Move the qualified graph onto Metal.** Preserve full-output, state, routing
+   and failure-atomicity comparisons. This is an execution milestone, not evidence
+   that the published checkpoint fits the machine.
+4. **Admit real checkpoint work.** Before acquisition or loader expansion, settle
+   payload, resident memory, context and latency budgets. DeepSeek's existing
+   [traffic sensitivity](research/host-memory.md#deepseek-routed-expert-traffic-sensitivity)
+   makes locality a feasibility question now, not after Metal completion. Julia
+   needs its own bounded checkpoint plan. Then qualify loading, prefill/decode or
+   typed scores, and an ordinary CLI request together.
+
+Do not start full-checkpoint acquisition until its resource plan is decided.
+If DeepSeek's feasibility gate rules out useful single-Mac execution under the
+chosen limits, explicitly revisit residency/quantization scope; do not silently
+start a pager framework. Julia can advance independently within a separately established
+resource envelope. Performance optimization follows a measured bottleneck
+on the relevant execution path, not another microbenchmark by default.
+
+### Work held at its current boundary
+
+Keep the schedule verifier, SMC accounting, and steering mechanics covered by
+existing tests. Resume application-quality work only for a named consumer and
+an independent outcome metric. Retain broad architecture research as background;
+no generic controller, particle-serving API, hierarchical router, training path,
+or universal tensor framework is needed for the next model-execution milestone.
+These remain accepted future directions rather than implicit parallel work.
 
 ### Performance adoption contract
 

@@ -64,8 +64,20 @@ configuration is:
 | maximum positions | 8,192 |
 | attention schedule | full attention every third layer, otherwise sliding attention |
 | local window | 128 |
-| position scheme | `sans_pos` with RoPE theta 160,000 |
+| position scheme | Q/K RoPE, theta 160,000; `sans_pos` metadata does not alter the pinned implementation |
 | token IDs | pad 0, CLS 1, mask 4, SEP 1 |
+
+The declared Transformers 5.0.0 implementation is pinned at
+`08810b1e278938278c50153ee1edfd7a20a759da`.
+Its [ModernBERT implementation](https://github.com/huggingface/transformers/blob/08810b1e278938278c50153ee1edfd7a20a759da/src/transformers/models/modernbert/modeling_modernbert.py)
+and [configuration](https://github.com/huggingface/transformers/blob/08810b1e278938278c50153ee1edfd7a20a759da/src/transformers/models/modernbert/configuration_modernbert.py)
+do not consume `position_embedding_type`; `sans_pos` must not be interpreted
+as disabling RoPE. Q/K rotary uses split-half rotation. Global layers are
+zero-based 0, 3, …, 21; local layers permit absolute position distance at most
+64, in addition to padding exclusion. Layer zero skips the attention pre-norm;
+later layers use affine LayerNorm without bias. The next block gate must cover
+both regimes, including a sequence long enough to cross the local boundary.
+FlashAttention's unpadding path is outside the initial CPU reference gate.
 
 This makes ModernBERT's global/local bidirectional attention, RoPE behavior,
 padding semantics, and tokenizer behavior prerequisites. A generic decoder
