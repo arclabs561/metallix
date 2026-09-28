@@ -1,7 +1,7 @@
-//! Bounded F32 `ModernBERT` encoder-layer reference for the pinned Julia-1 encoder.
+//! Bounded F32 `ModernBERT` blocks and 22-layer prefill for the pinned Julia-1 encoder.
 //!
-//! This is deliberately one block: it accepts validated caller-owned weights and
-//! does not imply checkpoint loading or a complete 22-layer encoder.
+//! The full prefill accepts caller-owned selected embedding rows and all layer
+//! weights. It does not load a checkpoint or serve ordinary typed requests.
 
 use crate::head::{ATTENTION_HEADS, HEAD_WIDTH, WIDTH};
 use thiserror::Error;
@@ -13,6 +13,11 @@ const WIDTH_F32: f32 = 384.0;
 const HEAD_WIDTH_F32: f32 = 64.0;
 const MAX_POSITIONS: usize = 126;
 const MAX_WORK: usize = 256_000_000;
+const FULL_ENCODER_LAYERS: usize = 22;
+const MAX_PREFILL_POSITIONS: usize = 8;
+const MAX_SELECTED_ROWS: usize = MAX_PREFILL_POSITIONS;
+const MAX_FULL_ENCODER_WORK: usize = 384_000_000;
+const PUBLISHED_VOCAB_SIZE: u64 = 256_000;
 
 /// Raw parameters in the same row-major layout as `PyTorch` `nn.Linear` weights.
 #[derive(Clone, Debug)]
@@ -23,6 +28,25 @@ pub struct EncoderBlockWeights {
     pub wo_mlp_weight: Vec<f32>,
     pub attn_norm_weight: Vec<f32>,
     pub mlp_norm_weight: Vec<f32>,
+}
+
+/// Caller-supplied selected embedding rows and all weights for the 22-layer encoder.
+#[derive(Clone, Debug)]
+pub struct FullEncoderWeights {
+    /// Strictly increasing token IDs corresponding to `token_rows`.
+    pub token_ids: Vec<u64>,
+    /// Row-major F32 embedding rows, one row for every `token_ids` entry.
+    pub token_rows: Vec<f32>,
+    pub embedding_norm_weight: Vec<f32>,
+    pub layers: Vec<EncoderBlockWeights>,
+    pub final_norm_weight: Vec<f32>,
+}
+
+/// Token IDs and a padding mask for one bounded, already serialized sequence.
+#[derive(Clone, Debug)]
+pub struct EncoderInput {
+    pub input_ids: Vec<u64>,
+    pub attention_mask: Vec<bool>,
 }
 
 /// One unbatched encoder sequence.  `layer` selects the pinned global/local regime.
@@ -51,8 +75,22 @@ pub enum JuliaEncoderError {
     NonFinite { field: &'static str, index: usize },
     #[error("Julia encoder has no unmasked key positions")]
     NoKeys,
-    #[error("Julia encoder scalar work exceeds {MAX_WORK}")]
+    #[error("Julia encoder affine/attention MAC count exceeds {MAX_WORK}")]
     Work,
+    #[error("Julia full encoder requires exactly {FULL_ENCODER_LAYERS} layers, got {0}")]
+    FullLayers(usize),
+    #[error("Julia full encoder selected rows must be 1..={MAX_SELECTED_ROWS}, got {0}")]
+    SelectedRows(usize),
+    #[error("Julia full encoder token IDs must be strictly increasing")]
+    TokenIds,
+    #[error("Julia full encoder has no selected row for token ID {0}")]
+    TokenId(u64),
+    #[error("Julia full encoder positions must be 1..={MAX_PREFILL_POSITIONS}, got {0}")]
+    PrefillPositions(usize),
+    #[error("Julia full encoder affine/attention MAC count exceeds {MAX_FULL_ENCODER_WORK}")]
+    FullWork,
+    #[error("Julia full encoder token ID {0} is outside the published vocabulary")]
+    VocabularyId(u64),
 }
 
 /// Validated weights for one `ModernBERT` `ModernBertEncoderLayer`.
@@ -146,6 +184,136 @@ impl EncoderBlock {
         )?;
         add_assign(&mut residual, &output, "MLP residual")?;
         Ok(residual)
+    }
+}
+
+/// A bounded CPU `ModernBERT` encoder with selected token rows, not a checkpoint loader.
+pub struct JuliaEncoder {
+    token_ids: Vec<u64>,
+    token_rows: Vec<f32>,
+    embedding_norm_weight: Vec<f32>,
+    layers: Vec<EncoderBlock>,
+    final_norm_weight: Vec<f32>,
+}
+
+impl JuliaEncoder {
+    pub fn new(weights: FullEncoderWeights) -> Result<Self, JuliaEncoderError> {
+        if weights.token_ids.is_empty() || weights.token_ids.len() > MAX_SELECTED_ROWS {
+            return Err(JuliaEncoderError::SelectedRows(weights.token_ids.len()));
+        }
+        if weights.token_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(JuliaEncoderError::TokenIds);
+        }
+        if let Some(&token_id) = weights
+            .token_ids
+            .iter()
+            .find(|&&token_id| token_id >= PUBLISHED_VOCAB_SIZE)
+        {
+            return Err(JuliaEncoderError::VocabularyId(token_id));
+        }
+        length(
+            "selected token rows",
+            &weights.token_rows,
+            weights.token_ids.len() * WIDTH,
+        )?;
+        length(
+            "embedding norm weight",
+            &weights.embedding_norm_weight,
+            WIDTH,
+        )?;
+        length("final norm weight", &weights.final_norm_weight, WIDTH)?;
+        if weights.layers.len() != FULL_ENCODER_LAYERS {
+            return Err(JuliaEncoderError::FullLayers(weights.layers.len()));
+        }
+        let mut layers = Vec::with_capacity(FULL_ENCODER_LAYERS);
+        for layer in weights.layers {
+            layers.push(EncoderBlock::new(layer)?);
+        }
+        Ok(Self {
+            token_ids: weights.token_ids,
+            token_rows: weights.token_rows,
+            embedding_norm_weight: weights.embedding_norm_weight,
+            layers,
+            final_norm_weight: weights.final_norm_weight,
+        })
+    }
+
+    /// Looks up supplied rows, applies embedding/final normalization, and runs layers 0 through 21.
+    ///
+    /// The MAC bound counts affine projections and both attention reductions;
+    /// row lookup and normalization reductions are deliberately outside that count.
+    pub fn forward(&self, input: &EncoderInput) -> Result<Vec<f32>, JuliaEncoderError> {
+        self.forward_inner(input, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_boundaries(
+        &self,
+        input: &EncoderInput,
+    ) -> Result<Vec<Vec<f32>>, JuliaEncoderError> {
+        let mut boundaries = Vec::with_capacity(FULL_ENCODER_LAYERS + 2);
+        self.forward_inner(input, Some(&mut boundaries))?;
+        Ok(boundaries)
+    }
+
+    fn forward_inner(
+        &self,
+        input: &EncoderInput,
+        mut boundaries: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Vec<f32>, JuliaEncoderError> {
+        let positions = input.input_ids.len();
+        if positions == 0 || positions > MAX_PREFILL_POSITIONS {
+            return Err(JuliaEncoderError::PrefillPositions(positions));
+        }
+        if input.attention_mask.len() != positions {
+            return Err(JuliaEncoderError::Length {
+                field: "prefill attention mask",
+                actual: input.attention_mask.len(),
+                expected: positions,
+            });
+        }
+        if !input.attention_mask.iter().any(|&value| value) {
+            return Err(JuliaEncoderError::NoKeys);
+        }
+        let per_layer = positions
+            .checked_mul(WIDTH * (4 * WIDTH + 3 * ENCODER_FF_WIDTH))
+            .and_then(|value| value.checked_add(positions * positions * 2 * WIDTH))
+            .ok_or(JuliaEncoderError::FullWork)?;
+        if per_layer
+            .checked_mul(FULL_ENCODER_LAYERS)
+            .ok_or(JuliaEncoderError::FullWork)?
+            > MAX_FULL_ENCODER_WORK
+        {
+            return Err(JuliaEncoderError::FullWork);
+        }
+        let mut hidden = Vec::with_capacity(positions * WIDTH);
+        for &token_id in &input.input_ids {
+            let row = self
+                .token_ids
+                .binary_search(&token_id)
+                .map_err(|_| JuliaEncoderError::TokenId(token_id))?;
+            hidden.extend_from_slice(&self.token_rows[row * WIDTH..(row + 1) * WIDTH]);
+        }
+        hidden = norm_rows(&hidden, &self.embedding_norm_weight, "embedding norm")?;
+        record_boundary(&mut boundaries, &hidden);
+        for (layer, block) in self.layers.iter().enumerate() {
+            hidden = block.forward(&EncoderBlockInput {
+                hidden,
+                positions,
+                attention_mask: input.attention_mask.clone(),
+                layer,
+            })?;
+            record_boundary(&mut boundaries, &hidden);
+        }
+        hidden = norm_rows(&hidden, &self.final_norm_weight, "final norm")?;
+        record_boundary(&mut boundaries, &hidden);
+        Ok(hidden)
+    }
+}
+
+fn record_boundary(boundaries: &mut Option<&mut Vec<Vec<f32>>>, hidden: &[f32]) {
+    if let Some(boundaries) = boundaries.as_deref_mut() {
+        boundaries.push(hidden.to_vec());
     }
 }
 
@@ -263,11 +431,16 @@ fn norm_rows(
                 index: row_index,
             });
         }
-        out.extend(
-            row.iter()
-                .zip(weight)
-                .map(|(x, w)| (*x - mean) * inverse * *w),
-        );
+        for (column, (x, w)) in row.iter().zip(weight).enumerate() {
+            let normalized = (*x - mean) * inverse * *w;
+            if !normalized.is_finite() {
+                return Err(JuliaEncoderError::NonFinite {
+                    field,
+                    index: row_index * WIDTH + column,
+                });
+            }
+            out.push(normalized);
+        }
     }
     Ok(out)
 }

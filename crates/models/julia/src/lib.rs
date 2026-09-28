@@ -2,9 +2,12 @@
 
 pub mod encoder;
 pub mod head;
+#[cfg(test)]
+mod prefill;
 
 pub use encoder::{
-    ENCODER_FF_WIDTH, EncoderBlock, EncoderBlockInput, EncoderBlockWeights, JuliaEncoderError,
+    ENCODER_FF_WIDTH, EncoderBlock, EncoderBlockInput, EncoderBlockWeights, EncoderInput,
+    FullEncoderWeights, JuliaEncoder, JuliaEncoderError,
 };
 
 pub use head::{

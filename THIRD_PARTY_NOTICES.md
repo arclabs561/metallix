@@ -20,7 +20,9 @@ the Apache-2.0 notice and license copy above.
 
 `crates/models/julia/src/encoder.rs`,
 `scripts/julia_encoder_reference.py`, and
-`fixtures/julia-1/encoder-reference.json` implement and test the arithmetic
+`fixtures/julia-1/encoder-reference.json`, plus the test-private prefix
+fixture pair `scripts/julia_prefill_reference.py` and
+`fixtures/julia-1/prefill-reference.json`, implement and test the arithmetic
 contract of Hugging Face Transformers' `ModernBertEncoderLayer` and associated
 rotary helpers at revision
 `08810b1e278938278c50153ee1edfd7a20a759da`. The Rust and independent Python

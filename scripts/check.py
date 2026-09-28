@@ -100,6 +100,8 @@ def main() -> int:
         ([sys.executable, "scripts/test_julia_encoding_contract.py"], False),
         ([sys.executable, "scripts/test_julia_tokenizer_fixture.py"], False),
         ([sys.executable, "scripts/test_julia_encoder_fixture.py"], False),
+        ([sys.executable, "scripts/test_julia_prefill_fixture.py"], False),
+        ([sys.executable, "scripts/test_julia_full_prefill_fixture.py"], False),
         ([sys.executable, "scripts/test_inspect_julia.py"], False),
         ([sys.executable, "scripts/test_qualify_codex.py"], False),
         ([sys.executable, "scripts/test_qualify_responses_tools.py"], False),

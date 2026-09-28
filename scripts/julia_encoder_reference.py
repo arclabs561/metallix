@@ -61,14 +61,14 @@ def values(shape: tuple[int, ...], ordinal: int) -> torch.Tensor:
     ) / 1000
 
 
-def weights() -> dict[str, torch.Tensor]:
+def weights(ordinal: int = 0) -> dict[str, torch.Tensor]:
     return {
-        "wqkv": values((3 * WIDTH, WIDTH), 0),
-        "attn_wo": values((WIDTH, WIDTH), 1),
-        "wi": values((2 * FF, WIDTH), 2),
-        "mlp_wo": values((WIDTH, FF), 3),
-        "attn_norm": values((WIDTH,), 4),
-        "mlp_norm": values((WIDTH,), 5),
+        "wqkv": values((3 * WIDTH, WIDTH), ordinal),
+        "attn_wo": values((WIDTH, WIDTH), ordinal + 1),
+        "wi": values((2 * FF, WIDTH), ordinal + 2),
+        "mlp_wo": values((WIDTH, FF), ordinal + 3),
+        "attn_norm": values((WIDTH,), ordinal + 4),
+        "mlp_norm": values((WIDTH,), ordinal + 5),
     }
 
 

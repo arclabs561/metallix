@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "julia_model": {
+      "revision": "a85b127321d580d65176c89ced8273f305745d85",
+      "sha256": "ef2ba82fe20cdf0db7bb887e9ef075476ed08b985ce9a95be0de3e26246ecc81"
+    },
+    "modernbert": {
+      "revision": "08810b1e278938278c50153ee1edfd7a20a759da",
+      "sha256": "83875f54a029339c62a8f5061801873d41e134b3e9abb8308b8e9b0f9f57b5dc"
+    }
+  },
+  "operator_config": {
+    "encoder_layers": [
+      0,
+      1
+    ],
+    "head_layers": 2,
+    "positions": 6,
+    "width": 384,
+    "tolerance": 1e-05
+  },
+  "input_generation": "arange(6*384), ((x*7)%29-14)/20; optional padded rows 4..5 add ((x*11)%31-15)/3",
+  "weight_generation": "encoder ordinals layer0=0..5, layer1=6..11; Julia head uses pinned named-parameter ordinals from head-reference",
+  "cases": [
+    {
+      "name": "base",
+      "attention_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      "marker_pos": [
+        1,
+        3
+      ],
+      "marker_mask": [
+        true,
+        true
+      ],
+      "qtype": 2,
+      "expected_scores": [
+        0.009898843243718147,
+        0.008665556088089943
+      ]
+    },
+    {
+      "name": "padding_perturbation",
+      "attention_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      "marker_pos": [
+        1,
+        3
+      ],
+      "marker_mask": [
+        true,
+        true
+      ],
+      "qtype": 2,
+      "perturb_padding": true,
+      "expected_scores": [
+        0.009898843243718147,
+        0.008665556088089943
+      ]
+    },
+    {
+      "name": "option_permutation",
+      "attention_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      "marker_pos": [
+        3,
+        1
+      ],
+      "marker_mask": [
+        true,
+        true
+      ],
+      "qtype": 2,
+      "expected_scores": [
+        0.008665556088089943,
+        0.009898843243718147
+      ]
+    },
+    {
+      "name": "unmasked_padding_control",
+      "attention_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "marker_pos": [
+        1,
+        3
+      ],
+      "marker_mask": [
+        true,
+        true
+      ],
+      "qtype": 2,
+      "perturb_padding": true,
+      "expected_scores": [
+        0.009503485634922981,
+        0.008090328425168991
+      ]
+    },
+    {
+      "name": "masked_marker",
+      "attention_mask": [
+        true,
+        true,
+        true,
+        true,
+        false,
+        false
+      ],
+      "marker_pos": [
+        1,
+        3,
+        2
+      ],
+      "marker_mask": [
+        true,
+        true,
+        false
+      ],
+      "qtype": 2,
+      "expected_scores": [
+        0.009898843243718147,
+        0.008665556088089943,
+        -10000.0
+      ]
+    }
+  ]
+}

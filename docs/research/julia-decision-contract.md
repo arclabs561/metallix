@@ -1,8 +1,11 @@
 # Julia-1 native decision prerequisite
 
 Status: source contract, published-header validation, real-tokenizer sequence
-parity, and a native CPU decision head are implemented. Full Julia execution
-still requires native ModernBERT and checkpoint qualification.
+parity, and a native CPU decision head are implemented. A bounded native
+22-layer prefill is present for diagnosis, but it has not qualified against the
+strict source-output gate: the `unmasked_control` synthetic case exceeds the
+fixed `1e-5` hidden-state tolerance. Full Julia execution still requires a
+numerical contract decision and checkpoint qualification.
 
 ## Reproduction identity
 
@@ -252,11 +255,33 @@ distant-token isolation, and the source's finite all-masked-local-query
 behavior. The fixture contains synthetic deterministic weights and inputs, not
 checkpoint weights.
 
-This qualifies one bounded CPU encoder operator, not token embedding, a
-22-layer encoder, checkpoint loading, Metal execution, or model-level quality.
-Next, qualify full native encoder composition under explicit checkpoint-resource
-budgets and independent source-runtime comparison before server or registry
-integration.
+This qualifies one bounded CPU encoder operator, not checkpoint loading, Metal
+execution, or model-level quality.
+One test-private composition gate now runs qualified encoder layers zero and
+one over already embedded synthetic F32 rows, then passes their output to the
+native decision head. Its five source-backed score cases cover padding
+invariance, an unmasked-padding control whose score delta exceeds the fixed
+`1e-5` comparison tolerance, marker permutation, and masked markers. This
+proves a reduced prefix-to-head handoff only; it does not create a public
+prefill API or make the input rows token embeddings.
+
+The crate also has a bounded diagnostic 22-layer composition: selected
+caller-supplied embedding rows, embedding LayerNorm, layers 0--21 with the
+pinned schedule, final LayerNorm, and a 384-million affine/attention MAC cap
+for at most eight positions. It rejects token IDs outside the published
+256,000-row vocabulary, missing selected rows, malformed layer counts and
+nonfinite affine-normalization output. This is not a usable typed request path:
+ordinary serialized Julia requests are longer than eight positions and no
+checkpoint rows are loaded.
+
+Its source gate executes the actual padded `ModernBertModel` under the pinned
+SDPA setting and compares every final hidden value before the head. That strict
+gate remains enabled and currently fails for `unmasked_control`; native scalar
+F32 reductions diverge from both source eager and source CPU-flash paths from
+layer zero and accumulate across the 22 layers. The implementation must remain
+unqualified until a separately reviewed numerical contract or a source-kernel
+compatible execution strategy resolves that mismatch. Checkpoint loading,
+Metal execution, server, or registry integration remain later boundaries.
 
 
 ## Native head placement
