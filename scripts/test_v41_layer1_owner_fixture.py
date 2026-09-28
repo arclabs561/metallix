@@ -50,7 +50,15 @@ class LayerOneOwnerFixtureTest(unittest.TestCase):
             {key: value for key, value in committed.items() if key != "source"},
             {key: value for key, value in self.fixture.items() if key != "source"},
         )
-        changing = {"forward_observers_sha256", "complete_capture_sha256"}
+        # Observer wrappers and capture-output controls may change their own
+        # source hashes. The complete exported numerical fixture must still
+        # match byte-for-byte; pinned model, kernel, loader, and exporter
+        # provenance remain fixed below.
+        changing = {
+            "forward_observers_sha256",
+            "runner_sha256",
+            "complete_capture_sha256",
+        }
         self.assertEqual(
             {
                 key: value

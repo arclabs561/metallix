@@ -2,6 +2,7 @@
 
 use std::{fs::File, io::Read, path::Path};
 
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 const MAX_TOKENIZER_BYTES: usize = 64 * 1024 * 1024;
@@ -11,6 +12,7 @@ const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 /// truncation policies have been explicitly disabled for CLI generation.
 pub(crate) struct QwenTokenizer {
     tokenizer: Tokenizer,
+    source_sha256: String,
 }
 
 /// Stateful decoder input retained until the tokenizer can emit a stable text
@@ -24,18 +26,32 @@ pub(crate) struct QwenIncrementalDecode {
 
 impl QwenTokenizer {
     pub(crate) fn load(model: &Path) -> Result<Self, String> {
-        let bytes = read_regular_file(&model.join("tokenizer.json"), MAX_TOKENIZER_BYTES)?;
+        let bytes = read_regular_file(
+            &model.join("tokenizer.json"),
+            MAX_TOKENIZER_BYTES,
+            "tokenizer file",
+        )?;
         Self::from_bytes(bytes)
     }
 
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
         let mut tokenizer = Tokenizer::from_bytes(bytes)
             .map_err(|_| String::from("local tokenizer.json could not be parsed"))?;
         tokenizer
             .with_truncation(None)
             .map_err(|_| String::from("local tokenizer could not disable truncation"))?;
         tokenizer.with_padding(None);
-        Ok(Self { tokenizer })
+        Ok(Self {
+            tokenizer,
+            source_sha256,
+        })
+    }
+
+    /// SHA-256 of the exact tokenizer.json bytes parsed for this tokenizer.
+    #[must_use]
+    pub(crate) fn source_sha256(&self) -> &str {
+        &self.source_sha256
     }
 
     /// Checks representable tokenizer IDs and EOS without requiring padded
@@ -141,47 +157,59 @@ impl QwenTokenizer {
     }
 }
 
-/// Reads one local regular tokenizer file with a post-open bound check, keeping
-/// a replacement from turning the metadata size into an unbounded allocation.
-fn read_regular_file(path: &Path, maximum_bytes: usize) -> Result<Vec<u8>, String> {
-    let metadata = path
-        .metadata()
-        .map_err(|_| String::from("local tokenizer.json must be a readable regular file"))?;
+/// Reads one bounded local regular file after rechecking the opened descriptor.
+///
+/// The caller owns the artifact-specific parsing and diagnostics. This keeps a
+/// replacement between the initial metadata check and open from turning a
+/// bounded artifact load into an unbounded allocation.
+pub(crate) fn read_regular_file(
+    path: &Path,
+    maximum_bytes: usize,
+    artifact: &str,
+) -> Result<Vec<u8>, String> {
+    let missing = || {
+        format!(
+            "local {artifact} {} must be a readable regular file",
+            path.display()
+        )
+    };
+    let metadata = path.metadata().map_err(|_| missing())?;
     if !metadata.is_file() {
-        return Err(String::from(
-            "local tokenizer.json must be a readable regular file",
-        ));
+        return Err(missing());
     }
     let maximum_bytes_u64 = u64::try_from(maximum_bytes)
-        .map_err(|_| String::from("tokenizer byte limit is unsupported on this platform"))?;
+        .map_err(|_| format!("{artifact} byte limit is unsupported on this platform"))?;
     if metadata.len() > maximum_bytes_u64 {
         return Err(format!(
-            "local tokenizer.json exceeds the {maximum_bytes}-byte limit"
+            "local {artifact} exceeds the {maximum_bytes}-byte limit"
         ));
     }
 
-    let file = File::open(path)
-        .map_err(|_| String::from("local tokenizer.json must be a readable regular file"))?;
-    if !file
-        .metadata()
-        .map_err(|_| String::from("local tokenizer.json must be a readable regular file"))?
-        .is_file()
-    {
-        return Err(String::from(
-            "local tokenizer.json must be a readable regular file",
-        ));
+    let file = File::open(path).map_err(|_| missing())?;
+    if !file.metadata().map_err(|_| missing())?.is_file() {
+        return Err(missing());
     }
     let capacity = usize::try_from(metadata.len())
-        .map_err(|_| String::from("local tokenizer.json size does not fit this platform"))?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(maximum_bytes_u64.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| String::from("local tokenizer.json could not be read"))?;
+        .map_err(|_| format!("local {artifact} size does not fit this platform"))?;
+    let bytes = read_at_most(file, maximum_bytes_u64, capacity)
+        .map_err(|_| format!("local {artifact} {} could not be read", path.display()))?;
     if bytes.len() > maximum_bytes {
         return Err(format!(
-            "local tokenizer.json exceeds the {maximum_bytes}-byte limit"
+            "local {artifact} exceeds the {maximum_bytes}-byte limit"
         ));
     }
+    Ok(bytes)
+}
+
+fn read_at_most(
+    reader: impl Read,
+    maximum_bytes: u64,
+    capacity: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -215,12 +243,20 @@ mod tests {
     fn local_tokenizer_rejects_malformed_nonregular_and_oversized_inputs() {
         assert!(QwenTokenizer::from_bytes(b"not tokenizer JSON".to_vec()).is_err());
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(super::read_regular_file(directory, 1024).is_err());
+        assert!(super::read_regular_file(directory, 1024, "test file").is_err());
         assert!(
-            super::read_regular_file(&directory.join("Cargo.toml"), 1)
+            super::read_regular_file(&directory.join("Cargo.toml"), 1, "test file")
                 .unwrap_err()
                 .contains("byte limit")
         );
+    }
+
+    #[test]
+    fn bounded_reader_retains_one_byte_overflow_without_unbounded_read() {
+        let mut reader = std::io::Cursor::new(b"abcdefgh");
+        let bytes = super::read_at_most(&mut reader, 3, 0).expect("bounded in-memory read");
+        assert_eq!(bytes, b"abcd");
+        assert_eq!(reader.position(), 4);
     }
 
     #[test]
@@ -287,6 +323,7 @@ mod tests {
                 .build()
                 .expect("small streaming tokenizer")
                 .into(),
+            source_sha256: String::from("test-only"),
         };
         let mut stream = QwenTokenizer::generated_decoder();
         assert_eq!(

@@ -37,7 +37,8 @@ class SourceObserverPolicyTest(unittest.TestCase):
         source = OBSERVERS.read_text()
         self.assertIn('record_name = f"layers.{layer_id}.block_input"', source)
         self.assertIn(
-            'name in {"layers.1", "layers.2", "layers.3", "layers.4"}', source
+            'name in {"layers.0", "layers.1", "layers.2", "layers.3", "layers.4"}',
+            source,
         )
         self.assertIn(
             '"incoming_pre": object_record(inputs[2], include_storage=True)', source

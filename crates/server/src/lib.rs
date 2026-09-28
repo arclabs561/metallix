@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 #[cfg(feature = "metal")]
-use crate::chat_generation::ResidentChatLimits;
+use crate::chat_generation::{ResidentChatLimits, render_generation_prompt};
 
 #[cfg(feature = "metal")]
 mod agent_receipt;
@@ -23,8 +23,12 @@ mod chat_generation;
 #[cfg(feature = "metal")]
 mod chat_tools;
 #[cfg(feature = "metal")]
+mod decision_cli;
+#[cfg(feature = "metal")]
 mod http_transport;
 mod model_registry;
+#[cfg(feature = "metal")]
+mod qwen_decisions;
 #[cfg(feature = "metal")]
 mod responses;
 
@@ -36,8 +40,12 @@ mod parity;
 mod qwen_constraints;
 #[cfg(feature = "metal")]
 mod qwen_forward;
+#[cfg(all(test, feature = "metal"))]
+mod qwen_particle_tests;
 #[cfg(feature = "metal")]
 mod qwen_tokenizer;
+#[cfg(all(feature = "metal", feature = "structured-output"))]
+mod schedule_requirements;
 #[cfg(feature = "metal")]
 mod v41_indexer;
 #[cfg(feature = "metal")]
@@ -166,6 +174,9 @@ fn sampling_configuration(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Score typed decision options directly with Qwen3, without generating text.
+    #[cfg(feature = "metal")]
+    Decide(decision_cli::DecisionArgs),
     /// Acquire supported model artifacts through the Hugging Face CLI.
     Fetch {
         #[command(subcommand)]
@@ -260,9 +271,13 @@ enum Command {
     },
     /// Generate one Qwen3 sequence with per-sequence KV reuse on Metal.
     #[cfg(feature = "metal")]
-    #[command(visible_alias = "gen")]
+    #[command(
+        visible_alias = "gen",
+        after_help = "Shorthand: invoke this command as `mx gen`."
+    )]
     GenerateQwenMetal {
-        #[arg(long)]
+        /// Local Qwen3 checkpoint directory containing config.json and weights.
+        #[arg(long, value_name = "MODEL_DIR")]
         model: PathBuf,
         /// Comma-separated raw token IDs; defaults to 1,2,3 when --prompt is absent.
         #[arg(long, value_delimiter = ',', conflicts_with = "prompt")]
@@ -270,6 +285,9 @@ enum Command {
         /// Plain-text prompt (at most 1 MiB), encoded by local tokenizer.json without a chat template or special tokens.
         #[arg(long, conflicts_with = "input_ids")]
         prompt: Option<String>,
+        /// Render --prompt as one non-thinking user message using the checkpoint's local chat template.
+        #[arg(long, requires = "prompt")]
+        chat_template: bool,
         /// Generated-token limit; default is 32 resident or 4 streamed. Streamed prompt plus limit must fit 32.
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..=256))]
         max_tokens: Option<u32>,
@@ -306,6 +324,22 @@ enum Command {
         /// Render a bounded stderr summary; decoded text for --prompt or schema output, otherwise raw IDs.
         #[arg(long)]
         preview: bool,
+        /// Generate resident schema-constrained `{"intervals":[{"start":number,"end":number}]}` candidates and accept only non-overlap.
+        #[cfg(feature = "structured-output")]
+        #[arg(long)]
+        verify_schedule: bool,
+        /// Exact integer-tick durations and time window (local JSON, at most 64 KiB).
+        #[cfg(feature = "structured-output")]
+        #[arg(long, requires = "verify_schedule")]
+        schedule_requirements: Option<PathBuf>,
+        /// Maximum complete candidates considered by --verify-schedule.
+        #[cfg(feature = "structured-output")]
+        #[arg(long, default_value_t = 4, requires = "verify_schedule", value_parser = clap::value_parser!(u32).range(1..=16))]
+        max_attempts: u32,
+        /// Cooperative wall-clock ceiling for the full verifier request, including fork and verification work.
+        #[cfg(feature = "structured-output")]
+        #[arg(long, default_value_t = 60_000, requires = "verify_schedule", value_parser = clap::value_parser!(u64).range(1..=600_000))]
+        max_candidate_ms: u64,
         /// Constrain generated JSON using a local schema (32 KiB maximum).
         #[cfg(feature = "structured-output")]
         #[arg(long)]
@@ -590,6 +624,8 @@ enum QwenInspectCommand {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "metal")]
+        Command::Decide(args) => args.run(),
         Command::Fetch {
             command:
                 FetchCommand::Deepseek {
@@ -657,6 +693,7 @@ pub fn run() -> ExitCode {
             model,
             input_ids,
             prompt,
+            chat_template,
             max_tokens,
             memory_mode,
             max_weight_bytes,
@@ -670,14 +707,52 @@ pub fn run() -> ExitCode {
             seed,
             preview,
             #[cfg(feature = "structured-output")]
+            verify_schedule,
+            #[cfg(feature = "structured-output")]
+            schedule_requirements,
+            #[cfg(feature = "structured-output")]
+            max_attempts,
+            #[cfg(feature = "structured-output")]
+            max_candidate_ms,
+            #[cfg(feature = "structured-output")]
             json_schema,
             #[cfg(feature = "structured-output")]
             json_schema_inline,
         } => {
+            #[cfg(feature = "structured-output")]
+            let requirements = match schedule_requirements
+                .as_deref()
+                .map(schedule_requirements::ScheduleRequirements::load)
+                .transpose()
+            {
+                Ok(requirements) => requirements,
+                Err(error) => {
+                    eprintln!("Qwen schedule requirements failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let max_tokens = generation_max_tokens(memory_mode, max_tokens);
-            let (input_ids, tokenizer) = match generation_input(input_ids, prompt) {
-                Ok(GenerationInput::RawIds(input_ids)) => (input_ids, None),
+            let (input_ids, tokenizer, input_format) = match generation_input(input_ids, prompt) {
+                Ok(GenerationInput::RawIds(input_ids)) => (
+                    input_ids,
+                    None,
+                    qwen_forward::GenerationInputFormat {
+                        kind: "raw_token_ids",
+                        chat_template_sha256: None,
+                    },
+                ),
                 Ok(GenerationInput::Prompt(prompt)) => {
+                    let rendered = if chat_template {
+                        match render_generation_prompt(&model, &prompt) {
+                            Ok(rendered) => Some(rendered),
+                            Err(error) => {
+                                eprintln!("Qwen prompt failed: {error}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let tokenizer = match qwen_tokenizer::QwenTokenizer::load(&model) {
                         Ok(tokenizer) => tokenizer,
                         Err(error) => {
@@ -685,14 +760,30 @@ pub fn run() -> ExitCode {
                             return ExitCode::FAILURE;
                         }
                     };
-                    let input_ids = match tokenizer.encode_prompt(&prompt) {
+                    let input = rendered
+                        .as_ref()
+                        .map_or(&prompt, |rendered| &rendered.rendered);
+                    let input_ids = match tokenizer.encode_prompt(input) {
                         Ok(input_ids) => input_ids,
                         Err(error) => {
                             eprintln!("Qwen prompt failed: {error}");
                             return ExitCode::FAILURE;
                         }
                     };
-                    (input_ids, Some(tokenizer))
+                    (
+                        input_ids,
+                        Some(tokenizer),
+                        qwen_forward::GenerationInputFormat {
+                            kind: if rendered.is_some() {
+                                "qwen_chat_template_user_message"
+                            } else {
+                                "plain_text_prompt"
+                            },
+                            chat_template_sha256: rendered
+                                .as_ref()
+                                .map(|rendered| rendered.template_sha256.clone()),
+                        },
+                    )
                 }
                 Err(error) => {
                     eprintln!("Qwen prompt failed: {error}");
@@ -726,12 +817,21 @@ pub fn run() -> ExitCode {
                     // already bounded this `u32` to 1..=4096.
                     tile_rows: tile_rows.map(|rows| rows as usize),
                 },
+                #[cfg(feature = "structured-output")]
+                verify_schedule
+                    .then_some(qwen_forward::ScheduleVerificationConfig {
+                        max_attempts,
+                        max_elapsed_ms: max_candidate_ms,
+                        requirements,
+                    })
+                    .as_ref(),
                 qwen_forward::GenerationDiagnostics {
                     tokenizer: tokenizer.as_ref(),
                     verbose,
                     logprobs,
                     preview,
                     sampling,
+                    input_format,
                 },
                 #[cfg(feature = "structured-output")]
                 match (json_schema.as_deref(), json_schema_inline.as_deref()) {
@@ -882,6 +982,10 @@ pub fn run() -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "fetch orchestration keeps preflight, metadata, template, and artifact gates visible"
+)]
 fn fetch_deepseek(directory: &Path, metadata_only: bool, dry_run: bool, yes: bool) -> ExitCode {
     let weights = !metadata_only;
     if weights && !dry_run && !yes {
@@ -931,6 +1035,10 @@ fn fetch_deepseek(directory: &Path, metadata_only: bool, dry_run: bool, yes: boo
     }
     if dry_run {
         model.arg("--dry-run");
+        // Planning does not benefit from parallel workers and the HF CLI can
+        // otherwise race its local cache-marker initialization, emitting
+        // misleading lock-wait noise before the plan is printed.
+        model.arg("--max-workers").arg("1");
     }
     if !run_hf(&mut model) {
         return ExitCode::FAILURE;
@@ -947,6 +1055,10 @@ fn fetch_deepseek(directory: &Path, metadata_only: bool, dry_run: bool, yes: boo
         .arg(&source.template_revision)
         .arg("--local-dir")
         .arg(directory);
+    if dry_run {
+        template.arg("--dry-run");
+        template.arg("--max-workers").arg("1");
+    }
     if !run_hf(&mut template) {
         return ExitCode::FAILURE;
     }
@@ -2594,6 +2706,30 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    fn generation_template_flag_requires_a_prompt() {
+        assert!(Cli::try_parse_from(["mx", "gen", "--model", "model", "--chat-template"]).is_err());
+        let templated = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--prompt",
+            "plain prompt",
+            "--chat-template",
+        ])
+        .expect("templated prompt generation");
+        assert!(matches!(
+            templated.command,
+            super::Command::GenerateQwenMetal {
+                prompt: Some(prompt),
+                chat_template: true,
+                ..
+            } if prompt == "plain prompt"
+        ));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
     fn serve_generation_timeout_is_bounded_and_defaults_to_one_minute() {
         let default =
             Cli::try_parse_from(["mx", "serve", "--model", "model"]).expect("serve defaults");
@@ -2704,6 +2840,11 @@ mod tests {
         assert!(normalized_help.contains("without a chat template or special tokens"));
         assert!(
             normalized_help
+                .contains("Local Qwen3 checkpoint directory containing config.json and weights")
+        );
+        assert!(normalized_help.contains("Shorthand: invoke this command as `mx gen`."));
+        assert!(
+            normalized_help
                 .contains("decoded text for --prompt or schema output, otherwise raw IDs")
         );
     }
@@ -2780,6 +2921,55 @@ mod tests {
                 ..
             } if path == std::path::Path::new("schema.json")
         ));
+    }
+
+    #[cfg(all(feature = "metal", feature = "structured-output"))]
+    #[test]
+    fn schedule_verification_has_explicit_bounded_cli_controls() {
+        let cli = Cli::try_parse_from([
+            "mx",
+            "gen",
+            "--model",
+            "model",
+            "--verify-schedule",
+            "--sample",
+            "--temperature",
+            "0.8",
+            "--seed",
+            "9",
+            "--json-schema-inline",
+            r#"{"type":"object"}"#,
+            "--max-attempts",
+            "3",
+            "--max-candidate-ms",
+            "1200",
+            "--schedule-requirements",
+            "requirements.json",
+        ])
+        .expect("bounded schedule verifier arguments");
+        assert!(matches!(
+            cli.command,
+            super::Command::GenerateQwenMetal {
+                verify_schedule: true,
+                max_attempts: 3,
+                max_candidate_ms: 1200,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["mx", "gen", "--model", "model", "--max-attempts", "3"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mx",
+                "gen",
+                "--model",
+                "model",
+                "--schedule-requirements",
+                "requirements.json"
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(feature = "metal")]

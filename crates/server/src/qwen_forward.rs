@@ -53,7 +53,6 @@ impl GenerationConfig {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct GenerationDiagnostics<'a> {
     pub(crate) verbose: bool,
     pub(crate) logprobs: bool,
@@ -61,6 +60,34 @@ pub(crate) struct GenerationDiagnostics<'a> {
     pub(crate) sampling: Option<SamplingConfiguration>,
     /// Optional decoder for text in the output receipt; execution still uses IDs.
     pub(crate) tokenizer: Option<&'a crate::qwen_tokenizer::QwenTokenizer>,
+    /// Input preparation recorded in every ordinary and candidate receipt.
+    pub(crate) input_format: GenerationInputFormat,
+}
+
+/// The exact prompt preparation performed before Qwen payload loading.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenerationInputFormat {
+    pub(crate) kind: &'static str,
+    pub(crate) chat_template_sha256: Option<String>,
+}
+
+impl GenerationInputFormat {
+    fn report(&self) -> serde_json::Value {
+        json!({
+            "kind": self.kind,
+            "chat_template_sha256": self.chat_template_sha256.as_deref(),
+        })
+    }
+}
+
+/// Bounded whole-candidate schedule verification. This is intentionally a
+/// fixed local contract, not a general verifier/plugin execution surface.
+#[cfg(feature = "structured-output")]
+#[derive(Debug)]
+pub(crate) struct ScheduleVerificationConfig {
+    pub(crate) max_attempts: u32,
+    pub(crate) max_elapsed_ms: u64,
+    pub(crate) requirements: Option<crate::schedule_requirements::ScheduleRequirements>,
 }
 
 /// The explicit request settings for a reproducible categorical policy.
@@ -136,6 +163,7 @@ impl SamplingPolicy {
     ) -> Result<(i32, Option<serde_json::Value>), Box<dyn std::error::Error>> {
         // `ConstraintRun` owns grammar-state commit. Keep the corresponding
         // entropy transition private until it reports the same successful draw.
+        let checkpoint = constraint.checkpoint();
         let mut candidate_rng = self.rng.clone();
         let uniform = unit_uniform(candidate_rng.next_u64());
         let sampled = constraint.sample_categorical(
@@ -143,9 +171,19 @@ impl SamplingPolicy {
             self.configuration.temperature,
             uniform,
             logprobs,
-        )?;
-        self.rng = candidate_rng;
-        Ok(sampled)
+        );
+        match sampled {
+            Ok(sampled) => {
+                self.rng = candidate_rng;
+                Ok(sampled)
+            }
+            Err(error) => {
+                constraint.restore(checkpoint).map_err(|restore_error| {
+                    format!("{error}; rollback failed: {restore_error}")
+                })?;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -279,6 +317,15 @@ impl GenerationExecutor<'_> {
         }
     }
 
+    /// Forks a resident KV snapshot for opt-in branch verification. Streamed
+    /// weights do not expose a branchable executor and report `None`.
+    fn fork_prefilled(&self) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Resident(executor) => Ok(Some(Self::Resident(executor.fork_prefilled()?))),
+            Self::Streamed(_) => Ok(None),
+        }
+    }
+
     fn cached_tokens(&self) -> usize {
         match self {
             Self::Resident(executor) => executor.cached_tokens(),
@@ -301,12 +348,19 @@ impl GenerationExecutor<'_> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CLI boundary keeps optional schema and candidate policy explicit"
+)]
 pub(crate) fn generate(
     model: &Path,
     input_ids: &[i32],
     max_tokens: u32,
     verify_cache: bool,
     memory: GenerationMemoryConfig,
+    #[cfg(feature = "structured-output")] schedule_verification: Option<
+        &ScheduleVerificationConfig,
+    >,
     diagnostics: GenerationDiagnostics<'_>,
     #[cfg(feature = "structured-output")] schema_source: Option<SchemaSource<'_>>,
 ) -> ExitCode {
@@ -316,6 +370,8 @@ pub(crate) fn generate(
         max_tokens,
         verify_cache,
         memory,
+        #[cfg(feature = "structured-output")]
+        schedule_verification,
         diagnostics,
         #[cfg(feature = "structured-output")]
         schema_source,
@@ -330,6 +386,7 @@ pub(crate) fn generate(
 
 #[allow(
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     reason = "linear diagnostic driver keeps model, verification and optional sampling timing boundaries explicit"
 )]
 fn generate_inner(
@@ -338,6 +395,9 @@ fn generate_inner(
     max_tokens: u32,
     verify_cache: bool,
     memory: GenerationMemoryConfig,
+    #[cfg(feature = "structured-output")] schedule_verification: Option<
+        &ScheduleVerificationConfig,
+    >,
     diagnostics: GenerationDiagnostics<'_>,
     #[cfg(feature = "structured-output")] schema_source: Option<SchemaSource<'_>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -347,11 +407,40 @@ fn generate_inner(
         preview,
         sampling: sampling_configuration,
         tokenizer,
+        input_format,
     } = diagnostics;
+    let metadata = fs::metadata(model).map_err(|error| {
+        format!(
+            "--model must name a readable Qwen3 checkpoint directory ({}): {error}",
+            model.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "--model must name a Qwen3 checkpoint directory, not a file: {}",
+            model.display()
+        )
+        .into());
+    }
     if input_ids.len().saturating_add(max_tokens as usize) > qwen::forward::MAX_DENSE_DEBUG_TOKENS {
         return Err("prompt plus generation budget exceeds diagnostic context limit".into());
     }
     let streamed = memory.streamed_plan(input_ids.len(), max_tokens)?;
+    #[cfg(feature = "structured-output")]
+    if schedule_verification.is_some() {
+        if verify_cache {
+            return Err("--verify-schedule cannot combine with --verify-cache; candidate branch parity is not yet part of this receipt".into());
+        }
+        if streamed.is_some() {
+            return Err("--verify-schedule requires --memory-mode resident because candidate promotion needs resident KV forks".into());
+        }
+        if schema_source.is_none() {
+            return Err("--verify-schedule requires --json-schema or --json-schema-inline".into());
+        }
+        if sampling_configuration.is_none() {
+            return Err("--verify-schedule requires --sample with --temperature and --seed so retry streams are distinct".into());
+        }
+    }
     if verbose {
         let diagnostic = verbose_preflight(input_ids.len(), max_tokens, verify_cache, streamed);
         eprintln!("{diagnostic}");
@@ -362,11 +451,7 @@ fn generate_inner(
     if let Some(tokenizer) = tokenizer {
         tokenizer.check_model_vocabulary(generation.vocab_size, generation.eos_token_id)?;
     }
-    #[cfg(feature = "structured-output")]
-    let mut constraint = schema_source
-        .map(|source| crate::qwen_constraints::ConstraintRun::load(model, source))
-        .transpose()?;
-    let started = Instant::now();
+    let request_started = Instant::now();
     let resident_weights = if streamed.is_none() {
         let mut weights = Qwen3MlxWeights::load(model)?;
         weights.prepare_float32()?;
@@ -392,7 +477,7 @@ fn generate_inner(
                 .executor(),
         ),
     };
-    let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let load_ms = request_started.elapsed().as_secs_f64() * 1000.0;
     // Stream profiles are opt-in diagnostics. Enable before prefill so each
     // cache-mutating candidate phase records exactly one consumed sample.
     executor.enable_profiling(verbose);
@@ -428,10 +513,37 @@ fn generate_inner(
             "qwen generation diagnostic: phase=prefill prefill_ms={prefill_ms:.3} cached_tokens={cached_tokens} logical_kv_bytes={logical_kv_bytes}",
         );
     }
+    #[cfg(feature = "structured-output")]
+    if let Some(schedule_config) = schedule_verification {
+        return generate_schedule_candidates(
+            model,
+            &raw,
+            input_ids,
+            max_tokens,
+            &mut executor,
+            &logits,
+            load_ms,
+            prefill_ms,
+            request_started,
+            schedule_config,
+            sampling_configuration.ok_or("schedule verification sampling policy is unavailable")?,
+            schema_source.ok_or("schedule verification schema is unavailable")?,
+            &input_format,
+            verbose,
+            logprobs,
+            preview,
+        );
+    }
+    #[cfg(feature = "structured-output")]
+    let mut constraint = schema_source
+        .map(|source| crate::qwen_constraints::ConstraintRun::load(model, source))
+        .transpose()?;
     let mut prefix = input_ids.to_vec();
     let mut generated = Vec::new();
     let mut decode_ms = Vec::new();
     let mut comparisons = Vec::new();
+    let mut branch_comparisons = Vec::new();
+    let mut branch_checked_positions = Vec::new();
     let mut token_scores = Vec::new();
     let mut finish_reason = "length";
     let mut streamed_oracle: Option<Qwen3MlxWeights> = None;
@@ -495,9 +607,30 @@ fn generate_inner(
         }
         if step + 1 < max_tokens {
             prefix.push(token);
+            let mut branch = if verify_cache {
+                executor.fork_prefilled()?
+            } else {
+                None
+            };
+            let branch_logits = if let Some(branch_executor) = branch.as_mut() {
+                Some(branch_executor.decode_last_logits(token)?)
+            } else {
+                None
+            };
             let started = Instant::now();
             logits = executor.decode_last_logits(token)?;
             decode_ms.push(started.elapsed().as_secs_f64() * 1000.0);
+            if let Some(branch_logits) = branch_logits {
+                let result = compare_logits(&logits, &branch_logits)?;
+                if !result.passed() {
+                    return Err(format!(
+                        "parent/branch logits differ after generation step {step}: {result:?}"
+                    )
+                    .into());
+                }
+                branch_comparisons.push(result);
+                branch_checked_positions.push(prefix.len() - 1);
+            }
             if verbose {
                 record_stream_profile(&mut executor, &mut phase_profiles, "decode", step + 1)?;
             }
@@ -522,6 +655,7 @@ fn generate_inner(
     "schema_version": 1,
     "operation": if sampled { "qwen3_sampled_cached_generation" } else { "qwen3_greedy_cached_generation" },
     "backend": "mlx-rs 0.25.3 Metal float32",
+    "input_format": input_format.report(),
     "input_ids": input_ids,
     "generated_ids": generated,
     "finish_reason": finish_reason,
@@ -531,6 +665,18 @@ fn generate_inner(
     "cached_tokens": executor.cached_tokens(),
     "logical_kv_bytes": executor.kv_bytes(),
     "cache_comparisons": comparisons,
+    "branch_comparison_count": branch_comparisons.len(),
+    "branch_checked_token_positions": branch_checked_positions,
+    "branch_comparisons": branch_comparisons,
+    "branch_verification": if !verify_cache {
+        "not_requested"
+    } else if streamed.is_some() {
+        "not_available_streamed"
+    } else if branch_comparisons.is_empty() {
+        "not_run_no_eligible_decode"
+    } else {
+        "resident_fork_parent_match"
+    },
     "scope": "single sequence; contiguous KV; first prefill not warmed; verification excluded from timed regions but may warm execution"
     });
     if let Some(tokenizer) = tokenizer {
@@ -613,6 +759,343 @@ fn generate_inner(
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "structured-output")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn generate_schedule_candidates(
+    model: &Path,
+    model_config_json: &str,
+    input_ids: &[i32],
+    max_tokens: u32,
+    parent: &mut GenerationExecutor<'_>,
+    prompt_logits: &[f32],
+    load_ms: f64,
+    prefill_ms: f64,
+    request_started: Instant,
+    config: &ScheduleVerificationConfig,
+    sampling: SamplingConfiguration,
+    schema_source: SchemaSource<'_>,
+    input_format: &GenerationInputFormat,
+    verbose: bool,
+    logprobs: bool,
+    preview: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sha2::Digest;
+    let mut attempts = Vec::new();
+    let mut constraint_identity = serde_json::Value::Null;
+    let mut constraint_owner = None;
+    let mut constraint_setup_ms = 0.0;
+    let mut total_generated_tokens = 0_u64;
+    let mut total_decode_ms = 0.0;
+    let mut total_fork_ms = 0.0;
+    let mut total_verifier_ms = 0.0;
+    let max_total_generated_tokens = u64::from(config.max_attempts) * u64::from(max_tokens);
+    let mut accepted = None;
+    let mut exhaustion_reason = "attempt_limit";
+
+    for index in 0..config.max_attempts {
+        if request_started.elapsed() >= std::time::Duration::from_millis(config.max_elapsed_ms) {
+            exhaustion_reason = "elapsed_limit";
+            break;
+        }
+        let attempt_seed = schedule_attempt_seed(sampling.seed, index);
+        let fork_started = Instant::now();
+        let mut child = parent
+            .fork_prefilled()?
+            .ok_or("schedule verification requires a resident forkable executor")?;
+        let fork_ms = elapsed_ms(fork_started);
+        total_fork_ms += fork_ms;
+        if constraint_owner.is_none() {
+            let setup_started = Instant::now();
+            let constraint = ConstraintRun::load(model, schema_source)?;
+            constraint_identity = constraint.identity();
+            constraint_owner = Some(constraint);
+            constraint_setup_ms = elapsed_ms(setup_started);
+        }
+        let constraint = constraint_owner
+            .as_mut()
+            .ok_or("candidate constraint state is unavailable")?;
+        let checkpoint = constraint.checkpoint();
+        let mut policy = SamplingPolicy::new(
+            SamplingConfiguration {
+                seed: attempt_seed,
+                temperature: sampling.temperature,
+            },
+            prompt_logits.len(),
+        );
+        let mut logits = prompt_logits.to_vec();
+        let mut generated = Vec::new();
+        let mut token_scores = Vec::new();
+        let mut decode_ms = Vec::new();
+        let mut timeout = false;
+
+        for step in 0..max_tokens {
+            if request_started.elapsed() >= std::time::Duration::from_millis(config.max_elapsed_ms)
+            {
+                timeout = true;
+                break;
+            }
+            let (token, scores) = policy.sample_constrained(constraint, &logits, logprobs)?;
+            if let Some(mut scores) = scores {
+                scores["token_id"] = json!(token);
+                token_scores.push(scores);
+            }
+            generated.push(token);
+            if constraint.is_complete() {
+                break;
+            }
+            if step + 1 < max_tokens {
+                let decode_started = Instant::now();
+                logits = child.decode_last_logits(token)?;
+                decode_ms.push(elapsed_ms(decode_started));
+            }
+        }
+        let generated_tokens = u64::try_from(generated.len())?;
+        total_generated_tokens += generated_tokens;
+        let attempt_decode_ms = decode_ms.iter().sum::<f64>();
+        total_decode_ms += attempt_decode_ms;
+
+        if timeout {
+            attempts.push(json!({
+                "index": index,
+                "seed": attempt_seed,
+                "status": "incomplete",
+                "reason": "elapsed_limit",
+                "generated_tokens": generated_tokens,
+                "fork_ms": fork_ms,
+                "decode_ms": attempt_decode_ms,
+            }));
+            exhaustion_reason = "elapsed_limit";
+            break;
+        }
+        if !constraint.is_complete() {
+            attempts.push(json!({
+                "index": index,
+                "seed": attempt_seed,
+                "status": "incomplete",
+                "reason": "generation_budget",
+                "generated_tokens": generated_tokens,
+                "fork_ms": fork_ms,
+                "decode_ms": attempt_decode_ms,
+            }));
+            constraint.restore(checkpoint)?;
+            continue;
+        }
+
+        if request_started.elapsed() >= std::time::Duration::from_millis(config.max_elapsed_ms) {
+            attempts.push(json!({
+                "index": index,
+                "seed": attempt_seed,
+                "status": "incomplete",
+                "reason": "elapsed_limit",
+                "generated_tokens": generated_tokens,
+                "fork_ms": fork_ms,
+                "decode_ms": attempt_decode_ms,
+            }));
+            exhaustion_reason = "elapsed_limit";
+            break;
+        }
+        let verification_started = Instant::now();
+        let output = constraint.validated_output()?;
+        let mut semantic = crate::qwen_constraints::verify_non_overlapping_schedule(&output);
+        if semantic.accepted() {
+            semantic.rejection = config
+                .requirements
+                .as_ref()
+                .and_then(|requirements| requirements.rejection(&output));
+        }
+        let verifier_ms = elapsed_ms(verification_started);
+        total_verifier_ms += verifier_ms;
+        if semantic.accepted() {
+            if request_started.elapsed() >= std::time::Duration::from_millis(config.max_elapsed_ms)
+            {
+                attempts.push(json!({
+                    "index": index,
+                    "seed": attempt_seed,
+                    "status": "incomplete",
+                    "reason": "elapsed_limit",
+                    "generated_tokens": generated_tokens,
+                    "fork_ms": fork_ms,
+                    "decode_ms": attempt_decode_ms,
+                    "verifier_ms": verifier_ms,
+                }));
+                exhaustion_reason = "elapsed_limit";
+                break;
+            }
+            // Materialize the terminal grammar token before promotion. The
+            // resulting resident child therefore contains the entire accepted
+            // candidate, even though its next logits are intentionally unused.
+            let materialize_started = Instant::now();
+            let terminal = *generated
+                .last()
+                .ok_or("complete grammar candidate has no terminal token")?;
+            let _ = child.decode_last_logits(terminal)?;
+            let terminal_decode_ms = elapsed_ms(materialize_started);
+            decode_ms.push(terminal_decode_ms);
+            let attempt_decode_ms = decode_ms.iter().sum::<f64>();
+            total_decode_ms += terminal_decode_ms;
+            if request_started.elapsed() >= std::time::Duration::from_millis(config.max_elapsed_ms)
+            {
+                attempts.push(json!({
+                    "index": index,
+                    "seed": attempt_seed,
+                    "status": "incomplete",
+                    "reason": "elapsed_limit",
+                    "generated_tokens": generated_tokens,
+                    "fork_ms": fork_ms,
+                    "decode_ms": attempt_decode_ms,
+                    "verifier_ms": verifier_ms,
+                }));
+                exhaustion_reason = "elapsed_limit";
+                break;
+            }
+            attempts.push(json!({
+                "index": index,
+                "seed": attempt_seed,
+                "status": "accepted",
+                "generated_tokens": generated_tokens,
+                "interval_count": semantic.interval_count,
+                "fork_ms": fork_ms,
+                "decode_ms": attempt_decode_ms,
+                "terminal_token_materialized": true,
+                "verifier_ms": verifier_ms,
+            }));
+            // This is the commit point: every rejected child has been dropped,
+            // while the accepted child becomes the request's resident state.
+            *parent = child;
+            let committed_constraint = constraint_owner
+                .take()
+                .ok_or("accepted constraint state is unavailable")?;
+            accepted = Some((
+                index,
+                generated,
+                token_scores,
+                decode_ms,
+                committed_constraint,
+            ));
+            break;
+        }
+        attempts.push(json!({
+            "index": index,
+            "seed": attempt_seed,
+            "status": "rejected",
+            "reason": semantic.rejection,
+            "generated_tokens": generated_tokens,
+            "interval_count": semantic.interval_count,
+            "fork_ms": fork_ms,
+            "decode_ms": attempt_decode_ms,
+            "verifier_ms": verifier_ms,
+        }));
+        constraint.restore(checkpoint)?;
+    }
+
+    let accepted_status = accepted.is_some();
+    let (generated, token_scores, decode_ms, constraint, finish_reason, accepted_attempt) =
+        if let Some((index, generated, token_scores, decode_ms, constraint)) = accepted {
+            (
+                generated,
+                token_scores,
+                decode_ms,
+                Some(constraint),
+                "grammar_complete",
+                Some(index),
+            )
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                "verification_exhausted",
+                None,
+            )
+        };
+    let mut report = json!({
+        "schema_version": 1,
+        "operation": "qwen3_verified_schedule_candidate",
+        "model_directory": model,
+        "config_json_sha256": format!("{:x}", sha2::Sha256::digest(model_config_json.as_bytes())),
+        "model_identity_scope": "local model directory and config bytes; checkpoint weights are not fingerprinted",
+        "sampling": sampling.report(),
+        "constraint_identity": constraint_identity,
+        "backend": "mlx-rs 0.25.3 Metal float32",
+        "input_format": input_format.report(),
+        "input_ids": input_ids,
+        "generated_ids": generated,
+        "finish_reason": finish_reason,
+        "load_ms": load_ms,
+        "prefill_ms": prefill_ms,
+        "decode_ms": decode_ms,
+        "cached_tokens": parent.cached_tokens(),
+        "logical_kv_bytes": parent.kv_bytes(),
+        "branch_verification": "candidate_children_forked_and_discarded_or_promoted",
+        "sampling_policy": {
+            "base": sampling.report(),
+            "attempt_seed_derivation": "splitmix64(base_seed + (attempt_index + 1) * 0x9E3779B97F4A7C15, wrapping arithmetic)",
+        },
+        "candidate_verification": {
+            "kind": if config.requirements.is_some() { "deterministic_schedule_requirements" } else { "deterministic_schedule_non_overlap" },
+            "requirements": config.requirements.as_ref().map(crate::schedule_requirements::ScheduleRequirements::report),
+            "status": if accepted_status { "accepted" } else { "exhausted" },
+            "accepted_attempt": accepted_attempt,
+            "exhaustion_reason": if accepted_status { serde_json::Value::Null } else { json!(exhaustion_reason) },
+            "max_attempts": config.max_attempts,
+            "max_elapsed_ms": config.max_elapsed_ms,
+            "max_total_generated_tokens": max_total_generated_tokens,
+            "total_generated_tokens": total_generated_tokens,
+            "attempts": attempts,
+            "costs_ms": {
+                "load": load_ms,
+                "prefill": prefill_ms,
+                "constraint_setup": constraint_setup_ms,
+                "fork_total": total_fork_ms,
+                "decode_total": total_decode_ms,
+                "verifier_total": total_verifier_ms,
+                "request_total": elapsed_ms(request_started),
+            },
+            "scope": "fixed local verifier for nonempty half-open intervals at output.intervals; adjacency is permitted; supplied requirements additionally enforce exact integer-tick count, durations and window; no requirements are inferred from prompt text; rejected candidate output is omitted",
+        },
+        "scope": "resident Qwen prompt KV forks; accepted child KV includes its terminal grammar token; complete grammar-constrained candidates are accepted only after deterministic schedule verification; candidate attempts are bounded by count, token budget, and cooperative elapsed time",
+    });
+    if let Some(constraint) = constraint.as_ref() {
+        report["constraint"] = constraint.report(verbose, true)?;
+    }
+    if logprobs && accepted_status {
+        report["logprobs"] = json!({
+            "log_base": "e",
+            "tokens": token_scores,
+            "scope": "selected-token scores for the accepted candidate only; rejected candidate output and token scores are omitted",
+        });
+    }
+    if preview {
+        crate::generation_preview::emit(&report);
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if accepted_status {
+        Ok(())
+    } else {
+        Err(format!("schedule verification exhausted: {exhaustion_reason}").into())
+    }
+}
+
+#[cfg(feature = "structured-output")]
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+/// `SplitMix64` gives each bounded candidate an independently derived reproducible
+/// entropy stream without exposing a retry as the same rejected draw.
+#[cfg(feature = "structured-output")]
+fn schedule_attempt_seed(request_seed: u64, attempt_index: u32) -> u64 {
+    let mut state = request_seed.wrapping_add(
+        u64::from(attempt_index)
+            .wrapping_add(1)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    );
+    state = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    state = (state ^ (state >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    state ^ (state >> 31)
 }
 
 fn verbose_preflight(
@@ -832,14 +1315,13 @@ fn measure(
 #[cfg(test)]
 mod tests {
     use super::{
-        GenerationMemoryConfig, GenerationMemoryMode, SamplingConfiguration, SamplingPolicy,
-        selected_model_logprob, unit_uniform, verbose_preflight,
+        GenerationInputFormat, GenerationMemoryConfig, GenerationMemoryMode, SamplingConfiguration,
+        SamplingPolicy, selected_model_logprob, unit_uniform, verbose_preflight,
     };
     #[cfg(feature = "structured-output")]
     use engine::constraint::{ConstraintLimits, JsonConstraintSession};
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
-    #[cfg(feature = "structured-output")]
     use serde_json::json;
 
     #[cfg(feature = "structured-output")]
@@ -946,6 +1428,28 @@ mod tests {
     }
 
     #[test]
+    fn generation_input_format_receipt_retains_template_identity() {
+        let plain = GenerationInputFormat {
+            kind: "plain_text_prompt",
+            chat_template_sha256: None,
+        };
+        assert_eq!(plain.report()["kind"], "plain_text_prompt");
+        assert!(plain.report()["chat_template_sha256"].is_null());
+
+        let templated = GenerationInputFormat {
+            kind: "qwen_chat_template_user_message",
+            chat_template_sha256: Some(String::from("aabb")),
+        };
+        assert_eq!(
+            templated.report(),
+            json!({
+                "kind": "qwen_chat_template_user_message",
+                "chat_template_sha256": "aabb",
+            })
+        );
+    }
+
+    #[test]
     fn seeded_policy_replays_and_matches_analytic_raw_and_deployed_logprobs() {
         let configuration = SamplingConfiguration {
             seed: 7,
@@ -1006,6 +1510,31 @@ mod tests {
         }
         assert_eq!(unit_uniform(0).to_bits(), 0.0_f64.to_bits());
         assert_eq!(unit_uniform(u64::MAX).to_bits(), 0x3fef_ffff_ffff_ffff);
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn schedule_attempt_streams_are_reproducible_and_distinct() {
+        let first = (0..4)
+            .map(|index| super::schedule_attempt_seed(91, index))
+            .collect::<Vec<_>>();
+        let replay = (0..4)
+            .map(|index| super::schedule_attempt_seed(91, index))
+            .collect::<Vec<_>>();
+        assert_eq!(first, replay);
+        assert_eq!(
+            first.len(),
+            first
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+        assert_ne!(first[0], 91);
+        assert_ne!(
+            super::schedule_attempt_seed(u64::MAX, 15),
+            super::schedule_attempt_seed(u64::MAX, 14)
+        );
     }
 
     #[test]
@@ -1161,6 +1690,44 @@ mod tests {
         assert!(
             (sampling_logprob - (2.0 * selected - (1.0_f64 + 2.0_f64.exp()).ln())).abs() < 1e-12
         );
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn reused_candidate_constraint_restores_partial_and_terminal_attempts() {
+        let mut constraint = constrained_run(1_024);
+        for (tokens, complete, expected) in [
+            (vec![10, 11], false, "fa"),
+            (vec![10, 11, 12, 13, 9, 14], true, "false"),
+        ] {
+            let checkpoint = constraint.checkpoint();
+            for token in tokens {
+                constraint
+                    .sample(&forced_constraint_logits(token), false)
+                    .unwrap();
+                if constraint.is_complete() {
+                    break;
+                }
+            }
+            assert_eq!(constraint.is_complete(), complete);
+            assert_eq!(constraint.decoded_bytes(), expected.as_bytes());
+            constraint.restore(checkpoint).unwrap();
+            assert!(!constraint.is_complete());
+            assert!(constraint.decoded_bytes().is_empty());
+            assert_eq!(
+                constraint.report(false, false).unwrap()["sampling_ms"],
+                json!([])
+            );
+        }
+        for token in [6, 7, 8, 9, 14] {
+            constraint
+                .sample(&forced_constraint_logits(token), false)
+                .unwrap();
+            if constraint.is_complete() {
+                break;
+            }
+        }
+        assert_eq!(constraint.validated_output().unwrap(), json!(true));
     }
 
     #[cfg(feature = "structured-output")]

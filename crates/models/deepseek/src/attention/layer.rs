@@ -40,8 +40,8 @@ pub struct LayerAttentionLayout {
     window: NonZeroUsize,
     groups: NonZeroUsize,
     output_rank: NonZeroUsize,
-    expected_source_layer: u16,
-    compressed_ratio: NonZeroUsize,
+    expected_source_layer: Option<u16>,
+    compressed_ratio: Option<NonZeroUsize>,
     norm_epsilon_bits: u32,
     softmax_scale_bits: u32,
 }
@@ -69,6 +69,76 @@ impl LayerAttentionLayout {
         output_rank: NonZeroUsize,
         expected_source_layer: u16,
         compressed_ratio: NonZeroUsize,
+        norm_epsilon: f32,
+        softmax_scale: f32,
+    ) -> Result<Self, LayerAttentionLayoutError> {
+        Self::new_inner(
+            batches,
+            hidden_dimension,
+            heads,
+            head_dimension,
+            rope_pairs,
+            q_rank,
+            window,
+            groups,
+            output_rank,
+            Some((expected_source_layer, compressed_ratio)),
+            norm_epsilon,
+            softmax_scale,
+        )
+    }
+
+    /// Creates the source-shaped window-only layout used by a layer without a
+    /// compressed-KV publication.  It cannot be passed to [`LayerAttentionState::forward`];
+    /// use [`LayerAttentionState::forward_window_only`] instead.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the source-visible attention dimensions remain explicit"
+    )]
+    pub fn new_window_only(
+        batches: NonZeroUsize,
+        hidden_dimension: NonZeroUsize,
+        heads: NonZeroUsize,
+        head_dimension: NonZeroUsize,
+        rope_pairs: NonZeroUsize,
+        q_rank: NonZeroUsize,
+        window: NonZeroUsize,
+        groups: NonZeroUsize,
+        output_rank: NonZeroUsize,
+        norm_epsilon: f32,
+        softmax_scale: f32,
+    ) -> Result<Self, LayerAttentionLayoutError> {
+        Self::new_inner(
+            batches,
+            hidden_dimension,
+            heads,
+            head_dimension,
+            rope_pairs,
+            q_rank,
+            window,
+            groups,
+            output_rank,
+            None,
+            norm_epsilon,
+            softmax_scale,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared constructor keeps compressed and window-only layouts identical"
+    )]
+    fn new_inner(
+        batches: NonZeroUsize,
+        hidden_dimension: NonZeroUsize,
+        heads: NonZeroUsize,
+        head_dimension: NonZeroUsize,
+        rope_pairs: NonZeroUsize,
+        q_rank: NonZeroUsize,
+        window: NonZeroUsize,
+        groups: NonZeroUsize,
+        output_rank: NonZeroUsize,
+        compression: Option<(u16, NonZeroUsize)>,
         norm_epsilon: f32,
         softmax_scale: f32,
     ) -> Result<Self, LayerAttentionLayoutError> {
@@ -149,8 +219,8 @@ impl LayerAttentionLayout {
             window,
             groups,
             output_rank,
-            expected_source_layer,
-            compressed_ratio,
+            expected_source_layer: compression.map(|(layer, _)| layer),
+            compressed_ratio: compression.map(|(_, ratio)| ratio),
             norm_epsilon_bits: norm_epsilon.to_bits(),
             softmax_scale_bits: softmax_scale.to_bits(),
         })
@@ -159,7 +229,10 @@ impl LayerAttentionLayout {
     /// The producer layer accepted for compressed numerical publications.
     #[must_use]
     pub const fn expected_source_layer(self) -> u16 {
-        self.expected_source_layer
+        match self.expected_source_layer {
+            Some(layer) => layer,
+            None => 0,
+        }
     }
 }
 
@@ -376,6 +449,9 @@ impl LayerAttentionState {
         weights: LayerAttentionWeights<'_>,
         publication: CompressedAttentionPublication<'_>,
     ) -> Result<LayerAttentionDiagnostic, LayerAttentionError> {
+        if self.layout.compressed_ratio.is_none() {
+            return Err(LayerAttentionError::WindowOnlyLayoutRequiresWindowMethod);
+        }
         let positions = self.input_positions(attention_input)?;
         let (step, reset_epoch) = self.validate_transition(start_position, positions)?;
         let expected_epoch = if reset_epoch {
@@ -406,7 +482,7 @@ impl LayerAttentionState {
             positions,
             frequencies,
             weights,
-            publication,
+            Some(publication),
             step,
         )?;
         let sparse_output = self.sparse_output(&query.q_after_rope, &window, positions, weights)?;
@@ -444,6 +520,91 @@ impl LayerAttentionState {
         self.ring = window.staged_ring;
         self.next_position = Some(next_position);
         self.epoch = expected_epoch;
+        self.next_call_id = next_call_id;
+        Ok(LayerAttentionDiagnostic {
+            wq_a: query.wq_a,
+            qr: query.qr,
+            wq_b_pre_rope: query.wq_b_pre_rope,
+            q_after_rope: query.q_after_rope,
+            prepared_window: window.prepared_window,
+            window_read: window.window_read,
+            window_indices: window.window_indices,
+            ring_after,
+            sparse_output,
+            final_output,
+        })
+    }
+
+    /// Computes one source-shaped attention call with only its local window.
+    ///
+    /// This path deliberately has no compressed-KV publication, producer
+    /// identity, or index concatenation.  It retains the same request-local
+    /// ring transition and all query, sparse, and output stages as [`Self::forward`].
+    pub fn forward_window_only(
+        &mut self,
+        attention_input: &[u16],
+        start_position: usize,
+        frequencies: &[RotaryFrequency],
+        weights: LayerAttentionWeights<'_>,
+    ) -> Result<LayerAttentionDiagnostic, LayerAttentionError> {
+        if self.layout.compressed_ratio.is_some() {
+            return Err(LayerAttentionError::CompressedLayoutRequiresPublication);
+        }
+        let positions = self.input_positions(attention_input)?;
+        let (step, reset_epoch) = self.validate_transition(start_position, positions)?;
+        let query = self.prepare_query(attention_input, positions, frequencies, weights)?;
+        let window = self.prepare_window(
+            attention_input,
+            start_position,
+            positions,
+            frequencies,
+            weights,
+            None,
+            step,
+        )?;
+        let sparse_output = self.sparse_output(&query.q_after_rope, &window, positions, weights)?;
+        let output_layout = AttentionOutputLayout::new(
+            self.layout.batches.get(),
+            positions,
+            self.layout.heads.get(),
+            self.layout.head_dimension.get(),
+            self.layout.rope_pairs.get(),
+            self.layout.groups.get(),
+            self.layout.output_rank.get(),
+            self.layout.hidden_dimension.get(),
+        )?;
+        let final_output = attention_output_reference(
+            &sparse_output,
+            frequencies,
+            weights.wo_a,
+            weights.wo_b.codes,
+            weights.wo_b.scales,
+            output_layout,
+        )?;
+        let next_position =
+            start_position
+                .checked_add(positions)
+                .ok_or(LayerAttentionError::ShapeOverflow {
+                    field: "next position",
+                })?;
+        let next_call_id = if start_position == 0 {
+            1
+        } else {
+            self.next_call_id
+                .checked_add(1)
+                .ok_or(LayerAttentionError::CallIdOverflow)?
+        };
+        let next_epoch = if reset_epoch {
+            self.epoch
+                .checked_add(1)
+                .ok_or(LayerAttentionError::EpochOverflow)?
+        } else {
+            self.epoch
+        };
+        let ring_after = window.staged_ring.clone();
+        self.ring = window.staged_ring;
+        self.next_position = Some(next_position);
+        self.epoch = next_epoch;
         self.next_call_id = next_call_id;
         Ok(LayerAttentionDiagnostic {
             wq_a: query.wq_a,
@@ -518,7 +679,7 @@ impl LayerAttentionState {
         positions: usize,
         frequencies: &[RotaryFrequency],
         weights: LayerAttentionWeights<'_>,
-        publication: CompressedAttentionPublication<'_>,
+        publication: Option<CompressedAttentionPublication<'_>>,
         step: WindowStep,
     ) -> Result<WindowStages, LayerAttentionError> {
         let rows = checked_product(&[self.layout.batches.get(), positions], "input rows")?;
@@ -574,22 +735,29 @@ impl LayerAttentionState {
         } else {
             (staged_ring.clone(), self.layout.window.get())
         };
-        let compressed_keys = self.compressed_keys(publication)?;
-        let shared_kv = concatenate_kv(
-            &window_read,
-            window_keys,
-            publication.numerical_bf16,
-            compressed_keys,
-            self.layout.batches.get(),
-            self.layout.head_dimension.get(),
-        )?;
         let window_indices = window_topk_indices(step, self.layout.window, self.layout.batches)?;
-        let indices = concatenate_indices(
-            &window_indices,
-            publication.indices,
-            self.layout.batches.get(),
-            positions,
-        )?;
+        let (shared_kv, indices, compressed_keys) = if let Some(publication) = publication {
+            let compressed_keys = self.compressed_keys(publication)?;
+            (
+                concatenate_kv(
+                    &window_read,
+                    window_keys,
+                    publication.numerical_bf16,
+                    compressed_keys,
+                    self.layout.batches.get(),
+                    self.layout.head_dimension.get(),
+                )?,
+                concatenate_indices(
+                    &window_indices,
+                    publication.indices,
+                    self.layout.batches.get(),
+                    positions,
+                )?,
+                compressed_keys,
+            )
+        } else {
+            (window_read.clone(), window_indices.clone(), 0)
+        };
         Ok(WindowStages {
             prepared_window,
             window_read,
@@ -716,7 +884,11 @@ impl LayerAttentionState {
                 .ok_or(LayerAttentionError::ShapeOverflow {
                     field: "compressed key position",
                 })?
-                / self.layout.compressed_ratio.get();
+                / self
+                    .layout
+                    .compressed_ratio
+                    .expect("compressed forward validated its layout")
+                    .get();
         if compressed_keys != expected_compressed_keys {
             return Err(LayerAttentionError::CompressedKeyCount {
                 actual: compressed_keys,
@@ -732,10 +904,14 @@ impl LayerAttentionState {
         epoch: u64,
         call_id: u64,
     ) -> Result<(), LayerAttentionError> {
-        if publication.source_layer != self.layout.expected_source_layer {
+        let expected_source_layer = self
+            .layout
+            .expected_source_layer
+            .expect("compressed forward validated its layout");
+        if publication.source_layer != expected_source_layer {
             return Err(LayerAttentionError::WrongSourceLayer {
                 actual: publication.source_layer,
-                expected: self.layout.expected_source_layer,
+                expected: expected_source_layer,
             });
         }
         if publication.epoch != epoch {
@@ -824,7 +1000,11 @@ impl LayerAttentionState {
                     .ok_or(LayerAttentionError::ShapeOverflow {
                         field: "causal position",
                     })?
-                    / self.layout.compressed_ratio.get();
+                    / self
+                        .layout
+                        .compressed_ratio
+                        .expect("compressed forward validated its layout")
+                        .get();
                 if index - window_keys >= causal {
                     return Err(LayerAttentionError::FutureCompressedIndex {
                         slot,
@@ -995,6 +1175,10 @@ pub enum LayerAttentionError {
         expected: Option<usize>,
         actual: usize,
     },
+    #[error("a window-only attention layout requires forward_window_only")]
+    WindowOnlyLayoutRequiresWindowMethod,
+    #[error("a compressed attention layout requires a compressed publication")]
+    CompressedLayoutRequiresPublication,
     #[error("compressed publication source layer {actual} is not expected layer {expected}")]
     WrongSourceLayer { actual: u16, expected: u16 },
     #[error("compressed publication epoch {actual} is not expected epoch {expected}")]

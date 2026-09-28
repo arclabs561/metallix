@@ -34,6 +34,7 @@ pub(crate) fn render(report: &Value, color: bool) -> String {
     );
 
     render_timing_summary(&mut output, report);
+    render_candidate_preview(&mut output, report);
     render_constraint_preview(&mut output, report);
     render_cache_summary(&mut output, report);
     render_logprob_preview(&mut output, report, color);
@@ -64,7 +65,41 @@ fn render_timing_summary(output: &mut String, report: &Value) {
     output.push('\n');
 }
 
+fn render_candidate_preview(output: &mut String, report: &Value) {
+    let Some(candidate) = report.get("candidate_verification") else {
+        return;
+    };
+    if let Some(status) = candidate.get("status").and_then(Value::as_str) {
+        line(
+            output,
+            "candidate_verification",
+            &sanitize_terminal_text(status),
+        );
+    }
+    if let Some(attempts) = candidate.get("attempts").and_then(Value::as_array) {
+        line(output, "candidate_attempts", &attempts.len().to_string());
+    }
+    if let Some(tokens) = candidate
+        .get("total_generated_tokens")
+        .and_then(Value::as_u64)
+    {
+        line(
+            output,
+            "candidate_total_generated_tokens",
+            &tokens.to_string(),
+        );
+    }
+}
+
 fn render_constraint_preview(output: &mut String, report: &Value) {
+    if let Some(branch) = report.get("branch_verification").and_then(Value::as_str) {
+        line(
+            output,
+            "branch_verification",
+            &sanitize_terminal_text(branch),
+        );
+    }
+
     let constraint = report.get("constraint").and_then(Value::as_object);
     if let Some(constraint) = constraint {
         let status = constraint
@@ -72,6 +107,18 @@ fn render_constraint_preview(output: &mut String, report: &Value) {
             .and_then(Value::as_str)
             .map_or_else(|| String::from("unavailable"), sanitize_terminal_text);
         line(output, "constraint_status", &status);
+        if let Some(verification) = constraint
+            .get("verification")
+            .and_then(Value::as_object)
+            .and_then(|verification| verification.get("status"))
+            .and_then(Value::as_str)
+        {
+            line(
+                output,
+                "constraint_verification",
+                &sanitize_terminal_text(verification),
+            );
+        }
         if let Some(text) = constraint.get("generated_text").and_then(Value::as_str) {
             line(output, "output_text", &sanitize_terminal_text(text));
             return;
@@ -350,6 +397,61 @@ mod tests {
 
         assert!(preview.contains("raw_token_ids: 7,8"));
         assert!(!preview.contains("output_text:"));
+    }
+
+    #[test]
+    fn exhausted_candidates_show_cost_without_accepted_output() {
+        let preview = render(
+            &json!({
+                "candidate_verification": {
+                    "status": "exhausted",
+                    "attempts": [{"status": "rejected"}, {"status": "incomplete"}],
+                    "total_generated_tokens": 17,
+                },
+                "generated_ids": [],
+            }),
+            false,
+        );
+        assert!(preview.contains("candidate_verification: exhausted"));
+        assert!(preview.contains("candidate_attempts: 2"));
+        assert!(preview.contains("candidate_total_generated_tokens: 17"));
+        assert!(!preview.contains("output_text:"));
+    }
+
+    #[test]
+    fn accepted_candidate_status_precedes_constrained_output_return() {
+        let preview = render(
+            &json!({
+                "candidate_verification": {
+                    "status": "accepted",
+                    "attempts": [{"status": "accepted"}],
+                    "total_generated_tokens": 3,
+                },
+                "constraint": {"status": "validated", "generated_text": "{}"},
+            }),
+            false,
+        );
+        assert!(preview.contains("candidate_verification: accepted"));
+        assert!(preview.contains("candidate_attempts: 1"));
+        assert!(preview.contains("output_text: {}"));
+    }
+
+    #[test]
+    fn constraint_and_branch_verification_are_visible_in_preview() {
+        let preview = render(
+            &json!({
+                "constraint": {
+                    "status": "validated",
+                    "verification": {"status": "passed"},
+                    "generated_text": "{}",
+                },
+                "branch_verification": "resident_fork_parent_match",
+            }),
+            false,
+        );
+
+        assert!(preview.contains("constraint_verification: passed"));
+        assert!(preview.contains("branch_verification: resident_fork_parent_match"));
     }
 
     #[test]

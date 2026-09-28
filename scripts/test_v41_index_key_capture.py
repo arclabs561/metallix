@@ -6,6 +6,7 @@ import hashlib
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from v41_index_key_capture import compressor_fixture, index_key_fixture
 
@@ -29,7 +30,7 @@ def _tensor(
 
 def _receipt() -> dict[str, object]:
     source_hash = "a" * 64
-    return {
+    receipt: dict[str, object] = {
         "capture_status": "completed synthetic source-forward capture; no parity claim",
         "coverage_status": {"pending": []},
         "source": {
@@ -88,6 +89,15 @@ def _receipt() -> dict[str, object]:
             for start_pos, sequence in ((0, 5), (5, 1), (6, 1))
         ],
     }
+    partial = receipt["steps"][2]
+    partial["intermediates"]["layers.1.attn.indexer_observation"] = {
+        "inputs": {
+            # This is the leading three positions of the preceding layer-three
+            # start-five cache, represented with exact source-style storage.
+            "shared_index_k_prefix": _tensor("torch.bfloat16", [1, 3, 64], 2, 7)
+        }
+    }
+    return receipt
 
 
 class IndexKeyCaptureTest(unittest.TestCase):
@@ -194,6 +204,64 @@ class IndexKeyCaptureTest(unittest.TestCase):
                 self.assertEqual(
                     hashlib.sha256(raw).hexdigest(), tensor["storage_sha256"]
                 )
+
+    def test_exports_same_trace_layer_three_to_partial_layer_one_bridge(self) -> None:
+        from v41_index_key_capture import layer3_to_layer1_fixture
+
+        receipt = _receipt()
+        expected_source = {
+            "complete_capture_sha256": hashlib.sha256(
+                json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False).encode()
+                + b"\n"
+            ).hexdigest()
+        }
+        with patch(
+            "v41_index_key_capture.v41_layer1_owner_capture.layer1_owner_fixture",
+            return_value={"source": expected_source},
+        ):
+            fixture = layer3_to_layer1_fixture(receipt)
+        self.assertEqual(fixture["schema_version"], 1)
+        self.assertEqual(fixture["consumer"]["layer"], 1)
+        self.assertEqual(fixture["consumer"]["start_pos"], 6)
+        self.assertEqual(fixture["consumer"]["consumed_prefix_positions"], 3)
+        self.assertEqual(
+            fixture["consumer"]["owner_fixture"]["source"]["complete_capture_sha256"],
+            fixture["source"]["complete_capture_sha256"],
+        )
+        produced = fixture["producer"]["keys"]["cases"][1]["index_cache_after"]
+        consumed = fixture["consumer"]["score_key_prefix"]
+        self.assertEqual(
+            bytes.fromhex(consumed["storage_hex"]),
+            bytes.fromhex(produced["storage_hex"])[: 3 * 64 * 2],
+        )
+
+    def test_rejects_partial_score_prefix_not_owned_by_preceding_layer_three_call(
+        self,
+    ) -> None:
+        from v41_index_key_capture import layer3_to_layer1_fixture
+
+        receipt = _receipt()
+        record = receipt["steps"][2]["intermediates"][
+            "layers.1.attn.indexer_observation"
+        ]["inputs"]["shared_index_k_prefix"]
+        raw = bytearray.fromhex(record["storage_hex"])
+        raw[0] ^= 1
+        record["storage_hex"] = raw.hex()
+        record["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+        expected_source = {
+            "complete_capture_sha256": hashlib.sha256(
+                json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False).encode()
+                + b"\n"
+            ).hexdigest()
+        }
+        with (
+            patch(
+                "v41_index_key_capture.v41_layer1_owner_capture.layer1_owner_fixture",
+                return_value={"source": expected_source},
+            ),
+            self.assertRaisesRegex(RuntimeError, "leading layer-three publication"),
+        ):
+            layer3_to_layer1_fixture(receipt)
 
     def test_compressor_rejects_wrong_weight_boundary(self) -> None:
         receipt = _receipt()

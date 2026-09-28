@@ -38,6 +38,177 @@ pub struct Qwen3ResidentChatPlan {
     planned_kv_bytes: u64,
 }
 
+/// An absolute, half-open token-position range selected for a residual intervention.
+///
+/// Positions are counted from the beginning of the prompt, so the same token is
+/// selected whether it is processed during prefill or a later one-token decode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen3SteeringPositionRange {
+    start_inclusive: usize,
+    end_exclusive: usize,
+}
+
+impl Qwen3SteeringPositionRange {
+    /// Creates a nonempty absolute token-position range.
+    pub fn new(start_inclusive: usize, end_exclusive: usize) -> Result<Self, Qwen3SteeringError> {
+        if start_inclusive >= end_exclusive {
+            return Err(Qwen3SteeringError::EmptyPositionRange {
+                start_inclusive,
+                end_exclusive,
+            });
+        }
+        Ok(Self {
+            start_inclusive,
+            end_exclusive,
+        })
+    }
+
+    /// First selected absolute token position.
+    #[must_use]
+    pub const fn start_inclusive(self) -> usize {
+        self.start_inclusive
+    }
+
+    /// First unselected absolute token position.
+    #[must_use]
+    pub const fn end_exclusive(self) -> usize {
+        self.end_exclusive
+    }
+
+    const fn contains(self, position: usize) -> bool {
+        position >= self.start_inclusive && position < self.end_exclusive
+    }
+}
+
+/// Caller-supplied Qwen residual artifact before it has been bound to one
+/// loaded Qwen configuration.
+///
+/// `model_identity` is retained as receipt provenance, but it is caller
+/// asserted: this adapter cannot independently authenticate that identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Qwen3ResidualSteeringArtifact {
+    model_identity: String,
+    declared_hidden_layers: usize,
+    declared_hidden_size: usize,
+    layer: usize,
+    residual: Vec<f32>,
+    coefficient: f32,
+    positions: Qwen3SteeringPositionRange,
+}
+
+impl Qwen3ResidualSteeringArtifact {
+    /// Creates an artifact whose model declaration is checked when bound.
+    pub fn new(
+        model_identity: impl Into<String>,
+        declared_hidden_layers: usize,
+        declared_hidden_size: usize,
+        layer: usize,
+        residual: Vec<f32>,
+        coefficient: f32,
+        positions: Qwen3SteeringPositionRange,
+    ) -> Result<Self, Qwen3SteeringError> {
+        let model_identity = model_identity.into();
+        if model_identity.trim().is_empty() {
+            return Err(Qwen3SteeringError::MissingModelIdentity);
+        }
+        if declared_hidden_layers == 0 || declared_hidden_size == 0 {
+            return Err(Qwen3SteeringError::InvalidDeclaredDimensions {
+                hidden_layers: declared_hidden_layers,
+                hidden_size: declared_hidden_size,
+            });
+        }
+        if !coefficient.is_finite() {
+            return Err(Qwen3SteeringError::NonFiniteCoefficient(coefficient));
+        }
+        if residual.iter().any(|value| !value.is_finite()) {
+            return Err(Qwen3SteeringError::NonFiniteResidual);
+        }
+        if residual.len() != declared_hidden_size {
+            return Err(Qwen3SteeringError::ResidualDimensionMismatch {
+                actual: residual.len(),
+                expected: declared_hidden_size,
+            });
+        }
+        if layer >= declared_hidden_layers {
+            return Err(Qwen3SteeringError::LayerOutOfDeclaredRange {
+                layer,
+                hidden_layers: declared_hidden_layers,
+            });
+        }
+        Ok(Self {
+            model_identity,
+            declared_hidden_layers,
+            declared_hidden_size,
+            layer,
+            residual,
+            coefficient,
+            positions,
+        })
+    }
+
+    /// The caller-asserted model identity retained for request receipts.
+    #[must_use]
+    pub fn model_identity(&self) -> &str {
+        &self.model_identity
+    }
+}
+
+/// A Qwen-local residual intervention validated against a loaded configuration.
+///
+/// It is an execution mechanism only. No artifact or receipt from this type
+/// establishes a behavioral benefit; that requires a separate held-out study.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Qwen3ResidualSteering {
+    artifact: Qwen3ResidualSteeringArtifact,
+    bound_config: Qwen3ForwardConfig,
+}
+
+impl Qwen3ResidualSteering {
+    /// Binds an artifact to this exact Qwen execution layout.
+    pub fn bind(
+        artifact: Qwen3ResidualSteeringArtifact,
+        config: &Qwen3ForwardConfig,
+    ) -> Result<Self, Qwen3SteeringError> {
+        if artifact.declared_hidden_layers != config.hidden_layers
+            || artifact.declared_hidden_size != config.hidden_size
+        {
+            return Err(Qwen3SteeringError::ConfigurationDimensionMismatch {
+                declared_hidden_layers: artifact.declared_hidden_layers,
+                declared_hidden_size: artifact.declared_hidden_size,
+                actual_hidden_layers: config.hidden_layers,
+                actual_hidden_size: config.hidden_size,
+            });
+        }
+        if artifact.layer >= config.hidden_layers {
+            return Err(Qwen3SteeringError::LayerOutOfDeclaredRange {
+                layer: artifact.layer,
+                hidden_layers: config.hidden_layers,
+            });
+        }
+        if artifact
+            .residual
+            .iter()
+            .any(|value| !(value * artifact.coefficient).is_finite())
+        {
+            return Err(Qwen3SteeringError::NonFiniteScaledResidual);
+        }
+        Ok(Self {
+            artifact,
+            bound_config: config.clone(),
+        })
+    }
+
+    /// Artifact provenance retained by this bound intervention.
+    #[must_use]
+    pub const fn artifact(&self) -> &Qwen3ResidualSteeringArtifact {
+        &self.artifact
+    }
+
+    fn is_bound_to(&self, config: &Qwen3ForwardConfig) -> bool {
+        self.bound_config == *config
+    }
+}
+
 impl Qwen3ResidentChatPlan {
     /// Maximum prompt-plus-generated tokens admitted by this executor.
     #[must_use]
@@ -222,6 +393,20 @@ pub fn forward_last_logits<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     input_ids: &[i32],
 ) -> Result<Vec<f32>, Qwen3ForwardError> {
+    forward_last_logits_with_residual_steering(weights, config, input_ids, None)
+}
+
+/// Runs the bounded uncached Qwen forward with an optional validated residual
+/// intervention.
+pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    input_ids: &[i32],
+    steering: Option<&Qwen3ResidualSteering>,
+) -> Result<Vec<f32>, Qwen3ForwardError> {
+    if steering.is_some_and(|steering| !steering.is_bound_to(config)) {
+        return Err(Qwen3SteeringError::BoundConfigurationMismatch.into());
+    }
     validate_input_ids(config, input_ids, 0, config.maximum_cached_tokens())?;
 
     let stream = StreamOrDevice::gpu();
@@ -236,6 +421,8 @@ pub fn forward_last_logits<S: BuildHasher>(
 
     for layer in 0..config.hidden_layers {
         hidden_states = forward_layer(config, weights, layer, &hidden_states)?;
+        hidden_states =
+            apply_residual_steering(steering, layer, 0, input_ids.len(), &hidden_states)?;
     }
 
     // Only the final position is requested; normalization and the tied output
@@ -300,6 +487,56 @@ pub(crate) fn forward_layer<S: BuildHasher>(
     residual.add_device(&mlp, &stream).map_err(Into::into)
 }
 
+fn apply_residual_steering(
+    steering: Option<&Qwen3ResidualSteering>,
+    layer: usize,
+    absolute_position_start: usize,
+    sequence_len: usize,
+    hidden_states: &Array,
+) -> Result<Array, Qwen3ForwardError> {
+    let Some(steering) = steering else {
+        return Ok(hidden_states.clone());
+    };
+    let artifact = &steering.artifact;
+    if artifact.layer != layer || artifact.coefficient == 0.0 {
+        return Ok(hidden_states.clone());
+    }
+
+    let mask = (0..sequence_len)
+        .map(|offset| {
+            absolute_position_start
+                .checked_add(offset)
+                .ok_or(Qwen3ForwardError::ShapeOverflow)
+                .map(|position| {
+                    if artifact.positions.contains(position) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !mask.iter().any(|value| *value != 0.0) {
+        return Ok(hidden_states.clone());
+    }
+
+    let hidden =
+        i32::try_from(artifact.residual.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    let sequence = i32::try_from(sequence_len).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    let scaled_residual = artifact
+        .residual
+        .iter()
+        .map(|value| value * artifact.coefficient)
+        .collect::<Vec<_>>();
+    let stream = StreamOrDevice::gpu();
+    let residual = Array::from_slice(&scaled_residual, &[1, 1, hidden]);
+    let mask = Array::from_slice(&mask, &[1, sequence, 1]);
+    let selected_residual = residual.multiply_device(&mask, &stream)?;
+    hidden_states
+        .add_device(&selected_residual, &stream)
+        .map_err(Into::into)
+}
+
 /// Applies Qwen3's final RMS normalization to a selected hidden state.
 ///
 /// The streamed qualification owns only the final norm vector at this point,
@@ -325,6 +562,7 @@ pub struct Qwen3ForwardExecutor<'a, S: BuildHasher> {
     maximum_context_tokens: usize,
     resident_chat_plan: Option<Qwen3ResidentChatPlan>,
     resident_cache_capacity: Option<usize>,
+    residual_steering: Option<Box<Qwen3ResidualSteering>>,
 }
 
 /// Adapter-local Qwen3 KV state.
@@ -348,6 +586,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             maximum_context_tokens: config.maximum_cached_tokens(),
             resident_chat_plan: None,
             resident_cache_capacity: None,
+            residual_steering: None,
         }
     }
 
@@ -367,6 +606,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             maximum_context_tokens: plan.maximum_context_tokens,
             resident_chat_plan: Some(plan),
             resident_cache_capacity: Some(plan.maximum_context_tokens),
+            residual_steering: None,
         }
     }
 
@@ -374,6 +614,32 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     pub fn reset(&mut self) {
         self.cache.iter_mut().for_each(|entry| *entry = None);
         self.cached_tokens = 0;
+    }
+
+    /// Installs or removes a residual intervention before this executor has
+    /// materialized KV. Refusing a mid-sequence change prevents caches from
+    /// mixing incompatible residual histories.
+    pub fn set_residual_steering(
+        &mut self,
+        steering: Option<Qwen3ResidualSteering>,
+    ) -> Result<(), Qwen3SteeringError> {
+        if self.cached_tokens != 0 {
+            return Err(Qwen3SteeringError::SteeringRequiresEmptyCache);
+        }
+        if steering
+            .as_ref()
+            .is_some_and(|steering| !steering.is_bound_to(self.config))
+        {
+            return Err(Qwen3SteeringError::BoundConfigurationMismatch);
+        }
+        self.residual_steering = steering.map(Box::new);
+        Ok(())
+    }
+
+    /// The installed residual intervention, if any.
+    #[must_use]
+    pub fn residual_steering(&self) -> Option<&Qwen3ResidualSteering> {
+        self.residual_steering.as_deref()
     }
 
     /// Returns the number of tokens represented in every layer's cache.
@@ -435,14 +701,14 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     /// Creates an independent decoder branch from this fully materialized KV
-    /// snapshot for the Qwen cache-replay qualification test. This is neither
-    /// a serving operation nor a cross-model cache API.
+    /// snapshot. The branch borrows the same weights and owns independent
+    /// cache handles; it is safe to discard when a controller or verifier
+    /// rejects the candidate.
     ///
     /// The retained arrays are evaluated before their handles are cloned.
     /// Later decode appends build replacement K/V arrays through concatenation;
     /// they do not mutate the snapshot arrays owned by this executor.
-    #[cfg(test)]
-    pub(crate) fn fork_prefilled(&self) -> Result<Self, Qwen3ForwardError> {
+    pub fn fork_prefilled(&self) -> Result<Self, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
@@ -480,6 +746,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             maximum_context_tokens: self.maximum_context_tokens,
             resident_chat_plan: self.resident_chat_plan,
             resident_cache_capacity: self.resident_cache_capacity,
+            residual_steering: self.residual_steering.clone(),
         })
     }
 
@@ -529,6 +796,13 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
                 rope_offset,
                 self.resident_cache_capacity,
             )?;
+            hidden_states = apply_residual_steering(
+                self.residual_steering.as_deref(),
+                layer,
+                self.cached_tokens,
+                input_ids.len(),
+                &hidden_states,
+            )?;
         }
 
         self.cached_tokens += input_ids.len();
@@ -570,6 +844,10 @@ pub(crate) fn forward_cached_layer<S: BuildHasher>(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the adapter keeps cache capacity explicit at this narrow execution boundary"
+)]
 fn forward_cached_layer_with_capacity<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
@@ -624,6 +902,10 @@ fn forward_cached_layer_with_capacity<S: BuildHasher>(
     residual.add_device(&mlp, &stream).map_err(Into::into)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the adapter keeps cache capacity explicit at this narrow execution boundary"
+)]
 fn cached_attention<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
@@ -678,7 +960,7 @@ fn cached_attention<S: BuildHasher>(
     let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
     let (keys, values, attention_keys, attention_values, causal) = match resident_cache_capacity {
         Some(maximum_capacity) => {
-            stepped_cached_kv(cache, key, value, rope_offset, maximum_capacity, &stream)?
+            stepped_cached_kv(cache, &key, &value, rope_offset, maximum_capacity, &stream)?
         }
         None => {
             if let Some(previous) = cache.take() {
@@ -734,14 +1016,16 @@ fn cached_attention<S: BuildHasher>(
     linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
 }
 
+type SteppedKv = (Array, Array, Option<Array>, Option<Array>, bool);
+
 fn stepped_cached_kv(
     cache: &mut Option<Qwen3LayerKv>,
-    key: Array,
-    value: Array,
+    key: &Array,
+    value: &Array,
     rope_offset: i32,
     maximum_capacity: usize,
     stream: &StreamOrDevice,
-) -> Result<(Array, Array, Option<Array>, Option<Array>, bool), Qwen3ForwardError> {
+) -> Result<SteppedKv, Qwen3ForwardError> {
     let appended = *key
         .shape()
         .get(2)
@@ -1178,10 +1462,85 @@ const fn default_rope_theta() -> f32 {
     1_000_000.0
 }
 
+/// Errors while parsing or binding a Qwen-local residual intervention.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum Qwen3SteeringError {
+    /// The artifact has no caller-supplied model identity for its receipt.
+    #[error("Qwen3 residual steering requires a nonempty model identity")]
+    MissingModelIdentity,
+    /// The artifact does not declare a usable Qwen residual layout.
+    #[error(
+        "Qwen3 residual steering declares invalid dimensions {hidden_layers} layers x {hidden_size} hidden"
+    )]
+    InvalidDeclaredDimensions {
+        /// Declared decoder layer count.
+        hidden_layers: usize,
+        /// Declared residual width.
+        hidden_size: usize,
+    },
+    /// The selected range does not contain a token position.
+    #[error("Qwen3 residual steering range [{start_inclusive}, {end_exclusive}) is empty")]
+    EmptyPositionRange {
+        /// First selected position.
+        start_inclusive: usize,
+        /// First excluded position.
+        end_exclusive: usize,
+    },
+    /// The artifact coefficient cannot be evaluated safely.
+    #[error("Qwen3 residual steering coefficient is non-finite: {0}")]
+    NonFiniteCoefficient(f32),
+    /// At least one residual vector entry cannot be evaluated safely.
+    #[error("Qwen3 residual steering vector contains a non-finite value")]
+    NonFiniteResidual,
+    /// Applying the finite coefficient would overflow a finite residual entry.
+    #[error("Qwen3 residual steering coefficient overflows a residual value")]
+    NonFiniteScaledResidual,
+    /// The vector width differs from the artifact's declared residual width.
+    #[error("Qwen3 residual steering vector has width {actual}, expected {expected}")]
+    ResidualDimensionMismatch {
+        /// Actual vector width.
+        actual: usize,
+        /// Declared residual width.
+        expected: usize,
+    },
+    /// The selected decoder layer is absent from the declared layout.
+    #[error("Qwen3 residual steering layer {layer} is outside {hidden_layers} declared layers")]
+    LayerOutOfDeclaredRange {
+        /// Selected zero-based layer.
+        layer: usize,
+        /// Declared layer count.
+        hidden_layers: usize,
+    },
+    /// The artifact's declared Qwen layout differs from the loaded model.
+    #[error(
+        "Qwen3 residual steering declares {declared_hidden_layers} layers x {declared_hidden_size} hidden, loaded model has {actual_hidden_layers} layers x {actual_hidden_size} hidden"
+    )]
+    ConfigurationDimensionMismatch {
+        /// Artifact's declared decoder layer count.
+        declared_hidden_layers: usize,
+        /// Artifact's declared residual width.
+        declared_hidden_size: usize,
+        /// Loaded decoder layer count.
+        actual_hidden_layers: usize,
+        /// Loaded residual width.
+        actual_hidden_size: usize,
+    },
+    /// A steering object was bound to a different Qwen configuration.
+    #[error("Qwen3 residual steering is bound to a different model configuration")]
+    BoundConfigurationMismatch,
+    /// Changing an intervention after KV materialization would mix histories.
+    #[error("Qwen3 residual steering can change only while the KV cache is empty")]
+    SteeringRequiresEmptyCache,
+}
+
 /// Errors from Qwen3 configuration qualification or its Metal forward graph.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Qwen3ForwardError {
+    /// A residual intervention was not bound to this exact Qwen configuration.
+    #[error(transparent)]
+    Steering(#[from] Qwen3SteeringError),
     /// The configuration was not JSON.
     #[error("invalid Qwen3 forward configuration: {0}")]
     Json(#[from] serde_json::Error),
@@ -1309,8 +1668,10 @@ mod tests {
     use crate::GPU_TEST_LOCK;
 
     use super::{
-        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, forward_last_logits,
-        forward_layer, linear, read_last_logits, rms_norm, stepped_capacity, weight,
+        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
+        Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
+        forward_last_logits, forward_last_logits_with_residual_steering, forward_layer, linear,
+        read_last_logits, rms_norm, stepped_capacity, weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -1606,10 +1967,189 @@ mod tests {
         assert_eq!(executor.kv_bytes(), 0);
     }
 
+    #[test]
+    fn residual_steering_rejects_corrupt_or_mismatched_artifacts() {
+        let config = small_dense_config();
+        let mut different_config = config.clone();
+        different_config.rope_theta = 123_456.0;
+        let positions = Qwen3SteeringPositionRange::new(1, 3).expect("nonempty range");
+        assert!(matches!(
+            Qwen3SteeringPositionRange::new(3, 3),
+            Err(Qwen3SteeringError::EmptyPositionRange { .. })
+        ));
+        assert!(matches!(
+            Qwen3ResidualSteeringArtifact::new("", 1, 4, 0, vec![0.0; 4], 1.0, positions),
+            Err(Qwen3SteeringError::MissingModelIdentity)
+        ));
+        assert!(matches!(
+            Qwen3ResidualSteeringArtifact::new("tiny", 1, 4, 0, vec![0.0; 3], 1.0, positions),
+            Err(Qwen3SteeringError::ResidualDimensionMismatch { .. })
+        ));
+        assert!(matches!(
+            Qwen3ResidualSteeringArtifact::new("tiny", 1, 4, 1, vec![0.0; 4], 1.0, positions),
+            Err(Qwen3SteeringError::LayerOutOfDeclaredRange { .. })
+        ));
+        assert!(matches!(
+            Qwen3ResidualSteeringArtifact::new(
+                "tiny",
+                1,
+                4,
+                0,
+                vec![0.0, f32::NAN, 0.0, 0.0],
+                1.0,
+                positions
+            ),
+            Err(Qwen3SteeringError::NonFiniteResidual)
+        ));
+        assert!(matches!(
+            Qwen3ResidualSteeringArtifact::new(
+                "tiny",
+                1,
+                4,
+                0,
+                vec![0.0; 4],
+                f32::INFINITY,
+                positions
+            ),
+            Err(Qwen3SteeringError::NonFiniteCoefficient(_))
+        ));
+        let wrong_layout =
+            Qwen3ResidualSteeringArtifact::new("tiny", 2, 4, 0, vec![0.0; 4], 1.0, positions)
+                .expect("well-formed but wrong declared layout");
+        assert!(matches!(
+            Qwen3ResidualSteering::bind(wrong_layout, &config),
+            Err(Qwen3SteeringError::ConfigurationDimensionMismatch { .. })
+        ));
+        let overflowing = Qwen3ResidualSteeringArtifact::new(
+            "tiny",
+            1,
+            4,
+            0,
+            vec![f32::MAX, 0.0, 0.0, 0.0],
+            2.0,
+            positions,
+        )
+        .expect("finite source artifact");
+        assert!(matches!(
+            Qwen3ResidualSteering::bind(overflowing, &config),
+            Err(Qwen3SteeringError::NonFiniteScaledResidual)
+        ));
+
+        let bound_to_first = residual_steering(&config, 1.0, 0, 1);
+        let weights = deterministic_weights();
+        let mut other_executor = Qwen3ForwardExecutor::new(&different_config, &weights);
+        assert!(matches!(
+            other_executor.set_residual_steering(Some(bound_to_first.clone())),
+            Err(Qwen3SteeringError::BoundConfigurationMismatch)
+        ));
+        assert!(matches!(
+            forward_last_logits_with_residual_steering(
+                &weights,
+                &different_config,
+                &[1],
+                Some(&bound_to_first),
+            ),
+            Err(Qwen3ForwardError::Steering(
+                Qwen3SteeringError::BoundConfigurationMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn residual_steering_disabled_zero_and_chunked_paths_are_qualified() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = small_dense_config();
+        let weights = deterministic_weights();
+        let prompt = [1_i32, 2, 3];
+        let baseline = forward_last_logits(&weights, &config, &prompt).expect("baseline");
+        assert_logits_match(
+            baseline.clone(),
+            forward_last_logits_with_residual_steering(&weights, &config, &prompt, None)
+                .expect("disabled forward"),
+        );
+
+        let zero = residual_steering(&config, 0.0, 1, 3);
+        assert_logits_match(
+            baseline.clone(),
+            forward_last_logits_with_residual_steering(&weights, &config, &prompt, Some(&zero))
+                .expect("zero-coefficient forward"),
+        );
+
+        let steering = residual_steering(&config, 2.0, 1, 3);
+        let steered =
+            forward_last_logits_with_residual_steering(&weights, &config, &prompt, Some(&steering))
+                .expect("steered forward");
+        assert!(
+            baseline
+                .iter()
+                .zip(&steered)
+                .any(|(plain, altered)| (plain - altered).abs() > 5e-5),
+            "nonzero residual should perturb this deterministic tiny model"
+        );
+
+        let mut chunked = Qwen3ForwardExecutor::new(&config, &weights);
+        chunked
+            .set_residual_steering(Some(steering.clone()))
+            .expect("install before prefill");
+        let _ = chunked
+            .prefill_last_logits(&prompt[..2])
+            .expect("chunk prefill");
+        let chunked_logits = chunked.decode_last_logits(prompt[2]).expect("chunk decode");
+        assert_logits_match(steered, chunked_logits);
+    }
+
+    #[test]
+    fn residual_steering_fork_inherits_without_mutating_parent_state() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = small_dense_config();
+        let weights = deterministic_weights();
+        let steering = residual_steering(&config, 1.5, 0, 4);
+        let mut parent = Qwen3ForwardExecutor::new(&config, &weights);
+        parent
+            .set_residual_steering(Some(steering.clone()))
+            .expect("install before prefill");
+        let _ = parent.prefill_last_logits(&[1, 2]).expect("parent prefill");
+        let mut child = parent.fork_prefilled().expect("fork inherits steering");
+        assert_eq!(child.residual_steering(), Some(&steering));
+        assert!(matches!(
+            child.set_residual_steering(None),
+            Err(Qwen3SteeringError::SteeringRequiresEmptyCache)
+        ));
+
+        let child_logits = child.decode_last_logits(3).expect("child decode");
+        assert_eq!(
+            parent.cached_tokens(),
+            2,
+            "child must not mutate parent cache"
+        );
+        assert_logits_match(
+            forward_last_logits_with_residual_steering(
+                &weights,
+                &config,
+                &[1, 2, 3],
+                Some(&steering),
+            )
+            .expect("child independent replay"),
+            child_logits,
+        );
+        let parent_logits = parent.decode_last_logits(4).expect("parent decode");
+        assert_logits_match(
+            forward_last_logits_with_residual_steering(
+                &weights,
+                &config,
+                &[1, 2, 4],
+                Some(&steering),
+            )
+            .expect("parent independent replay"),
+            parent_logits,
+        );
+    }
+
     mod cache_component_profile;
     mod capacity_cache_profile;
     mod decode_profile;
     mod particle_replay;
+    mod steering_checkpoint;
 
     #[test]
     fn resident_chat_cached_decode_matches_fresh_prefill_beyond_512_tokens() {
@@ -1807,6 +2347,26 @@ mod tests {
             }"#,
         )
         .expect("small dense Qwen3 config")
+    }
+
+    fn residual_steering(
+        config: &Qwen3ForwardConfig,
+        coefficient: f32,
+        start_inclusive: usize,
+        end_exclusive: usize,
+    ) -> Qwen3ResidualSteering {
+        let artifact = Qwen3ResidualSteeringArtifact::new(
+            "tiny-qwen-test",
+            config.hidden_layers,
+            config.hidden_size,
+            0,
+            vec![0.25, -0.5, 0.75, -1.0],
+            coefficient,
+            Qwen3SteeringPositionRange::new(start_inclusive, end_exclusive)
+                .expect("test position range"),
+        )
+        .expect("test steering artifact");
+        Qwen3ResidualSteering::bind(artifact, config).expect("bind test steering")
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {

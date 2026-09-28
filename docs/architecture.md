@@ -96,6 +96,23 @@ counts do not make the full checkpoint resident.
 
 ## Delivery order
 
+## Programmable inference boundary
+
+Metallix's broader identity is a programmable inference substrate, not only a
+DeepSeek or Qwen server. A future controller layer may express symbolic
+constraints, tool protocols, semantic potentials, proposals, or particles;
+model adapters remain responsible for model-private execution state and
+resource policy. The controller boundary must not assume that every model has
+only an append-only KV cache.
+
+The current implementation boundary is intentionally narrower: seeded
+categorical sampling and transactional JSON Schema masking are qualified on
+the bounded Qwen diagnostic; SMC accounting is test-only. AICI and
+llguidance are external prior art and possible dependencies, not implemented
+features. Promotion requires tokenizer-aware mask parity, real logits,
+snapshot/restore and ancestry checks, and Apple-Silicon measurements. See the
+[programmatic inference design](design/programmatic-inference.md).
+
 Qwen3-0.6B is the resident control model used to qualify MLX loading, numerical
 forward agreement, and single-sequence cached-decode agreement before attempting
 V4.1's larger sparse execution path. Passing Qwen tests does not qualify CED,

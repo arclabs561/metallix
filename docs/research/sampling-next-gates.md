@@ -28,12 +28,57 @@ population extinction. Multinomial ancestor draws and weighted terminal
 selection exercise the engine's categorical sampler against an independent
 CDF oracle at fixed entropy values.
 
+`crates/engine/tests/smc_finite_oracle.rs` then applies the same finite
+accounting to the public `engine::smc::ParticleSet` primitive. It distinguishes
+an absorbing EOS particle from a hard-rejected zero-mass particle, checks that
+neither can receive a further transition, and records the pre-resampling log
+mean weight separately from a population's current log-weight sum. Systematic
+resampling resets child stage weights to zero and returns that prior stage
+mean; a driver, not the primitive, owns the accumulated finite-particle
+normalizer estimate. A checked importance-ratio update now distinguishes zero target mass from
+zero proposal support: the former rejects a particle, while the latter is an
+error without mutation, including the undefined zero/zero case. Nonfinite and
+overflowed ratios also leave state unchanged; the independent finite oracle
+checks each boundary. This is still no model scheduler, cache fork owner or
+particle-serving API.
+
 The exact enumerated target has normalizer 0.36; the chosen finite particle
 trace estimates 23/30 and loses a supported path. That deliberate disagreement
 guards against presenting finite-particle inference as exact conditioning.
 This is test-only accounting, not a particle runtime, model-backed cache
 fork, convergence experiment or calibrated-confidence feature. Physical
 cache-fork/reindex parity remains a prerequisite for model-backed particles.
+
+## Model-backed composition check
+
+The test-only `crates/server/src/qwen_particle_tests.rs` composes real Qwen
+proposals, production `ParticleSet` resampling, and adapter-owned KV forks.
+The local Qwen3-0.6B checkpoint passed with three particles, two transitions,
+one resampling boundary, and fixed entropy. Its declared target is the deployed
+temperature-0.7 proposal multiplied by synthetic potentials; raw temperature-one
+model probabilities are diagnostic only. This is not a target/draft model
+correction or an application-quality experiment.
+
+The independent stage means are 7/6 and 4/3, giving this finite trace's 14/9
+normalizer estimate. Duplicated children match fresh-prefix logits, and probes
+of all original parents after child decoding catch mutable-cache aliasing.
+The engine's separate two-resampling oracle checks stage means 1, 3/2 and 1/2,
+which compose to 3/4 while retaining absorbing EOS. Neither test establishes
+exact conditioning, calibrated confidence, throughput, or a serving API.
+
+```sh
+METALLIX_QWEN_MODEL=/path/to/local/Qwen3 RUST_TEST_THREADS=1 cargo test -p server --all-features checkpoint_qwen_smc_resampling_composes_weights_and_replays_cache_ancestry -- --ignored --nocapture
+```
+
+A second ignored checkpoint test,
+`checkpoint_qwen_temperature_proposal_corrects_raw_model_weights_and_replays_ancestry`,
+passed on the same local 0.6B model. It uses raw temperature-one model
+probabilities as target `p` and temperature-0.7 probabilities as proposal `q`.
+An independent FP64 reference checks selected-token `p/q` corrections,
+normalization, ESS, systematic-resampling ancestry and fresh-prefix replay.
+The test rejects a proposal whose floating-point support loses any vocabulary
+entry. Three particles and fixed entropy qualify this numerical/cache path;
+they do not establish exact conditioning or application quality.
 
 ## Gate 1: one explicit sampled-policy distribution
 
@@ -189,10 +234,13 @@ did not meet that tolerance; this result does not qualify BF16 execution.
 
 Reproduce with `METALLIX_QWEN_MODEL=<snapshot> cargo test -p qwen --all-features
 checkpoint_particle_ancestry_fork_replays_next_logits -- --ignored --nocapture`.
-The implementation and harness remain test-only. Cloned array handles plus
-immutable concatenation pass this bounded replay gate; allocated/shared/resident
-memory, release behavior, fork latency and model-backed particle scheduling
-remain unmeasured. This is not a production cache-branch API or SMC runtime.
+The ancestry harness remains test-only. The resident executor now exposes
+`Qwen3ForwardExecutor::fork_prefilled`, used by the cache-parity diagnostic and
+[verified schedule candidates](../candidate-control.md). The executor preserves
+immutable parent arrays while children build replacement state; the adopted
+stepped-capacity path uses functional slice updates. A candidate receipt records
+fork time, but does not qualify physical sharing, allocator release, peak memory,
+or model-backed particle scheduling. No SMC runtime is implied.
 
 **Question.** Can real decode state be forked/reindexed correctly and does any
 reported uncertainty mean more than a token statistic?

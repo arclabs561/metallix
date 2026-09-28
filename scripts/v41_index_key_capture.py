@@ -28,6 +28,8 @@ import struct
 from pathlib import Path
 from typing import Any
 
+import v41_layer1_owner_capture
+
 OWNER_LAYER = 3
 CONSUMER_LAYER = 4
 EXPECTED_START_POSITIONS = (0, 5, 6)
@@ -204,7 +206,10 @@ def index_key_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 f"index-key fixture expected model {name}={expected!r}, got {model_args.get(name)!r}"
             )
     ratios = model_args.get("compress_ratios")
-    if not isinstance(ratios, list) or len(ratios) <= CONSUMER_LAYER:
+    # The offline JSON input carries lists, while the in-process reference
+    # runner intentionally converts schedule arrays to immutable tuples before
+    # constructing ModelArgs. Both are the same pinned schedule.
+    if not isinstance(ratios, (list, tuple)) or len(ratios) <= CONSUMER_LAYER:
         raise RuntimeError("index-key fixture lacks owner/consumer compression ratios")
     if ratios[OWNER_LAYER] != 1 or ratios[CONSUMER_LAYER] != 1:
         raise RuntimeError(
@@ -361,7 +366,10 @@ def compressor_fixture(receipt: dict[str, object]) -> dict[str, object]:
         raise TypeError("compressor fixture has invalid input dimension")
     if not isinstance(latent_dimension, int) or isinstance(latent_dimension, bool):
         raise TypeError("compressor fixture has invalid latent dimension")
-    if model_args.get("compress_ratios", [])[OWNER_LAYER] != 1:
+    ratios = model_args.get("compress_ratios", ())
+    if not isinstance(ratios, (list, tuple)) or len(ratios) <= OWNER_LAYER:
+        raise RuntimeError("compressor fixture lacks layer-three compression ratio")
+    if ratios[OWNER_LAYER] != 1:
         raise RuntimeError("compressor fixture requires layer-three ratio-one schedule")
 
     wkv = _tensor(
@@ -450,6 +458,85 @@ def compressor_fixture(receipt: dict[str, object]) -> dict[str, object]:
     }
 
 
+def layer3_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Bridge a native layer-three key publication to layer one's next partial call.
+
+    This is a bounded projection of one completed source trace.  It retains
+    only the ratio-one producer operands needed to replay the six-key prefix,
+    plus the three-key layer-one score operand that consumes its leading
+    prefix.  It never joins records from separately captured fixtures.
+    """
+    keys = index_key_fixture(receipt)
+    compressor = compressor_fixture(receipt)
+    owner = v41_layer1_owner_capture.layer1_owner_fixture(receipt)
+    if (
+        keys["source"]["complete_capture_sha256"]
+        != compressor["source"]["complete_capture_sha256"]
+    ):
+        raise RuntimeError("layer-three bridge requires one complete source capture")
+    if (
+        owner["source"]["complete_capture_sha256"]
+        != keys["source"]["complete_capture_sha256"]
+    ):
+        raise RuntimeError(
+            "layer-three bridge owner fixture has different capture provenance"
+        )
+    steps = receipt.get("steps")
+    if not isinstance(steps, list) or len(steps) != len(EXPECTED_START_POSITIONS):
+        raise RuntimeError("layer-three bridge requires the pinned three-call trace")
+    partial_step = _require_dict(steps[2], "partial layer-one step")
+    if partial_step.get("start_pos") != 6:
+        raise RuntimeError("layer-three bridge requires partial start position six")
+    intermediates = _require_dict(
+        partial_step.get("intermediates"), "partial layer-one intermediates"
+    )
+    observation = _require_dict(
+        intermediates.get("layers.1.attn.indexer_observation"),
+        "partial layer-one indexer observation",
+    )
+    inputs = _require_dict(observation.get("inputs"), "partial layer-one index inputs")
+    consumed = _tensor(
+        inputs.get("shared_index_k_prefix"),
+        "partial layer-one shared layer-three score prefix",
+        dtype="torch.bfloat16",
+        shape=[1, 3, 64],
+        byte_width=BF16_BYTES,
+    )
+    predecessor = keys["cases"][1]
+    if not isinstance(predecessor, dict):
+        raise TypeError("layer-three bridge lacks predecessor key case")
+    complete_prefix = _tensor(
+        predecessor.get("index_cache_after"),
+        "predecessor layer-three index cache",
+        dtype="torch.bfloat16",
+        shape=[1, 6, 64],
+        byte_width=BF16_BYTES,
+    )
+    complete_raw = bytes.fromhex(complete_prefix["storage_hex"])
+    consumed_raw = bytes.fromhex(consumed["storage_hex"])
+    if consumed_raw != complete_raw[: len(consumed_raw)]:
+        raise RuntimeError(
+            "partial layer-one score operand is not the leading layer-three publication"
+        )
+    return {
+        "schema_version": 1,
+        "scope": (
+            "same-trace layer-three ratio-one native key publication through the "
+            "leading score-key prefix consumed by the next partial layer-one call; "
+            "not native layer-three block execution, full scheduler behavior, or model parity"
+        ),
+        "source": keys["source"],
+        "producer": {"keys": keys, "compressor": compressor},
+        "consumer": {
+            "layer": 1,
+            "start_pos": 6,
+            "consumed_prefix_positions": 3,
+            "score_key_prefix": consumed,
+            "owner_fixture": owner,
+        },
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -462,6 +549,11 @@ def _parse_args() -> argparse.Namespace:
         "--compressor-output",
         type=Path,
         help="optional supplementary compressor fixture JSON to write",
+    )
+    parser.add_argument(
+        "--layer3-to-layer1-output",
+        type=Path,
+        help="optional same-trace layer-three-to-layer-one bridge fixture JSON to write",
     )
     return parser.parse_args()
 
@@ -493,6 +585,17 @@ def main() -> None:
         args.compressor_output.write_text(
             json.dumps(
                 compressor_fixture(receipt), indent=2, sort_keys=True, allow_nan=False
+            )
+            + "\n"
+        )
+    if args.layer3_to_layer1_output is not None:
+        args.layer3_to_layer1_output.parent.mkdir(parents=True, exist_ok=True)
+        args.layer3_to_layer1_output.write_text(
+            json.dumps(
+                layer3_to_layer1_fixture(receipt),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
             )
             + "\n"
         )

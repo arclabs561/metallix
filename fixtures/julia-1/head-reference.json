@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "source": {
+    "revision": "a85b127321d580d65176c89ced8273f305745d85",
+    "path": "julia/model.py",
+    "sha256": "ef2ba82fe20cdf0db7bb887e9ef075476ed08b985ce9a95be0de3e26246ecc81",
+    "symbol": "JuliaDecisionModel"
+  },
+  "runtime": {"torch": "2.13.0", "device": "cpu", "dtype": "float32"},
+  "operator_config": {
+    "width": 384,
+    "head_layers": 2,
+    "attention_heads": 6,
+    "feed_forward_width": 1536,
+    "dropout": 0.1,
+    "norm_first": true,
+    "activation": "relu",
+    "scorer_activation": "gelu",
+    "layer_norm_eps": 1e-05,
+    "causal": false,
+    "invalid_marker_score": -10000.0
+  },
+  "synthetic_inputs": "arange(6*384), ((x*7)%29-14)/20; deterministic parameter fill ((x+ordinal*17)%97-48)/1000",
+  "tolerances": {"rtol": 1e-05, "atol": 1e-05},
+  "cases": [
+    {
+      "name": "base",
+      "attention_mask": [true, true, true, true, false, false],
+      "marker_pos": [1, 3],
+      "marker_mask": [true, true],
+      "qtype": 2,
+      "expected_scores": [0.009646272286772728, 0.008379431441426277]
+    },
+    {
+      "name": "padding_perturbation",
+      "attention_mask": [true, true, true, true, false, false],
+      "marker_pos": [1, 3],
+      "marker_mask": [true, true],
+      "qtype": 2,
+      "perturb_padding": true,
+      "expected_scores": [0.009646272286772728, 0.008379431441426277]
+    },
+    {
+      "name": "option_permutation",
+      "attention_mask": [true, true, true, true, false, false],
+      "marker_pos": [3, 1],
+      "marker_mask": [true, true],
+      "qtype": 2,
+      "expected_scores": [0.008379431441426277, 0.009646272286772728]
+    },
+    {
+      "name": "unmasked_padding_control",
+      "attention_mask": [true, true, true, true, true, true],
+      "marker_pos": [1, 3],
+      "marker_mask": [true, true],
+      "qtype": 2,
+      "perturb_padding": true,
+      "expected_scores": [0.009617665782570839, 0.008349062874913216]
+    },
+    {
+      "name": "masked_marker",
+      "attention_mask": [true, true, true, true, false, false],
+      "marker_pos": [1, 3, 2],
+      "marker_mask": [true, true, false],
+      "qtype": 2,
+      "expected_scores": [0.009646272286772728, 0.008379431441426277, -10000.0]
+    }
+  ]
+}

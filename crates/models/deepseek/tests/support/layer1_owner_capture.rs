@@ -7,6 +7,7 @@ use deepseek::{
     compressor::{CompressorInput, CompressorState},
     indexer::{
         bf16::index_scores_bf16_reference,
+        cache::{IndexKeyPublicationId, IndexKeyState},
         compressed_kv::{CompressedKvLayout, prepare_compressed_kv},
         key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
         query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
@@ -104,10 +105,14 @@ fn fixture() -> Fixture {
         format!("{:x}", Sha256::digest(raw.as_bytes())),
         FIXTURE_SHA256
     );
+    fixture_from_raw(raw, CAPTURE_SHA256)
+}
+
+fn fixture_from_raw(raw: &str, expected_capture: &str) -> Fixture {
     let fixture: Fixture = serde_json::from_str(raw).expect("layer-one owner fixture JSON");
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.source.revision, REVISION);
-    assert_eq!(fixture.source.complete_capture_sha256, CAPTURE_SHA256);
+    assert_eq!(fixture.source.complete_capture_sha256, expected_capture);
     assert_eq!(fixture.model.owner_layer, 1);
     assert_eq!(fixture.model.ratio, 2);
     assert_eq!(fixture.model.index_topk, 1);
@@ -174,45 +179,24 @@ fn i32s(tensor: &Tensor) -> Vec<i32> {
         .collect()
 }
 
-fn prior_layer_three_prefix() -> Vec<u16> {
-    let root: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../fixtures/deepseek-v41/forward-candidate-reference.json"
-    ))
-    .expect("layer-three candidate fixture");
-    assert_eq!(root["source"]["revision"].as_str(), Some(REVISION));
-    assert_eq!(
-        root["source"]["complete_capture_sha256"].as_str(),
-        Some("7c5cc8541da338fa3426d63e32b9a66e9132e07ab68ee26d86fbf9e29f62f48d")
-    );
-    let case = root["cases"]
-        .as_array()
-        .expect("candidate cases")
+/// Return the bounded layer-three score operand consumed by the partial
+/// layer-one call. It must come from the same complete source capture as the
+/// owner trace: a separately captured candidate fixture can share a model
+/// revision while still have different observer provenance and inputs.
+fn prior_layer_three_prefix(fixture: &Fixture) -> Vec<u16> {
+    let partial = fixture
+        .cases
         .iter()
-        .find(|case| case["start_pos"].as_u64() == Some(5))
-        .expect("layer-three start five");
-    let tensor = &case["inputs"]["shared_index_k_prefix"];
-    assert_eq!(tensor["dtype"].as_str(), Some("torch.bfloat16"));
-    assert_eq!(tensor["shape"], serde_json::json!([1, 6, 64]));
-    assert_eq!(tensor["numel"].as_u64(), Some(384));
-    let hex = tensor["storage_hex"].as_str().expect("storage hex");
-    assert!(
-        hex.len().is_multiple_of(2),
-        "candidate storage hex alignment"
+        .find(|case| case.start_pos == 6)
+        .expect("captured partial layer-one decode");
+    let owner = bf16(&partial.index_key_prefix);
+    let source = bf16(&partial.index_score_key_prefix);
+    assert_eq!(source.len(), 3 * 64, "partial source score-key geometry");
+    assert_ne!(
+        source, owner,
+        "partial source score key must remain distinct from owner publication"
     );
-    let raw: Vec<_> = hex
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16).expect("byte"))
-        .collect();
-    assert_eq!(raw.len(), 384 * 2, "candidate BF16 storage length");
-    assert_eq!(
-        format!("{:x}", Sha256::digest(&raw)),
-        tensor["storage_sha256"].as_str().expect("storage hash")
-    );
-    raw[..3 * 64 * 2]
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes(word.try_into().expect("BF16")))
-        .collect()
+    source
 }
 
 fn frequencies(tensor: &Tensor) -> Vec<RotaryFrequency> {
@@ -485,22 +469,35 @@ fn assert_native_score(
     indices
 }
 
-#[derive(Default)]
-struct RequestScoreState {
-    layer_three_prefix: Option<Vec<u16>>,
+struct LayerThreeSharedScoreState {
+    layer_three_keys: IndexKeyState,
 }
 
-impl RequestScoreState {
-    fn reset(&mut self) {
-        self.layer_three_prefix = None;
+impl LayerThreeSharedScoreState {
+    fn new() -> Self {
+        Self {
+            // The fixture exports exactly the three source-layer-three keys
+            // consumed by the partial layer-one call. Do not retain a wider
+            // candidate trace whose provenance belongs to another capture.
+            layer_three_keys: IndexKeyState::new(nonzero(1), nonzero(64), nonzero(3), 3)
+                .expect("bounded layer-three shared score state"),
+        }
     }
 
-    fn publish_layer_three(&mut self, prefix: Vec<u16>) {
-        assert!(
-            self.layer_three_prefix.is_none(),
-            "layer-three score state already published"
-        );
-        self.layer_three_prefix = Some(prefix);
+    fn reset(&mut self) {
+        self.layer_three_keys
+            .reset()
+            .expect("layer-three shared score state reset");
+    }
+
+    fn publish_layer_three(&mut self, prefix: &[u16]) {
+        let epoch = self.layer_three_keys.epoch();
+        let call_id = self.layer_three_keys.next_call_id();
+        let start = self.layer_three_keys.valid_positions();
+        let publication = IndexKeyPublicationId::new(3, epoch, call_id);
+        self.layer_three_keys
+            .append_prepared(publication, start, prefix)
+            .expect("source-grounded layer-three shared-key publication");
     }
 
     fn score_keys_for(&self, case: &Case, owned_keys: &[u16], source_keys: &[u16]) -> Vec<u16> {
@@ -511,14 +508,14 @@ impl RequestScoreState {
                     "partial layer-one owner prefix stays distinct"
                 );
                 let previous = self
-                    .layer_three_prefix
-                    .as_ref()
-                    .expect("partial decode requires request-local layer-three publication");
+                    .layer_three_keys
+                    .prefix(0)
+                    .expect("layer-three shared-key batch");
                 assert_eq!(
                     previous, source_keys,
                     "start six previous layer-three score prefix"
                 );
-                previous.clone()
+                previous.to_vec()
             }
             0 | 5 => {
                 assert_eq!(
@@ -536,15 +533,76 @@ impl RequestScoreState {
 /// A partial decode may consume score keys published by an earlier layer call,
 /// but that publication belongs to one request and must not survive reset.
 pub(super) fn request_local_score_state_rejects_cross_request_reuse() -> bool {
-    let mut state = RequestScoreState::default();
-    let published = prior_layer_three_prefix();
-    state.publish_layer_three(published.clone());
+    let mut state = LayerThreeSharedScoreState::new();
+    let fixture = fixture();
+    let published = prior_layer_three_prefix(&fixture);
+    state.publish_layer_three(&published);
     assert_eq!(
-        state.layer_three_prefix.as_deref(),
-        Some(published.as_slice())
+        state.layer_three_keys.prefix(0).expect("published prefix"),
+        published.as_slice()
     );
     state.reset();
-    state.layer_three_prefix.is_none()
+    state
+        .layer_three_keys
+        .prefix(0)
+        .expect("reset prefix")
+        .is_empty()
+}
+
+/// The bounded layer-three publication is an operand from this source trace,
+/// not an interchangeable same-revision candidate capture.
+pub(super) fn partial_score_prefix_provenance_gate_rejects_mismatch() -> bool {
+    let fixture = fixture();
+    let partial = fixture
+        .cases
+        .iter()
+        .find(|case| case.start_pos == 6)
+        .expect("captured partial layer-one decode");
+    let owner = bf16(&partial.index_key_prefix);
+    let expected = prior_layer_three_prefix(&fixture);
+    let mut substituted = expected.clone();
+    substituted[0] ^= 1;
+    let mut state = LayerThreeSharedScoreState::new();
+    state.publish_layer_three(&expected);
+    std::panic::catch_unwind(|| state.score_keys_for(partial, &owner, &substituted)).is_err()
+}
+
+/// Score the captured partial layer-one call with a complete, natively produced
+/// layer-three prefix. The source consumes only its leading three keys; keeping
+/// that projection explicit prevents a six-key producer cache from being
+/// silently substituted for the smaller score domain.
+#[allow(
+    dead_code,
+    reason = "used by the separate layer-three bridge integration test"
+)]
+pub(super) fn partial_score_with_native_layer_three_prefix(
+    owner_fixture_json: &str,
+    expected_capture: &str,
+    producer_prefix: &[u16],
+) -> Vec<i32> {
+    let fixture = fixture_from_raw(owner_fixture_json, expected_capture);
+    let partial = fixture
+        .cases
+        .iter()
+        .find(|case| case.start_pos == 6)
+        .expect("captured partial layer-one decode");
+    assert_eq!(
+        producer_prefix.len(),
+        6 * 64,
+        "complete layer-three prefix geometry"
+    );
+    let source_score_keys = bf16(&partial.index_score_key_prefix);
+    let consumed = &producer_prefix[..source_score_keys.len()];
+    let owner_keys = bf16(&partial.index_key_prefix);
+    let mut state = LayerThreeSharedScoreState::new();
+    state.publish_layer_three(consumed);
+    let score_keys = state.score_keys_for(partial, &owner_keys, &source_score_keys);
+    assert_native_score(
+        &fixture,
+        partial,
+        &frequencies(&fixture.frequency_table),
+        &score_keys,
+    )
 }
 
 /// Replays source-owned KV/key publication through direct index selection.
@@ -574,7 +632,7 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         .expect("source compressed-KV layout");
     let mut keys = Vec::new();
     let mut kv = Vec::new();
-    let mut request_score_state = RequestScoreState::default();
+    let mut request_score_state = LayerThreeSharedScoreState::new();
     let mut outputs = Vec::new();
     for case in &fixture.cases {
         if case.start_pos == 0 {
@@ -634,7 +692,7 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         assert_eq!(keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
         if case.start_pos == 5 {
-            request_score_state.publish_layer_three(prior_layer_three_prefix());
+            request_score_state.publish_layer_three(&prior_layer_three_prefix(&fixture));
         }
         let score_keys = request_score_state.score_keys_for(case, &keys, &source_score_keys);
         let selected_indices = assert_native_score(&fixture, case, &all_frequencies, &score_keys);

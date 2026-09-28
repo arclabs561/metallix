@@ -3,23 +3,60 @@
 </p>
 <h1 align="center">metallix</h1>
 
-A local inference engine for Apple Silicon, built around Rust and Metal.
+A programmable local inference engine for Apple Silicon, built around Rust,
+Metal, and explicit model-state contracts.
 
 Generate JSON that follows your schema. Replay a sampled sequence. Inspect
 token probabilities and check the KV cache—all from `mx`.
 
 Qwen3-0.6B and Qwen3-4B-Instruct-2507 run today. DeepSeek-V4.1-Flash is the main target; its
-configuration and isolated Metal operators work today, but it cannot generate
-yet through Metallix's native adapter. A separate machine-local oMLX smoke
+metadata and a reduced native forward graph are qualified, but it cannot
+generate yet through Metallix's native adapter. A separate machine-local oMLX smoke
 route can load the cached DeepSeek-V4.1-Flash MLX snapshot; see the [local
 profile ledger](docs/experiments/deepseek-local-profile.md).
 
-The longer-term direction includes broader MLX computation, multimodal models,
-SMC/sampling, and training/LoRA. See the [adapter/config proposal](docs/model-adapters.md)
-and [model landscape survey](docs/research/hf-trending-landscape.md); these are
-planned capabilities, separate from the working commands below.
+Metallix is intended to grow into a programmable inference substrate for
+stateful, sparse, hybrid, speculative, and memory-constrained models. That
+direction includes symbolic controllers, grammar and schema control,
+mechanistic observation and activation steering, verifier and tool feedback,
+hierarchical/recursive inference, episodic and semantic memory, continual
+adaptation, probabilistic programs, sequential Monte Carlo (SMC), broader MLX
+computation, and selected multimodal capabilities. These are research
+directions, not claims that the current binaries implement AICI, mechanistic
+steering, recursive agents, continual learning, or model-backed SMC. The
+[programmatic inference design](docs/design/programmatic-inference.md) records
+the boundary and gates.
+
+Training/LoRA remains a separate, later capability. See the
+[adapter/config proposal](docs/model-adapters.md) and [model landscape
+survey](docs/research/hf-trending-landscape.md) for the broader planning
+context.
 The [delivery roadmap](docs/delivery-roadmap.md) orders that work and
 defines the correctness, performance and resource gates.
+
+## Current capabilities
+
+| Surface | Working scope | Limit |
+| --- | --- | --- |
+| Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
+| [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
+| [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
+| [DeepSeek](docs/progress.md) | Source-checked reduced joins, including layer-zero window attention, FFN and stateful key handoffs | Full native generation remains unfinished |
+| [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
+| [Julia-1](docs/research/julia-decision-contract.md) | Source-pinned tokenizer parity, published-header validation, and synthetic CPU head reference | No native encoder or decision-head execution yet |
+
+On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
+65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.
+This is [local adapter qualification](docs/typed-decisions.md#local-qualification-evidence),
+not an official JevBench score. A separate frozen schedule test did not show a
+full-task adherence benefit from the non-overlap verifier; its
+[results and limits](docs/candidate-control.md#fixed-synthetic-task-quality-check)
+are recorded separately. Explicit requirements safely rejected all eight
+plain-prompt 4B retry runs. Using the checkpoint's chat format on those same
+tasks reached 7/8 full-task successes with verified retries versus 6/8 for the
+schema-only baseline. A fresh, separately frozen same-family confirmation set
+reached 3/8 versus 2/8, using 1,606 versus 478 generated tokens. These small
+synthetic checks establish strict acceptance, not general quality or a speedup.
 
 ## Setup
 
@@ -74,8 +111,10 @@ Metallix stores no credentials and introduces no custom container format.
 `mx gen --prompt` encodes plain text with the local `tokenizer.json` and
 returns a JSON receipt on stdout. Its `generated_text` field is decoded model
 output; `--preview` writes a bounded rendering of that receipt to stderr. This
-is text completion, not a chat interface: the CLI adds no chat template or
-special tokens.
+is plain text completion by default. Add `--chat-template` to render the prompt
+as one user message using the checkpoint's template, with thinking disabled
+and an assistant-generation prefix. The receipt records `input_format` and the
+exact selected template's SHA-256. This option requires `--prompt`.
 
 ```sh
 mx gen --model "$MODEL" --prompt "The capital of France is" --max-tokens 8 \
@@ -109,6 +148,9 @@ mx gen --model "$MODEL" --prompt "Return only the status." --max-tokens 8 \
 
 Successful schema output is independently validated. A token budget that ends
 before the grammar completes reports `incomplete` and exits nonzero.
+The JSON receipt records this separately as `constraint.verification`, with
+`passed` only after independent JSON Schema validation; grammar masking alone
+is not reported as semantic verification.
 
 Excerpt from a local run:
 
@@ -119,14 +161,75 @@ Excerpt from a local run:
 This demonstrates grammar completion and validation for the shown input, not
 general structured-output quality.
 
+## Verify a schedule against explicit requirements
+
+For exact task acceptance, put integer-tick durations and the allowed time
+window in `requirements.json`:
+
+```json
+{"durations":[2,2],"window":{"start":0,"end":8}}
+```
+
+Save this as `schedule-schema.json`:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "intervals": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
+        "required": ["start", "end"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["intervals"],
+  "additionalProperties": false
+}
+```
+
+```sh
+mx gen --model "$MODEL" --prompt 'Return two non-overlapping intervals, each two ticks long, between 0 and 8.' \
+  --chat-template \
+  --json-schema schedule-schema.json --sample --temperature 1 --seed 41 \
+  --verify-schedule --schedule-requirements requirements.json \
+  --max-attempts 4 --max-tokens 128
+```
+
+The local 0.6B run accepted this schedule on its first attempt:
+
+```json
+{"intervals":[{"start":0,"end":2},{"start":2,"end":4}]}
+```
+
+The schema describes `{"intervals":[{"start":integer,"end":integer},...]}`.
+Acceptance requires non-overlap, the exact duration multiset (and therefore
+interval count), and containment in the window. The receipt includes the
+validated requirements and their file hash. Requirements are not extracted
+from prompt text; omitted requirements leave the non-overlap-only behavior.
+Exhaustion returns nonzero and exposes no accepted candidate. See the
+[candidate control guide](docs/candidate-control.md) for bounds and evaluation.
+
 ## Experimental chat and local control plane
+
+`mx decide --model "$MODEL" --request decision.json` scores typed `choice`,
+`score`, and `noul` questions directly from Qwen3 option logits, with zero
+generated answer tokens. It uses the same context and KV admission bounds
+below, with fresh KV state per question and no generated-token reservation.
+See [typed decisions](docs/typed-decisions.md) for the request format,
+uncalibrated-probability contract, and public JevBench adapter qualification.
 
 `chat`, `agent`, and `serve` are experimental Metal-only controls for one
 locally available Qwen3 checkpoint. They use that checkpoint's
 `tokenizer_config.json` chat template. A resident session loads model weights
 once, then starts with fresh KV state for every chat turn or HTTP request.
-The `--context-tokens` control applies only to these three commands: it accepts
-1 through 16,384 and defaults to 2048 total prompt-plus-generated tokens.
+For these three commands, `--context-tokens` accepts 1 through 16,384 and
+defaults to 2048 total prompt-plus-generated tokens.
 `--kv-budget-mib` sets the corresponding logical f32 K/V admission budget from
 1 through 8192 MiB and defaults to 512 MiB. `--max-tokens` reserves part of the
 context and accepts 1 through 256. Before checkpoint payloads load, the control
@@ -278,8 +381,12 @@ mx gen --model "$MODEL" --input-ids 9707,11,1879 --max-tokens 4 \
   --verify-cache --verbose
 ```
 
-See [the generation guide](DEVELOPMENT.md) for streamed weights, memory
-budgets, profiles, benchmarks, and the full JSON report fields.
+With resident execution, `--verify-cache` also forks the materialized KV
+state for each candidate decode and compares child logits with the parent;
+the receipt reports this as `branch_verification`. Streamed execution reports
+that branch verification is unavailable while retaining its full-forward
+cache check. See [the generation guide](DEVELOPMENT.md) for streamed weights,
+memory budgets, profiles, benchmarks, and the full JSON report fields.
 
 ## Build features
 
@@ -288,6 +395,32 @@ budgets, profiles, benchmarks, and the full JSON report fields.
 | Default | Configuration and checkpoint inspection; no Metal execution |
 | `metal` | Qwen execution and V4.1 operator diagnostics on Apple Silicon |
 | `structured-output` with `metal` | Qwen JSON Schema constrained generation |
+
+## Research direction: programmable inference
+
+The engine is being shaped around a separation between a model-owned executor
+and programmable control/orchestration. A controller may eventually observe
+qualified internal state, apply a calibrated activation intervention, express
+a grammar or tool protocol, call a verifier, recurse over external context,
+maintain memory, or run a proposal/particle policy; the adapter still owns KV,
+recurrent, routing, expert, and SSD state. This is the intended path for
+combining research-grade control with Metal execution without turning every
+model into a generic tensor interface.
+
+The current boundary is deliberately conservative:
+
+- JSON Schema masking and seeded categorical sampling are qualified only on
+  the bounded Qwen diagnostic.
+- The SMC primitive and particle accounting are test-only; they do not provide
+  particle-aware Qwen or DeepSeek serving.
+- AICI, llguidance, probabilistic-programming, and SMC integrations remain
+  research/design work until logits, tokenizer, snapshot/restore, and ancestry
+  gates pass on a real adapter.
+
+See [Programmatic and probabilistic inference](docs/design/programmatic-inference.md),
+[programmatic inference frontiers](docs/research/programmatic-inference-frontiers.md),
+[structured-generation research](docs/research/structured-generation-frontiers.md),
+and [sampling gates](docs/research/sampling-next-gates.md).
 
 ## What is qualified
 
@@ -344,11 +477,13 @@ layer-three/four suffix to final logits. BF16 boundaries remain exact and HC
 coefficients use fixed analytic bounds; discarded attention fails before FFN.
 The captured layer-one initial residual/pre-mix and the partial-call layer-three
 shared score keys remain boundaries. This is not a production API, whole graph,
-Metal path, or checkpoint execution. The next reduced-graph boundary is the
-Engram1 now feeds the native layer-one path through the reduced suffix with
-corruption rejection. The next DeepSeek boundary is layer zero and token
-embeddings, then real
-previous-call layer-three state.
+Metal path, or checkpoint execution. The layer-zero bridge now joins native
+window-only attention, HC mixing and RMSNorm/MoE FFN, passing the exact BF16
+residual to native Engram1 at starts 0, 5 and 6. Native HC pre-mix and RMSNorm
+now also reconstruct the attention input exactly. Incoming block residual,
+prior HC pre-mix and HC-coefficient production remain captured. Removing those
+upstream inputs and carrying real previous-call layer-three state are the
+next reduced-graph gates.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

@@ -11,6 +11,67 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- A frozen four-task/two-seed schedule comparison now separates non-overlap
+  validity from requested count/duration/window adherence. Verified retries
+  did not improve task adherence on either local checkpoint: 0/8 for both,
+  versus 0/8 (0.6B) and 3/8 (4B) baselines. All 32 runs completed without
+  infrastructure errors. The [candidate control note](candidate-control.md)
+  records compute budgets, exact task hash and the task-aware-verifier gap.
+
+- Optional `--schedule-requirements` now enforces exact interval count,
+  duration multiset and window from a bounded local descriptor. Four local
+  smoke cases accepted a compliant schedule and rejected each mismatch.
+  The unchanged frozen 4B follow-up exhausted all eight retry runs without
+  publishing an invalid candidate; baseline task adherence remained 3/8.
+  Stronger verification is established, improved task completion is not.
+  A subsequent serialization-only diagnostic using the checkpoint chat template
+  reached 7/8 verified successes versus 6/8 schema-only successes on those same
+  tasks. A fresh, separately frozen same-family set reached 3/8 verified
+  successes versus 2/8 baseline, using 1,606 versus 478 generated tokens.
+  Five verified runs exhausted their budgets; no invalid schedule was accepted.
+  This small confirmation does not establish general task quality.
+
+- The ignored local 0.6B steering checkpoint test passes exact zero-coefficient
+  identity, observable finite intervention, fork inheritance and parent-cache
+  immutability. Full/chunk logit differences meet the existing `5e-5` bound
+  for both unsteered and steered controls. Behavioral benefit remains unmeasured.
+
+- Layer-zero native window-only attention, BF16 HC post/pre/post mixing and RMSNorm/MoE FFN
+  reconstruct the exact residual consumed by layer-one Engram at starts 0, 5
+  and 6. Native HC pre-mix and RMSNorm also reproduce the attention input
+  exactly, with an incoming-residual corruption control. Corrupted HC
+  coefficients fail the source oracle; rejected out-of-order
+  attention calls leave the state retryable, including reset and replay.
+  Incoming block residual, prior HC pre-mix and HC-coefficient production remain
+  captured, so the join does not claim complete native layer-zero execution.
+- Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
+  for marker placement, option ordering, mask sanitation, strict truncation,
+  and padding. Its bounded artifact inspector validates the complete pinned
+  published safetensors header without reading tensor payloads.
+  Six published-tokenizer sequence cases now match the audited pinned source,
+  including option permutation and strict rejection. A synthetic F32 head
+  reference independently spells out attention, residuals, feed-forward, gather
+  and scoring against the pinned source. Native encoder/head execution remains open; see the [Julia contract](research/julia-decision-contract.md).
+
+- `mx decide` scores Qwen3 answer-letter logits directly for bounded `choice`,
+  `score`, and `noul` questions, returning normalized option probabilities and
+  zero generated tokens. Each question gets fresh KV state. The local 0.6B
+  checkpoint passed three typed receipt/replay checks and completed all 72
+  pinned public JevBench tasks without execution or receipt failures, with
+  35 correct (48.6%). The same prompt/tasks on Qwen3-4B-Instruct-2507
+  produced 65/72 correct (90.3%), again with complete valid receipts. This is
+  local adapter qualification, not an official benchmark result or calibrated confidence. See [typed decisions](typed-decisions.md).
+- SMC importance updates now reject proposal zero support and invalid log
+  probabilities atomically; target zero support rejects the particle. The
+  finite independent oracle checks this boundary and composed stage means
+  across two resampling rounds. An ignored checkpoint test now composes real
+  Qwen proposals, cache forks and particle weights under explicit synthetic
+  potentials; the local 0.6B run passed, including fresh-prefix and parent-cache
+  replay. A second checkpoint test checks raw temperature-one target versus
+  temperature-0.7 proposal correction, normalized weights, ESS, ancestry and
+  fresh-prefix replay, rejecting lost proposal support. This is a test-only
+  driver, not a particle-serving API.
+
 - Native Qwen3 chat uses the checkpoint template and keeps model weights loaded
   across turns. KV state is rebuilt per turn. `--context-tokens` defaults to
   2048 and `--kv-budget-mib` to 512 MiB, with experimental ceilings of 16,384
@@ -69,10 +130,13 @@ choices without expanding current support claims.
 - Six test-only native layer-one owner checks execute the ratio-two compressor's
   FP32 WKV/wgate projections, then check the BF16 latent plus owned compressed
   KV/index-key publications, native index query and score stages, and causal
-  selected IDs at starts 0, 5, and 6. The twelve-check source suite preserves
-  the partial-start distinction: its score-key operand is a captured layer-three
-  shared prefix, not layer one's retained owner key/KV state. This is not a
-  production API or complete native layer-one execution.
+  selected IDs at starts 0, 5, and 6. A same-trace bridge now reconstructs the
+  preceding layer-three ratio-one compressor/key publication natively from its
+  captured attention input, then feeds the consumed leading three keys through
+  request-local index state into the partial layer-one score/selection gate.
+  It rejects a substituted prefix and preserves distinct owner key/KV state.
+  Layer-three block input and attention remain captured boundaries; this is not
+  a production API or complete native layer-one execution.
 - The six-check source fixture
   `layer1-attention-reference.json` pins layer-one attention at SHA-256
   `a13bb6cd53406f04e436f119aa8dec2184ca43a4d4f4969205bff8bdf26ac31b`.
@@ -135,12 +199,23 @@ choices without expanding current support claims.
   4B checkpoints in FP32, plus 16 generated tiny-model ancestry cases. Duplicate
   branches leave parent and EOS cache snapshots unchanged. Particle scheduling
   and physical cache-sharing costs remain separate [sampling gates](research/sampling-next-gates.md).
+- The programmable-control vertical now has same-session grammar checkpoints,
+  explicit independent JSON Schema verification receipts, and transactional
+  rollback of the constrained controller plus seeded sampling RNG on rejected
+  draws. The Qwen executor exposes its validated KV fork operation. Resident
+  `--verify-cache` now exercises that fork before each candidate decode and
+  compares branch/parent next logits; streamed mode reports the branch
+  limitation explicitly.
 - The [model/runtime refresh](research/model-runtime-refresh.md) records primary
   sources for Qwen3.8, vLLM-Metal, and Whallm, with explicit qualification gates.
 - The engine now has a bounded SMC state primitive with deterministic
   systematic resampling and absorbing particles. A Qwen test-only LoRA
   micrograph checks gradient/update ownership and adapter export parity; neither
   is a production training or particle-decoding API yet.
+
+See [verified schedule candidates](candidate-control.md) for the current resident
+Qwen consumer, receipt semantics, qualification command, and remaining evidence
+gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 
 ## Next, in dependency order
 
@@ -168,7 +243,11 @@ choices without expanding current support claims.
    residual/pre-mix remains captured. Engram1 now feeds the native layer-one
    path through the reduced suffix with exact fixture and corruption gates. The
    layer-zero token embedding now has an exact source fixture and OOV/mutation
-   controls. The next boundary is a full stateful runner, while preserving the
+   controls. Native layer-zero window-only attention, HC mixing, RMSNorm and
+   MoE FFN now feed Engram1. Incoming block residual, prior HC pre-mix and
+   HC-coefficient production remain captured. Remove those upstream boundaries,
+   then carry the trace through a full
+   stateful runner, while preserving the
    source-grounded partial-call layer-three shared score keys and discrete
    routing gates. This pair does not use the layer-three/four candidate-mask
    path. Operator and joined-suffix parity do not establish full model generation.

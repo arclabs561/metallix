@@ -16,6 +16,7 @@ use minijinja_contrib::pycompat::unknown_method_callback;
 use qwen::metal::Qwen3MlxWeights;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::qwen_tokenizer::QwenTokenizer;
 
@@ -139,6 +140,37 @@ impl ChatMessage {
             name: None,
         }
     }
+}
+
+/// A bounded one-user-message prompt rendered from the checkpoint's own template.
+///
+/// This only prepares generation input. It neither loads checkpoint weights
+/// nor creates a resident chat session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GenerationTemplatePrompt {
+    pub(crate) rendered: String,
+    pub(crate) template_sha256: String,
+}
+
+/// Renders one non-thinking user message using the local checkpoint template.
+///
+/// It applies the resident-chat source, input, rendered-byte, and fuel limits
+/// before a caller can begin a checkpoint payload load.
+pub(crate) fn render_generation_prompt(
+    model: &Path,
+    prompt: &str,
+) -> Result<GenerationTemplatePrompt, String> {
+    let messages = [ChatMessage::text(ChatRole::User, prompt)];
+    let request = ChatRequest::new(&messages, 1);
+    validate_request(request)?;
+    let template_source = load_template(model)?;
+    let template_sha256 = format!("{:x}", Sha256::digest(template_source.as_bytes()));
+    let template = parse_template(template_source)?;
+    let rendered = render_template(&template, request)?;
+    Ok(GenerationTemplatePrompt {
+        rendered,
+        template_sha256,
+    })
 }
 
 /// One chat turn. Tool schemas remain JSON because their externally defined
@@ -287,6 +319,21 @@ pub(crate) struct ChatSession {
     kv_budget_bytes: u64,
     planned_kv_bytes: u64,
     load_ms: f64,
+    config_sha256: String,
+    tokenizer_sha256: String,
+    template_sha256: String,
+}
+
+/// The non-generative result of a single independently-prefilled chat prompt.
+///
+/// The logits are deliberately exposed only inside the server crate: callers
+/// must select a small, validated answer-token set rather than serialize a
+/// complete vocabulary distribution.
+pub(crate) struct ChatPrefill {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) prompt_tokens: usize,
+    pub(crate) render_ms: f64,
+    pub(crate) prefill_ms: f64,
 }
 
 /// Backend-neutral generation seam consumed by the Responses/Codex protocol.
@@ -317,10 +364,12 @@ impl ChatSession {
     /// Loads and prepares a checkpoint once, including its template and tokenizer.
     pub(crate) fn load(model: &Path, limits: ResidentChatLimits) -> Result<Self, String> {
         let started = Instant::now();
-        let (config, plan) = load_config(model, limits)?;
+        let (config, plan, config_sha256) = load_config(model, limits)?;
         let tokenizer = QwenTokenizer::load(model)?;
+        let tokenizer_sha256 = tokenizer.source_sha256().to_owned();
         tokenizer.check_model_vocabulary(config.vocab_size, config.eos_token_id)?;
         let template_source = load_template(model)?;
+        let template_sha256 = format!("{:x}", Sha256::digest(template_source.as_bytes()));
         let template = parse_template(template_source)?;
 
         let mut weights = Qwen3MlxWeights::load(model).map_err(|error| error.to_string())?;
@@ -337,6 +386,9 @@ impl ChatSession {
             kv_budget_bytes: limits.kv_budget_bytes(),
             planned_kv_bytes: plan.planned_kv_bytes(),
             load_ms: elapsed_ms(started.elapsed()),
+            config_sha256,
+            tokenizer_sha256,
+            template_sha256,
         })
     }
 
@@ -344,6 +396,68 @@ impl ChatSession {
     #[must_use]
     pub(crate) const fn load_ms(&self) -> f64 {
         self.load_ms
+    }
+
+    /// Hash of the exact checkpoint template source selected at session load.
+    #[must_use]
+    pub(crate) fn template_sha256(&self) -> &str {
+        &self.template_sha256
+    }
+
+    /// Hashes of the exact local metadata parsed during session loading.
+    #[must_use]
+    pub(crate) fn config_sha256(&self) -> &str {
+        &self.config_sha256
+    }
+
+    #[must_use]
+    pub(crate) fn tokenizer_sha256(&self) -> &str {
+        &self.tokenizer_sha256
+    }
+
+    /// Encodes a decision answer label as exactly one ordinary tokenizer token.
+    pub(crate) fn answer_label_token(&self, label: &str) -> Result<i32, String> {
+        let ids = self.tokenizer.encode_prompt(label)?;
+        match ids.as_slice() {
+            [token] => Ok(*token),
+            _ => Err(format!(
+                "decision answer label {label:?} must encode as exactly one token"
+            )),
+        }
+    }
+
+    /// Renders and pre-fills one fresh chat prompt without selecting or decoding
+    /// any output token. Each call creates a separate resident executor, so no
+    /// question can contribute K/V state to another question.
+    pub(crate) fn prefill_chat(&mut self, messages: &[ChatMessage]) -> Result<ChatPrefill, String> {
+        let request = ChatRequest::new(messages, 1);
+        validate_request(request)?;
+        let render_started = Instant::now();
+        let prompt = self.render(request)?;
+        let render_ms = elapsed_ms(render_started.elapsed());
+        let input_ids = self.tokenizer.encode_prompt(&prompt)?;
+        validate_ids(&input_ids, self.eos_token_id, self.vocabulary_size)?;
+        if input_ids.len() > self.context_limit {
+            return Err(format!(
+                "decision requires prompt_tokens <= {}; received {}",
+                self.context_limit,
+                input_ids.len()
+            ));
+        }
+        let mut executor = self
+            .weights
+            .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
+            .map_err(|error| error.to_string())?;
+        let prefill_started = Instant::now();
+        let logits = executor
+            .prefill_last_logits(&input_ids)
+            .map_err(|error| error.to_string())?;
+        Ok(ChatPrefill {
+            logits,
+            prompt_tokens: input_ids.len(),
+            render_ms,
+            prefill_ms: elapsed_ms(prefill_started.elapsed()),
+        })
     }
 
     /// Generates one complete chat turn and streams only cumulative-decoder text deltas.
@@ -477,31 +591,37 @@ impl ChatSession {
     }
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
-        let messages = serde_json::to_value(request.messages)
-            .map_err(|_| String::from("chat messages could not be serialized"))?;
-        let tools = serde_json::to_value(request.tools)
-            .map_err(|_| String::from("chat tools could not be serialized"))?;
-        let rendered = self
-            .template
-            .get_template("qwen_chat")
-            .map_err(|error| format!("local chat template is unavailable: {error}"))?
-            .render(context! {
-                messages => messages,
-                tools => tools,
-                add_generation_prompt => true,
-                enable_thinking => request.enable_thinking,
-                thinking_mode => if request.enable_thinking { "thinking" } else { "non-thinking" },
-                reasoning_effort => request.reasoning_effort.unwrap_or("low"),
-                drop_thinking => !request.enable_thinking,
-            })
-            .map_err(|error| format!("local chat template could not be rendered: {error}"))?;
-        if rendered.len() > MAX_CHAT_RENDERED_BYTES {
-            return Err(format!(
-                "rendered chat prompt exceeds the {MAX_CHAT_RENDERED_BYTES}-byte limit"
-            ));
-        }
-        Ok(rendered)
+        render_template(&self.template, request)
     }
+}
+
+fn render_template(
+    template: &Environment<'static>,
+    request: ChatRequest<'_>,
+) -> Result<String, String> {
+    let messages = serde_json::to_value(request.messages)
+        .map_err(|_| String::from("chat messages could not be serialized"))?;
+    let tools = serde_json::to_value(request.tools)
+        .map_err(|_| String::from("chat tools could not be serialized"))?;
+    let rendered = template
+        .get_template("qwen_chat")
+        .map_err(|error| format!("local chat template is unavailable: {error}"))?
+        .render(context! {
+            messages => messages,
+            tools => tools,
+            add_generation_prompt => true,
+            enable_thinking => request.enable_thinking,
+            thinking_mode => if request.enable_thinking { "thinking" } else { "non-thinking" },
+            reasoning_effort => request.reasoning_effort.unwrap_or("low"),
+            drop_thinking => !request.enable_thinking,
+        })
+        .map_err(|error| format!("local chat template could not be rendered: {error}"))?;
+    if rendered.len() > MAX_CHAT_RENDERED_BYTES {
+        return Err(format!(
+            "rendered chat prompt exceeds the {MAX_CHAT_RENDERED_BYTES}-byte limit"
+        ));
+    }
+    Ok(rendered)
 }
 
 impl ChatBackend for ChatSession {
@@ -522,7 +642,7 @@ impl ChatBackend for ChatSession {
 fn load_config(
     model: &Path,
     limits: ResidentChatLimits,
-) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan), String> {
+) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan, String), String> {
     let path = model.join("config.json");
     let raw = fs::read_to_string(&path)
         .map_err(|_| String::from("local model config.json could not be read"))?;
@@ -534,26 +654,21 @@ fn load_config(
             config.resident_chat_plan(limits.context_tokens(), limits.kv_budget_bytes())
         })
         .map_err(|error| error.to_string())?;
-    Ok((config, plan))
+    Ok((
+        config,
+        plan,
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+    ))
 }
 
 fn load_template(model: &Path) -> Result<String, String> {
     let path = model.join("tokenizer_config.json");
-    let metadata = path
-        .metadata()
-        .map_err(|_| String::from("local tokenizer_config.json must be a readable regular file"))?;
-    if !metadata.is_file() || metadata.len() > MAX_CHAT_TEMPLATE_BYTES as u64 {
-        return Err(format!(
-            "local tokenizer_config.json exceeds the {MAX_CHAT_TEMPLATE_BYTES}-byte limit or is not regular"
-        ));
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|_| String::from("local tokenizer_config.json could not be read"))?;
-    if raw.len() > MAX_CHAT_TEMPLATE_BYTES {
-        return Err(format!(
-            "local tokenizer_config.json exceeds the {MAX_CHAT_TEMPLATE_BYTES}-byte limit"
-        ));
-    }
+    let raw = String::from_utf8(crate::qwen_tokenizer::read_regular_file(
+        &path,
+        MAX_CHAT_TEMPLATE_BYTES,
+        "tokenizer_config.json",
+    )?)
+    .map_err(|_| String::from("local tokenizer_config.json could not be read"))?;
     let config: Value = serde_json::from_str(&raw)
         .map_err(|_| String::from("local tokenizer_config.json could not be parsed"))?;
     if let Some(template) = config
@@ -565,18 +680,17 @@ fn load_template(model: &Path) -> Result<String, String> {
     }
 
     let external = model.join("chat_template.jinja");
-    let metadata = external.metadata().map_err(|_| {
-        String::from(
+    if !external.exists() {
+        return Err(String::from(
             "local tokenizer_config.json has no chat_template and chat_template.jinja is absent",
-        )
-    })?;
-    if !metadata.is_file() || metadata.len() > MAX_CHAT_TEMPLATE_BYTES as u64 {
-        return Err(format!(
-            "local chat_template.jinja exceeds the {MAX_CHAT_TEMPLATE_BYTES}-byte limit or is not regular"
         ));
     }
-    let template = fs::read_to_string(external)
-        .map_err(|_| String::from("local chat_template.jinja could not be read"))?;
+    let template = String::from_utf8(crate::qwen_tokenizer::read_regular_file(
+        &external,
+        MAX_CHAT_TEMPLATE_BYTES,
+        "chat_template.jinja",
+    )?)
+    .map_err(|_| String::from("local chat_template.jinja could not be read"))?;
     if template.trim().is_empty() {
         return Err(String::from("local chat_template.jinja must not be empty"));
     }
@@ -714,6 +828,7 @@ fn elapsed_ms(duration: Duration) -> f64 {
 mod tests {
     use std::{
         fs,
+        path::Path,
         time::{Duration, Instant},
     };
 
@@ -724,7 +839,8 @@ mod tests {
 
     use super::{
         ChatGenerationError, ChatMessage, ChatRole, ChatToolCall, ChatToolResult,
-        GenerationDeadline, ResidentChatLimits, load_template, parse_template,
+        GenerationDeadline, MAX_CHAT_INPUT_BYTES, MAX_CHAT_TEMPLATE_BYTES, ResidentChatLimits,
+        load_template, parse_template, render_generation_prompt,
     };
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
@@ -784,6 +900,92 @@ mod tests {
             "{{ messages }}"
         );
         fs::remove_dir_all(root).expect("remove template test directory");
+    }
+
+    #[test]
+    fn template_sources_reject_oversized_invalid_utf8_and_nonregular_files() {
+        let root = std::env::temp_dir().join(format!(
+            "metallix-template-source-limits-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("template test directory");
+        let config = root.join("tokenizer_config.json");
+        let external = root.join("chat_template.jinja");
+        let oversized = vec![b'x'; MAX_CHAT_TEMPLATE_BYTES + 1];
+
+        fs::write(&config, &oversized).expect("oversized tokenizer config");
+        assert!(
+            load_template(&root)
+                .expect_err("oversized tokenizer config must fail")
+                .contains("byte limit")
+        );
+        fs::write(&config, [0xff]).expect("invalid UTF-8 tokenizer config");
+        assert!(
+            load_template(&root)
+                .expect_err("invalid UTF-8 tokenizer config must fail")
+                .contains("could not be read")
+        );
+        fs::remove_file(&config).expect("remove tokenizer config file");
+        fs::create_dir(&config).expect("nonregular tokenizer config");
+        assert!(
+            load_template(&root)
+                .expect_err("nonregular tokenizer config must fail")
+                .contains("readable regular file")
+        );
+        fs::remove_dir(&config).expect("remove tokenizer config directory");
+
+        fs::write(&config, b"{}").expect("fallback tokenizer config");
+        fs::write(&external, &oversized).expect("oversized external template");
+        assert!(
+            load_template(&root)
+                .expect_err("oversized external template must fail")
+                .contains("byte limit")
+        );
+        fs::write(&external, [0xff]).expect("invalid UTF-8 external template");
+        assert!(
+            load_template(&root)
+                .expect_err("invalid UTF-8 external template must fail")
+                .contains("could not be read")
+        );
+        fs::remove_file(&external).expect("remove external template file");
+        fs::create_dir(&external).expect("nonregular external template");
+        assert!(
+            load_template(&root)
+                .expect_err("nonregular external template must fail")
+                .contains("readable regular file")
+        );
+
+        fs::remove_dir_all(root).expect("remove template test directory");
+    }
+
+    #[test]
+    fn generation_template_renders_one_nonthinking_user_message_before_weights() {
+        let root = std::env::temp_dir().join(format!(
+            "metallix-generation-template-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("template test directory");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            serde_json::json!({"chat_template": TEMPLATE}).to_string(),
+        )
+        .expect("tokenizer config");
+        let rendered =
+            render_generation_prompt(&root, "hello").expect("bounded generation template render");
+        assert_eq!(rendered.template_sha256, TEMPLATE_SHA256);
+        assert_eq!(
+            rendered.rendered,
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        fs::remove_dir_all(root).expect("remove template test directory");
+    }
+
+    #[test]
+    fn generation_template_rejects_oversize_user_input_before_template_reads() {
+        let prompt = "x".repeat(MAX_CHAT_INPUT_BYTES + 1);
+        let error = render_generation_prompt(Path::new("missing-model"), &prompt)
+            .expect_err("input boundary must run before template reads");
+        assert!(error.contains("byte limit"));
     }
 
     #[test]

@@ -1,5 +1,47 @@
 # Chat serving performance ledger
 
+## Candidate grammar reuse pilot
+
+On 2026-09-27, a local Qwen3-0.6B CLI pilot on an Apple M3 Max with 128 GiB
+unified memory compared compiling the same grammar
+on every candidate attempt with compiling it once and restoring its root
+checkpoint between attempts. Both release binaries used `--all-features`,
+Float32 Metal, the existing checkpoint snapshot
+`c1899de289a04d12100db370d81485cdf75e47ca`, and the same dirty base at
+`c7af37bb63d44e3570a98534c2167a0b8e8ba0be`.
+
+Each case used four pairs of fresh processes, alternating binary order, with
+the first pair excluded as warmup. Filesystem caches were not flushed. Wall
+time includes process startup, model loading, grammar setup, and generation.
+Each measured cell has three repeats of one fixed seed, not independent task
+samples. The valid control accepted its first candidate; the mixed case reached
+acceptance on attempt six after three rejections and two token-limit finishes.
+
+| Case | Before median (range), seconds | Reuse median (range), seconds |
+| --- | --- | --- |
+| One-attempt valid control | 1.138 (1.134–1.157) | 1.141 (1.136–1.188) |
+| Six-attempt mixed case | 5.710 (5.692–5.729) | 3.868 (3.863–3.965) |
+
+Grammar reuse reduced this retry case's median wall time by 32.2%. Accepted
+token IDs and every attempt's seed, status, and token count matched between
+binaries, including warmups. A separate initial ordinary/verified comparison
+also preserved these traces across the change. This is a mechanism cost pilot,
+not evidence of held-out task quality or a general speedup over unconstrained
+generation. macOS `/usr/bin/time -l` peak RSS varied substantially in unchanged
+controls too; these observations do not establish a memory improvement.
+
+Session-owned receipts under `.agents/receipts/candidate-control/` retain
+`cost-before.json`, `cost-after.json`, `cost-interleaved.json`, `measure.py`, and
+`interleave.py`, including exact argv, schemas, prompts, timings, and results.
+The before binary SHA-256 is
+`53e16da1a57042a6c519cae5134a406f7f4ba37e5d8ba8ee48d8fff52b4438fc`;
+the reuse binary is
+`c1a73b737f39f2cf12091729f4a747ec35817b3d6576593abf56916c320f4b68`.
+The partial/terminal grammar-restore regression and serial canonical
+`RUST_TEST_THREADS=1 just check-metal` gate pass after the change.
+
+## HTTP baseline harness
+
 `scripts/benchmark-openai.mjs` establishes the client-observed baseline for a
 local server that implements the streamed Responses API. It is a harness, not
 a result: do not fill this document with estimated model performance.

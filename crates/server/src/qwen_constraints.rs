@@ -2,7 +2,9 @@
 
 use std::{fs::File, io::Read, path::Path, time::Instant};
 
-use engine::constraint::{ConstraintLimits, ConstraintStep, JsonConstraintSession};
+use engine::constraint::{
+    ConstraintLimits, ConstraintStep, JsonConstraintCheckpoint, JsonConstraintSession,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -40,7 +42,123 @@ pub(crate) struct ConstraintRun {
     tokenizer_json_sha256: String,
 }
 
+/// Transactional controller state for one constrained Qwen branch.
+///
+/// Model KV state and the sampler RNG live in their respective owners; this
+/// checkpoint only covers grammar/output state and its diagnostic timing
+/// cursor.
+pub(crate) struct ConstraintCheckpoint {
+    session: JsonConstraintCheckpoint,
+    complete: bool,
+    sampling_len: usize,
+}
+
+/// Result of the fixed, local schedule semantic check.
+///
+/// The schema still owns the surrounding JSON shape. This verifier deliberately
+/// accepts only `{ "intervals": [{"start": number, "end": number}, ...] }`
+/// so its meaning is stable and no executable verifier surface is needed.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ScheduleVerification {
+    pub(crate) interval_count: usize,
+    pub(crate) rejection: Option<&'static str>,
+}
+
+impl ScheduleVerification {
+    pub(crate) const fn accepted(&self) -> bool {
+        self.rejection.is_none()
+    }
+}
+
+pub(crate) fn verify_non_overlapping_schedule(value: &Value) -> ScheduleVerification {
+    const MAX_INTERVALS: usize = 128;
+    let Some(intervals) = value.get("intervals").and_then(Value::as_array) else {
+        return ScheduleVerification {
+            interval_count: 0,
+            rejection: Some("missing_intervals"),
+        };
+    };
+    if intervals.is_empty() {
+        return ScheduleVerification {
+            interval_count: 0,
+            rejection: Some("empty_intervals"),
+        };
+    }
+    if intervals.len() > MAX_INTERVALS {
+        return ScheduleVerification {
+            interval_count: intervals.len(),
+            rejection: Some("too_many_intervals"),
+        };
+    }
+
+    let mut bounds = Vec::with_capacity(intervals.len());
+    for interval in intervals {
+        let Some(start) = interval.get("start").and_then(Value::as_f64) else {
+            return ScheduleVerification {
+                interval_count: intervals.len(),
+                rejection: Some("interval_start_not_finite_number"),
+            };
+        };
+        let Some(end) = interval.get("end").and_then(Value::as_f64) else {
+            return ScheduleVerification {
+                interval_count: intervals.len(),
+                rejection: Some("interval_end_not_finite_number"),
+            };
+        };
+        if !start.is_finite() || !end.is_finite() {
+            return ScheduleVerification {
+                interval_count: intervals.len(),
+                rejection: Some("interval_bound_not_finite"),
+            };
+        }
+        if start >= end {
+            return ScheduleVerification {
+                interval_count: intervals.len(),
+                rejection: Some("interval_not_positive_width"),
+            };
+        }
+        bounds.push((start, end));
+    }
+    bounds.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
+    if bounds.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return ScheduleVerification {
+            interval_count: intervals.len(),
+            rejection: Some("overlapping_intervals"),
+        };
+    }
+    ScheduleVerification {
+        interval_count: intervals.len(),
+        rejection: None,
+    }
+}
+
 impl ConstraintRun {
+    pub(crate) fn identity(&self) -> Value {
+        json!({
+            "schema_json_sha256": self.schema_json_sha256,
+            "tokenizer_json_sha256": self.tokenizer_json_sha256,
+            "scope": "reserialized parsed JSON; not checkpoint weights",
+        })
+    }
+
+    pub(crate) fn checkpoint(&self) -> ConstraintCheckpoint {
+        ConstraintCheckpoint {
+            session: self.session.checkpoint(),
+            complete: self.complete,
+            sampling_len: self.sampling_ms.len(),
+        }
+    }
+
+    pub(crate) fn restore(
+        &mut self,
+        checkpoint: ConstraintCheckpoint,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.session.restore(checkpoint.session)?;
+        self.complete = checkpoint.complete;
+        self.sampling_ms.truncate(checkpoint.sampling_len);
+        Ok(())
+    }
+
     pub(crate) fn load(
         model: &Path,
         schema_source: SchemaSource<'_>,
@@ -159,6 +277,13 @@ impl ConstraintRun {
         self.complete
     }
 
+    pub(crate) fn validated_output(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        if !self.complete {
+            return Err("cannot verify an incomplete grammar output".into());
+        }
+        Ok(self.session.validate_complete()?)
+    }
+
     pub(crate) fn report(
         &self,
         verbose: bool,
@@ -179,8 +304,23 @@ impl ConstraintRun {
                 self.complete,
             );
         }
+        let verification = if self.complete {
+            json!({
+                "status": "passed",
+                "kind": "independent_json_schema",
+                "grammar": "tokenizer_aware_mask",
+                "scope": "decoded JSON value; does not validate model quality or checkpoint identity",
+            })
+        } else {
+            json!({
+                "status": "not_run",
+                "kind": "independent_json_schema",
+                "reason": "grammar_incomplete",
+            })
+        };
         Ok(json!({
             "status": if self.complete { "validated" } else { "incomplete" },
+            "verification": verification,
             "output": output,
             "generated_text": String::from_utf8_lossy(self.session.decoded_bytes()),
             "setup_ms": self.setup_ms,
@@ -234,7 +374,7 @@ fn read_json(path: &Path, maximum: usize) -> Result<Value, Box<dyn std::error::E
 
 #[cfg(test)]
 mod source_tests {
-    use super::{MAX_SCHEMA_BYTES, SchemaSource};
+    use super::{MAX_SCHEMA_BYTES, SchemaSource, verify_non_overlapping_schedule};
     use serde_json::json;
 
     #[test]
@@ -280,5 +420,37 @@ mod source_tests {
         );
         let exact = format!("{}true", " ".repeat(MAX_SCHEMA_BYTES - 4));
         assert_eq!(SchemaSource::Inline(&exact).read().unwrap(), json!(true));
+    }
+
+    #[test]
+    fn schedule_verifier_enforces_nonempty_half_open_positive_intervals() {
+        let accepted = verify_non_overlapping_schedule(&json!({
+            "intervals": [{"start": 0, "end": 1}, {"start": 1, "end": 2.5}]
+        }));
+        assert!(accepted.accepted());
+        assert_eq!(accepted.interval_count, 2);
+
+        for (value, rejection) in [
+            (json!({"intervals": []}), "empty_intervals"),
+            (
+                json!({"intervals": [{"start": 2, "end": 2}]}),
+                "interval_not_positive_width",
+            ),
+            (
+                json!({"intervals": [{"start": 0, "end": 2}, {"start": 1, "end": 3}]}),
+                "overlapping_intervals",
+            ),
+            (
+                json!({"intervals": [{"start": 0, "end": 4}, {"start": 1, "end": 2}]}),
+                "overlapping_intervals",
+            ),
+            (
+                json!({"intervals": [{"start": "zero", "end": 1}]}),
+                "interval_start_not_finite_number",
+            ),
+        ] {
+            let result = verify_non_overlapping_schedule(&value);
+            assert_eq!(result.rejection, Some(rejection));
+        }
     }
 }

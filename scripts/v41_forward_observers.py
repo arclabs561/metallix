@@ -297,6 +297,8 @@ def hooks_for(
     """Capture selected source boundaries and restore all observer bindings."""
     records: dict[str, object] = {}
     handles: list[torch.utils.hooks.RemovableHandle] = []
+    layer_zero = model.layers[0]
+    layer_zero_attention = layer_zero.attn
     layer_one = model.layers[1]
     layer_one_attention = layer_one.attn
     layer_one_indexer = layer_one_attention.indexer
@@ -329,6 +331,9 @@ def hooks_for(
     had_hc_mixes, prior_hc_mixes, original_hc_mixes = instance_method(
         layer_four, "hc_mixes"
     )
+    had_layer_zero_hc_mixes, prior_layer_zero_hc_mixes, _ = instance_method(
+        layer_zero, "hc_mixes"
+    )
     had_producer_hc_mixes, prior_producer_hc_mixes, _ = instance_method(
         layer_three, "hc_mixes"
     )
@@ -340,6 +345,9 @@ def hooks_for(
     )
     had_owner_window, prior_owner_window, original_owner_window = instance_method(
         layer_one_attention, "_window_kv"
+    )
+    had_layer_zero_window, prior_layer_zero_window, original_layer_zero_window = (
+        instance_method(layer_zero_attention, "_window_kv")
     )
     had_owner_compress, prior_owner_compress, original_owner_compress = instance_method(
         layer_one_attention, "_compress_kv"
@@ -517,13 +525,25 @@ def hooks_for(
                     capture_input("norm_input", exactly_one=True)
                 )
             )
-        if name in {"layers.1.ffn", "layers.2.ffn", "layers.3.ffn", "layers.4.ffn"}:
+        if name in {
+            "layers.0.ffn",
+            "layers.1.ffn",
+            "layers.2.ffn",
+            "layers.3.ffn",
+            "layers.4.ffn",
+        }:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(f"{name}_input", exactly_one=False)
                 )
             )
-        if name in {"layers.1.attn", "layers.2.attn", "layers.3.attn", "layers.4.attn"}:
+        if name in {
+            "layers.0.attn",
+            "layers.1.attn",
+            "layers.2.attn",
+            "layers.3.attn",
+            "layers.4.attn",
+        }:
             handles.append(
                 module.register_forward_pre_hook(
                     capture_input(
@@ -532,20 +552,27 @@ def hooks_for(
                     )
                 )
             )
-        if name == "layers.2.attn":
+        if name in {"layers.0.attn", "layers.2.attn"}:
 
-            def capture_layer_two_freqs(
-                module: torch.nn.Module, _inputs: tuple[object, ...]
-            ) -> None:
-                cap_guard("layers.2.attn.freqs_cis")
-                freqs = getattr(module, "freqs_cis", None)
-                if not isinstance(freqs, torch.Tensor):
-                    raise TypeError("layer-two attention has no frequency table")
-                records["layers.2.attn.freqs_cis"] = object_record(
-                    freqs, include_storage=True
+            def capture_attention_freqs(record_name: str):
+                def hook(
+                    observed_module: torch.nn.Module, _inputs: tuple[object, ...]
+                ) -> None:
+                    cap_guard(record_name)
+                    freqs = getattr(observed_module, "freqs_cis", None)
+                    if not isinstance(freqs, torch.Tensor):
+                        raise TypeError(
+                            f"{record_name} source module has no frequency table"
+                        )
+                    records[record_name] = object_record(freqs, include_storage=True)
+
+                return hook
+
+            handles.append(
+                module.register_forward_pre_hook(
+                    capture_attention_freqs(f"{name}.freqs_cis")
                 )
-
-            handles.append(module.register_forward_pre_hook(capture_layer_two_freqs))
+            )
         if name in {"layers.1.engram", "layers.3.engram"}:
             handles.append(module.register_forward_pre_hook(capture_engram_input))
         if name in {
@@ -562,6 +589,9 @@ def hooks_for(
         }:
             handles.append(module.register_forward_hook(capture(name)))
         if name in {
+            "layers.0.attn.wq_a",
+            "layers.0.attn.q_norm",
+            "layers.0.attn.wq_b",
             "layers.1.attn.wq_a",
             "layers.1.attn.q_norm",
             "layers.1.attn.wq_b",
@@ -577,6 +607,7 @@ def hooks_for(
         }:
             handles.append(module.register_forward_hook(capture(name)))
         if name in {
+            "layers.0.attn.wo_b",
             "layers.1.attn.wo_b",
             "layers.2.attn.wo_b",
             "layers.3.attn.wo_b",
@@ -591,6 +622,7 @@ def hooks_for(
                 )
             )
         if name in {
+            "layers.0.ffn_norm",
             "layers.1.ffn_norm",
             "layers.2.ffn_norm",
             "layers.3.ffn_norm",
@@ -645,7 +677,7 @@ def hooks_for(
                     mark_quantization_phase(consumer_state, _QuantizationPhase.QUERY)
                 )
             )
-        if name in {"layers.1", "layers.2", "layers.3", "layers.4"}:
+        if name in {"layers.0", "layers.1", "layers.2", "layers.3", "layers.4"}:
             layer_id = int(name.removeprefix("layers."))
             handles.append(
                 module.register_forward_pre_hook(capture_block_input(layer_id))
@@ -658,7 +690,9 @@ def hooks_for(
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         layer_id = (
-            1
+            0
+            if hc_fn is layer_zero.hc_ffn_fn
+            else 1
             if hc_fn is model.layers[1].hc_ffn_fn
             else 2
             if hc_fn is model.layers[2].hc_ffn_fn
@@ -855,12 +889,16 @@ def hooks_for(
         return output
 
     try:
+        layer_zero.hc_mixes = observed_hc_mixes
         layer_one.hc_mixes = observed_hc_mixes
         layer_two.hc_mixes = observed_hc_mixes
         layer_three.hc_mixes = observed_hc_mixes
         layer_four.hc_mixes = observed_hc_mixes
         layer_two_attention._window_kv = observed_window_kv_for(
             2, layer_two_attention, original_layer_two_window
+        )
+        layer_zero_attention._window_kv = observed_window_kv_for(
+            0, layer_zero_attention, original_layer_zero_window
         )
         layer_two_attention._compress_kv = observed_compress_kv_for(
             2, original_layer_two_compress
@@ -900,6 +938,12 @@ def hooks_for(
         for handle in handles:
             handle.remove()
         _restore_instance(
+            layer_zero_attention,
+            "_window_kv",
+            had_layer_zero_window,
+            prior_layer_zero_window,
+        )
+        _restore_instance(
             layer_two_attention,
             "_window_kv",
             had_layer_two_window,
@@ -910,6 +954,12 @@ def hooks_for(
             "_compress_kv",
             had_layer_two_compress,
             prior_layer_two_compress,
+        )
+        _restore_instance(
+            layer_zero,
+            "hc_mixes",
+            had_layer_zero_hc_mixes,
+            prior_layer_zero_hc_mixes,
         )
         _restore_instance(
             layer_one,

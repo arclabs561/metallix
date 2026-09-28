@@ -87,6 +87,17 @@ pub enum ConstraintFinish {
     Truncated,
 }
 
+/// A same-session grammar and output checkpoint.
+///
+/// This does not snapshot model logits, RNG state, or model/cache state. A
+/// caller that branches model execution must checkpoint those layers too.
+pub struct JsonConstraintCheckpoint {
+    env: TokEnv,
+    matcher: Matcher,
+    output: Vec<u8>,
+    state: SessionState,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionState {
     Active,
@@ -125,6 +136,9 @@ pub enum ConstraintError {
     /// Grammar or independent-schema compilation failed.
     #[error("JSON Schema compilation failed")]
     SchemaCompilation,
+    /// A checkpoint belongs to a different constraint session.
+    #[error("constraint checkpoint belongs to a different session")]
+    CheckpointMismatch,
     /// Tokenizer metadata could not be converted into a trie.
     #[error("tokenizer metadata could not be converted into a token trie")]
     TokenizerCompilation,
@@ -253,6 +267,32 @@ impl JsonConstraintSession {
     /// Selects and consumes the finite maximum grammar-allowed tokenizer logit.
     pub fn select_argmax(&mut self, logits: &[f32]) -> Result<ConstraintStep, ConstraintError> {
         self.select(logits, false).map(|(step, _)| step)
+    }
+
+    /// Captures grammar state and decoded bytes for a reversible branch.
+    #[must_use]
+    pub fn checkpoint(&self) -> JsonConstraintCheckpoint {
+        JsonConstraintCheckpoint {
+            env: Arc::clone(&self.env),
+            matcher: self.matcher.deep_clone(),
+            output: self.output.clone(),
+            state: self.state,
+        }
+    }
+
+    /// Restores a checkpoint created by this session.
+    ///
+    /// The checkpoint is consumed so a caller cannot accidentally reuse a
+    /// stale branch after restoring it once.
+    pub fn restore(&mut self, checkpoint: JsonConstraintCheckpoint) -> Result<(), ConstraintError> {
+        if !Arc::ptr_eq(&self.env, &checkpoint.env) {
+            return Err(ConstraintError::CheckpointMismatch);
+        }
+        self.matcher = checkpoint.matcher;
+        self.output = checkpoint.output;
+        self.state = checkpoint.state;
+        self.legal_mask.fill(false);
+        Ok(())
     }
 
     /// Selects and consumes the constrained maximum, returning pre-consumption log probabilities.
@@ -814,6 +854,38 @@ mod tests {
         assert_eq!(
             session.select_argmax(&values),
             Err(ConstraintError::NonFiniteLogit)
+        );
+    }
+
+    #[test]
+    fn checkpoint_restores_grammar_and_output_for_a_branch() {
+        let mut session = session();
+        session
+            .select_argmax(&logits(token_id(b'{')))
+            .expect("opening brace is allowed");
+        let checkpoint = session.checkpoint();
+
+        session
+            .select_argmax(&logits(token_id(b'"')))
+            .expect("quote is allowed after opening brace");
+        assert_eq!(session.decoded_bytes(), b"{\"");
+
+        session.restore(checkpoint).expect("same-session restore");
+        assert_eq!(session.decoded_bytes(), b"{");
+        session
+            .select_argmax(&logits(token_id(b'"')))
+            .expect("restored branch remains usable");
+        assert_eq!(session.decoded_bytes(), b"{\"");
+    }
+
+    #[test]
+    fn checkpoint_cannot_cross_constraint_sessions() {
+        let source = session();
+        let mut destination = session();
+
+        assert_eq!(
+            destination.restore(source.checkpoint()),
+            Err(ConstraintError::CheckpointMismatch)
         );
     }
 

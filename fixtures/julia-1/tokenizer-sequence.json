@@ -1,0 +1,16 @@
+{
+  "source": {"repository": "SupersonicLabs/Julia-1", "revision": "a85b127321d580d65176c89ced8273f305745d85", "path": "julia/data.py", "sha256": "e3510fa4152ec11fa193046715991f44d7c2f85fd2488a98ef11c9d3db23da4e", "ast_symbols": ["QTYPES", "sequence"]},
+  "tokenizer": {"sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f", "tokenizers_version": "0.23.2", "special_ids": {"pad": 0, "cls": 1, "sep": 1, "mask": 4}, "mask_token": "<mask>"},
+  "lexical_ids": {
+    "choice question: Pick": [6241, 2872, 235292, 17350], "noul question: Is": [552, 6311, 2872, 235292, 2125], "choice question: Pick  ": [6241, 2872, 235292, 17350, 235248, 235248], " A": [586], " B": [599], " false": [1566], " true": [1382], " A ": [586, 235248], "café": [18688],
+    "café café café café café café café café café café café café café café café café café café café café café café café café café café café café café café café café ": [18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 18688, 235248]
+  },
+  "cases": [
+    {"name": "choice_strict", "row": {"state": "café", "question": "Pick", "options": ["A", "B"]}, "parameters": {"max_length": 64, "head_length": 32, "strict": true}, "expected": {"ids": [1,6241,2872,235292,17350,1,4,586,4,599,1,18688,1], "markers": [6,8], "qtype": 0, "truncated": false, "option_tokens": [1,1]}},
+    {"name": "choice_reverse_options", "row": {"state": "café", "question": "Pick", "options": ["B", "A"]}, "parameters": {"max_length": 64, "head_length": 32, "strict": true}, "expected": {"ids": [1,6241,2872,235292,17350,1,4,599,4,586,1,18688,1], "markers": [6,8], "qtype": 0, "truncated": false, "option_tokens": [1,1]}},
+    {"name": "noul_order", "row": {"state": "café", "question": "Is", "type": "noul", "options": ["false", "true"]}, "parameters": {"max_length": 64, "head_length": 32, "strict": false}, "expected": {"ids": [1,552,6311,2872,235292,2125,1,4,1566,4,1382,1,18688,1], "markers": [7,9], "qtype": 2, "truncated": false}},
+    {"name": "mask_replaced", "row": {"state": "café", "question": "Pick <mask>", "options": ["A<mask>", "B"]}, "parameters": {"max_length": 64, "head_length": 32, "strict": false}, "expected": {"ids": [1,6241,2872,235292,17350,235248,235248,1,4,586,235248,4,599,1,18688,1], "markers": [8,11], "qtype": 0, "truncated": false}},
+    {"name": "state_truncation", "row": {"state": "café café café café café café café café café café café café café café café café café café café café café café café café café café café café café café café café ", "question": "Pick", "options": ["B", "A"]}, "parameters": {"max_length": 16, "head_length": 11, "strict": false}, "expected": {"ids": [1,6241,2872,235292,17350,1,4,599,4,586,1,18688,18688,18688,18688,1], "markers": [6,8], "qtype": 0, "truncated": true}},
+    {"name": "strict_mask_rejected", "row": {"state": "café", "question": "Pick <mask>", "options": ["A", "B"]}, "parameters": {"max_length": 64, "head_length": 32, "strict": true}, "expected_error": "Reserved model marker in request"}
+  ]
+}

@@ -1,7 +1,7 @@
 # Delivery roadmap
 
 Status: active sequence; API choices remain proposals. Scope: existing-model completion, measured performance, useful
-local agents, then broader MLX capabilities. Grounded in
+local agents, programmable inference, then broader MLX capabilities. Grounded in
 [architecture](architecture.md), [current progress](progress.md),
 [adapter/config direction](model-adapters.md),
 [performance evidence](experiments/chat-performance.md), and
@@ -14,6 +14,21 @@ interfaces stable or turn synthetic parity into model support.
 
 ## Current checkpoint
 
+Qwen is the usable adapter: text/chat/tools and typed decisions execute on
+local 0.6B and 4B checkpoints. The public-task decision qualification reached
+35/72 and 65/72 respectively; this is not an official benchmark score.
+Exact schedule verification now accepts an explicit count/duration/window
+contract. Plain-prompt 4B retries exhausted all eight cases; using the checkpoint
+chat format reached 7/8 on the same observed tasks (schema-only baseline 6/8).
+A separately frozen confirmation set reached 3/8 versus 2/8, at 1,606 versus
+478 generated tokens. Strict acceptance holds; broad quality remains unqualified.
+SMC proposal
+correction and steering pass checkpoint mechanics tests; application quality
+and serving integration remain separate gates. Julia has source-pinned encoding
+and complete published-header checks, plus six real-tokenizer source-parity
+vectors. A synthetic CPU head reference now matches the pinned source; native
+encoder/head execution remains open.
+
 The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
 about 1% short-prompt regression. Matched real 2048-token requests for Qwen3-
@@ -21,9 +36,12 @@ about 1% short-prompt regression. Matched real 2048-token requests for Qwen3-
 the resident production path. DeepSeek's source gates now cover Engram1,
 layer-one, and exact layer-zero token embeddings; native layer-one attention/HC/FFN now feeds
 the layer-two-to-logits reduced suffix; Engram1 now feeds the native layer-one
-path through the reduced suffix with corruption rejection. Layer zero and
-embeddings now qualify through the resident CPU Q/KV boundary; Metal/full-graph
-execution and real previous-call shared state remain next. Native
+path through the reduced suffix with corruption rejection. Native layer-zero
+window-only attention, HC mixing and RMSNorm/MoE FFN now reproduce its residual
+into Engram1. Incoming block residual, prior HC pre-mix and HC-coefficient
+production remain captured;
+remove those boundaries before claiming a complete reduced oracle. Metal
+execution and real previous-call shared state follow those gates. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
@@ -42,7 +60,11 @@ Qwen is the usable vertical: resident chat, bounded read tools, experimental
 Responses, and qualified 0.6B/4B controls. DeepSeek's native reduced suffix now
 connects layer-one attention/HC/FFN through layer two and final logits. Layer-one
 initial residual/pre-mix and partial-call layer-three shared score keys still
-cross captured boundaries. Its scalar numerical oracle and bounded
+cross captured boundaries. The new layer-zero bridge removes the captured FFN
+output; native window-only attention is also joined, with its input reconstructed
+by native HC pre-mix and RMSNorm. Incoming block residual, prior pre-mix and
+coefficient synthesis remain open.
+Its scalar numerical oracle and bounded
 Metal operators are not a complete GPU decoder.
 
 Performance work has located a useful next experiment: cache concatenation
@@ -62,7 +84,26 @@ Keep three completion milestones separate:
 The single-Mac boundary, architecture-specific graphs, and no-full-DeepSeek-
 checkpoint-download-before-reference-parity gate remain in force. Training,
 multimodal work and model discovery are accepted directions, not reasons to
-start a universal backend framework or a cluster scheduler.
+start a universal backend framework or a cluster scheduler. Symbolic
+controllers, mechanistic observation, recursive orchestration, memory and SMC
+are broader research lanes over the same model-owned state contract, not
+permission to skip the real logits/state gates.
+
+## Programmable inference milestone
+
+Metallix's broader product thesis is a measured runtime for interventions over
+model execution: symbolic constraints, activation/probe controls, verifier and
+tool feedback, recursive subqueries, hierarchical memory, and probabilistic
+search. These are distinct mechanisms with distinct evidence classes. The
+[programmatic inference design](design/programmatic-inference.md) and
+[frontiers ledger](research/programmatic-inference-frontiers.md) define their
+shared boundary and limits.
+
+The first useful vertical should be one end-to-end controller over the working
+Qwen path: a declared specification, a transactional intervention or
+constraint, an independent verifier, accept/rollback behavior, and a receipt.
+Only after that should the same contract be exercised by a real DeepSeek
+adapter, recursive context handles, activation steering, or particles.
 
 **Open before expensive checkpoint work:** define the target context, acceptable
 first-token latency, minimum useful decode rate and SSD/RAM budget for the
@@ -79,7 +120,7 @@ measurements; competing GPU workloads invalidate performance comparisons.
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
 | Qwen performance | Profile the adopted stepped resident path across model sizes and repeated request shapes. | Preserve full-logit/token and branch/EOS replay; retain the concatenation receipt as a regression control. | Reversible implementation; no public tuning flag. |
-| DeepSeek completion | Metal/full-graph execution and real previous-call layer-three state after qualified embedding-through-CPU-QKV composition. Consumer: the complete reduced text oracle. | Engram1→layer-one→layer-two suffix passes exact fixture and corruption gates; next boundaries preserve source-derived numerical bounds, routes, and retry behavior. | Reversible implementation; source semantics must not be silently changed. |
+| DeepSeek completion | Remove remaining layer-zero input/coefficient and previous-call state boundaries. Consumer: the complete reduced text oracle. | Preserve exact same-trace FFN/Engram1 handoff, source-derived numerical bounds, routes and retry behavior before Metal composition. | Reversible implementation; source semantics must not be silently changed. |
 | Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
 
 For each boundary, use existing operators and fixtures first. Add a capture only
@@ -87,9 +128,10 @@ when a specific missing operand blocks the next join. Once the complete reduced
 oracle passes, stop extending fixture infrastructure for its own sake and move
 the execution graph onto Metal.
 
-DeepSeek's embedding-through-CPU-QKV join is now qualified after the
-Engram1→layer-one entry. Next, execute the whole reduced graph on Metal in token
-order with a request-local previous-call shared index publication so layer
+DeepSeek now joins window-only layer-zero attention to its native FFN/Engram
+consumer. After removing the upstream input and coefficient boundaries,
+execute the reduced graph in token order with a request-local previous-call
+shared index publication so layer
 three's real previous publication supplies the next partial layer-one call. That
 last gate removes the captured shared-key shortcut. Exercise more than the fixed
 5/1/1 trace, including multiple compression boundaries and reset/retry sequences.

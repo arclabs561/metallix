@@ -1,0 +1,9 @@
+{
+  "source_repository": "SupersonicLabs/Julia-1",
+  "source_revision": "a85b127321d580d65176c89ced8273f305745d85",
+  "declared_model_bytes": 577189056,
+  "header_bytes": 17568,
+  "header_sha256": "228dd499df2a19d94285cf64b61f28e1beafec9f9a45984fbb878f0c43c34e19",
+  "tensor_count": 170,
+  "tensor_contract_sha256": "6e986ce6b9b8ae653a33f89bf021a3670e313a353ff1298fe902d99438b44d48"
+}

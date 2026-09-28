@@ -147,6 +147,22 @@ are absent; that skip is not source verification.
 
 ## Boundaries and provenance
 
+The same-trace layer-zero bridge pins block, HC, FFN and Engram1 storage at
+starts 0, 5 and 6. Native window-only attention, HC mixing and RMSNorm/MoE
+reconstruct the terminal BF16 residual and pass it to native Engram1. The
+window-only path accepts no compressed publication and preserves the existing
+compressed-attention contract. Out-of-order rejection, reset and retry are
+checked against source outputs. Native HC pre-mix and RMSNorm now reconstruct
+the attention input from the incoming residual and pre-mix, with exact source
+comparison and a corrupted-residual negative control. Incoming block residual,
+prior HC pre-mix and HC-coefficient production remain captured. This reduced CPU reference join
+does not establish native full-graph, Metal or checkpoint execution.
+
+```sh
+uv run scripts/test_v41_layer0_to_layer1_fixture.py
+cargo test -p deepseek --test forward_layer0_to_layer1
+```
+
 The source loader verifies SHA-256 before executing retained `model.py` and
 `engram.py`. It replaces the six kernel imports and supplies the real Engram
 classes; unused vision imports are excluded. Model class and function bodies

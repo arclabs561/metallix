@@ -40,7 +40,9 @@ SCRIPTS = ROOT / "scripts"
 SOURCE_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
 KERNEL_SHA256 = "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455"
 TRACE_INPUT_IDS = ((0, 1, 2, 3, 4, 5, 6),)
-MAX_HOOK_RECORDS = 96
+# Layer-zero window-only attention retains six additional exact source stages
+# (frequency, Q prefix, window, and output-projection input).
+MAX_HOOK_RECORDS = 104
 SAMPLE_VALUES = 8
 MAX_CAPTURE_BYTES = 16 << 20
 # HC state and its source-produced collapse are both exact bit fixtures.  Keep
@@ -54,12 +56,17 @@ MAX_MOE_FIXTURE_BYTES = 512 << 10
 # The reduced graph is deliberately small enough that complete tensor bytes fit
 # under this limit; exceeding it is a schema/capture regression, not truncation.
 MAX_ATTENTION_FIXTURE_BYTES = 512 << 10
+# Layer zero retains both HC coefficient calls and the exact same-trace Engram
+# handoff, but remains bounded below the complete receipt cap.
+MAX_LAYER_ZERO_TO_LAYER_ONE_FIXTURE_BYTES = 576 << 10
 
 sys.path.insert(0, str(SCRIPTS))
 import v41_attention_capture
 import v41_cpu_kernels as kernels
 import v41_forward_manifest as forward_manifest
 import v41_forward_observers
+import v41_index_key_capture
+import v41_layer0_to_layer1_capture
 import v41_source_loader as source_loader
 
 
@@ -1151,6 +1158,22 @@ def main() -> int:
             "a complete source capture"
         ),
     )
+    parser.add_argument(
+        "--layer3-to-layer1-fixture-output",
+        type=Path,
+        help=(
+            "write the compact same-trace layer-three key publication to "
+            "partial layer-one score-prefix fixture"
+        ),
+    )
+    parser.add_argument(
+        "--layer0-to-layer1-fixture-output",
+        type=Path,
+        help=(
+            "write the compact same-trace layer-zero producer to layer-one "
+            "Engram input fixture"
+        ),
+    )
     args = parser.parse_args()
     receipt = run_capture()
     artifact_bytes = serialized_capture(receipt)
@@ -1284,11 +1307,67 @@ def main() -> int:
                 sort_keys=True,
             )
         )
+    if args.layer3_to_layer1_fixture_output is not None:
+        fixture = v41_index_key_capture.layer3_to_layer1_fixture(receipt)
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_MOE_FIXTURE_BYTES:
+            raise RuntimeError(
+                f"layer-three bridge fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_MOE_FIXTURE_BYTES} bytes"
+            )
+        args.layer3_to_layer1_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.layer3_to_layer1_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "complete_capture_sha256": fixture["source"][
+                        "complete_capture_sha256"
+                    ],
+                    "path": str(args.layer3_to_layer1_fixture_output),
+                    "status": "source_forward_layer_three_to_layer_one_fixture",
+                },
+                sort_keys=True,
+            )
+        )
+    if args.layer0_to_layer1_fixture_output is not None:
+        fixture = v41_layer0_to_layer1_capture.layer0_to_layer1_fixture(receipt)
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_LAYER_ZERO_TO_LAYER_ONE_FIXTURE_BYTES:
+            raise RuntimeError(
+                f"layer-zero bridge fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_LAYER_ZERO_TO_LAYER_ONE_FIXTURE_BYTES} bytes"
+            )
+        args.layer0_to_layer1_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.layer0_to_layer1_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "complete_capture_sha256": fixture["source"][
+                        "complete_capture_sha256"
+                    ],
+                    "path": str(args.layer0_to_layer1_fixture_output),
+                    "status": "source_layer_zero_to_layer_one_fixture",
+                },
+                sort_keys=True,
+            )
+        )
     if (
         args.output is None
         and args.head_fixture_output is None
         and args.moe_fixture_output is None
         and args.attention_fixture_output is None
+        and args.layer3_to_layer1_fixture_output is None
+        and args.layer0_to_layer1_fixture_output is None
     ):
         print(artifact_bytes.decode("utf-8"), end="")
     return 0

@@ -43,6 +43,8 @@ is still pending where the ledger says excerpts or selected sections.
 | Inference interventions | [Prompt, logit and activation controls](inference-interventions.md) | Mechanism boundaries, reference probabilities and quality/cache controls |
 | Uncertainty | [Probability, entropy and calibration](uncertainty.md) | Observable token statistics versus independently calibrated answer correctness |
 | Probabilistic control | [GenLM and LLaMPPL](genlm-control.md) | Target versus proposal, weighted grammars and finite-particle guarantees |
+| Symbolic controllers | [Structured-generation frontiers](structured-generation-frontiers.md) | Grammar mechanisms, controller boundaries, AICI and llguidance prior art |
+| Programmatic inference | [Programmatic inference frontiers](programmatic-inference-frontiers.md) | Interpretability, activation steering, recursion, hierarchy, memory, verifiers and research gates |
 | Feynman–Kac methods | [Correctors and particle speculation](feynman-kac-steering.md) | Diffusion versus autoregressive state and approximation costs |
 | Power sampling | [Power-SMC](power-smc.md) | Sequence-level targets, importance weights, EOS and cache ancestry |
 | Quantization | [Quantization and precision](quantization-precision.md) | Exact format decoding versus quality-changing conversion |
