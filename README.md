@@ -12,7 +12,8 @@ token probabilities and check the KV cache—all from `mx`.
 Qwen3-0.6B and Qwen3-4B-Instruct-2507 run today. DeepSeek-V4.1-Flash is the main target; its
 metadata and a reduced native forward graph are qualified, but it cannot
 generate yet through Metallix's native adapter. A separate machine-local oMLX smoke
-route can load the cached DeepSeek-V4.1-Flash MLX snapshot; see the [local
+route can load a cached quantized DeepSeek V4 snapshot with different model
+geometry; it does not qualify the V4.1 target. See the [local
 profile ledger](docs/experiments/deepseek-local-profile.md).
 
 Metallix is intended to grow into a programmable inference substrate for
@@ -41,7 +42,7 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition with live layer-one and layer-three state and previous-call key publication | Layer-two/Engram3 traversal still replays; other captured operands and native generation remain unfinished |
+| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications | Fixture-backed operands remain; whole-request failure/reset semantics and native generation are unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 
@@ -291,8 +292,10 @@ complete input history, function-call round trips, greedy sampling, JSON or
 SSE responses, and automatic tool choice are supported. Response storage,
 `previous_response_id`, images, nonzero temperature, seeds, top-p changes,
 and non-automatic tool choice are rejected. It is not ready to serve as a full
-Codex backend. A bounded 4B Codex command-tool check is still insufficient
-evidence for that role. Accepted connections have a five-second total header/body read
+Codex backend. Native 4B passed six ordered two-call replay trials across JSON
+and SSE with fresh synthetic tool results; that and the bounded Codex
+command-tool check remain insufficient evidence for general coding. Accepted
+connections have a five-second total header/body read
 deadline and bounded writes; each connection handles one request. Transfer
 encoding, `Expect`, and duplicate body lengths are rejected. Generation has a
 separate cooperative 60-second budget (`--generation-timeout-ms`, 1–120000).
@@ -482,13 +485,16 @@ now also reconstruct the attention input exactly. Token embedding, HC-copy
 expansion and identity pre-mix reconstruct the incoming block state from the
 same trace's token IDs and weights. HC coefficients now come from native
 projection: F32 values satisfy the existing analytic bounds, and their native
-layer-one consumer reproduces the exact BF16 attention input. A single stateful
-token-to-logits runner with real previous-call layer-three state is the next gate.
+layer-one consumer reproduces the exact BF16 attention input. The reduced graph
+now retains layer-one, layer-two, Engram3 and layer-three state through starts
+0, 5 and 6. Layer two consumes the live layer-one KV/index publication;
+bootstrap and final continuation reuse prior outputs without replaying them.
+Whole-request failure/reset behavior and alternate prefill/decode partitions
+remain gates before a production stateful token-to-logits runner.
 The unified reduced-runner fixture keeps these same-trace projections together;
 the current Rust composition consumes only its layer-zero projection. Downstream
-parameters, numerical oracles, and attention history/shared-key state still
-come from legacy fixture seams, so the reduced prefill test is not a stateful
-decoder.
+parameters and numerical oracles still come from legacy fixture seams, so this
+bounded stateful test composition is not a production decoder.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
@@ -538,14 +544,14 @@ seeded temperature sampling is opt-in, with or without a JSON schema. The
 plain `gen` resident diagnostic allows at most `min(model context, 512)` total
 prompt-plus-generated tokens; streamed mode allows at most 32 total and
 separately checks weight/staging and retained-KV budgets. The experimental
-`chat`, `agent`, and `serve` controls have their separate 1–2048 context flag
-and fixed logical-KV admission described above.
+`chat`, `agent`, and `serve` controls accept 1–16,384 total context tokens
+(default 2048), subject to the configurable logical-KV admission described above.
 Experimental Qwen3 chat, a bounded read-only workspace agent, and a loopback
 Responses subset exist with the limits above. There is no V4.1 decoder,
 continuous batching, execution-backed paged KV, quantization conversion, or
 tuning workflow yet. Beyond-RAM execution remains a goal, not a demonstrated
-capability. V4.1 weight download is gated on its own small text-forward
-numerical fixture.
+capability. Full V4.1 checkpoint acquisition requires both native reference
+parity and an explicit storage, memory, context and latency budget.
 
 ## License
 

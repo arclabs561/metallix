@@ -61,11 +61,15 @@ choices without expanding current support claims.
   and attention state across the three calls. Its starts-zero/five results feed
   the layer-three bootstrap directly; the same layer-one session then consumes
   the published prefix at start six. Native attention inputs feed its owner
-  projections, with captured values used as exact checks. Layer-two/Engram3
-  traversal still replays. This test-private layer-one composition does not
-  provide whole-step rollback or production request-epoch reset guarantees;
-  native ownership of the remaining histories and one complete traversal are
-  still required for a stateful token-to-logits runner.
+  projections, with captured values used as exact checks. Layer-two attention
+  and Engram3 hashing now also retain state across those calls. Layer two
+  consumes the exact publication produced by live layer one; its independent
+  fixture-fed owner remains only for standalone controls. Bootstrap consumes
+  the already-computed layer-two/Engram3 prefix, and final continuation advances
+  the same sessions once at start six. This removes that prefix replay from
+  the data-producing path. Fixture-backed operands, whole-request rollback/reset
+  semantics and alternate call partitions still separate this test-private
+  composition from a production token-to-logits runner.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -93,7 +97,11 @@ choices without expanding current support claims.
   by approximately 2.00335 times. Traces locate the excess inside attention,
   before the output projection. Accumulating only attention QK dots in F64
   reduced that error but introduced a second calibration failure, so the
-  experiment was reverted and its baseline/trial evidence retained. Held-out
+  experiment was reverted and its baseline/trial evidence retained. Same-input
+  replay then separated QKV propagation, rotary transforms and score reduction.
+  A balanced-F32 score reduction passed the legacy source test but worsened
+  frozen calibration from seven passing cases to six, introducing a new
+  `cal_len5` failure; it too was reverted. Held-out
   inputs remain unopened; see the
   [numerical experiment](experiments/julia-accuracy-contract.md). This is not a
   full-checkpoint encoder, Metal implementation, or serving integration; see
@@ -137,7 +145,9 @@ choices without expanding current support claims.
 - The reusable Responses qualifier passed three JSON and three SSE native 4B
   tool-result replay trials at 2048 tokens and 1024 MiB. It now validates model,
   output-item, and content identities; three live tool-stream disconnect
-  recoveries also passed. Results are synthetic client-provided values, not
+  recoveries also passed. A new workload requires two ordered calls and both
+  fresh result values in the final answer. All six new JSON/SSE trials passed
+  with the same checkpoint and admission limits. Results are synthetic client-provided values, not
   filesystem tool execution. The private stepped-capacity Qwen experiment passed
   all 50 whole-logit trace pairs, reduced the long-prompt median by 18.16%, and
   regressed short prompts by about 1%; 128-plus-64-token logical KV is 112 MiB rather
