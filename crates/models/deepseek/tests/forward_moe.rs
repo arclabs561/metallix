@@ -1549,6 +1549,19 @@ impl ReducedLiveRequest {
     }
 }
 
+fn assert_finalization_failure_requires_restart(request: &mut ReducedLiveRequest) {
+    // A late suffix failure must invalidate a traversal that already completed.
+    // Repairing the operand alone cannot authorize a second finalization attempt.
+    let valid_residual = request.engram3_entries[2].1.clone();
+    request.engram3_entries[2].1[0] ^= 1;
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.finish())).is_err());
+    assert_eq!(request.lifecycle, ReducedRequestLifecycle::Poisoned);
+    request.engram3_entries[2].1 = valid_residual;
+    let poisoned_finish = request.state_marker();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.finish())).is_err());
+    assert_eq!(request.state_marker(), poisoned_finish);
+}
+
 #[test]
 fn reduced_request_poison_blocks_retry_and_restart_is_fresh() {
     let bundle: Value = serde_json::from_str(include_str!(
@@ -1619,6 +1632,12 @@ fn reduced_request_poison_blocks_retry_and_restart_is_fresh() {
         "repeat finish must not mutate request"
     );
     let mut fresh = ReducedLiveRequest::new();
+    fresh.step(&streams[0], &pre[0], None);
+    fresh.step(&streams[1], &pre[1], None);
+    let fresh_prefix = fresh.prior_l3_prefix().to_vec();
+    fresh.step(&streams[2], &pre[2], Some(&fresh_prefix));
+    assert_finalization_failure_requires_restart(&mut fresh);
+    fresh.restart();
     fresh.step(&streams[0], &pre[0], None);
     fresh.step(&streams[1], &pre[1], None);
     let fresh_prefix = fresh.prior_l3_prefix().to_vec();

@@ -78,7 +78,9 @@ choices without expanding current support claims.
   request wrapper now marks the composition poisoned before mutable work,
   rejects continuation after a late failure, and reconstructs all its L1–L3
   owners on restart. Regressions compare restarted and fresh final-block
-  outputs and check both against the final-logit source oracle. This establishes
+  outputs and check both against the final-logit source oracle. A finalization
+  corruption control also rejects retry after the operand is repaired; removing
+  finalization poisoning makes the regression fail. This establishes
   invalidation/rebuild for the reduced fixture path, not production rollback.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
