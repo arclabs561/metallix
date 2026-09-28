@@ -562,7 +562,8 @@ pub(super) fn native_layer_one_entries_from_engram_entries_with_pre(
 /// Test-private composition of the live L1 request state.  One `step` consumes
 /// precisely one source partition through Engram, the ratio-two owner, layer
 /// attention, HC, and FFN, returning the residual and HC pre-mix consumed by
-/// layer two.  The L2/Engram3 suffix remains an explicit replay seam.
+/// layer two. The reduced graph carries this session's live publication into
+/// layer two and retains Engram3 state across the same calls.
 pub(super) struct NativeLayerOneSession {
     fixture: Fixture,
     engram: layer1_engram_capture::NativeLayerOneEngramSession,

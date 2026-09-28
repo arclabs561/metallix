@@ -179,6 +179,13 @@ impl NativeLayerOneEngramSession {
         let case = &field(&self.root, "cases").as_array().unwrap()[self.next_case];
         let start = usize_field(case, "start_pos");
         assert_eq!(start, [0, 5, 6][self.next_case], "native Engram call order");
+        // Reject caller input before publishing any token history.
+        let captured = bf16(field(case, "stream"));
+        let stream = supplied_stream.map_or(captured.as_slice(), |(supplied_start, supplied)| {
+            assert_eq!(*supplied_start, start, "native Engram stream start");
+            assert_eq!(supplied, &captured, "native Engram stream boundary");
+            supplied.as_slice()
+        });
         let positions = shape(field(case, "input_ids"))[1];
         let token_map = i64s(field(state, "token_map"));
         let tokens: Vec<_> = i64s(field(case, "input_ids"))
@@ -220,12 +227,6 @@ impl NativeLayerOneEngramSession {
         );
         assert_eq!(wkv, bf16(field(case, "wkv_output")));
         let (key, value) = split_wkv(case, model, &wkv);
-        let captured = bf16(field(case, "stream"));
-        let stream = supplied_stream.map_or(captured.as_slice(), |(supplied_start, supplied)| {
-            assert_eq!(*supplied_start, start, "native Engram stream start");
-            assert_eq!(supplied, &captured, "native Engram stream boundary");
-            supplied.as_slice()
-        });
         let q = bf16(field(parameters, "layers.1.engram.q_weight"))
             .into_iter()
             .map(f32_from_bf16)
@@ -237,6 +238,45 @@ impl NativeLayerOneEngramSession {
         let output = gate_output(case, model, stream, &key, &value, &q, &k);
         self.next_case += 1;
         (start, output)
+    }
+}
+
+#[test]
+fn rejected_engram_stream_does_not_publish_hash_history() {
+    for rejected_case in [0, 1] {
+        let mut session = NativeLayerOneEngramSession::new();
+        let mut control = NativeLayerOneEngramSession::new();
+        for _ in 0..rejected_case {
+            assert_eq!(session.step(None), control.step(None));
+        }
+        let case = &field(&session.root, "cases").as_array().unwrap()[rejected_case];
+        let start = usize_field(case, "start_pos");
+        let following_start = start + shape(field(case, "input_ids"))[1];
+        let mut invalid = bf16(field(case, "stream"));
+        invalid[0] ^= 1;
+        let mut before = session.hashes.clone();
+        assert!(
+            before
+                .write_and_hash(&[CompressedToken::Live(0)], 1, following_start)
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.step(Some(&(start, invalid)));
+            }))
+            .is_err()
+        );
+        assert_eq!(session.next_case, rejected_case);
+        let mut after = session.hashes.clone();
+        assert!(
+            after
+                .write_and_hash(&[CompressedToken::Live(0)], 1, following_start)
+                .is_err(),
+            "rejected stream must not make the next token's history available"
+        );
+        for _ in rejected_case..3 {
+            assert_eq!(session.step(None), control.step(None));
+        }
     }
 }
 

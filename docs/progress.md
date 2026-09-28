@@ -70,6 +70,12 @@ choices without expanding current support claims.
   the data-producing path. Fixture-backed operands, whole-request rollback/reset
   semantics and alternate call partitions still separate this test-private
   composition from a production token-to-logits runner.
+  A completion audit found that both live Engram helpers checked supplied
+  residuals after committing hash history. They now reject bad inputs first.
+  Regressions at starts zero and five prove rejected calls cannot make future
+  token history available and that correct retries reproduce the control
+  continuation. This covers input preflight only: a late layer-one publication
+  mismatch can still advance earlier owners before rejection.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
