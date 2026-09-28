@@ -273,3 +273,21 @@ comparable scale in source. This does not justify a native-only projection
 precision patch. Any future QKV change must lower the native projection gap
 without increasing the upstream gap or breaking source parity, then pass all
 eight frozen calibration hidden, score, and probability boundaries unchanged.
+
+### Embedding-normalization diagnostic
+
+The calibration-only `cal_len7` receipt
+`.agents/receipts/julia/embedding-norm-diagnostic.json` uses fixed known
+calibration IDs and the saved baseline report; it does not read held-out inputs.
+It records the report, generator, and diagnostic hashes. A scalar F32 two-pass
+normalization replay exactly reproduces native embedding output. Torch F32
+LayerNorm exactly reproduces the captured source embedding output. Native versus
+source embedding maximum error is `5.9605e-7`; a scalar F32 Welford replay has
+the same maximum error to source and is farther from native (`8.3447e-7`). This
+is a `cal_len7` diagnostic only, not an eight-case experiment, and does not
+claim that scalar Welford matches the source CPU backend's vectorized algorithm.
+
+```sh
+uv run .agents/receipts/julia/embedding_norm_diagnostic.py \
+  --output /absolute/path/embedding-norm-diagnostic.json
+```
