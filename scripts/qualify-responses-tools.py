@@ -27,14 +27,15 @@ TOOL = {
     "description": "Retrieve the current qualification value.",
     "parameters": {
         "type": "object",
-        "properties": {"key": {"type": "string", "enum": ["qualification_value"]}},
+        "properties": {"key": {"type": "string", "enum": ["first", "second"]}},
         "required": ["key"],
         "additionalProperties": False,
     },
 }
 PROMPT = (
-    "Call read_fact with key qualification_value. After receiving its result, reply "
-    "exactly QUALIFIED:<the value returned> and no other text."
+    "Call read_fact with key first. After receiving its result, call read_fact with "
+    "key second. After receiving both results, reply exactly "
+    "QUALIFIED:<first>|<second> and no other text."
 )
 
 
@@ -400,7 +401,7 @@ def validate_stream_events(response: dict, events: list[dict]) -> None:
             raise ProtocolError("unsupported response output item")
 
 
-def call_from_response(response: dict) -> dict:
+def call_from_response(response: dict, expected_key: str) -> dict:
     output = response["output"]
     if len(output) != 1 or not isinstance(output[0], dict):
         raise ModelError("expected exactly one function call")
@@ -420,7 +421,7 @@ def call_from_response(response: dict) -> dict:
         arguments = json.loads(call["arguments"])
     except json.JSONDecodeError as error:
         raise ModelError("model returned malformed function arguments") from error
-    if arguments != {"key": "qualification_value"}:
+    if arguments != {"key": expected_key}:
         raise ModelError("model returned wrong function arguments")
     return call
 
@@ -456,32 +457,40 @@ def answer_text(response: dict) -> str:
     return "".join(message_text(item) for item in response["output"])
 
 
-def replay_input(call: dict, value: str) -> list[dict]:
-    result = {
+def tool_result(call: dict, value: str) -> dict:
+    return {
         "type": "function_call_output",
         "call_id": call["call_id"],
         "output": json.dumps({"qualification_value": value}),
     }
-    return [
-        {"role": "user", "content": PROMPT},
-        call,
-        result,
-    ]
 
 
-def validate_replay_input(items: object, call_id: str) -> None:
-    if not isinstance(items, list) or len(items) != 3:
+def replay_input(call_results: list[tuple[dict, str]]) -> list[dict]:
+    """Build the complete supplied history for each successive tool-result turn."""
+    items: list[dict] = [{"role": "user", "content": PROMPT}]
+    for call, value in call_results:
+        items.extend((call, tool_result(call, value)))
+    return items
+
+
+def validate_replay_input(items: object, call_results: list[tuple[dict, str]]) -> None:
+    if not isinstance(items, list) or len(items) != 1 + 2 * len(call_results):
         raise ProtocolError("replay input shape is invalid")
-    call, result = items[1:]
-    if (
-        not isinstance(call, dict)
-        or not isinstance(result, dict)
-        or call.get("type") != "function_call"
-        or result.get("type") != "function_call_output"
-        or call.get("call_id") != call_id
-        or result.get("call_id") != call_id
-    ):
-        raise ProtocolError("replay output does not match the function call")
+    if items[0] != {"role": "user", "content": PROMPT}:
+        raise ProtocolError("replay input does not retain the qualification prompt")
+    for index, (expected_call, value) in enumerate(call_results):
+        call = items[1 + index * 2]
+        result = items[2 + index * 2]
+        if (
+            not isinstance(call, dict)
+            or not isinstance(result, dict)
+            or call != expected_call
+            or call.get("type") != "function_call"
+            or result != tool_result(expected_call, value)
+        ):
+            raise ProtocolError(
+                "replay output does not match the ordered function calls"
+            )
 
 
 def request(
@@ -559,7 +568,7 @@ def main() -> int:
     plan = {
         "schema_version": 1,
         "status": "dry_run",
-        "scope": "Responses function-call and held-out result replay",
+        "scope": "Responses ordered two-call tool-result replay with held-out values",
         "url": origin,
         "model_id": args.model_id,
         "repeats": args.repeats,
@@ -607,11 +616,11 @@ def main() -> int:
                         args.output,
                         f"{label}-call",
                     )
-                    call = call_from_response(first)
-                    value = f"FACT-{os.urandom(16).hex()}"
-                    replay = replay_input(call, value)
-                    validate_replay_input(replay, call["call_id"])
-                    second_payload = {**first_payload, "input": replay}
+                    first_call = call_from_response(first, "first")
+                    first_value = f"FACT-{os.urandom(16).hex()}"
+                    second_input = replay_input([(first_call, first_value)])
+                    validate_replay_input(second_input, [(first_call, first_value)])
+                    second_payload = {**first_payload, "input": second_input}
                     second, second_events = request(
                         host,
                         port,
@@ -619,28 +628,57 @@ def main() -> int:
                         second_payload,
                         args.timeout_seconds,
                         args.output,
+                        f"{label}-second-call",
+                    )
+                    second_call = call_from_response(second, "second")
+                    second_value = f"FACT-{os.urandom(16).hex()}"
+                    final_input = replay_input(
+                        [(first_call, first_value), (second_call, second_value)]
+                    )
+                    validate_replay_input(
+                        final_input,
+                        [(first_call, first_value), (second_call, second_value)],
+                    )
+                    final_payload = {**first_payload, "input": final_input}
+                    final, final_events = request(
+                        host,
+                        port,
+                        base_path,
+                        final_payload,
+                        args.timeout_seconds,
+                        args.output,
                         f"{label}-answer",
                     )
-                    if answer_text(second) != f"QUALIFIED:{value}":
+                    if answer_text(final) != f"QUALIFIED:{first_value}|{second_value}":
                         raise ModelError(
-                            "model answer does not exactly reproduce held-out value"
+                            "model answer does not exactly reproduce ordered held-out values"
                         )
                     row.update(
                         {
                             "passed": True,
                             "wall_ms": (time.monotonic() - started) * 1000,
                             "call_usage": first["usage"],
-                            "answer_usage": second["usage"],
+                            "second_call_usage": second["usage"],
+                            "answer_usage": final["usage"],
                             "call_event_count": None
                             if first_events is None
                             else len(first_events),
-                            "answer_event_count": None
+                            "second_call_event_count": None
                             if second_events is None
                             else len(second_events),
+                            "answer_event_count": None
+                            if final_events is None
+                            else len(final_events),
                             "request_sha256": {
                                 "call": sha256(
                                     (
                                         args.output / f"{label}-call.request.json"
+                                    ).read_bytes()
+                                ),
+                                "second_call": sha256(
+                                    (
+                                        args.output
+                                        / f"{label}-second-call.request.json"
                                     ).read_bytes()
                                 ),
                                 "answer": sha256(

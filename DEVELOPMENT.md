@@ -485,8 +485,9 @@ uv run scripts/qualify-responses-tools.py --run \
 ```
 
 Omit `--run` to inspect its dry run. Use a new output directory. By default it
-runs three JSON and three SSE trials, validates native function-call output,
-and replays a matching call ID with a fresh synthetic result. It records raw
+runs three JSON and three SSE trials. Each requires two ordered native function
+calls with distinct IDs, replays both fresh synthetic results in the complete
+history, and checks their exact ordered values in the final answer. It records raw
 responses and distinguishes model, protocol, and transport failures. The client
 supplies the tool result; this does not execute filesystem tools or establish
 Codex readiness. See [measured results](docs/experiments/chat-performance.md#native-responses-tool-replay).

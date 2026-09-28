@@ -674,6 +674,24 @@ content-part lifecycle and completed text. All twelve retained responses from
 the earlier six live replay trials pass the stricter checks. This reassessment
 is recorded separately and is not a new live model run.
 
+### Ordered two-call replay
+
+The current qualifier extends each trial to three requests: `read_fact(first)`,
+`read_fact(second)` after receiving the first result, then an exact answer
+containing both fresh values in order. It binds the original prompt, distinct
+call IDs, complete call objects and result payloads throughout replay. This
+replaces the one-call workload above; the older receipt remains its own baseline.
+
+A fresh native 4B run passed all three JSON and three SSE trials at the same
+checkpoint revision, 2048-token context and 1024-MiB KV admission. All eighteen
+requests completed; independent inspection of the saved requests confirmed
+ordered calls and matching result IDs. The temporary server was stopped after
+the run. Receipts are owner-local at
+`.agents/receipts/qwen-two-call-20260928/`, including executable SHA-256
+`5a007f8b36b1c11a978eb679b450deebd076e1e2d378776c0de3d7556411b43c`.
+This qualifies bounded synthetic two-call replay, not filesystem tool execution,
+general coding or concurrent cancellation.
+
 ### Tool-stream disconnect recovery
 
 On the same 4B server executable and limits as the six replay trials above,

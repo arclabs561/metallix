@@ -24,7 +24,9 @@ module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
 
-def call_response() -> dict:
+def call_response(
+    key: str = "first", call_id: str = "call_1", item_id: str = "fc_1"
+) -> dict:
     return {
         "id": "resp_1",
         "object": "response",
@@ -33,11 +35,11 @@ def call_response() -> dict:
         "usage": {"input_tokens": 5, "output_tokens": 4, "total_tokens": 9},
         "output": [
             {
-                "id": "fc_1",
+                "id": item_id,
                 "type": "function_call",
-                "call_id": "call_1",
+                "call_id": call_id,
                 "name": "read_fact",
-                "arguments": '{"key":"qualification_value"}',
+                "arguments": json.dumps({"key": key}, separators=(",", ":")),
                 "status": "completed",
             }
         ],
@@ -206,10 +208,31 @@ class ResponsesToolsTests(unittest.TestCase):
 
     def test_call_and_replay_contract(self) -> None:
         response = module.validate_response(call_response())
-        call = module.call_from_response(response)
-        replay = module.replay_input(call, "FACT-hidden")
-        module.validate_replay_input(replay, "call_1")
-        self.assertEqual(replay[-1]["call_id"], "call_1")
+        first = module.call_from_response(response, "first")
+        second = module.call_from_response(
+            module.validate_response(call_response("second", "call_2", "fc_2")),
+            "second",
+        )
+        replay = module.replay_input([(first, "FACT-first"), (second, "FACT-second")])
+        module.validate_replay_input(
+            replay, [(first, "FACT-first"), (second, "FACT-second")]
+        )
+        self.assertEqual(
+            [
+                item["call_id"]
+                for item in replay
+                if item.get("type") == "function_call_output"
+            ],
+            ["call_1", "call_2"],
+        )
+        self.assertEqual(
+            [
+                json.loads(item["output"])["qualification_value"]
+                for item in replay
+                if item.get("type") == "function_call_output"
+            ],
+            ["FACT-first", "FACT-second"],
+        )
 
     def test_response_model_and_function_item_identity_are_required(self) -> None:
         response = call_response()
@@ -225,7 +248,7 @@ class ResponsesToolsTests(unittest.TestCase):
         malformed = copy.deepcopy(response)
         del malformed["output"][0]["id"]
         with self.assertRaises(module.ProtocolError):
-            module.call_from_response(malformed)
+            module.call_from_response(malformed, "first")
 
     def test_sse_binds_message_content_parts_and_completed_text(self) -> None:
         response, events = module.parse_sse(message_sse(message_response()))
@@ -305,18 +328,21 @@ class ResponsesToolsTests(unittest.TestCase):
     def test_malformed_or_mismatched_replay_evidence_is_protocol_failure(self) -> None:
         with self.assertRaises(module.ProtocolError):
             module.parse_sse("data: not-json\n\n")
-        replay = module.replay_input(
-            module.call_from_response(call_response()), "FACT-x"
-        )
+        first = module.call_from_response(call_response(), "first")
+        replay = module.replay_input([(first, "FACT-x")])
         replay[-1]["call_id"] = "other"
         with self.assertRaises(module.ProtocolError):
-            module.validate_replay_input(replay, "call_1")
+            module.validate_replay_input(replay, [(first, "FACT-x")])
+        replay = module.replay_input([(first, "FACT-x")])
+        replay[-1]["output"] = json.dumps({"qualification_value": "swapped"})
+        with self.assertRaises(module.ProtocolError):
+            module.validate_replay_input(replay, [(first, "FACT-x")])
 
     def test_wrong_tool_call_and_answer_are_model_failures(self) -> None:
         response = call_response()
         response["output"][0]["name"] = "wrong"
         with self.assertRaises(module.ModelError):
-            module.call_from_response(response)
+            module.call_from_response(response, "first")
         with self.assertRaises(module.ModelError):
             module.answer_text(module.validate_response(call_response()))
 
