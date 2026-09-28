@@ -154,8 +154,11 @@ window-only path accepts no compressed publication and preserves the existing
 compressed-attention contract. Out-of-order rejection, reset and retry are
 checked against source outputs. Native HC pre-mix and RMSNorm now reconstruct
 the attention input from the incoming residual and pre-mix, with exact source
-comparison and a corrupted-residual negative control. Incoming block residual,
-prior HC pre-mix and HC-coefficient production remain captured. This reduced CPU reference join
+comparison. Startup now uses the same trace's `embed.weight` and token IDs,
+expands each embedding into HC copies, and initializes the pre-mix to select
+copy zero. Captured startup tensors serve only as exact oracles; unknown token
+IDs and changed embedding rows are negative controls. Layer-zero attention and
+FFN HC-coefficient production remain captured. This reduced CPU reference join
 does not establish native full-graph, Metal or checkpoint execution.
 
 ```sh

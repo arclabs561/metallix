@@ -43,7 +43,7 @@ defines the correctness, performance and resource gates.
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
 | [DeepSeek](docs/progress.md) | Source-checked reduced joins, including layer-zero window attention, FFN and stateful key handoffs | Full native generation remains unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
-| [Julia-1](docs/research/julia-decision-contract.md) | Source-pinned tokenizer parity, published-header validation, and synthetic CPU head reference | No native encoder or decision-head execution yet |
+| [Julia-1](docs/research/julia-decision-contract.md) | Source-pinned tokenizer parity, published-header validation, and native CPU decision-head parity | No native encoder or full-checkpoint execution yet |
 
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.
@@ -480,10 +480,11 @@ shared score keys remain boundaries. This is not a production API, whole graph,
 Metal path, or checkpoint execution. The layer-zero bridge now joins native
 window-only attention, HC mixing and RMSNorm/MoE FFN, passing the exact BF16
 residual to native Engram1 at starts 0, 5 and 6. Native HC pre-mix and RMSNorm
-now also reconstruct the attention input exactly. Incoming block residual,
-prior HC pre-mix and HC-coefficient production remain captured. Removing those
-upstream inputs and carrying real previous-call layer-three state are the
-next reduced-graph gates.
+now also reconstruct the attention input exactly. Token embedding, HC-copy
+expansion and identity pre-mix reconstruct the incoming block state from the
+same trace's token IDs and weights. HC-coefficient production remains captured;
+removing it and carrying real previous-call layer-three state are the next
+reduced-graph gates.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

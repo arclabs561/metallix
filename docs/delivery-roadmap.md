@@ -26,8 +26,9 @@ SMC proposal
 correction and steering pass checkpoint mechanics tests; application quality
 and serving integration remain separate gates. Julia has source-pinned encoding
 and complete published-header checks, plus six real-tokenizer source-parity
-vectors. A synthetic CPU head reference now matches the pinned source; native
-encoder/head execution remains open.
+vectors. A native CPU decision head now consumes supplied weights and hidden
+states and matches the five-case synthetic source fixture. Native encoder and
+full-checkpoint execution remain open.
 
 The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
@@ -38,9 +39,9 @@ layer-one, and exact layer-zero token embeddings; native layer-one attention/HC/
 the layer-two-to-logits reduced suffix; Engram1 now feeds the native layer-one
 path through the reduced suffix with corruption rejection. Native layer-zero
 window-only attention, HC mixing and RMSNorm/MoE FFN now reproduce its residual
-into Engram1. Incoming block residual, prior HC pre-mix and HC-coefficient
-production remain captured;
-remove those boundaries before claiming a complete reduced oracle. Metal
+into Engram1. Native token embedding, HC-copy expansion and identity pre-mix
+now supply the same-trace incoming state. HC-coefficient production remains
+captured; remove it before claiming a complete reduced oracle. Metal
 execution and real previous-call shared state follow those gates. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
@@ -62,8 +63,8 @@ connects layer-one attention/HC/FFN through layer two and final logits. Layer-on
 initial residual/pre-mix and partial-call layer-three shared score keys still
 cross captured boundaries. The new layer-zero bridge removes the captured FFN
 output; native window-only attention is also joined, with its input reconstructed
-by native HC pre-mix and RMSNorm. Incoming block residual, prior pre-mix and
-coefficient synthesis remain open.
+by native HC pre-mix and RMSNorm. Native startup from token IDs supplies the
+incoming residual and identity pre-mix; coefficient synthesis remains open.
 Its scalar numerical oracle and bounded
 Metal operators are not a complete GPU decoder.
 

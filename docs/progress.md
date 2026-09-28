@@ -42,8 +42,9 @@ choices without expanding current support claims.
   exactly, with an incoming-residual corruption control. Corrupted HC
   coefficients fail the source oracle; rejected out-of-order
   attention calls leave the state retryable, including reset and replay.
-  Incoming block residual, prior HC pre-mix and HC-coefficient production remain
-  captured, so the join does not claim complete native layer-zero execution.
+  Token embedding, HC-copy expansion and identity pre-mix now reconstruct the
+  incoming block state from the same trace's IDs and weights. HC-coefficient
+  production remains captured, so complete native layer-zero execution is open.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -51,7 +52,10 @@ choices without expanding current support claims.
   Six published-tokenizer sequence cases now match the audited pinned source,
   including option permutation and strict rejection. A synthetic F32 head
   reference independently spells out attention, residuals, feed-forward, gather
-  and scoring against the pinned source. Native encoder/head execution remains open; see the [Julia contract](research/julia-decision-contract.md).
+  and scoring against the pinned source. The new CPU-only Julia crate executes
+  that head from supplied weights and hidden states, with all five frozen cases
+  and bounded-input failures covered. Native encoder and full-checkpoint
+  execution remain open; see the [Julia contract](research/julia-decision-contract.md).
 
 - `mx decide` scores Qwen3 answer-letter logits directly for bounded `choice`,
   `score`, and `noul` questions, returning normalized option probabilities and
@@ -244,8 +248,9 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
    path through the reduced suffix with exact fixture and corruption gates. The
    layer-zero token embedding now has an exact source fixture and OOV/mutation
    controls. Native layer-zero window-only attention, HC mixing, RMSNorm and
-   MoE FFN now feed Engram1. Incoming block residual, prior HC pre-mix and
-   HC-coefficient production remain captured. Remove those upstream boundaries,
+   MoE FFN now feed Engram1. Native embedding and identity HC initialization
+   supply the same-trace incoming block state. HC-coefficient production remains
+   captured. Remove that boundary,
    then carry the trace through a full
    stateful runner, while preserving the
    source-grounded partial-call layer-three shared score keys and discrete

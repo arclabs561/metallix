@@ -114,6 +114,17 @@ def fill_synthetic_parameters(model: nn.Module) -> None:
             parameter.copy_(((values + ordinal * 17).remainder(97) - 48) / 1000)
 
 
+def parameter_generation(model: nn.Module) -> dict[str, Any]:
+    """Pin PyTorch's source-model registration order for native consumers."""
+    return {
+        "formula": "((flat_index + ordinal*17) % 97 - 48) / 1000",
+        "named_parameters": [
+            {"ordinal": ordinal, "name": name, "shape": list(parameter.shape)}
+            for ordinal, (name, parameter) in enumerate(model.named_parameters())
+        ],
+    }
+
+
 def build_source_oracle() -> tuple[nn.Module, FakeEncoder]:
     model_class = load_source_model()
     encoder = FakeEncoder()
@@ -295,6 +306,7 @@ def records() -> dict[str, Any]:
             "invalid_marker_score": -10000.0,
         },
         "synthetic_inputs": "arange(6*384), ((x*7)%29-14)/20; deterministic parameter fill ((x+ordinal*17)%97-48)/1000",
+        "parameter_generation": parameter_generation(model),
         "tolerances": {"rtol": RTOL, "atol": ATOL},
         "cases": output,
     }
@@ -312,6 +324,7 @@ def verify(fixture: dict[str, Any]) -> None:
         "runtime",
         "operator_config",
         "synthetic_inputs",
+        "parameter_generation",
         "tolerances",
     ):
         if fixture[field] != actual[field]:

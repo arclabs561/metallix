@@ -130,6 +130,7 @@ def _coefficients(value: object, label: str, sequence: int) -> dict[str, Any]:
 
 def _parameters(encoded: dict[str, Any]) -> dict[str, Any]:
     layouts = {
+        "embed.weight": ("torch.bfloat16", [8, 128]),
         "layers.0.hc_attn_fn": ("torch.float32", [8, 256]),
         "layers.0.hc_attn_base": ("torch.float32", [8]),
         "layers.0.hc_attn_scale": ("torch.float32", [3]),
@@ -209,7 +210,7 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
         raise RuntimeError("layer-zero bridge has incomplete source provenance")
     if not isinstance(steps, list) or len(steps) != len(EXPECTED_START_POSITIONS):
         raise RuntimeError("layer-zero bridge requires the pinned prefill/decode trace")
-    geometry = {"dim": 128, "hc_mult": 2, "n_layers": 5}
+    geometry = {"dim": 128, "hc_mult": 2, "n_layers": 5, "vocab_size": 8}
     geometry.update(
         {
             "moe_inter_dim": 128,
@@ -254,6 +255,18 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
             "layer-zero block pre",
             dtype="torch.float32",
             shape=[1, sequence, 2],
+        )
+        input_ids = _tensor(
+            source_step.get("input_ids"),
+            "layer-zero input IDs",
+            dtype="torch.int64",
+            shape=[1, sequence],
+        )
+        embedding = _tensor(
+            values.get("embed"),
+            "layer-zero embedding",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, 128],
         )
         attention_input = _tensor(
             values.get("layers.0.attention_input"),
@@ -462,6 +475,7 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
         cases.append(
             {
                 "start_pos": start_pos,
+                "startup": {"input_ids": input_ids, "embedding": embedding},
                 "block_input": {"residual": block_residual, "incoming_pre": block_pre},
                 "attention_input": attention_input,
                 "attention_output": attention_output,
@@ -495,7 +509,7 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
         "contract": {
             "layer_zero_producer": "source-pinned native attention and FFN with captured upstream HC inputs",
             "layer_one_consumer": "same-storage source oracle consumed by the native Engram entry",
-            "remaining_producer_boundary": "incoming block residual, prior HC pre-mix, and HC coefficient production remain source-captured",
+            "remaining_producer_boundary": "layer-zero attention and FFN HC coefficient production remain source-captured",
         },
         "parameters": _parameters(encoded),
         "cases": cases,

@@ -3,14 +3,14 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::{
-    RotaryFrequency,
+    RotaryFrequency, StartupLayout,
     attention::layer::{
         Fp8Projection, LayerAttentionDiagnostic, LayerAttentionError, LayerAttentionLayout,
         LayerAttentionState, LayerAttentionWeights,
     },
     hc::mixing::{hc_post_bf16_reference, hc_pre_bf16_reference},
     moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference},
-    rms_norm_bf16_reference,
+    rms_norm_bf16_reference, startup_bf16_reference,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 )]
 mod layer1_engram_capture;
 
-const FIXTURE_SHA256: &str = "7e4d0655511f766f8ac9f6380bd46ee35548db72e70c623864571ebcb2865ecd";
+const FIXTURE_SHA256: &str = "75b65ac8b23ea8fbe18aa8741098d511d1a7e2f3203252a246fec6ecc09f285a";
 
 fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
     value.get(key).unwrap_or_else(|| panic!("missing {key}"))
@@ -112,6 +112,14 @@ fn i32s(value: &Value) -> Vec<i32> {
     bytes(value)
         .chunks_exact(4)
         .map(|word| i32::from_le_bytes(word.try_into().expect("i32")))
+        .collect()
+}
+
+fn u64s(value: &Value) -> Vec<u64> {
+    assert_eq!(field(value, "dtype").as_str(), Some("torch.int64"));
+    bytes(value)
+        .chunks_exact(8)
+        .map(|word| u64::from_le_bytes(word.try_into().expect("u64")))
         .collect()
 }
 
@@ -266,6 +274,45 @@ fn assert_attention_diagnostic(case: &Value, diagnostic: &LayerAttentionDiagnost
     );
 }
 
+fn native_startup(root: &Value, case: &Value) -> (Vec<u16>, Vec<f32>) {
+    let startup = field(case, "startup");
+    let ids = u64s(field(startup, "input_ids"));
+    let table = bf16(field(field(root, "parameters"), "embed.weight"));
+    let output = startup_bf16_reference(
+        &ids,
+        &table,
+        StartupLayout::new(8, 128, 2).expect("startup layout"),
+    )
+    .expect("source token embedding startup");
+    let embedding = ids
+        .iter()
+        .flat_map(|&id| {
+            let row = usize::try_from(id).expect("validated source token");
+            table[row * 128..(row + 1) * 128].iter().copied()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        embedding,
+        bf16(field(startup, "embedding")),
+        "native embedding"
+    );
+    let block_input = field(case, "block_input");
+    assert_eq!(
+        output.residual_bf16(),
+        bf16(field(block_input, "residual")),
+        "native two-copy startup residual"
+    );
+    assert_eq!(
+        output.identity_pre(),
+        fp32(field(block_input, "incoming_pre")),
+        "native identity startup pre-mix"
+    );
+    (
+        output.residual_bf16().to_vec(),
+        output.identity_pre().to_vec(),
+    )
+}
+
 fn native_attention_input(root: &Value, case: &Value) -> Vec<u16> {
     let positions = usize::try_from(
         field(field(case, "attention_input"), "shape")
@@ -275,9 +322,7 @@ fn native_attention_input(root: &Value, case: &Value) -> Vec<u16> {
             .expect("positions"),
     )
     .expect("usize positions");
-    let block_input = field(case, "block_input");
-    let residual = bf16(field(block_input, "residual"));
-    let incoming_pre = fp32(field(block_input, "incoming_pre"));
+    let (residual, incoming_pre) = native_startup(root, case);
     let norm_weight = bf16(field(
         field(root, "parameters"),
         "layers.0.attn_norm.weight",
@@ -662,29 +707,28 @@ fn window_only_attention_rejects_out_of_order_decode_then_resets_and_retries() {
 }
 
 #[test]
-fn corrupting_layer_zero_incoming_residual_fails_native_attention_input_oracle() {
+fn layer_zero_startup_rejects_unknown_tokens_and_changed_embedding_rows() {
     let root: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/deepseek-v41/layer0-to-layer1-reference.json"
     ))
     .expect("layer-zero bridge fixture JSON");
     let case = &field(&root, "cases").as_array().expect("cases")[0];
-    let block_input = field(case, "block_input");
-    let mut residual = bf16(field(block_input, "residual"));
-    residual.fill(0);
-    let incoming_pre = fp32(field(block_input, "incoming_pre"));
-    let norm_weight = bf16(field(
-        field(&root, "parameters"),
-        "layers.0.attn_norm.weight",
-    ));
-    let mut collapsed = vec![0; 128];
-    hc_pre_bf16_reference(&residual[..256], &incoming_pre[..2], 128, &mut collapsed)
-        .expect("corrupted layer-zero incoming HC pre-mix");
-    let mut normalized = vec![0; 128];
-    rms_norm_bf16_reference(&collapsed, &norm_weight, 1.0e-20, &mut normalized)
-        .expect("corrupted layer-zero attention RMSNorm");
+    let startup = field(case, "startup");
+    let ids = u64s(field(startup, "input_ids"));
+    let mut table = bf16(field(field(&root, "parameters"), "embed.weight"));
+    let layout = StartupLayout::new(8, 128, 2).expect("startup layout");
+    assert!(startup_bf16_reference(&[8], &table, layout).is_err());
+    let expected = startup_bf16_reference(&ids, &table, layout)
+        .expect("source startup")
+        .residual_bf16()
+        .to_vec();
+    let row = usize::try_from(ids[0]).expect("source token row");
+    table[row * 128] ^= 1;
     assert_ne!(
-        normalized,
-        native_attention_input(&root, case)[..128],
-        "a corrupted incoming residual must not pass the native attention-input oracle"
+        startup_bf16_reference(&ids, &table, layout)
+            .expect("changed in-range startup row")
+            .residual_bf16(),
+        expected,
+        "a changed source embedding row must not pass the startup oracle"
     );
 }

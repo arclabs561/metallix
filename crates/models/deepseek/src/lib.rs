@@ -16,6 +16,7 @@ pub mod precision;
 pub mod rotary;
 pub mod routing;
 pub mod selection;
+pub mod startup;
 
 pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
@@ -38,6 +39,7 @@ pub use routing::{
     ExpertRoute, FlashRoutingError, MAX_FLASH_ROUTING_WIDTH, flash_sqrt_softplus_routes,
 };
 pub use selection::{SelectionError, select_indices};
+pub use startup::{StartupError, StartupLayout, StartupOutput, startup_bf16_reference};
 
 // MLX's native test operations share process-global device initialization.
 #[cfg(all(test, feature = "metal"))]

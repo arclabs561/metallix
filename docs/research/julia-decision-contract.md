@@ -1,8 +1,8 @@
 # Julia-1 native decision prerequisite
 
 Status: source contract, published-header validation, real-tokenizer sequence
-parity, and a synthetic CPU decision-head reference are implemented. Native
-Julia model execution remains unimplemented.
+parity, and a native CPU decision head are implemented. Full Julia execution
+still requires native ModernBERT and checkpoint qualification.
 
 ## Reproduction identity
 
@@ -199,8 +199,15 @@ Five cases cover ordinary scoring, nonuniform padding perturbation, an unmasked
 padding negative control, marker permutation, and an invalid marker. All use
 CPU PyTorch 2.13.0, deterministic synthetic parameters, and fixed `1e-5`
 absolute/relative tolerances. Fixture metadata and case inputs are checked too.
-This qualifies head math against the source, not checkpoint weights or native
-Rust/Metal operators.
+The CPU-only `julia` crate now implements this head in Rust from caller-supplied
+F32 weights and encoder hidden states. Its fixture test checks structured
+parameter names, shapes and generation ordinals, then executes all five cases
+under the same fixed tolerance. Malformed tensors, missing unmasked keys,
+out-of-range markers (including masked ones), nonfinite inputs and overflowing
+normalization statistics are rejected. A checked operation budget includes
+both attention reductions, all head affine projections and scorer work.
+This qualifies native CPU head math, not checkpoint weights, ModernBERT,
+Metal execution or model-level quality.
 
 The optional source gate requires an inspected copy of pinned `julia/model.py`
 at `.agents/receipts/julia/model.py`, SHA-256
@@ -213,7 +220,20 @@ uv run scripts/julia_head_reference.py
 uv run scripts/test_julia_head_reference.py
 ```
 
-Next, port the qualified head operations and qualify a separate native
-ModernBERT forward under an explicit checkpoint-resource budget. Native support
+The native head gate runs with `cargo test -p julia` and the workspace check.
+Next, qualify a separate native ModernBERT forward under an explicit
+checkpoint-resource budget. Native support
 requires an actual pinned checkpoint and independent source-runtime numerical
 comparison before server or registry integration.
+
+
+## Native head placement
+
+The native head lives in `crates/models/julia`, beside the existing
+model crates. A test-only experiment would prove the arithmetic but leave no
+reusable head for a later encoder. Putting it in the shared engine or importing
+DeepSeek numerical policy would couple unrelated model contracts. A bounded
+CPU head with local affine, normalization, attention and activation operations
+keeps this step model-specific without introducing a shared tensor framework.
+The first gate is the synthetic pinned-source fixture; encoder execution and
+checkpoint loading remain separately qualified boundaries.
