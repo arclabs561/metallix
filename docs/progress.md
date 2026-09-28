@@ -57,9 +57,15 @@ choices without expanding current support claims.
   reset clears it for a new request. One live layer-three owner now advances
   through starts zero, five and six, and its attention outputs feed the final
   logits without replaying that owner. Owner and attention epochs advance
-  together on reset. Earlier-layer bootstrap traversal remains two-pass;
-  native ownership of the remaining histories and a single request-local
-  traversal are still required for a stateful token-to-logits runner.
+  together on reset. Layer one now also retains Engram, compressed-owner/shared-score
+  and attention state across the three calls. Its starts-zero/five results feed
+  the layer-three bootstrap directly; the same layer-one session then consumes
+  the published prefix at start six. Native attention inputs feed its owner
+  projections, with captured values used as exact checks. Layer-two/Engram3
+  traversal still replays. This test-private layer-one composition does not
+  provide whole-step rollback or production request-epoch reset guarantees;
+  native ownership of the remaining histories and one complete traversal are
+  still required for a stateful token-to-logits runner.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -84,7 +90,11 @@ choices without expanding current support claims.
   neither the tolerance nor the fixture weights were changed. A preregistered
   independent F64 experiment now localizes a separate calibration failure to
   layer zero on `cal_len7`: native error exceeds the source-derived envelope
-  by approximately 2.00335 times. Held-out inputs remain unopened; see the
+  by approximately 2.00335 times. Traces locate the excess inside attention,
+  before the output projection. Accumulating only attention QK dots in F64
+  reduced that error but introduced a second calibration failure, so the
+  experiment was reverted and its baseline/trial evidence retained. Held-out
+  inputs remain unopened; see the
   [numerical experiment](experiments/julia-accuracy-contract.md). This is not a
   full-checkpoint encoder, Metal implementation, or serving integration; see
   the [Julia contract](research/julia-decision-contract.md).
