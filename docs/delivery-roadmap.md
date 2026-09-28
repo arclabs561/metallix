@@ -121,7 +121,7 @@ measurements; competing GPU workloads invalidate performance comparisons.
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
 | Qwen performance | Profile the adopted stepped resident path across model sizes and repeated request shapes. | Preserve full-logit/token and branch/EOS replay; retain the concatenation receipt as a regression control. | Reversible implementation; no public tuning flag. |
-| DeepSeek completion | Remove remaining layer-zero input/coefficient and previous-call state boundaries. Consumer: the complete reduced text oracle. | Preserve exact same-trace FFN/Engram1 handoff, source-derived numerical bounds, routes and retry behavior before Metal composition. | Reversible implementation; source semantics must not be silently changed. |
+| DeepSeek completion | Remove remaining layer-zero HC-coefficient and previous-call state boundaries. Consumer: the complete reduced text oracle. | Preserve exact same-trace FFN/Engram1 handoff, source-derived numerical bounds, routes and retry behavior before Metal composition. | Reversible implementation; source semantics must not be silently changed. |
 | Bounded feasibility/review | Estimate checkpoint storage, expert/Engram residency and bytes transferred per token from inspected metadata; compare to measured local I/O and an explicit latency target. | Record assumptions and a feasible envelope, or trigger the architecture's pager/runtime pivot. Do not download the full checkpoint to discover an obvious capacity failure. | Reversible analysis. |
 
 For each boundary, use existing operators and fixtures first. Add a capture only
@@ -130,7 +130,8 @@ oracle passes, stop extending fixture infrastructure for its own sake and move
 the execution graph onto Metal.
 
 DeepSeek now joins window-only layer-zero attention to its native FFN/Engram
-consumer. After removing the upstream input and coefficient boundaries,
+consumer, with native startup from token IDs. After removing the remaining
+HC-coefficient boundary,
 execute the reduced graph in token order with a request-local previous-call
 shared index publication so layer
 three's real previous publication supplies the next partial layer-one call. That
