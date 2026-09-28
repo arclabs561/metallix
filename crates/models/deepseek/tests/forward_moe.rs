@@ -1064,7 +1064,7 @@ fn block_tail_from_entries(
 #[derive(Clone, Copy)]
 struct LayerFourBundleInputs<'a> {
     bundle: &'a Value,
-    owner_inputs: &'a [(usize, Vec<u16>)],
+    publications: &'a [owner_attention_capture::NativeLayerThreePublication],
 }
 
 fn block_tail_from_entries_with_bundle(
@@ -1382,10 +1382,10 @@ fn native_block_attention_outputs(
             Some(f.source.complete_capture_sha256.as_str()),
             bundle.bundle["source"]["complete_capture_sha256"].as_str()
         );
-        owner_attention_capture::native_outputs_from_bundle_inputs(
+        owner_attention_capture::native_outputs_from_bundle_publications(
             &inputs,
             bundle.bundle,
-            bundle.owner_inputs,
+            bundle.publications,
         )
     } else {
         owner_attention_capture::native_outputs_from_ownered_inputs(
@@ -1636,7 +1636,11 @@ impl ReducedLiveRequest {
             Some(&third),
             Some(LayerFourBundleInputs {
                 bundle: &self.bundle,
-                owner_inputs: self.l3.as_ref().expect("completed L3 publisher").inputs(),
+                publications: self
+                    .l3
+                    .as_ref()
+                    .expect("completed L3 publisher")
+                    .publications(),
             }),
         );
         assert_eq!(
@@ -1703,7 +1707,6 @@ fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
     for defect in [
         "owner_capture",
         "observer_identity",
-        "compressor_weight",
         "candidate_weight",
         "l4_norm",
         "head_weight",
@@ -1719,12 +1722,8 @@ fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
                 projections["layer3_candidate"]["source"]["forward_observers_sha256"] =
                     Value::String("0".repeat(64));
             }
-            "compressor_weight" | "candidate_weight" => {
-                let tensor = if defect == "compressor_weight" {
-                    &mut projections["layer3_compressor"]["weights"]["norm"]
-                } else {
-                    &mut projections["layer3_candidate"]["encoded_parameters"]["layers.3.attn.q_norm.weight"]
-                };
+            "candidate_weight" => {
+                let tensor = &mut projections["layer3_candidate"]["encoded_parameters"]["layers.3.attn.q_norm.weight"];
                 let zeros = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
                 tensor["storage_hex"] = Value::String("0".repeat(zeros.len() * 2));
                 tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&zeros)));
@@ -1753,12 +1752,19 @@ fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
 }
 
 #[test]
-fn layer_four_rejects_malformed_live_layer_three_history() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the publication corruption matrix beside its producer-preservation assertions"
+)]
+fn layer_four_rejects_malformed_committed_layer_three_publications() {
     let mut request = completed_reduced_request();
     let publisher = request.l3.as_ref().unwrap();
-    let original = publisher.inputs().to_vec();
+    let original = publisher.publications().to_vec();
     assert_eq!(
-        original.iter().map(|(start, _)| *start).collect::<Vec<_>>(),
+        original
+            .iter()
+            .map(|record| record.start_pos)
+            .collect::<Vec<_>>(),
         [0, 5, 6]
     );
     let attention_inputs = request.bundle["projections"]["layer4_attention"]["cases"]
@@ -1782,6 +1788,13 @@ fn layer_four_rejects_malformed_live_layer_three_history() {
         "wrong_start",
         "truncated_row",
         "changed_value",
+        "wrong_layer",
+        "wrong_epoch",
+        "wrong_call",
+        "truncated_keys",
+        "changed_keys",
+        "truncated_kv",
+        "changed_kv",
     ] {
         let mut changed = original.clone();
         match defect {
@@ -1790,28 +1803,48 @@ fn layer_four_rejects_malformed_live_layer_three_history() {
             }
             "extra_call" => changed.push(original[2].clone()),
             "reordered" => changed.swap(1, 2),
-            "wrong_start" => changed[2].0 = 5,
+            "wrong_start" => changed[2].start_pos = 5,
             "truncated_row" => {
-                changed[2].1.pop();
+                changed[2].input.pop();
             }
-            "changed_value" => changed[2].1[0] ^= 1,
+            "changed_value" => changed[2].input[0] ^= 1,
+            "wrong_layer" | "wrong_epoch" | "wrong_call" => {
+                let id = changed[2].publication;
+                changed[2].publication = deepseek::indexer::cache::IndexKeyPublicationId::new(
+                    if defect == "wrong_layer" {
+                        4
+                    } else {
+                        id.source_layer()
+                    },
+                    id.epoch() + u64::from(defect == "wrong_epoch"),
+                    id.call_id() + u64::from(defect == "wrong_call"),
+                );
+            }
+            "truncated_keys" => {
+                changed[2].key_prefix.pop();
+            }
+            "changed_keys" => changed[2].key_prefix[0] ^= 1,
+            "truncated_kv" => {
+                changed[2].kv_prefix.pop();
+            }
+            "changed_kv" => changed[2].kv_prefix[0] ^= 1,
             _ => unreachable!(),
         }
         assert!(
-            std::panic::catch_unwind(
-                || owner_attention_capture::native_outputs_from_bundle_inputs(
+            std::panic::catch_unwind(|| {
+                owner_attention_capture::native_outputs_from_bundle_publications(
                     &attention_inputs,
                     &request.bundle,
-                    &changed
+                    &changed,
                 )
-            )
+            })
             .is_err(),
             "invalid handoff accepted: {defect}"
         );
         assert_eq!(
-            publisher.inputs(),
+            publisher.publications(),
             original,
-            "producer input history after {defect}"
+            "producer publication history after {defect}"
         );
         assert_eq!(
             publisher.outputs(),

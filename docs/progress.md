@@ -53,16 +53,14 @@ choices without expanding current support claims.
   retains a typed L3 projection with matching bundle capture/revision/model
   identity and unchanged numerical limits. Mixed-capture metadata is rejected;
   zeroing a supplied L3 normalization weight fails the final numerical oracle.
-  L4 now uses the same bundle for attention, candidate selection, index-key and
-  compressor weights, MoE operands, and the final head. Standalone legacy
-  wrappers retain their original identity gates. L1/L2 and the persistent L3
-  owner/attention path still use legacy captures; this remains an incremental
-  migration, not a fully unified source trace. L4 now receives the exact input
-  history consumed successfully by the persistent L3 session, instead of
-  reconstructing those inputs from captured HC operands. Altered live input is
-  rejected without changing producer history; reset clears the history. L4 still
-  recomputes its owner from those live inputs during finalization. Direct reuse
-  of L3's committed key/KV publication remains a separate gate. The previous-call layer-three
+  L4 uses the same bundle for attention, candidate selection, MoE operands and
+  the final head. It directly consumes the persistent L3 session's committed
+  key/KV prefixes and publication identities, then computes its own query and
+  selection. It no longer reruns the L3 owner at finalization. Snapshots retain
+  successfully consumed L3 inputs, and reset clears publication history.
+  Standalone legacy wrappers retain their original identity gates. L1/L2 and
+  the persistent L3 owner/attention path still use legacy captures; this remains
+  an incremental migration, not a fully unified source trace. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
@@ -363,14 +361,16 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 
 ## Validation
 
-The live L3 input handoff passes all 62 DeepSeek `forward_moe` tests. The new
-control rejects missing or extra calls, reordered or duplicate starts, truncated
-rows and changed values while leaving producer inputs, outputs and key history
-intact. A valid finalization still passes afterward. Reset checks retain only
-the successful retry input.
-The captured-HC input decoder is no longer used by the unified L4 path and was
-removed. Owner recomputation remains explicit rather than being counted as
-publication reuse.
+The committed L3 publication handoff passes all 62 DeepSeek `forward_moe`
+tests and strict all-target/all-feature Clippy against the existing final-logit
+oracle. The canonical Metal check still stops at the unchanged Julia encoder
+mismatch below. Receipts: `.agents/receipts/candidate-control/committed-publication-*`. Its negative controls reject malformed call histories, altered owner
+inputs, wrong layer/epoch/call identities, and changed or truncated key/KV
+prefixes without changing the producer. A valid finalization passes afterward.
+L4 recomputes its own query/selection but never stages another L3 owner.
+The obsolete post-publication compressor-weight mutation control was removed:
+L4 no longer consumes those weights. Candidate, L4 normalization and head weight
+controls remain, as do exact bundle provenance checks.
 
 The unified L4 attention/owner/MoE/head migration passes all 61 DeepSeek
 `forward_moe` tests and strict all-target/all-feature DeepSeek Clippy. Its controls

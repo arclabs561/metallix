@@ -797,105 +797,180 @@ pub(super) fn native_outputs_from_ownered_inputs(
     )
 }
 
-/// Runs the layer-four owner/attention consumer from one unified source bundle.
-pub(super) fn native_outputs_from_bundle_inputs(
-    supplied_inputs: &[(usize, Vec<u16>)],
-    bundle: &Value,
-    live_owner_inputs: &[(usize, Vec<u16>)],
-) -> Vec<Vec<u16>> {
+fn publication_bundle_operands(bundle: &Value) -> (Value, Value, &str) {
+    let source = field(bundle, "source");
     assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
-    // Pin every source field to the checked-in capture metadata, including
-    // observer and extractor identities. Numerical operands still come only
-    // from the caller's bundle, so weight-mutation controls remain meaningful.
     let pinned: Value = serde_json::from_str(include_str!(
         "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
     ))
     .expect("pinned reduced bundle metadata");
-    let source = field(bundle, "source");
     assert_eq!(source, field(&pinned, "source"), "bundle source metadata");
     assert_eq!(field(source, "revision").as_str(), Some(REVISION));
-    assert_eq!(
-        field(source, "model_sha256").as_str(),
-        Some("4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65")
-    );
     let capture = field(source, "complete_capture_sha256")
         .as_str()
         .expect("bundle capture");
-    assert_eq!(capture.len(), 64);
     let projections = field(bundle, "projections");
     let projection = |name| {
         let value = field(projections, name).clone();
-        assert_eq!(
-            field(&value, "schema_version").as_u64(),
-            Some(1),
-            "{name} schema"
-        );
         let child = field(&value, "source");
-        assert_eq!(
-            child, &pinned["projections"][name]["source"],
-            "{name} source metadata"
-        );
-        assert_eq!(
-            field(child, "revision").as_str(),
-            Some(REVISION),
-            "{name} revision"
-        );
-        assert_eq!(
-            field(child, "model_sha256").as_str(),
-            field(source, "model_sha256").as_str(),
-            "{name} model"
-        );
+        assert_eq!(field(&value, "schema_version").as_u64(), Some(1));
         assert_eq!(
             field(child, "complete_capture_sha256").as_str(),
-            Some(capture),
-            "{name} capture"
+            Some(capture)
         );
         value
     };
-    let attention_raw = projection("layer4_attention");
-    assert_eq!(field(&attention_raw, "schema_version").as_u64(), Some(1));
-    let attention: attention_capture::Fixture = serde_json::from_value(attention_raw.clone())
-        .expect("typed bundle layer-four attention fixture");
-    assert_eq!(attention.cases.len(), 3);
-    let raw = attention_raw;
-    let owner = projection("layer3_index_key");
-    let compressor = projection("layer3_compressor");
-    let candidate = projection("layer3_candidate");
-    let candidate_oracle_inputs = field(&candidate, "cases")
-        .as_array()
-        .expect("bundle candidate cases")
-        .iter()
-        .map(|case| {
-            (
-                usize_field(case, "start_pos"),
-                bf16(field(case, "attention_input")),
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        live_owner_inputs.len(),
-        candidate_oracle_inputs.len(),
-        "live L3 input count"
-    );
-    for ((live_start, live_input), (source_start, source_input)) in
-        live_owner_inputs.iter().zip(&candidate_oracle_inputs)
-    {
-        assert_eq!(*live_start, *source_start, "live L3 input start");
-        assert_eq!(live_input.len(), source_input.len(), "live L3 input shape");
+    for name in [
+        "layer4_attention",
+        "layer3_candidate",
+        "layer3_index_key",
+        "layer3_compressor",
+    ] {
+        let value = projection(name);
+        assert_eq!(
+            field(&value, "source"),
+            &pinned["projections"][name]["source"],
+            "{name} source metadata"
+        );
     }
-    native_outputs_from_parts(
-        supplied_inputs,
+    (
+        projection("layer4_attention"),
+        projection("layer3_candidate"),
         capture,
-        OwnerAttentionOperands {
-            raw,
-            attention,
-            owner,
-            compressor,
-            owner_inputs: live_owner_inputs.to_vec(),
-            candidate_oracle_inputs,
-            candidate_projection: Some((&candidate, capture)),
-        },
     )
+}
+
+fn assert_publication_boundary(
+    publication: &NativeLayerThreePublication,
+    attention_case: &attention_capture::Case,
+    raw_case: &Value,
+    candidate: &Value,
+    call_id: usize,
+) {
+    assert_eq!(
+        publication.start_pos, attention_case.start_pos,
+        "L3 publication start"
+    );
+    assert_eq!(
+        publication.publication.source_layer(),
+        SOURCE_LAYER,
+        "L3 publication source"
+    );
+    assert_eq!(publication.publication.epoch(), 0, "L3 publication epoch");
+    assert_eq!(
+        publication.publication.call_id(),
+        u64::try_from(call_id).expect("L4 call"),
+        "L3 publication call"
+    );
+    let indexer = field(raw_case, "indexer");
+    let source_inputs = field(indexer, "inputs");
+    assert_eq!(
+        publication.input,
+        bf16(&candidate["cases"][call_id]["attention_input"]),
+        "L3 owner input oracle"
+    );
+    assert_eq!(
+        publication.key_prefix,
+        bf16(field(source_inputs, "shared_index_k_prefix")),
+        "L3 key prefix oracle"
+    );
+    assert_eq!(
+        publication.kv_prefix,
+        attention_case.compressed_kv.bf16(),
+        "L3 KV prefix oracle"
+    );
+}
+
+/// Consumes already committed L3 publication snapshots for L4. It never stages
+/// or commits another ratio-one owner; only L4's own query and selection run.
+pub(super) fn native_outputs_from_bundle_publications(
+    supplied_inputs: &[(usize, Vec<u16>)],
+    bundle: &Value,
+    publications: &[NativeLayerThreePublication],
+) -> Vec<Vec<u16>> {
+    assert_eq!(
+        supplied_inputs.len(),
+        publications.len(),
+        "L4 publication count"
+    );
+    let (raw, candidate, capture) = publication_bundle_operands(bundle);
+    let attention: attention_capture::Fixture =
+        serde_json::from_value(raw.clone()).expect("typed L4 bundle attention");
+    let model = field(&raw, "model");
+    let parameters = field(&raw, "encoded_parameters");
+    let heads = usize_field(model, "index_n_heads");
+    let head_dimension = usize_field(model, "index_head_dim");
+    let index_layout = IndexQueryLayout::new(
+        nonzero(1),
+        nonzero(usize_field(model, "dim")),
+        nonzero(usize_field(model, "q_lora_rank")),
+        nonzero(heads),
+        nonzero(head_dimension),
+        nonzero(usize_field(model, "rope_head_dim") / 2),
+    )
+    .expect("L4 index layout");
+    let wq_b_codes = fp8(field(parameters, "layers.4.attn.indexer.wq_b.weight"));
+    let wq_b_scales = fp8(field(parameters, "layers.4.attn.indexer.wq_b.scale"));
+    let weights_proj = bf16(field(
+        parameters,
+        "layers.4.attn.indexer.weights_proj.weight",
+    ));
+    let index_weights = IndexQueryWeights {
+        wq_b_codes: &wq_b_codes,
+        wq_b_scales: &wq_b_scales,
+        weights_proj: &weights_proj,
+    };
+    let all_frequencies = frequencies(&attention);
+    let weights = attention_weights(&attention.encoded_parameters);
+    let mut state = LayerAttentionState::new(attention_layout(&attention.model));
+    let raw_cases = field(&raw, "cases").as_array().expect("L4 source cases");
+    assert_eq!(raw_cases.len(), attention.cases.len());
+    assert_eq!(raw_cases.len(), 3, "source partition count");
+    assert_eq!(
+        publications.len(),
+        raw_cases.len(),
+        "complete publication history"
+    );
+    let mut outputs = Vec::with_capacity(publications.len());
+    for (call_id, (((raw_case, attention_case), (start, input)), publication)) in raw_cases
+        .iter()
+        .zip(&attention.cases)
+        .zip(supplied_inputs)
+        .zip(publications)
+        .enumerate()
+    {
+        assert_eq!(*start, attention_case.start_pos, "L4 supplied start");
+        assert_publication_boundary(publication, attention_case, raw_case, &candidate, call_id);
+        assert_eq!(input, &attention_case.input.bf16(), "L4 supplied input");
+        let indices = generated_indices(
+            &raw,
+            raw_case,
+            attention_case,
+            index_layout,
+            index_weights,
+            &publication.key_prefix,
+            publication.publication,
+            &publication.input,
+            input,
+            Some((&candidate, capture)),
+        );
+        let diagnostic = forward_with_publication(
+            &mut state,
+            input,
+            *start,
+            0,
+            u64::try_from(call_id).expect("L4 call"),
+            SOURCE_LAYER,
+            &publication.kv_prefix,
+            &indices,
+            call_frequencies(&all_frequencies, attention_case),
+            weights.borrowed(),
+        )
+        .expect("committed L3 publication drives L4 attention");
+        assert_diagnostic(attention_case, &diagnostic);
+        outputs.push(diagnostic.final_output);
+    }
+    outputs
 }
 
 /// Runs the layer-three source-attention fixture from its native HC input,
@@ -915,6 +990,17 @@ pub(super) struct NativeLayerThreeRun {
     pub(super) previous_call_key_prefix: Vec<u16>,
 }
 
+/// One committed L3 producer publication retained only after its attention
+/// consumer completed successfully in this request-local trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct NativeLayerThreePublication {
+    pub(super) start_pos: usize,
+    pub(super) publication: IndexKeyPublicationId,
+    pub(super) input: Vec<u16>,
+    pub(super) key_prefix: Vec<u16>,
+    pub(super) kv_prefix: Vec<u16>,
+}
+
 /// Test-private request owner for the source-shaped L3 producer and attention.
 /// Each `step` advances the same coupled production cache; it never recreates
 /// the preceding prefix while a later source partition is processed.
@@ -924,6 +1010,7 @@ pub(super) struct NativeLayerThreePublisher {
     next_call: usize,
     outputs: Vec<Vec<u16>>,
     inputs: Vec<(usize, Vec<u16>)>,
+    publications: Vec<NativeLayerThreePublication>,
     previous_call_key_prefix: Option<Vec<u16>>,
 }
 
@@ -956,10 +1043,15 @@ impl NativeLayerThreePublisher {
             next_call: 0,
             outputs: Vec::new(),
             inputs: Vec::new(),
+            publications: Vec::new(),
             previous_call_key_prefix: None,
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep the prepare, commit, attention and successful-publication sequence together"
+    )]
     pub(super) fn step(&mut self, supplied: &(usize, Vec<u16>)) -> Vec<u16> {
         let raw = raw_fixture();
         let attention = attention_capture::layer_three_fixture();
@@ -1056,8 +1148,39 @@ impl NativeLayerThreePublisher {
             attention_case.compressed_kv.bf16(),
             "native staged KV prefix"
         );
-        pending.commit().expect("owner publication commit");
-        self.forward_published_attention(&attention, attention_case, *start, owner_input, &indices)
+        let _committed = pending.commit().expect("owner publication commit");
+        let output = self.forward_published_attention(
+            &attention,
+            attention_case,
+            *start,
+            owner_input,
+            &indices,
+        );
+        self.retain_publication(*start, publication, owner_input);
+        output
+    }
+
+    fn retain_publication(
+        &mut self,
+        start: usize,
+        publication: IndexKeyPublicationId,
+        owner_input: &[u16],
+    ) {
+        self.publications.push(NativeLayerThreePublication {
+            start_pos: start,
+            publication,
+            input: owner_input.to_vec(),
+            key_prefix: self
+                .key_owner
+                .key_prefix(0)
+                .expect("published key prefix")
+                .to_vec(),
+            kv_prefix: self
+                .key_owner
+                .kv_prefix(0)
+                .expect("published KV prefix")
+                .to_vec(),
+        });
     }
 
     fn forward_published_attention(
@@ -1167,6 +1290,10 @@ impl NativeLayerThreePublisher {
         &self.inputs
     }
 
+    pub(super) fn publications(&self) -> &[NativeLayerThreePublication] {
+        &self.publications
+    }
+
     pub(super) fn outputs(&self) -> &[Vec<u16>] {
         &self.outputs
     }
@@ -1188,6 +1315,7 @@ impl NativeLayerThreePublisher {
         self.next_call = 0;
         self.outputs.clear();
         self.inputs.clear();
+        self.publications.clear();
         self.previous_call_key_prefix = None;
         let _ = self.step(retry);
         assert_eq!(
@@ -1196,6 +1324,15 @@ impl NativeLayerThreePublisher {
             "reset retry keeps one successful input"
         );
         assert_eq!(self.inputs[0], *retry, "reset retry input history");
+        assert_eq!(
+            self.publications.len(),
+            1,
+            "reset retry keeps one publication"
+        );
+        assert_eq!(
+            self.publications[0].start_pos, retry.0,
+            "reset retry publication start"
+        );
         assert!(
             !self
                 .key_owner
