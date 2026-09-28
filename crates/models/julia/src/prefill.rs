@@ -1,9 +1,9 @@
 //! Test-private source parity for a two-layer encoded prefix and Julia head.
 
 use crate::{
-    DecisionHead, ENCODER_FF_WIDTH, EncoderBlock, EncoderBlockInput, EncoderBlockWeights,
-    EncoderInput, FEED_FORWARD_WIDTH, FullEncoderWeights, HeadInput, HeadLayerWeights, HeadWeights,
-    JuliaEncoder, ScorerWeights, WIDTH,
+    ATTENTION_HEADS, DecisionHead, ENCODER_FF_WIDTH, EncoderBlock, EncoderBlockInput,
+    EncoderBlockWeights, EncoderInput, FEED_FORWARD_WIDTH, FullEncoderWeights, HeadInput,
+    HeadLayerWeights, HeadWeights, JuliaEncoder, ScorerWeights, WIDTH,
 };
 use serde_json::{Value, json};
 
@@ -429,6 +429,83 @@ fn write_accuracy_calibration_outputs() {
             "manifest_sha256": "e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82",
             "weight_f32_sha256": "db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68",
             "cases": cases,
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "writes opt-in cal_len7 layer-zero trace to JULIA_DIAGNOSTIC_OUTPUT"]
+fn write_cal_len7_layer0_trace() {
+    fn rows(value: &[f32], width: usize) -> Vec<&[f32]> {
+        value.chunks_exact(width).collect()
+    }
+
+    fn heads_queries_keys(value: &[f32], positions: usize) -> Vec<Vec<Vec<f32>>> {
+        (0..ATTENTION_HEADS)
+            .map(|head| {
+                (0..positions)
+                    .map(|query| {
+                        (0..positions)
+                            .map(|key| value[(query * ATTENTION_HEADS + head) * positions + key])
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/julia-1/accuracy-cases.json"
+    ))
+    .unwrap();
+    let case = manifest["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"].as_str() == Some("cal_len7"))
+        .unwrap();
+    let input = EncoderInput {
+        input_ids: case["input_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_u64().unwrap())
+            .collect(),
+        attention_mask: case["attention_mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_bool().unwrap())
+            .collect(),
+    };
+    let mut boundaries = full_encoder().forward_boundaries(&input).unwrap();
+    let embedding = boundaries.remove(0);
+    let trace = EncoderBlock::new(full_weights().layers.into_iter().next().unwrap())
+        .unwrap()
+        .forward_layer0_trace(&EncoderBlockInput {
+            hidden: embedding,
+            positions: input.input_ids.len(),
+            attention_mask: input.attention_mask,
+            layer: 0,
+        })
+        .unwrap();
+    let path = std::env::var("JULIA_DIAGNOSTIC_OUTPUT")
+        .expect("set JULIA_DIAGNOSTIC_OUTPUT to an owner-local diagnostic path");
+    std::fs::write(
+        path,
+        json!({
+            "schema_version": 2,
+            "case": "cal_len7",
+            "attention_layout": "head_query_key",
+            "qkv": rows(&trace.qkv, 3 * WIDTH),
+            "logits": heads_queries_keys(&trace.logits, input.input_ids.len()),
+            "probabilities": heads_queries_keys(&trace.probabilities, input.input_ids.len()),
+            "attention_shape": [ATTENTION_HEADS, input.input_ids.len(), input.input_ids.len()],
+            "attended": rows(&trace.attended, WIDTH),
+            "post_wo_residual": rows(&trace.post_wo_residual, WIDTH),
         })
         .to_string()
             + "\n",

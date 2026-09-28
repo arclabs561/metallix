@@ -156,6 +156,51 @@ def boundaries(case: dict[str, Any]) -> tuple[dict[str, torch.Tensor], list[str]
     return observed, operators
 
 
+def layer0_trace(case: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Capture actual SDPA layer-zero intermediates through source module hooks."""
+    encoder = source_encoder()
+    input_ids = torch.tensor([case["input_ids"]], dtype=torch.int64)
+    attention_mask = torch.tensor([case["attention_mask"]], dtype=torch.bool)
+    observed: dict[str, torch.Tensor] = {}
+
+    def output(name: str):
+        def hook(_: torch.nn.Module, __: tuple[object, ...], value: object) -> None:
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"unexpected {name} output")
+            observed[name] = value.detach().squeeze(0).clone()
+
+        return hook
+
+    def input_hook(name: str):
+        def hook(_: torch.nn.Module, value: tuple[object, ...]) -> None:
+            if not value or not isinstance(value[0], torch.Tensor):
+                raise TypeError(f"unexpected {name} input")
+            observed[name] = value[0].detach().squeeze(0).clone()
+
+        return hook
+
+    layer = encoder.layers[0]
+    hooks = [
+        encoder.embeddings.register_forward_hook(output("embedding")),
+        layer.attn.Wqkv.register_forward_hook(output("qkv")),
+        layer.attn.Wo.register_forward_pre_hook(input_hook("attended")),
+        layer.attn.Wo.register_forward_hook(output("wo")),
+    ]
+    with torch.inference_mode():
+        encoder(input_ids=input_ids, attention_mask=attention_mask)
+    for hook in hooks:
+        hook.remove()
+    observed["post_wo_residual"] = observed["embedding"] + observed["wo"]
+    positions = observed["qkv"].shape[0]
+    qkv = observed["qkv"].reshape(positions, 3, 6, 64)
+    query, key, _ = qkv.unbind(dim=1)
+    query, key = ENCODER.rope(query), ENCODER.rope(key)
+    logits = torch.einsum("qhd,khd->hqk", query, key) / 64.0**0.5
+    observed["logits"] = logits
+    observed["probabilities"] = logits.softmax(dim=-1, dtype=torch.float32)
+    return observed
+
+
 def eager_boundaries(case: dict[str, Any]) -> dict[str, torch.Tensor]:
     """Run the individually hash-gated eager layers to isolate the SDPA seam."""
     input_ids = torch.tensor(case["input_ids"], dtype=torch.int64)

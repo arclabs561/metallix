@@ -98,6 +98,19 @@ pub struct EncoderBlock {
     weights: EncoderBlockWeights,
 }
 
+struct AttentionTrace {
+    logits: Vec<f32>,
+    probabilities: Vec<f32>,
+}
+
+pub(crate) struct Layer0Trace {
+    pub qkv: Vec<f32>,
+    pub logits: Vec<f32>,
+    pub probabilities: Vec<f32>,
+    pub attended: Vec<f32>,
+    pub post_wo_residual: Vec<f32>,
+}
+
 impl EncoderBlock {
     pub fn new(weights: EncoderBlockWeights) -> Result<Self, JuliaEncoderError> {
         validate_weights(&weights)?;
@@ -109,6 +122,33 @@ impl EncoderBlock {
     /// Layer zero has the source `Identity` attention norm. Layers divisible by
     /// three use full attention; the rest use the source's symmetric +/-64 window.
     pub fn forward(&self, input: &EncoderBlockInput) -> Result<Vec<f32>, JuliaEncoderError> {
+        self.forward_inner(input, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_layer0_trace(
+        &self,
+        input: &EncoderBlockInput,
+    ) -> Result<Layer0Trace, JuliaEncoderError> {
+        if input.layer != 0 {
+            return Err(JuliaEncoderError::Layer(input.layer));
+        }
+        let mut trace = Layer0Trace {
+            qkv: Vec::new(),
+            logits: Vec::new(),
+            probabilities: Vec::new(),
+            attended: Vec::new(),
+            post_wo_residual: Vec::new(),
+        };
+        self.forward_inner(input, Some(&mut trace))?;
+        Ok(trace)
+    }
+
+    fn forward_inner(
+        &self,
+        input: &EncoderBlockInput,
+        mut trace: Option<&mut Layer0Trace>,
+    ) -> Result<Vec<f32>, JuliaEncoderError> {
         validate_input(input)?;
         if !input.attention_mask.iter().any(|&x| x) {
             return Err(JuliaEncoderError::NoKeys);
@@ -147,8 +187,28 @@ impl EncoderBlock {
             &self.weights.wqkv_weight,
             "Wqkv",
         )?;
-        let mut attended = attention(&qkv, input.positions, &input.attention_mask, input.layer)?;
-        attended = linear(
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.qkv.clone_from(&qkv);
+        }
+        let mut attention_trace = trace.as_deref_mut().map(|_| AttentionTrace {
+            logits: Vec::new(),
+            probabilities: Vec::new(),
+        });
+        let attended = attention(
+            &qkv,
+            input.positions,
+            &input.attention_mask,
+            input.layer,
+            attention_trace.as_mut(),
+        )?;
+        if let (Some(trace), Some(attention_trace)) = (trace.as_deref_mut(), attention_trace) {
+            trace.logits = attention_trace.logits;
+            trace.probabilities = attention_trace.probabilities;
+        }
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.attended.clone_from(&attended);
+        }
+        let attended = linear(
             &attended,
             input.positions,
             WIDTH,
@@ -158,6 +218,9 @@ impl EncoderBlock {
         )?;
         let mut residual = input.hidden.clone();
         add_assign(&mut residual, &attended, "attention residual")?;
+        if let Some(trace) = trace {
+            trace.post_wo_residual.clone_from(&residual);
+        }
         let normalized = norm_rows(&residual, &self.weights.mlp_norm_weight, "MLP norm")?;
         let wi = linear(
             &normalized,
@@ -322,6 +385,7 @@ fn attention(
     positions: usize,
     mask: &[bool],
     layer: usize,
+    mut trace: Option<&mut AttentionTrace>,
 ) -> Result<Vec<f32>, JuliaEncoderError> {
     let mut out = vec![0.0; positions * WIDTH];
     let scale = HEAD_WIDTH_F32.sqrt().recip();
@@ -356,11 +420,18 @@ fn attention(
                     index: query,
                 });
             }
+            let probabilities: Vec<f32> = logits
+                .iter()
+                .map(|logit| (*logit - maximum).exp() / denominator)
+                .collect();
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.logits.extend_from_slice(&logits);
+                trace.probabilities.extend_from_slice(&probabilities);
+            }
             for dim in 0..HEAD_WIDTH {
                 let mut value = 0.0;
                 for key in 0..positions {
-                    value += ((logits[key] - maximum).exp() / denominator)
-                        * qkv[qkv_index(key, 2, head, dim)];
+                    value += probabilities[key] * qkv[qkv_index(key, 2, head, dim)];
                 }
                 out[query * WIDTH + head * HEAD_WIDTH + dim] = value;
             }

@@ -225,6 +225,34 @@ def f64_case(
     }
 
 
+def f64_layer0_trace(case: dict[str, Any]) -> dict[str, torch.Tensor]:
+    input_ids = torch.tensor(case["input_ids"], dtype=torch.int64)
+    mask = torch.tensor(case["attention_mask"], dtype=torch.bool)
+    embedding = norm(
+        f64(FULL.ENCODER.values((FULL.VOCAB, WIDTH), 200)[input_ids]),
+        f64(FULL.near_one(201)),
+    )
+    weights = FULL.layer_weights(0)
+    qkv = (embedding @ f64(weights["wqkv"]).transpose(0, 1)).reshape(
+        embedding.shape[0], 3, HEADS, HEAD_DIM
+    )
+    query, key, val = qkv.unbind(dim=1)
+    query, key = rope(query, False), rope(key, False)
+    scores = torch.einsum("qhd,khd->hqk", query, key) / math.sqrt(HEAD_DIM)
+    scores = scores.masked_fill(~mask[None, None, :], torch.finfo(torch.float32).min)
+    attended = torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), val).reshape_as(
+        embedding
+    )
+    return {
+        "qkv": qkv.reshape(embedding.shape[0], 3 * WIDTH),
+        "logits": scores,
+        "probabilities": scores.softmax(dim=-1),
+        "attended": attended,
+        "post_wo_residual": embedding
+        + attended @ f64(weights["attn_wo"]).transpose(0, 1),
+    }
+
+
 def error(actual: torch.Tensor, reference: torch.Tensor) -> dict[str, Any]:
     difference = (actual.to(torch.float64) - reference).abs().flatten()
     maximum, index = difference.max(dim=0)
@@ -681,7 +709,25 @@ def main() -> None:
     parser.add_argument("--include-held-out", action="store_true")
     parser.add_argument("--check-defects", action="store_true")
     parser.add_argument("--check-properties", action="store_true")
+    parser.add_argument("--trace-case")
+    parser.add_argument("--trace-output", type=Path)
     args = parser.parse_args()
+    if args.trace_case:
+        if args.trace_case != "cal_len7" or args.trace_output is None:
+            raise ValueError("only cal_len7 trace requires --trace-output")
+        case = next(
+            case for case in manifest_cases() if case["name"] == args.trace_case
+        )
+        source = FULL.layer0_trace(case)
+        reference = f64_layer0_trace(case)
+        trace = {
+            "case": args.trace_case,
+            "source_f32": {name: tensor_record(source[name]) for name in reference},
+            "ideal_f64": {name: tensor_record(reference[name]) for name in reference},
+        }
+        args.trace_output.parent.mkdir(parents=True, exist_ok=True)
+        args.trace_output.write_text(json.dumps(trace, indent=2) + "\n")
+        return
     output = report(args.native_output, args.include_held_out)
     if args.check_defects:
         output["defect_controls"] = defect_controls()

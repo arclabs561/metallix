@@ -151,3 +151,45 @@ uv run scripts/julia_accuracy_reference.py \
   --check-defects --check-properties \
   --write-report /absolute/path/accuracy-calibration-native-f64.json > /dev/null
 ```
+
+### Rejected QK-reduction experiment
+
+The `cal_len7` layer-0 trace located the excess before softmax: native raw QKV
+was within `3.8147e-6` of source-derived F32, while attended values before
+`Wo` differed by `7.4387e-5`. An isolated runtime trial accumulated only the
+64-term QK dot product in F64, cast the completed dot to F32, and retained the
+existing F32 score scaling, RoPE, masking, softmax, value reduction, and all
+weights. The trace improved source-derived maximum errors for logits from
+`1.0681e-4` to `9.1553e-5`, probabilities from `1.5169e-5` to `1.0133e-5`,
+and attended values from `7.4387e-5` to `3.7193e-5`.
+
+The frozen all-calibration result nevertheless failed. It reduced `cal_len7`
+layer 0 from `2.00335` to `1.45272` times its frozen boundary, but left ten
+`cal_len7` boundaries failing and introduced failures at `cal_len5` layer 21
+(`1.02518`) and final normalization (`1.00866`). Scores and probabilities
+passed. The trial was reverted; baseline and trial traces remain owner-local
+at `.agents/receipts/julia/cal-len7-layer0-native-baseline-f32dot.json` and
+`.agents/receipts/julia/cal-len7-layer0-native-f64dot.json`, and the frozen
+all-calibration trial report is
+`.agents/receipts/julia/accuracy-calibration-native-f64dot.json`. The next
+diagnosis is same-input replay that separates QKV/RoPE/score construction from
+reduction behavior; it must not stack another precision change.
+
+
+Raw QKV and attended outputs above are actual pinned source-module captures.
+Source logits and probabilities are explicit reconstructions from captured QKV,
+not internal CPU FlashAttention observations. The original baseline/trial native
+trace files store flat attention arrays in query/head/key order despite their
+original `attention_shape` metadata; the reported comparisons transpose them
+explicitly. New native trace schema 2 stores nested head/query/key arrays and
+names that layout. Preserve this distinction when replaying historical traces.
+
+
+Reproduce the retained trace without evaluating held-out inputs:
+
+```sh
+uv run scripts/julia_accuracy_reference.py --trace-case cal_len7 \
+  --trace-output /absolute/path/cal-len7-layer0-source-f64.json
+JULIA_DIAGNOSTIC_OUTPUT=/absolute/path/cal-len7-layer0-native-v2.json \
+  cargo test -p julia write_cal_len7_layer0_trace -- --ignored
+```
