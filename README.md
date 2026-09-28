@@ -41,9 +41,9 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Source-checked reduced join from token startup through layer-one input, then the native reduced suffix | Later attention state remains fixture-fed; full native generation is unfinished |
+| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition with native previous-call layer-three keys feeding layer-one selection | Two-pass test composition; other attention state remains fixture-fed; native generation is unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
-| [Julia-1](docs/research/julia-decision-contract.md) | Source-pinned tokenizer parity, published-header validation, native CPU decision-head parity, and one bounded ModernBERT encoder block | No full-checkpoint encoder or serving integration yet |
+| [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.

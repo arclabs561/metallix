@@ -50,9 +50,13 @@ choices without expanding current support claims.
   cases now compose one bounded prefill/decode partition through native Engram1,
   layer one and the existing final reduced suffix. The checked-in unified source
   bundle feeds layer zero only; downstream parameters, numerical oracles, and
-  attention-history/shared-key state remain legacy fixture-fed. A real
-  previous-call layer-three publication, reset and retry are the next
-  producer-state gate, before calling this a stateful token-to-logits runner.
+  attention histories remain legacy fixture-fed. The previous-call layer-three
+  key prefix now comes from native execution of starts zero and five and feeds
+  the actual layer-one start-six selection used by the final-logit path.
+  Rejected publication preserves nonempty owner state for a same-ID retry;
+  reset clears it for a new request. This two-pass composition still needs a
+  single request-local stepping path and native ownership of the remaining
+  histories before it is a stateful token-to-logits runner.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -67,8 +71,16 @@ choices without expanding current support claims.
   normalization, later affine normalization, Q/K RoPE, global and +/-64 local
   attention, and GEGLU. Eight source-backed synthetic output cases cover
   padding, local/global windows, distant-token isolation, and an all-masked
-  local query. This is not a full-checkpoint encoder, Metal implementation, or
-  serving integration; see the [Julia contract](research/julia-decision-contract.md).
+  local query. Five additional source-backed cases join two encoder blocks to
+  the head, including padding and marker controls.
+  A bounded eight-token, 22-layer prototype adds selected token lookup,
+  embedding normalization and final normalization, but its full hidden-state
+  comparison against the pinned SDPA source fails the fixed `1e-5` bound on the
+  unmasked control. Three isolated reduction-precision experiments did not
+  close that gap and were reverted. Full-stack qualification remains open;
+  neither the tolerance nor the fixture weights were changed. This is not a
+  full-checkpoint encoder, Metal implementation, or serving integration; see
+  the [Julia contract](research/julia-decision-contract.md).
 
 - `mx decide` scores Qwen3 answer-letter logits directly for bounded `choice`,
   `score`, and `noul` questions, returning normalized option probabilities and

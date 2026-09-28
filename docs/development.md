@@ -23,6 +23,12 @@ regenerated hash. Rust parity tests remain the numerical gate. Source
 provenance and regeneration instructions are in [the Engram reference](research/v41-engram.md)
 and [the reduced V4.1 reference](research/v41-forward-reference.md).
 
+Julia's frozen encoder and composition fixtures also have lightweight structure
+and provenance checks in the canonical gate. Rust executes their numerical
+comparisons. Regenerating the source oracles is a separate, explicit operation
+with pinned Torch and Transformers dependencies; see the
+[Julia contract](research/julia-decision-contract.md).
+
 ## Compiler-aware custom lints
 
 [Dylint](https://github.com/trailofbits/dylint) can load custom Rust lint
