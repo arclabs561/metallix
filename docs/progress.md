@@ -364,8 +364,10 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 ## Validation
 
 The live L3 input handoff passes all 62 DeepSeek `forward_moe` tests. The new
-control changes a consumed L3 input and requires L4 rejection while leaving
-producer history intact; reset checks retain only the successful retry input.
+control rejects missing or extra calls, reordered or duplicate starts, truncated
+rows and changed values while leaving producer inputs, outputs and key history
+intact. A valid finalization still passes afterward. Reset checks retain only
+the successful retry input.
 The captured-HC input decoder is no longer used by the unified L4 path and was
 removed. Owner recomputation remains explicit rather than being counted as
 publication reuse.

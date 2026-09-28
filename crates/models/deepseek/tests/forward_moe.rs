@@ -1753,8 +1753,8 @@ fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
 }
 
 #[test]
-fn layer_four_rejects_changed_live_layer_three_input() {
-    let request = completed_reduced_request();
+fn layer_four_rejects_malformed_live_layer_three_history() {
+    let mut request = completed_reduced_request();
     let publisher = request.l3.as_ref().unwrap();
     let original = publisher.inputs().to_vec();
     assert_eq!(
@@ -1773,23 +1773,59 @@ fn layer_four_rejects_changed_live_layer_three_input() {
             )
         })
         .collect::<Vec<_>>();
-    let mut changed = original.clone();
-    changed[2].1[0] ^= 1;
-    assert!(
-        std::panic::catch_unwind(
-            || owner_attention_capture::native_outputs_from_bundle_inputs(
-                &attention_inputs,
-                &request.bundle,
-                &changed
+    let outputs = publisher.outputs().to_vec();
+    let prefix = publisher.previous_call_key_prefix().to_vec();
+    for defect in [
+        "missing_call",
+        "extra_call",
+        "reordered",
+        "wrong_start",
+        "truncated_row",
+        "changed_value",
+    ] {
+        let mut changed = original.clone();
+        match defect {
+            "missing_call" => {
+                changed.pop();
+            }
+            "extra_call" => changed.push(original[2].clone()),
+            "reordered" => changed.swap(1, 2),
+            "wrong_start" => changed[2].0 = 5,
+            "truncated_row" => {
+                changed[2].1.pop();
+            }
+            "changed_value" => changed[2].1[0] ^= 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            std::panic::catch_unwind(
+                || owner_attention_capture::native_outputs_from_bundle_inputs(
+                    &attention_inputs,
+                    &request.bundle,
+                    &changed
+                )
             )
-        )
-        .is_err()
-    );
-    assert_eq!(
-        publisher.inputs(),
-        original,
-        "consumer rejection leaves producer history unchanged"
-    );
+            .is_err(),
+            "invalid handoff accepted: {defect}"
+        );
+        assert_eq!(
+            publisher.inputs(),
+            original,
+            "producer input history after {defect}"
+        );
+        assert_eq!(
+            publisher.outputs(),
+            outputs,
+            "producer outputs after {defect}"
+        );
+        assert_eq!(
+            publisher.previous_call_key_prefix(),
+            prefix,
+            "producer key prefix after {defect}"
+        );
+    }
+    let _ = request.finish();
+    assert_eq!(request.lifecycle, ReducedRequestLifecycle::Finalized);
 }
 
 fn assert_finalization_failure_requires_restart(request: &mut ReducedLiveRequest) {
