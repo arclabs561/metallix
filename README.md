@@ -298,7 +298,10 @@ encoding, `Expect`, and duplicate body lengths are rejected. Generation has a
 separate cooperative 60-second budget (`--generation-timeout-ms`, 1–120000).
 Checks surround prefill and each decode, including tokens with no visible text.
 An in-flight Metal operation must return before the budget can stop further
-work; client disconnects are still detected through failed output writes.
+work. Streaming responses detect client disconnects when an output write fails.
+Non-streaming JSON responses do not write during generation, so a disconnected
+client can occupy the single-request server until generation completes or the
+budget expires. Use streaming when early disconnect detection matters.
 
 A bounded native Codex command-tool check passed three fresh trials against a
 4B server configured with `--context-tokens 16384 --kv-budget-mib 8192`. Each

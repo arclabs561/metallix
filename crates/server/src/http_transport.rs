@@ -346,8 +346,8 @@ fn map_read_error(kind: io::ErrorKind) -> HttpError {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::Write as _,
-        net::{TcpListener, TcpStream},
+        io::{Read as _, Write as _},
+        net::{Shutdown, TcpListener, TcpStream},
         thread,
         time::Duration,
     };
@@ -570,6 +570,39 @@ mod tests {
                 message: "request headers exceed the 16 KiB limit"
             })
         );
+    }
+
+    #[test]
+    fn request_half_close_still_receives_the_complete_json_response() {
+        let listener = listener();
+        let address = listener.local_addr().unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            received
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut connection = Connection::accept(stream, TransportLimits::default());
+        let request = connection.read_request().unwrap();
+        assert_eq!(request.path, "/v1/responses");
+        assert_eq!(request.body, b"{}");
+        // Read EOF proves only that the peer has finished sending. It is not
+        // evidence that the peer stopped waiting for the response.
+        assert_eq!(connection.stream.peek(&mut [0]).unwrap(), 0);
+        connection.begin_response();
+        connection.write_all(response).unwrap();
+        connection.flush().unwrap();
+        drop(connection);
+        assert_eq!(client.join().unwrap(), response);
     }
 
     #[test]
