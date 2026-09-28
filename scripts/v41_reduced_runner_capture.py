@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import v41_attention_capture
+import v41_candidate_capture
 import v41_index_key_capture
 import v41_layer0_to_layer1_capture
 import v41_layer1_attention_capture
@@ -275,7 +276,11 @@ def reduced_runner_fixture(receipt: dict[str, object]) -> dict[str, object]:
         raise RuntimeError("reduced-runner fixture requires a completed source capture")
     if receipt.get("coverage_status", {}).get("pending") != []:
         raise RuntimeError("reduced-runner fixture requires complete source coverage")
-    canonical = _sha256(_serialized(receipt))
+    serialized = _serialized(receipt)
+    canonical = _sha256(serialized)
+    # Project the same JSON representation for in-process and file-based callers.
+    # The source runner may retain tuple-valued model arguments in memory.
+    receipt = json.loads(serialized)
     runner = _runner_module()
     projections = {
         "layer0_to_layer1": v41_layer0_to_layer1_capture.layer0_to_layer1_fixture(
@@ -297,6 +302,9 @@ def reduced_runner_fixture(receipt: dict[str, object]) -> dict[str, object]:
             receipt, helper_path=SCRIPTS / "v41_layer3_attention_capture.py"
         ),
         "layer3_moe": runner.moe_fixture(receipt, layer=3),
+        "layer3_candidate": v41_candidate_capture.candidate_fixture(receipt),
+        "layer3_index_key": v41_index_key_capture.index_key_fixture(receipt),
+        "layer3_compressor": v41_index_key_capture.compressor_fixture(receipt),
         "layer3_to_layer1": v41_index_key_capture.layer3_to_layer1_fixture(receipt),
         "layer4_attention": v41_attention_capture.attention_fixture(
             receipt, helper_path=SCRIPTS / "v41_attention_capture.py"

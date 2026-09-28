@@ -54,7 +54,11 @@ choices without expanding current support claims.
   identity and unchanged numerical limits. Mixed-capture metadata is rejected;
   zeroing a supplied L3 normalization weight fails the final numerical oracle.
   L1/L2, L3 owner/attention capture inputs, and L4/head remain legacy fixture-fed;
-  this is an incremental migration, not a fully unified source trace. The previous-call layer-three
+  this is an incremental migration, not a fully unified source trace.
+  The bundle also now includes L3 candidate/HC, index-key and compressor
+  projections needed to migrate the L4 attention owner. Their input and latent
+  storage agree exactly across all three calls; the native L4 consumer has not
+  yet switched to them. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
@@ -356,9 +360,10 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 ## Validation
 
 The unified L3 operand migration passes all 60 DeepSeek `forward_moe` tests,
-including mixed-capture and changed-weight rejection. The exporter integrity
-suite passes seven checks; its opt-in source-regeneration check was not rerun
-because the exporter and fixture bytes are unchanged. The calibration-only
+including mixed-capture and changed-weight rejection. The expanded exporter
+integrity suite passes all nine checks, including full pinned source regeneration.
+All 15 existing projections remain unchanged; three owner projections were added
+under the same complete-capture identity. The calibration-only
 Julia normalization replay reproduced the saved native and source embedding
 outputs exactly and found no improvement from scalar Welford. No Julia runtime
 arithmetic or acceptance limits changed.

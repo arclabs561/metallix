@@ -32,6 +32,9 @@ EXPECTED = {
     "layer3_engram",
     "layer3_attention",
     "layer3_moe",
+    "layer3_candidate",
+    "layer3_index_key",
+    "layer3_compressor",
     "layer3_to_layer1",
     "layer4_attention",
     "layer4_moe",
@@ -100,6 +103,23 @@ class ReducedRunnerFixtureTest(unittest.TestCase):
                 owner["selected_indices"]["storage_sha256"],
                 attention["layer_one_published_indices"]["storage_sha256"],
             )
+
+    def test_layer_three_owner_projections_share_exact_operands(self) -> None:
+        projections = self.fixture["projections"]
+        names = ("layer3_candidate", "layer3_index_key", "layer3_compressor")
+        cases = [projections[name]["cases"] for name in names]
+        for name, entries in zip(names, cases, strict=True):
+            self.assertEqual([entry["start_pos"] for entry in entries], [0, 5, 6], name)
+        for candidate, index, compressor in zip(*cases, strict=True):
+            for field in ("dtype", "shape", "storage_hex", "storage_sha256"):
+                self.assertEqual(
+                    candidate["inputs"]["x"][field],
+                    compressor["attention_input"][field],
+                )
+                self.assertEqual(
+                    candidate["inputs"]["latent"][field], compressor["latent"][field]
+                )
+                self.assertEqual(index["latent"][field], compressor["latent"][field])
 
     def test_synthetic_source_route_projection_is_bounded_and_pinned(self) -> None:
         exporter = load("v41_reduced_runner_capture.py", "v41_reduced_runner_exporter")
