@@ -25,8 +25,9 @@ correction and steering pass checkpoint mechanics tests; application quality
 and serving integration remain separate gates. Julia has source-pinned encoding
 and complete published-header checks, plus six real-tokenizer source-parity
 vectors. A native CPU decision head now consumes supplied weights and hidden
-states and matches the five-case synthetic source fixture. Native encoder and
-full-checkpoint execution remain open.
+states and matches the five-case synthetic source fixture. A bounded native
+ModernBERT block now matches eight source-backed global/local attention cases.
+Full encoder prefill, checkpoint execution and serving integration remain open.
 
 The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
@@ -40,7 +41,9 @@ window-only attention, HC mixing and RMSNorm/MoE FFN now reproduce its residual
 into Engram1. Native token embedding, HC-copy expansion and identity pre-mix
 now supply the same-trace incoming state. Native HC projection supplies both
 sublayers' coefficients under the existing F32 envelope policy; its native
-layer-one consumer matches the exact BF16 attention input. A single stateful
+layer-one consumer matches the exact BF16 attention input. The unified source
+bundle now feeds layer zero into the native reduced suffix, while downstream
+attention histories and shared-key publications remain fixture-fed. A stateful
 runner and real previous-call shared state remain before a complete reduced
 oracle, followed by Metal execution. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
@@ -124,20 +127,20 @@ gate; another broad model survey is not on the critical path.
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
 | DeepSeek primary | Compose the qualified layer-zero coefficients and joins into one request-local token-to-logits reduced runner. Consumer: the existing reduced text graph. | Existing numerical policy, exact discrete routing/BF16 boundaries, multiple prefill/decode partitions, previous-call state, reset and retry. | Reversible scalar implementation; no public decoder API yet. |
-| Julia secondary | One source-pinned ModernBERT block with global/local attention, RoPE, normalization and GEGLU; then bounded encoder prefill composed with the native head. Consumer: typed decisions. | Independent source comparison on padded and window-crossing inputs, followed by encoder-to-head scores. | Reversible CPU reference before Metal or checkpoint loading. |
+| Julia secondary | Compose the qualified ModernBERT block into bounded encoder prefill with the native head. Consumer: typed decisions. | Independent complete encoder-to-head scores on padded and window-crossing inputs; retain the eight block controls. | Reversible CPU reference before Metal or checkpoint loading. |
 | Feasibility and review | Refine DeepSeek residency/selected-byte traffic from existing metadata and source routes in parallel. Consumer: the checkpoint acquisition decision. | Explicit RAM/SSD/context/latency budget; distinguish metadata sensitivity from measured hit rates. | Read-only estimates and bounded local probes. |
 | Qwen maintenance | Keep text/tools/typed decisions and optional controller behavior working. | Existing regression checks; new work needs a concrete bug or representative application requirement. | Reversible fixes; no further scheduling benchmark variants. |
 
 ### Dependency order and stopping gates
 
-1. **Close the current numerical uncertainties.** DeepSeek coefficient comparisons
-   must use the existing stage-specific policy, with exact downstream BF16 and
-   routing checks. Julia must follow the pinned Transformers implementation,
-   including actual RoPE behavior rather than inferring semantics from metadata.
-   Stop and diagnose any mismatch; do not widen tolerances to advance the checklist.
+1. **Preserve the qualified numerical boundaries.** DeepSeek coefficient comparisons
+   use the existing stage-specific policy, with exact downstream BF16 and routing
+   checks. Julia's complete block follows the pinned Transformers RoPE, masking
+   and GEGLU behavior. These gates pass; retain their controls during composition.
+   Stop and diagnose a new mismatch rather than widening tolerances.
 2. **Compose execution.** DeepSeek gets one bounded stateful runner from tokens
-   to logits, with native previous-call layer-three publication. Julia gets one
-   complete encoder block and then encoder-to-head prefill. A new fixture is
+   to logits, with native previous-call layer-three publication. Julia gets
+   encoder-to-head prefill from its qualified block. A new fixture is
    justified only by a missing operand or independent oracle for these consumers.
 3. **Move the qualified graph onto Metal.** Preserve full-output, state, routing
    and failure-atomicity comparisons. This is an execution milestone, not evidence
