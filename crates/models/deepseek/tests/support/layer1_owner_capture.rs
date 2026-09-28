@@ -89,6 +89,7 @@ struct Tensor {
 }
 
 /// One native owner publication and its source-qualified selection after a call.
+#[derive(Clone)]
 pub(super) struct NativeCase {
     pub start_pos: usize,
     pub latent: Option<Vec<u16>>,

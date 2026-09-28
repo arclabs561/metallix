@@ -72,7 +72,15 @@ pub(super) fn native_layer_two_entries_from_attention(
                 .iter()
                 .take(call_count)
                 .enumerate()
-                .map(|(index, case)| {
+                .map(|(index, default_case)| {
+                    let case = entries.map_or(default_case, |entries| {
+                        let start = entries[index].0;
+                        fixture
+                            .cases
+                            .iter()
+                            .find(|case| case.start_pos == start)
+                            .expect("native layer-two FFN source start")
+                    });
                     let positions = case.after_attention_residual.shape[1];
                     let captured_residual = case.after_attention_residual.bf16();
                     let captured_pre = case.attention_pre.fp32();

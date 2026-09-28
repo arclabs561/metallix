@@ -568,6 +568,7 @@ pub(super) struct NativeLayerOneSession {
     engram: layer1_engram_capture::NativeLayerOneEngramSession,
     owner: layer1_owner_capture::NativeLayerOneOwnerSession,
     attention: layer1_attention_capture::NativeLayerOneAttentionSession,
+    last_publication: Option<layer1_owner_capture::NativeCase>,
     next_case: usize,
 }
 
@@ -578,6 +579,7 @@ impl NativeLayerOneSession {
             engram: layer1_engram_capture::NativeLayerOneEngramSession::new(),
             owner: layer1_owner_capture::NativeLayerOneOwnerSession::new(None),
             attention: layer1_attention_capture::NativeLayerOneAttentionSession::new(),
+            last_publication: None,
             next_case: 0,
         }
     }
@@ -622,12 +624,23 @@ impl NativeLayerOneSession {
             case.attention_input.bf16(),
             "native L1 HC attention input"
         );
-        let owner = self.owner.step_with_input(&input);
-        let attention = self.attention.step(&(start, input), &owner);
+        self.last_publication = Some(self.owner.step_with_input(&input));
+        let attention = self.attention.step(
+            &(start, input),
+            self.last_publication
+                .as_ref()
+                .expect("live L1 owner publication"),
+        );
         let handoff = attention_handoffs(&self.fixture, &[attention]);
         let mut output = native_ffn(&self.fixture, &handoff);
         self.next_case += 1;
         output.pop().expect("one native L1 FFN result")
+    }
+
+    pub(super) fn last_publication(&self) -> &layer1_owner_capture::NativeCase {
+        self.last_publication
+            .as_ref()
+            .expect("live L1 owner publication")
     }
 }
 

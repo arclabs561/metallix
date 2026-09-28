@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use super::{
     BlockConfig, BlockControl, Coefficients, Tensor, assert_final_suffix, block_tail_from_entries,
     derive_attention_input, engram_capture, fixture, hc_coefficient_bounds, hc_projection_bounds,
-    layer_three_fixture, layer2_attention_capture, layer2_ffn,
+    layer_three_fixture, layer1_owner_capture, layer2_attention_capture, layer2_ffn,
     native_layer_three_block_tail_from_entries,
 };
 
@@ -207,13 +207,14 @@ fn handoffs(
         (1..=fixture.cases.len()).contains(&outputs.len()),
         "native layer-two attention handoff prefix"
     );
-    fixture
-        .cases
+    outputs
         .iter()
-        .take(outputs.len())
-        .zip(outputs)
-        .map(|(case, (start, attention))| {
-            assert_eq!(*start, case.start_pos);
+        .map(|(start, attention)| {
+            let case = fixture
+                .cases
+                .iter()
+                .find(|case| case.start_pos == *start)
+                .expect("native layer-two attention handoff source start");
             let residual = case.residual.bf16();
             assert_eq!(attention.len() * 2, residual.len());
             let mut joined = Vec::new();
@@ -282,6 +283,63 @@ pub(super) fn native_layer_two_entries_from_entries(
     let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
     let attention = handoffs(&fixture, &outputs);
     layer2_ffn::native_layer_two_entries_from_attention(Some(&attention))
+}
+
+/// Test-private continuation that keeps L2 attention/window state across the
+/// live L1 partitions. FFN remains the existing exact source boundary.
+pub(super) struct NativeLayerTwoSession {
+    fixture: HcFixture,
+    attention: layer2_attention_capture::NativeLayerTwoAttentionSession,
+    next_case: usize,
+}
+
+impl NativeLayerTwoSession {
+    pub(super) fn new() -> Self {
+        Self {
+            fixture: hc_fixture(),
+            attention: layer2_attention_capture::NativeLayerTwoAttentionSession::new(),
+            next_case: 0,
+        }
+    }
+
+    pub(super) fn step(
+        &mut self,
+        (start, residual, incoming): &(usize, Vec<u16>, Vec<f32>),
+        live_owner: Option<&layer1_owner_capture::NativeCase>,
+    ) -> (usize, Vec<u16>, Vec<f32>) {
+        let case = &self.fixture.cases[self.next_case];
+        assert_eq!(*start, case.start_pos, "native L2 live start");
+        assert_eq!(
+            residual,
+            &case.residual.bf16(),
+            "native L1 terminal residual at layer-two boundary"
+        );
+        let norm = self.fixture.block_parameters["layers.2.attn_norm.weight"].bf16();
+        let input = residual
+            .chunks_exact(256)
+            .enumerate()
+            .flat_map(|(position, row)| {
+                derive_attention_input(
+                    row,
+                    &incoming[position * 2..(position + 1) * 2],
+                    &norm,
+                    self.fixture.block_config.norm_eps,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            input,
+            case.attention_input.bf16(),
+            "native layer-two HC attention input"
+        );
+        let output = self
+            .attention
+            .step_with_publication(&(*start, input), live_owner);
+        let handoff = handoffs(&self.fixture, &[output]);
+        let result = layer2_ffn::native_layer_two_entries_from_attention(Some(&handoff));
+        self.next_case += 1;
+        result.into_iter().next().expect("one native L2 result")
+    }
 }
 
 #[test]

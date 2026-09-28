@@ -303,73 +303,105 @@ fn assert_diagnostic(case: &Value, diagnostic: &LayerAttentionDiagnostic) {
 /// assertions below then reject a numerically divergent attention continuation.
 pub(super) fn native_outputs_from_inputs(inputs: &[(usize, Vec<u16>)]) -> Vec<(usize, Vec<u16>)> {
     let root = fixture();
-    let frequencies = frequencies(&root);
-    let weights = weights(&root);
     let cases = field(&root, "cases").as_array().expect("source cases");
     assert!(
         (1..=cases.len()).contains(&inputs.len()),
         "source call prefix count"
     );
-    let owner =
-        layer1_owner_capture::native_publications_with_previous_layer_three_prefix_for_calls(
-            None,
-            inputs.len(),
+    let mut session = NativeLayerTwoAttentionSession::new();
+    inputs.iter().map(|input| session.step(input)).collect()
+}
+
+/// Test-private live L2 attention request state.  It retains the attention
+/// window and the source-qualified L1 owner prefix across the 0/5/6 calls.
+pub(super) struct NativeLayerTwoAttentionSession {
+    root: Value,
+    frequencies: Vec<RotaryFrequency>,
+    weights: Weights,
+    state: LayerAttentionState,
+    owner: layer1_owner_capture::NativeLayerOneOwnerSession,
+    next_case: usize,
+}
+
+impl NativeLayerTwoAttentionSession {
+    pub(super) fn new() -> Self {
+        let root = fixture();
+        Self {
+            frequencies: frequencies(&root),
+            weights: weights(&root),
+            state: LayerAttentionState::new(layout(&root)),
+            owner: layer1_owner_capture::NativeLayerOneOwnerSession::new(None),
+            root,
+            next_case: 0,
+        }
+    }
+
+    pub(super) fn step(&mut self, input: &(usize, Vec<u16>)) -> (usize, Vec<u16>) {
+        self.step_with_publication(input, None)
+    }
+
+    pub(super) fn step_with_publication(
+        &mut self,
+        (supplied_start, input): &(usize, Vec<u16>),
+        live_owner: Option<&layer1_owner_capture::NativeCase>,
+    ) -> (usize, Vec<u16>) {
+        let case = &field(&self.root, "cases").as_array().expect("source cases")[self.next_case];
+        let call_id = self.next_case;
+        let start = usize_field(case, "start_pos");
+        assert_eq!(
+            start,
+            [0, 5, 6][call_id],
+            "native layer-two attention call order"
         );
-    let mut state = LayerAttentionState::new(layout(&root));
-    cases
-        .iter()
-        .take(inputs.len())
-        .zip(inputs)
-        .enumerate()
-        .map(|(call_id, (case, (supplied_start, input)))| {
-            let start = usize_field(case, "start_pos");
-            assert_eq!(*supplied_start, start, "captured call start {call_id}");
-            assert_eq!(
-                input.len(),
-                bf16(field(case, "input")).len(),
-                "start {start} input geometry"
-            );
-            let source_kv = bf16(field(case, "layer_one_published_kv"));
-            let source_ids = i32s(field(case, "layer_one_published_indices"));
-            assert_eq!(
-                source_kv,
-                bf16(field(case, "compressed_kv")),
-                "start {start} source layer-one KV boundary"
-            );
-            assert_eq!(
-                source_ids,
-                i32s(field(case, "compressed_indices")),
-                "start {start} source layer-one IDs boundary"
-            );
-            assert_eq!(owner[call_id].start_pos, start);
-            assert_eq!(
-                owner[call_id].kv_prefix, source_kv,
-                "start {start} native layer-one KV publication"
-            );
-            assert_eq!(
-                owner[call_id].selected_indices, source_ids,
-                "start {start} native layer-one selected IDs"
-            );
-            let positions = input.len() / 128;
-            let diagnostic = state
-                .forward(
-                    input,
-                    start,
-                    &frequencies[start * 16..(start + positions) * 16],
-                    weights.borrowed(),
-                    CompressedAttentionPublication {
-                        source_layer: 1,
-                        epoch: 0,
-                        call_id: u64::try_from(call_id).expect("three calls"),
-                        numerical_bf16: &owner[call_id].kv_prefix,
-                        indices: &owner[call_id].selected_indices,
-                    },
-                )
-                .expect("native layer-two attention");
-            assert_diagnostic(case, &diagnostic);
-            (start, diagnostic.final_output)
-        })
-        .collect()
+        assert_eq!(*supplied_start, start, "captured call start {call_id}");
+        assert_eq!(
+            input.len(),
+            bf16(field(case, "input")).len(),
+            "start {start} input geometry"
+        );
+        let source_kv = bf16(field(case, "layer_one_published_kv"));
+        let source_ids = i32s(field(case, "layer_one_published_indices"));
+        assert_eq!(
+            source_kv,
+            bf16(field(case, "compressed_kv")),
+            "start {start} source layer-one KV boundary"
+        );
+        assert_eq!(
+            source_ids,
+            i32s(field(case, "compressed_indices")),
+            "start {start} source layer-one IDs boundary"
+        );
+        let owner = live_owner.cloned().unwrap_or_else(|| self.owner.step());
+        assert_eq!(owner.start_pos, start);
+        assert_eq!(
+            owner.kv_prefix, source_kv,
+            "start {start} native layer-one KV publication"
+        );
+        assert_eq!(
+            owner.selected_indices, source_ids,
+            "start {start} native layer-one selected IDs"
+        );
+        let positions = input.len() / 128;
+        let diagnostic = self
+            .state
+            .forward(
+                input,
+                start,
+                &self.frequencies[start * 16..(start + positions) * 16],
+                self.weights.borrowed(),
+                CompressedAttentionPublication {
+                    source_layer: 1,
+                    epoch: 0,
+                    call_id: u64::try_from(call_id).expect("three calls"),
+                    numerical_bf16: &owner.kv_prefix,
+                    indices: &owner.selected_indices,
+                },
+            )
+            .expect("native layer-two attention");
+        assert_diagnostic(case, &diagnostic);
+        self.next_case += 1;
+        (start, diagnostic.final_output)
+    }
 }
 
 /// Runs the captured layer-two inputs through the native attention chain.

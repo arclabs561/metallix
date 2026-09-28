@@ -1386,14 +1386,23 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         .collect::<Vec<_>>();
     let mut layer_one_session = layer1_join::NativeLayerOneSession::new();
     let first = layer_one_session.step(&streams[0], &incoming_pre[0]);
+    let mut layer_two_session = layer2_join::NativeLayerTwoSession::new();
+    let first_l2 = layer_two_session.step(&first, Some(layer_one_session.last_publication()));
     let second = layer_one_session.step(&streams[1], &incoming_pre[1]);
+    let second_l2 = layer_two_session.step(&second, Some(layer_one_session.last_publication()));
+    let mut layer_three_engram = engram_capture::NativeLayerThreeEngramSession::new();
+    let first_engram = layer_three_engram.step(Some(&(first_l2.0, first_l2.1.clone())));
+    let second_engram = layer_three_engram.step(Some(&(second_l2.0, second_l2.1.clone())));
+    let mut final_layer_three_engram = vec![first_engram, second_engram];
     let (mut layer_three_publisher, previous_layer_three_prefix) =
-        native_previous_layer_three_publisher(&[first.clone(), second.clone()]);
+        native_previous_layer_three_publisher(
+            &[first_l2.clone(), second_l2.clone()],
+            &final_layer_three_engram,
+        );
     let layer_three_fixture = layer_three_fixture();
 
-    // L2/Engram3 is still an explicit replay seam here.  Its complete prior
-    // L3 publication is injected only after the live L1 start-five call and
-    // immediately before the partial start-six call consumes it.
+    // The live L2 and Engram3 prefix produces the complete prior L3
+    // publication after start five and before the partial start-six L1 call.
     let mut corrupted_prefix = previous_layer_three_prefix.clone();
     corrupted_prefix[0] ^= 1;
     assert!(
@@ -1409,15 +1418,10 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
     );
     layer_one_session.supply_previous_layer_three_prefix(&previous_layer_three_prefix);
     let third_l1 = layer_one_session.step(&streams[2], &incoming_pre[2]);
-    let layer_one = vec![first, second, third_l1];
-    let layer_two = layer2_join::native_layer_two_entries_from_entries(&layer_one);
-    let final_layer_three_streams = layer_two
-        .iter()
-        .map(|(start, residual, _)| (*start, residual.clone()))
-        .collect::<Vec<_>>();
-    let final_layer_three_engram = engram_capture::native_layer_three_block_entries_from_streams(
-        Some(&final_layer_three_streams),
-    );
+    let third_l2 = layer_two_session.step(&third_l1, Some(layer_one_session.last_publication()));
+    let third_engram = layer_three_engram.step(Some(&(third_l2.0, third_l2.1.clone())));
+    let layer_two = [first_l2, second_l2, third_l2];
+    final_layer_three_engram.push(third_engram);
     let final_layer_three_pre = layer_two
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
@@ -1448,34 +1452,31 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
 /// consumed by the following L1 partial decode. The source start-six operands
 /// remain outside this bootstrap traversal.
 fn bootstrap_layer_three_inputs(
-    layer_one: &[(usize, Vec<u16>, Vec<f32>)],
+    layer_two: &[(usize, Vec<u16>, Vec<f32>)],
+    engram: &[(usize, Vec<u16>)],
 ) -> Vec<(usize, Vec<u16>)> {
-    assert_eq!(layer_one.len(), 2, "two preceding native L1 calls");
+    assert_eq!(layer_two.len(), 2, "two preceding native L2 calls");
     assert_eq!(
-        layer_one
+        layer_two
             .iter()
             .map(|(start, _, _)| *start)
             .collect::<Vec<_>>(),
         [0, 5],
         "L3 bootstrap sees the already-committed L1 prefix"
     );
-    let layer_two = layer2_join::native_layer_two_entries_from_entries(layer_one);
-    let streams = layer_two
-        .iter()
-        .map(|(start, residual, _)| (*start, residual.clone()))
-        .collect::<Vec<_>>();
-    let engram = engram_capture::native_layer_three_block_entries_from_streams(Some(&streams));
+    assert_eq!(engram.len(), layer_two.len(), "live L3 Engram prefix count");
     let pre = layer_two
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    native_layer_three_attention_inputs_from_entries(&layer_three_fixture(), &engram, &pre)
+    native_layer_three_attention_inputs_from_entries(&layer_three_fixture(), engram, &pre)
 }
 
 fn native_previous_layer_three_publisher(
-    layer_one: &[(usize, Vec<u16>, Vec<f32>)],
+    layer_two: &[(usize, Vec<u16>, Vec<f32>)],
+    engram: &[(usize, Vec<u16>)],
 ) -> (owner_attention_capture::NativeLayerThreePublisher, Vec<u16>) {
-    let inputs = bootstrap_layer_three_inputs(layer_one);
+    let inputs = bootstrap_layer_three_inputs(layer_two, engram);
     let mut publisher = owner_attention_capture::NativeLayerThreePublisher::new();
     publisher.step(&inputs[0]);
     publisher.step(&inputs[1]);

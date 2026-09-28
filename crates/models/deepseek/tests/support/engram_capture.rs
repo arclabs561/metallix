@@ -108,128 +108,131 @@ fn fixture() -> Value {
 
 /// Produces exact gated layer-three block entries keyed by source start position.
 pub(super) fn native_layer_three_block_entries() -> Vec<(usize, Vec<u16>)> {
-    native_layer_three_block_entries_from_streams(None)
+    let mut session = NativeLayerThreeEngramSession::new();
+    (0..3).map(|_| session.step(None)).collect()
 }
 
 /// Recomputes the layer-three Engram gate from native upstream residuals.
 pub(super) fn native_layer_three_block_entries_from_streams(
     supplied_streams: Option<&[(usize, Vec<u16>)]>,
 ) -> Vec<(usize, Vec<u16>)> {
-    let root = fixture();
-    native_block_entries_from_streams(&root, 3, 1, supplied_streams)
-}
-
-/// Replays one layer-qualified Engram source capture.
-///
-/// `hash_column` indexes the model-qualified Engram columns in the shared
-/// hash-state result. The pinned layer-three fixture uses column one; layer one
-/// will use column zero without changing the stateful hash transition.
-fn native_block_entries_from_streams(
-    root: &Value,
-    layer: usize,
-    hash_column: usize,
-    supplied_streams: Option<&[(usize, Vec<u16>)]>,
-) -> Vec<(usize, Vec<u16>)> {
-    let model = field(root, "model");
-    let engram = field(root, "engram");
-    let state = field(engram, "hash_state");
-    let layout = field(engram, "layout");
-    let layer_ids = field(layout, "layer_ids").as_array().unwrap();
-    assert_eq!(layer_ids[hash_column].as_u64(), Some(layer as u64));
-    let token_map = i64s(field(state, "token_map"));
-    let hash_layout = EngramHashLayout::new(
-        usize_field(layout, "max_ngram_size"),
-        usize_field(layout, "n_heads"),
-        layer_ids.len(),
-        field(state, "pad_id").as_i64().unwrap(),
-        i64s(field(state, "primes")),
-        i64s(field(state, "offsets")),
-        i64s(field(state, "multipliers")),
-    )
-    .unwrap();
-    let cases = field(root, "cases").as_array().unwrap();
-    let capacity = cases
-        .iter()
-        .map(|c| usize_field(c, "start_pos") + shape(field(c, "input_ids"))[1])
-        .max()
-        .unwrap();
-    let mut hashes = EngramHashState::new(hash_layout, 1, capacity).unwrap();
-    let parameters = field(root, "encoded_parameters");
-    let prefix = format!("layers.{layer}.engram");
-    let embed_codes = fp8_codes(field(parameters, &format!("{prefix}.embed.weight")));
-    let embed_scales = fp8_scales(field(parameters, &format!("{prefix}.embed.scale")));
-    let embed_rows = field(layout, "num_embeddings").as_array().unwrap()[hash_column]
-        .as_u64()
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let embed =
-        EngramEmbeddingLayout::new(embed_rows, usize_field(model, "embedding_dim"), 32).unwrap();
-    let wkv_codes = fp8_codes(field(parameters, &format!("{prefix}.wkv.weight")));
-    let wkv_scales = fp8_scales(field(parameters, &format!("{prefix}.wkv.scale")));
-    let q: Vec<f32> = bf16(field(parameters, &format!("{prefix}.q_weight")))
-        .into_iter()
-        .map(f32_from_bf16)
-        .collect();
-    let k: Vec<f32> = bf16(field(parameters, &format!("{prefix}.k_weight")))
-        .into_iter()
-        .map(f32_from_bf16)
-        .collect();
-    let call_count = supplied_streams.map_or(cases.len(), <[_]>::len);
+    let count = supplied_streams.map_or(3, <[_]>::len);
     assert!(
-        (1..=cases.len()).contains(&call_count),
+        (1..=3).contains(&count),
         "native Engram stream prefix count"
     );
-    cases
-        .iter()
-        .take(call_count)
-        .enumerate()
-        .map(|(case_index, case)| {
-            let positions = shape(field(case, "input_ids"))[1];
-            let start = usize_field(case, "start_pos");
-            let tokens: Vec<_> = i64s(field(case, "input_ids"))
-                .into_iter()
-                .map(|id| CompressedToken::Live(token_map[usize::try_from(id).unwrap()]))
-                .collect();
-            let all = hashes.write_and_hash(&tokens, positions, start).unwrap();
-            let columns = usize_field(model, "hash_columns");
-            let ids: Vec<_> = all
-                .chunks_exact(layer_ids.len() * columns)
-                .flat_map(|row| {
-                    row[hash_column * columns..(hash_column + 1) * columns]
-                        .iter()
-                        .copied()
-                })
-                .collect();
-            assert_eq!(ids, i64s(field(case, "captured_hash_ids")));
-            let mut looked = vec![0; ids.len() * usize_field(model, "embedding_dim")];
-            engram_embedding_bf16_reference(&ids, &embed_codes, &embed_scales, embed, &mut looked)
-                .unwrap();
-            assert_eq!(looked, bf16(field(case, "embedding")));
-            check_masked_lookup(&ids, &embed_codes, &embed_scales, embed, &looked);
-            let wkv = project_wkv(
-                &looked,
-                positions,
-                columns * usize_field(model, "embedding_dim"),
-                usize_field(model, "wkv_width"),
-                &wkv_codes,
-                &wkv_scales,
-            );
-            assert_eq!(wkv, bf16(field(case, "wkv_output")));
-            let (key, value) = split_wkv(case, model, &wkv);
-            let captured_stream = bf16(field(case, "stream"));
-            let stream = if let Some(streams) = supplied_streams {
-                let (supplied_start, supplied) = &streams[case_index];
-                assert_eq!(*supplied_start, start, "native Engram stream start");
-                assert_eq!(supplied, &captured_stream, "native Engram stream boundary");
-                supplied.as_slice()
-            } else {
-                captured_stream.as_slice()
-            };
-            let output = gate_output(case, model, stream, &key, &value, &q, &k);
-            (start, output)
-        })
+    let mut session = NativeLayerThreeEngramSession::new();
+    (0..count)
+        .map(|index| session.step(supplied_streams.map(|streams| &streams[index])))
         .collect()
+}
+
+/// Test-private layer-three Engram request state. Hash history is retained
+/// across the source partitions rather than rebuilding the [0, 5] prefix.
+pub(super) struct NativeLayerThreeEngramSession {
+    root: Value,
+    hashes: EngramHashState,
+    next_case: usize,
+}
+
+impl NativeLayerThreeEngramSession {
+    pub(super) fn new() -> Self {
+        let root = fixture();
+        let engram = field(&root, "engram");
+        let state = field(engram, "hash_state");
+        let layout = field(engram, "layout");
+        let layers = field(layout, "layer_ids").as_array().unwrap();
+        let layout_hash = EngramHashLayout::new(
+            usize_field(layout, "max_ngram_size"),
+            usize_field(layout, "n_heads"),
+            layers.len(),
+            field(state, "pad_id").as_i64().unwrap(),
+            i64s(field(state, "primes")),
+            i64s(field(state, "offsets")),
+            i64s(field(state, "multipliers")),
+        )
+        .unwrap();
+        let capacity = field(&root, "cases")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|case| usize_field(case, "start_pos") + shape(field(case, "input_ids"))[1])
+            .max()
+            .unwrap();
+        Self {
+            root,
+            hashes: EngramHashState::new(layout_hash, 1, capacity).unwrap(),
+            next_case: 0,
+        }
+    }
+    pub(super) fn step(&mut self, supplied: Option<&(usize, Vec<u16>)>) -> (usize, Vec<u16>) {
+        let model = field(&self.root, "model");
+        let engram = field(&self.root, "engram");
+        let state = field(engram, "hash_state");
+        let layout = field(engram, "layout");
+        let layers = field(layout, "layer_ids").as_array().unwrap();
+        let case = &field(&self.root, "cases").as_array().unwrap()[self.next_case];
+        let start = usize_field(case, "start_pos");
+        assert_eq!(start, [0, 5, 6][self.next_case], "native Engram call order");
+        let positions = shape(field(case, "input_ids"))[1];
+        let token_map = i64s(field(state, "token_map"));
+        let tokens = i64s(field(case, "input_ids"))
+            .into_iter()
+            .map(|id| CompressedToken::Live(token_map[usize::try_from(id).unwrap()]))
+            .collect::<Vec<_>>();
+        let all = self
+            .hashes
+            .write_and_hash(&tokens, positions, start)
+            .unwrap();
+        let columns = usize_field(model, "hash_columns");
+        let ids = all
+            .chunks_exact(layers.len() * columns)
+            .flat_map(|row| row[columns..2 * columns].iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, i64s(field(case, "captured_hash_ids")));
+        let params = field(&self.root, "encoded_parameters");
+        let embed_codes = fp8_codes(field(params, "layers.3.engram.embed.weight"));
+        let embed_scales = fp8_scales(field(params, "layers.3.engram.embed.scale"));
+        let rows = field(layout, "num_embeddings").as_array().unwrap()[1]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let embed =
+            EngramEmbeddingLayout::new(rows, usize_field(model, "embedding_dim"), 32).unwrap();
+        let mut looked = vec![0; ids.len() * usize_field(model, "embedding_dim")];
+        engram_embedding_bf16_reference(&ids, &embed_codes, &embed_scales, embed, &mut looked)
+            .unwrap();
+        assert_eq!(looked, bf16(field(case, "embedding")));
+        check_masked_lookup(&ids, &embed_codes, &embed_scales, embed, &looked);
+        let wkv = project_wkv(
+            &looked,
+            positions,
+            columns * usize_field(model, "embedding_dim"),
+            usize_field(model, "wkv_width"),
+            &fp8_codes(field(params, "layers.3.engram.wkv.weight")),
+            &fp8_scales(field(params, "layers.3.engram.wkv.scale")),
+        );
+        assert_eq!(wkv, bf16(field(case, "wkv_output")));
+        let (key, value) = split_wkv(case, model, &wkv);
+        let captured = bf16(field(case, "stream"));
+        let stream = supplied.map_or(captured.as_slice(), |(given, input)| {
+            assert_eq!(*given, start, "native Engram stream start");
+            assert_eq!(input, &captured, "native Engram stream boundary");
+            input.as_slice()
+        });
+        let q = bf16(field(params, "layers.3.engram.q_weight"))
+            .into_iter()
+            .map(f32_from_bf16)
+            .collect::<Vec<_>>();
+        let k = bf16(field(params, "layers.3.engram.k_weight"))
+            .into_iter()
+            .map(f32_from_bf16)
+            .collect::<Vec<_>>();
+        let output = gate_output(case, model, stream, &key, &value, &q, &k);
+        self.next_case += 1;
+        (start, output)
+    }
 }
 
 fn split_wkv(case: &Value, model: &Value, wkv: &[u16]) -> (Vec<u16>, Vec<u16>) {
