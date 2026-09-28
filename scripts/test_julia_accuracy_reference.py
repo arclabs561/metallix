@@ -96,6 +96,25 @@ class ReceiptValidationTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             REFERENCE.balanced_f32_scores(query.double(), query.double())
 
+    def test_projection_calibration_requires_pinned_identity_and_case(self) -> None:
+        report = {
+            "manifest_sha256": REFERENCE.MANIFEST_SHA256,
+            "weight_f32_sha256": self.weight_sha,
+            "cases": [],
+        }
+        with self.assertRaises(ValueError):
+            REFERENCE.calibration_case_for_projection(report)
+        report["manifest_sha256"] = REFERENCE.MANIFEST_SHA256
+        report["cases"] = [
+            {"name": "cal_len7", "split": "calibration"},
+            {"name": "cal_len7", "split": "calibration"},
+        ]
+        with self.assertRaises(ValueError):
+            REFERENCE.calibration_case_for_projection(report)
+        report["manifest_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            REFERENCE.calibration_case_for_projection(report)
+
 
 if __name__ == "__main__":
     unittest.main()

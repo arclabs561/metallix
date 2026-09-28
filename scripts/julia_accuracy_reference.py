@@ -317,8 +317,108 @@ def balanced_f32_scores(query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
     return scores
 
 
+def calibration_case_for_projection(report: dict[str, Any]) -> dict[str, Any]:
+    if report.get("manifest_sha256") != MANIFEST_SHA256:
+        raise ValueError("projection calibration report manifest identity mismatch")
+    if report.get("weight_f32_sha256") != weights_f32_sha256():
+        raise ValueError("projection calibration report weight identity mismatch")
+    cases = report.get("cases")
+    if not isinstance(cases, list):
+        raise TypeError("projection calibration report lacks cases")
+    if not all(isinstance(case, dict) for case in cases):
+        raise TypeError("projection calibration report has malformed cases")
+    matches = [case for case in cases if case.get("name") == "cal_len7"]
+    if len(matches) != 1 or matches[0].get("split") != "calibration":
+        raise ValueError(
+            "projection calibration report requires one cal_len7 calibration case"
+        )
+    return matches[0]
+
+
+def projection_ablation(
+    calibration_path: Path,
+    native_qkv: torch.Tensor,
+    source_qkv: torch.Tensor,
+    ideal_qkv: torch.Tensor,
+) -> dict[str, Any]:
+    report = json.loads(calibration_path.read_text())
+    case = calibration_case_for_projection(report)
+    native_record = case.get("native_f32_vs_f64")
+    source_boundaries = case.get("source_f32_boundaries")
+    ideal_record = case.get("ideal_f64")
+    if not isinstance(native_record, dict) or not isinstance(source_boundaries, dict):
+        raise TypeError(
+            "projection calibration report lacks captured native/source boundaries"
+        )
+    if not isinstance(ideal_record, dict):
+        raise TypeError("projection calibration report lacks ideal boundaries")
+    native_boundaries = native_record.get("boundaries")
+    ideal_stages = ideal_record.get("stages")
+    source_embedding_record = source_boundaries.get("embedding")
+    if not isinstance(native_boundaries, list) or len(native_boundaries) != len(
+        stage_names()
+    ):
+        raise ValueError("projection calibration native boundary count mismatch")
+    if not isinstance(ideal_stages, list) or len(ideal_stages) != len(stage_names()):
+        raise ValueError("projection calibration ideal boundary count mismatch")
+    if not isinstance(source_embedding_record, dict):
+        raise TypeError("projection calibration source embedding record is invalid")
+    positions = native_qkv.shape[0]
+    embedding_shape = (positions, WIDTH)
+    qkv_shape = (positions, 3 * WIDTH)
+    native_embedding = trace_tensor(
+        native_boundaries[0], embedding_shape, "native calibration embedding"
+    )
+    source_embedding = trace_tensor(
+        source_embedding_record.get("value"),
+        embedding_shape,
+        "source calibration embedding",
+    )
+    ideal_embedding = trace_tensor(
+        ideal_stages[0], embedding_shape, "ideal calibration embedding", torch.float64
+    )
+    weight = f64(FULL.layer_weights(0)["wqkv"])
+
+    def project(value: torch.Tensor) -> torch.Tensor:
+        return value.to(torch.float64) @ weight.transpose(0, 1)
+
+    native_projected = project(native_embedding)
+    source_projected = project(source_embedding)
+    ideal_projected = project(ideal_embedding)
+    ideal_identity = error(ideal_projected, ideal_qkv)
+    if ideal_identity["max_abs"] != 0.0:
+        raise ValueError("F64 ideal embedding projection does not reproduce ideal QKV")
+    return {
+        "calibration_report_sha256": hashlib.sha256(
+            calibration_path.read_bytes()
+        ).hexdigest(),
+        "manifest_sha256": report["manifest_sha256"],
+        "weight_f32_sha256": report["weight_f32_sha256"],
+        "case": "cal_len7",
+        "shapes": {"embedding": list(embedding_shape), "qkv": list(qkv_shape)},
+        "comparisons": {
+            "native_projection_accumulation": error(native_qkv, native_projected),
+            "source_projection_accumulation": error(source_qkv, source_projected),
+            "upstream_native_vs_source_embedding_propagation": error(
+                native_projected, source_projected
+            ),
+            "source_embedding_norm_propagation": error(
+                source_projected, ideal_projected
+            ),
+            "native_embedding_vs_source": error(
+                native_embedding, source_embedding.to(torch.float64)
+            ),
+            "native_embedding_vs_ideal": error(native_embedding, ideal_embedding),
+            "ideal_projection_identity": ideal_identity,
+        },
+    }
+
+
 def layer0_replay(
-    native_path: Path, source_path: Path, score_reduction: str = "serial_f32"
+    native_path: Path,
+    source_path: Path,
+    score_reduction: str = "serial_f32",
+    calibration_path: Path | None = None,
 ) -> dict[str, Any]:
     native = json.loads(native_path.read_text())
     source = json.loads(source_path.read_text())
@@ -346,6 +446,9 @@ def layer0_replay(
     source_values = source.get("source_f32")
     if not isinstance(source_values, dict):
         raise TypeError("source replay trace lacks source_f32 tensors")
+    ideal_values = source.get("ideal_f64")
+    if not isinstance(ideal_values, dict):
+        raise TypeError("source replay trace lacks ideal_f64 tensors")
     source_qkv = trace_tensor(source_values.get("qkv"), shape_qkv, "source qkv")
     source_query = trace_tensor(
         source_values.get("rotated_query"), shape_rotated, "source rotated query"
@@ -355,6 +458,9 @@ def layer0_replay(
     )
     source_logits = trace_tensor(
         source_values.get("logits"), shape_scores, "source logits"
+    )
+    ideal_qkv = trace_tensor(
+        ideal_values.get("qkv"), shape_qkv, "ideal QKV", torch.float64
     )
 
     native_parts = native_qkv.reshape(positions, 3, HEADS, HEAD_DIM)
@@ -392,11 +498,15 @@ def layer0_replay(
         rope(native_query_f64, False),
         rope(native_key_f64, False),
     ) / math.sqrt(HEAD_DIM)
-    return {
+    replay = {
         "case": "cal_len7",
         "native_trace_schema": 2,
         "native_score_reduction": score_reduction,
         "source_trace": "explicit_source_qkv_reconstruction",
+        "input_sha256": {
+            "native_trace": hashlib.sha256(native_path.read_bytes()).hexdigest(),
+            "source_trace": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        },
         "comparisons": {
             "source_tensor_reconstruction_identity": error(
                 source_logits, source_reconstructed.to(torch.float64)
@@ -432,6 +542,11 @@ def layer0_replay(
             ),
         },
     }
+    if calibration_path is not None:
+        replay["projection_ablation"] = projection_ablation(
+            calibration_path, native_qkv, source_qkv, ideal_qkv
+        )
+    return replay
 
 
 def weights_f32_sha256() -> str:
@@ -885,6 +1000,7 @@ def main() -> None:
     parser.add_argument("--replay-native", type=Path)
     parser.add_argument("--replay-source", type=Path)
     parser.add_argument("--replay-output", type=Path)
+    parser.add_argument("--replay-calibration-report", type=Path)
     parser.add_argument(
         "--replay-reduction",
         choices=("serial_f32", "balanced_f32"),
@@ -894,9 +1010,16 @@ def main() -> None:
     replay_paths = (args.replay_native, args.replay_source, args.replay_output)
     if any(replay_paths) and not all(replay_paths):
         raise ValueError("layer-zero replay requires native, source, and output paths")
+    if args.replay_calibration_report is not None and not all(replay_paths):
+        raise ValueError(
+            "projection ablation requires complete layer-zero replay paths"
+        )
     if all(replay_paths):
         replay = layer0_replay(
-            args.replay_native, args.replay_source, args.replay_reduction
+            args.replay_native,
+            args.replay_source,
+            args.replay_reduction,
+            args.replay_calibration_report,
         )
         args.replay_output.parent.mkdir(parents=True, exist_ok=True)
         args.replay_output.write_text(json.dumps(replay, indent=2) + "\n")

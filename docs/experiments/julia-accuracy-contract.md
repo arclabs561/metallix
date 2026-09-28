@@ -245,3 +245,31 @@ automatically. Owner-local artifacts are
 `.agents/receipts/julia/cal-len7-layer0-native-balanced-f32.json`,
 `.agents/receipts/julia/cal-len7-layer0-replay-balanced-f32.json`, and
 `.agents/receipts/julia/accuracy-calibration-native-balanced-f32.json`.
+
+### QKV projection/input ablation
+
+The replay report can extend the existing `cal_len7` trace with a same-weight
+F64 Wqkv projection ablation. It binds SHA-256 identities for both trace inputs
+and the saved baseline calibration report, requires the frozen manifest and
+generated F32-weight identities, validates `[7, 384]` embeddings and `[7,
+1152]` QKV tensors, and fails unless projecting the saved ideal-F64 embedding
+reproduces the saved ideal QKV exactly. Reproduce it with:
+
+```sh
+uv run scripts/julia_accuracy_reference.py \
+  --replay-native /absolute/path/cal-len7-layer0-native-replay.json \
+  --replay-source /absolute/path/cal-len7-layer0-source-f64-v2.json \
+  --replay-calibration-report /absolute/path/accuracy-calibration-native-f64.json \
+  --replay-output /absolute/path/cal-len7-layer0-replay-projection.json
+```
+
+For the saved serial baseline, native QKV versus F64 projection of its captured
+embedding is `5.8637e-6`; source QKV versus F64 projection of its captured
+source-F32 embedding is `5.7967e-6`; and F64 projection of native versus source
+embeddings is `3.3297e-6`. Source-F32 embedding versus ideal-F64 embedding
+propagates by `8.5707e-7`. The values are non-additive, but projection
+accumulation exceeds upstream input-normalization propagation and occurs at a
+comparable scale in source. This does not justify a native-only projection
+precision patch. Any future QKV change must lower the native projection gap
+without increasing the upstream gap or breaking source parity, then pass all
+eight frozen calibration hidden, score, and probability boundaries unchanged.
