@@ -287,6 +287,7 @@ fn write_full_encoder_outputs_for_source_diagnosis() {
     ))
     .unwrap();
     let encoder = full_encoder();
+    let head = head();
     let cases: Vec<Value> = fixture["cases"]
         .as_array()
         .unwrap()
@@ -306,15 +307,133 @@ fn write_full_encoder_outputs_for_source_diagnosis() {
                     .map(|item| item.as_bool().unwrap())
                     .collect(),
             };
+            let boundaries = encoder.forward_boundaries(&input).unwrap();
+            let hidden = boundaries.last().unwrap().clone();
+            let scores = head
+                .scores(&HeadInput {
+                    hidden: hidden.clone(),
+                    positions: input.input_ids.len(),
+                    attention_mask: input.attention_mask,
+                    marker_pos: case["marker_pos"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| usize::try_from(item.as_u64().unwrap()).unwrap())
+                        .collect(),
+                    marker_mask: case["marker_mask"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item.as_bool().unwrap())
+                        .collect(),
+                    qtype: usize::try_from(case["qtype"].as_u64().unwrap()).unwrap(),
+                })
+                .unwrap();
             json!({
                 "name": case["name"],
-                "hidden": encoder.forward(&input).unwrap().chunks_exact(WIDTH).collect::<Vec<_>>(),
+                "hidden": hidden.chunks_exact(WIDTH).collect::<Vec<_>>(),
+                "boundaries": boundaries
+                    .iter()
+                    .map(|boundary| boundary.chunks_exact(WIDTH).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "scores": scores,
             })
         })
         .collect();
     let path = std::env::var("JULIA_DIAGNOSTIC_OUTPUT")
         .expect("set JULIA_DIAGNOSTIC_OUTPUT to an owner-local diagnostic path");
-    std::fs::write(path, json!({ "cases": cases }).to_string() + "\n").unwrap();
+    std::fs::write(
+        path,
+        json!({
+            "schema_version": 1,
+            "protocol_schema": 1,
+            "manifest_sha256": "e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82",
+            "weight_f32_sha256": "db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68",
+            "cases": cases,
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "writes opt-in calibration-only accuracy outputs to JULIA_DIAGNOSTIC_OUTPUT"]
+fn write_accuracy_calibration_outputs() {
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/julia-1/accuracy-cases.json"
+    ))
+    .unwrap();
+    let encoder = full_encoder();
+    let head = head();
+    let cases: Vec<Value> = manifest["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["split"].as_str() == Some("calibration"))
+        .map(|case| {
+            let input = EncoderInput {
+                input_ids: case["input_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.as_u64().unwrap())
+                    .collect(),
+                attention_mask: case["attention_mask"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.as_bool().unwrap())
+                    .collect(),
+            };
+            let boundaries = encoder.forward_boundaries(&input).unwrap();
+            let hidden = boundaries.last().unwrap().clone();
+            let scores = head
+                .scores(&HeadInput {
+                    hidden: hidden.clone(),
+                    positions: input.input_ids.len(),
+                    attention_mask: input.attention_mask,
+                    marker_pos: case["marker_pos"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| usize::try_from(item.as_u64().unwrap()).unwrap())
+                        .collect(),
+                    marker_mask: case["marker_mask"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item.as_bool().unwrap())
+                        .collect(),
+                    qtype: usize::try_from(case["qtype"].as_u64().unwrap()).unwrap(),
+                })
+                .unwrap();
+            json!({
+                "name": case["name"],
+                "hidden": hidden.chunks_exact(WIDTH).collect::<Vec<_>>(),
+                "boundaries": boundaries
+                    .iter()
+                    .map(|boundary| boundary.chunks_exact(WIDTH).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                "scores": scores,
+            })
+        })
+        .collect();
+    let path = std::env::var("JULIA_DIAGNOSTIC_OUTPUT")
+        .expect("set JULIA_DIAGNOSTIC_OUTPUT to an owner-local diagnostic path");
+    std::fs::write(
+        path,
+        json!({
+            "schema_version": 1,
+            "protocol_schema": 1,
+            "manifest_sha256": "e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82",
+            "weight_f32_sha256": "db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68",
+            "cases": cases,
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
 }
 
 #[test]

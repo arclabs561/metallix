@@ -107,5 +107,47 @@ Do not change thresholds, fixtures, or runtime arithmetic during acceptance.
 
 ## Results and conclusion
 
-Not recorded yet. Reproduction commands, manifest identity, measured results,
-and the implementing commit will be appended after the bounded run.
+Calibration stopped this experiment before held-out execution. The frozen
+manifest is `fixtures/julia-1/accuracy-cases.json`, SHA-256
+`e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82`;
+it has eight calibration and eight held-out cases. The generated F32 weight
+identity is `db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68`.
+
+The owner-local receipt
+`.agents/receipts/julia/accuracy-calibration-native-f64.json` records source,
+F64 and native calibration boundaries, source/build provenance and defect
+controls. Seven calibration cases fit every frozen hidden boundary; `cal_len7`
+exceeds 23 boundaries from layer 0 through final normalization. At layer 0 its
+worst normalized error is about 2.003 times the pre-registered boundary. Raw
+score and probability checks remain below their prospective budgets, but do
+not qualify the encoder. The held-out split was deliberately not generated or
+read for native acceptance.
+
+The reference properties pass: constant unit-weight normalization is zero;
+nonconstant unit-weight normalization has zero mean; RoPE preserves the position-zero vector and norm; masked padding
+does not change visible hidden states or valid scores; and marker permutation
+permutes scores. Deliberate omitted-final-norm, wrong-layer mapping, inverted
+mask and wrong-RoPE-theta controls all breach the hidden defect check.
+
+Next diagnosis starts at layer 0 for `cal_len7`: capture actual source and
+native raw QKV, attention output before `Wo`, and post-`Wo` residual. Expand
+to MLP intermediates only if that attention trace matches. The strict original
+F32 source gate remains enabled and failing; no numerical runtime change or
+acceptance threshold was made.
+
+The reference uses the pinned Transformers revision
+`08810b1e278938278c50153ee1edfd7a20a759da` and its ModernBERT source SHA-256
+`83875f54a029339c62a8f5061801873d41e134b3e9abb8308b8e9b0f9f57b5dc`, plus
+the pinned Julia source revision and hash recorded in the Julia decision
+contract. Reproduce the opt-in diagnostic after writing the calibration export
+to an absolute owner-local path:
+
+```sh
+JULIA_DIAGNOSTIC_OUTPUT=/absolute/path/accuracy-native-calibration.json \
+  cargo test -p julia write_accuracy_calibration_outputs -- --ignored
+uv run scripts/test_julia_accuracy_reference.py
+uv run scripts/julia_accuracy_reference.py \
+  --native-output /absolute/path/accuracy-native-calibration.json \
+  --check-defects --check-properties \
+  --write-report /absolute/path/accuracy-calibration-native-f64.json > /dev/null
+```

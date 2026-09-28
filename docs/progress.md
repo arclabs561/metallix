@@ -81,7 +81,11 @@ choices without expanding current support claims.
   comparison against the pinned SDPA source fails the fixed `1e-5` bound on the
   unmasked control. Three isolated reduction-precision experiments did not
   close that gap and were reverted. Full-stack qualification remains open;
-  neither the tolerance nor the fixture weights were changed. This is not a
+  neither the tolerance nor the fixture weights were changed. A preregistered
+  independent F64 experiment now localizes a separate calibration failure to
+  layer zero on `cal_len7`: native error exceeds the source-derived envelope
+  by approximately 2.00335 times. Held-out inputs remain unopened; see the
+  [numerical experiment](experiments/julia-accuracy-contract.md). This is not a
   full-checkpoint encoder, Metal implementation, or serving integration; see
   the [Julia contract](research/julia-decision-contract.md).
 
