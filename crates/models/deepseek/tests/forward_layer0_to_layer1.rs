@@ -8,13 +8,21 @@ use deepseek::{
         Fp8Projection, LayerAttentionDiagnostic, LayerAttentionError, LayerAttentionLayout,
         LayerAttentionState, LayerAttentionWeights,
     },
-    hc::mixing::{hc_post_bf16_reference, hc_pre_bf16_reference},
+    hc::{
+        HcCoefficients,
+        mixing::{hc_post_bf16_reference, hc_pre_bf16_reference},
+        projection::project_hc_coefficients,
+    },
     moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference},
     rms_norm_bf16_reference, startup_bf16_reference,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[path = "support/hc_coefficient_bounds.rs"]
+mod hc_coefficient_bounds;
+#[path = "support/hc_projection_bounds.rs"]
+mod hc_projection_bounds;
 #[path = "support/layer1_engram_capture.rs"]
 #[allow(
     dead_code,
@@ -22,7 +30,7 @@ use sha2::{Digest, Sha256};
 )]
 mod layer1_engram_capture;
 
-const FIXTURE_SHA256: &str = "75b65ac8b23ea8fbe18aa8741098d511d1a7e2f3203252a246fec6ecc09f285a";
+const FIXTURE_SHA256: &str = "2a0e294e62565be699c710fdfbf4f52bb63a0e9f3bea8e7eceae8ea11164b862";
 
 fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
     value.get(key).unwrap_or_else(|| panic!("missing {key}"))
@@ -396,13 +404,75 @@ fn native_layer_zero_attention_outputs(root: &Value) -> Vec<(usize, Vec<u16>)> {
         .collect()
 }
 
-fn coefficients(case: &Value, sublayer: &str) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let values = field(field(field(case, "hc"), sublayer), "coefficients");
-    (
-        fp32(field(values, "pre")),
-        fp32(field(values, "post")),
-        fp32(field(values, "comb")),
+fn native_hc_coefficients(root: &Value, sublayer: &str, residual: &[u16]) -> HcCoefficients {
+    let model = field(root, "model");
+    let parameters = field(root, "parameters");
+    let prefix = format!("layers.0.hc_{sublayer}");
+    let projection = fp32(field(parameters, &format!("{prefix}_fn")));
+    let scale: [f32; 3] = fp32(field(parameters, &format!("{prefix}_scale")))
+        .try_into()
+        .expect("three HC scales");
+    let base = fp32(field(parameters, &format!("{prefix}_base")));
+    project_hc_coefficients(
+        residual,
+        &projection,
+        &scale,
+        &base,
+        2,
+        serde_json::from_value(field(model, "norm_eps").clone()).expect("HC norm epsilon"),
+        usize_field(model, "hc_sinkhorn_iters"),
+        serde_json::from_value(field(model, "hc_eps").clone()).expect("HC epsilon"),
     )
+    .expect("native layer-zero HC projection")
+}
+
+fn assert_native_next_pre_envelope(
+    root: &Value,
+    case: &Value,
+    position: usize,
+    residual: &[u16],
+    native: &HcCoefficients,
+) {
+    let model = field(root, "model");
+    let parameters = field(root, "parameters");
+    let projection = fp32(field(parameters, "layers.0.hc_ffn_fn"));
+    let scale: [f32; 3] = fp32(field(parameters, "layers.0.hc_ffn_scale"))
+        .try_into()
+        .expect("three HC scales");
+    let base = fp32(field(parameters, "layers.0.hc_ffn_base"));
+    let norm_eps =
+        serde_json::from_value(field(model, "norm_eps").clone()).expect("HC norm epsilon");
+    let projection_bounds =
+        hc_projection_bounds::normalized_projection_envelopes(residual, &projection, norm_eps)
+            .expect("source-grounded HC projection bounds");
+    let mix_bounds = projection_bounds
+        .iter()
+        .map(|bound| [bound.lo, bound.hi])
+        .collect::<Vec<_>>();
+    let coefficient_bounds = hc_coefficient_bounds::coefficient_envelopes(
+        &mix_bounds,
+        &scale,
+        &base,
+        usize_field(model, "hc_sinkhorn_iters"),
+        serde_json::from_value(field(model, "hc_eps").clone()).expect("HC epsilon"),
+    )
+    .expect("source-grounded HC coefficient bounds");
+    let source = fp32(field(case, "block_next_pre"));
+    for ((bound, &source), &actual) in coefficient_bounds
+        .pre
+        .iter()
+        .zip(&source[position * 2..(position + 1) * 2])
+        .zip(native.pre())
+    {
+        assert!(
+            source.is_finite() && bound[0] <= f64::from(source) && f64::from(source) <= bound[1],
+            "source next HC pre within analytic envelope"
+        );
+        assert!(
+            actual.is_finite() && bound[0] <= f64::from(actual) && f64::from(actual) <= bound[1],
+            "native next HC pre within analytic envelope"
+        );
+    }
 }
 
 fn with_native_layer_zero_moe<R>(root: &Value, body: impl FnOnce(MoEReference<'_>) -> R) -> R {
@@ -476,7 +546,7 @@ fn native_layer_zero_output(
             .expect("positions"),
     )
     .expect("usize positions");
-    let residual = bf16(field(field(case, "block_input"), "residual"));
+    let (residual, _incoming_pre) = native_startup(root, case);
     let expected_attention = bf16(field(case, "attention_output"));
     assert_eq!(
         attention, expected_attention,
@@ -487,18 +557,17 @@ fn native_layer_zero_output(
     let expected_ffn = bf16(field(case, "ffn_output"));
     let ffn_norm = bf16(field(field(root, "parameters"), "layers.0.ffn_norm.weight"));
     let expected_output = bf16(field(case, "block_output"));
-    let expected_next_pre = fp32(field(case, "block_next_pre"));
-    let (attention_pre, attention_post, attention_comb) = coefficients(case, "attention");
-    let (ffn_pre, ffn_post, ffn_comb) = coefficients(case, "ffn");
     let mut output = Vec::with_capacity(expected_output.len());
+    let mut next_pre = Vec::with_capacity(positions * 2);
     for position in 0..positions {
         let residual = &residual[position * 256..(position + 1) * 256];
+        let attention_coefficients = native_hc_coefficients(root, "attn", residual);
         let mut after_attention = vec![0; 256];
         hc_post_bf16_reference(
             &attention[position * 128..(position + 1) * 128],
             residual,
-            &attention_post[position * 2..(position + 1) * 2],
-            &attention_comb[position * 4..(position + 1) * 4],
+            attention_coefficients.post(),
+            attention_coefficients.comb(),
             &mut after_attention,
         )
         .expect("native layer-zero attention HC post mix");
@@ -510,7 +579,7 @@ fn native_layer_zero_output(
         let mut collapsed = vec![0; 128];
         hc_pre_bf16_reference(
             &after_attention,
-            &attention_pre[position * 2..(position + 1) * 2],
+            attention_coefficients.pre(),
             128,
             &mut collapsed,
         )
@@ -536,12 +605,13 @@ fn native_layer_zero_output(
             &expected_ffn[position * 128..(position + 1) * 128],
             "native layer-zero MoE output at position {position}"
         );
+        let ffn_coefficients = native_hc_coefficients(root, "ffn", &after_attention);
         let mut terminal = vec![0; 256];
         hc_post_bf16_reference(
             moe_output.output_bf16(),
             &after_attention,
-            &ffn_post[position * 2..(position + 1) * 2],
-            &ffn_comb[position * 4..(position + 1) * 4],
+            ffn_coefficients.post(),
+            ffn_coefficients.comb(),
             &mut terminal,
         )
         .expect("native layer-zero FFN HC post mix");
@@ -550,13 +620,13 @@ fn native_layer_zero_output(
             expected_output[position * 256..(position + 1) * 256],
             "native layer-zero terminal residual at position {position}"
         );
+        assert_native_next_pre_envelope(root, case, position, &after_attention, &ffn_coefficients);
         output.extend(terminal);
+        next_pre.extend_from_slice(ffn_coefficients.pre());
     }
-    assert_eq!(
-        ffn_pre, expected_next_pre,
-        "native layer-zero next HC pre-mix"
-    );
-    (output, ffn_pre)
+    assert_eq!(next_pre.len(), fp32(field(case, "block_next_pre")).len());
+    assert!(next_pre.iter().all(|value| value.is_finite()));
+    (output, next_pre)
 }
 
 #[test]
@@ -570,11 +640,11 @@ fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
     assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
     assert_eq!(
         field(field(&root, "contract"), "layer_zero_producer").as_str(),
-        Some("source-pinned native attention and FFN with captured upstream HC inputs")
+        Some("source-pinned native startup, attention, FFN, and HC composition")
     );
     let cases = field(&root, "cases").as_array().expect("bridge cases");
     let attention_outputs = native_layer_zero_attention_outputs(&root);
-    let streams = with_native_layer_zero_moe(&root, |moe| {
+    let native_layer_zero = with_native_layer_zero_moe(&root, |moe| {
         cases
             .iter()
             .map(|case| {
@@ -593,13 +663,17 @@ fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
                         (*attention_start == start).then_some(output.as_slice())
                     })
                     .expect("native attention case");
-                let (native_output, _next_pre) =
+                let (native_output, next_pre) =
                     native_layer_zero_output(&root, case, attention, &moe);
                 assert_eq!(native_output, bf16(output));
-                (start, native_output)
+                (start, native_output, next_pre)
             })
             .collect::<Vec<_>>()
     });
+    let streams = native_layer_zero
+        .iter()
+        .map(|(start, output, _)| (*start, output.clone()))
+        .collect::<Vec<_>>();
     assert_eq!(
         streams.iter().map(|(start, _)| *start).collect::<Vec<_>>(),
         [0, 5, 6]
@@ -612,32 +686,78 @@ fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
         entries.iter().map(|(start, _)| *start).collect::<Vec<_>>(),
         [0, 5, 6]
     );
+    let layer_one_norm = bf16(field(
+        field(&root, "parameters"),
+        "layers.1.attn_norm.weight",
+    ));
+    for ((case, (start, entry)), (_, _, native_pre)) in
+        cases.iter().zip(&entries).zip(&native_layer_zero)
+    {
+        assert_eq!(*start, usize_field(case, "start_pos"));
+        assert_eq!(
+            entry,
+            &bf16(field(field(case, "downstream"), "layer_one_engram_output")),
+            "native layer-one Engram output"
+        );
+        let mut attention_input = Vec::new();
+        for (residual, pre) in entry.chunks_exact(256).zip(native_pre.chunks_exact(2)) {
+            let mut collapsed = vec![0; 128];
+            hc_pre_bf16_reference(residual, pre, 128, &mut collapsed)
+                .expect("native layer-one downstream HC pre-mix");
+            let mut normalized = vec![0; 128];
+            rms_norm_bf16_reference(&collapsed, &layer_one_norm, 1.0e-20, &mut normalized)
+                .expect("native layer-one downstream RMSNorm");
+            attention_input.extend(normalized);
+        }
+        assert_eq!(
+            attention_input,
+            bf16(field(
+                field(case, "downstream"),
+                "layer_one_attention_input"
+            )),
+            "native layer-zero pre-mix feeds layer-one attention input"
+        );
+    }
 }
 
 #[test]
-fn corrupting_layer_zero_hc_post_coefficient_fails_exact_terminal_oracle() {
+fn corrupting_layer_zero_hc_projection_changes_native_coefficients() {
     let root: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/deepseek-v41/layer0-to-layer1-reference.json"
     ))
     .expect("layer-zero bridge fixture JSON");
     let case = &field(&root, "cases").as_array().expect("bridge cases")[0];
-    let residual = bf16(field(field(case, "block_input"), "residual"));
-    let attention = bf16(field(case, "attention_output"));
-    let (_, mut post, comb) = coefficients(case, "attention");
-    post[0] += 1.0;
-    let mut corrupted = vec![0; 256];
-    hc_post_bf16_reference(
-        &attention[..128],
-        &residual[..256],
-        &post[..2],
-        &comb[..4],
-        &mut corrupted,
-    )
-    .expect("corrupted layer-zero HC control");
-    assert_ne!(
-        corrupted,
-        bf16(field(case, "after_attention_residual"))[..256],
-        "a changed source HC coefficient must fail the exact source residual"
+    let (residual, _) = native_startup(&root, case);
+    let baseline = native_hc_coefficients(&root, "attn", &residual[..256]);
+    let model = field(&root, "model");
+    let parameters = field(&root, "parameters");
+    let projection = fp32(field(parameters, "layers.0.hc_attn_fn"));
+    let scale: [f32; 3] = fp32(field(parameters, "layers.0.hc_attn_scale"))
+        .try_into()
+        .expect("three HC scales");
+    let changed = projection[..512]
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| **value != 0.0)
+        .find_map(|(index, _)| {
+            let mut changed_projection = projection.clone();
+            changed_projection[index] *= 2.0;
+            let changed = project_hc_coefficients(
+                &residual[..256],
+                &changed_projection,
+                &scale,
+                &fp32(field(parameters, "layers.0.hc_attn_base")),
+                2,
+                serde_json::from_value(field(model, "norm_eps").clone()).expect("HC norm epsilon"),
+                usize_field(model, "hc_sinkhorn_iters"),
+                serde_json::from_value(field(model, "hc_eps").clone()).expect("HC epsilon"),
+            )
+            .expect("changed layer-zero HC projection");
+            (changed.pre() != baseline.pre()).then_some(changed)
+        });
+    assert!(
+        changed.is_some(),
+        "a nonzero attention-pre projection coefficient must affect native HC pre"
     );
 }
 

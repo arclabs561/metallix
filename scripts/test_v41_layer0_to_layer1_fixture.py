@@ -85,6 +85,13 @@ class LayerZeroToLayerOneFixtureTest(unittest.TestCase):
             self.assertEqual(startup["input_ids"]["shape"], [1, sequence])
             self.assertEqual(startup["embedding"]["shape"], [1, sequence, 128])
             self.assertEqual(startup["embedding"]["dtype"], "torch.bfloat16")
+            downstream = case["downstream"]
+            self.assertEqual(
+                downstream["layer_one_engram_output"]["shape"], [1, sequence, 2, 128]
+            )
+            self.assertEqual(
+                downstream["layer_one_attention_input"]["shape"], [1, sequence, 128]
+            )
             attention = case["attention"]
             self.assertEqual(attention["frequencies"]["shape"], [8, 16])
             self.assertEqual(
@@ -109,6 +116,9 @@ class LayerZeroToLayerOneFixtureTest(unittest.TestCase):
         self.assertEqual(self.fixture["model"]["n_routed_experts"], 4)
         self.assertEqual(self.fixture["model"]["o_groups"], 2)
         self.assertEqual(self.fixture["model"]["vocab_size"], 8)
+        self.assertEqual(self.fixture["model"]["hc_sinkhorn_iters"], 20)
+        self.assertEqual(self.fixture["model"]["norm_eps"], 1e-20)
+        self.assertEqual(self.fixture["model"]["hc_eps"], 1e-6)
         self.assertEqual(self.fixture["parameters"]["embed.weight"]["shape"], [8, 128])
         self.assertEqual(
             self.fixture["parameters"]["layers.0.ffn.gate.weight"]["shape"], [4, 128]

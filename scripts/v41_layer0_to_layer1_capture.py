@@ -139,6 +139,7 @@ def _parameters(encoded: dict[str, Any]) -> dict[str, Any]:
         "layers.0.hc_ffn_base": ("torch.float32", [8]),
         "layers.0.hc_ffn_scale": ("torch.float32", [3]),
         "layers.0.ffn_norm.weight": ("torch.bfloat16", [128]),
+        "layers.1.attn_norm.weight": ("torch.bfloat16", [128]),
     }
     ffn = "layers.0.ffn"
     routed = tuple(f"{ffn}.experts.{index}" for index in range(4))
@@ -229,6 +230,9 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
             "o_lora_rank": 32,
             "o_groups": 2,
             "window_size": 6,
+            "norm_eps": 1e-20,
+            "hc_eps": 1e-6,
+            "hc_sinkhorn_iters": 20,
         }
     )
     if any(model.get(name) != value for name, value in geometry.items()):
@@ -438,6 +442,18 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
             dtype="torch.float32",
             shape=[1, sequence, 2],
         )
+        layer_one_engram_output = _tensor(
+            values.get("layers.1.engram"),
+            "layer-one Engram output",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, 2, 128],
+        )
+        layer_one_attention_input = _tensor(
+            values.get("layers.1.attention_input"),
+            "layer-one attention input",
+            dtype="torch.bfloat16",
+            shape=[1, sequence, 128],
+        )
         engram = _object(values.get("layers.1.engram_input"), "layer-one Engram input")
         stream = _tensor(
             engram.get("stream"),
@@ -494,6 +510,10 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "block_output": output,
                 "block_next_pre": next_pre,
                 "layer_one_engram_stream": stream,
+                "downstream": {
+                    "layer_one_engram_output": layer_one_engram_output,
+                    "layer_one_attention_input": layer_one_attention_input,
+                },
                 "hc": hc,
             }
         )
@@ -507,9 +527,9 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
         },
         "model": geometry,
         "contract": {
-            "layer_zero_producer": "source-pinned native attention and FFN with captured upstream HC inputs",
+            "layer_zero_producer": "source-pinned native startup, attention, FFN, and HC composition",
             "layer_one_consumer": "same-storage source oracle consumed by the native Engram entry",
-            "remaining_producer_boundary": "layer-zero attention and FFN HC coefficient production remain source-captured",
+            "remaining_producer_boundary": "no layer-zero runtime numerical operand remains source-captured; retained HC records are exact source oracles",
         },
         "parameters": _parameters(encoded),
         "cases": cases,
