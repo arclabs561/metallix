@@ -1384,22 +1384,10 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    let mut layer_one_session = layer1_join::NativeLayerOneSession::new();
-    let first = layer_one_session.step(&streams[0], &incoming_pre[0]);
-    let mut layer_two_session = layer2_join::NativeLayerTwoSession::new();
-    let first_l2 = layer_two_session.step(&first, Some(layer_one_session.last_publication()));
-    let second = layer_one_session.step(&streams[1], &incoming_pre[1]);
-    let second_l2 = layer_two_session.step(&second, Some(layer_one_session.last_publication()));
-    let mut layer_three_engram = engram_capture::NativeLayerThreeEngramSession::new();
-    let first_engram = layer_three_engram.step(Some(&(first_l2.0, first_l2.1.clone())));
-    let second_engram = layer_three_engram.step(Some(&(second_l2.0, second_l2.1.clone())));
-    let mut final_layer_three_engram = vec![first_engram, second_engram];
-    let (mut layer_three_publisher, previous_layer_three_prefix) =
-        native_previous_layer_three_publisher(
-            &[first_l2.clone(), second_l2.clone()],
-            &final_layer_three_engram,
-        );
-    let layer_three_fixture = layer_three_fixture();
+    let mut request = ReducedLiveRequest::new();
+    request.step(&streams[0], &incoming_pre[0], None);
+    request.step(&streams[1], &incoming_pre[1], None);
+    let previous_layer_three_prefix = request.prior_l3_prefix().to_vec();
 
     // The live L2 and Engram3 prefix produces the complete prior L3
     // publication after start five and before the partial start-six L1 call.
@@ -1407,45 +1395,254 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
     corrupted_prefix[0] ^= 1;
     assert!(
         std::panic::catch_unwind(|| {
-            let mut session = layer1_join::NativeLayerOneSession::new();
-            session.step(&streams[0], &incoming_pre[0]);
-            session.step(&streams[1], &incoming_pre[1]);
-            session.supply_previous_layer_three_prefix(&corrupted_prefix);
-            session.step(&streams[2], &incoming_pre[2]);
+            let mut session = ReducedLiveRequest::new();
+            session.step(&streams[0], &incoming_pre[0], None);
+            session.step(&streams[1], &incoming_pre[1], None);
+            session.step(&streams[2], &incoming_pre[2], Some(&corrupted_prefix));
         })
         .is_err(),
         "a changed native previous-call publication must fail the layer-one score oracle"
     );
-    layer_one_session.supply_previous_layer_three_prefix(&previous_layer_three_prefix);
-    let third_l1 = layer_one_session.step(&streams[2], &incoming_pre[2]);
-    let third_l2 = layer_two_session.step(&third_l1, Some(layer_one_session.last_publication()));
-    let third_engram = layer_three_engram.step(Some(&(third_l2.0, third_l2.1.clone())));
-    let layer_two = [first_l2, second_l2, third_l2];
-    final_layer_three_engram.push(third_engram);
-    let final_layer_three_pre = layer_two
+    request.step(
+        &streams[2],
+        &incoming_pre[2],
+        Some(&previous_layer_three_prefix),
+    );
+    let _ = request.finish();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReducedRequestLifecycle {
+    Healthy,
+    Poisoned,
+    Completed,
+    Finalized,
+}
+
+/// Test-only request cursor. A panicking numerical/source assertion leaves it
+/// poisoned; this deliberately does not claim rollback of its component state.
+struct ReducedLiveRequest {
+    l1: layer1_join::NativeLayerOneSession,
+    l2: layer2_join::NativeLayerTwoSession,
+    engram3: engram_capture::NativeLayerThreeEngramSession,
+    l3: Option<owner_attention_capture::NativeLayerThreePublisher>,
+    l2_entries: Vec<(usize, Vec<u16>, Vec<f32>)>,
+    engram3_entries: Vec<(usize, Vec<u16>)>,
+    lifecycle: ReducedRequestLifecycle,
+    cursor: usize,
+}
+
+impl ReducedLiveRequest {
+    fn new() -> Self {
+        Self {
+            l1: layer1_join::NativeLayerOneSession::new(),
+            l2: layer2_join::NativeLayerTwoSession::new(),
+            engram3: engram_capture::NativeLayerThreeEngramSession::new(),
+            l3: None,
+            l2_entries: Vec::new(),
+            engram3_entries: Vec::new(),
+            lifecycle: ReducedRequestLifecycle::Healthy,
+            cursor: 0,
+        }
+    }
+
+    fn step(
+        &mut self,
+        stream: &(usize, Vec<u16>),
+        pre: &(usize, Vec<f32>),
+        prior_l3: Option<&[u16]>,
+    ) {
+        assert_eq!(
+            self.lifecycle,
+            ReducedRequestLifecycle::Healthy,
+            "poisoned reduced request rejects step"
+        );
+        assert_eq!(stream.0, [0, 5, 6][self.cursor], "reduced request cursor");
+        self.lifecycle = ReducedRequestLifecycle::Poisoned;
+        if self.cursor == 2 {
+            self.l1.supply_previous_layer_three_prefix(
+                prior_l3.expect("start six needs prior L3 prefix"),
+            );
+        }
+        let l1 = self.l1.step(stream, pre);
+        let l2 = self.l2.step(&l1, Some(self.l1.last_publication()));
+        let engram = self.engram3.step(Some(&(l2.0, l2.1.clone())));
+        self.l2_entries.push(l2);
+        self.engram3_entries.push(engram);
+        self.cursor += 1;
+        if self.cursor == 2 {
+            let (publisher, _) =
+                native_previous_layer_three_publisher(&self.l2_entries, &self.engram3_entries);
+            self.l3 = Some(publisher);
+        }
+        if self.cursor == 3 {
+            let pre = self
+                .l2_entries
+                .iter()
+                .map(|(start, _, pre)| (*start, pre.clone()))
+                .collect::<Vec<_>>();
+            let inputs = native_layer_three_attention_inputs_from_entries(
+                &layer_three_fixture(),
+                &self.engram3_entries,
+                &pre,
+            );
+            self.l3
+                .as_mut()
+                .expect("L3 publisher before start six")
+                .step(&inputs[2]);
+        }
+        self.lifecycle = if self.cursor == 3 {
+            ReducedRequestLifecycle::Completed
+        } else {
+            ReducedRequestLifecycle::Healthy
+        };
+    }
+
+    fn prior_l3_prefix(&self) -> &[u16] {
+        self.l3
+            .as_ref()
+            .expect("L3 prefix after start five")
+            .previous_call_key_prefix()
+    }
+
+    fn restart(&mut self) {
+        *self = Self::new();
+    }
+
+    fn state_marker(&self) -> (ReducedRequestLifecycle, usize, usize, usize) {
+        (
+            self.lifecycle,
+            self.cursor,
+            self.l2_entries.len(),
+            self.engram3_entries.len(),
+        )
+    }
+
+    fn finish(&mut self) -> Vec<BlockTailOutput> {
+        assert_eq!(
+            self.lifecycle,
+            ReducedRequestLifecycle::Completed,
+            "only complete traversal may finalize"
+        );
+        self.lifecycle = ReducedRequestLifecycle::Poisoned;
+        let pre = self
+            .l2_entries
+            .iter()
+            .map(|(start, _, pre)| (*start, pre.clone()))
+            .collect::<Vec<_>>();
+        let fixture_three = layer_three_fixture();
+        let third = native_layer_three_block_tail_from_entries_with_attention(
+            &fixture_three,
+            Some(&self.engram3_entries),
+            Some(&pre),
+            Some(self.l3.as_ref().expect("complete L3 publisher").outputs()),
+        );
+        let output = block_tail_from_entries(
+            &fixture(),
+            BlockControl::NativeAttention,
+            true,
+            Some(&third),
+        );
+        assert_final_suffix(&fixture(), &output);
+        self.lifecycle = ReducedRequestLifecycle::Finalized;
+        output
+    }
+}
+
+#[test]
+fn reduced_request_poison_blocks_retry_and_restart_is_fresh() {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("reduced runner bundle JSON");
+    let entries = layer_zero::native_layer_zero_entries_from_projection(
+        &bundle["projections"]["layer0_to_layer1"],
+    );
+    let streams = entries
+        .iter()
+        .map(|(start, residual, _)| (*start, residual.clone()))
+        .collect::<Vec<_>>();
+    let pre = entries
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    let final_layer_three_inputs = native_layer_three_attention_inputs_from_entries(
-        &layer_three_fixture,
-        &final_layer_three_engram,
-        &final_layer_three_pre,
+    let mut partial = ReducedLiveRequest::new();
+    partial.step(&streams[0], &pre[0], None);
+    partial.restart();
+    partial.step(&streams[0], &pre[0], None);
+    partial.step(&streams[1], &pre[1], None);
+    let partial_prefix = partial.prior_l3_prefix().to_vec();
+    partial.step(&streams[2], &pre[2], Some(&partial_prefix));
+    let _ = partial.finish();
+
+    let mut request = ReducedLiveRequest::new();
+    request.step(&streams[0], &pre[0], None);
+    request.step(&streams[1], &pre[1], None);
+    let prefix = request.prior_l3_prefix().to_vec();
+    let mut corrupt = prefix.clone();
+    corrupt[0] ^= 1;
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.step(
+            &streams[2],
+            &pre[2],
+            Some(&corrupt)
+        )))
+        .is_err()
     );
-    layer_three_publisher.step(&final_layer_three_inputs[2]);
-    let third = native_layer_three_block_tail_from_entries_with_attention(
-        &layer_three_fixture,
-        Some(&final_layer_three_engram),
-        Some(&final_layer_three_pre),
-        Some(layer_three_publisher.outputs()),
+    let poisoned = request.state_marker();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.step(
+            &streams[2],
+            &pre[2],
+            Some(&prefix)
+        )))
+        .is_err()
     );
-    layer_three_publisher.reset_and_retry(&final_layer_three_inputs[0]);
-    let output = block_tail_from_entries(
-        &fixture(),
-        BlockControl::NativeAttention,
-        true,
-        Some(&third),
+    assert_eq!(
+        request.state_marker(),
+        poisoned,
+        "poisoned retry must not mutate request"
     );
-    assert_final_suffix(&fixture(), output);
+    request.restart();
+    request.step(&streams[0], &pre[0], None);
+    request.step(&streams[1], &pre[1], None);
+    let fresh_prefix = request.prior_l3_prefix().to_vec();
+    request.step(&streams[2], &pre[2], Some(&fresh_prefix));
+    assert_eq!(request.lifecycle, ReducedRequestLifecycle::Completed);
+    let restarted = request.finish();
+    let finalized = request.state_marker();
+    assert_eq!(request.lifecycle, ReducedRequestLifecycle::Finalized);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.finish())).is_err());
+    assert_eq!(
+        request.state_marker(),
+        finalized,
+        "repeat finish must not mutate request"
+    );
+    let mut fresh = ReducedLiveRequest::new();
+    fresh.step(&streams[0], &pre[0], None);
+    fresh.step(&streams[1], &pre[1], None);
+    let fresh_prefix = fresh.prior_l3_prefix().to_vec();
+    fresh.step(&streams[2], &pre[2], Some(&fresh_prefix));
+    let fresh_output = fresh.finish();
+    assert_eq!(restarted.len(), fresh_output.len());
+    for (restarted, fresh) in restarted.iter().zip(&fresh_output) {
+        assert_eq!(
+            restarted.residual, fresh.residual,
+            "restart matches fresh final L4 output residual"
+        );
+        assert_eq!(
+            restarted.next_pre, fresh.next_pre,
+            "restart matches fresh terminal pre"
+        );
+    }
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| request.step(
+            &streams[2],
+            &pre[2],
+            Some(&fresh_prefix)
+        )))
+        .is_err()
+    );
 }
 
 /// Produces only the two preceding layer-three calls that publish the prefix
@@ -1504,7 +1701,7 @@ fn native_layer_three_engram_through_final_suffix_matches_source_logits() {
         true,
         Some(&native),
     );
-    assert_final_suffix(&layer_four, output);
+    assert_final_suffix(&layer_four, &output);
 }
 
 #[test]
@@ -1533,7 +1730,7 @@ fn native_layer_two_ffn_engram_through_final_suffix_matches_source_logits() {
         true,
         Some(&native),
     );
-    assert_final_suffix(&layer_four, output);
+    assert_final_suffix(&layer_four, &output);
 }
 
 #[test]
@@ -1939,7 +2136,7 @@ fn final_norm_row(
 fn native_layer_four_final_suffix_matches_source_logits_with_propagated_input_bounds() {
     let f = fixture();
     let native = block_tail(&f, BlockControl::NativeAttention, true);
-    assert_final_suffix(&f, native);
+    assert_final_suffix(&f, &native);
 }
 
 #[test]
@@ -1971,7 +2168,7 @@ fn native_layer_three_through_final_suffix_matches_source_logits() {
         true,
         Some(&entries),
     );
-    assert_final_suffix(&layer_four, native);
+    assert_final_suffix(&layer_four, &native);
 }
 
 #[test]
@@ -1987,7 +2184,7 @@ fn joined_suffix_rejects_corrupted_layer_three_coefficients() {
     );
 }
 
-fn assert_final_suffix(f: &Fixture, native: Vec<BlockTailOutput>) {
+fn assert_final_suffix(f: &Fixture, native: &[BlockTailOutput]) {
     let head = head_fixture();
     assert_eq!(head.source.revision, f.source.revision);
     assert_eq!(head.source.model_sha256, f.source.model_sha256);

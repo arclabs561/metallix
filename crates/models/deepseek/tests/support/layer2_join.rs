@@ -265,7 +265,7 @@ fn through_final_suffix(layer_two: Vec<(usize, Vec<u16>, Vec<f32>)>) {
     let fourth = fixture();
     let output =
         block_tail_from_entries(&fourth, BlockControl::NativeAttention, true, Some(&third));
-    assert_final_suffix(&fourth, output);
+    assert_final_suffix(&fourth, &output);
 }
 
 pub(super) fn native_layer_two_from_entries(entries: &BlockEntries) {
