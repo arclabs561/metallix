@@ -41,9 +41,9 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Source-checked reduced joins, including layer-zero window attention, FFN and stateful key handoffs | Full native generation remains unfinished |
+| [DeepSeek](docs/progress.md) | Source-checked reduced join from token startup through layer-one input, then the native reduced suffix | Later attention state remains fixture-fed; full native generation is unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
-| [Julia-1](docs/research/julia-decision-contract.md) | Source-pinned tokenizer parity, published-header validation, and native CPU decision-head parity | No native encoder or full-checkpoint execution yet |
+| [Julia-1](docs/research/julia-decision-contract.md) | Source-pinned tokenizer parity, published-header validation, native CPU decision-head parity, and one bounded ModernBERT encoder block | No full-checkpoint encoder or serving integration yet |
 
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.
@@ -481,6 +481,11 @@ same trace's token IDs and weights. HC coefficients now come from native
 projection: F32 values satisfy the existing analytic bounds, and their native
 layer-one consumer reproduces the exact BF16 attention input. A single stateful
 token-to-logits runner with real previous-call layer-three state is the next gate.
+The unified reduced-runner fixture keeps these same-trace projections together;
+the current Rust composition consumes only its layer-zero projection. Downstream
+parameters, numerical oracles, and attention history/shared-key state still
+come from legacy fixture seams, so the reduced prefill test is not a stateful
+decoder.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

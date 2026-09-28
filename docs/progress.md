@@ -47,7 +47,12 @@ choices without expanding current support claims.
   and FFN HC coefficients now come from native projection; next-pre values use
   the existing analytic F32 envelopes, while the native layer-one pre-mix and
   RMSNorm consumer matches the exact BF16 source attention input. These joined
-  cases still require composition into one stateful token-to-logits runner.
+  cases now compose one bounded prefill/decode partition through native Engram1,
+  layer one and the existing final reduced suffix. The checked-in unified source
+  bundle feeds layer zero only; downstream parameters, numerical oracles, and
+  attention-history/shared-key state remain legacy fixture-fed. A real
+  previous-call layer-three publication, reset and retry are the next
+  producer-state gate, before calling this a stateful token-to-logits runner.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -55,10 +60,15 @@ choices without expanding current support claims.
   Six published-tokenizer sequence cases now match the audited pinned source,
   including option permutation and strict rejection. A synthetic F32 head
   reference independently spells out attention, residuals, feed-forward, gather
-  and scoring against the pinned source. The new CPU-only Julia crate executes
+  and scoring against the pinned source. The CPU-only Julia crate executes
   that head from supplied weights and hidden states, with all five frozen cases
-  and bounded-input failures covered. Native encoder and full-checkpoint
-  execution remain open; see the [Julia contract](research/julia-decision-contract.md).
+  and bounded-input failures covered. It also executes one bounded F32
+  ModernBERT encoder block from caller-supplied weights: layer-zero identity
+  normalization, later affine normalization, Q/K RoPE, global and +/-64 local
+  attention, and GEGLU. Eight source-backed synthetic output cases cover
+  padding, local/global windows, distant-token isolation, and an all-masked
+  local query. This is not a full-checkpoint encoder, Metal implementation, or
+  serving integration; see the [Julia contract](research/julia-decision-contract.md).
 
 - `mx decide` scores Qwen3 answer-letter logits directly for bounded `choice`,
   `score`, and `noul` questions, returning normalized option probabilities and

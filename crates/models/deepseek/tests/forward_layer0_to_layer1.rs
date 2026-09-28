@@ -20,15 +20,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[path = "support/hc_coefficient_bounds.rs"]
-mod hc_coefficient_bounds;
+pub(crate) mod hc_coefficient_bounds;
 #[path = "support/hc_projection_bounds.rs"]
-mod hc_projection_bounds;
+pub(crate) mod hc_projection_bounds;
 #[path = "support/layer1_engram_capture.rs"]
 #[allow(
     dead_code,
     reason = "the bridge test needs the supplied-stream entry helper from the shared Engram fixture oracle"
 )]
-mod layer1_engram_capture;
+pub(crate) mod layer1_engram_capture;
 
 const FIXTURE_SHA256: &str = "2a0e294e62565be699c710fdfbf4f52bb63a0e9f3bea8e7eceae8ea11164b862";
 
@@ -629,32 +629,31 @@ fn native_layer_zero_output(
     (output, next_pre)
 }
 
-#[test]
-fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
-    let raw = include_str!("../../../../fixtures/deepseek-v41/layer0-to-layer1-reference.json");
+/// Runs the source-pinned layer-zero bridge from the supplied projection.
+///
+/// This is deliberately test-private: it is a reduced-oracle seam, not a
+/// decoder API.  Keeping the parsed projection as its input prevents a
+/// composition test from silently falling back to the older stand-alone
+/// capture.
+pub(crate) fn native_layer_zero_entries_from_projection(
+    root: &Value,
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
+    assert_eq!(field(root, "schema_version").as_u64(), Some(1));
     assert_eq!(
-        format!("{:x}", Sha256::digest(raw.as_bytes())),
-        FIXTURE_SHA256
-    );
-    let root: Value = serde_json::from_str(raw).expect("layer-zero bridge fixture JSON");
-    assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
-    assert_eq!(
-        field(field(&root, "contract"), "layer_zero_producer").as_str(),
+        field(field(root, "contract"), "layer_zero_producer").as_str(),
         Some("source-pinned native startup, attention, FFN, and HC composition")
     );
-    let cases = field(&root, "cases").as_array().expect("bridge cases");
-    let attention_outputs = native_layer_zero_attention_outputs(&root);
-    let native_layer_zero = with_native_layer_zero_moe(&root, |moe| {
+    let cases = field(root, "cases").as_array().expect("bridge cases");
+    let attention_outputs = native_layer_zero_attention_outputs(root);
+    with_native_layer_zero_moe(root, |moe| {
         cases
             .iter()
             .map(|case| {
-                let start = usize::try_from(field(case, "start_pos").as_u64().expect("start"))
-                    .expect("usize start");
+                let start = usize_field(case, "start_pos");
                 let output = field(case, "block_output");
-                let stream = field(case, "layer_one_engram_stream");
                 assert_eq!(
                     field(output, "storage_sha256"),
-                    field(stream, "storage_sha256"),
+                    field(field(case, "layer_one_engram_stream"), "storage_sha256"),
                     "layer-zero output must be the exact layer-one stream"
                 );
                 let attention = attention_outputs
@@ -664,12 +663,24 @@ fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
                     })
                     .expect("native attention case");
                 let (native_output, next_pre) =
-                    native_layer_zero_output(&root, case, attention, &moe);
+                    native_layer_zero_output(root, case, attention, &moe);
                 assert_eq!(native_output, bf16(output));
                 (start, native_output, next_pre)
             })
-            .collect::<Vec<_>>()
-    });
+            .collect()
+    })
+}
+
+#[test]
+fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
+    let raw = include_str!("../../../../fixtures/deepseek-v41/layer0-to-layer1-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        FIXTURE_SHA256
+    );
+    let root: Value = serde_json::from_str(raw).expect("layer-zero bridge fixture JSON");
+    let cases = field(&root, "cases").as_array().expect("bridge cases");
+    let native_layer_zero = native_layer_zero_entries_from_projection(&root);
     let streams = native_layer_zero
         .iter()
         .map(|(start, output, _)| (*start, output.clone()))

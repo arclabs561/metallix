@@ -107,12 +107,12 @@ fn fixture() -> Value {
 }
 
 /// Produces exact gated layer-one block entries keyed by source start position.
-pub(super) fn native_layer_one_block_entries() -> Vec<(usize, Vec<u16>)> {
+pub(crate) fn native_layer_one_block_entries() -> Vec<(usize, Vec<u16>)> {
     native_layer_one_block_entries_from_streams(None)
 }
 
 /// Recomputes the layer-one Engram gate from native upstream residuals.
-pub(super) fn native_layer_one_block_entries_from_streams(
+pub(crate) fn native_layer_one_block_entries_from_streams(
     supplied_streams: Option<&[(usize, Vec<u16>)]>,
 ) -> Vec<(usize, Vec<u16>)> {
     let root = fixture();

@@ -19,6 +19,7 @@ use deepseek::{
     rms_norm_bf16_reference,
 };
 use serde::Deserialize;
+use serde_json::Value;
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -28,14 +29,8 @@ mod candidate_capture;
 mod engram_capture;
 #[path = "support/hc_chain_bounds.rs"]
 mod hc_chain_bounds;
-#[path = "support/hc_coefficient_bounds.rs"]
-mod hc_coefficient_bounds;
-#[path = "support/hc_projection_bounds.rs"]
-mod hc_projection_bounds;
 #[path = "support/layer1_attention_capture.rs"]
 mod layer1_attention_capture;
-#[path = "support/layer1_engram_capture.rs"]
-mod layer1_engram_capture;
 #[path = "support/layer1_join.rs"]
 mod layer1_join;
 #[allow(
@@ -50,11 +45,14 @@ mod layer2_attention_capture;
 mod layer2_ffn;
 #[path = "support/layer2_join.rs"]
 mod layer2_join;
+#[path = "forward_layer0_to_layer1.rs"]
+mod layer_zero;
 #[path = "support/owner_attention_capture.rs"]
 mod owner_attention_capture;
 #[path = "support/rounding_interval.rs"]
 mod rounding_interval;
 
+use layer_zero::{hc_coefficient_bounds, hc_projection_bounds, layer1_engram_capture};
 use layer2_ffn::native_layer_two_entries;
 
 #[derive(Deserialize)]
@@ -1351,6 +1349,45 @@ fn native_layer_three_owner_attention_hc_ffn_reaches_layer_four_entry() {
 fn native_layer_one_engram_reaches_layer_two_suffix() {
     let engram_entries = layer1_engram_capture::native_layer_one_block_entries();
     let layer_one = layer1_join::native_layer_one_entries_from_engram_entries(&engram_entries);
+    layer2_join::native_layer_two_from_entries(&layer_one);
+}
+
+#[test]
+fn projection_fed_prefill_reaches_final_reduced_logits() {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("reduced runner bundle JSON");
+    assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+    let trace = &bundle["trace"];
+    assert_eq!(trace["input_ids"].as_array().map(Vec::len), Some(1));
+    assert_eq!(trace["starts"].as_array().map(Vec::len), Some(3));
+    let layer_zero_projection = &bundle["projections"]["layer0_to_layer1"];
+    let layer_zero = layer_zero::native_layer_zero_entries_from_projection(layer_zero_projection);
+    assert_eq!(
+        layer_zero
+            .iter()
+            .map(|(start, _, _)| *start)
+            .collect::<Vec<_>>(),
+        [0, 5, 6],
+        "the projection-fed prefill and decode partitions retain source order"
+    );
+
+    // The native layer-zero residual is the only upstream block operand here;
+    // the Engram consumes it directly.  The later layer fixtures remain
+    // separate reduced-oracle boundaries until their state publications are
+    // composed natively.
+    let streams = layer_zero
+        .iter()
+        .map(|(start, residual, _)| (*start, residual.clone()))
+        .collect::<Vec<_>>();
+    let incoming_pre = layer_zero
+        .iter()
+        .map(|(start, _, pre)| (*start, pre.clone()))
+        .collect::<Vec<_>>();
+    let engram = layer1_engram_capture::native_layer_one_block_entries_from_streams(Some(&streams));
+    let layer_one =
+        layer1_join::native_layer_one_entries_from_engram_entries_with_pre(&engram, &incoming_pre);
     layer2_join::native_layer_two_from_entries(&layer_one);
 }
 

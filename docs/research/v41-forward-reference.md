@@ -172,6 +172,24 @@ uv run scripts/test_v41_layer0_to_layer1_fixture.py
 cargo test -p deepseek --test forward_layer0_to_layer1
 ```
 
+`fixtures/deepseek-v41/reduced-runner-reference.json` bundles every currently
+qualified reduced-forward projection from one complete source capture. Its
+source gate regenerates the bundle and checks the cross-projection storage
+handoffs:
+
+```sh
+uv run scripts/test_v41_reduced_runner_fixture.py
+cargo test -p deepseek --test forward_moe projection_fed_prefill_reaches_final_reduced_logits
+```
+
+The Rust test parses that bundle and uses its layer-zero projection for token
+startup through native Engram1 and the layer-one HC input. It then enters the
+existing native reduced suffix. The bundle does not make downstream operands
+native: later parameter/oracle fixtures and the layer-one through layer-four
+attention histories and shared-key publications are still supplied by legacy
+fixtures. Real previous-call layer-three publication, failure-atomic reset, and
+retry are therefore the next producer-state gate.
+
 The source loader verifies SHA-256 before executing retained `model.py` and
 `engram.py`. It replaces the six kernel imports and supplies the real Engram
 classes; unused vision imports are excluded. Model class and function bodies

@@ -69,16 +69,19 @@ greedy sampling and grammar constraints with explicit weight/KV budgets.
 Long-running allocator behavior and larger contexts remain separate gates.
 The [V4.1 sparse-attention reference](../experiments/v41-attention.md) supplies
 a small CPU semantic oracle, not native BF16 or Metal-kernel parity.
-DeepSeek-V4.1 now has a small source-captured layer-one-to-logits reduced path:
-native layer-one attention, HC, and FFN feed layer two, then Engram3 and the
-native layer-three/four suffix through final HC, RMSNorm, and the FP32 head for
-the captured prefill/decode calls. Layer one's initial residual/pre-mix and the
-partial call's layer-three shared score keys remain captured boundaries. This is
-not full-model generation, Metal parity, or checkpoint support. The next joins
-are the earlier Engram/HC entry, then layer zero and token embeddings, followed
-by real previous-call layer-three state. Qwen correctness still does not
-establish DeepSeek support. Training techniques remain reference material, not
-an implemented training subsystem.
+DeepSeek-V4.1 now has a small source-captured reduced path: token IDs, native
+startup, layer-zero attention/HC/FFN, and Engram1 produce the native layer-one
+attention input; native layer one then feeds layer two, Engram3 and the
+layer-three/four suffix through final HC, RMSNorm, and the FP32 head for the
+captured prefill/decode partitions. A unified fixture proves every projection
+derives from one completed source capture, but the Rust composition currently
+consumes only its layer-zero projection. Downstream parameters, numerical
+oracles, attention histories, and shared-key publications remain legacy
+fixture-fed boundaries. This is not a stateful runner, full-model generation,
+Metal parity, or checkpoint support. The next producer-state gap is real
+previous-call layer-three publication with reset/retry behavior. Qwen
+correctness still does not establish DeepSeek support. Training techniques
+remain reference material, not an implemented training subsystem.
 
 ## What each new finding records
 

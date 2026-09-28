@@ -14,12 +14,14 @@ just check-metal      # the same gate including Metal features on Apple Silicon
 not download model checkpoints. Build and Python tooling must be installed;
 dependency resolution may still access registries.
 
-The fixture checker covers only the Engram hash and preprojected residual-gate
-JSON captures. It checks tensor names, shapes, encodings, value ranges and
-little-endian payload hashes. This catches accidental fixture corruption, not
-an incorrect reference implementation or a maliciously regenerated hash.
-Rust parity tests remain the numerical gate. Source provenance and regeneration
-instructions are in [the Engram reference](research/v41-engram.md).
+Fixture checks cover the Engram hash and preprojected residual-gate captures,
+plus the unified reduced V4.1 source bundle. They check tensor names, shapes,
+encodings, value ranges, little-endian payload hashes, source provenance, and
+same-capture cross-projection handoffs. This catches accidental fixture
+corruption, not an incorrect reference implementation or a maliciously
+regenerated hash. Rust parity tests remain the numerical gate. Source
+provenance and regeneration instructions are in [the Engram reference](research/v41-engram.md)
+and [the reduced V4.1 reference](research/v41-forward-reference.md).
 
 ## Compiler-aware custom lints
 

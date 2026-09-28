@@ -485,18 +485,50 @@ pub(super) fn native_layer_one_entries_from_engram_entries(
     entries: &[(usize, Vec<u16>)],
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let fixture = fixture();
+    let incoming_pre = fixture
+        .cases
+        .iter()
+        .map(|case| (case.start_pos, case.incoming_pre.fp32()))
+        .collect::<Vec<_>>();
+    native_layer_one_entries_from_engram_entries_with_pre(entries, &incoming_pre)
+}
+
+/// Continues layer one from an upstream native Engram residual and its native
+/// HC pre-mix state.  The stand-alone overload retains the historical fixture
+/// regression; composition callers must use this entry point instead.
+pub(super) fn native_layer_one_entries_from_engram_entries_with_pre(
+    entries: &[(usize, Vec<u16>)],
+    incoming_pre: &[(usize, Vec<f32>)],
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
+    let fixture = fixture();
     assert_eq!(
         entries.len(),
         fixture.cases.len(),
         "native Engram entry count"
     );
+    assert_eq!(
+        incoming_pre.len(),
+        fixture.cases.len(),
+        "native Engram incoming HC pre count"
+    );
     let block_entries = fixture
         .cases
         .iter()
         .zip(entries)
-        .map(|(case, (start, residual))| {
+        .zip(incoming_pre)
+        .map(|((case, (start, residual)), (pre_start, pre))| {
             assert_eq!(*start, case.start_pos, "native Engram entry start");
-            (*start, residual.clone(), case.incoming_pre.fp32())
+            assert_eq!(
+                *pre_start, case.start_pos,
+                "native Engram incoming HC pre start"
+            );
+            assert_eq!(
+                pre.len(),
+                case.incoming_pre.fp32().len(),
+                "native Engram incoming HC pre width"
+            );
+            assert!(pre.iter().all(|value| value.is_finite()));
+            (*start, residual.clone(), pre.clone())
         })
         .collect::<Vec<_>>();
     native_layer_one_entries_from_block_entries(Some(&block_entries))

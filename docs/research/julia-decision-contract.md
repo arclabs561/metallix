@@ -232,11 +232,31 @@ uv run scripts/julia_head_reference.py
 uv run scripts/test_julia_head_reference.py
 ```
 
-The native head gate runs with `cargo test -p julia` and the workspace check.
-Next, qualify a separate native ModernBERT forward under an explicit
-checkpoint-resource budget. Native support
-requires an actual pinned checkpoint and independent source-runtime numerical
-comparison before server or registry integration.
+The native head and bounded encoder-block gates run with `cargo test -p julia`.
+The canonical lightweight check also runs
+`scripts/test_julia_encoder_fixture.py`, which verifies the frozen fixture's
+source identity and all eight required control cases without importing Torch.
+
+The CPU-only encoder block accepts one unbatched sequence of at most 126
+positions and caller-supplied F32 weights. It implements the pinned
+`ModernBertEncoderLayer` order: layer-zero identity attention normalization,
+later affine LayerNorm, bias-free QKV and output projections, F32 split-half
+Q/K RoPE, global or +/-64 local bidirectional attention, MLP LayerNorm and
+exact-erf GEGLU. It checks a 256-million scalar-operation bound. The frozen
+source oracle instantiates the exact hash-pinned Transformers 5.0 layer in
+eager CPU mode, compares it with an independently spelled-out expression, and
+exports complete observed F32 outputs. Rust compares every exported value at
+fixed `1e-5` absolute error for eight cases: masked-padding invariance,
+unmasked-padding control, a 66-token local/global window distinction,
+distant-token isolation, and the source's finite all-masked-local-query
+behavior. The fixture contains synthetic deterministic weights and inputs, not
+checkpoint weights.
+
+This qualifies one bounded CPU encoder operator, not token embedding, a
+22-layer encoder, checkpoint loading, Metal execution, or model-level quality.
+Next, qualify full native encoder composition under explicit checkpoint-resource
+budgets and independent source-runtime comparison before server or registry
+integration.
 
 
 ## Native head placement
@@ -247,5 +267,6 @@ reusable head for a later encoder. Putting it in the shared engine or importing
 DeepSeek numerical policy would couple unrelated model contracts. A bounded
 CPU head with local affine, normalization, attention and activation operations
 keeps this step model-specific without introducing a shared tensor framework.
-The first gate is the synthetic pinned-source fixture; encoder execution and
-checkpoint loading remain separately qualified boundaries.
+The first head gate is the synthetic pinned-source fixture. The separate
+encoder-block gate provides a reusable bounded CPU operator; full encoder
+composition and checkpoint loading remain separately qualified boundaries.

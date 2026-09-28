@@ -18,6 +18,20 @@ in `crates/models/qwen/src/forward.rs` is a parser-test layout, not a tracked
 upstream config file. These Qwen-derived compatibility records are covered by
 the Apache-2.0 notice and license copy above.
 
+`crates/models/julia/src/encoder.rs`,
+`scripts/julia_encoder_reference.py`, and
+`fixtures/julia-1/encoder-reference.json` implement and test the arithmetic
+contract of Hugging Face Transformers' `ModernBertEncoderLayer` and associated
+rotary helpers at revision
+`08810b1e278938278c50153ee1edfd7a20a759da`. The Rust and independent Python
+expressions were written for this repository; the fixture is generated from a
+hash-checked execution of that pinned upstream layer with synthetic weights.
+No upstream source file, checkpoint, or tokenizer payload is tracked. The
+upstream module identifies Answer.AI, LightOn, contributors, and Hugging Face
+as copyright holders and is licensed under Apache License 2.0. The existing
+copy is in `third_party/LICENSE-APACHE-2.0.txt`; see the [pinned source and
+license](https://github.com/huggingface/transformers/blob/08810b1e278938278c50153ee1edfd7a20a759da/LICENSE).
+
 The candidate-block selection and FP32 index-score diagnostics in
 `crates/models/deepseek/src/csa2.rs`, `indexer.rs`, and `selection.rs` follow
 `select_candidate_blocks` and the score-reduction expressions in
