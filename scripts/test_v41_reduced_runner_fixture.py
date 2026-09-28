@@ -101,6 +101,74 @@ class ReducedRunnerFixtureTest(unittest.TestCase):
                 attention["layer_one_published_indices"]["storage_sha256"],
             )
 
+    def test_synthetic_source_route_projection_is_bounded_and_pinned(self) -> None:
+        exporter = load("v41_reduced_runner_capture.py", "v41_reduced_runner_exporter")
+        trace = exporter.synthetic_route_trace_from_moe_projections(
+            self.fixture["projections"]
+        )
+        self.assertEqual(trace["schema_version"], 1)
+        self.assertIn("collector qualification only", trace["scope"])
+        self.assertEqual(
+            trace["source"]["complete_capture_sha256"],
+            self.fixture["source"]["complete_capture_sha256"],
+        )
+        self.assertEqual(
+            trace["synthetic_geometry"],
+            {
+                "hidden_width": 128,
+                "routed_experts": 4,
+                "selected_experts": 2,
+                "layers": [3, 4],
+                "starts": [0, 5, 6],
+            },
+        )
+        self.assertEqual(len(trace["rows"]), 14)
+        self.assertEqual(trace["rows"][0]["expert_ids"], [2, 0])
+        self.assertEqual(
+            trace["rows"][0]["source_gate_indices_sha256"],
+            "9e6537257f2121080ec1e88a7952d920d773cb43f74ab6674af1ea52ddd3f335",
+        )
+        for row in trace["rows"]:
+            self.assertIn(row["layer"], (3, 4))
+            self.assertIn(row["phase"], ("prefill", "decode"))
+            self.assertEqual(len(row["expert_ids"]), 2)
+            self.assertTrue(all(0 <= expert < 4 for expert in row["expert_ids"]))
+            self.assertEqual(len(row["source_gate_indices_sha256"]), 64)
+
+    def test_synthetic_source_route_projection_rejects_changed_gate_storage(
+        self,
+    ) -> None:
+        exporter = load("v41_reduced_runner_capture.py", "v41_reduced_runner_exporter")
+        altered = json.loads(json.dumps(self.fixture["projections"]))
+        altered["layer3_moe"]["cases"][0]["gate_indices"]["storage_hex"] = "00"
+        with self.assertRaisesRegex(RuntimeError, "source gate storage"):
+            exporter.synthetic_route_trace_from_moe_projections(altered)
+
+    def test_synthetic_source_route_projection_rejects_non_int64_gate_indices(
+        self,
+    ) -> None:
+        exporter = load("v41_reduced_runner_capture.py", "v41_reduced_runner_exporter")
+        altered = json.loads(json.dumps(self.fixture["projections"]))
+        altered["layer4_moe"]["cases"][1]["gate_indices"]["dtype"] = "torch.int32"
+        with self.assertRaisesRegex(RuntimeError, "invalid source gate layout"):
+            exporter.synthetic_route_trace_from_moe_projections(altered)
+
+    def test_synthetic_source_route_projection_rejects_unpinned_geometry(self) -> None:
+        exporter = load("v41_reduced_runner_capture.py", "v41_reduced_runner_exporter")
+        altered = json.loads(json.dumps(self.fixture["projections"]))
+        altered["layer3_moe"]["cases"][0]["gate_indices"]["shape"] = [4, 2]
+        with self.assertRaisesRegex(RuntimeError, "invalid source gate layout"):
+            exporter.synthetic_route_trace_from_moe_projections(altered)
+
+    def test_synthetic_source_route_projection_rejects_mixed_source_identity(
+        self,
+    ) -> None:
+        exporter = load("v41_reduced_runner_capture.py", "v41_reduced_runner_exporter")
+        altered = json.loads(json.dumps(self.fixture["projections"]))
+        altered["layer4_moe"]["source"]["runner_sha256"] = "different-runner"
+        with self.assertRaisesRegex(RuntimeError, "mixes source runner_sha256"):
+            exporter.synthetic_route_trace_from_moe_projections(altered)
+
 
 @unittest.skipUnless(
     os.environ.get("V41_REGENERATE_SOURCE") == "1",

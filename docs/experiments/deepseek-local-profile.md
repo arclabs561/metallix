@@ -1,9 +1,18 @@
-# Local DeepSeek-V4.1-Flash profile
+# Local DeepSeek V4 quantized baseline
 
-A local OpenAI-compatible DeepSeek route is validated outside Metallix's native
+A local OpenAI-compatible DeepSeek smoke route was validated outside Metallix's native
 Rust adapter using oMLX 0.7.0.dev4 and the cached
 `mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed` snapshot. The snapshot is
 MIT-licensed, 92.8 GB on disk, and requires roughly 80–90 GB of unified memory.
+
+The local `deepseek-v41-flash` service name is a historical alias, not an
+artifact identity. This snapshot's configuration has width 4096, 43 layers and
+256 routed experts; the pinned published V4.1 target has width 5120, 40 backbone
+layers and 384 routed experts. The snapshot also uses mixed affine quantization
+instead of the published packed expert weights and E8M0 scales. Its smoke,
+memory and throughput results therefore cannot qualify published V4.1 execution
+or establish its routing locality and SSD traffic budget. Keep this external
+baseline separate from the [native feasibility gate](../research/host-memory.md#deepseek-routed-expert-traffic-sensitivity).
 
 The machine-local Codex profile is `/Users/arc/.codex/deepseek-v41-local.config.toml`:
 

@@ -263,3 +263,35 @@ Read ranges are `0–7`, then `8–663` and `8–671`, respectively. The index h
 the inspected expert-header hash is
 `139eeea4664aba161a4b4cb82a60a86a2429467601ee6584a887825f8137adfd`.
 The fresh config and hash source matched the identities in the research index.
+
+### Route evidence and the external baseline
+
+The cached `mlx-community/DeepSeek-V4-Flash-0731-2.4bit-mixed` snapshot is a
+separate architecture: width 4096, 43 layers, 256 routed experts and affine
+quantization, versus this target's width 5120, 40 backbone layers, 384 experts
+and packed expert/E8M0 encoding. Snapshot revision
+`10001e0065f8394e03e968e652cbbe7cd2ca122c`, config SHA-256
+`44735712733fcf8f299bdf1faa1d87fac88f1917efe1d3876d6d4c582f79a68f`,
+binds that distinction. Its local service alias does not identify the published
+V4.1 target. External smoke throughput or routing cannot qualify these traffic
+estimates; see the [baseline ledger](../experiments/deepseek-local-profile.md).
+
+An additive route projector now extracts exact source-selected expert IDs from
+the existing reduced capture without evaluating a router:
+
+```sh
+uv run scripts/v41_reduced_runner_capture.py \
+  --input artifacts/v41-reduced-runner-source.json \
+  --output artifacts/reduced-runner-projection.json \
+  --synthetic-route-trace-output artifacts/synthetic-route-trace.json
+```
+
+It preserves source hashes, layer/start/offset, prefill/decode phase and ordered
+top-k IDs. The fourteen rows cover layers three/four at starts 0/5/6 in a
+four-expert, top-two synthetic graph. They qualify collector inputs, not real
+model cache hit rates. Real locality remains gated on a source-compatible V4.1
+router trace. Use such a trace to measure route-weighted misses and useful versus
+requested bytes under an explicit RAM budget before selecting a pager or
+acquiring full weights. The illustrative five-token/s target above requires
+at least about 86.5–87.1% of selected expert bytes to hit residency even before
+compute and read amplification; stored capacity fraction cannot establish that.
