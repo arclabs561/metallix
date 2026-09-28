@@ -42,7 +42,7 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications | Fixture-backed operands remain; whole-request failure/reset semantics and native generation are unfinished |
+| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications and tested request invalidation/rebuild | Test-private fixture-backed operands remain; production recovery and native generation are unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 
@@ -306,14 +306,15 @@ Non-streaming JSON responses do not write during generation, so a disconnected
 client can occupy the single-request server until generation completes or the
 budget expires. Use streaming when early disconnect detection matters.
 
-A bounded native Codex command-tool check passed three fresh trials against a
-4B server configured with `--context-tokens 16384 --kv-budget-mib 8192`. Each
-trial read a distinct synthetic fact through Codex's command tool, returned its
-expected marker, and finished its turn. It used fallback model metadata and
-does not establish general coding, complete tool grammar, steady-state
-performance, or a production-ready Codex backend. A strict reassessment
-verified command execution before the exact answer and terminal completion in
-every saved trial. The test used Codex CLI 0.153.4. No user profile was installed.
+A bounded native Codex command-tool run passed six fresh trials against the
+cached 4B checkpoint at `--context-tokens 16384 --kv-budget-mib 8192`:
+three single-file reads and three two-file pointer chains. Each chain required
+reading a filename, then that file, before returning its exact fresh marker.
+All workspaces remained unchanged and every turn completed. The controlled
+CLI used fallback model metadata and isolated instructions/features; no user
+profile was installed. These read-only tasks do not establish general coding,
+complete tool grammar, steady-state performance, or a production-ready Codex
+backend.
 
 The corresponding server and optional user-level profile shape are:
 

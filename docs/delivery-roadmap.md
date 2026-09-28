@@ -42,10 +42,11 @@ into Engram1. Native token embedding, HC-copy expansion and identity pre-mix
 now supply the same-trace incoming state. Native HC projection supplies both
 sublayers' coefficients under the existing F32 envelope policy; its native
 layer-one consumer matches the exact BF16 attention input. The unified source
-bundle now feeds layer zero into the native reduced suffix, while downstream
-attention histories and shared-key publications remain fixture-fed. A stateful
-runner and real previous-call shared state remain before a complete reduced
-oracle, followed by Metal execution. Native
+bundle now feeds layer zero into the native reduced suffix. Live L1–L3 state
+and the previous-call L3 publication now flow through the test-private runner,
+including failure invalidation and fresh reconstruction. Downstream weights and
+source checks remain fixture-backed; broader partitions, checkpoint loading and
+Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
@@ -227,7 +228,7 @@ existing product boundary.
 | --- | --- | --- |
 | KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Stepped growth, failure-parity, and matched 0.6B/4B resident requests passed with exact output/token parity. Keep the bounded stepped path and retain the concatenation measurements as a regression control. |
 | DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Reproduce the pinned source for the parity baseline. Never silently substitute owner keys. Decide before claiming complete model parity. |
-| DeepSeek request failure lifecycle | Roll back every owner to the last committed call; or invalidate the entire request after any late failure and reconstruct all state before a fresh request. | Prefer invalidation first. A corrupted previous-L3 prefix can fail after L1 Engram/compressor state has advanced; component-local transactions cannot make that call retryable. Before exposing a runner, test continuation rejection and a complete fresh-request restart. This remains a proposal, not an implemented recovery guarantee. |
+| DeepSeek request failure lifecycle | Roll back every owner to the last committed call; or invalidate the entire request after any late failure and reconstruct all state before a fresh request. | Prefer invalidation first. A corrupted previous-L3 prefix can fail after L1 Engram/compressor state has advanced; component-local transactions cannot make that call retryable. The reduced test-private wrapper now rejects continuation after poisoning and rebuilds its L1–L3 state for a fresh request, checked through final-logit source bounds. Carry this contract into the real runner once fixture operands are replaced; production recovery remains unimplemented. |
 | Native runtime versus upstream integration | Continue the specialized executor; or retain qualification/adapter work and integrate a runtime that demonstrably meets the same target. | Apply the existing architecture pivot using matched evidence, not popularity. |
 | MLX binding upgrade | Keep the qualified pinned stack; or upgrade to unlock a demonstrated blocking operation/performance gain. | Avoid combining an upgrade with a cache-layout change. Qualify an upgrade as its own change before depending on new semantics. |
 | Adapter/config shape, model and engine boundary | Closed typed task adapters; versus a universal tensor/graph interface. | Follow the existing thin-MLX proposal. Decide exact signatures only with concrete consumers; keep manifest versions explicit. |

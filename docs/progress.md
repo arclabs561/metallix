@@ -67,15 +67,19 @@ choices without expanding current support claims.
   fixture-fed owner remains only for standalone controls. Bootstrap consumes
   the already-computed layer-two/Engram3 prefix, and final continuation advances
   the same sessions once at start six. This removes that prefix replay from
-  the data-producing path. Fixture-backed operands, whole-request rollback/reset
-  semantics and alternate call partitions still separate this test-private
-  composition from a production token-to-logits runner.
+  the data-producing path. Fixture-backed operands and alternate call partitions still separate this
+  test-private composition from a production token-to-logits runner.
   A completion audit found that both live Engram helpers checked supplied
   residuals after committing hash history. They now reject bad inputs first.
   Regressions at starts zero and five prove rejected calls cannot make future
   token history available and that correct retries reproduce the control
   continuation. This covers input preflight only: a late layer-one publication
-  mismatch can still advance earlier owners before rejection.
+  mismatch can still advance earlier owners before rejection. A test-private
+  request wrapper now marks the composition poisoned before mutable work,
+  rejects continuation after a late failure, and reconstructs all its L1–L3
+  owners on restart. Regressions compare restarted and fresh final-block
+  outputs and check both against the final-logit source oracle. This establishes
+  invalidation/rebuild for the reduced fixture path, not production rollback.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned
@@ -143,11 +147,14 @@ choices without expanding current support claims.
   positions also matched across all 151,936 logits, with maximum absolute
   difference 0.000020980835. This does not qualify the expanded ceilings,
   general coding, or general Codex coding.
-- A separate native Codex command-tool check passed 3/3 fresh synthetic-fact
-  trials against the 4B server at 16,384 tokens and 8192 MiB. Strict
-  reassessment verified command execution before each exact final answer and
-  terminal completion; the controlled CLI was 0.153.4. It used fallback model
-  metadata and controlled instructions/features, so no user profile was added.
+- A fresh native Codex run passed all six read-only tasks against the same 4B
+  checkpoint at 16,384 tokens and 8192 MiB: three single-file reads and three
+  two-file pointer chains. The assessor verified ordered command evidence,
+  exact final answers, terminal completion and unchanged synthetic workspaces.
+  The temporary server stopped after the run. Receipts are retained locally at
+  `.agents/receipts/qwen-codex-chain-20260928/`; `run.json` pins the release
+  binary SHA and checkpoint revision. This remains bounded tool qualification,
+  with controlled CLI instructions/features and fallback model metadata.
 - The reusable Responses qualifier passed three JSON and three SSE native 4B
   tool-result replay trials at 2048 tokens and 1024 MiB. It now validates model,
   output-item, and content identities; three live tool-stream disconnect
@@ -332,8 +339,8 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 4. **Serving owner: Responses lane.** Socket read/write deadlines are bounded;
    qualify concurrent admission, client-driven cancellation, the experimental
    16,384-token/8192-MiB resident limits, custom-tool requirements, and broader
-   Codex tasks. A bounded native Codex command-tool run passed 3/3 fresh trials
-   against the 4B server at those limits, but used fallback model metadata and
+   Codex tasks. A bounded native Codex command-tool run passed three single-file and three
+   two-file-chain trials against the 4B server at those limits, but used fallback model metadata and
    does not establish general coding or complete tool grammar support.
    No live profile was changed.
 5. **Runtime owner: comparison lane.** Run matched quality/tool/performance
@@ -342,6 +349,15 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 
 ## Validation
 
+The current recovery batch passed all 58 DeepSeek `forward_moe` tests and strict
+all-target/all-feature DeepSeek Clippy. Seven Julia diagnostic tests and all 22
+Codex assessor tests passed. The canonical `RUST_TEST_THREADS=1 just check-metal`
+run stops at the unchanged Julia full-encoder source-parity failure:
+`unmasked_control hidden[0]: -0.2049238 != -0.20494038`
+(12 passed, one failed, four ignored). Earlier green batches below are historical;
+the current full gate is red. New receipts are retained locally under
+`.agents/receipts/candidate-control/request-recovery-*`.
+
 The cooperative budget's live probes covered JSON and SSE at 1 ms and 100 ms,
 followed by healthy requests. The warm 100 ms stream emitted ten text deltas
 before exactly one timeout failure. With the default budget, both JSON and SSE
@@ -349,10 +365,9 @@ clients that half-closed their sending side received the expected 32-token
 response and matching text. A 1 ms budget still took 22–40 ms to return:
 the currently running synchronous phase must finish before expiry is observed.
 
-The canonical checks are `RUSTC_WRAPPER= uv run scripts/check.py` and
-`RUSTC_WRAPPER= uv run scripts/check.py --metal`. The wrapper override avoids a
-local sccache startup failure and does not modify global compiler settings.
-Both checks passed on the final implementation, followed by a release build
+The canonical checks are `uv run scripts/check.py` and
+`uv run scripts/check.py --metal`; preserve the configured `RUSTC_WRAPPER`.
+The historical cooperative-budget batch passed both checks, followed by a release build
 and the live HTTP checks above. The owned test server was stopped after
 validation; use the README command to start a new one.
 
