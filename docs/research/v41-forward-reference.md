@@ -184,11 +184,20 @@ cargo test -p deepseek --test forward_moe projection_fed_prefill_reaches_final_r
 
 The Rust test parses that bundle and uses its layer-zero projection for token
 startup through native Engram1 and the layer-one HC input. It then enters the
-existing native reduced suffix. The bundle does not make downstream operands
-native: later parameter/oracle fixtures and the layer-one through layer-four
-attention histories and shared-key publications are still supplied by legacy
-fixtures. Real previous-call layer-three publication, failure-atomic reset, and
-retry are therefore the next producer-state gate.
+existing native reduced suffix. A bounded first pass executes only starts zero
+and five through layer three, whose native owner publishes the key prefix used
+by layer one's start-six score selection in the final traversal. No start-six
+layer-one/layer-two operand is executed to produce that preceding publication.
+Corrupting the supplied prefix fails the score oracle. A rejected producer
+update after a nonempty publication preserves its key/KV contents and call
+identity; the same call can then commit, and reset clears the publication for a
+new request.
+
+This is still a two-pass reduced composition, not a general stateful decoder.
+The bundle does not make every downstream operand native: later parameter and
+numerical-oracle fixtures, attention histories, and other publications remain
+legacy fixture-fed. The next execution gate is a single request-local stepping
+path that owns those histories across prefill/decode partitions.
 
 The source loader verifies SHA-256 before executing retained `model.py` and
 `engram.py`. It replaces the six kernel imports and supplies the real Engram

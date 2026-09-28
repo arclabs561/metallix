@@ -175,11 +175,14 @@ fn native_block_entries_from_streams(
         .into_iter()
         .map(f32_from_bf16)
         .collect();
-    if let Some(streams) = supplied_streams {
-        assert_eq!(streams.len(), cases.len(), "native Engram stream count");
-    }
+    let call_count = supplied_streams.map_or(cases.len(), <[_]>::len);
+    assert!(
+        (1..=cases.len()).contains(&call_count),
+        "native Engram stream prefix count"
+    );
     cases
         .iter()
+        .take(call_count)
         .enumerate()
         .map(|(case_index, case)| {
             let positions = shape(field(case, "input_ids"))[1];

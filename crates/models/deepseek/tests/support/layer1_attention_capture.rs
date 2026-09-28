@@ -301,15 +301,33 @@ fn assert_diagnostic(case: &Value, diagnostic: &LayerAttentionDiagnostic) {
 /// checked for captured call identity and exact BF16 content here; the source
 /// stage assertions then check the complete attention continuation.
 pub(super) fn native_outputs_from_inputs(inputs: &[(usize, Vec<u16>)]) -> Vec<(usize, Vec<u16>)> {
+    native_outputs_from_inputs_with_previous_layer_three_prefix(inputs, None)
+}
+
+/// Runs layer-one attention with an actual request-local previous layer-three
+/// score prefix. The prefix influences only the source-defined partial score
+/// selection that produces the final call's attention publication.
+pub(super) fn native_outputs_from_inputs_with_previous_layer_three_prefix(
+    inputs: &[(usize, Vec<u16>)],
+    previous_layer_three_prefix: Option<&[u16]>,
+) -> Vec<(usize, Vec<u16>)> {
     let root = fixture();
     let frequencies = frequencies(&root);
     let weights = weights(&root);
-    let owner = layer1_owner_capture::native_publications();
-    let mut state = LayerAttentionState::new(layout(&root));
     let cases = field(&root, "cases").as_array().expect("source cases");
-    assert_eq!(inputs.len(), cases.len(), "source call count");
+    assert!(
+        (1..=cases.len()).contains(&inputs.len()),
+        "source call prefix count"
+    );
+    let owner =
+        layer1_owner_capture::native_publications_with_previous_layer_three_prefix_for_calls(
+            previous_layer_three_prefix,
+            inputs.len(),
+        );
+    let mut state = LayerAttentionState::new(layout(&root));
     cases
         .iter()
+        .take(inputs.len())
         .zip(inputs)
         .enumerate()
         .map(|(call_id, (case, (supplied_start, input)))| {

@@ -84,13 +84,16 @@ fn fixture() -> Fixture {
 pub(super) type BlockEntries = [(usize, Vec<u16>, Vec<f32>)];
 
 fn native_inputs(fixture: &Fixture, entries: Option<&BlockEntries>) -> Vec<(usize, Vec<u16>)> {
-    if let Some(entries) = entries {
-        assert_eq!(entries.len(), fixture.cases.len());
-    }
+    let call_count = entries.map_or(fixture.cases.len(), <[_]>::len);
+    assert!(
+        (1..=fixture.cases.len()).contains(&call_count),
+        "native layer-one input call prefix"
+    );
     let norm = fixture.block_parameters["layers.1.attn_norm.weight"].bf16();
     fixture
         .cases
         .iter()
+        .take(call_count)
         .enumerate()
         .map(|(index, case)| {
             let captured_residual = case.residual.bf16();
@@ -225,10 +228,14 @@ fn attention_handoffs(
     fixture: &Fixture,
     outputs: &[(usize, Vec<u16>)],
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
-    assert_eq!(outputs.len(), fixture.cases.len());
+    assert!(
+        (1..=fixture.cases.len()).contains(&outputs.len()),
+        "native layer-one attention handoff prefix"
+    );
     fixture
         .cases
         .iter()
+        .take(outputs.len())
         .zip(outputs)
         .map(|(case, (start, attention))| {
             assert_eq!(*start, case.start_pos);
@@ -275,7 +282,10 @@ fn native_ffn(
     fixture: &Fixture,
     entries: &[(usize, Vec<u16>, Vec<f32>)],
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
-    assert_eq!(entries.len(), fixture.cases.len());
+    assert!(
+        (1..=fixture.cases.len()).contains(&entries.len()),
+        "native layer-one FFN call prefix"
+    );
     let norm = fixture.block_parameters["layers.1.ffn_norm.weight"].bf16();
     let projection = fixture.block_parameters["layers.1.hc_ffn_fn"].fp32();
     let scale: [f32; 3] = fixture.block_parameters["layers.1.hc_ffn_scale"]
@@ -304,6 +314,7 @@ fn native_ffn(
             fixture
                 .cases
                 .iter()
+                .take(entries.len())
                 .zip(entries)
                 .map(|(case, (start, residual, pre))| {
                     assert_eq!(*start, case.start_pos);
@@ -475,9 +486,20 @@ pub(super) fn native_layer_one_entries() -> Vec<(usize, Vec<u16>, Vec<f32>)> {
 pub(super) fn native_layer_one_entries_from_block_entries(
     entries: Option<&BlockEntries>,
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
+    native_layer_one_entries_from_block_entries_with_previous_layer_three_prefix(entries, None)
+}
+
+pub(super) fn native_layer_one_entries_from_block_entries_with_previous_layer_three_prefix(
+    entries: Option<&BlockEntries>,
+    previous_layer_three_prefix: Option<&[u16]>,
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let fixture = fixture();
     let inputs = native_inputs(&fixture, entries);
-    let outputs = layer1_attention_capture::native_outputs_from_inputs(&inputs);
+    let outputs =
+        layer1_attention_capture::native_outputs_from_inputs_with_previous_layer_three_prefix(
+            &inputs,
+            previous_layer_three_prefix,
+        );
     native_ffn(&fixture, &attention_handoffs(&fixture, &outputs))
 }
 
@@ -501,6 +523,45 @@ pub(super) fn native_layer_one_entries_from_engram_entries_with_pre(
     incoming_pre: &[(usize, Vec<f32>)],
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let fixture = fixture();
+    assert!(
+        (1..=fixture.cases.len()).contains(&entries.len()),
+        "native Engram entry prefix count"
+    );
+    assert_eq!(
+        incoming_pre.len(),
+        entries.len(),
+        "native Engram incoming HC pre prefix count"
+    );
+    let block_entries = fixture
+        .cases
+        .iter()
+        .take(entries.len())
+        .zip(entries)
+        .zip(incoming_pre)
+        .map(|((case, (start, residual)), (pre_start, pre))| {
+            assert_eq!(*start, case.start_pos, "native Engram entry start");
+            assert_eq!(
+                *pre_start, case.start_pos,
+                "native Engram incoming HC pre start"
+            );
+            assert_eq!(
+                pre.len(),
+                case.incoming_pre.fp32().len(),
+                "native Engram incoming HC pre width"
+            );
+            assert!(pre.iter().all(|value| value.is_finite()));
+            (*start, residual.clone(), pre.clone())
+        })
+        .collect::<Vec<_>>();
+    native_layer_one_entries_from_block_entries(Some(&block_entries))
+}
+
+pub(super) fn native_layer_one_entries_from_engram_entries_with_pre_and_previous_layer_three_prefix(
+    entries: &[(usize, Vec<u16>)],
+    incoming_pre: &[(usize, Vec<f32>)],
+    previous_layer_three_prefix: &[u16],
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
+    let fixture = fixture();
     assert_eq!(
         entries.len(),
         fixture.cases.len(),
@@ -522,16 +583,15 @@ pub(super) fn native_layer_one_entries_from_engram_entries_with_pre(
                 *pre_start, case.start_pos,
                 "native Engram incoming HC pre start"
             );
-            assert_eq!(
-                pre.len(),
-                case.incoming_pre.fp32().len(),
-                "native Engram incoming HC pre width"
-            );
+            assert_eq!(pre.len(), case.incoming_pre.fp32().len());
             assert!(pre.iter().all(|value| value.is_finite()));
             (*start, residual.clone(), pre.clone())
         })
         .collect::<Vec<_>>();
-    native_layer_one_entries_from_block_entries(Some(&block_entries))
+    native_layer_one_entries_from_block_entries_with_previous_layer_three_prefix(
+        Some(&block_entries),
+        Some(previous_layer_three_prefix),
+    )
 }
 
 #[test]

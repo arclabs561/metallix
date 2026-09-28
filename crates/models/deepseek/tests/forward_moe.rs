@@ -1373,10 +1373,9 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         "the projection-fed prefill and decode partitions retain source order"
     );
 
-    // The native layer-zero residual is the only upstream block operand here;
-    // the Engram consumes it directly.  The later layer fixtures remain
-    // separate reduced-oracle boundaries until their state publications are
-    // composed natively.
+    // The native layer-zero residual and pre-mix enter Engram1 and layer one.
+    // Later weights and attention arithmetic remain fixture-backed, but the
+    // layer-three score prefix below is produced from this composed input.
     let streams = layer_zero
         .iter()
         .map(|(start, residual, _)| (*start, residual.clone()))
@@ -1385,10 +1384,104 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
+    let previous_layer_three_prefix = native_previous_layer_three_prefix(&streams, &incoming_pre);
+    let layer_three_fixture = layer_three_fixture();
+
+    // The final full traversal starts only after its preceding native prefix is
+    // published. It supplies the actual start-six L1 selection below.
     let engram = layer1_engram_capture::native_layer_one_block_entries_from_streams(Some(&streams));
-    let layer_one =
-        layer1_join::native_layer_one_entries_from_engram_entries_with_pre(&engram, &incoming_pre);
-    layer2_join::native_layer_two_from_entries(&layer_one);
+    let mut corrupted_prefix = previous_layer_three_prefix.clone();
+    corrupted_prefix[0] ^= 1;
+    assert!(
+        std::panic::catch_unwind(|| {
+            layer1_join::native_layer_one_entries_from_engram_entries_with_pre_and_previous_layer_three_prefix(
+                &engram,
+                &incoming_pre,
+                &corrupted_prefix,
+            )
+        })
+        .is_err(),
+        "a changed native previous-call publication must fail the layer-one score oracle"
+    );
+    let layer_one = layer1_join::native_layer_one_entries_from_engram_entries_with_pre_and_previous_layer_three_prefix(
+        &engram,
+        &incoming_pre,
+        &previous_layer_three_prefix,
+    );
+    let layer_two = layer2_join::native_layer_two_entries_from_entries(&layer_one);
+    let final_layer_three_streams = layer_two
+        .iter()
+        .map(|(start, residual, _)| (*start, residual.clone()))
+        .collect::<Vec<_>>();
+    let final_layer_three_engram = engram_capture::native_layer_three_block_entries_from_streams(
+        Some(&final_layer_three_streams),
+    );
+    let final_layer_three_pre = layer_two
+        .iter()
+        .map(|(start, _, pre)| (*start, pre.clone()))
+        .collect::<Vec<_>>();
+    let third = native_layer_three_block_tail_from_entries(
+        &layer_three_fixture,
+        Some(&final_layer_three_engram),
+        Some(&final_layer_three_pre),
+    );
+    let output = block_tail_from_entries(
+        &fixture(),
+        BlockControl::NativeAttention,
+        true,
+        Some(&third),
+    );
+    assert_final_suffix(&fixture(), output);
+}
+
+/// Produces only the two preceding layer-three calls that publish the prefix
+/// consumed by the following L1 partial decode. The source start-six operands
+/// remain outside this bootstrap traversal.
+fn native_previous_layer_three_prefix(
+    streams: &[(usize, Vec<u16>)],
+    incoming_pre: &[(usize, Vec<f32>)],
+) -> Vec<u16> {
+    assert_eq!(streams.len(), 3, "reduced source partition count");
+    assert_eq!(
+        incoming_pre.len(),
+        streams.len(),
+        "reduced source HC pre count"
+    );
+    let bootstrap_engram =
+        layer1_engram_capture::native_layer_one_block_entries_from_streams(Some(&streams[..2]));
+    let bootstrap_layer_one = layer1_join::native_layer_one_entries_from_engram_entries_with_pre(
+        &bootstrap_engram,
+        &incoming_pre[..2],
+    );
+    let bootstrap_layer_two =
+        layer2_join::native_layer_two_entries_from_entries(&bootstrap_layer_one);
+    let bootstrap_layer_three_streams = bootstrap_layer_two
+        .iter()
+        .map(|(start, residual, _)| (*start, residual.clone()))
+        .collect::<Vec<_>>();
+    let bootstrap_layer_three_engram =
+        engram_capture::native_layer_three_block_entries_from_streams(Some(
+            &bootstrap_layer_three_streams,
+        ));
+    let bootstrap_layer_three_pre = bootstrap_layer_two
+        .iter()
+        .map(|(start, _, pre)| (*start, pre.clone()))
+        .collect::<Vec<_>>();
+    let layer_three_fixture = layer_three_fixture();
+    let bootstrap_layer_three_inputs = native_layer_three_attention_inputs_from_entries(
+        &layer_three_fixture,
+        &bootstrap_layer_three_engram,
+        &bootstrap_layer_three_pre,
+    );
+    let layer_three = owner_attention_capture::native_layer_three_run_from_supplied_inputs(
+        &bootstrap_layer_three_inputs,
+    );
+    assert_eq!(
+        layer_three.outputs.len(),
+        2,
+        "prior publication must not execute start six"
+    );
+    layer_three.previous_call_key_prefix
 }
 
 #[test]
@@ -1491,6 +1584,59 @@ fn joined_suffix_rejects_corrupted_engram_entry() {
 
 fn native_layer_three_block_tail(f: &Fixture) -> Vec<BlockTailOutput> {
     native_layer_three_block_tail_from_entries(f, None, None)
+}
+
+fn native_layer_three_attention_inputs_from_entries(
+    f: &Fixture,
+    entries: &[(usize, Vec<u16>)],
+    incoming_pre: &[(usize, Vec<f32>)],
+) -> Vec<(usize, Vec<u16>)> {
+    assert!(
+        (1..=f.cases.len()).contains(&entries.len()),
+        "native layer-three entry prefix count"
+    );
+    assert_eq!(
+        incoming_pre.len(),
+        entries.len(),
+        "native layer-two pre prefix count"
+    );
+    let parameters = block_tail_parameters_for(f, 3);
+    f.cases
+        .iter()
+        .take(entries.len())
+        .zip(entries)
+        .zip(incoming_pre)
+        .map(|((case, (start, residual)), (native_start, pre))| {
+            assert_eq!(*start, case.start_pos);
+            assert_eq!(*native_start, case.start_pos, "native layer-two pre start");
+            assert_eq!(
+                *residual,
+                case.block_input.bf16(),
+                "native Engram layer-three entry"
+            );
+            assert_eq!(
+                pre.len(),
+                case.block_incoming_pre.fp32().len(),
+                "native layer-two pre width"
+            );
+            let input: Vec<_> = (0..case.input.shape[1])
+                .flat_map(|position| {
+                    derive_attention_input(
+                        &residual[position * 256..(position + 1) * 256],
+                        &pre[position * 2..(position + 1) * 2],
+                        &parameters.attn_norm,
+                        f.block_config.norm_eps,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                input,
+                case.attention_input.bf16(),
+                "native Engram HC attention input"
+            );
+            (case.start_pos, input)
+        })
+        .collect()
 }
 
 fn native_layer_three_block_tail_from_entries(

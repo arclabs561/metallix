@@ -611,7 +611,34 @@ pub(super) fn partial_score_with_native_layer_three_prefix(
 /// separately: source global score state was subsequently owned by layer three,
 /// whereas this owner retains its own key and KV prefixes.
 pub(super) fn native_publications() -> Vec<NativeCase> {
+    native_publications_with_previous_layer_three_prefix(None)
+}
+
+/// Replays the layer-one owner stream while publishing the previous layer-three
+/// score prefix at its source-visible start-five boundary. The override is
+/// consumed only by the following partial start-six score.
+pub(super) fn native_publications_with_previous_layer_three_prefix(
+    previous_layer_three_prefix: Option<&[u16]>,
+) -> Vec<NativeCase> {
     let fixture = fixture();
+    native_publications_with_previous_layer_three_prefix_for_calls(
+        previous_layer_three_prefix,
+        fixture.cases.len(),
+    )
+}
+
+/// Replays an ordered nonempty prefix of the source owner calls. This permits
+/// the preceding calls to publish their state without reading the following
+/// partial decode's operands.
+pub(super) fn native_publications_with_previous_layer_three_prefix_for_calls(
+    previous_layer_three_prefix: Option<&[u16]>,
+    call_count: usize,
+) -> Vec<NativeCase> {
+    let fixture = fixture();
+    assert!(
+        (1..=fixture.cases.len()).contains(&call_count),
+        "native layer-one owner call prefix"
+    );
     let all_frequencies = frequencies(&fixture.frequency_table);
     let wkv = fp32(parameter(&fixture, "layers.1.attn.compressor.wkv.weight"));
     let wgate = fp32(parameter(&fixture, "layers.1.attn.compressor.wgate.weight"));
@@ -634,7 +661,7 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
     let mut kv = Vec::new();
     let mut request_score_state = LayerThreeSharedScoreState::new();
     let mut outputs = Vec::new();
-    for case in &fixture.cases {
+    for case in fixture.cases.iter().take(call_count) {
         if case.start_pos == 0 {
             request_score_state.reset();
         }
@@ -649,16 +676,7 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
                 case.start_pos,
             )
             .expect("source ratio-two stream call");
-        match (&latent, &case.latent) {
-            (Some(actual), Some(expected)) => assert_eq!(
-                actual,
-                &bf16(expected),
-                "start {} compressor latent",
-                case.start_pos
-            ),
-            (None, None) => {}
-            _ => panic!("start {} latent publication disagrees", case.start_pos),
-        }
+        assert_latent_matches_source(case, latent.as_deref());
         if let Some(latent) = &latent {
             assert_eq!(case.group_frequency_positions.len(), latent.len() / 64);
             let mut selected = Vec::new();
@@ -691,8 +709,13 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         );
         assert_eq!(keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
-        if case.start_pos == 5 {
-            request_score_state.publish_layer_three(&prior_layer_three_prefix(&fixture));
+        if case.start_pos == 5 && call_count > outputs.len() + 1 {
+            publish_previous_layer_three_prefix(
+                &mut request_score_state,
+                &fixture,
+                &source_score_keys,
+                previous_layer_three_prefix,
+            );
         }
         let score_keys = request_score_state.score_keys_for(case, &keys, &source_score_keys);
         let selected_indices = assert_native_score(&fixture, case, &all_frequencies, &score_keys);
@@ -706,6 +729,39 @@ pub(super) fn native_publications() -> Vec<NativeCase> {
         });
     }
     outputs
+}
+
+fn assert_latent_matches_source(case: &Case, latent: Option<&[u16]>) {
+    match (latent, &case.latent) {
+        (Some(actual), Some(expected)) => assert_eq!(
+            actual,
+            &bf16(expected),
+            "start {} compressor latent",
+            case.start_pos
+        ),
+        (None, None) => {}
+        _ => panic!("start {} latent publication disagrees", case.start_pos),
+    }
+}
+
+/// Publishes the source-visible prior layer-three score keys for the following
+/// partial call. Native producers publish six keys after start five; the L1
+/// scorer consumes its source-qualified leading three-key window.
+fn publish_previous_layer_three_prefix(
+    state: &mut LayerThreeSharedScoreState,
+    fixture: &Fixture,
+    source_score_keys: &[u16],
+    previous_layer_three_prefix: Option<&[u16]>,
+) {
+    let prefix = if let Some(prefix) = previous_layer_three_prefix {
+        assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
+        prefix[..source_score_keys.len()].to_vec()
+    } else {
+        let captured = prior_layer_three_prefix(fixture);
+        assert_eq!(captured.len(), source_score_keys.len());
+        captured
+    };
+    state.publish_layer_three(&prefix);
 }
 
 /// Replacing the source's partial-decode score keys with the native layer-one

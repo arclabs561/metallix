@@ -37,9 +37,11 @@ pub(super) fn native_layer_two_entries_from_attention(
     entries: Option<&AttentionEntries>,
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let fixture = layer_two_fixture();
-    if let Some(entries) = entries {
-        assert_eq!(entries.len(), fixture.cases.len());
-    }
+    let call_count = entries.map_or(fixture.cases.len(), <[_]>::len);
+    assert!(
+        (1..=fixture.cases.len()).contains(&call_count),
+        "native layer-two FFN call prefix"
+    );
     let norm = fixture.block_parameters["layers.2.ffn_norm.weight"].bf16();
     let projection = fixture.block_parameters["layers.2.hc_ffn_fn"].fp32();
     let scale: [f32; 3] = fixture.block_parameters["layers.2.hc_ffn_scale"]
@@ -68,6 +70,7 @@ pub(super) fn native_layer_two_entries_from_attention(
             fixture
                 .cases
                 .iter()
+                .take(call_count)
                 .enumerate()
                 .map(|(index, case)| {
                     let positions = case.after_attention_residual.shape[1];

@@ -305,12 +305,20 @@ pub(super) fn native_outputs_from_inputs(inputs: &[(usize, Vec<u16>)]) -> Vec<(u
     let root = fixture();
     let frequencies = frequencies(&root);
     let weights = weights(&root);
-    let owner = layer1_owner_capture::native_publications();
-    let mut state = LayerAttentionState::new(layout(&root));
     let cases = field(&root, "cases").as_array().expect("source cases");
-    assert_eq!(inputs.len(), cases.len(), "source call count");
+    assert!(
+        (1..=cases.len()).contains(&inputs.len()),
+        "source call prefix count"
+    );
+    let owner =
+        layer1_owner_capture::native_publications_with_previous_layer_three_prefix_for_calls(
+            None,
+            inputs.len(),
+        );
+    let mut state = LayerAttentionState::new(layout(&root));
     cases
         .iter()
+        .take(inputs.len())
         .zip(inputs)
         .enumerate()
         .map(|(call_id, (case, (supplied_start, input)))| {

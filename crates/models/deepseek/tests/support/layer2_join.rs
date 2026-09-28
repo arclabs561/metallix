@@ -62,13 +62,16 @@ fn hc_fixture() -> HcFixture {
 pub(super) type BlockEntries = [(usize, Vec<u16>, Vec<f32>)];
 
 fn native_inputs(fixture: &HcFixture, entries: Option<&BlockEntries>) -> Vec<(usize, Vec<u16>)> {
-    if let Some(entries) = entries {
-        assert_eq!(entries.len(), fixture.cases.len());
-    }
+    let call_count = entries.map_or(fixture.cases.len(), <[_]>::len);
+    assert!(
+        (1..=fixture.cases.len()).contains(&call_count),
+        "native layer-two input call prefix"
+    );
     let norm = fixture.block_parameters["layers.2.attn_norm.weight"].bf16();
     fixture
         .cases
         .iter()
+        .take(call_count)
         .enumerate()
         .map(|(index, case)| {
             let captured_residual = case.residual.bf16();
@@ -200,10 +203,14 @@ fn handoffs(
     fixture: &HcFixture,
     outputs: &[(usize, Vec<u16>)],
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
-    assert_eq!(outputs.len(), fixture.cases.len());
+    assert!(
+        (1..=fixture.cases.len()).contains(&outputs.len()),
+        "native layer-two attention handoff prefix"
+    );
     fixture
         .cases
         .iter()
+        .take(outputs.len())
         .zip(outputs)
         .map(|(case, (start, attention))| {
             assert_eq!(*start, case.start_pos);
@@ -239,8 +246,7 @@ fn handoffs(
         .collect()
 }
 
-fn through_final_suffix(entries: &layer2_ffn::AttentionEntries) {
-    let layer_two = layer2_ffn::native_layer_two_entries_from_attention(Some(entries));
+fn through_final_suffix(layer_two: Vec<(usize, Vec<u16>, Vec<f32>)>) {
     let streams: Vec<_> = layer_two
         .iter()
         .map(|(start, residual, _)| (*start, residual.clone()))
@@ -262,10 +268,20 @@ fn through_final_suffix(entries: &layer2_ffn::AttentionEntries) {
 }
 
 pub(super) fn native_layer_two_from_entries(entries: &BlockEntries) {
+    let layer_two = native_layer_two_entries_from_entries(entries);
+    through_final_suffix(layer_two);
+}
+
+/// Continues the supplied native layer-one handoff through layer two, retaining
+/// the resulting residual/pre-mix pair for the layer-three producer.
+pub(super) fn native_layer_two_entries_from_entries(
+    entries: &BlockEntries,
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let fixture = hc_fixture();
     let inputs = native_inputs(&fixture, Some(entries));
     let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
-    through_final_suffix(&handoffs(&fixture, &outputs));
+    let attention = handoffs(&fixture, &outputs);
+    layer2_ffn::native_layer_two_entries_from_attention(Some(&attention))
 }
 
 #[test]
@@ -273,7 +289,10 @@ fn native_layer_two_attention_hc_ffn_reaches_final_logits() {
     let fixture = hc_fixture();
     let inputs = native_inputs(&fixture, None);
     let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
-    through_final_suffix(&handoffs(&fixture, &outputs));
+    let attention = handoffs(&fixture, &outputs);
+    through_final_suffix(layer2_ffn::native_layer_two_entries_from_attention(Some(
+        &attention,
+    )));
 }
 
 #[test]
