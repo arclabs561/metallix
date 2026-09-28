@@ -57,9 +57,12 @@ choices without expanding current support claims.
   compressor weights, MoE operands, and the final head. Standalone legacy
   wrappers retain their original identity gates. L1/L2 and the persistent L3
   owner/attention path still use legacy captures; this remains an incremental
-  migration, not a fully unified source trace. L4 also still reconstructs its
-  owner from captured L3 HC operands during finalization; bundle provenance
-  does not yet establish a live owner handoff from the persistent L3 session. The previous-call layer-three
+  migration, not a fully unified source trace. L4 now receives the exact input
+  history consumed successfully by the persistent L3 session, instead of
+  reconstructing those inputs from captured HC operands. Altered live input is
+  rejected without changing producer history; reset clears the history. L4 still
+  recomputes its owner from those live inputs during finalization. Direct reuse
+  of L3's committed key/KV publication remains a separate gate. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
@@ -359,6 +362,13 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
    whether a new native model adapter is worth its implementation cost.
 
 ## Validation
+
+The live L3 input handoff passes all 62 DeepSeek `forward_moe` tests. The new
+control changes a consumed L3 input and requires L4 rejection while leaving
+producer history intact; reset checks retain only the successful retry input.
+The captured-HC input decoder is no longer used by the unified L4 path and was
+removed. Owner recomputation remains explicit rather than being counted as
+publication reuse.
 
 The unified L4 attention/owner/MoE/head migration passes all 61 DeepSeek
 `forward_moe` tests and strict all-target/all-feature DeepSeek Clippy. Its controls

@@ -1061,12 +1061,18 @@ fn block_tail_from_entries(
     block_tail_from_entries_with_bundle(f, control, verify_contract, entries, None)
 }
 
+#[derive(Clone, Copy)]
+struct LayerFourBundleInputs<'a> {
+    bundle: &'a Value,
+    owner_inputs: &'a [(usize, Vec<u16>)],
+}
+
 fn block_tail_from_entries_with_bundle(
     f: &Fixture,
     control: BlockControl,
     verify_contract: bool,
     entries: Option<&[BlockTailOutput]>,
-    bundle: Option<&Value>,
+    bundle: Option<LayerFourBundleInputs<'_>>,
 ) -> Vec<BlockTailOutput> {
     if let Some(entries) = entries {
         assert_eq!(entries.len(), f.cases.len());
@@ -1343,7 +1349,7 @@ fn native_block_attention_outputs(
     f: &Fixture,
     parameters: &BlockTailParameters,
     entries: Option<&[BlockTailOutput]>,
-    bundle: Option<&Value>,
+    bundle: Option<LayerFourBundleInputs<'_>>,
 ) -> Vec<Vec<u16>> {
     let inputs = f
         .cases
@@ -1374,9 +1380,13 @@ fn native_block_attention_outputs(
     let outputs = if let Some(bundle) = bundle {
         assert_eq!(
             Some(f.source.complete_capture_sha256.as_str()),
-            bundle["source"]["complete_capture_sha256"].as_str()
+            bundle.bundle["source"]["complete_capture_sha256"].as_str()
         );
-        owner_attention_capture::native_outputs_from_bundle_inputs(&inputs, bundle)
+        owner_attention_capture::native_outputs_from_bundle_inputs(
+            &inputs,
+            bundle.bundle,
+            bundle.owner_inputs,
+        )
     } else {
         owner_attention_capture::native_outputs_from_ownered_inputs(
             &inputs,
@@ -1624,7 +1634,10 @@ impl ReducedLiveRequest {
             BlockControl::NativeAttention,
             true,
             Some(&third),
-            Some(&self.bundle),
+            Some(LayerFourBundleInputs {
+                bundle: &self.bundle,
+                owner_inputs: self.l3.as_ref().expect("completed L3 publisher").inputs(),
+            }),
         );
         assert_eq!(
             self.bundle["projections"]["head"]["schema_version"].as_u64(),
@@ -1737,6 +1750,46 @@ fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
         );
         assert_eq!(request.lifecycle, ReducedRequestLifecycle::Poisoned);
     }
+}
+
+#[test]
+fn layer_four_rejects_changed_live_layer_three_input() {
+    let request = completed_reduced_request();
+    let publisher = request.l3.as_ref().unwrap();
+    let original = publisher.inputs().to_vec();
+    assert_eq!(
+        original.iter().map(|(start, _)| *start).collect::<Vec<_>>(),
+        [0, 5, 6]
+    );
+    let attention_inputs = request.bundle["projections"]["layer4_attention"]["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|case| {
+            let tensor: Tensor = serde_json::from_value(case["input"].clone()).unwrap();
+            (
+                usize::try_from(case["start_pos"].as_u64().unwrap()).unwrap(),
+                tensor.bf16(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut changed = original.clone();
+    changed[2].1[0] ^= 1;
+    assert!(
+        std::panic::catch_unwind(
+            || owner_attention_capture::native_outputs_from_bundle_inputs(
+                &attention_inputs,
+                &request.bundle,
+                &changed
+            )
+        )
+        .is_err()
+    );
+    assert_eq!(
+        publisher.inputs(),
+        original,
+        "consumer rejection leaves producer history unchanged"
+    );
 }
 
 fn assert_finalization_failure_requires_restart(request: &mut ReducedLiveRequest) {

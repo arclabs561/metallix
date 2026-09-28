@@ -781,7 +781,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
                 candidate_capture::captured_attention_input(case.start_pos),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
     native_outputs_from_parts(
         supplied_inputs,
         expected_capture_sha256,
@@ -801,6 +801,7 @@ pub(super) fn native_outputs_from_ownered_inputs(
 pub(super) fn native_outputs_from_bundle_inputs(
     supplied_inputs: &[(usize, Vec<u16>)],
     bundle: &Value,
+    live_owner_inputs: &[(usize, Vec<u16>)],
 ) -> Vec<Vec<u16>> {
     assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
     // Pin every source field to the checked-in capture metadata, including
@@ -860,9 +861,6 @@ pub(super) fn native_outputs_from_bundle_inputs(
     let owner = projection("layer3_index_key");
     let compressor = projection("layer3_compressor");
     let candidate = projection("layer3_candidate");
-    let candidate_raw =
-        serde_json::to_string(&candidate).expect("serialize bundle candidate projection");
-    let owner_inputs = candidate_hc_capture::derived_inputs_from_json(&candidate_raw, capture);
     let candidate_oracle_inputs = field(&candidate, "cases")
         .as_array()
         .expect("bundle candidate cases")
@@ -873,7 +871,18 @@ pub(super) fn native_outputs_from_bundle_inputs(
                 bf16(field(case, "attention_input")),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
+    assert_eq!(
+        live_owner_inputs.len(),
+        candidate_oracle_inputs.len(),
+        "live L3 input count"
+    );
+    for ((live_start, live_input), (source_start, source_input)) in
+        live_owner_inputs.iter().zip(&candidate_oracle_inputs)
+    {
+        assert_eq!(*live_start, *source_start, "live L3 input start");
+        assert_eq!(live_input.len(), source_input.len(), "live L3 input shape");
+    }
     native_outputs_from_parts(
         supplied_inputs,
         capture,
@@ -882,7 +891,7 @@ pub(super) fn native_outputs_from_bundle_inputs(
             attention,
             owner,
             compressor,
-            owner_inputs,
+            owner_inputs: live_owner_inputs.to_vec(),
             candidate_oracle_inputs,
             candidate_projection: Some((&candidate, capture)),
         },
@@ -914,6 +923,7 @@ pub(super) struct NativeLayerThreePublisher {
     attention_state: LayerAttentionState,
     next_call: usize,
     outputs: Vec<Vec<u16>>,
+    inputs: Vec<(usize, Vec<u16>)>,
     previous_call_key_prefix: Option<Vec<u16>>,
 }
 
@@ -945,6 +955,7 @@ impl NativeLayerThreePublisher {
             attention_state: LayerAttentionState::new(attention_layout(&attention.model)),
             next_call: 0,
             outputs: Vec::new(),
+            inputs: Vec::new(),
             previous_call_key_prefix: None,
         }
     }
@@ -1080,6 +1091,7 @@ impl NativeLayerThreePublisher {
             self.previous_call_key_prefix = Some(prefix.to_vec());
         }
         self.next_call += 1;
+        self.inputs.push((start, owner_input.to_vec()));
         self.outputs.push(diagnostic.final_output.clone());
         diagnostic.final_output
     }
@@ -1151,6 +1163,10 @@ impl NativeLayerThreePublisher {
             .expect("start-five publication before partial L1")
     }
 
+    pub(super) fn inputs(&self) -> &[(usize, Vec<u16>)] {
+        &self.inputs
+    }
+
     pub(super) fn outputs(&self) -> &[Vec<u16>] {
         &self.outputs
     }
@@ -1171,8 +1187,15 @@ impl NativeLayerThreePublisher {
         self.attention_state.reset().expect("attention reset");
         self.next_call = 0;
         self.outputs.clear();
+        self.inputs.clear();
         self.previous_call_key_prefix = None;
         let _ = self.step(retry);
+        assert_eq!(
+            self.inputs.len(),
+            1,
+            "reset retry keeps one successful input"
+        );
+        assert_eq!(self.inputs[0], *retry, "reset retry input history");
         assert!(
             !self
                 .key_owner
