@@ -61,7 +61,8 @@ choices without expanding current support claims.
   The persistent L3 Engram, owner, compressor, candidate selection and attention now
   retain caller-supplied unified-bundle operands. The bootstrap uses unified L3
   HC parameters too. Standalone legacy wrappers retain their identity gates.
-  L1/L2 still use legacy captures; this remains an incremental
+  L2 now retains unified HC, attention and FFN operands and requires the live
+  L1 publication. L1 still uses legacy captures; this remains an incremental
   migration, not a fully unified source trace. The previous-call layer-three
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
@@ -362,6 +363,14 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
    whether a new native model adapter is worth its implementation cost.
 
 ## Validation
+
+The persistent L2 session retains unified HC, attention and FFN operands, and
+requires the live L1 publication instead of replaying a legacy owner. All 70
+DeepSeek `forward_moe` tests pass, including changed-weight/source rejection
+and the absent-publication control. Strict all-target/all-feature Clippy passes;
+the canonical Metal check still stops at the unchanged Julia encoder mismatch.
+Receipts: `.agents/receipts/candidate-control/unified-l2-*`.
+
 
 The persistent L3 path now consumes unified-bundle Engram, owner/compressor,
 candidate and attention operands, with bootstrap HC from the same bundle.

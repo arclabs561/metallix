@@ -5,9 +5,10 @@ use super::{
     with_model_parameters,
 };
 use deepseek::{ffn::FfnSublayerReference, hc::projection::project_hc_diagnostics};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-fn layer_two_fixture() -> LayerTwoFixture {
+fn fixture() -> LayerTwoFixture {
     let source = include_str!("../../../../../fixtures/deepseek-v41/layer2-ffn-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(source.as_bytes())),
@@ -15,6 +16,39 @@ fn layer_two_fixture() -> LayerTwoFixture {
         "pinned layer-two source capture"
     );
     let fixture: LayerTwoFixture = serde_json::from_str(source).unwrap();
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 5, 6]
+    );
+    fixture
+}
+
+/// Decodes the L2 FFN projection from the unified reduced-runner bundle.
+/// Pinned source records identify the allowed capture; the returned fixture's
+/// numerical tensors are exclusively the caller-supplied projection.
+pub(super) fn fixture_from_bundle(bundle: &Value) -> LayerTwoFixture {
+    assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned reduced bundle metadata");
+    assert_eq!(bundle["source"], pinned["source"], "bundle source metadata");
+    let raw = bundle["projections"]["layer2_ffn"].clone();
+    assert_eq!(raw["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        raw["source"], pinned["projections"]["layer2_ffn"]["source"],
+        "layer2_ffn source metadata"
+    );
+    assert_eq!(
+        raw["source"]["complete_capture_sha256"], bundle["source"]["complete_capture_sha256"],
+        "layer2_ffn capture"
+    );
+    let fixture: LayerTwoFixture = serde_json::from_value(raw).expect("bundled layer-two FFN");
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(
         fixture
@@ -36,7 +70,17 @@ pub(super) type AttentionEntries = [(usize, Vec<u16>, Vec<f32>)];
 pub(super) fn native_layer_two_entries_from_attention(
     entries: Option<&AttentionEntries>,
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
-    let fixture = layer_two_fixture();
+    let fixture = fixture();
+    native_layer_two_entries_from_attention_with_fixture(&fixture, entries)
+}
+
+/// Executes the existing exact FFN boundary against a retained fixture.  The
+/// live L2 session supplies a unified-bundle fixture; standalone callers keep
+/// using the pinned legacy fixture through the wrapper above.
+pub(super) fn native_layer_two_entries_from_attention_with_fixture(
+    fixture: &LayerTwoFixture,
+    entries: Option<&AttentionEntries>,
+) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     let call_count = entries.map_or(fixture.cases.len(), <[_]>::len);
     assert!(
         (1..=fixture.cases.len()).contains(&call_count),
@@ -121,7 +165,7 @@ pub(super) fn native_layer_two_entries_from_attention(
                             result.moe().output_bf16(),
                             &expected_moe[position * 128..(position + 1) * 128]
                         );
-                        assert_layer_two_next_pre_envelope(&fixture, case, position, &result);
+                        assert_layer_two_next_pre_envelope(fixture, case, position, &result);
                         output.extend_from_slice(result.output_bf16());
                         next.extend_from_slice(result.coefficients().pre());
                     }

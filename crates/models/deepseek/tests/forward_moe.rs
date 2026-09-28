@@ -1536,7 +1536,7 @@ impl ReducedLiveRequest {
         .expect("unified reduced bundle");
         Self {
             l1: layer1_join::NativeLayerOneSession::new(),
-            l2: layer2_join::NativeLayerTwoSession::new(),
+            l2: layer2_join::NativeLayerTwoSession::from_bundle(&bundle),
             engram3: engram_capture::NativeLayerThreeEngramSession::from_bundle(&bundle),
             l3_fixture: layer_three_fixture_from_bundle(&bundle),
             bundle,
@@ -1698,6 +1698,73 @@ fn completed_reduced_request() -> ReducedLiveRequest {
         );
     }
     request
+}
+
+fn unified_l2_session_fixture() -> (Value, (usize, Vec<u16>, Vec<f32>)) {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("unified bundle");
+    let case = &bundle["projections"]["layer2_hc"]["cases"][0];
+    let residual: Tensor = serde_json::from_value(case["residual"].clone()).unwrap();
+    let pre: Tensor = serde_json::from_value(case["incoming_pre"].clone()).unwrap();
+    let input = (0, residual.bf16(), pre.fp32());
+    (bundle, input)
+}
+
+#[test]
+fn unified_l2_rejects_changed_source_metadata() {
+    let (bundle, _) = unified_l2_session_fixture();
+    for name in ["layer2_hc", "layer2_attention", "layer2_ffn"] {
+        let mut changed = bundle.clone();
+        changed["projections"][name]["source"]["loader_sha256"] = Value::String("0".repeat(64));
+        assert!(
+            std::panic::catch_unwind(|| layer2_join::NativeLayerTwoSession::from_bundle(&changed))
+                .is_err(),
+            "changed source accepted: {name}"
+        );
+    }
+}
+
+#[test]
+fn unified_l2_consumes_supplied_weights() {
+    let (bundle, input) = unified_l2_session_fixture();
+    let mut producer = layer1_owner_capture::NativeLayerOneOwnerSession::new(None);
+    let publication = producer.step();
+    for (projection, container, weight) in [
+        ("layer2_hc", "block_parameters", "layers.2.attn_norm.weight"),
+        (
+            "layer2_attention",
+            "encoded_parameters",
+            "layers.2.attn.q_norm.weight",
+        ),
+        ("layer2_ffn", "block_parameters", "layers.2.ffn_norm.weight"),
+    ] {
+        let mut changed = bundle.clone();
+        let tensor = &mut changed["projections"][projection][container][weight];
+        let bytes = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
+        tensor["storage_hex"] = Value::String("0".repeat(bytes.len() * 2));
+        tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&bytes)));
+        let mut session = layer2_join::NativeLayerTwoSession::from_bundle(&changed);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || session.step(&input, Some(&publication))
+            ))
+            .is_err(),
+            "changed supplied weight bypassed: {projection}"
+        );
+    }
+}
+
+#[test]
+fn unified_l2_requires_live_l1_publication() {
+    let (bundle, input) = unified_l2_session_fixture();
+    let mut session = layer2_join::NativeLayerTwoSession::from_bundle(&bundle);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.step(&input, None)))
+            .is_err(),
+        "bundled L2 must not replay a legacy L1 owner"
+    );
 }
 
 fn unified_l3_publisher_fixture() -> (Value, Vec<(usize, Vec<u16>)>) {

@@ -319,18 +319,55 @@ pub(super) struct NativeLayerTwoAttentionSession {
     frequencies: Vec<RotaryFrequency>,
     weights: Weights,
     state: LayerAttentionState,
-    owner: layer1_owner_capture::NativeLayerOneOwnerSession,
+    owner: Option<layer1_owner_capture::NativeLayerOneOwnerSession>,
     next_case: usize,
 }
 
 impl NativeLayerTwoAttentionSession {
     pub(super) fn new() -> Self {
-        let root = fixture();
+        Self::from_root(fixture(), true)
+    }
+
+    /// Starts the persistent layer-two attention from the caller's unified
+    /// bundle. Source identity is pinned to the checked-in capture while the
+    /// numerical attention operands come from the supplied projection.
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
+        assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
+        let pinned: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+        ))
+        .expect("pinned reduced bundle metadata");
+        assert_eq!(
+            field(bundle, "source"),
+            field(&pinned, "source"),
+            "bundle source metadata"
+        );
+        let projection = field(field(bundle, "projections"), "layer2_attention");
+        assert_eq!(field(projection, "schema_version").as_u64(), Some(1));
+        assert_eq!(
+            field(projection, "source"),
+            field(&field(&pinned, "projections")["layer2_attention"], "source"),
+            "layer-two attention source metadata"
+        );
+        Self::from_root(projection.clone(), false)
+    }
+
+    fn from_root(root: Value, legacy_owner: bool) -> Self {
+        assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
+        assert_eq!(
+            field(field(&root, "source"), "revision").as_str(),
+            Some(REVISION)
+        );
+        assert_eq!(
+            field(field(&root, "source"), "storage_byteorder").as_str(),
+            Some("little")
+        );
         Self {
             frequencies: frequencies(&root),
             weights: weights(&root),
             state: LayerAttentionState::new(layout(&root)),
-            owner: layer1_owner_capture::NativeLayerOneOwnerSession::new(None),
+            owner: legacy_owner
+                .then(|| layer1_owner_capture::NativeLayerOneOwnerSession::new(None)),
             root,
             next_case: 0,
         }
@@ -371,7 +408,12 @@ impl NativeLayerTwoAttentionSession {
             i32s(field(case, "compressed_indices")),
             "start {start} source layer-one IDs boundary"
         );
-        let owner = live_owner.cloned().unwrap_or_else(|| self.owner.step());
+        let owner = live_owner.cloned().unwrap_or_else(|| {
+            self.owner
+                .as_mut()
+                .expect("bundle layer-two attention requires a live layer-one publication")
+                .step()
+        });
         assert_eq!(owner.start_pos, start);
         assert_eq!(
             owner.kv_prefix, source_kv,

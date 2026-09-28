@@ -7,6 +7,7 @@ use deepseek::hc::{
     HcCoefficients, mixing::hc_post_bf16_reference, projection::project_hc_diagnostics,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -43,6 +44,43 @@ fn hc_fixture() -> HcFixture {
         "9bc422171d741516879dd3e14dd856fc1b099e9521190d4da75e1c8ba1722edf"
     );
     let fixture: HcFixture = serde_json::from_str(raw).unwrap();
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(fixture.block_config.copies, 2);
+    assert_eq!(fixture.block_config.hc_sinkhorn_iters, 20);
+    assert_eq!(fixture.block_config.norm_eps.to_bits(), 1e-20_f32.to_bits());
+    assert_eq!(fixture.block_config.hc_eps.to_bits(), 1e-6_f32.to_bits());
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 5, 6]
+    );
+    fixture
+}
+
+/// Decodes L2's HC projection from the unified reduced-runner bundle.  The
+/// source record is pinned for identity while all retained HC tensors come
+/// from the caller's projection.
+fn hc_fixture_from_bundle(bundle: &Value) -> HcFixture {
+    assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned reduced bundle metadata");
+    assert_eq!(bundle["source"], pinned["source"], "bundle source metadata");
+    let raw = bundle["projections"]["layer2_hc"].clone();
+    assert_eq!(raw["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        raw["source"], pinned["projections"]["layer2_hc"]["source"],
+        "layer2_hc source metadata"
+    );
+    assert_eq!(
+        raw["source"]["complete_capture_sha256"], bundle["source"]["complete_capture_sha256"],
+        "layer2_hc capture"
+    );
+    let fixture: HcFixture = serde_json::from_value(raw).expect("bundled layer-two HC");
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.block_config.copies, 2);
     assert_eq!(fixture.block_config.hc_sinkhorn_iters, 20);
@@ -289,15 +327,21 @@ pub(super) fn native_layer_two_entries_from_entries(
 /// live L1 partitions. FFN remains the existing exact source boundary.
 pub(super) struct NativeLayerTwoSession {
     fixture: HcFixture,
+    ffn: super::LayerTwoFixture,
     attention: layer2_attention_capture::NativeLayerTwoAttentionSession,
     next_case: usize,
 }
 
 impl NativeLayerTwoSession {
-    pub(super) fn new() -> Self {
+    /// Starts the persistent L2 join from the caller's unified bundle.  HC,
+    /// attention, and FFN each retain their own validated projection.
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
         Self {
-            fixture: hc_fixture(),
-            attention: layer2_attention_capture::NativeLayerTwoAttentionSession::new(),
+            fixture: hc_fixture_from_bundle(bundle),
+            ffn: layer2_ffn::fixture_from_bundle(bundle),
+            attention: layer2_attention_capture::NativeLayerTwoAttentionSession::from_bundle(
+                bundle,
+            ),
             next_case: 0,
         }
     }
@@ -336,7 +380,10 @@ impl NativeLayerTwoSession {
             .attention
             .step_with_publication(&(*start, input), live_owner);
         let handoff = handoffs(&self.fixture, &[output]);
-        let result = layer2_ffn::native_layer_two_entries_from_attention(Some(&handoff));
+        let result = layer2_ffn::native_layer_two_entries_from_attention_with_fixture(
+            &self.ffn,
+            Some(&handoff),
+        );
         self.next_case += 1;
         result.into_iter().next().expect("one native L2 result")
     }
