@@ -23,6 +23,7 @@ use attention_capture::{
     weights as attention_weights,
 };
 use deepseek::{
+    RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionState},
     indexer::{
         cache::IndexKeyPublicationId,
@@ -748,79 +749,63 @@ pub(super) struct NativeLayerThreeRun {
     pub(super) previous_call_key_prefix: Vec<u16>,
 }
 
-/// Continues layer-three owner publication and attention from a caller-provided
-/// normalized layer input. The captured HC path remains the default wrapper;
-/// Engram integration supplies the HC/RMSNorm result derived from its native
-/// BF16 residual here.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the source owner operands remain explicit"
-)]
-pub(super) fn native_layer_three_outputs_from_supplied_inputs(
-    owner_inputs: &[(usize, Vec<u16>)],
-) -> Vec<Vec<u16>> {
-    native_layer_three_run_from_supplied_inputs(owner_inputs).outputs
+/// Test-private request owner for the source-shaped L3 producer and attention.
+/// Each `step` advances the same coupled production cache; it never recreates
+/// the preceding prefix while a later source partition is processed.
+pub(super) struct NativeLayerThreePublisher {
+    key_owner: RatioOneCompressedOwner,
+    attention_state: LayerAttentionState,
+    next_call: usize,
+    outputs: Vec<Vec<u16>>,
+    previous_call_key_prefix: Option<Vec<u16>>,
 }
 
-/// Runs the source-shaped layer-three calls while retaining the publication
-/// produced after the preceding call. The partial layer-one score consumes its
-/// leading three keys, not the layer-one owner cache.
-#[allow(
-    clippy::too_many_lines,
-    reason = "the source owner operands remain explicit"
-)]
-pub(super) fn native_layer_three_run_from_supplied_inputs(
-    owner_inputs: &[(usize, Vec<u16>)],
-) -> NativeLayerThreeRun {
-    let raw = raw_fixture();
-    let attention = attention_capture::layer_three_fixture();
-    let owner: Value = serde_json::from_str(include_str!(
-        "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
-    ))
-    .expect("owner fixture");
-    let owner_model = field(&owner, "model");
-    let owner_cases = field(&owner, "cases").as_array().expect("owner calls");
-    assert_eq!(owner_cases.len(), attention.cases.len());
-    assert!(
-        (2..=attention.cases.len()).contains(&owner_inputs.len()),
-        "layer-three prior publication requires exactly the prefill and prior decode, or the full source trace"
-    );
-    let owner_weights = field(&owner, "weights");
-    let wk = bf16(field(owner_weights, "wk"));
-    let norm = bf16(field(owner_weights, "norm"));
-    let compressor = compressor_fixture();
-    let compressor_cases = field(&compressor, "cases")
-        .as_array()
-        .expect("compressor calls");
-    let compressor_weights = field(&compressor, "weights");
-    let wkv = bf16(field(compressor_weights, "wkv"));
-    let compressor_norm = bf16(field(compressor_weights, "norm"));
-    let key_layout = IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
-        .expect("captured key layout");
-    let weights = RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &norm));
-    let mut key_owner = RatioOneCompressedOwner::new(
-        key_layout,
-        nonzero(128),
-        nonzero(usize_field(owner_model, "cache_capacity")),
-        3,
-        &compressor_norm,
-        1e-20,
-    )
-    .expect("bounded atomic owner");
-    let all_frequencies = frequencies(&attention);
-    let attention_weights = attention_capture::weights_for_layer(&attention.encoded_parameters, 3);
-    let mut state = LayerAttentionState::new(attention_layout(&attention.model));
-    let mut outputs = Vec::with_capacity(owner_inputs.len());
-    let mut previous_call_key_prefix = None;
-    for (call_id, ((attention_case, owner_case), compressor_case)) in attention
-        .cases
-        .iter()
-        .zip(owner_cases)
-        .zip(compressor_cases)
-        .take(owner_inputs.len())
-        .enumerate()
-    {
-        let (start, owner_input) = &owner_inputs[call_id];
+impl NativeLayerThreePublisher {
+    pub(super) fn new() -> Self {
+        let owner: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+        ))
+        .expect("owner fixture");
+        let owner_model = field(&owner, "model");
+        let compressor = compressor_fixture();
+        let compressor_weights = field(&compressor, "weights");
+        let compressor_norm = bf16(field(compressor_weights, "norm"));
+        let key_layout =
+            IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
+                .expect("captured key layout");
+        let key_owner = RatioOneCompressedOwner::new(
+            key_layout,
+            nonzero(128),
+            nonzero(usize_field(owner_model, "cache_capacity")),
+            3,
+            &compressor_norm,
+            1e-20,
+        )
+        .expect("bounded atomic owner");
+        let attention = attention_capture::layer_three_fixture();
+        Self {
+            key_owner,
+            attention_state: LayerAttentionState::new(attention_layout(&attention.model)),
+            next_call: 0,
+            outputs: Vec::new(),
+            previous_call_key_prefix: None,
+        }
+    }
+
+    pub(super) fn step(&mut self, supplied: &(usize, Vec<u16>)) -> Vec<u16> {
+        let raw = raw_fixture();
+        let attention = attention_capture::layer_three_fixture();
+        let owner: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+        ))
+        .expect("owner fixture");
+        let compressor = compressor_fixture();
+        let attention_case = &attention.cases[self.next_call];
+        let owner_case = &field(&owner, "cases").as_array().expect("owner calls")[self.next_call];
+        let compressor_case = &field(&compressor, "cases")
+            .as_array()
+            .expect("compressor calls")[self.next_call];
+        let (start, owner_input) = supplied;
         assert_eq!(*start, attention_case.start_pos, "HC attention start");
         assert_eq!(
             owner_input,
@@ -833,90 +818,40 @@ pub(super) fn native_layer_three_run_from_supplied_inputs(
             *start,
             "compressor start"
         );
-        let positions = shape(field(owner_case, "latent"))[1];
         assert_eq!(
             owner_input,
             &bf16(field(compressor_case, "attention_input")),
             "owner input"
         );
+        let positions = shape(field(owner_case, "latent"))[1];
+        let owner_weights = field(&owner, "weights");
+        let compressor_weights = field(&compressor, "weights");
+        let wk = bf16(field(owner_weights, "wk"));
+        let norm = bf16(field(owner_weights, "norm"));
+        let wkv = bf16(field(compressor_weights, "wkv"));
+        let weights = RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &norm));
+        let epoch = self.key_owner.epoch();
         let publication =
-            IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("call ID"));
+            IndexKeyPublicationId::new(3, epoch, u64::try_from(self.next_call).expect("call ID"));
         let owner_frequencies = source_frequencies(&raw, *start, positions, 16);
-        let owner_call = RatioOneOwnerCall::new(
+        self.assert_rejected_retry(
             publication,
             *start,
-            nonzero(positions),
+            positions,
             owner_input,
             &owner_frequencies,
             weights,
         );
-        if call_id == 0 {
-            let rejected = key_owner.prepare(RatioOneOwnerCall::new(
+        let pending = self
+            .key_owner
+            .prepare(RatioOneOwnerCall::new(
                 publication,
                 *start,
                 nonzero(positions),
-                &owner_input[..owner_input.len() - 1],
+                owner_input,
                 &owner_frequencies,
                 weights,
-            ));
-            assert!(rejected.is_err(), "short producer input must reject");
-            assert!(
-                key_owner
-                    .key_prefix(0)
-                    .expect("rejected key prefix")
-                    .is_empty(),
-                "rejected producer update must remain invisible"
-            );
-            assert_eq!(
-                key_owner.next_call_id(),
-                0,
-                "rejected call keeps same ID retryable"
-            );
-        } else if call_id == 1 {
-            let key_before = key_owner.key_prefix(0).expect("live key prefix").to_vec();
-            let kv_before = key_owner.kv_prefix(0).expect("live KV prefix").to_vec();
-            let metadata = (
-                key_owner.epoch(),
-                key_owner.next_call_id(),
-                key_owner.next_position(),
-                key_owner.valid_positions(),
-            );
-            let rejected = key_owner.prepare(RatioOneOwnerCall::new(
-                publication,
-                *start,
-                nonzero(positions),
-                &owner_input[..owner_input.len() - 1],
-                &owner_frequencies,
-                weights,
-            ));
-            assert!(rejected.is_err(), "short producer continuation must reject");
-            assert_eq!(
-                key_owner
-                    .key_prefix(0)
-                    .expect("rejected continuation key prefix"),
-                key_before,
-                "rejected continuation preserves published key prefix"
-            );
-            assert_eq!(
-                key_owner
-                    .kv_prefix(0)
-                    .expect("rejected continuation KV prefix"),
-                kv_before,
-                "rejected continuation preserves published KV prefix"
-            );
-            assert_eq!(
-                (
-                    key_owner.epoch(),
-                    key_owner.next_call_id(),
-                    key_owner.next_position(),
-                    key_owner.valid_positions(),
-                ),
-                metadata,
-                "rejected continuation is invisible and keeps same ID retryable"
-            );
-        }
-        let pending = key_owner
-            .prepare(owner_call)
+            ))
             .expect("staged owner publication");
         let keys = pending.key_prefix(0).expect("complete staged key prefix");
         let call = SelectionCall::new(
@@ -933,11 +868,16 @@ pub(super) fn native_layer_three_run_from_supplied_inputs(
         );
         assert_eq!(
             call,
-            candidate_capture::source_call(*start),
+            candidate_capture::source_call_in_epoch(*start, epoch),
             "producer call identity"
         );
-        let indices =
-            candidate_capture::generated_producer_indices(*start, keys, call, owner_input);
+        let indices = candidate_capture::generated_producer_indices_in_epoch(
+            *start,
+            keys,
+            call,
+            owner_input,
+            epoch,
+        );
         assert_eq!(
             indices,
             attention_case.compressed_indices.i32(),
@@ -949,64 +889,166 @@ pub(super) fn native_layer_three_run_from_supplied_inputs(
             "native staged KV prefix"
         );
         pending.commit().expect("owner publication commit");
+        self.forward_published_attention(&attention, attention_case, *start, owner_input, &indices)
+    }
+
+    fn forward_published_attention(
+        &mut self,
+        attention: &attention_capture::Fixture,
+        attention_case: &attention_capture::Case,
+        start: usize,
+        owner_input: &[u16],
+        indices: &[i32],
+    ) -> Vec<u16> {
+        let all_frequencies = frequencies(attention);
+        let attention_weights =
+            attention_capture::weights_for_layer(&attention.encoded_parameters, 3);
         let diagnostic = forward_with_publication(
-            &mut state,
+            &mut self.attention_state,
             owner_input,
-            *start,
-            key_owner.epoch(),
-            u64::try_from(call_id).expect("call ID"),
+            start,
+            self.key_owner.epoch(),
+            u64::try_from(self.next_call).expect("call ID"),
             SOURCE_LAYER,
-            key_owner.kv_prefix(0).expect("published KV prefix"),
-            &indices,
+            self.key_owner.kv_prefix(0).expect("published KV prefix"),
+            indices,
             call_frequencies(&all_frequencies, attention_case),
             attention_weights.borrowed(),
         )
         .expect("native owner and producer publication drives layer-three attention");
         assert_diagnostic(attention_case, &diagnostic);
-        if call_id == 1 {
-            let prefix = key_owner.key_prefix(0).expect("published key prefix");
+        if self.next_call == 1 {
+            let prefix = self.key_owner.key_prefix(0).expect("published key prefix");
             assert_eq!(prefix.len(), 6 * 64, "start-five layer-three key prefix");
-            previous_call_key_prefix = Some(prefix.to_vec());
+            self.previous_call_key_prefix = Some(prefix.to_vec());
         }
-        outputs.push(diagnostic.final_output);
+        self.next_call += 1;
+        self.outputs.push(diagnostic.final_output.clone());
+        diagnostic.final_output
     }
-    key_owner.reset().expect("producer reset");
-    assert!(
-        key_owner
+
+    fn assert_rejected_retry(
+        &mut self,
+        publication: IndexKeyPublicationId,
+        start: usize,
+        positions: usize,
+        input: &[u16],
+        frequencies: &[RotaryFrequency],
+        weights: RatioOneOwnerWeights<'_>,
+    ) {
+        if self.next_call > 1 {
+            return;
+        }
+        let key_before = self
+            .key_owner
             .key_prefix(0)
-            .expect("reset key prefix")
-            .is_empty(),
-        "producer reset clears the prior request publication"
-    );
-    assert_eq!(
-        key_owner.next_call_id(),
-        0,
-        "reset restarts publication ordinal"
-    );
-    let (retry_start, retry_input) = &owner_inputs[0];
-    let retry_positions = shape(field(&owner_cases[0], "latent"))[1];
-    let retry_frequencies = source_frequencies(&raw, *retry_start, retry_positions, 16);
-    let retry = key_owner
-        .prepare(RatioOneOwnerCall::new(
-            IndexKeyPublicationId::new(3, key_owner.epoch(), 0),
-            *retry_start,
-            nonzero(retry_positions),
-            retry_input,
-            &retry_frequencies,
-            weights,
-        ))
-        .expect("reset producer accepts a new request");
-    retry.commit().expect("reset producer publication commit");
+            .expect("live key prefix")
+            .to_vec();
+        let kv_before = self
+            .key_owner
+            .kv_prefix(0)
+            .expect("live KV prefix")
+            .to_vec();
+        let metadata = (
+            self.key_owner.epoch(),
+            self.key_owner.next_call_id(),
+            self.key_owner.next_position(),
+            self.key_owner.valid_positions(),
+        );
+        assert!(
+            self.key_owner
+                .prepare(RatioOneOwnerCall::new(
+                    publication,
+                    start,
+                    nonzero(positions),
+                    &input[..input.len() - 1],
+                    frequencies,
+                    weights,
+                ))
+                .is_err(),
+            "short producer input must reject"
+        );
+        assert_eq!(
+            self.key_owner.key_prefix(0).expect("rejected key prefix"),
+            key_before
+        );
+        assert_eq!(
+            self.key_owner.kv_prefix(0).expect("rejected KV prefix"),
+            kv_before
+        );
+        assert_eq!(
+            (
+                self.key_owner.epoch(),
+                self.key_owner.next_call_id(),
+                self.key_owner.next_position(),
+                self.key_owner.valid_positions()
+            ),
+            metadata,
+            "rejected producer update is invisible and same ID remains retryable"
+        );
+    }
+
+    pub(super) fn previous_call_key_prefix(&self) -> &[u16] {
+        self.previous_call_key_prefix
+            .as_deref()
+            .expect("start-five publication before partial L1")
+    }
+
+    pub(super) fn outputs(&self) -> &[Vec<u16>] {
+        &self.outputs
+    }
+
+    pub(super) fn reset_and_retry(&mut self, retry: &(usize, Vec<u16>)) {
+        self.key_owner.reset().expect("producer reset");
+        assert!(
+            self.key_owner
+                .key_prefix(0)
+                .expect("reset key prefix")
+                .is_empty()
+        );
+        assert_eq!(
+            self.key_owner.next_call_id(),
+            0,
+            "reset restarts publication ordinal"
+        );
+        self.attention_state.reset().expect("attention reset");
+        self.next_call = 0;
+        self.outputs.clear();
+        self.previous_call_key_prefix = None;
+        let _ = self.step(retry);
+        assert!(
+            !self
+                .key_owner
+                .key_prefix(0)
+                .expect("retry key prefix")
+                .is_empty()
+        );
+    }
+}
+
+pub(super) fn native_layer_three_outputs_from_supplied_inputs(
+    owner_inputs: &[(usize, Vec<u16>)],
+) -> Vec<Vec<u16>> {
+    native_layer_three_run_from_supplied_inputs(owner_inputs).outputs
+}
+
+/// Runs a bounded source sequence through one live request-local owner.
+pub(super) fn native_layer_three_run_from_supplied_inputs(
+    owner_inputs: &[(usize, Vec<u16>)],
+) -> NativeLayerThreeRun {
     assert!(
-        !key_owner
-            .key_prefix(0)
-            .expect("retry key prefix")
-            .is_empty(),
-        "new request publishes after reset"
+        (2..=3).contains(&owner_inputs.len()),
+        "bounded layer-three source sequence"
     );
+    let mut publisher = NativeLayerThreePublisher::new();
+    for input in owner_inputs {
+        publisher.step(input);
+    }
+    let prefix = publisher.previous_call_key_prefix().to_vec();
+    let outputs = publisher.outputs().to_vec();
+    publisher.reset_and_retry(&owner_inputs[0]);
     NativeLayerThreeRun {
         outputs,
-        previous_call_key_prefix: previous_call_key_prefix
-            .expect("layer-three start-five publication before partial layer-one"),
+        previous_call_key_prefix: prefix,
     }
 }

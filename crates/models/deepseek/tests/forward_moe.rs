@@ -1384,7 +1384,8 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    let previous_layer_three_prefix = native_previous_layer_three_prefix(&streams, &incoming_pre);
+    let (mut layer_three_publisher, previous_layer_three_prefix) =
+        native_previous_layer_three_publisher(&streams, &incoming_pre);
     let layer_three_fixture = layer_three_fixture();
 
     // The final full traversal starts only after its preceding native prefix is
@@ -1420,11 +1421,19 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    let third = native_layer_three_block_tail_from_entries(
+    let final_layer_three_inputs = native_layer_three_attention_inputs_from_entries(
+        &layer_three_fixture,
+        &final_layer_three_engram,
+        &final_layer_three_pre,
+    );
+    layer_three_publisher.step(&final_layer_three_inputs[2]);
+    let third = native_layer_three_block_tail_from_entries_with_attention(
         &layer_three_fixture,
         Some(&final_layer_three_engram),
         Some(&final_layer_three_pre),
+        Some(layer_three_publisher.outputs()),
     );
+    layer_three_publisher.reset_and_retry(&final_layer_three_inputs[0]);
     let output = block_tail_from_entries(
         &fixture(),
         BlockControl::NativeAttention,
@@ -1437,51 +1446,45 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
 /// Produces only the two preceding layer-three calls that publish the prefix
 /// consumed by the following L1 partial decode. The source start-six operands
 /// remain outside this bootstrap traversal.
-fn native_previous_layer_three_prefix(
+fn bootstrap_layer_three_inputs(
     streams: &[(usize, Vec<u16>)],
     incoming_pre: &[(usize, Vec<f32>)],
-) -> Vec<u16> {
+) -> Vec<(usize, Vec<u16>)> {
     assert_eq!(streams.len(), 3, "reduced source partition count");
     assert_eq!(
         incoming_pre.len(),
         streams.len(),
         "reduced source HC pre count"
     );
-    let bootstrap_engram =
+    let engram =
         layer1_engram_capture::native_layer_one_block_entries_from_streams(Some(&streams[..2]));
-    let bootstrap_layer_one = layer1_join::native_layer_one_entries_from_engram_entries_with_pre(
-        &bootstrap_engram,
+    let layer_one = layer1_join::native_layer_one_entries_from_engram_entries_with_pre(
+        &engram,
         &incoming_pre[..2],
     );
-    let bootstrap_layer_two =
-        layer2_join::native_layer_two_entries_from_entries(&bootstrap_layer_one);
-    let bootstrap_layer_three_streams = bootstrap_layer_two
+    let layer_two = layer2_join::native_layer_two_entries_from_entries(&layer_one);
+    let streams = layer_two
         .iter()
         .map(|(start, residual, _)| (*start, residual.clone()))
         .collect::<Vec<_>>();
-    let bootstrap_layer_three_engram =
-        engram_capture::native_layer_three_block_entries_from_streams(Some(
-            &bootstrap_layer_three_streams,
-        ));
-    let bootstrap_layer_three_pre = bootstrap_layer_two
+    let engram = engram_capture::native_layer_three_block_entries_from_streams(Some(&streams));
+    let pre = layer_two
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
-    let layer_three_fixture = layer_three_fixture();
-    let bootstrap_layer_three_inputs = native_layer_three_attention_inputs_from_entries(
-        &layer_three_fixture,
-        &bootstrap_layer_three_engram,
-        &bootstrap_layer_three_pre,
-    );
-    let layer_three = owner_attention_capture::native_layer_three_run_from_supplied_inputs(
-        &bootstrap_layer_three_inputs,
-    );
-    assert_eq!(
-        layer_three.outputs.len(),
-        2,
-        "prior publication must not execute start six"
-    );
-    layer_three.previous_call_key_prefix
+    native_layer_three_attention_inputs_from_entries(&layer_three_fixture(), &engram, &pre)
+}
+
+fn native_previous_layer_three_publisher(
+    streams: &[(usize, Vec<u16>)],
+    incoming_pre: &[(usize, Vec<f32>)],
+) -> (owner_attention_capture::NativeLayerThreePublisher, Vec<u16>) {
+    let inputs = bootstrap_layer_three_inputs(streams, incoming_pre);
+    let mut publisher = owner_attention_capture::NativeLayerThreePublisher::new();
+    publisher.step(&inputs[0]);
+    publisher.step(&inputs[1]);
+    let prefix = publisher.previous_call_key_prefix().to_vec();
+    (publisher, prefix)
 }
 
 #[test]
@@ -1644,9 +1647,21 @@ fn native_layer_three_block_tail_from_entries(
     entries: Option<&[(usize, Vec<u16>)]>,
     incoming_pre: Option<&[(usize, Vec<f32>)]>,
 ) -> Vec<BlockTailOutput> {
+    native_layer_three_block_tail_from_entries_with_attention(f, entries, incoming_pre, None)
+}
+
+fn native_layer_three_block_tail_from_entries_with_attention(
+    f: &Fixture,
+    entries: Option<&[(usize, Vec<u16>)]>,
+    incoming_pre: Option<&[(usize, Vec<f32>)]>,
+    supplied_attention: Option<&[Vec<u16>]>,
+) -> Vec<BlockTailOutput> {
     let parameters = block_tail_parameters_for(f, 3);
     let config = &f.block_config;
-    let attention = if let Some(entries) = entries {
+    let attention = if let Some(outputs) = supplied_attention {
+        assert_eq!(outputs.len(), f.cases.len(), "live L3 attention call count");
+        outputs.to_vec()
+    } else if let Some(entries) = entries {
         assert_eq!(entries.len(), f.cases.len());
         if let Some(incoming_pre) = incoming_pre {
             assert_eq!(

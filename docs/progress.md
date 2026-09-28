@@ -54,9 +54,12 @@ choices without expanding current support claims.
   key prefix now comes from native execution of starts zero and five and feeds
   the actual layer-one start-six selection used by the final-logit path.
   Rejected publication preserves nonempty owner state for a same-ID retry;
-  reset clears it for a new request. This two-pass composition still needs a
-  single request-local stepping path and native ownership of the remaining
-  histories before it is a stateful token-to-logits runner.
+  reset clears it for a new request. One live layer-three owner now advances
+  through starts zero, five and six, and its attention outputs feed the final
+  logits without replaying that owner. Owner and attention epochs advance
+  together on reset. Earlier-layer bootstrap traversal remains two-pass;
+  native ownership of the remaining histories and a single request-local
+  traversal are still required for a stateful token-to-logits runner.
 - Julia-1's source-pinned encoding contract now has nine pure-stdlib fixtures
   for marker placement, option ordering, mask sanitation, strict truncation,
   and padding. Its bounded artifact inspector validates the complete pinned

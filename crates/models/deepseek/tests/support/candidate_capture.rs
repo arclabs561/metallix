@@ -279,6 +279,11 @@ fn source_case(fixture: &Fixture, start: usize) -> &Case {
 
 /// Maps a captured call to the test owner's epoch-zero publication sequence.
 pub(super) fn source_call(start: usize) -> SelectionCall {
+    source_call_in_epoch(start, 0)
+}
+
+/// Rebinds a source geometry and call ordinal to a live request epoch.
+pub(super) fn source_call_in_epoch(start: usize, epoch: u64) -> SelectionCall {
     let fixture = fixture();
     let (call_id, case) = fixture
         .cases
@@ -295,7 +300,11 @@ pub(super) fn source_call(start: usize) -> SelectionCall {
     )
     .expect("captured selection geometry");
     SelectionCall::new(
-        IndexKeyPublicationId::new(3, 0, u64::try_from(call_id).expect("three captured calls")),
+        IndexKeyPublicationId::new(
+            3,
+            epoch,
+            u64::try_from(call_id).expect("three captured calls"),
+        ),
         0,
         geometry,
     )
@@ -343,11 +352,23 @@ pub(super) fn generated_producer_indices(
     call: SelectionCall,
     attention_input: &[u16],
 ) -> Vec<i32> {
+    generated_producer_indices_in_epoch(start, native_keys, call, attention_input, 0)
+}
+
+/// Runs the same captured candidate geometry against a live request epoch.
+pub(super) fn generated_producer_indices_in_epoch(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    epoch: u64,
+) -> Vec<i32> {
     let (candidates, scores) = generated_candidates_and_scores_from_attention_input(
         start,
         native_keys,
         call,
         attention_input,
+        epoch,
     );
     select_from_candidates(&scores, call, &candidates, 1)
         .expect("producer final selection")
@@ -370,8 +391,14 @@ pub(super) fn generated_candidates_from_attention_input(
     call: SelectionCall,
     attention_input: &[u16],
 ) -> CandidateSelection {
-    generated_candidates_and_scores_from_attention_input(start, native_keys, call, attention_input)
-        .0
+    generated_candidates_and_scores_from_attention_input(
+        start,
+        native_keys,
+        call,
+        attention_input,
+        0,
+    )
+    .0
 }
 
 #[expect(
@@ -387,12 +414,13 @@ fn generated_candidates_and_scores_from_attention_input(
     native_keys: &[u16],
     call: SelectionCall,
     attention_input: &[u16],
+    epoch: u64,
 ) -> (CandidateSelection, Vec<u16>) {
     let fixture = fixture();
     let case = source_case(&fixture, start);
     assert_eq!(
         call,
-        source_call(start),
+        source_call_in_epoch(start, epoch),
         "source selection call at start {start}"
     );
     let expected_keys = case.inputs.shared_index_k_prefix.bf16();
