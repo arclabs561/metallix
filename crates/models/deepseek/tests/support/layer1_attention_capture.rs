@@ -312,68 +312,100 @@ pub(super) fn native_outputs_from_inputs_with_previous_layer_three_prefix(
     previous_layer_three_prefix: Option<&[u16]>,
 ) -> Vec<(usize, Vec<u16>)> {
     let root = fixture();
-    let frequencies = frequencies(&root);
-    let weights = weights(&root);
     let cases = field(&root, "cases").as_array().expect("source cases");
     assert!(
         (1..=cases.len()).contains(&inputs.len()),
         "source call prefix count"
     );
-    let owner =
-        layer1_owner_capture::native_publications_with_previous_layer_three_prefix_for_calls(
-            previous_layer_three_prefix,
-            inputs.len(),
-        );
-    let mut state = LayerAttentionState::new(layout(&root));
-    cases
+    let mut owner =
+        layer1_owner_capture::NativeLayerOneOwnerSession::new(previous_layer_three_prefix);
+    let mut session = NativeLayerOneAttentionSession::new();
+    inputs
         .iter()
-        .take(inputs.len())
-        .zip(inputs)
-        .enumerate()
-        .map(|(call_id, (case, (supplied_start, input)))| {
-            let start = usize_field(case, "start_pos");
-            assert_eq!(*supplied_start, start, "captured call start {call_id}");
-            assert_eq!(
-                input,
-                &bf16(field(case, "input")),
-                "start {start} input BF16 boundary"
-            );
-            let source_kv = bf16(field(case, "compressed_kv"));
-            let source_ids = i32s(field(case, "compressed_indices"));
-            assert_eq!(owner[call_id].start_pos, start);
-            assert_eq!(
-                owner[call_id].kv_prefix, source_kv,
-                "start {start} native layer-one KV publication"
-            );
-            assert_eq!(
-                owner[call_id].selected_indices, source_ids,
-                "start {start} native layer-one selected IDs"
-            );
-            // The captured graph is single-batch: the source sparse operand
-            // is exactly its local window followed by the native owner prefix.
-            let mut sparse_kv = bf16(field(case, "window_kv"));
-            sparse_kv.extend_from_slice(&owner[call_id].kv_prefix);
-            assert_eq!(sparse_kv, bf16(field(case, "sparse_kv")));
-            let positions = input.len() / 128;
-            let diagnostic = state
-                .forward(
-                    input,
-                    start,
-                    &frequencies[start * 16..(start + positions) * 16],
-                    weights.borrowed(),
-                    CompressedAttentionPublication {
-                        source_layer: 1,
-                        epoch: 0,
-                        call_id: u64::try_from(call_id).expect("three calls"),
-                        numerical_bf16: &owner[call_id].kv_prefix,
-                        indices: &owner[call_id].selected_indices,
-                    },
-                )
-                .expect("native layer-one attention");
-            assert_diagnostic(case, &diagnostic);
-            (start, diagnostic.final_output)
-        })
+        .map(|input| session.step(input, &owner.step()))
         .collect()
+}
+
+/// Test-private request session for the production layer-attention adapter.
+/// Its window/cache state advances one source partition at a time and accepts
+/// the matching live owner publication from the same request session.
+pub(super) struct NativeLayerOneAttentionSession {
+    root: Value,
+    frequencies: Vec<RotaryFrequency>,
+    weights: Weights,
+    state: LayerAttentionState,
+    next_case: usize,
+}
+
+impl NativeLayerOneAttentionSession {
+    pub(super) fn new() -> Self {
+        let root = fixture();
+        Self {
+            frequencies: frequencies(&root),
+            weights: weights(&root),
+            state: LayerAttentionState::new(layout(&root)),
+            root,
+            next_case: 0,
+        }
+    }
+
+    pub(super) fn step(
+        &mut self,
+        (supplied_start, input): &(usize, Vec<u16>),
+        owner: &layer1_owner_capture::NativeCase,
+    ) -> (usize, Vec<u16>) {
+        let case = &field(&self.root, "cases").as_array().expect("source cases")[self.next_case];
+        let start = usize_field(case, "start_pos");
+        assert_eq!(
+            start,
+            [0, 5, 6][self.next_case],
+            "native layer-one attention call order"
+        );
+        assert_eq!(
+            *supplied_start, start,
+            "captured call start {}",
+            self.next_case
+        );
+        assert_eq!(
+            input,
+            &bf16(field(case, "input")),
+            "start {start} input BF16 boundary"
+        );
+        assert_eq!(owner.start_pos, start);
+        assert_eq!(
+            owner.kv_prefix,
+            bf16(field(case, "compressed_kv")),
+            "start {start} native layer-one KV publication"
+        );
+        assert_eq!(
+            owner.selected_indices,
+            i32s(field(case, "compressed_indices")),
+            "start {start} native layer-one selected IDs"
+        );
+        let mut sparse_kv = bf16(field(case, "window_kv"));
+        sparse_kv.extend_from_slice(&owner.kv_prefix);
+        assert_eq!(sparse_kv, bf16(field(case, "sparse_kv")));
+        let positions = input.len() / 128;
+        let diagnostic = self
+            .state
+            .forward(
+                input,
+                start,
+                &self.frequencies[start * 16..(start + positions) * 16],
+                self.weights.borrowed(),
+                CompressedAttentionPublication {
+                    source_layer: 1,
+                    epoch: 0,
+                    call_id: u64::try_from(self.next_case).expect("three calls"),
+                    numerical_bf16: &owner.kv_prefix,
+                    indices: &owner.selected_indices,
+                },
+            )
+            .expect("native layer-one attention");
+        assert_diagnostic(case, &diagnostic);
+        self.next_case += 1;
+        (start, diagnostic.final_output)
+    }
 }
 
 /// Runs the captured layer-one inputs through the native attention chain.

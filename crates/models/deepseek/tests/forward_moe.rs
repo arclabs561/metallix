@@ -1384,31 +1384,32 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
         .iter()
         .map(|(start, _, pre)| (*start, pre.clone()))
         .collect::<Vec<_>>();
+    let mut layer_one_session = layer1_join::NativeLayerOneSession::new();
+    let first = layer_one_session.step(&streams[0], &incoming_pre[0]);
+    let second = layer_one_session.step(&streams[1], &incoming_pre[1]);
     let (mut layer_three_publisher, previous_layer_three_prefix) =
-        native_previous_layer_three_publisher(&streams, &incoming_pre);
+        native_previous_layer_three_publisher(&[first.clone(), second.clone()]);
     let layer_three_fixture = layer_three_fixture();
 
-    // The final full traversal starts only after its preceding native prefix is
-    // published. It supplies the actual start-six L1 selection below.
-    let engram = layer1_engram_capture::native_layer_one_block_entries_from_streams(Some(&streams));
+    // L2/Engram3 is still an explicit replay seam here.  Its complete prior
+    // L3 publication is injected only after the live L1 start-five call and
+    // immediately before the partial start-six call consumes it.
     let mut corrupted_prefix = previous_layer_three_prefix.clone();
     corrupted_prefix[0] ^= 1;
     assert!(
         std::panic::catch_unwind(|| {
-            layer1_join::native_layer_one_entries_from_engram_entries_with_pre_and_previous_layer_three_prefix(
-                &engram,
-                &incoming_pre,
-                &corrupted_prefix,
-            )
+            let mut session = layer1_join::NativeLayerOneSession::new();
+            session.step(&streams[0], &incoming_pre[0]);
+            session.step(&streams[1], &incoming_pre[1]);
+            session.supply_previous_layer_three_prefix(&corrupted_prefix);
+            session.step(&streams[2], &incoming_pre[2]);
         })
         .is_err(),
         "a changed native previous-call publication must fail the layer-one score oracle"
     );
-    let layer_one = layer1_join::native_layer_one_entries_from_engram_entries_with_pre_and_previous_layer_three_prefix(
-        &engram,
-        &incoming_pre,
-        &previous_layer_three_prefix,
-    );
+    layer_one_session.supply_previous_layer_three_prefix(&previous_layer_three_prefix);
+    let third_l1 = layer_one_session.step(&streams[2], &incoming_pre[2]);
+    let layer_one = vec![first, second, third_l1];
     let layer_two = layer2_join::native_layer_two_entries_from_entries(&layer_one);
     let final_layer_three_streams = layer_two
         .iter()
@@ -1447,22 +1448,18 @@ fn projection_fed_prefill_reaches_final_reduced_logits() {
 /// consumed by the following L1 partial decode. The source start-six operands
 /// remain outside this bootstrap traversal.
 fn bootstrap_layer_three_inputs(
-    streams: &[(usize, Vec<u16>)],
-    incoming_pre: &[(usize, Vec<f32>)],
+    layer_one: &[(usize, Vec<u16>, Vec<f32>)],
 ) -> Vec<(usize, Vec<u16>)> {
-    assert_eq!(streams.len(), 3, "reduced source partition count");
+    assert_eq!(layer_one.len(), 2, "two preceding native L1 calls");
     assert_eq!(
-        incoming_pre.len(),
-        streams.len(),
-        "reduced source HC pre count"
+        layer_one
+            .iter()
+            .map(|(start, _, _)| *start)
+            .collect::<Vec<_>>(),
+        [0, 5],
+        "L3 bootstrap sees the already-committed L1 prefix"
     );
-    let engram =
-        layer1_engram_capture::native_layer_one_block_entries_from_streams(Some(&streams[..2]));
-    let layer_one = layer1_join::native_layer_one_entries_from_engram_entries_with_pre(
-        &engram,
-        &incoming_pre[..2],
-    );
-    let layer_two = layer2_join::native_layer_two_entries_from_entries(&layer_one);
+    let layer_two = layer2_join::native_layer_two_entries_from_entries(layer_one);
     let streams = layer_two
         .iter()
         .map(|(start, residual, _)| (*start, residual.clone()))
@@ -1476,10 +1473,9 @@ fn bootstrap_layer_three_inputs(
 }
 
 fn native_previous_layer_three_publisher(
-    streams: &[(usize, Vec<u16>)],
-    incoming_pre: &[(usize, Vec<f32>)],
+    layer_one: &[(usize, Vec<u16>, Vec<f32>)],
 ) -> (owner_attention_capture::NativeLayerThreePublisher, Vec<u16>) {
-    let inputs = bootstrap_layer_three_inputs(streams, incoming_pre);
+    let inputs = bootstrap_layer_three_inputs(layer_one);
     let mut publisher = owner_attention_capture::NativeLayerThreePublisher::new();
     publisher.step(&inputs[0]);
     publisher.step(&inputs[1]);

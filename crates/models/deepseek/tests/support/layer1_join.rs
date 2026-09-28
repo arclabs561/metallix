@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BlockConfig, Coefficients, Model, Tensor, derive_attention_input, hc_coefficient_bounds,
-    hc_projection_bounds, layer1_attention_capture, layer2_join, with_model_parameters,
+    hc_projection_bounds, layer1_attention_capture, layer1_engram_capture, layer1_owner_capture,
+    layer2_join, with_model_parameters,
 };
 
 const FIXTURE_SHA256: &str = "5f31036c71b797e7195a6b93cf2d656b8744b1e6a80a04dc68007d26e326b89b";
@@ -232,13 +233,14 @@ fn attention_handoffs(
         (1..=fixture.cases.len()).contains(&outputs.len()),
         "native layer-one attention handoff prefix"
     );
-    fixture
-        .cases
+    outputs
         .iter()
-        .take(outputs.len())
-        .zip(outputs)
-        .map(|(case, (start, attention))| {
-            assert_eq!(*start, case.start_pos);
+        .map(|(start, attention)| {
+            let case = fixture
+                .cases
+                .iter()
+                .find(|case| case.start_pos == *start)
+                .expect("native layer-one attention handoff source start");
             assert_eq!(
                 attention,
                 &case.attention_output.bf16(),
@@ -311,13 +313,14 @@ fn native_ffn(
                 fixture.block_config.hc_eps,
             )
             .expect("native layer-one FFN");
-            fixture
-                .cases
+            entries
                 .iter()
-                .take(entries.len())
-                .zip(entries)
-                .map(|(case, (start, residual, pre))| {
-                    assert_eq!(*start, case.start_pos);
+                .map(|(start, residual, pre)| {
+                    let case = fixture
+                        .cases
+                        .iter()
+                        .find(|case| case.start_pos == *start)
+                        .expect("native layer-one FFN source start");
                     assert_eq!(residual, &case.after_attention_residual.bf16());
                     assert_eq!(pre.len(), case.attention_pre.fp32().len());
                     assert!(pre.iter().all(|value| value.is_finite()));
@@ -556,42 +559,76 @@ pub(super) fn native_layer_one_entries_from_engram_entries_with_pre(
     native_layer_one_entries_from_block_entries(Some(&block_entries))
 }
 
-pub(super) fn native_layer_one_entries_from_engram_entries_with_pre_and_previous_layer_three_prefix(
-    entries: &[(usize, Vec<u16>)],
-    incoming_pre: &[(usize, Vec<f32>)],
-    previous_layer_three_prefix: &[u16],
-) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
-    let fixture = fixture();
-    assert_eq!(
-        entries.len(),
-        fixture.cases.len(),
-        "native Engram entry count"
-    );
-    assert_eq!(
-        incoming_pre.len(),
-        fixture.cases.len(),
-        "native Engram incoming HC pre count"
-    );
-    let block_entries = fixture
-        .cases
-        .iter()
-        .zip(entries)
-        .zip(incoming_pre)
-        .map(|((case, (start, residual)), (pre_start, pre))| {
-            assert_eq!(*start, case.start_pos, "native Engram entry start");
-            assert_eq!(
-                *pre_start, case.start_pos,
-                "native Engram incoming HC pre start"
-            );
-            assert_eq!(pre.len(), case.incoming_pre.fp32().len());
-            assert!(pre.iter().all(|value| value.is_finite()));
-            (*start, residual.clone(), pre.clone())
-        })
-        .collect::<Vec<_>>();
-    native_layer_one_entries_from_block_entries_with_previous_layer_three_prefix(
-        Some(&block_entries),
-        Some(previous_layer_three_prefix),
-    )
+/// Test-private composition of the live L1 request state.  One `step` consumes
+/// precisely one source partition through Engram, the ratio-two owner, layer
+/// attention, HC, and FFN, returning the residual and HC pre-mix consumed by
+/// layer two.  The L2/Engram3 suffix remains an explicit replay seam.
+pub(super) struct NativeLayerOneSession {
+    fixture: Fixture,
+    engram: layer1_engram_capture::NativeLayerOneEngramSession,
+    owner: layer1_owner_capture::NativeLayerOneOwnerSession,
+    attention: layer1_attention_capture::NativeLayerOneAttentionSession,
+    next_case: usize,
+}
+
+impl NativeLayerOneSession {
+    pub(super) fn new() -> Self {
+        Self {
+            fixture: fixture(),
+            engram: layer1_engram_capture::NativeLayerOneEngramSession::new(),
+            owner: layer1_owner_capture::NativeLayerOneOwnerSession::new(None),
+            attention: layer1_attention_capture::NativeLayerOneAttentionSession::new(),
+            next_case: 0,
+        }
+    }
+
+    /// Supplies L3's complete prior-call publication after L1 start five and
+    /// before L1 start six.  It is deliberately not available to either of
+    /// the earlier L1 calls.
+    pub(super) fn supply_previous_layer_three_prefix(&mut self, prefix: &[u16]) {
+        self.owner.supply_previous_layer_three_prefix(prefix);
+    }
+
+    pub(super) fn step(
+        &mut self,
+        stream: &(usize, Vec<u16>),
+        incoming_pre: &(usize, Vec<f32>),
+    ) -> (usize, Vec<u16>, Vec<f32>) {
+        let case = &self.fixture.cases[self.next_case];
+        assert_eq!(stream.0, case.start_pos, "native L1 stream start");
+        assert_eq!(incoming_pre.0, case.start_pos, "native L1 HC pre start");
+        assert_eq!(
+            incoming_pre.1.len(),
+            case.incoming_pre.fp32().len(),
+            "native L1 HC pre width"
+        );
+        assert!(incoming_pre.1.iter().all(|value| value.is_finite()));
+        let (start, residual) = self.engram.step(Some(stream));
+        let norm = self.fixture.block_parameters["layers.1.attn_norm.weight"].bf16();
+        let input = residual
+            .chunks_exact(256)
+            .enumerate()
+            .flat_map(|(position, row)| {
+                derive_attention_input(
+                    row,
+                    &incoming_pre.1[position * 2..(position + 1) * 2],
+                    &norm,
+                    self.fixture.block_config.norm_eps,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            input,
+            case.attention_input.bf16(),
+            "native L1 HC attention input"
+        );
+        let owner = self.owner.step_with_input(&input);
+        let attention = self.attention.step(&(start, input), &owner);
+        let handoff = attention_handoffs(&self.fixture, &[attention]);
+        let mut output = native_ffn(&self.fixture, &handoff);
+        self.next_case += 1;
+        output.pop().expect("one native L1 FFN result")
+    }
 }
 
 #[test]

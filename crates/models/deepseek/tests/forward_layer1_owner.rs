@@ -32,6 +32,11 @@ fn request_local_layer_three_score_state_is_reset_between_requests() {
 }
 
 #[test]
+fn layer_one_owner_session_reset_clears_prefixes() {
+    assert!(layer1_owner_capture::request_session_reset_clears_owner_prefixes());
+}
+
+#[test]
 fn partial_layer_three_score_operand_rejects_cross_capture_substitution() {
     assert!(layer1_owner_capture::partial_score_prefix_provenance_gate_rejects_mismatch());
 }

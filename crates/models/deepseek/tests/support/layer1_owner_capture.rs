@@ -300,9 +300,19 @@ fn assert_fp32_projection_envelope(
     Ok(())
 }
 
-fn source_projections(case: &Case, wkv: &[f32], wgate: &[f32]) -> (Vec<f32>, Vec<f32>) {
+fn source_projections(
+    case: &Case,
+    input: &[u16],
+    wkv: &[f32],
+    wgate: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
     assert_eq!(case.input.shape, [1, case.sequence, 128]);
-    let input = bf16(&case.input);
+    assert_eq!(
+        input,
+        bf16(&case.input),
+        "start {} owner input BF16 boundary",
+        case.start_pos
+    );
     let input_f32: Vec<_> = input.iter().copied().map(bf16_to_f32).collect();
     let mut projected = vec![0.0; case.sequence * 64];
     fp32_linear_reference(&input_f32, wkv, case.sequence, 128, 64, &mut projected)
@@ -611,20 +621,8 @@ pub(super) fn partial_score_with_native_layer_three_prefix(
 /// separately: source global score state was subsequently owned by layer three,
 /// whereas this owner retains its own key and KV prefixes.
 pub(super) fn native_publications() -> Vec<NativeCase> {
-    native_publications_with_previous_layer_three_prefix(None)
-}
-
-/// Replays the layer-one owner stream while publishing the previous layer-three
-/// score prefix at its source-visible start-five boundary. The override is
-/// consumed only by the following partial start-six score.
-pub(super) fn native_publications_with_previous_layer_three_prefix(
-    previous_layer_three_prefix: Option<&[u16]>,
-) -> Vec<NativeCase> {
     let fixture = fixture();
-    native_publications_with_previous_layer_three_prefix_for_calls(
-        previous_layer_three_prefix,
-        fixture.cases.len(),
-    )
+    native_publications_with_previous_layer_three_prefix_for_calls(None, fixture.cases.len())
 }
 
 /// Replays an ordered nonempty prefix of the source owner calls. This permits
@@ -639,34 +637,92 @@ pub(super) fn native_publications_with_previous_layer_three_prefix_for_calls(
         (1..=fixture.cases.len()).contains(&call_count),
         "native layer-one owner call prefix"
     );
-    let all_frequencies = frequencies(&fixture.frequency_table);
-    let wkv = fp32(parameter(&fixture, "layers.1.attn.compressor.wkv.weight"));
-    let wgate = fp32(parameter(&fixture, "layers.1.attn.compressor.wgate.weight"));
-    let compressor_norm = bf16(parameter(&fixture, "layers.1.attn.compressor.norm.weight"));
-    let wk = bf16(parameter(&fixture, "layers.1.attn.indexer.wk.weight"));
-    let key_norm = bf16(parameter(&fixture, "layers.1.attn.indexer.k_norm.weight"));
-    let mut compressor = CompressorState::new(1, 64, 2, &compressor_norm, fixture.model.norm_eps)
-        .expect("source ratio-two compressor");
-    let key_layout = IndexKeyLayout::new(
-        nonzero(1),
-        nonzero(64),
-        nonzero(64),
-        nonzero(16),
-        fixture.model.norm_eps,
-    )
-    .expect("source index-key layout");
-    let kv_layout = CompressedKvLayout::new(nonzero(1), nonzero(64), nonzero(16))
-        .expect("source compressed-KV layout");
-    let mut keys = Vec::new();
-    let mut kv = Vec::new();
-    let mut request_score_state = LayerThreeSharedScoreState::new();
-    let mut outputs = Vec::new();
-    for case in fixture.cases.iter().take(call_count) {
-        if case.start_pos == 0 {
-            request_score_state.reset();
+    let mut session = NativeLayerOneOwnerSession::new(previous_layer_three_prefix);
+    (0..call_count).map(|_| session.step()).collect()
+}
+
+/// Test-private request session for the layer-one ratio-two owner.  It keeps
+/// the compressor, owner key/KV prefixes, and the source-qualified prior-L3
+/// score operand live across source calls.
+pub(super) struct NativeLayerOneOwnerSession {
+    fixture: Fixture,
+    all_frequencies: Vec<RotaryFrequency>,
+    wkv: Vec<f32>,
+    wgate: Vec<f32>,
+    wk: Vec<u16>,
+    key_norm: Vec<u16>,
+    compressor: CompressorState,
+    key_layout: IndexKeyLayout,
+    kv_layout: CompressedKvLayout,
+    keys: Vec<u16>,
+    kv: Vec<u16>,
+    score_state: LayerThreeSharedScoreState,
+    previous_layer_three_prefix: Option<Vec<u16>>,
+    next_case: usize,
+}
+
+impl NativeLayerOneOwnerSession {
+    pub(super) fn new(previous_layer_three_prefix: Option<&[u16]>) -> Self {
+        if let Some(prefix) = previous_layer_three_prefix {
+            assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
         }
-        let (projected, gate) = source_projections(case, &wkv, &wgate);
-        let latent = compressor
+        let fixture = fixture();
+        let compressor_norm = bf16(parameter(&fixture, "layers.1.attn.compressor.norm.weight"));
+        let norm_eps = fixture.model.norm_eps;
+        Self {
+            all_frequencies: frequencies(&fixture.frequency_table),
+            wkv: fp32(parameter(&fixture, "layers.1.attn.compressor.wkv.weight")),
+            wgate: fp32(parameter(&fixture, "layers.1.attn.compressor.wgate.weight")),
+            wk: bf16(parameter(&fixture, "layers.1.attn.indexer.wk.weight")),
+            key_norm: bf16(parameter(&fixture, "layers.1.attn.indexer.k_norm.weight")),
+            compressor: CompressorState::new(1, 64, 2, &compressor_norm, norm_eps)
+                .expect("source ratio-two compressor"),
+            key_layout: IndexKeyLayout::new(
+                nonzero(1),
+                nonzero(64),
+                nonzero(64),
+                nonzero(16),
+                norm_eps,
+            )
+            .expect("source index-key layout"),
+            kv_layout: CompressedKvLayout::new(nonzero(1), nonzero(64), nonzero(16))
+                .expect("source compressed-KV layout"),
+            fixture,
+            keys: Vec::new(),
+            kv: Vec::new(),
+            score_state: LayerThreeSharedScoreState::new(),
+            previous_layer_three_prefix: previous_layer_three_prefix.map(ToOwned::to_owned),
+            next_case: 0,
+        }
+    }
+
+    /// Advances exactly one captured owner call.  Prefix and compressor
+    /// mutation is supplied by their native bounded operations; this fixture
+    /// composition does not claim a cross-owner rollback transaction.
+    /// Compatibility step for the standalone owner fixture. Composed callers
+    /// use [`Self::step_with_input`] to carry their derived L1 attention input.
+    pub(super) fn step(&mut self) -> NativeCase {
+        let input = bf16(&self.fixture.cases[self.next_case].input);
+        self.step_with_input(&input)
+    }
+
+    pub(super) fn step_with_input(&mut self, input: &[u16]) -> NativeCase {
+        let case = self
+            .fixture
+            .cases
+            .get(self.next_case)
+            .expect("native layer-one owner calls exhausted");
+        assert_eq!(
+            case.start_pos,
+            [0, 5, 6][self.next_case],
+            "native layer-one owner call order"
+        );
+        if case.start_pos == 0 {
+            self.score_state.reset();
+        }
+        let (projected, gate) = source_projections(case, input, &self.wkv, &self.wgate);
+        let latent = self
+            .compressor
             .forward(
                 CompressorInput::Gated {
                     kv: &projected,
@@ -681,54 +737,109 @@ pub(super) fn native_publications_with_previous_layer_three_prefix_for_calls(
             assert_eq!(case.group_frequency_positions.len(), latent.len() / 64);
             let mut selected = Vec::new();
             for &position in &case.group_frequency_positions {
-                selected.extend_from_slice(&all_frequencies[position * 16..(position + 1) * 16]);
+                selected
+                    .extend_from_slice(&self.all_frequencies[position * 16..(position + 1) * 16]);
             }
             let prepared_keys = prepare_index_keys(
                 latent,
                 &selected,
-                IndexKeyWeights::new(&wk, &key_norm),
-                key_layout,
+                IndexKeyWeights::new(&self.wk, &self.key_norm),
+                self.key_layout,
             )
             .expect("native source-shaped index keys");
-            let prepared_kv = prepare_compressed_kv(latent, &selected, kv_layout)
+            let prepared_kv = prepare_compressed_kv(latent, &selected, self.kv_layout)
                 .expect("native source-shaped compressed KV");
-            keys.extend_from_slice(&prepared_keys.post_fp4);
-            kv.extend_from_slice(&prepared_kv.post_fp4);
+            self.keys.extend_from_slice(&prepared_keys.post_fp4);
+            self.kv.extend_from_slice(&prepared_kv.post_fp4);
         }
         assert_eq!(
-            keys,
+            self.keys,
             bf16(&case.index_key_prefix),
             "start {} owned key prefix",
             case.start_pos
         );
         assert_eq!(
-            kv,
+            self.kv,
             bf16(&case.compressed_kv_prefix),
             "start {} owned KV prefix",
             case.start_pos
         );
-        assert_eq!(keys.len(), case.compressed_prefix * 64);
+        assert_eq!(self.keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
-        if case.start_pos == 5 && call_count > outputs.len() + 1 {
+        if case.start_pos == 6 {
             publish_previous_layer_three_prefix(
-                &mut request_score_state,
-                &fixture,
+                &mut self.score_state,
+                &self.fixture,
                 &source_score_keys,
-                previous_layer_three_prefix,
+                self.previous_layer_three_prefix.as_deref(),
             );
         }
-        let score_keys = request_score_state.score_keys_for(case, &keys, &source_score_keys);
-        let selected_indices = assert_native_score(&fixture, case, &all_frequencies, &score_keys);
-        outputs.push(NativeCase {
+        let score_keys = self
+            .score_state
+            .score_keys_for(case, &self.keys, &source_score_keys);
+        let selected_indices =
+            assert_native_score(&self.fixture, case, &self.all_frequencies, &score_keys);
+        self.next_case += 1;
+        NativeCase {
             start_pos: case.start_pos,
             latent,
-            key_prefix: keys.clone(),
-            kv_prefix: kv.clone(),
+            key_prefix: self.keys.clone(),
+            kv_prefix: self.kv.clone(),
             source_score_key_prefix: source_score_keys,
             selected_indices,
-        });
+        }
     }
-    outputs
+
+    /// Supplies the complete producer prefix after the preceding L3 call has
+    /// committed and before L1's start-six partial decode reads it.
+    pub(super) fn supply_previous_layer_three_prefix(&mut self, prefix: &[u16]) {
+        assert_eq!(
+            self.next_case, 2,
+            "previous L3 prefix arrives before L1 start six"
+        );
+        assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
+        self.previous_layer_three_prefix = Some(prefix.to_vec());
+    }
+
+    /// Reconstructs a fresh fixture request. It intentionally clears the
+    /// previous request's supplied L3 publication; this is not an epoch-level
+    /// reset contract for the production owners.
+    pub(super) fn restart_request(&mut self) {
+        *self = Self::new(None);
+    }
+}
+
+/// Resetting a request session removes old owner prefixes before the next
+/// start-zero publication is admitted.
+pub(super) fn request_session_reset_clears_owner_prefixes() -> bool {
+    let mut session = NativeLayerOneOwnerSession::new(None);
+    // The owner fixture records only the three source-visible L3 keys.  The
+    // unused suffix supplies the required complete-prefix geometry for this
+    // restart control; it is deliberately not presented as producer evidence.
+    let mut source_prefix_with_unused_test_suffix = prior_layer_three_prefix(&fixture());
+    source_prefix_with_unused_test_suffix.resize(6 * 64, 0);
+    session.step();
+    session.step();
+    session.supply_previous_layer_three_prefix(&source_prefix_with_unused_test_suffix);
+    let partial = session.step();
+    session.restart_request();
+    let cleared = session.previous_layer_three_prefix.is_none()
+        && session.keys.is_empty()
+        && session.kv.is_empty()
+        && session.next_case == 0
+        && session
+            .score_state
+            .layer_three_keys
+            .prefix(0)
+            .expect("fresh score prefix")
+            .is_empty();
+    let reset_first = session.step();
+    partial.source_score_key_prefix == source_prefix_with_unused_test_suffix[..3 * 64]
+        && cleared
+        && reset_first.start_pos == 0
+        && reset_first.key_prefix == bf16(&fixture().cases[0].index_key_prefix)
+        && reset_first.kv_prefix == bf16(&fixture().cases[0].compressed_kv_prefix)
+        && reset_first.selected_indices == i32s(&fixture().cases[0].selected_indices)
 }
 
 fn assert_latent_matches_source(case: &Case, latent: Option<&[u16]>) {
