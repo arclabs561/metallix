@@ -226,6 +226,21 @@ class CandidateEvaluationTests(unittest.TestCase):
         self.assertEqual(scored["generated_work_tokens"], 23)
         self.assertEqual(scored["receipt_elapsed_ms"], 456.5)
         self.assertEqual(scored["wall_elapsed_ms"], 789.0)
+        strict_item = module.RunPlan(
+            "candidate",
+            module.frozen_tasks()[0],
+            17,
+            ("mx",),
+            requirements={"durations": [2, 2], "window": {"start": 0, "end": 8}},
+        )
+        wrong_duration = copy.deepcopy(report)
+        wrong_duration["constraint"]["generated_text"] = (
+            '{"intervals":[{"start":0,"end":1},{"start":2,"end":3}]}'
+        )
+        # The weak verifier may accept this; the explicit contract must not.
+        self.assertFalse(module.score(wrong_duration, item, 0, 1.0)["task_adherent"])
+        with self.assertRaisesRegex(ValueError, "explicit task requirements"):
+            module.score(wrong_duration, strict_item, 0, 1.0)
         bad = copy.deepcopy(report)
         bad["candidate_verification"]["status"] = "exhausted"
         with self.assertRaises(ValueError):

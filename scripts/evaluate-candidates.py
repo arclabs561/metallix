@@ -406,6 +406,12 @@ def score(
             raise ValueError(
                 "accepted candidate is not independently semantically valid"
             )
+        if (
+            accepted
+            and plan_item.requirements is not None
+            and not task_adherent(value, plan_item.task)
+        ):
+            raise ValueError("accepted candidate violates explicit task requirements")
     elapsed = receipt_elapsed_ms(report, plan_item.arm)
     if elapsed is None:
         raise ValueError("receipt has missing or invalid elapsed costs")

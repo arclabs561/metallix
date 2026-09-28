@@ -178,8 +178,12 @@ and 211 before execution. Task hash:
 It retains the same schema, checkpoint, chat formatting, temperature and budgets.
 On the pinned 4B checkpoint, schema-only generation met all task requirements
 in 2/8 runs (478 generated tokens); verified retries accepted 3/8 (1,606 tokens)
-and exhausted five. All 16 runs produced valid receipts without infrastructure
-errors, and every accepted schedule met the task requirements. This smaller
+and exhausted five. These are eight runs per arm: four tasks at two seeds, with
+up to four attempts per verified run versus one schema-only attempt. Across the
+24 verified attempts, three were accepted, 17 failed duration requirements,
+one overlapped, and three reached the generation budget. All 16 runs produced
+valid receipts without infrastructure errors, and every accepted schedule met
+the task requirements. This smaller
 result limits the earlier development-set observation: acceptance is reliable
 on these cases, while completion remains weak and retries cost more work.
 This is same-family synthetic confirmation, not an official benchmark or
