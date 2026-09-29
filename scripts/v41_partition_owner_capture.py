@@ -3,11 +3,11 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Project the source-owned layer-three operands from the 4/1/1/1 receipt.
+"""Project source operands for alternate layer-three native qualification.
 
-This is a compact, byte-preserving source receipt for a prospective native
-owner/compressor/index-key implementation.  It is not a new qualified fixture:
-the source execution and its observer noninterference gate remain authoritative.
+The compact, byte-preserving fixture retains the L3 owner, selection, attention,
+and post-attention block boundaries from the observed 4/1/1/1 receipt. It is a
+source capture, not a claim that native execution or the source runner is canonical.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ _WIDTHS = {
     "torch.complex64": 8,
     "torch.float8_e4m3fn": 1,
     "torch.float8_e8m0fnu": 1,
+    "torch.float4_e2m1fn_x2": 1,
 }
 _PINNED_SOURCE = {
     "cpu_backend_sha256": "b1f1f3cfdb93b674a5f96a114cf45bf5be9ad3a555ae95ac24add567f9f5232e",
@@ -75,6 +76,32 @@ _ATTENTION_MODEL_INTS = (
     "o_lora_rank",
     "candidate_source_layer",
 )
+
+_POST_ATTENTION_MODEL = {
+    "dim": 128,
+    "hc_mult": 2,
+    "moe_inter_dim": 128,
+    "n_routed_experts": 4,
+    "n_activated_experts": 2,
+    "n_shared_experts": 1,
+    "score_func": "sqrtsoftplus",
+    "gate_temp": 1.0,
+    "norm_topk_prob": True,
+    "route_scale": 1.0,
+    "swiglu_limit": 0.0,
+    "expert_dtype": "fp4",
+}
+
+_BLOCK_PARAMETER_SPECS = {
+    "layers.3.hc_attn_fn": ("torch.float32", [8, 256]),
+    "layers.3.hc_attn_base": ("torch.float32", [8]),
+    "layers.3.hc_attn_scale": ("torch.float32", [3]),
+    "layers.3.hc_ffn_fn": ("torch.float32", [8, 256]),
+    "layers.3.hc_ffn_base": ("torch.float32", [8]),
+    "layers.3.hc_ffn_scale": ("torch.float32", [3]),
+    "layers.3.attn_norm.weight": ("torch.bfloat16", [128]),
+    "layers.3.ffn_norm.weight": ("torch.bfloat16", [128]),
+}
 
 
 class CaptureError(ValueError):
@@ -157,6 +184,8 @@ def _tensor(
         raise CaptureError(f"{label} contains nonfinite E8M0FNU storage")
     if dtype in {"torch.int32", "torch.int64"} and record.get("finite") is not True:
         raise CaptureError(f"{label} must be finite")
+    if dtype == "torch.float4_e2m1fn_x2" and record.get("finite") is not True:
+        raise CaptureError(f"{label} must be finite")
     return record, raw
 
 
@@ -178,6 +207,211 @@ def _same(left: object, right: object, label: str) -> None:
         or left_bytes != right_bytes
     ):
         raise CaptureError(f"{label} is not byte-identical")
+
+
+def _post_attention_parameters(
+    encoded: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep the complete L3 MoE and HC parameter subset consumed by the block tail."""
+    ffn = "layers.3.ffn"
+    routed = tuple(f"{ffn}.experts.{index}" for index in range(4))
+    experts = (*routed, f"{ffn}.shared_experts")
+    names = {
+        f"{ffn}.gate.weight",
+        f"{ffn}.gate.bias",
+        *(
+            f"{expert}.{projection}.{field}"
+            for expert in experts
+            for projection in ("w1", "w2", "w3")
+            for field in ("weight", "scale")
+        ),
+    }
+    parameters = {name: encoded.get(name) for name in names}
+    if any(value is None for value in parameters.values()):
+        raise CaptureError(
+            "source layer-three post-attention path lacks MoE parameters"
+        )
+    specs: dict[str, tuple[str, list[int]]] = {
+        f"{ffn}.gate.weight": ("torch.bfloat16", [4, 128]),
+        f"{ffn}.gate.bias": ("torch.float32", [4]),
+    }
+    for expert in routed:
+        for projection in ("w1", "w2", "w3"):
+            specs[f"{expert}.{projection}.weight"] = (
+                "torch.float4_e2m1fn_x2",
+                [128, 64],
+            )
+            specs[f"{expert}.{projection}.scale"] = ("torch.float8_e8m0fnu", [128, 4])
+    for projection in ("w1", "w2", "w3"):
+        specs[f"{ffn}.shared_experts.{projection}.weight"] = (
+            "torch.float8_e4m3fn",
+            [128, 128],
+        )
+        specs[f"{ffn}.shared_experts.{projection}.scale"] = (
+            "torch.float8_e8m0fnu",
+            [4, 4],
+        )
+    for name, (dtype, shape) in specs.items():
+        _require_tensor(
+            parameters[name], f"layer-three MoE parameter {name}", dtype, shape
+        )
+    block = {name: encoded.get(name) for name in _BLOCK_PARAMETER_SPECS}
+    for name, (dtype, shape) in _BLOCK_PARAMETER_SPECS.items():
+        _require_tensor(
+            block[name], f"layer-three block parameter {name}", dtype, shape
+        )
+    return parameters, block
+
+
+def _coefficients(value: object, label: str, positions: int) -> Mapping[str, Any]:
+    coefficients = _object(value, label)
+    if set(coefficients) != {"pre", "post", "comb"}:
+        raise CaptureError(f"{label} lacks complete HC coefficients")
+    for name, shape in (
+        ("pre", [1, positions, 2]),
+        ("post", [1, positions, 2]),
+        ("comb", [1, positions, 2, 2]),
+    ):
+        _require_tensor(
+            coefficients.get(name), f"{label} {name}", "torch.float32", shape
+        )
+    return coefficients
+
+
+def _validate_post_attention(
+    root: Mapping[str, Any], owner_cases: list[object]
+) -> None:
+    post = _object(root.get("post_attention"), "fixture post-attention")
+    if post.get("source") != root.get("source"):
+        raise CaptureError(
+            "post-attention source provenance differs from fixture source"
+        )
+    if post.get("source_receipt_sha256") != root.get("source_receipt_sha256"):
+        raise CaptureError(
+            "post-attention receipt identity differs from fixture source"
+        )
+    if post.get("capture_identity") != root.get("capture_identity"):
+        raise CaptureError(
+            "post-attention capture identity differs from fixture source"
+        )
+    model = _object(post.get("model"), "fixture post-attention model")
+    if model != _POST_ATTENTION_MODEL or any(
+        type(model.get(name)) is not type(expected)
+        for name, expected in _POST_ATTENTION_MODEL.items()
+    ):
+        raise CaptureError(
+            "fixture post-attention model differs from the pinned source"
+        )
+    config = _object(post.get("block_config"), "fixture post-attention HC config")
+    expected_config = {
+        "copies": 2,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1.0e-6,
+        "norm_eps": 1.0e-20,
+    }
+    if config != expected_config or any(
+        type(config.get(name)) is not type(expected)
+        for name, expected in expected_config.items()
+    ):
+        raise CaptureError("fixture post-attention HC configuration differs")
+    encoded = _object(post.get("encoded_parameters"), "fixture post-attention MoE")
+    block = _object(
+        post.get("block_parameters"), "fixture post-attention block parameters"
+    )
+    if set(encoded) & set(block) or set(block) != set(_BLOCK_PARAMETER_SPECS):
+        raise CaptureError(
+            "post-attention parameter maps overlap or misplace block keys"
+        )
+    expected_encoded, _ = _post_attention_parameters({**encoded, **block})
+    if set(encoded) != set(expected_encoded):
+        raise CaptureError(
+            "post-attention MoE parameter keys differ from the source contract"
+        )
+    policy = _object(post.get("comparison_policy"), "fixture post-attention policy")
+    expected_policy = {
+        "output_bf16": "exact storage bits",
+        "route_weight_abs_error_max": 9.5367431640625e-07,
+        "fixed_before_candidate_execution": True,
+        "block_next_pre_abs_error_max": 9.5367431640625e-07,
+    }
+    if policy != expected_policy or any(
+        type(policy.get(name)) is not type(expected)
+        for name, expected in expected_policy.items()
+    ):
+        raise CaptureError("fixture post-attention comparison policy differs")
+    cases = post.get("cases")
+    if not isinstance(cases, list) or len(cases) != len(_SCHEDULE):
+        raise CaptureError("fixture post-attention must retain four cases")
+    for owner_case, case, (start_pos, token_count) in zip(
+        owner_cases, cases, _SCHEDULE, strict=True
+    ):
+        owner = _object(owner_case, f"case {start_pos} owner")
+        item = _object(case, f"case {start_pos} post-attention")
+        if type(item.get("start_pos")) is not int or item.get("start_pos") != start_pos:
+            raise CaptureError("post-attention cases do not use the pinned schedule")
+        for name, dtype, shape in (
+            ("input", "torch.bfloat16", [1, token_count, 128]),
+            ("gate_weights", "torch.float32", [token_count, 2]),
+            ("gate_indices", "torch.int64", [token_count, 2]),
+            ("output", "torch.bfloat16", [1, token_count, 128]),
+            ("block_input", "torch.bfloat16", [1, token_count, 2, 128]),
+            ("block_incoming_pre", "torch.float32", [1, token_count, 2]),
+            ("attention_input", "torch.bfloat16", [1, token_count, 128]),
+            ("attention_output", "torch.bfloat16", [1, token_count, 128]),
+            ("after_attention_residual", "torch.bfloat16", [1, token_count, 2, 128]),
+            ("attention_hc_mixes", "torch.float32", [1, token_count, 8]),
+            ("ffn_collapsed", "torch.bfloat16", [1, token_count, 128]),
+            ("ffn_hc_mixes", "torch.float32", [1, token_count, 8]),
+            ("block_output", "torch.bfloat16", [1, token_count, 2, 128]),
+            ("block_next_pre", "torch.float32", [1, token_count, 2]),
+        ):
+            _require_tensor(
+                item.get(name), f"case {start_pos} post-attention {name}", dtype, shape
+            )
+        _coefficients(
+            item.get("attention_coefficients"),
+            f"case {start_pos} attention HC",
+            token_count,
+        )
+        _coefficients(
+            item.get("ffn_coefficients"), f"case {start_pos} FFN HC", token_count
+        )
+        next_entry = _object(
+            item.get("next_block_entry"), f"case {start_pos} layer-four entry"
+        )
+        _require_tensor(
+            next_entry.get("residual"),
+            f"case {start_pos} layer-four residual",
+            "torch.bfloat16",
+            [1, token_count, 2, 128],
+        )
+        _require_tensor(
+            next_entry.get("incoming_pre"),
+            f"case {start_pos} layer-four pre",
+            "torch.float32",
+            [1, token_count, 2],
+        )
+        attention = _object(owner.get("attention"), f"case {start_pos} attention")
+        _same(
+            item.get("attention_input"),
+            attention.get("input"),
+            f"case {start_pos} attention-to-block input",
+        )
+        _same(
+            item.get("attention_output"),
+            attention.get("output"),
+            f"case {start_pos} attention-to-block output",
+        )
+        _same(
+            item.get("block_output"),
+            next_entry.get("residual"),
+            f"case {start_pos} layer-three-to-four residual",
+        )
+        _same(
+            item.get("block_next_pre"),
+            next_entry.get("incoming_pre"),
+            f"case {start_pos} layer-three-to-four pre",
+        )
 
 
 def _next_layer_one_prefix(calls: list[Mapping[str, Any]], index: int) -> object:
@@ -325,6 +559,28 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         or actual_model.get("candidate_source_layer") != 3
     ):
         raise CaptureError("source owner/rotary geometry differs")
+    if any(
+        actual_model.get(name) != value for name, value in _POST_ATTENTION_MODEL.items()
+    ):
+        raise CaptureError("source layer-three post-attention model differs")
+    post_attention_parameters, post_attention_block_parameters = (
+        _post_attention_parameters(parameters)
+    )
+    post_attention_config = {
+        "copies": actual_model.get("hc_mult"),
+        "hc_sinkhorn_iters": actual_model.get("hc_sinkhorn_iters"),
+        "hc_eps": actual_model.get("hc_eps"),
+        "norm_eps": actual_model.get("norm_eps"),
+    }
+    if (
+        post_attention_config["copies"] != 2
+        or post_attention_config["hc_sinkhorn_iters"] != 20
+        or type(post_attention_config["hc_eps"]) is not float
+        or post_attention_config["hc_eps"] != 1.0e-6
+        or type(post_attention_config["norm_eps"]) is not float
+        or post_attention_config["norm_eps"] != 1.0e-20
+    ):
+        raise CaptureError("source layer-three post-attention HC configuration differs")
     model = {
         "batches": actual_model.get("max_batch_size"),
         "input_dimension": actual_model.get("dim"),
@@ -347,6 +603,7 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
     if not isinstance(bridge_calls, list) or len(bridge_calls) != len(_SCHEDULE):
         raise CaptureError("bridge projection lacks the four validated calls")
     cases: list[dict[str, object]] = []
+    post_attention_cases: list[dict[str, object]] = []
     expected_frequency: Mapping[str, Any] | None = None
     for index, (call, bridge_call, (start_pos, token_count)) in enumerate(
         zip(calls, bridge_calls, _SCHEDULE, strict=True)
@@ -617,6 +874,137 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
                 [1, token_count, 128],
             ),
         }
+        hc_calls = call.get("hyper_connection_mixes")
+        if not isinstance(hc_calls, list):
+            raise CaptureError(f"call {start_pos} lacks HC observations")
+        layer_three_hc = {
+            item.get("sublayer"): item
+            for item in hc_calls
+            if isinstance(item, Mapping) and item.get("layer_id") == 3
+        }
+        if set(layer_three_hc) != {"attention", "ffn"}:
+            raise CaptureError(f"call {start_pos} lacks layer-three HC sublayers")
+        attention_hc = layer_three_hc["attention"]
+        ffn_hc = layer_three_hc["ffn"]
+        attention_coefficients = _coefficients(
+            attention_hc.get("outputs"), f"call {start_pos} attention HC", token_count
+        )
+        ffn_coefficients = _coefficients(
+            ffn_hc.get("outputs"), f"call {start_pos} FFN HC", token_count
+        )
+        attention_hc_mixes = _require_tensor(
+            _object(
+                attention_hc.get("inputs"), f"call {start_pos} attention HC inputs"
+            ).get("mixes"),
+            f"call {start_pos} attention HC mixes",
+            "torch.float32",
+            [1, token_count, 8],
+        )
+        ffn_hc_mixes = _require_tensor(
+            _object(ffn_hc.get("inputs"), f"call {start_pos} FFN HC inputs").get(
+                "mixes"
+            ),
+            f"call {start_pos} FFN HC mixes",
+            "torch.float32",
+            [1, token_count, 8],
+        )
+        block_input = _object(
+            intermediates.get("layers.3.block_input"),
+            f"call {start_pos} layer-three block input",
+        )
+        next_block_entry = _object(
+            intermediates.get("layers.4.block_input"),
+            f"call {start_pos} layer-four block entry",
+        )
+        terminal = intermediates.get("layers.3")
+        if not isinstance(terminal, list) or len(terminal) != 2:
+            raise CaptureError(f"call {start_pos} lacks layer-three terminal state")
+        gate = intermediates.get("layers.3.ffn.gate")
+        if not isinstance(gate, list) or len(gate) != 2:
+            raise CaptureError(f"call {start_pos} lacks layer-three MoE gate")
+        post_attention = {
+            "start_pos": start_pos,
+            "input": _require_tensor(
+                intermediates.get("layers.3.ffn_input"),
+                f"call {start_pos} layer-three MoE input",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "gate_weights": _require_tensor(
+                gate[0],
+                f"call {start_pos} layer-three gate weights",
+                "torch.float32",
+                [token_count, 2],
+            ),
+            "gate_indices": _require_tensor(
+                gate[1],
+                f"call {start_pos} layer-three gate indices",
+                "torch.int64",
+                [token_count, 2],
+            ),
+            "output": _require_tensor(
+                intermediates.get("layers.3.ffn"),
+                f"call {start_pos} layer-three MoE output",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "block_input": _require_tensor(
+                block_input.get("residual"),
+                f"call {start_pos} layer-three residual entry",
+                "torch.bfloat16",
+                [1, token_count, 2, 128],
+            ),
+            "block_incoming_pre": _require_tensor(
+                block_input.get("incoming_pre"),
+                f"call {start_pos} layer-three incoming pre",
+                "torch.float32",
+                [1, token_count, 2],
+            ),
+            "attention_input": input_record,
+            "attention_output": attention["output"],
+            "after_attention_residual": _require_tensor(
+                intermediates.get("layers.3.after_attention_residual"),
+                f"call {start_pos} post-attention residual",
+                "torch.bfloat16",
+                [1, token_count, 2, 128],
+            ),
+            "attention_hc_mixes": attention_hc_mixes,
+            "attention_coefficients": attention_coefficients,
+            "ffn_collapsed": _require_tensor(
+                intermediates.get("layers.3.ffn_collapsed"),
+                f"call {start_pos} FFN collapsed input",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "ffn_hc_mixes": ffn_hc_mixes,
+            "ffn_coefficients": ffn_coefficients,
+            "block_output": _require_tensor(
+                terminal[0],
+                f"call {start_pos} layer-three terminal residual",
+                "torch.bfloat16",
+                [1, token_count, 2, 128],
+            ),
+            "block_next_pre": _require_tensor(
+                terminal[1],
+                f"call {start_pos} layer-three terminal pre",
+                "torch.float32",
+                [1, token_count, 2],
+            ),
+            "next_block_entry": {
+                "residual": _require_tensor(
+                    next_block_entry.get("residual"),
+                    f"call {start_pos} layer-four residual entry",
+                    "torch.bfloat16",
+                    [1, token_count, 2, 128],
+                ),
+                "incoming_pre": _require_tensor(
+                    next_block_entry.get("incoming_pre"),
+                    f"call {start_pos} layer-four incoming pre",
+                    "torch.float32",
+                    [1, token_count, 2],
+                ),
+            },
+        }
         _same(
             selection["qr"],
             intermediates.get("layers.3.attn.q_norm"),
@@ -642,6 +1030,26 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
             attention["compressed_indices"],
             selection["indices"],
             f"call {start_pos} attention selected-ID boundary",
+        )
+        _same(
+            post_attention["attention_input"],
+            attention["input"],
+            f"call {start_pos} attention-to-block input",
+        )
+        _same(
+            post_attention["attention_output"],
+            attention["output"],
+            f"call {start_pos} attention-to-block output",
+        )
+        _same(
+            post_attention["block_output"],
+            post_attention["next_block_entry"]["residual"],
+            f"call {start_pos} layer-three-to-four residual",
+        )
+        _same(
+            post_attention["block_next_pre"],
+            post_attention["next_block_entry"]["incoming_pre"],
+            f"call {start_pos} layer-three-to-four pre",
         )
         bridge_intermediates = _object(
             _object(bridge_call, "bridge call").get("intermediates"),
@@ -680,6 +1088,7 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
                 "attention": attention,
             }
         )
+        post_attention_cases.append(post_attention)
 
     attention_static = _object(
         capture.get("attention_static"), "layer-three attention static inputs"
@@ -702,6 +1111,22 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         "selection_weights": selection_weights,
         "attention_model": actual_model,
         "attention_weights": attention_weights,
+        "post_attention": {
+            "source": root.get("source"),
+            "source_receipt_sha256": source_sha256,
+            "capture_identity": capture.get("capture_identity"),
+            "model": {name: actual_model[name] for name in _POST_ATTENTION_MODEL},
+            "block_config": post_attention_config,
+            "encoded_parameters": post_attention_parameters,
+            "block_parameters": post_attention_block_parameters,
+            "cases": post_attention_cases,
+            "comparison_policy": {
+                "output_bf16": "exact storage bits",
+                "route_weight_abs_error_max": 9.5367431640625e-07,
+                "fixed_before_candidate_execution": True,
+                "block_next_pre_abs_error_max": 9.5367431640625e-07,
+            },
+        },
         "frequencies": expected_frequency,
         "cases": cases,
     }
@@ -978,6 +1403,8 @@ def validate_fixture(fixture: object) -> None:
             raise CaptureError(
                 f"case {start_pos} must not retain a layer-one score prefix"
             )
+
+    _validate_post_attention(root, cases)
 
 
 def _read_input(path: Path) -> bytes:

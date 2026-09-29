@@ -6,7 +6,7 @@
 //! Owner and attention have separate commit boundaries.
 
 #[path = "support/attention_capture.rs"]
-mod attention_capture;
+pub(crate) mod attention_capture;
 
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
@@ -240,7 +240,7 @@ fn fixture() -> Fixture {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
-        "4b0632e90ccec4c3ebf4c35c6d3d4a65e0126f02fd0afbf853468763711f02fe"
+        "562df6a8b2258968ca5bfc72ae0e5375afc45f14559d5e07d3388b211302498f"
     );
     let fixture: Fixture = serde_json::from_str(raw).expect("partition owner fixture JSON");
     assert_eq!(fixture.schema_version, 1);
@@ -579,9 +579,10 @@ fn run_native_owner_attention_partition(
     owner: &mut RatioOneCompressedOwner,
     attention: &mut LayerAttentionState,
     fixture: &Fixture,
-) {
+) -> Vec<(usize, Vec<u16>)> {
     let frequencies = fixture.frequencies.frequencies();
     let weights = attention_capture::weights_for_layer(&fixture.attention_weights, 3);
+    let mut outputs = Vec::with_capacity(fixture.cases.len());
     for index in 0..fixture.cases.len() {
         let case = &fixture.cases[index];
         let attention_case = &case.attention;
@@ -616,7 +617,17 @@ fn run_native_owner_attention_partition(
         )
         .expect("live owner publication drives layer-three attention");
         attention_capture::assert_diagnostic(attention_case, &diagnostic);
+        outputs.push((start, diagnostic.final_output));
     }
+    outputs
+}
+
+pub(crate) fn alternate_partition_owner_attention_outputs() -> Vec<(usize, Vec<u16>)> {
+    let fixture = fixture();
+    let mut owner = owner(&fixture);
+    let mut attention =
+        LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
+    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture)
 }
 
 #[test]
@@ -630,11 +641,8 @@ fn alternate_partition_owner_matches_source_prefixes_and_partial_bridges() {
 
 #[test]
 fn alternate_partition_owner_publications_drive_native_layer_three_attention() {
-    let fixture = fixture();
-    let mut owner = owner(&fixture);
-    let mut attention =
-        LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
-    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
+    let outputs = alternate_partition_owner_attention_outputs();
+    assert_eq!(outputs.len(), SCHEDULE.len());
 }
 
 #[test]
@@ -643,12 +651,12 @@ fn owner_and_layer_three_attention_reset_then_replay_together() {
     let mut owner = owner(&fixture);
     let mut attention =
         LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
-    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
+    let _ = run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
     owner.reset().expect("reset live owner publication state");
     attention
         .reset()
         .expect("reset layer-three attention state");
-    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
+    let _ = run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
 }
 
 #[test]

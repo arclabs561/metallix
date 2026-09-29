@@ -1,8 +1,8 @@
-//! Shared source-captured layer-four attention oracle for integration tests.
+//! Shared source-captured attention oracle for integration tests.
 //!
-//! The compressed KV publication is a layer-three source view.  This helper
-//! consumes its supplied layer-four IDs; it does not recreate the upstream
-//! indexer, compressor, or reindexing.
+//! The caller supplies compressed KV publications and selected IDs. This helper
+//! does not recreate the upstream indexer, compressor, or reindexing.
+//! Crate visibility lets nested test compositions share one oracle module.
 
 #![allow(
     dead_code,
@@ -21,33 +21,33 @@ use deepseek::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-pub(super) const SOURCE_LAYER: u16 = 3;
+pub(crate) const SOURCE_LAYER: u16 = 3;
 const FREQUENCY_PAIRS_PER_POSITION: usize = 16;
 
 #[derive(Deserialize)]
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     schema_version: u32,
     source: BTreeMap<String, String>,
-    pub(super) model: Model,
+    pub(crate) model: Model,
     frequencies: Frequencies,
-    pub(super) encoded_parameters: BTreeMap<String, Tensor>,
-    pub(super) cases: Vec<Case>,
+    pub(crate) encoded_parameters: BTreeMap<String, Tensor>,
+    pub(crate) cases: Vec<Case>,
     comparison_policy: Policy,
 }
 
 #[derive(Deserialize)]
-pub(super) struct Model {
-    pub(super) dim: usize,
-    pub(super) head_dim: usize,
-    pub(super) n_heads: usize,
-    pub(super) q_lora_rank: usize,
-    pub(super) rope_head_dim: usize,
-    pub(super) window_size: usize,
-    pub(super) o_groups: usize,
-    pub(super) o_lora_rank: usize,
-    pub(super) compress_ratios: Vec<usize>,
+pub(crate) struct Model {
+    pub(crate) dim: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) n_heads: usize,
+    pub(crate) q_lora_rank: usize,
+    pub(crate) rope_head_dim: usize,
+    pub(crate) window_size: usize,
+    pub(crate) o_groups: usize,
+    pub(crate) o_lora_rank: usize,
+    pub(crate) compress_ratios: Vec<usize>,
     candidate_source_layer: usize,
-    pub(super) norm_eps: f32,
+    pub(crate) norm_eps: f32,
 }
 
 #[derive(Deserialize)]
@@ -65,28 +65,28 @@ struct Policy {
 }
 
 #[derive(Deserialize)]
-pub(super) struct Case {
-    pub(super) start_pos: usize,
-    pub(super) input: Tensor,
-    pub(super) wq_a_output: Tensor,
-    pub(super) q_norm_output: Tensor,
-    pub(super) wq_b_pre_rope: Tensor,
-    pub(super) q_after_rope: Tensor,
-    pub(super) prepared_window_kv: Tensor,
-    pub(super) window_kv: Tensor,
-    pub(super) window_indices: Tensor,
-    pub(super) window_ring_after: Tensor,
-    pub(super) compressed_kv: Tensor,
-    pub(super) compressed_indices: Tensor,
-    pub(super) sparse_output_pre_inverse_rope: Tensor,
-    pub(super) wo_b_input: Tensor,
-    pub(super) output: Tensor,
+pub(crate) struct Case {
+    pub(crate) start_pos: usize,
+    pub(crate) input: Tensor,
+    pub(crate) wq_a_output: Tensor,
+    pub(crate) q_norm_output: Tensor,
+    pub(crate) wq_b_pre_rope: Tensor,
+    pub(crate) q_after_rope: Tensor,
+    pub(crate) prepared_window_kv: Tensor,
+    pub(crate) window_kv: Tensor,
+    pub(crate) window_indices: Tensor,
+    pub(crate) window_ring_after: Tensor,
+    pub(crate) compressed_kv: Tensor,
+    pub(crate) compressed_indices: Tensor,
+    pub(crate) sparse_output_pre_inverse_rope: Tensor,
+    pub(crate) wo_b_input: Tensor,
+    pub(crate) output: Tensor,
 }
 
 #[derive(Deserialize)]
-pub(super) struct Tensor {
-    pub(super) dtype: String,
-    pub(super) shape: Vec<usize>,
+pub(crate) struct Tensor {
+    pub(crate) dtype: String,
+    pub(crate) shape: Vec<usize>,
     storage_hex: String,
     storage_sha256: String,
 }
@@ -114,7 +114,7 @@ impl Tensor {
         bytes
     }
 
-    pub(super) fn bf16(&self) -> Vec<u16> {
+    pub(crate) fn bf16(&self) -> Vec<u16> {
         assert_eq!(self.dtype, "torch.bfloat16");
         let bytes = self.bytes();
         assert_eq!(bytes.len(), self.shape.iter().product::<usize>() * 2);
@@ -134,7 +134,7 @@ impl Tensor {
             .collect()
     }
 
-    pub(super) fn i32(&self) -> Vec<i32> {
+    pub(crate) fn i32(&self) -> Vec<i32> {
         assert_eq!(self.dtype, "torch.int32");
         let bytes = self.bytes();
         assert_eq!(bytes.len(), self.shape.iter().product::<usize>() * 4);
@@ -145,7 +145,7 @@ impl Tensor {
     }
 }
 
-pub(super) fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let fixture: Fixture = serde_json::from_str(include_str!(
         "../../../../../fixtures/deepseek-v41/forward-attention-reference.json"
     ))
@@ -167,7 +167,7 @@ pub(super) fn fixture() -> Fixture {
 
 /// A new source capture for the producer layer; historical layer-four fixture
 /// identities remain intentionally separate.
-pub(super) fn layer_three_fixture() -> Fixture {
+pub(crate) fn layer_three_fixture() -> Fixture {
     let fixture: Fixture = serde_json::from_str(include_str!(
         "../../../../../fixtures/deepseek-v41/forward-layer3-attention-reference.json"
     ))
@@ -284,7 +284,7 @@ fn assert_fixture_contract_for(fixture: &Fixture, attention_layer: usize, histor
     }
 }
 
-pub(super) fn frequencies(fixture: &Fixture) -> Vec<RotaryFrequency> {
+pub(crate) fn frequencies(fixture: &Fixture) -> Vec<RotaryFrequency> {
     fixture
         .frequencies
         .fp32_pairs
@@ -295,7 +295,7 @@ pub(super) fn frequencies(fixture: &Fixture) -> Vec<RotaryFrequency> {
         .collect()
 }
 
-pub(super) fn call_frequencies<'a>(
+pub(crate) fn call_frequencies<'a>(
     all: &'a [RotaryFrequency],
     case: &Case,
 ) -> &'a [RotaryFrequency] {
@@ -332,7 +332,7 @@ fn source_input_elements(case: &Case) -> usize {
         .expect("bounded captured attention input elements")
 }
 
-pub(super) fn layout(model: &Model) -> LayerAttentionLayout {
+pub(crate) fn layout(model: &Model) -> LayerAttentionLayout {
     LayerAttentionLayout::new(
         nonzero(1),
         nonzero(model.dim),
@@ -351,11 +351,11 @@ pub(super) fn layout(model: &Model) -> LayerAttentionLayout {
     .expect("source-shaped layer attention layout")
 }
 
-pub(super) fn nonzero(value: usize) -> NonZeroUsize {
+pub(crate) fn nonzero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("fixture dimensions are nonzero")
 }
 
-pub(super) struct EncodedWeights {
+pub(crate) struct EncodedWeights {
     wq_a_codes: Vec<u8>,
     wq_a_scales: Vec<u8>,
     q_norm: Vec<u16>,
@@ -371,7 +371,7 @@ pub(super) struct EncodedWeights {
 }
 
 impl EncodedWeights {
-    pub(super) fn borrowed(&self) -> LayerAttentionWeights<'_> {
+    pub(crate) fn borrowed(&self) -> LayerAttentionWeights<'_> {
         LayerAttentionWeights {
             wq_a: Fp8Projection {
                 codes: &self.wq_a_codes,
@@ -397,11 +397,11 @@ impl EncodedWeights {
     }
 }
 
-pub(super) fn weights(parameters: &BTreeMap<String, Tensor>) -> EncodedWeights {
+pub(crate) fn weights(parameters: &BTreeMap<String, Tensor>) -> EncodedWeights {
     weights_for_layer(parameters, 4)
 }
 
-pub(super) fn weights_for_layer(
+pub(crate) fn weights_for_layer(
     parameters: &BTreeMap<String, Tensor>,
     layer: usize,
 ) -> EncodedWeights {
@@ -443,7 +443,7 @@ fn fp8_scales(parameters: &BTreeMap<String, Tensor>, name: &str) -> Vec<u8> {
     parameters[name].bytes()
 }
 
-pub(super) fn forward_case(
+pub(crate) fn forward_case(
     state: &mut LayerAttentionState,
     case: &Case,
     epoch: u64,
@@ -473,7 +473,7 @@ pub(super) fn forward_case(
     clippy::too_many_arguments,
     reason = "negative controls keep each publication boundary explicit"
 )]
-pub(super) fn forward_with_publication(
+pub(crate) fn forward_with_publication(
     state: &mut LayerAttentionState,
     input: &[u16],
     start_position: usize,
@@ -500,7 +500,7 @@ pub(super) fn forward_with_publication(
     )
 }
 
-pub(super) fn assert_diagnostic(case: &Case, diagnostic: &LayerAttentionDiagnostic) {
+pub(crate) fn assert_diagnostic(case: &Case, diagnostic: &LayerAttentionDiagnostic) {
     assert_bf16_exact(case, "WQ-A", &diagnostic.wq_a, &case.wq_a_output.bf16());
     assert_bf16_exact(case, "Q norm", &diagnostic.qr, &case.q_norm_output.bf16());
     assert_bf16_exact(
@@ -593,7 +593,7 @@ fn assert_i32_exact(case: &Case, stage: &str, native: &[i32], source: &[i32]) {
     }
 }
 
-pub(super) fn prefetched_state(
+pub(crate) fn prefetched_state(
     fixture: &Fixture,
     frequencies: &[RotaryFrequency],
     weights: LayerAttentionWeights<'_>,
@@ -614,7 +614,7 @@ pub(super) fn prefetched_state(
 
 /// Runs the three captured attention calls as one native cache-continuous sequence.
 /// Supplied call starts and BF16 inputs are checked against the pinned source fixture.
-pub(super) fn native_outputs_from_inputs(
+pub(crate) fn native_outputs_from_inputs(
     inputs: &[(usize, Vec<u16>)],
     expected_capture_sha256: &str,
 ) -> Vec<Vec<u16>> {

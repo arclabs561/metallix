@@ -66,11 +66,11 @@ operands verbatim, with the source receipt and capture identities. Extraction
 requires completed execution and successful observer controls. These checks
 establish source handoffs, not native alternate-partition support.
 
-### Native alternate owner, selection and attention
+### Native alternate L3 owner through post-attention block
 
 ```sh
 uv run scripts/v41_partition_owner_capture.py --input artifacts/v41-partition-boundaries.json --output artifacts/v41-partition-owner.json
-cargo test -p deepseek --test forward_partition_owner
+cargo test -p deepseek --test forward_partition_owner --test forward_moe
 ```
 
 The compact `partition-owner-reference.json` fixture projects actual source
@@ -104,8 +104,19 @@ commit also leaves live state unchanged; retrying its identity succeeds. These
 six integration tests cover the owner/selection path and its attention consumer,
 including reset of both states followed by exact replay. Owner commit precedes
 attention execution; these tests do not establish rollback across that boundary.
-Surrounding block operations, L1 scoring and full-graph final-head agreement
-remain unqualified for the alternate schedule.
+
+The additive `post_attention` projection retains the same alternate source
+identity, actual L3 MoE/HC weights and all four L4-entry observations.
+`forward_moe` consumes the computed owner-attention outputs through its existing
+HC/FFN path. Expert IDs, MoE outputs and terminal BF16 residuals match exactly;
+FP32 coefficients satisfy the unchanged source-derived interval checks. A zeroed
+HC projection is rejected by the numerical checks, and the existing zero-attention
+control runs at each call. Extraction rejects detached attention/block/L4
+handoffs and overlapping or misplaced parameter keys.
+
+L3 residual inputs and incoming coefficients remain source-fed. L1 scoring,
+surrounding layers and full-graph final-head agreement remain unqualified for
+the alternate schedule.
 
 ## Run it
 

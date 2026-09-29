@@ -187,6 +187,107 @@ class PartitionOwnerCaptureTest(unittest.TestCase):
         with self.assertRaises((ValueError, RuntimeError)):
             capture.validate_fixture(fixture)
 
+    def test_every_retained_tensor_requires_matching_storage_digest(self) -> None:
+        def tensors(value, path=()):
+            if isinstance(value, dict):
+                if "storage_hex" in value:
+                    yield path
+                else:
+                    for key, child in value.items():
+                        yield from tensors(child, (*path, key))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    yield from tensors(child, (*path, index))
+
+        paths = list(tensors(self.fixture))
+        self.assertTrue(paths, "the source fixture must retain numerical operands")
+        for path in paths:
+            with self.subTest(path=path):
+                fixture = copy.deepcopy(self.fixture)
+                tensor = fixture
+                for key in path:
+                    tensor = tensor[key]
+                tensor["storage_sha256"] = "0" * 64
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
+    def test_post_attention_preserves_call_and_layer_handoffs(self) -> None:
+        capture.validate_fixture(self.fixture)
+        cases = self.fixture["post_attention"]["cases"]
+        self.assertEqual([case["start_pos"] for case in cases], [0, 4, 5, 6])
+        for owner, case in zip(self.fixture["cases"], cases, strict=True):
+            self.assertEqual(
+                case["attention_output"]["storage_sha256"],
+                owner["attention"]["output"]["storage_sha256"],
+            )
+            self.assertEqual(
+                case["block_output"]["storage_sha256"],
+                case["next_block_entry"]["residual"]["storage_sha256"],
+            )
+            self.assertEqual(
+                case["block_next_pre"]["storage_sha256"],
+                case["next_block_entry"]["incoming_pre"]["storage_sha256"],
+            )
+
+    def test_rejects_detached_post_attention_handoffs(self) -> None:
+        for path in (
+            ("attention_input",),
+            ("attention_output",),
+            ("next_block_entry", "residual"),
+            ("next_block_entry", "incoming_pre"),
+        ):
+            with self.subTest(path=path):
+                fixture = copy.deepcopy(self.fixture)
+                tensor = fixture["post_attention"]["cases"][1]
+                for key in path:
+                    tensor = tensor[key]
+                raw = bytearray.fromhex(tensor["storage_hex"])
+                raw[0] ^= 1
+                tensor["storage_hex"] = raw.hex()
+                tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
+    def test_rejects_relabelled_post_attention_contract(self) -> None:
+        for path, replacement in (
+            (("source", "runner_sha256"), "0" * 64),
+            (("source_receipt_sha256",), "0" * 64),
+            (("capture_identity", "sha256"), "0" * 64),
+            (("model", "n_shared_experts"), True),
+            (("model", "norm_topk_prob"), 1),
+            (("model", "route_scale"), True),
+            (("block_config", "copies"), 2.0),
+            (("comparison_policy", "fixed_before_candidate_execution"), 1),
+            (("cases", 0, "start_pos"), False),
+        ):
+            with self.subTest(path=path):
+                fixture = copy.deepcopy(self.fixture)
+                section = fixture["post_attention"]
+                for key in path[:-1]:
+                    section = section[key]
+                section[path[-1]] = replacement
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
+    def test_rejects_shadowed_or_misplaced_post_attention_parameters(self) -> None:
+        for defect in ("shadow", "move", "extra"):
+            with self.subTest(defect=defect):
+                fixture = copy.deepcopy(self.fixture)
+                post = fixture["post_attention"]
+                name = "layers.3.ffn.gate.weight"
+                tensor = post["encoded_parameters"][name]
+                if defect == "shadow":
+                    post["block_parameters"][name] = copy.deepcopy(tensor)
+                    tensor["storage_sha256"] = "0" * 64
+                elif defect == "move":
+                    post["block_parameters"][name] = post["encoded_parameters"].pop(
+                        name
+                    )
+                else:
+                    post["encoded_parameters"]["unused.weight"] = copy.deepcopy(tensor)
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
 
 if __name__ == "__main__":
     unittest.main()

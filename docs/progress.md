@@ -379,12 +379,19 @@ successful retry, plus reset, stale-publication rejection and exact replay.
 Two of these tests join the committed native KV and computed IDs to L3 attention
 and replay after resetting both states. Window reads/writes, sparse outputs and
 final attention outputs match the source exactly.
-Eight extractor/fixture tests reject malformed geometry/storage, relabelled
+Thirteen extractor/fixture tests reject malformed geometry/storage, relabelled
 capture/probe/backend identities, substituted partial prefixes, malformed
 FP8/bool storage, invalid causal scores and detached attention input/KV/IDs. The extractor binds the probe and
 schedule to the recorded capture hash and requires little-endian storage.
-This qualifies the L3 owner, selection and attention path; surrounding layers
-and full native-graph qualification remain open. Owner cancellation/retry checks
+Two additional native tests feed these computed attention outputs through the
+existing L3 HC/FFN implementation to the L4 entry, and reject a zeroed HC
+projection through numerical checks. Terminal BF16 residuals and expert IDs
+match exactly; FP32 coefficients retain the existing source-derived bounds.
+The extractor also rejects detached block handoffs, relabelled nested provenance,
+parameter-map shadowing and corrupt storage digests for every retained tensor.
+This qualifies the L3 owner, selection, attention and post-attention block path.
+L3 block inputs remain source-fed; surrounding layers and full native-graph
+qualification remain open. Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 
@@ -407,7 +414,8 @@ The composed L1 path now retains unified Engram, owner, attention and tail
 operands. Its start-six owner call requires the preceding live L3 prefix before
 mutating compressor state. Changed source metadata and weights are rejected;
 the complete reduced path retains its request invalidation/reconstruction tests.
-All 73 DeepSeek `forward_moe` tests and strict all-target/all-feature Clippy pass.
+The current `forward_moe` binary passes 81 tests (including six imported
+partition-owner controls); its standalone partition-owner binary passes six.
 The canonical Metal check reaches the unchanged Julia encoder mismatch below.
 Receipts: `.agents/receipts/candidate-control/unified-l1-*`.
 

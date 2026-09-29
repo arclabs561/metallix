@@ -22,8 +22,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-#[path = "support/attention_capture.rs"]
-mod attention_capture;
+use partition_owner::attention_capture;
 #[path = "support/candidate_capture.rs"]
 mod candidate_capture;
 #[path = "support/engram_capture.rs"]
@@ -50,6 +49,12 @@ mod layer2_join;
 mod layer_zero;
 #[path = "support/owner_attention_capture.rs"]
 mod owner_attention_capture;
+#[allow(
+    dead_code,
+    reason = "the alternate owner-attention runner shares its test-only source qualification"
+)]
+#[path = "forward_partition_owner.rs"]
+mod partition_owner;
 #[path = "support/rounding_interval.rs"]
 mod rounding_interval;
 
@@ -76,18 +81,43 @@ struct BlockConfig {
     norm_eps: f32,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct Source {
     revision: String,
     model_sha256: String,
     cpu_backend_sha256: String,
-    complete_capture_sha256: String,
-    storage_byteorder: String,
+    #[serde(default)]
+    complete_capture_sha256: Option<String>,
+    #[serde(default)]
+    storage_byteorder: Option<String>,
     kernel_source_sha256: String,
     loader_sha256: String,
     engram_sha256: String,
-    manifest_canonical_sha256: String,
+    #[serde(default)]
+    manifest_canonical_sha256: Option<String>,
     runner_sha256: String,
+}
+
+#[derive(Deserialize)]
+struct AlternatePartitionFixture {
+    schema_version: u32,
+    source_receipt_sha256: String,
+    source: Source,
+    capture_identity: Value,
+    post_attention: AlternatePostAttention,
+}
+
+#[derive(Deserialize)]
+struct AlternatePostAttention {
+    source_receipt_sha256: String,
+    source: Source,
+    capture_identity: Value,
+    model: Model,
+    encoded_parameters: BTreeMap<String, Tensor>,
+    cases: Vec<Case>,
+    comparison_policy: Policy,
+    block_parameters: BTreeMap<String, Tensor>,
+    block_config: BlockConfig,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +294,72 @@ fn fixture() -> Fixture {
     f
 }
 
+fn alternate_partition_tail_fixture() -> Fixture {
+    const SOURCE_RECEIPT_SHA256: &str =
+        "9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906";
+    const FIXTURE_SHA256: &str = "562df6a8b2258968ca5bfc72ae0e5375afc45f14559d5e07d3388b211302498f";
+    let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        FIXTURE_SHA256
+    );
+    let alternate: AlternatePartitionFixture =
+        serde_json::from_str(raw).expect("typed alternate partition fixture");
+    assert_eq!(alternate.schema_version, 1);
+    assert_eq!(alternate.source_receipt_sha256, SOURCE_RECEIPT_SHA256);
+    assert_eq!(
+        alternate.source.revision,
+        "dba1be0a40aa45a94ad051997016db3960a90277"
+    );
+    assert_eq!(
+        alternate.source.model_sha256,
+        "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+    );
+    assert_eq!(
+        alternate.post_attention.source_receipt_sha256, alternate.source_receipt_sha256,
+        "post-attention source receipt"
+    );
+    assert_eq!(
+        alternate.post_attention.source, alternate.source,
+        "post-attention source provenance"
+    );
+    assert_eq!(
+        alternate.post_attention.capture_identity, alternate.capture_identity,
+        "post-attention capture identity"
+    );
+    assert_eq!(
+        alternate.capture_identity["schedule"],
+        serde_json::json!([4, 1, 1, 1]),
+        "alternate capture schedule"
+    );
+    let post = alternate.post_attention;
+    let fixture = Fixture {
+        schema_version: alternate.schema_version,
+        source: post.source,
+        model: post.model,
+        encoded_parameters: post.encoded_parameters,
+        cases: post.cases,
+        comparison_policy: post.comparison_policy,
+        block_parameters: post.block_parameters,
+        block_config: post.block_config,
+    };
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 4, 5, 6],
+        "alternate layer-three calls"
+    );
+    assert!(fixture.source.complete_capture_sha256.is_none());
+    assert!(fixture.source.manifest_canonical_sha256.is_none());
+    assert!(fixture.source.storage_byteorder.is_none());
+    assert_encoded_parameter_schema_for(&fixture, 3);
+    validate_block_tail_fixture(&fixture);
+    fixture
+}
+
 fn fixture_from(source: &str) -> Fixture {
     serde_json::from_str(source).expect("valid source MoE fixture")
 }
@@ -282,8 +378,8 @@ fn layer_three_fixture() -> Fixture {
         "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
     );
     assert_eq!(
-        f.source.complete_capture_sha256,
-        "7a6290921f79573e976aba42ec296f038adda2efc0d3d89b8583c6f58c79cb92"
+        f.source.complete_capture_sha256.as_deref(),
+        Some("7a6290921f79573e976aba42ec296f038adda2efc0d3d89b8583c6f58c79cb92")
     );
     assert_eq!(
         f.source.cpu_backend_sha256,
@@ -302,14 +398,14 @@ fn layer_three_fixture() -> Fixture {
         "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897"
     );
     assert_eq!(
-        f.source.manifest_canonical_sha256,
-        "fd69a8fce4d5048f87db705603e05e3077c4f9bda402ec08be848aaa5cbdb92e"
+        f.source.manifest_canonical_sha256.as_deref(),
+        Some("fd69a8fce4d5048f87db705603e05e3077c4f9bda402ec08be848aaa5cbdb92e")
     );
     assert_eq!(
         f.source.runner_sha256,
         "48f10d6a0ba0888580132a08e9821bf0f707ec5a0cc609a777c0a37c59666684"
     );
-    assert_eq!(f.source.storage_byteorder, "little");
+    assert_eq!(f.source.storage_byteorder.as_deref(), Some("little"));
     assert_model_and_case_contract(&f);
     f
 }
@@ -346,10 +442,12 @@ fn moe_fixture_from_bundle(bundle: &Value, layer: usize) -> Fixture {
             .expect("bundle model")
     );
     assert_eq!(
-        fixture.source.complete_capture_sha256,
-        bundle["source"]["complete_capture_sha256"]
-            .as_str()
-            .expect("bundle capture")
+        fixture.source.complete_capture_sha256.as_deref(),
+        Some(
+            bundle["source"]["complete_capture_sha256"]
+                .as_str()
+                .expect("bundle capture")
+        )
     );
     assert_eq!(
         fixture.source.revision,
@@ -395,14 +493,14 @@ fn assert_source_provenance(f: &Fixture) {
         "b1f1f3cfdb93b674a5f96a114cf45bf5be9ad3a555ae95ac24add567f9f5232e"
     );
     assert_eq!(
-        f.source.complete_capture_sha256,
-        "e27dde6ead409c74f7bb2c9e08d4cd5a2b0cfc3c9505c7d6b8908b1cd78b1cc6"
+        f.source.complete_capture_sha256.as_deref(),
+        Some("e27dde6ead409c74f7bb2c9e08d4cd5a2b0cfc3c9505c7d6b8908b1cd78b1cc6")
     );
     assert_eq!(
         f.source.runner_sha256,
         "bc1a1cca7c3570831152cd98b829b41905c50b9d0485c1354268a647c3e5dff8"
     );
-    assert_eq!(f.source.storage_byteorder, "little");
+    assert_eq!(f.source.storage_byteorder.as_deref(), Some("little"));
     assert_eq!(
         f.source.kernel_source_sha256,
         "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455"
@@ -416,8 +514,8 @@ fn assert_source_provenance(f: &Fixture) {
         "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897"
     );
     assert_eq!(
-        f.source.manifest_canonical_sha256,
-        "fd69a8fce4d5048f87db705603e05e3077c4f9bda402ec08be848aaa5cbdb92e"
+        f.source.manifest_canonical_sha256.as_deref(),
+        Some("fd69a8fce4d5048f87db705603e05e3077c4f9bda402ec08be848aaa5cbdb92e")
     );
 }
 
@@ -1389,7 +1487,7 @@ fn native_block_attention_outputs(
         .collect::<Vec<_>>();
     let outputs = if let Some(bundle) = bundle {
         assert_eq!(
-            Some(f.source.complete_capture_sha256.as_str()),
+            f.source.complete_capture_sha256.as_deref(),
             bundle.bundle["source"]["complete_capture_sha256"].as_str()
         );
         owner_attention_capture::native_outputs_from_bundle_publications(
@@ -1400,7 +1498,10 @@ fn native_block_attention_outputs(
     } else {
         owner_attention_capture::native_outputs_from_ownered_inputs(
             &inputs,
-            &f.source.complete_capture_sha256,
+            f.source
+                .complete_capture_sha256
+                .as_deref()
+                .expect("complete source capture for owner replay"),
         )
     };
     assert_eq!(outputs.len(), f.cases.len());
@@ -2355,6 +2456,56 @@ fn native_layer_three_engram_through_final_suffix_matches_source_logits() {
 }
 
 #[test]
+fn alternate_partition_owner_attention_reaches_layer_four_through_native_layer_three_tail() {
+    let f = alternate_partition_tail_fixture();
+    let attention = partition_owner::alternate_partition_owner_attention_outputs();
+    assert_eq!(
+        attention
+            .iter()
+            .map(|(start, _)| *start)
+            .collect::<Vec<_>>(),
+        [0, 4, 5, 6],
+        "alternate native owner-attention calls"
+    );
+    let supplied: Vec<_> = attention.into_iter().map(|(_, output)| output).collect();
+    let tail =
+        native_layer_three_block_tail_from_entries_with_attention(&f, None, None, Some(&supplied));
+    for (case, output) in f.cases.iter().zip(&tail) {
+        let (residual, _) = source_layer_four_entry(case);
+        assert_eq!(output.residual, residual, "alternate L3 terminal residual");
+        assert_eq!(
+            output.terminal_envelopes.as_ref().map(Vec::len),
+            Some(case.input.shape[1]),
+            "alternate L3 source layer-four entry envelopes"
+        );
+    }
+}
+
+#[test]
+fn alternate_partition_rejects_changed_layer_three_attention_hc_projection() {
+    let mut f = alternate_partition_tail_fixture();
+    let projection = f
+        .block_parameters
+        .get_mut("layers.3.hc_attn_fn")
+        .expect("alternate layer-three attention HC projection");
+    projection.storage_hex = "0".repeat(projection.storage_hex.len());
+    let attention = partition_owner::alternate_partition_owner_attention_outputs();
+    let supplied: Vec<_> = attention.into_iter().map(|(_, output)| output).collect();
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            native_layer_three_block_tail_from_entries_with_attention(
+                &f,
+                None,
+                None,
+                Some(&supplied),
+            )
+        }))
+        .is_err(),
+        "changed captured layer-three attention HC projection must alter native arithmetic"
+    );
+}
+
+#[test]
 fn native_layer_two_ffn_engram_through_final_suffix_matches_source_logits() {
     let layer_two = native_layer_two_entries();
     let streams: Vec<_> = layer_two
@@ -2843,7 +2994,10 @@ fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: 
     assert_eq!(head.source.model_sha256, f.source.model_sha256);
     assert_eq!(
         head.source.complete_capture_sha256,
-        f.source.complete_capture_sha256
+        f.source
+            .complete_capture_sha256
+            .as_deref()
+            .expect("complete source capture for final suffix")
     );
     assert_eq!(head.cases.len(), f.cases.len());
     assert_eq!(head.weight_shape[1], 128);
