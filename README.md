@@ -518,8 +518,10 @@ and serving remain open. Runtime components under `deepseek::reduced` now own
 final-head arithmetic, attention HC/FFN block tails, and persistent Engram hashing,
 embedding, projection and gating. They accept supplied operands without fixture
 readers or expected outputs. Engram publishes history only after a successful
-step. Complete token-to-logits request orchestration still remains in the test
-harness.
+step. `StartupSession` now executes caller token IDs through embedding, HC/norm,
+window attention and the first block tail, retaining its window across calls.
+Its late failures require reset. Complete L1–L4 request orchestration still
+remains in the test harness.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

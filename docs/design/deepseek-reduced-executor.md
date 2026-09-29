@@ -31,9 +31,17 @@ residual gating). Engram stages hash history and commits it only after every
 numerical stage succeeds; reset reconstructs pristine history. Fixture decoding
 and every source-stage comparison remain test-owned.
 
+`AttentionInput` now owns incoming HC collapse and RMSNorm. `StartupSession`
+composes embedding, attention preparation, window-only attention and the first
+block tail over caller token IDs. It retains the window between calls and
+invalidates itself after any admitted-call failure; reset clears the window
+and cursor. Both established schedules retain their independent source checks.
+
 The remaining assembly owns L1/L2/L3/L4 request state with the preceding-call
-L3 publication. Weights
-must be separated from the source cases; synthetic layouts remain explicitly
+L3 publication. L1 needs a ratio-two owner using its existing compressor and
+key/KV primitives; the ratio-one L3 owner is not a substitute. L3 extraction
+also needs typed candidate-mask projection rather than fixture-selected IDs.
+Weights must be separated from the source cases; synthetic layouts remain explicitly
 bounded. Both established schedules must work. A late failure invalidates the
 request, and restart reconstructs all mutable state from immutable weights.
 No component-local rollback claim is sufficient for the entire request.

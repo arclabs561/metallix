@@ -40,8 +40,9 @@ head. Failure invalidation and fresh reconstruction remain bounded fixture
 controls. The alternate L3/L4 tails and head still run after the upstream loop;
 interleaved request execution and alternate full-request recovery remain open.
 The final head, HC/FFN block tails and persistent Engram arithmetic/state now
-have fixture-independent runtime components; complete request assembly and
-supplied-weight/token-input execution are the next extraction gate.
+have fixture-independent runtime components. A stateful first-block session
+now accepts caller token IDs and weights through its complete window-attention
+and HC/FFN path. Complete L1–L4 request assembly remains the next extraction gate.
 Downstream weights and source checks remain fixture-backed; broader partitions,
 checkpoint loading and Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three

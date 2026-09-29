@@ -8,13 +8,11 @@ use deepseek::{
         Fp8Projection, LayerAttentionDiagnostic, LayerAttentionError, LayerAttentionLayout,
         LayerAttentionState, LayerAttentionWeights,
     },
-    hc::{
-        HcCoefficients,
-        mixing::{hc_post_bf16_reference, hc_pre_bf16_reference},
-        projection::project_hc_coefficients,
-    },
+    ffn::FfnSublayerReference,
+    hc::{HcCoefficients, projection::project_hc_coefficients},
     moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference},
-    rms_norm_bf16_reference, startup_bf16_reference,
+    reduced::{AttentionInput, BlockTailReference, StartupSession, StartupStepOutput},
+    startup_bf16_reference,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -337,20 +335,16 @@ fn native_attention_input(root: &Value, case: &Value) -> Vec<u16> {
         field(root, "parameters"),
         "layers.0.attn_norm.weight",
     ));
+    let preparation = AttentionInput::new(&norm_weight, 2, 1.0e-20).unwrap();
     let mut attention_input = Vec::with_capacity(positions * 128);
     for position in 0..positions {
-        let mut collapsed = vec![0; 128];
-        hc_pre_bf16_reference(
-            &residual[position * 256..(position + 1) * 256],
-            &incoming_pre[position * 2..(position + 1) * 2],
-            128,
-            &mut collapsed,
-        )
-        .expect("native layer-zero incoming HC pre-mix");
-        let mut normalized = vec![0; 128];
-        rms_norm_bf16_reference(&collapsed, &norm_weight, 1.0e-20, &mut normalized)
-            .expect("native layer-zero attention RMSNorm");
-        attention_input.extend(normalized);
+        let output = preparation
+            .forward(
+                &residual[position * 256..(position + 1) * 256],
+                &incoming_pre[position * 2..(position + 1) * 2],
+            )
+            .expect("runtime attention preparation");
+        attention_input.extend_from_slice(output.normalized_bf16());
     }
     assert_eq!(
         attention_input,
@@ -372,38 +366,6 @@ fn forward_window_case(
     let from = start.checked_mul(16).expect("frequency offset");
     let to = from + positions * 16;
     state.forward_window_only(attention_input, start, &all_frequencies[from..to], weights)
-}
-
-fn native_layer_zero_attention_outputs(root: &Value) -> Vec<(usize, Vec<u16>)> {
-    let all_frequencies = frequencies(field(
-        field(
-            &field(root, "cases").as_array().expect("cases")[0],
-            "attention",
-        ),
-        "frequencies",
-    ));
-    assert_eq!(all_frequencies.len(), 8 * 16, "source frequency table");
-    let weights = attention_weights(root);
-    let mut state = LayerAttentionState::new(window_only_layout(root));
-    field(root, "cases")
-        .as_array()
-        .expect("cases")
-        .iter()
-        .map(|case| {
-            let start = usize_field(case, "start_pos");
-            let attention_input = native_attention_input(root, case);
-            let diagnostic = forward_window_case(
-                &mut state,
-                case,
-                &attention_input,
-                &all_frequencies,
-                weights.borrowed(),
-            )
-            .expect("native layer-zero window-only attention");
-            assert_attention_diagnostic(case, &diagnostic);
-            (start, diagnostic.final_output)
-        })
-        .collect()
 }
 
 fn native_hc_coefficients(root: &Value, sublayer: &str, residual: &[u16]) -> HcCoefficients {
@@ -534,101 +496,117 @@ fn with_native_layer_zero_moe<R>(root: &Value, body: impl FnOnce(MoEReference<'_
     body(MoEReference::new(config, &gate, &bias, &routed, shared).expect("layer-zero MoE"))
 }
 
-fn native_layer_zero_output(
-    root: &Value,
-    case: &Value,
-    attention: &[u16],
-    moe: &MoEReference<'_>,
-) -> (Vec<u16>, Vec<f32>) {
-    let positions = usize::try_from(
-        field(field(case, "block_output"), "shape")
-            .as_array()
-            .expect("shape")[1]
-            .as_u64()
-            .expect("positions"),
-    )
-    .expect("usize positions");
-    let (residual, _incoming_pre) = native_startup(root, case);
-    let expected_attention = bf16(field(case, "attention_output"));
+fn with_runtime_startup<R>(root: &Value, body: impl FnOnce(StartupSession<'_>) -> R) -> R {
+    let parameters = field(root, "parameters");
+    let model = field(root, "model");
+    let table = bf16(field(parameters, "embed.weight"));
+    let norm = bf16(field(parameters, "layers.0.attn_norm.weight"));
+    let ffn_norm = bf16(field(parameters, "layers.0.ffn_norm.weight"));
+    let attn_projection = fp32(field(parameters, "layers.0.hc_attn_fn"));
+    let attn_scale: [f32; 3] = fp32(field(parameters, "layers.0.hc_attn_scale"))
+        .try_into()
+        .unwrap();
+    let attn_base = fp32(field(parameters, "layers.0.hc_attn_base"));
+    let ffn_projection = fp32(field(parameters, "layers.0.hc_ffn_fn"));
+    let ffn_scale: [f32; 3] = fp32(field(parameters, "layers.0.hc_ffn_scale"))
+        .try_into()
+        .unwrap();
+    let ffn_base = fp32(field(parameters, "layers.0.hc_ffn_base"));
+    let epsilon = serde_json::from_value(field(model, "norm_eps").clone()).unwrap();
+    let iterations = usize_field(model, "hc_sinkhorn_iters");
+    let hc_epsilon = serde_json::from_value(field(model, "hc_eps").clone()).unwrap();
+    let attention = attention_weights(root);
+    with_native_layer_zero_moe(root, |moe| {
+        let ffn = FfnSublayerReference::new(
+            moe,
+            &ffn_norm,
+            &ffn_projection,
+            &ffn_scale,
+            &ffn_base,
+            2,
+            epsilon,
+            iterations,
+            hc_epsilon,
+        )
+        .unwrap();
+        let tail = BlockTailReference::new(
+            ffn,
+            &attn_projection,
+            &attn_scale,
+            &attn_base,
+            2,
+            epsilon,
+            iterations,
+            hc_epsilon,
+        )
+        .unwrap();
+        body(
+            StartupSession::new(
+                &table,
+                &norm,
+                epsilon,
+                window_only_layout(root),
+                attention.borrowed(),
+                tail,
+            )
+            .unwrap(),
+        )
+    })
+}
+
+fn assert_runtime_startup(root: &Value, case: &Value, output: &StartupStepOutput) {
+    let (initial, pre) = native_startup(root, case);
+    assert_eq!(output.startup().residual_bf16(), initial);
+    assert_eq!(output.startup().identity_pre(), pre);
     assert_eq!(
-        attention, expected_attention,
-        "native layer-zero attention output"
+        output.attention_input(),
+        bf16(field(case, "attention_input"))
     );
-    let expected_after_attention = bf16(field(case, "after_attention_residual"));
-    let expected_ffn_collapse = bf16(field(case, "ffn_collapsed"));
-    let expected_ffn = bf16(field(case, "ffn_output"));
-    let ffn_norm = bf16(field(field(root, "parameters"), "layers.0.ffn_norm.weight"));
-    let expected_output = bf16(field(case, "block_output"));
-    let mut output = Vec::with_capacity(expected_output.len());
-    let mut next_pre = Vec::with_capacity(positions * 2);
-    for position in 0..positions {
-        let residual = &residual[position * 256..(position + 1) * 256];
-        let attention_coefficients = native_hc_coefficients(root, "attn", residual);
-        let mut after_attention = vec![0; 256];
-        hc_post_bf16_reference(
-            &attention[position * 128..(position + 1) * 128],
-            residual,
-            attention_coefficients.post(),
-            attention_coefficients.comb(),
-            &mut after_attention,
-        )
-        .expect("native layer-zero attention HC post mix");
+    assert_attention_diagnostic(case, output.attention());
+    assert_eq!(
+        output.attention().final_output,
+        bf16(field(case, "attention_output"))
+    );
+    let after = bf16(field(case, "after_attention_residual"));
+    let collapsed = bf16(field(case, "ffn_collapsed"));
+    let normalized = bf16(field(case, "ffn_input"));
+    let moe = bf16(field(case, "ffn_output"));
+    let terminal = bf16(field(case, "block_output"));
+    for (position, tail) in output.tails().iter().enumerate() {
         assert_eq!(
-            after_attention,
-            expected_after_attention[position * 256..(position + 1) * 256],
-            "native layer-zero attention residual at position {position}"
+            tail.after_attention_bf16(),
+            &after[position * 256..(position + 1) * 256]
         );
-        let mut collapsed = vec![0; 128];
-        hc_pre_bf16_reference(
-            &after_attention,
-            attention_coefficients.pre(),
-            128,
-            &mut collapsed,
-        )
-        .expect("native layer-zero attention HC pre mix");
         assert_eq!(
-            collapsed,
-            expected_ffn_collapse[position * 128..(position + 1) * 128],
-            "native layer-zero FFN collapse at position {position}"
+            tail.ffn().collapsed_bf16(),
+            &collapsed[position * 128..(position + 1) * 128]
         );
-        let mut normalized = vec![0; 128];
-        rms_norm_bf16_reference(&collapsed, &ffn_norm, 1e-20, &mut normalized)
-            .expect("native layer-zero FFN normalization");
         assert_eq!(
-            normalized,
-            bf16(field(case, "ffn_input"))[position * 128..(position + 1) * 128],
-            "native layer-zero FFN input at position {position}"
+            tail.ffn().normalized_bf16(),
+            &normalized[position * 128..(position + 1) * 128]
         );
-        let moe_output = moe
-            .forward_token(&normalized)
-            .expect("native layer-zero MoE");
         assert_eq!(
-            moe_output.output_bf16(),
-            &expected_ffn[position * 128..(position + 1) * 128],
-            "native layer-zero MoE output at position {position}"
+            tail.ffn().moe().output_bf16(),
+            &moe[position * 128..(position + 1) * 128]
         );
-        let ffn_coefficients = native_hc_coefficients(root, "ffn", &after_attention);
-        let mut terminal = vec![0; 256];
-        hc_post_bf16_reference(
-            moe_output.output_bf16(),
-            &after_attention,
-            ffn_coefficients.post(),
-            ffn_coefficients.comb(),
-            &mut terminal,
-        )
-        .expect("native layer-zero FFN HC post mix");
         assert_eq!(
-            terminal,
-            expected_output[position * 256..(position + 1) * 256],
-            "native layer-zero terminal residual at position {position}"
+            tail.ffn().output_bf16(),
+            &terminal[position * 256..(position + 1) * 256]
         );
-        assert_native_next_pre_envelope(root, case, position, &after_attention, &ffn_coefficients);
-        output.extend(terminal);
-        next_pre.extend_from_slice(ffn_coefficients.pre());
+        assert_native_next_pre_envelope(
+            root,
+            case,
+            position,
+            tail.after_attention_bf16(),
+            tail.ffn().coefficients(),
+        );
     }
-    assert_eq!(next_pre.len(), fp32(field(case, "block_next_pre")).len());
-    assert!(next_pre.iter().all(|value| value.is_finite()));
-    (output, next_pre)
+    assert_eq!(output.residual(), terminal);
+    assert_eq!(
+        output.next_pre().len(),
+        fp32(field(case, "block_next_pre")).len()
+    );
+    assert!(output.next_pre().iter().all(|value| value.is_finite()));
 }
 
 /// Runs the source-pinned layer-zero bridge from the supplied projection.
@@ -646,28 +624,31 @@ pub(crate) fn native_layer_zero_entries_from_projection(
         Some("source-pinned native startup, attention, FFN, and HC composition")
     );
     let cases = field(root, "cases").as_array().expect("bridge cases");
-    let attention_outputs = native_layer_zero_attention_outputs(root);
-    with_native_layer_zero_moe(root, |moe| {
+    let all_frequencies = frequencies(field(field(&cases[0], "attention"), "frequencies"));
+    assert_eq!(all_frequencies.len(), 8 * 16, "source frequency table");
+    with_runtime_startup(root, |mut session| {
         cases
             .iter()
             .map(|case| {
                 let start = usize_field(case, "start_pos");
-                let output = field(case, "block_output");
+                let ids = u64s(field(field(case, "startup"), "input_ids"));
+                let output = session
+                    .step(
+                        start,
+                        &ids,
+                        &all_frequencies[start * 16..(start + ids.len()) * 16],
+                    )
+                    .expect("runtime first block");
                 assert_eq!(
-                    field(output, "storage_sha256"),
-                    field(field(case, "layer_one_engram_stream"), "storage_sha256"),
-                    "layer-zero output must be the exact layer-one stream"
+                    field(field(case, "block_output"), "storage_sha256"),
+                    field(field(case, "layer_one_engram_stream"), "storage_sha256")
                 );
-                let attention = attention_outputs
-                    .iter()
-                    .find_map(|(attention_start, output)| {
-                        (*attention_start == start).then_some(output.as_slice())
-                    })
-                    .expect("native attention case");
-                let (native_output, next_pre) =
-                    native_layer_zero_output(root, case, attention, &moe);
-                assert_eq!(native_output, bf16(output));
-                (start, native_output, next_pre)
+                assert_runtime_startup(root, case, &output);
+                (
+                    start,
+                    output.residual().to_vec(),
+                    output.next_pre().to_vec(),
+                )
             })
             .collect()
     })
@@ -728,11 +709,11 @@ pub(crate) fn alternate_layer_one_inputs() -> Vec<(usize, Vec<u16>)> {
         assert_eq!(entry, bf16(&case["downstream"]["layer_one_engram_output"]));
         let mut attention_input = Vec::new();
         for (residual, pre) in entry.chunks_exact(256).zip(pre.chunks_exact(2)) {
-            let mut collapsed = vec![0; 128];
-            hc_pre_bf16_reference(residual, pre, 128, &mut collapsed).unwrap();
-            let mut normalized = vec![0; 128];
-            rms_norm_bf16_reference(&collapsed, &norm, 1.0e-20, &mut normalized).unwrap();
-            attention_input.extend(normalized);
+            let prepared = AttentionInput::new(&norm, 2, 1.0e-20)
+                .unwrap()
+                .forward(residual, pre)
+                .unwrap();
+            attention_input.extend_from_slice(prepared.normalized_bf16());
         }
         assert_eq!(
             attention_input,
@@ -832,13 +813,11 @@ fn source_layer_zero_output_feeds_native_layer_one_engram_entries() {
         );
         let mut attention_input = Vec::new();
         for (residual, pre) in entry.chunks_exact(256).zip(native_pre.chunks_exact(2)) {
-            let mut collapsed = vec![0; 128];
-            hc_pre_bf16_reference(residual, pre, 128, &mut collapsed)
-                .expect("native layer-one downstream HC pre-mix");
-            let mut normalized = vec![0; 128];
-            rms_norm_bf16_reference(&collapsed, &layer_one_norm, 1.0e-20, &mut normalized)
-                .expect("native layer-one downstream RMSNorm");
-            attention_input.extend(normalized);
+            let prepared = AttentionInput::new(&layer_one_norm, 2, 1.0e-20)
+                .unwrap()
+                .forward(residual, pre)
+                .unwrap();
+            attention_input.extend_from_slice(prepared.normalized_bf16());
         }
         assert_eq!(
             attention_input,
@@ -982,4 +961,72 @@ fn layer_zero_startup_rejects_unknown_tokens_and_changed_embedding_rows() {
         expected,
         "a changed source embedding row must not pass the startup oracle"
     );
+}
+
+#[test]
+fn runtime_startup_reset_replays_both_source_schedules() {
+    let raw = include_str!("../../../../fixtures/deepseek-v41/layer0-to-layer1-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        FIXTURE_SHA256
+    );
+    let canonical: Value = serde_json::from_str(raw).unwrap();
+    for root in [canonical, alternate_startup_projection()] {
+        let cases = root["cases"].as_array().unwrap();
+        let all = frequencies(&cases[0]["attention"]["frequencies"]);
+        with_runtime_startup(&root, |mut runtime| {
+            assert!(matches!(
+                runtime.step(1, &[0], &[]),
+                Err(deepseek::reduced::StartupSessionError::UnexpectedStart { .. })
+            ));
+            assert!(!runtime.is_poisoned());
+            for _ in 0..2 {
+                for case in cases {
+                    let start = usize_field(case, "start_pos");
+                    let ids = u64s(&case["startup"]["input_ids"]);
+                    let output = runtime
+                        .step(start, &ids, &all[start * 16..(start + ids.len()) * 16])
+                        .unwrap();
+                    assert_runtime_startup(&root, case, &output);
+                    assert_eq!(runtime.next_start(), start + ids.len());
+                }
+                runtime.reset().unwrap();
+                assert_eq!(runtime.next_start(), 0);
+                assert!(!runtime.is_poisoned());
+            }
+        });
+    }
+}
+
+#[test]
+fn runtime_startup_late_tail_failure_invalidates_attention_state() {
+    let mut root = alternate_startup_projection();
+    let tensor = &mut root["parameters"]["layers.0.ffn_norm.weight"];
+    let mut storage = bytes(tensor);
+    storage[..2].copy_from_slice(&0x7fc0_u16.to_le_bytes());
+    let mut hex = String::with_capacity(storage.len() * 2);
+    for byte in &storage {
+        write!(&mut hex, "{byte:02x}").unwrap();
+    }
+    tensor["storage_hex"] = Value::String(hex);
+    tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&storage)));
+    let case = &root["cases"][0];
+    let ids = u64s(&case["startup"]["input_ids"]);
+    let all = frequencies(&case["attention"]["frequencies"]);
+    with_runtime_startup(&root, |mut runtime| {
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime.step(0, &ids, &all[..ids.len() * 16]),
+                Err(deepseek::reduced::StartupSessionError::Tail(_))
+            ));
+            assert!(runtime.is_poisoned());
+            assert_eq!(runtime.next_start(), 0);
+            assert!(matches!(
+                runtime.step(0, &ids, &all[..ids.len() * 16]),
+                Err(deepseek::reduced::StartupSessionError::Poisoned)
+            ));
+            runtime.reset().unwrap();
+            assert!(!runtime.is_poisoned());
+        }
+    });
 }

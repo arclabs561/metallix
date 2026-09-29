@@ -47,6 +47,12 @@ pub struct LayerAttentionLayout {
 }
 
 impl LayerAttentionLayout {
+    pub(crate) fn is_batch_one_window_only(self, width: usize) -> bool {
+        self.batches.get() == 1
+            && self.hidden_dimension.get() == width
+            && self.expected_source_layer.is_none()
+    }
+
     /// Creates a bounded source-shaped layout.
     ///
     /// `expected_source_layer` identifies the only producer whose borrowed

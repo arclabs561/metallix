@@ -16,6 +16,11 @@
 //! # Ok::<(), deepseek::reduced::FinalHeadError>(())
 //! ```
 
+mod input;
+pub use input::{AttentionInput, AttentionInputError, AttentionInputOutput};
+mod startup;
+pub use startup::{StartupSession, StartupSessionError, StartupStepOutput};
+
 mod engram;
 pub use engram::{
     EngramSession, EngramSessionConfig, EngramSessionError, EngramSessionWeights, EngramStepOutput,

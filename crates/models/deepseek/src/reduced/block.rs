@@ -34,6 +34,10 @@ pub struct BlockTailReference<'a> {
 }
 
 impl<'a> BlockTailReference<'a> {
+    pub(crate) const fn geometry(self) -> (usize, usize) {
+        (self.copies, self.width)
+    }
+
     /// Validates static attention HC operands and their FFN geometry.
     ///
     /// The attention HC projection is row-major

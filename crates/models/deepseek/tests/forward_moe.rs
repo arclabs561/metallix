@@ -7,7 +7,7 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference};
-use deepseek::reduced::{BlockTailReference, FinalHead};
+use deepseek::reduced::{AttentionInput, BlockTailReference, FinalHead};
 use deepseek::{
     RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionState},
@@ -27,7 +27,6 @@ use deepseek::{
             SelectionAdapterError, SelectionCall, SelectionGeometry, select_from_candidates,
         },
     },
-    rms_norm_bf16_reference,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -2051,11 +2050,12 @@ fn derive_attention_input(
     norm_weight: &[u16],
     norm_eps: f32,
 ) -> Vec<u16> {
-    let mut collapsed = vec![0; 128];
-    hc_pre_bf16_reference(residual, incoming_pre, 128, &mut collapsed).unwrap();
-    let mut normalized = vec![0; 128];
-    rms_norm_bf16_reference(&collapsed, norm_weight, norm_eps, &mut normalized).unwrap();
-    normalized
+    AttentionInput::new(norm_weight, incoming_pre.len(), norm_eps)
+        .expect("runtime attention-input operands")
+        .forward(residual, incoming_pre)
+        .expect("runtime attention-input preparation")
+        .normalized_bf16()
+        .to_vec()
 }
 
 fn block_entry(case: &Case, native: Option<&BlockTailOutput>) -> (Vec<u16>, Vec<f32>) {

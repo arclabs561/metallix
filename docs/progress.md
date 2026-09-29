@@ -11,6 +11,14 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- `StartupSession` now executes the complete first block from supplied token
+  IDs and immutable weights, retaining window attention state across calls.
+  Both canonical and alternate startup-to-head compositions use it. Every
+  startup, attention and FFN source boundary remains checked. A late FFN
+  failure after attention commits poisons the session until reset; both
+  schedules replay after reset. `AttentionInput` owns the shared incoming
+  HC collapse and RMSNorm. L1–L4 request assembly is still test-owned.
+
 - Reduced runtime components now include `BlockTailReference` and persistent
   `EngramSession`. The block tail consumes actual attention and residuals;
   Engram owns hashing, FP8 embedding/WKV and residual gating over supplied
