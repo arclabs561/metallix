@@ -147,6 +147,36 @@ class PartitionOwnerCaptureTest(unittest.TestCase):
                 with self.assertRaises((ValueError, RuntimeError, TypeError)):
                     capture.validate_fixture(fixture)
 
+    def test_attention_window_and_publication_boundaries(self) -> None:
+        capture.validate_fixture(self.fixture)
+        for case in self.fixture["cases"]:
+            attention = case["attention"]
+            self.assertEqual(attention["start_pos"], case["start_pos"])
+            self.assertEqual(
+                attention["output"]["shape"], [1, case["token_count"], 128]
+            )
+            self.assertEqual(attention["window_ring_after"]["shape"], [1, 6, 64])
+            self.assertEqual(
+                attention["compressed_indices"]["storage_sha256"],
+                case["selection"]["indices"]["storage_sha256"],
+            )
+            self.assertEqual(
+                attention["compressed_kv"]["storage_sha256"],
+                case["compressed_kv_prefix"]["storage_sha256"],
+            )
+
+    def test_rejects_detached_attention_inputs_and_publications(self) -> None:
+        for field in ("input", "compressed_kv", "compressed_indices"):
+            with self.subTest(field=field):
+                fixture = copy.deepcopy(self.fixture)
+                tensor = fixture["cases"][1]["attention"][field]
+                raw = bytearray.fromhex(tensor["storage_hex"])
+                raw[0] ^= 1
+                tensor["storage_hex"] = raw.hex()
+                tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises((ValueError, RuntimeError, TypeError)):
+                    capture.validate_fixture(fixture)
+
     def test_rejects_substituted_partial_consumer(self) -> None:
         fixture = copy.deepcopy(self.fixture)
         tensor = fixture["cases"][0]["next_layer1_score_prefix"]

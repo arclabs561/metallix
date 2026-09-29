@@ -373,15 +373,19 @@ Before commit, staged native keys also feed WQ-A/QR and index-query preparation,
 all BF16 score stages, causal masking, candidate masks and selected IDs. Each
 boundary matches the source exactly across all four calls; selection rejects a
 candidate carrying the wrong publication identity.
-Four integration tests cover the four-call sequence, cancelled prepared decode,
+Six integration tests cover the four-call sequence, cancelled prepared decode,
 out-of-order and malformed late-call rejection with unchanged owner state and
 successful retry, plus reset, stale-publication rejection and exact replay.
-Six extractor/fixture tests reject malformed geometry/storage, relabelled
+Two of these tests join the committed native KV and computed IDs to L3 attention
+and replay after resetting both states. Window reads/writes, sparse outputs and
+final attention outputs match the source exactly.
+Eight extractor/fixture tests reject malformed geometry/storage, relabelled
 capture/probe/backend identities, substituted partial prefixes, malformed
-FP8/bool storage and invalid causal scores. The extractor binds the probe and
+FP8/bool storage, invalid causal scores and detached attention input/KV/IDs. The extractor binds the probe and
 schedule to the recorded capture hash and requires little-endian storage.
-This qualifies the owner and selection path; alternate attention and the full
-native graph remain open. The existing numerical policy is unchanged.
+This qualifies the L3 owner, selection and attention path; surrounding layers
+and full native-graph qualification remain open. Owner cancellation/retry checks
+do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 
 A separate [source partition probe](research/v41-forward-reference.md#partition-experiment)

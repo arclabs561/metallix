@@ -66,7 +66,7 @@ operands verbatim, with the source receipt and capture identities. Extraction
 requires completed execution and successful observer controls. These checks
 establish source handoffs, not native alternate-partition support.
 
-### Native alternate owner and selection
+### Native alternate owner, selection and attention
 
 ```sh
 uv run scripts/v41_partition_owner_capture.py --input artifacts/v41-partition-boundaries.json --output artifacts/v41-partition-owner.json
@@ -87,17 +87,25 @@ head-summed scores all match the source BF16 bits. `produce_candidates` and
 `select_from_candidates` then reproduce the causal scores, boolean mask and
 selected IDs exactly. Captured offsets are 4, 6, 6 and 6; they are not inferred
 from the number of processed tokens. A changed publication identity is rejected.
-The extended fixture adds selection observations without changing the earlier
-owner operands or the source capture identity.
+The extended fixture adds selection and attention observations without changing
+the earlier owner operands or the source capture identity.
+
+After owner commit, `LayerAttentionState` consumes the actual committed KV prefix
+and computed selected IDs. The existing attention oracle checks exact BF16
+query stages, prepared/window/ring KV, window indices, sparse output and final
+attention output across all four calls. Attention and indexer rotary tables are
+explicitly checked for identical source bytes.
 
 Rejected out-of-order and malformed late calls leave epoch, call ordinal,
 position and both prefixes unchanged; the valid retry matches the source.
 Reset advances the epoch, clears positions/prefixes, rejects an old publication
 and replays all four calls exactly. Dropping a valid prepared decode before
 commit also leaves live state unchanged; retrying its identity succeeds. These
-four integration tests exercise the native owner and selection together. They
-do not establish alternate attention, L1 scoring or final-head agreement for
-the full native graph.
+six integration tests cover the owner/selection path and its attention consumer,
+including reset of both states followed by exact replay. Owner commit precedes
+attention execution; these tests do not establish rollback across that boundary.
+Surrounding block operations, L1 scoring and full-graph final-head agreement
+remain unqualified for the alternate schedule.
 
 ## Run it
 

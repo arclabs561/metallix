@@ -49,6 +49,33 @@ _PINNED_SOURCE = {
     "runner_sha256": "7f217a4c42039e6cb55d9914ae095b656ad199a240c585eef11a2d2eace750f0",
 }
 
+_ATTENTION_PARAMETERS = {
+    "attn_sink": ("torch.float32", [2]),
+    "wq_a.weight": ("torch.float8_e4m3fn", [32, 128]),
+    "wq_a.scale": ("torch.float8_e8m0fnu", [1, 4]),
+    "q_norm.weight": ("torch.bfloat16", [32]),
+    "wq_b.weight": ("torch.float8_e4m3fn", [128, 32]),
+    "wq_b.scale": ("torch.float8_e8m0fnu", [4, 1]),
+    "wkv.weight": ("torch.float8_e4m3fn", [64, 128]),
+    "wkv.scale": ("torch.float8_e8m0fnu", [2, 4]),
+    "kv_norm.weight": ("torch.bfloat16", [64]),
+    "wo_a.weight": ("torch.bfloat16", [64, 64]),
+    "wo_b.weight": ("torch.float8_e4m3fn", [128, 64]),
+    "wo_b.scale": ("torch.float8_e8m0fnu", [4, 2]),
+}
+
+_ATTENTION_MODEL_INTS = (
+    "dim",
+    "head_dim",
+    "n_heads",
+    "q_lora_rank",
+    "rope_head_dim",
+    "window_size",
+    "o_groups",
+    "o_lora_rank",
+    "candidate_source_layer",
+)
+
 
 class CaptureError(ValueError):
     """The source receipt cannot safely produce an owner projection."""
@@ -259,6 +286,22 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         for name, (path, dtype, shape) in selection_weight_specs.items()
     }
     actual_model = _object(capture.get("actual_model_args"), "actual model arguments")
+    if (
+        any(type(actual_model.get(name)) is not int for name in _ATTENTION_MODEL_INTS)
+        or not isinstance(actual_model.get("compress_ratios"), list)
+        or any(type(value) is not int for value in actual_model["compress_ratios"])
+        or type(actual_model.get("norm_eps")) is not float
+    ):
+        raise CaptureError("source layer-three attention model has invalid types")
+    attention_weights = {
+        f"layers.3.attn.{suffix}": _require_tensor(
+            parameters.get(f"layers.3.attn.{suffix}"),
+            f"layer-three attention weight {suffix}",
+            dtype,
+            shape,
+        )
+        for suffix, (dtype, shape) in _ATTENTION_PARAMETERS.items()
+    }
     expected_actual_model = {
         "max_batch_size": 1,
         "max_seq_len": 8,
@@ -471,6 +514,109 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
             raise CaptureError("decode calls must not retain causal scores")
         else:
             selection["causal_scores"] = None
+
+        sparse_calls = call.get("sparse_attention_calls")
+        if not isinstance(sparse_calls, list):
+            raise CaptureError(f"call {start_pos} lacks sparse attention observations")
+        layer_three_sparse = [
+            sparse
+            for sparse in sparse_calls
+            if isinstance(sparse, Mapping) and sparse.get("layer_id") == 3
+        ]
+        if len(layer_three_sparse) != 1:
+            raise CaptureError(
+                f"call {start_pos} requires one layer-three sparse attention observation"
+            )
+        sparse = layer_three_sparse[0]
+        sparse_inputs = _object(
+            sparse.get("inputs"), f"call {start_pos} layer-three sparse inputs"
+        )
+        window = _object(
+            intermediates.get("layers.3.attn.window"),
+            f"call {start_pos} layer-three window",
+        )
+        # Prefill retains its active four rows; source decode reads the fixed
+        # six-slot window, including causally masked future physical slots.
+        window_positions = (
+            token_count if start_pos == 0 else actual_model["window_size"]
+        )
+        attention = {
+            "start_pos": start_pos,
+            "input": input_record,
+            "wq_a_output": _require_tensor(
+                intermediates.get("layers.3.attn.wq_a"),
+                f"call {start_pos} attention WQ-A output",
+                "torch.bfloat16",
+                [1, token_count, 32],
+            ),
+            "q_norm_output": _require_tensor(
+                intermediates.get("layers.3.attn.q_norm"),
+                f"call {start_pos} attention normalized query",
+                "torch.bfloat16",
+                [1, token_count, 32],
+            ),
+            "wq_b_pre_rope": _require_tensor(
+                intermediates.get("layers.3.attn.wq_b"),
+                f"call {start_pos} attention WQ-B output",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "q_after_rope": _require_tensor(
+                sparse_inputs.get("q_after_rope"),
+                f"call {start_pos} sparse query after rotary",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            "prepared_window_kv": _require_tensor(
+                window.get("prepared_window_kv"),
+                f"call {start_pos} prepared window KV",
+                "torch.bfloat16",
+                [1, token_count, 64],
+            ),
+            "window_kv": _require_tensor(
+                window.get("window_kv"),
+                f"call {start_pos} returned window KV",
+                "torch.bfloat16",
+                [1, window_positions, 64],
+            ),
+            "window_indices": _require_tensor(
+                window.get("indices"),
+                f"call {start_pos} window indices",
+                "torch.int32",
+                [1, token_count, window_positions],
+            ),
+            "window_ring_after": _require_tensor(
+                window.get("ring_after"),
+                f"call {start_pos} window ring",
+                "torch.bfloat16",
+                [1, actual_model["window_size"], 64],
+            ),
+            "compressed_kv": borrowed,
+            "compressed_indices": _require_tensor(
+                compressed.get("indices"),
+                f"call {start_pos} compressed indices",
+                "torch.int32",
+                [1, token_count, 1],
+            ),
+            "sparse_output_pre_inverse_rope": _require_tensor(
+                sparse.get("output_pre_inverse_rope"),
+                f"call {start_pos} sparse output",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            "wo_b_input": _require_tensor(
+                intermediates.get("layers.3.attn.wo_b_input"),
+                f"call {start_pos} attention WO-B input",
+                "torch.bfloat16",
+                [1, token_count, 64],
+            ),
+            "output": _require_tensor(
+                intermediates.get("layers.3.attn"),
+                f"call {start_pos} attention output",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+        }
         _same(
             selection["qr"],
             intermediates.get("layers.3.attn.q_norm"),
@@ -480,6 +626,22 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
             selection["indices"],
             compressed.get("indices"),
             f"call {start_pos} selected candidate IDs",
+        )
+        _same(attention["input"], input_record, f"call {start_pos} attention input")
+        _same(
+            attention["q_norm_output"],
+            selection["qr"],
+            f"call {start_pos} attention query boundary",
+        )
+        _same(
+            attention["compressed_kv"],
+            borrowed,
+            f"call {start_pos} attention compressed KV boundary",
+        )
+        _same(
+            attention["compressed_indices"],
+            selection["indices"],
+            f"call {start_pos} attention selected-ID boundary",
         )
         bridge_intermediates = _object(
             _object(bridge_call, "bridge call").get("intermediates"),
@@ -515,8 +677,18 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
                 "compressed_kv_prefix": borrowed,
                 "next_layer1_score_prefix": next_prefix,
                 "selection": selection,
+                "attention": attention,
             }
         )
+
+    attention_static = _object(
+        capture.get("attention_static"), "layer-three attention static inputs"
+    )
+    _same(
+        expected_frequency,
+        attention_static.get("layer_3_freqs_cis"),
+        "layer-three attention and indexer frequency table",
+    )
 
     fixture: dict[str, object] = {
         "schema_version": 1,
@@ -528,6 +700,8 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         "weights": weights,
         "selection_model": selection_model,
         "selection_weights": selection_weights,
+        "attention_model": actual_model,
+        "attention_weights": attention_weights,
         "frequencies": expected_frequency,
         "cases": cases,
     }
@@ -626,6 +800,36 @@ def validate_fixture(fixture: object) -> None:
             dtype,
             shape,
         )
+    attention_model = _object(root.get("attention_model"), "fixture attention model")
+    if (
+        any(
+            type(attention_model.get(name)) is not int for name in _ATTENTION_MODEL_INTS
+        )
+        or attention_model.get("dim") != 128
+        or attention_model.get("head_dim") != 64
+        or attention_model.get("n_heads") != 2
+        or attention_model.get("q_lora_rank") != 32
+        or attention_model.get("rope_head_dim") != 32
+        or attention_model.get("window_size") != 6
+        or attention_model.get("o_groups") != 2
+        or attention_model.get("o_lora_rank") != 32
+        or attention_model.get("candidate_source_layer") != 3
+        or attention_model.get("compress_ratios") != [0, 2, 2, 1, 1]
+        or any(type(value) is not int for value in attention_model["compress_ratios"])
+        or type(attention_model.get("norm_eps")) is not float
+        or attention_model["norm_eps"] != 1.0e-20
+    ):
+        raise CaptureError("fixture attention model differs from the pinned source")
+    attention_weights = _object(
+        root.get("attention_weights"), "fixture attention weights"
+    )
+    for suffix, (dtype, shape) in _ATTENTION_PARAMETERS.items():
+        _require_tensor(
+            attention_weights.get(f"layers.3.attn.{suffix}"),
+            f"fixture attention weight {suffix}",
+            dtype,
+            shape,
+        )
     _require_tensor(
         root.get("frequencies"), "fixture frequencies", "torch.complex64", [8, 16]
     )
@@ -698,6 +902,53 @@ def validate_fixture(fixture: object) -> None:
                 raise CaptureError("case 0 causal score geometry differs")
         elif causal is not None:
             raise CaptureError(f"case {start_pos} must not retain causal scores")
+        attention = _object(item.get("attention"), f"case {start_pos} attention")
+        if attention.get("start_pos") != start_pos:
+            raise CaptureError(f"case {start_pos} attention start differs")
+        window_positions = token_count if start_pos == 0 else 6
+        for name, dtype, shape in (
+            ("input", "torch.bfloat16", [1, token_count, 128]),
+            ("wq_a_output", "torch.bfloat16", [1, token_count, 32]),
+            ("q_norm_output", "torch.bfloat16", [1, token_count, 32]),
+            ("wq_b_pre_rope", "torch.bfloat16", [1, token_count, 128]),
+            ("q_after_rope", "torch.bfloat16", [1, token_count, 2, 64]),
+            ("prepared_window_kv", "torch.bfloat16", [1, token_count, 64]),
+            ("window_kv", "torch.bfloat16", [1, window_positions, 64]),
+            ("window_indices", "torch.int32", [1, token_count, window_positions]),
+            ("window_ring_after", "torch.bfloat16", [1, 6, 64]),
+            ("compressed_kv", "torch.bfloat16", [1, start_pos + token_count, 64]),
+            ("compressed_indices", "torch.int32", [1, token_count, 1]),
+            (
+                "sparse_output_pre_inverse_rope",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            ("wo_b_input", "torch.bfloat16", [1, token_count, 64]),
+            ("output", "torch.bfloat16", [1, token_count, 128]),
+        ):
+            _require_tensor(
+                attention.get(name), f"case {start_pos} attention {name}", dtype, shape
+            )
+        _same(
+            attention.get("input"),
+            item.get("input"),
+            f"case {start_pos} attention input",
+        )
+        _same(
+            attention.get("q_norm_output"),
+            selection.get("qr"),
+            f"case {start_pos} attention query boundary",
+        )
+        _same(
+            attention.get("compressed_kv"),
+            item.get("compressed_kv_prefix"),
+            f"case {start_pos} attention compressed KV boundary",
+        )
+        _same(
+            attention.get("compressed_indices"),
+            selection.get("indices"),
+            f"case {start_pos} attention selected-ID boundary",
+        )
         _require_tensor(
             item.get("compressed_kv_prefix"),
             f"case {start_pos} borrowed KV prefix",

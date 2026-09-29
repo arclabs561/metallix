@@ -1,14 +1,18 @@
 //! Native ratio-one owner over the alternate 4/1/1/1 source partition.
 //!
-//! This is a small transaction integration: the source fixture supplies only
-//! owner operands and observed prefixes, while `RatioOneCompressedOwner`
-//! performs the WKV, compressor, key, KV, prepare, and commit path.
+//! The source fixture supplies inputs and numerical oracles.
+//! `RatioOneCompressedOwner` publishes native keys/KV after native selection;
+//! `LayerAttentionState` then consumes the committed KV and computed IDs.
+//! Owner and attention have separate commit boundaries.
 
-use std::num::NonZeroUsize;
+#[path = "support/attention_capture.rs"]
+mod attention_capture;
+
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::{
     RotaryFrequency,
-    attention::layer::Fp8Projection,
+    attention::layer::{Fp8Projection, LayerAttentionState},
     indexer::{
         cache::IndexKeyPublicationId,
         key::{IndexKeyLayout, IndexKeyWeights},
@@ -44,6 +48,8 @@ struct Fixture {
     frequencies: Tensor,
     selection_model: SelectionModel,
     selection_weights: SelectionWeights,
+    attention_model: attention_capture::Model,
+    attention_weights: BTreeMap<String, attention_capture::Tensor>,
     cases: Vec<Case>,
 }
 
@@ -85,6 +91,7 @@ struct Case {
     compressed_kv_prefix: Tensor,
     next_layer1_score_prefix: Option<Tensor>,
     selection: Selection,
+    attention: attention_capture::Case,
 }
 
 #[derive(Deserialize)]
@@ -233,7 +240,7 @@ fn fixture() -> Fixture {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
-        "ff01eebf14cd1045884e9dbb66f97c0c373680304b8b3f9a72ad2500d769d2f0"
+        "4b0632e90ccec4c3ebf4c35c6d3d4a65e0126f02fd0afbf853468763711f02fe"
     );
     let fixture: Fixture = serde_json::from_str(raw).expect("partition owner fixture JSON");
     assert_eq!(fixture.schema_version, 1);
@@ -278,6 +285,7 @@ fn fixture() -> Fixture {
     assert_eq!(fixture.selection_weights.wq_b_codes.shape, [128, 32]);
     assert_eq!(fixture.selection_weights.wq_b_scales.shape, [4, 1]);
     assert_eq!(fixture.selection_weights.weights_proj.shape, [2, 128]);
+    assert_attention_weights(&fixture);
     assert_eq!(fixture.cases.len(), SCHEDULE.len());
     for (index, (case, &(start, count))) in fixture.cases.iter().zip(SCHEDULE).enumerate() {
         assert_eq!((case.start_pos, case.token_count), (start, count));
@@ -305,6 +313,7 @@ fn fixture() -> Fixture {
         );
         assert_eq!(case.selection.indices.shape, [1, count, 1]);
         assert_eq!(case.selection.causal_scores.is_some(), start == 0);
+        assert_eq!(case.attention.start_pos, start, "attention source start");
         assert_eq!(
             case.next_layer1_score_prefix.is_some(),
             matches!(start, 0 | 5),
@@ -316,6 +325,30 @@ fn fixture() -> Fixture {
         }
     }
     fixture
+}
+
+fn assert_attention_weights(fixture: &Fixture) {
+    for suffix in [
+        "wq_a.weight",
+        "wq_a.scale",
+        "q_norm.weight",
+        "wq_b.weight",
+        "wq_b.scale",
+        "wkv.weight",
+        "wkv.scale",
+        "kv_norm.weight",
+        "attn_sink",
+        "wo_a.weight",
+        "wo_b.weight",
+        "wo_b.scale",
+    ] {
+        assert!(
+            fixture
+                .attention_weights
+                .contains_key(&format!("layers.3.attn.{suffix}")),
+            "captured layer-three attention {suffix}"
+        );
+    }
 }
 
 fn owner(fixture: &Fixture) -> RatioOneCompressedOwner {
@@ -376,7 +409,7 @@ fn assert_pending_selection(
     pending: &PendingRatioOneCompressedOwner<'_>,
     fixture: &Fixture,
     index: usize,
-) {
+) -> Vec<i32> {
     let case = &fixture.cases[index];
     let selection = &case.selection;
     let keys = pending.key_prefix(0).expect("staged native key prefix");
@@ -476,9 +509,10 @@ fn assert_pending_selection(
         .is_err(),
         "candidate selection rejects a changed publication identity"
     );
+    selected.indices
 }
 
-fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: usize) {
+fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: usize) -> Vec<i32> {
     let case = &fixture.cases[index];
     let frequencies = fixture.frequencies.frequencies();
     let wkv = fixture.weights.wkv.bf16();
@@ -497,7 +531,7 @@ fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: us
             RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &key_norm)),
         ))
         .expect("source-shaped owner preparation");
-    assert_pending_selection(&pending, fixture, index);
+    let selected_indices = assert_pending_selection(&pending, fixture, index);
     let diagnostic = pending.commit().expect("source-shaped owner commit");
     assert_eq!(
         diagnostic.owner.projected,
@@ -527,6 +561,7 @@ fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: us
             "native committed L3 keys feed the next L1 partial score prefix"
         );
     }
+    selected_indices
 }
 
 fn state(owner: &RatioOneCompressedOwner) -> (u64, u64, usize, usize, Vec<u16>, Vec<u16>) {
@@ -540,6 +575,50 @@ fn state(owner: &RatioOneCompressedOwner) -> (u64, u64, usize, usize, Vec<u16>, 
     )
 }
 
+fn run_native_owner_attention_partition(
+    owner: &mut RatioOneCompressedOwner,
+    attention: &mut LayerAttentionState,
+    fixture: &Fixture,
+) {
+    let frequencies = fixture.frequencies.frequencies();
+    let weights = attention_capture::weights_for_layer(&fixture.attention_weights, 3);
+    for index in 0..fixture.cases.len() {
+        let case = &fixture.cases[index];
+        let attention_case = &case.attention;
+        let selected_indices = commit_case(owner, fixture, index);
+        assert_eq!(
+            attention_case.input.bf16(),
+            case.input.bf16(),
+            "owner input crosses the layer-three attention boundary"
+        );
+        assert_eq!(
+            selected_indices,
+            attention_case.compressed_indices.i32(),
+            "live owner selection IDs drive layer-three attention"
+        );
+        let start = case.start_pos;
+        let end = start + case.token_count;
+        let call_id = owner
+            .next_call_id()
+            .checked_sub(1)
+            .expect("completed owner call ordinal");
+        let diagnostic = attention_capture::forward_with_publication(
+            attention,
+            &attention_case.input.bf16(),
+            start,
+            owner.epoch(),
+            call_id,
+            3,
+            owner.kv_prefix(0).expect("committed live owner KV prefix"),
+            &selected_indices,
+            &frequencies[start * 16..end * 16],
+            weights.borrowed(),
+        )
+        .expect("live owner publication drives layer-three attention");
+        attention_capture::assert_diagnostic(attention_case, &diagnostic);
+    }
+}
+
 #[test]
 fn alternate_partition_owner_matches_source_prefixes_and_partial_bridges() {
     let fixture = fixture();
@@ -547,6 +626,29 @@ fn alternate_partition_owner_matches_source_prefixes_and_partial_bridges() {
     for index in 0..fixture.cases.len() {
         commit_case(&mut owner, &fixture, index);
     }
+}
+
+#[test]
+fn alternate_partition_owner_publications_drive_native_layer_three_attention() {
+    let fixture = fixture();
+    let mut owner = owner(&fixture);
+    let mut attention =
+        LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
+    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
+}
+
+#[test]
+fn owner_and_layer_three_attention_reset_then_replay_together() {
+    let fixture = fixture();
+    let mut owner = owner(&fixture);
+    let mut attention =
+        LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
+    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
+    owner.reset().expect("reset live owner publication state");
+    attention
+        .reset()
+        .expect("reset layer-three attention state");
+    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture);
 }
 
 #[test]
