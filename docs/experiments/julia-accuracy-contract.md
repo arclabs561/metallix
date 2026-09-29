@@ -291,3 +291,27 @@ claim that scalar Welford matches the source CPU backend's vectorized algorithm.
 uv run .agents/receipts/julia/embedding_norm_diagnostic.py \
   --output /absolute/path/embedding-norm-diagnostic.json
 ```
+
+### Softmax and value-reduction replay
+
+The calibration-only `scripts/julia_calibration_attention_replay.py` compares
+saved `cal_len7` layer-zero probabilities with Torch F32 softmax on the same
+logits, then compares attended values with tensor aggregation on the same
+probabilities and values. It records both input hashes and its own hash; it
+reads no acceptance inputs and changes neither runtime arithmetic nor limits.
+
+In `.agents/receipts/julia/calibration-attention-replay.json`, native
+probabilities differ from Torch F32 softmax by at most `1.19209e-7`. Native
+attended values differ from same-probability tensor aggregation by `9.53674e-7`;
+the actual source capture differs from its reconstructed aggregation by
+`1.90735e-6`. The source logits/probabilities are explicitly reconstructed from
+source QKV, while its attended values are the actual module capture. These
+single-case observations do not support a softmax/value-reduction runtime patch
+and do not qualify the failing encoder. Retain the serial F32 implementation.
+
+```sh
+uv run scripts/julia_calibration_attention_replay.py \
+  --native-trace .agents/receipts/julia/cal-len7-layer0-native-replay.json \
+  --source-trace .agents/receipts/julia/cal-len7-layer0-source-f64-v2.json \
+  --output /absolute/path/calibration-attention-replay.json
+```
