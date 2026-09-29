@@ -22,6 +22,12 @@ pub use ratio_two::{
     RatioTwoOwnerLayout, RatioTwoOwnerWeights,
 };
 
+mod layer_one;
+pub use layer_one::{
+    LayerOneCall, LayerOneConfig, LayerOneSession, LayerOneSessionError, LayerOneStepOutput,
+    PreviousLayerThreeKeys,
+};
+
 mod layer_three;
 pub use layer_three::{
     LayerThreeCall, LayerThreeConfig, LayerThreeSession, LayerThreeSessionError,

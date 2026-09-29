@@ -1,5 +1,9 @@
 //! Native layer-one ratio-two owner publication against the source fixture.
 
+#[allow(
+    dead_code,
+    reason = "composed runtime adapters are exercised by forward_moe"
+)]
 #[path = "support/layer1_owner_capture.rs"]
 mod layer1_owner_capture;
 

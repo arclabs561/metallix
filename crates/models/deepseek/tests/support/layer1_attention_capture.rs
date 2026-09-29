@@ -18,6 +18,7 @@ use deepseek::{
         CompressedAttentionPublication, Fp8Projection, LayerAttentionDiagnostic,
         LayerAttentionError, LayerAttentionLayout, LayerAttentionState, LayerAttentionWeights,
     },
+    reduced::LayerOneStepOutput,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -28,6 +29,16 @@ const REVISION: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
 pub(super) struct NativeOutput {
     pub(super) start_pos: usize,
     pub(super) output: Vec<u16>,
+}
+
+/// Borrowed L1 attention operands, including the canonical candidate QR
+/// source. Canonical owner fixtures deliberately do not duplicate WQ-A/QNorm.
+pub(super) struct RuntimeAttentionOperands<'a> {
+    pub(super) layout: LayerAttentionLayout,
+    pub(super) frequencies: &'a [RotaryFrequency],
+    pub(super) weights: LayerAttentionWeights<'a>,
+    pub(super) candidate_wq_a: Fp8Projection<'a>,
+    pub(super) candidate_q_norm: &'a [u16],
 }
 
 fn fixture() -> Value {
@@ -205,6 +216,62 @@ fn weights(root: &Value) -> Weights {
     }
 }
 
+fn with_runtime_attention_operands<R>(
+    root: &Value,
+    body: impl FnOnce(RuntimeAttentionOperands<'_>) -> R,
+) -> R {
+    let weights = weights(root);
+    let frequencies = frequencies(root);
+    let borrowed = weights.borrowed();
+    body(RuntimeAttentionOperands {
+        layout: layout(root),
+        frequencies: &frequencies,
+        candidate_wq_a: borrowed.wq_a,
+        candidate_q_norm: borrowed.q_norm,
+        weights: borrowed,
+    })
+}
+
+/// Lends the bundle's checked L1 attention operands to one runtime step.
+pub(super) fn with_bundle_runtime_attention_operands<R>(
+    bundle: &Value,
+    body: impl FnOnce(RuntimeAttentionOperands<'_>) -> R,
+) -> R {
+    assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned reduced bundle metadata");
+    assert_eq!(field(bundle, "source"), field(&pinned, "source"));
+    let projection = field(field(bundle, "projections"), "layer1_attention");
+    assert_eq!(field(projection, "schema_version").as_u64(), Some(1));
+    assert_eq!(
+        field(projection, "source"),
+        field(&field(&pinned, "projections")["layer1_attention"], "source"),
+        "layer-one attention source metadata"
+    );
+    with_runtime_attention_operands(projection, body)
+}
+
+/// Lends alternate L1 attention operands to one runtime step.
+pub(super) fn with_alternate_runtime_attention_operands<R>(
+    root: &Value,
+    body: impl FnOnce(RuntimeAttentionOperands<'_>) -> R,
+) -> R {
+    let projection = &root["attention"];
+    for name in ["source", "source_receipt_sha256", "capture_identity"] {
+        assert_eq!(
+            projection[name], root[name],
+            "alternate attention provenance"
+        );
+    }
+    assert_eq!(
+        projection["runtime"]["storage_byteorder"].as_str(),
+        Some("little")
+    );
+    with_runtime_attention_operands(projection, body)
+}
+
 fn layout(root: &Value) -> LayerAttentionLayout {
     let model = field(root, "model");
     let ratios = field(model, "compress_ratios").as_array().expect("ratios");
@@ -293,6 +360,70 @@ fn assert_diagnostic(case: &Value, diagnostic: &LayerAttentionDiagnostic) {
         &diagnostic.final_output,
         &bf16(field(case, "output")),
     );
+}
+
+/// Re-decodes the bundle's attention projection and checks every runtime
+/// attention stage after the composed L1 session has consumed live prefixes.
+pub(super) fn assert_bundle_runtime_attention(
+    bundle: &Value,
+    case_index: usize,
+    input: &[u16],
+    output: &LayerOneStepOutput,
+) {
+    let projection = &bundle["projections"]["layer1_attention"];
+    let cases = field(projection, "cases")
+        .as_array()
+        .expect("bundle attention cases");
+    assert_runtime_attention(
+        cases.get(case_index).expect("bundle attention case"),
+        input,
+        output,
+    );
+}
+
+/// Checks the alternate attention source stages after live runtime execution.
+pub(super) fn assert_alternate_runtime_attention(
+    root: &Value,
+    case_index: usize,
+    input: &[u16],
+    output: &LayerOneStepOutput,
+) {
+    let projection = &root["attention"];
+    let cases = field(projection, "cases")
+        .as_array()
+        .expect("alternate attention cases");
+    assert_runtime_attention(
+        cases.get(case_index).expect("alternate attention case"),
+        input,
+        output,
+    );
+}
+
+fn assert_runtime_attention(case: &Value, input: &[u16], output: &LayerOneStepOutput) {
+    let start = usize_field(case, "start_pos");
+    assert_eq!(
+        input,
+        bf16(field(case, "input")),
+        "start {start} input BF16 boundary"
+    );
+    assert_eq!(
+        output.kv_prefix(),
+        bf16(field(case, "compressed_kv")),
+        "start {start} native L1 KV publication"
+    );
+    assert_eq!(
+        output.selected_indices(),
+        i32s(field(case, "compressed_indices")),
+        "start {start} native L1 selected IDs"
+    );
+    let mut sparse_kv = bf16(field(case, "window_kv"));
+    sparse_kv.extend_from_slice(output.kv_prefix());
+    assert_eq!(
+        sparse_kv,
+        bf16(field(case, "sparse_kv")),
+        "start {start} sparse KV"
+    );
+    assert_diagnostic(case, output.attention());
 }
 
 /// Runs layer-one attention with supplied native inputs and native owner publications.

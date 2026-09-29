@@ -11,6 +11,19 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- `LayerOneSession` now owns ratio-two compression, query scoring, direct
+  causal selection and attention. It derives token and completed-group rotary
+  positions from live state. Partial calls validate the preceding L3 publication
+  identity and full key prefix, use its completed-group rows for scores, and
+  retain L1's own KV for attention. Both source schedules use this runtime and
+  all 99 `forward_moe` checks pass with unchanged bounds. Two independent runtime
+  tests cover distinct score/KV ownership, late attention failure, reset replay
+  and rejection of stale L3 epochs. The serial Metal check completes DeepSeek
+  and stops at the same Julia numerical mismatch recorded below. Receipts:
+  `.agents/receipts/candidate-control/runtime-l1-{composition,full-check}.log`.
+  Whole-request ordering and recovery across Engram, block tails and all layers
+  still need runtime orchestration.
+
 - `LayerThreeSession` now owns the ratio-one compressor/key/KV, candidate
   projection/selection and attention lifecycle over caller-supplied operands.
   It derives publication identities and window offsets from live state; both
@@ -22,7 +35,7 @@ choices without expanding current support claims.
   The serial Metal check completes DeepSeek and stops at the unchanged Julia
   `unmasked_control hidden[0]` mismatch (`-0.2049238` versus `-0.20494038`).
   Receipts: `.agents/receipts/candidate-control/runtime-l3-{focused,full-check}.log`.
-  Complete L1 assembly and request-wide orchestration remain to extract.
+  Request-wide orchestration remains to extract.
 
 - L1 ratio-two compression, key preparation and paired key/KV publication now
   execute in `RatioTwoCompressedOwner` from live inputs and borrowed weights.
@@ -30,8 +43,8 @@ choices without expanding current support claims.
   remain retryable, and reset advances the epoch. L3 `CandidateProjector`
   computes query scores and masks from supplied input and keys, with exact
   row-geometry checks. Both source schedules still reach their existing final
-  logit bounds. Prior-L3 score-prefix policy and complete request assembly
-  remain test-owned. Six independent owner/projector tests cover partial
+  logit bounds. These primitives now feed the runtime L1/L3 sessions; complete
+  request assembly remains test-owned. Six independent owner/projector tests cover partial
   publications, late-error retry, reset epochs and score-matrix geometry.
 
 - `StartupSession` now executes the complete first block from supplied token

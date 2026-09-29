@@ -44,8 +44,9 @@ have fixture-independent runtime components. A stateful first-block session
 now accepts caller token IDs and weights through its complete window-attention
 and HC/FFN path. L1 ratio-two owner publication and L3 candidate projection
 are also runtime components. `LayerThreeSession` joins its owner, selection
-and attention with coordinated invalidation/reset. Complete L1 assembly and
-L1–L4 request orchestration remain the next extraction gates.
+and attention with coordinated invalidation/reset. `LayerOneSession` now does
+the same for ratio-two ownership and direct selection, including the preceding
+L3 score-prefix rule. L1–L4 request orchestration remains the next extraction gate.
 Downstream weights and source checks remain fixture-backed; broader partitions,
 checkpoint loading and Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three

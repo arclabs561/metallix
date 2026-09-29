@@ -3,11 +3,15 @@
 //! The layer-one block entry remains source-captured. From its derived attention
 //! input onward, this uses native owner-backed attention, HC, and FFN operators.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::{
     ffn::FfnSublayerReference,
     hc::{HcCoefficients, mixing::hc_post_bf16_reference, projection::project_hc_diagnostics},
+    indexer::{cache::IndexKeyPublicationId, query::CandidateQueryWeights},
+    reduced::{
+        LayerOneCall, LayerOneConfig, LayerOneSession, LayerOneStepOutput, PreviousLayerThreeKeys,
+    },
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -618,10 +622,22 @@ pub(super) fn native_layer_one_entries_from_engram_entries_with_pre(
 pub(super) struct NativeLayerOneSession {
     fixture: Fixture,
     engram: layer1_engram_capture::NativeLayerOneEngramSession,
-    owner: layer1_owner_capture::NativeLayerOneOwnerSession,
-    attention: layer1_attention_capture::NativeLayerOneAttentionSession,
+    runtime: LayerOneSession,
+    operands: RuntimeOperandSource,
     last_publication: Option<layer1_owner_capture::NativeCase>,
+    previous_layer_three: Option<PreviousLayerThreePublication>,
     next_case: usize,
+}
+
+#[derive(Clone)]
+enum RuntimeOperandSource {
+    Bundle(Value),
+    Alternate { projection: Value, startup: Value },
+}
+
+struct PreviousLayerThreePublication {
+    publication: IndexKeyPublicationId,
+    keys: Vec<u16>,
 }
 
 impl NativeLayerOneSession {
@@ -631,11 +647,10 @@ impl NativeLayerOneSession {
         Self {
             fixture: fixture_from_bundle(bundle),
             engram: layer1_engram_capture::NativeLayerOneEngramSession::from_bundle(bundle),
-            owner: layer1_owner_capture::NativeLayerOneOwnerSession::from_bundle(bundle),
-            attention: layer1_attention_capture::NativeLayerOneAttentionSession::from_bundle(
-                bundle,
-            ),
+            runtime: runtime_from_bundle(bundle),
+            operands: RuntimeOperandSource::Bundle(bundle.clone()),
             last_publication: None,
+            previous_layer_three: None,
             next_case: 0,
         }
     }
@@ -670,21 +685,32 @@ impl NativeLayerOneSession {
             engram: layer1_engram_capture::NativeLayerOneEngramSession::from_alternate_startup(
                 startup,
             ),
-            owner: layer1_owner_capture::NativeLayerOneOwnerSession::from_alternate(
-                projection, startup,
-            ),
-            attention: layer1_attention_capture::NativeLayerOneAttentionSession::from_alternate(
-                projection,
-            ),
+            runtime: runtime_from_alternate(projection, startup),
+            operands: RuntimeOperandSource::Alternate {
+                projection: projection.clone(),
+                startup: startup.clone(),
+            },
             last_publication: None,
+            previous_layer_three: None,
             next_case: 0,
         }
     }
 
     /// Supplies L3's complete preceding-call publication before a partial
     /// L1 compression group consumes its score keys.
-    pub(super) fn supply_previous_layer_three_prefix(&mut self, prefix: &[u16]) {
-        self.owner.supply_previous_layer_three_prefix(prefix);
+    pub(super) fn supply_previous_layer_three_prefix(
+        &mut self,
+        publication: IndexKeyPublicationId,
+        keys: &[u16],
+    ) {
+        assert!(
+            self.previous_layer_three.is_none(),
+            "one prior L3 publication per L1 call"
+        );
+        self.previous_layer_three = Some(PreviousLayerThreePublication {
+            publication,
+            keys: keys.to_vec(),
+        });
     }
 
     pub(super) fn step(
@@ -720,13 +746,52 @@ impl NativeLayerOneSession {
             case.attention_input.bf16(),
             "native L1 HC attention input"
         );
-        self.last_publication = Some(self.owner.step_with_input(&input));
-        let attention = self.attention.step(
-            &(start, input),
-            self.last_publication
-                .as_ref()
-                .expect("live L1 owner publication"),
-        );
+        assert_eq!(self.runtime.next_start(), start, "runtime L1 request start");
+        let prior = self.previous_layer_three.take();
+        let output = self.step_runtime(&input, prior.as_ref());
+        self.last_publication = Some(layer1_owner_capture::NativeCase {
+            start_pos: start,
+            latent: output.owner().latent().map(<[u16]>::to_vec),
+            key_prefix: output.key_prefix().to_vec(),
+            kv_prefix: output.kv_prefix().to_vec(),
+            source_score_key_prefix: output.score_key_prefix().to_vec(),
+            selected_indices: output.selected_indices().to_vec(),
+        });
+        match &self.operands {
+            RuntimeOperandSource::Bundle(bundle) => {
+                layer1_owner_capture::assert_bundle_runtime_step(
+                    bundle,
+                    self.next_case,
+                    &input,
+                    &output,
+                );
+                layer1_attention_capture::assert_bundle_runtime_attention(
+                    bundle,
+                    self.next_case,
+                    &input,
+                    &output,
+                );
+            }
+            RuntimeOperandSource::Alternate {
+                projection,
+                startup,
+            } => {
+                layer1_owner_capture::assert_alternate_runtime_step(
+                    projection,
+                    startup,
+                    self.next_case,
+                    &input,
+                    &output,
+                );
+                layer1_attention_capture::assert_alternate_runtime_attention(
+                    projection,
+                    self.next_case,
+                    &input,
+                    &output,
+                );
+            }
+        }
+        let attention = (start, output.attention().final_output.clone());
         let native_entry = (start, residual, incoming_pre.1.clone());
         let handoff = attention_handoffs(&self.fixture, &[attention], Some(&[native_entry]));
         let mut output = native_ffn(&self.fixture, &handoff);
@@ -734,11 +799,140 @@ impl NativeLayerOneSession {
         output.pop().expect("one native L1 FFN result")
     }
 
+    fn step_runtime(
+        &mut self,
+        input: &[u16],
+        previous: Option<&PreviousLayerThreePublication>,
+    ) -> LayerOneStepOutput {
+        let source = self.operands.clone();
+        match source {
+            RuntimeOperandSource::Bundle(bundle) => {
+                layer1_owner_capture::with_bundle_runtime_owner_operands(
+                    &bundle,
+                    self.next_case,
+                    |owner| {
+                        layer1_attention_capture::with_bundle_runtime_attention_operands(
+                            &bundle,
+                            |attention| {
+                                assert_eq!(
+                                    owner.frequencies, attention.frequencies,
+                                    "bundle L1 owner and attention frequency table"
+                                );
+                                let query_weights = CandidateQueryWeights {
+                                    wq_a: owner.query_wq_a.unwrap_or(attention.candidate_wq_a),
+                                    q_norm: owner.query_norm.unwrap_or(attention.candidate_q_norm),
+                                    index: owner.index_weights,
+                                };
+                                let previous = previous.map(|publication| {
+                                    PreviousLayerThreeKeys::new(
+                                        publication.publication,
+                                        &publication.keys,
+                                    )
+                                });
+                                self.runtime
+                                    .step(LayerOneCall::new(
+                                        input,
+                                        owner.positions,
+                                        owner.frequencies,
+                                        owner.owner_weights,
+                                        query_weights,
+                                        owner.query_layout,
+                                        attention.weights,
+                                        previous,
+                                    ))
+                                    .expect("live bundle layer-one runtime step")
+                            },
+                        )
+                    },
+                )
+            }
+            RuntimeOperandSource::Alternate {
+                projection,
+                startup,
+            } => layer1_owner_capture::with_alternate_runtime_owner_operands(
+                &projection,
+                &startup,
+                self.next_case,
+                |owner| {
+                    layer1_attention_capture::with_alternate_runtime_attention_operands(
+                        &projection,
+                        |attention| {
+                            assert_eq!(
+                                owner.frequencies, attention.frequencies,
+                                "alternate L1 owner and attention frequency table"
+                            );
+                            let query_weights = CandidateQueryWeights {
+                                wq_a: owner.query_wq_a.unwrap_or(attention.candidate_wq_a),
+                                q_norm: owner.query_norm.unwrap_or(attention.candidate_q_norm),
+                                index: owner.index_weights,
+                            };
+                            let previous = previous.map(|publication| {
+                                PreviousLayerThreeKeys::new(
+                                    publication.publication,
+                                    &publication.keys,
+                                )
+                            });
+                            self.runtime
+                                .step(LayerOneCall::new(
+                                    input,
+                                    owner.positions,
+                                    owner.frequencies,
+                                    owner.owner_weights,
+                                    query_weights,
+                                    owner.query_layout,
+                                    attention.weights,
+                                    previous,
+                                ))
+                                .expect("live alternate layer-one runtime step")
+                        },
+                    )
+                },
+            ),
+        }
+    }
+
     pub(super) fn last_publication(&self) -> &layer1_owner_capture::NativeCase {
         self.last_publication
             .as_ref()
             .expect("live L1 owner publication")
     }
+}
+
+fn runtime_from_bundle(bundle: &Value) -> LayerOneSession {
+    layer1_owner_capture::with_bundle_runtime_owner_operands(bundle, 0, |owner| {
+        layer1_attention_capture::with_bundle_runtime_attention_operands(bundle, |attention| {
+            LayerOneSession::new(
+                LayerOneConfig::new(
+                    owner.layout,
+                    attention.layout,
+                    NonZeroUsize::new(1).expect("source index topk"),
+                )
+                .expect("bundle layer-one runtime geometry"),
+                owner.compressor_norm,
+            )
+            .expect("bundle layer-one runtime")
+        })
+    })
+}
+
+fn runtime_from_alternate(projection: &Value, startup: &Value) -> LayerOneSession {
+    layer1_owner_capture::with_alternate_runtime_owner_operands(projection, startup, 0, |owner| {
+        layer1_attention_capture::with_alternate_runtime_attention_operands(
+            projection,
+            |attention| {
+                LayerOneSession::new(
+                    LayerOneConfig::new(
+                        owner.layout,
+                        attention.layout,
+                        NonZeroUsize::new(1).expect("source index topk"),
+                    )
+                    .expect("alternate layer-one runtime geometry"),
+                    owner.compressor_norm,
+                )
+                .expect("alternate layer-one runtime")
+            },
+        )
+    })
 }
 
 #[test]

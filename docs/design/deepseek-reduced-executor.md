@@ -47,8 +47,13 @@ joins ratio-one owner preparation, candidate scoring/selection, owner commit
 and attention. It derives publication identity and selection offsets from live
 state. Any admitted failure poisons the session; reset clears both owners and
 advances their epoch together. This does not promise rollback after the owner
-commits and attention fails. Complete L1 assembly and prior-L3 score-prefix
-policy remain to extract, followed by full-request orchestration.
+commits and attention fails. `LayerOneSession` similarly joins ratio-two
+ownership, query scoring, direct causal selection and attention. Partial groups
+require the preceding L3 publication with matching source, epoch and call ordinal,
+and consume its leading completed-group rows while keeping L1 KV. The session
+derives token/group frequency positions and publication identity from live state.
+Full-request orchestration still needs extraction, including Engram/block-tail
+ordering and coherent recovery across layers.
 Weights must be separated from the source cases; synthetic layouts remain explicitly
 bounded. Both established schedules must work. A late failure invalidates the
 request, and restart reconstructs all mutable state from immutable weights.

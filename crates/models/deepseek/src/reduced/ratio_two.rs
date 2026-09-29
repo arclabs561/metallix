@@ -116,6 +116,42 @@ impl RatioTwoOwnerLayout {
             self.rope_pairs,
         )?)
     }
+
+    /// Returns the fixed batch count for request-session composition.
+    #[must_use]
+    pub(crate) const fn batches(self) -> NonZeroUsize {
+        self.batches
+    }
+
+    /// Returns the BF16 attention-input row width.
+    #[must_use]
+    pub(crate) const fn input_dimension(self) -> NonZeroUsize {
+        self.input_dimension
+    }
+
+    /// Returns the compressed latent width.
+    #[must_use]
+    pub(crate) const fn latent_dimension(self) -> NonZeroUsize {
+        self.latent_dimension
+    }
+
+    /// Returns the prepared index-key row width.
+    #[must_use]
+    pub(crate) const fn key_dimension(self) -> NonZeroUsize {
+        self.key_dimension
+    }
+
+    /// Returns the rotary-pair count used by prepared keys and KV.
+    #[must_use]
+    pub(crate) const fn rope_pairs(self) -> NonZeroUsize {
+        self.rope_pairs
+    }
+
+    /// Returns the maximum completed compressed positions in this request.
+    #[must_use]
+    pub(crate) const fn capacity(self) -> NonZeroUsize {
+        self.capacity
+    }
 }
 
 /// Borrowed immutable numerical operands for the ratio-two owner.

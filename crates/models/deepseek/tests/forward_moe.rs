@@ -2284,7 +2284,16 @@ impl ReducedLiveRequest {
         assert_eq!(stream.0, [0, 5, 6][self.cursor], "reduced request cursor");
         self.lifecycle = ReducedRequestLifecycle::Poisoned;
         if self.cursor == 2 {
+            let publication = self
+                .l3
+                .as_ref()
+                .expect("preceding live L3 publisher")
+                .publications()
+                .last()
+                .expect("preceding committed L3 publication")
+                .publication;
             self.l1.supply_previous_layer_three_prefix(
+                publication,
                 prior_l3.expect("start six needs prior L3 prefix"),
             );
         }
@@ -3812,7 +3821,10 @@ fn alternate_partition_native_layer_one_tail_reaches_layer_two_entry() {
     let mut layer_one = layer1_join::NativeLayerOneSession::from_alternate(&projection, &startup);
     for (index, (start, residual, pre)) in upstream.iter().enumerate() {
         if matches!(start, 4 | 6) {
-            layer_one.supply_previous_layer_three_prefix(&publications[index - 1].key_prefix);
+            layer_one.supply_previous_layer_three_prefix(
+                publications[index - 1].publication,
+                &publications[index - 1].key_prefix,
+            );
         }
         let (output_start, output, next_pre) =
             layer_one.step(&(*start, residual.clone()), &(*start, pre.clone()));
@@ -3859,7 +3871,10 @@ fn alternate_partition_native_layer_one_and_two_reach_layer_three_stream() {
         layer2_join::NativeLayerTwoSession::from_alternate(&two_projection, &one_projection);
     for (index, (start, residual, pre)) in upstream.iter().enumerate() {
         if matches!(start, 4 | 6) {
-            one.supply_previous_layer_three_prefix(&publications[index - 1].key_prefix);
+            one.supply_previous_layer_three_prefix(
+                publications[index - 1].publication,
+                &publications[index - 1].key_prefix,
+            );
         }
         let entry = one.step(&(*start, residual.clone()), &(*start, pre.clone()));
         let (output_start, residual, pre) = two.step(&entry, Some(one.last_publication()));
@@ -3900,7 +3915,10 @@ fn alternate_partition_live_upstream_and_owner_reach_final_logits() {
     let mut publications: Vec<partition_owner::AlternateLayerThreePublication> = Vec::new();
     for (index, (start, residual, pre)) in upstream.iter().enumerate() {
         if matches!(start, 4 | 6) {
-            one.supply_previous_layer_three_prefix(&publications[index - 1].key_prefix);
+            one.supply_previous_layer_three_prefix(
+                publications[index - 1].publication,
+                &publications[index - 1].key_prefix,
+            );
         }
         let first = one.step(&(*start, residual.clone()), &(*start, pre.clone()));
         let (two_start, stream, pre) = two.step(&first, Some(one.last_publication()));

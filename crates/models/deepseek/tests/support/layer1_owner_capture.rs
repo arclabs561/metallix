@@ -17,7 +17,8 @@ use deepseek::{
     },
     precision::fp32_linear_reference,
     reduced::{
-        RatioTwoCompressedOwner, RatioTwoOwnerCall, RatioTwoOwnerLayout, RatioTwoOwnerWeights,
+        LayerOneStepOutput, RatioTwoCompressedOwner, RatioTwoOwnerCall, RatioTwoOwnerLayout,
+        RatioTwoOwnerWeights,
     },
     select_indices,
 };
@@ -107,6 +108,22 @@ pub(super) struct NativeCase {
     pub kv_prefix: Vec<u16>,
     pub source_score_key_prefix: Vec<u16>,
     pub selected_indices: Vec<i32>,
+}
+
+/// Borrowed numerical L1 owner and index-query operands for one runtime call.
+/// The test adapter keeps decoded vectors local to its callback, so source
+/// fixture storage never escapes into request state.
+pub(super) struct RuntimeOwnerOperands<'a> {
+    pub(super) layout: RatioTwoOwnerLayout,
+    pub(super) compressor_norm: &'a [u16],
+    pub(super) owner_weights: RatioTwoOwnerWeights<'a>,
+    pub(super) index_weights: IndexQueryWeights<'a>,
+    pub(super) query_wq_a: Option<Fp8Projection<'a>>,
+    pub(super) query_norm: Option<&'a [u16]>,
+    pub(super) query_layout: CandidateQueryLayout,
+    pub(super) frequencies: &'a [RotaryFrequency],
+    pub(super) start: usize,
+    pub(super) positions: NonZeroUsize,
 }
 
 fn fixture() -> Fixture {
@@ -964,6 +981,295 @@ impl NativeLayerOneOwnerSession {
             self.require_previous_layer_three_prefix,
         );
     }
+}
+
+fn bundle_fixture(bundle: &Value) -> Fixture {
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned reduced bundle metadata");
+    assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+    assert_eq!(bundle["source"], pinned["source"], "bundle source metadata");
+    let projection = bundle["projections"]["layer1_owner"].clone();
+    assert_eq!(
+        projection["source"], pinned["projections"]["layer1_owner"]["source"],
+        "layer-one owner source metadata"
+    );
+    let capture = bundle["source"]["complete_capture_sha256"]
+        .as_str()
+        .expect("bundle capture identity");
+    let fixture: Fixture = serde_json::from_value(projection).expect("layer-one owner bundle JSON");
+    validate_fixture(&fixture, capture);
+    fixture
+}
+
+fn alternate_fixture(projection: &Value, startup: &Value) -> Fixture {
+    for name in ["source", "source_receipt_sha256", "capture_identity"] {
+        assert_eq!(projection[name], startup[name], "alternate L1 provenance");
+    }
+    let fixture: Fixture = serde_json::from_value(projection.clone()).expect("alternate L1 owner");
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(fixture.source.revision, REVISION);
+    assert!(fixture.source.complete_capture_sha256.is_none());
+    assert_eq!(
+        (
+            fixture.model.owner_layer,
+            fixture.model.ratio,
+            fixture.model.index_topk
+        ),
+        (1, 2, 1)
+    );
+    assert_eq!(fixture.query_parameters.len(), 3);
+    assert_eq!(fixture.cases.len(), 4);
+    for (case, (start, count, partial)) in
+        fixture
+            .cases
+            .iter()
+            .zip([(0, 4, false), (4, 1, true), (5, 1, false), (6, 1, true)])
+    {
+        assert_eq!(
+            (case.start_pos, case.sequence, case.latent.is_none()),
+            (start, count, partial)
+        );
+    }
+    fixture
+}
+
+fn runtime_owner_layout(fixture: &Fixture) -> RatioTwoOwnerLayout {
+    RatioTwoOwnerLayout::new(
+        nonzero(1),
+        nonzero(128),
+        nonzero(64),
+        nonzero(64),
+        nonzero(16),
+        nonzero(
+            fixture
+                .cases
+                .iter()
+                .map(|case| case.start_pos + case.sequence)
+                .max()
+                .expect("nonempty L1 source calls")
+                .div_ceil(2),
+        ),
+        fixture.model.norm_eps,
+    )
+    .expect("runtime ratio-two owner layout")
+}
+
+fn with_runtime_owner_operands<R>(
+    fixture: &Fixture,
+    case_index: usize,
+    body: impl FnOnce(RuntimeOwnerOperands<'_>) -> R,
+) -> R {
+    let case = fixture
+        .cases
+        .get(case_index)
+        .expect("runtime owner call index");
+    let compressor_norm = bf16(parameter(fixture, "layers.1.attn.compressor.norm.weight"));
+    let wkv = fp32(parameter(fixture, "layers.1.attn.compressor.wkv.weight"));
+    let wgate = fp32(parameter(fixture, "layers.1.attn.compressor.wgate.weight"));
+    let wk = bf16(parameter(fixture, "layers.1.attn.indexer.wk.weight"));
+    let key_norm = bf16(parameter(fixture, "layers.1.attn.indexer.k_norm.weight"));
+    let wq_b_codes = fp8(parameter(fixture, "layers.1.attn.indexer.wq_b.weight"));
+    let wq_b_scales = fp8(parameter(fixture, "layers.1.attn.indexer.wq_b.scale"));
+    let weights_proj = bf16(parameter(
+        fixture,
+        "layers.1.attn.indexer.weights_proj.weight",
+    ));
+    let query_wq_a_codes = (!fixture.query_parameters.is_empty())
+        .then(|| fp8(&fixture.query_parameters["layers.1.attn.wq_a.weight"]));
+    let query_wq_a_scales = (!fixture.query_parameters.is_empty())
+        .then(|| fp8(&fixture.query_parameters["layers.1.attn.wq_a.scale"]));
+    let query_norm_values = (!fixture.query_parameters.is_empty())
+        .then(|| bf16(&fixture.query_parameters["layers.1.attn.q_norm.weight"]));
+    let query_wq_a = query_wq_a_codes
+        .as_deref()
+        .zip(query_wq_a_scales.as_deref())
+        .map(|(codes, scales)| Fp8Projection { codes, scales });
+    let query_norm = query_norm_values.as_deref();
+    let all_frequencies = frequencies(&fixture.frequency_table);
+    body(RuntimeOwnerOperands {
+        layout: runtime_owner_layout(fixture),
+        compressor_norm: &compressor_norm,
+        owner_weights: RatioTwoOwnerWeights::new(
+            &wkv,
+            &wgate,
+            IndexKeyWeights::new(&wk, &key_norm),
+        ),
+        index_weights: IndexQueryWeights {
+            wq_b_codes: &wq_b_codes,
+            wq_b_scales: &wq_b_scales,
+            weights_proj: &weights_proj,
+        },
+        query_wq_a,
+        query_norm,
+        query_layout: CandidateQueryLayout::new(
+            IndexQueryLayout::new(
+                nonzero(1),
+                nonzero(128),
+                nonzero(32),
+                nonzero(2),
+                nonzero(64),
+                nonzero(16),
+            )
+            .expect("runtime L1 index query layout"),
+            fixture.model.norm_eps,
+        )
+        .expect("runtime L1 candidate query layout"),
+        frequencies: &all_frequencies,
+        start: case.start_pos,
+        positions: nonzero(case.sequence),
+    })
+}
+
+/// Lends canonical unified-bundle owner/index operands to one runtime call.
+pub(super) fn with_bundle_runtime_owner_operands<R>(
+    bundle: &Value,
+    case_index: usize,
+    body: impl FnOnce(RuntimeOwnerOperands<'_>) -> R,
+) -> R {
+    with_runtime_owner_operands(&bundle_fixture(bundle), case_index, body)
+}
+
+/// Lends alternate owner/query operands to one runtime call.
+pub(super) fn with_alternate_runtime_owner_operands<R>(
+    projection: &Value,
+    startup: &Value,
+    case_index: usize,
+    body: impl FnOnce(RuntimeOwnerOperands<'_>) -> R,
+) -> R {
+    with_runtime_owner_operands(&alternate_fixture(projection, startup), case_index, body)
+}
+
+/// Re-decodes the current owner source and compares a live runtime step's
+/// owner, score, selection, and publication prefixes at its own boundary.
+pub(super) fn assert_bundle_runtime_step(
+    bundle: &Value,
+    case_index: usize,
+    input: &[u16],
+    output: &LayerOneStepOutput,
+) {
+    assert_runtime_step(&bundle_fixture(bundle), case_index, input, output);
+}
+
+pub(super) fn assert_alternate_runtime_step(
+    projection: &Value,
+    startup: &Value,
+    case_index: usize,
+    input: &[u16],
+    output: &LayerOneStepOutput,
+) {
+    assert_runtime_step(
+        &alternate_fixture(projection, startup),
+        case_index,
+        input,
+        output,
+    );
+}
+
+fn assert_runtime_step(
+    fixture: &Fixture,
+    case_index: usize,
+    input: &[u16],
+    output: &LayerOneStepOutput,
+) {
+    let case = fixture
+        .cases
+        .get(case_index)
+        .expect("runtime owner source case");
+    assert_eq!(input, bf16(&case.input), "runtime owner input boundary");
+    assert_eq!(
+        output.publication().source_layer(),
+        1,
+        "runtime L1 publication layer"
+    );
+    assert_eq!(
+        output.publication().call_id(),
+        u64::try_from(case_index).expect("bounded L1 call"),
+        "runtime L1 publication ordinal"
+    );
+    let wkv = fp32(parameter(fixture, "layers.1.attn.compressor.wkv.weight"));
+    let wgate = fp32(parameter(fixture, "layers.1.attn.compressor.wgate.weight"));
+    assert_source_projections(
+        case,
+        input,
+        &wkv,
+        &wgate,
+        output.owner().projected(),
+        output.owner().gate(),
+    );
+    assert_latent_matches_source(case, output.owner().latent());
+    assert_owner_prefixes(case, output.key_prefix(), output.kv_prefix());
+    assert_eq!(
+        output.scored().query.qr,
+        bf16(&case.index_qr),
+        "runtime candidate QR crosses owner boundary"
+    );
+    if let Some(expected_wq_a) = &case.wq_a_output {
+        assert_eq!(
+            output.scored().query.wq_a,
+            bf16(expected_wq_a),
+            "runtime alternate candidate WQ-A"
+        );
+    }
+    let expected_score_keys = bf16(&case.index_score_key_prefix);
+    assert_eq!(
+        output.score_key_prefix(),
+        expected_score_keys,
+        "runtime source score-key boundary"
+    );
+    let query = &output.scored().query.index;
+    let operations = &case.index_operations;
+    assert_eq!(
+        query.query_post_fp4,
+        bf16(&operations.q_after_rope_fp4),
+        "runtime source index Q"
+    );
+    assert_eq!(
+        query.projected_head_weights,
+        bf16(&operations.weights_proj_output),
+        "runtime source head weights"
+    );
+    assert_eq!(
+        query.scaled_head_weights,
+        bf16(&operations.scaled_weights),
+        "runtime source scaled weights"
+    );
+    assert_eq!(
+        output.scored().dot_products,
+        bf16(&operations.scores_einsum),
+        "runtime source dot scores"
+    );
+    assert_eq!(
+        output.scored().rectified,
+        bf16(&operations.scores_after_relu),
+        "runtime source relu scores"
+    );
+    assert_eq!(
+        output.scored().weighted,
+        bf16(&operations.scores_weighted_per_head),
+        "runtime source weighted scores"
+    );
+    assert_eq!(
+        output.scored().scores,
+        bf16(&operations.scores_after_head_sum),
+        "runtime source head-sum scores"
+    );
+    assert_eq!(
+        output.selected_indices(),
+        i32s(&case.selected_indices),
+        "runtime source selected IDs"
+    );
+    let expected_causal = case
+        .index_operations
+        .scores_after_causal_mask
+        .as_ref()
+        .map_or_else(|| bf16(&case.index_operations.scores_after_head_sum), bf16);
+    assert_eq!(
+        output.causal_scores(),
+        expected_causal,
+        "runtime source causal scores"
+    );
 }
 
 /// Resetting a request session removes old owner prefixes before the next
