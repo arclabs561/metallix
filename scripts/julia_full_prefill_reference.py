@@ -47,7 +47,9 @@ def layer_weights(layer: int) -> dict[str, torch.Tensor]:
     return weights
 
 
-def source_encoder() -> torch.nn.Module:
+def source_encoder(attention_implementation: str = "sdpa") -> torch.nn.Module:
+    if attention_implementation not in {"sdpa", "eager"}:
+        raise ValueError("attention implementation must be sdpa or eager")
     import transformers.models.modernbert.modeling_modernbert as source_module
     from transformers.models.modernbert.configuration_modernbert import ModernBertConfig
     from transformers.models.modernbert.modeling_modernbert import ModernBertModel
@@ -81,7 +83,7 @@ def source_encoder() -> torch.nn.Module:
             "sliding_attention": {"rope_theta": 160000.0, "rope_type": "default"},
         },
     )
-    config._attn_implementation = "sdpa"
+    config._attn_implementation = attention_implementation
     model = ModernBertModel(config).eval()
     with torch.no_grad():
         model.embeddings.tok_embeddings.weight.copy_(
@@ -156,9 +158,11 @@ def boundaries(case: dict[str, Any]) -> tuple[dict[str, torch.Tensor], list[str]
     return observed, operators
 
 
-def layer0_trace(case: dict[str, Any]) -> dict[str, torch.Tensor]:
-    """Capture actual SDPA layer-zero intermediates through source module hooks."""
-    encoder = source_encoder()
+def layer0_trace(
+    case: dict[str, Any], attention_implementation: str = "sdpa"
+) -> dict[str, torch.Tensor]:
+    """Capture source layer-zero intermediates through actual module hooks."""
+    encoder = source_encoder(attention_implementation)
     input_ids = torch.tensor([case["input_ids"]], dtype=torch.int64)
     attention_mask = torch.tensor([case["attention_mask"]], dtype=torch.bool)
     observed: dict[str, torch.Tensor] = {}

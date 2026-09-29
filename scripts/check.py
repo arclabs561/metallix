@@ -113,6 +113,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_julia_encoder_fixture.py"], False),
         ([sys.executable, "scripts/test_julia_prefill_fixture.py"], False),
         ([sys.executable, "scripts/test_julia_full_prefill_fixture.py"], False),
+        ([sys.executable, "scripts/test_julia_calibration_source_oracle.py"], False),
         ([sys.executable, "scripts/test_inspect_julia.py"], False),
         ([sys.executable, "scripts/test_qualify_codex.py"], False),
         ([sys.executable, "scripts/test_qualify_responses_tools.py"], False),

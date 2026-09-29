@@ -7,6 +7,28 @@ strict source-output gate: the `unmasked_control` synthetic case exceeds the
 fixed `1e-5` hidden-state tolerance. Full Julia execution still requires a
 numerical contract decision and checkpoint qualification.
 
+## Calibration-only source control
+
+`scripts/julia_calibration_source_oracle.py` compares actual pinned eager
+layer-zero attention with the explicit QKV/RoPE/F32-softmax/value reconstruction
+on fixed `cal_len7`. The offline, single-thread run produced exact eager
+agreement and `1.9073486328125e-6` maximum SDPA-versus-eager attended difference;
+QKV was identical. The immutable receipt is
+`.agents/receipts/julia/calibration-source-oracle.json`. The command validates
+finite exact shapes, records source/input/backend identity, and refuses to
+replace a receipt. It neither accesses held-out inputs nor changes native
+arithmetic or the `1e-5` acceptance threshold.
+
+```sh
+uv run --offline scripts/julia_calibration_source_oracle.py --run-source \
+  --output /tmp/julia-source-oracle.json
+```
+
+This validates the layer-zero reconstruction as a diagnostic. It does not
+resolve the full-encoder source-backend compatibility failure or establish a
+portable numerical contract. A fidelity-target decision still precedes another
+native arithmetic experiment.
+
 ## Reproduction identity
 
 The public Hugging Face model API reported the following source revision on

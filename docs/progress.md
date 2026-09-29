@@ -11,6 +11,15 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The calibration-only Julia source-oracle control now executes pinned eager
+  and SDPA layer-zero traces on fixed `cal_len7`. Actual eager attention matches
+  the explicit reconstruction exactly; SDPA/eager attended maximum difference
+  is `1.9073486328125e-6`, with identical QKV. The receipt records input/source
+  hashes, finite shapes and single-thread backend configuration. This validates
+  one oracle boundary, not native full-encoder accuracy: the existing numerical
+  failure and held-out gate remain unchanged. Receipt:
+  `.agents/receipts/julia/calibration-source-oracle.json`.
+
 - `mx run-deepseek-reduced` executes the complete scalar request from an admitted
   numerical artifact and caller token IDs, without Metal. `ReducedArtifact`
   checks exact tensor names, encodings, hashes, finite values and size bounds;
