@@ -1,6 +1,6 @@
 //! Same-trace layer-zero block output consumed by the native layer-one Engram.
 
-use std::{collections::BTreeMap, num::NonZeroUsize};
+use std::{collections::BTreeMap, fmt::Write as _, num::NonZeroUsize};
 
 use deepseek::{
     RotaryFrequency, StartupLayout,
@@ -669,6 +669,64 @@ pub(crate) fn native_layer_zero_entries_from_projection(
             })
             .collect()
     })
+}
+
+fn alternate_startup_projection() -> Value {
+    let raw = include_str!("../../../../fixtures/deepseek-v41/partition-startup-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        "e541cf0ae0e5c33441585e2960be9e9cd4ea00f3b427ed12c9177c7a3f355b3b"
+    );
+    let root: Value = serde_json::from_str(raw).expect("alternate startup projection");
+    assert_eq!(
+        field(&root, "source_receipt_sha256").as_str(),
+        Some("9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906")
+    );
+    assert_eq!(
+        field(field(&root, "capture_identity"), "schedule"),
+        &serde_json::json!([4, 1, 1, 1])
+    );
+    root
+}
+
+#[test]
+fn alternate_partition_native_startup_reaches_layer_one_stream() {
+    let root = alternate_startup_projection();
+    let entries = native_layer_zero_entries_from_projection(&root);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(start, _, _)| *start)
+            .collect::<Vec<_>>(),
+        [0, 4, 5, 6]
+    );
+    for ((start, residual, pre), case) in entries
+        .iter()
+        .zip(field(&root, "cases").as_array().unwrap())
+    {
+        assert_eq!(*start, usize_field(case, "start_pos"));
+        assert_eq!(residual, &bf16(field(case, "layer_one_engram_stream")));
+        assert_eq!(pre.len(), residual.len() / 128);
+    }
+}
+
+#[test]
+fn alternate_partition_startup_rejects_changed_embedding() {
+    let mut root = alternate_startup_projection();
+    let tensor = &mut root["parameters"]["embed.weight"];
+    let mut storage = bytes(tensor);
+    storage[..256].fill(0);
+    let mut hex = String::with_capacity(storage.len() * 2);
+    for byte in &storage {
+        write!(&mut hex, "{byte:02x}").unwrap();
+    }
+    tensor["storage_hex"] = Value::String(hex);
+    tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&storage)));
+    let case = &root["cases"][0];
+    assert!(
+        std::panic::catch_unwind(|| native_startup(&root, case)).is_err(),
+        "changed numerical weights must fail startup even with a valid storage digest"
+    );
 }
 
 #[test]

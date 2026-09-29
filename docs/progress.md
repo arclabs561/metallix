@@ -395,7 +395,13 @@ candidate sets, rejects stale candidate identities, and uses derived native L3
 residual/pre inputs. Its attention, HC/FFN and head run through the existing
 source-derived bounds; no captured coefficients replace the native handoff.
 The final normalization zeroing control remains active. Earlier L3 inputs are
-source-fed, so upstream L0–L2/Engram and full native-graph qualification remain open. Owner cancellation/retry checks
+source-fed. A separate source-pinned alternate projection now drives native token
+startup, L0 window attention, HC and FFN on starts 0/4/5/6. The computed terminal
+stream matches the observed L1 Engram input exactly; a changed embedding with a
+recomputed storage digest fails the numerical gate. Observed token IDs are joined
+to captured calls by start and count, checked against the experiment input, and
+retain alternate receipt provenance. Native L1 Engram/L1–L2 and their join to L3
+still separate these qualified portions from full native-graph qualification. Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 

@@ -24,12 +24,14 @@ import hashlib
 import json
 import math
 import struct
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_FIXTURE_BYTES = 576 * 1024
-EXPECTED_START_POSITIONS = (0, 5, 6)
+CANONICAL_SCHEDULE = ((0, 5), (5, 1), (6, 1))
+EXPECTED_START_POSITIONS = tuple(start for start, _ in CANONICAL_SCHEDULE)
 SOURCE_FIELDS = (
     "revision",
     "model_sha256",
@@ -190,27 +192,37 @@ def _parameters(encoded: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
-    """Extract one same-trace layer-zero producer to native layer-one seam."""
+def layer_zero_projection(
+    model: object,
+    encoded: object,
+    steps: object,
+    *,
+    schedule: tuple[tuple[int, int], ...] = CANONICAL_SCHEDULE,
+) -> dict[str, object]:
+    """Project validated layer-zero numerical operands for one explicit schedule.
+
+    Callers bind provenance and receipt identity themselves.  This prevents an
+    alternate source partition from being represented as a canonical capture.
+    """
+    model = _object(model, "model arguments")
+    encoded = _object(encoded, "encoded parameters")
     if (
-        receipt.get("capture_status")
-        != "completed synthetic source-forward capture; no parity claim"
-    ):
-        raise RuntimeError("layer-zero bridge requires a completed source capture")
-    source = _object(receipt.get("source"), "source provenance")
-    runtime = _object(receipt.get("runtime"), "runtime provenance")
-    model = _object(receipt.get("model_args"), "model arguments")
-    encoded = _object(receipt.get("encoded_parameters"), "encoded parameters")
-    steps = receipt.get("steps")
-    coverage = _object(receipt.get("coverage_status"), "coverage")
-    if runtime.get("storage_byteorder") != "little" or coverage.get("pending") != []:
-        raise RuntimeError(
-            "layer-zero bridge requires complete little-endian capture coverage"
+        not schedule
+        or schedule[0][0] != 0
+        or any(
+            type(start) is not int or type(token_count) is not int or token_count <= 0
+            for start, token_count in schedule
         )
-    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
-        raise RuntimeError("layer-zero bridge has incomplete source provenance")
-    if not isinstance(steps, list) or len(steps) != len(EXPECTED_START_POSITIONS):
-        raise RuntimeError("layer-zero bridge requires the pinned prefill/decode trace")
+        or any(
+            start != previous_start + previous_count
+            for (previous_start, previous_count), (start, _) in pairwise(schedule)
+        )
+    ):
+        raise RuntimeError(
+            "layer-zero projection requires a contiguous schedule from zero"
+        )
+    if not isinstance(steps, list) or len(steps) != len(schedule):
+        raise RuntimeError("layer-zero projection requires one step per schedule entry")
     geometry = {"dim": 128, "hc_mult": 2, "n_layers": 5, "vocab_size": 8}
     geometry.update(
         {
@@ -239,11 +251,12 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
         raise RuntimeError("layer-zero bridge has unexpected reduced model geometry")
 
     cases: list[dict[str, object]] = []
-    for step, start_pos in zip(steps, EXPECTED_START_POSITIONS, strict=True):
+    for step, (start_pos, sequence) in zip(steps, schedule, strict=True):
         source_step = _object(step, "capture step")
-        if source_step.get("start_pos") != start_pos:
-            raise RuntimeError("layer-zero bridge start positions drifted")
-        sequence = 5 if start_pos == 0 else 1
+        if source_step.get("start_pos") != start_pos or (
+            "token_count" in source_step and source_step.get("token_count") != sequence
+        ):
+            raise RuntimeError("layer-zero projection schedule drifted")
         values = _object(source_step.get("intermediates"), "step intermediates")
         block_input = _object(
             values.get("layers.0.block_input"), "layer-zero block input"
@@ -517,14 +530,8 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "hc": hc,
             }
         )
-    capture = serialized_capture(receipt)
     return {
         "schema_version": 1,
-        "source": {
-            **{field: source[field] for field in SOURCE_FIELDS},
-            "complete_capture_sha256": _sha256(capture),
-            "extractor_sha256": _sha256(Path(__file__).read_bytes()),
-        },
         "model": geometry,
         "contract": {
             "layer_zero_producer": "source-pinned native startup, attention, FFN, and HC composition",
@@ -533,6 +540,39 @@ def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
         },
         "parameters": _parameters(encoded),
         "cases": cases,
+    }
+
+
+def layer0_to_layer1_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Extract one same-trace layer-zero producer to native layer-one seam."""
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError("layer-zero bridge requires a completed source capture")
+    source = _object(receipt.get("source"), "source provenance")
+    runtime = _object(receipt.get("runtime"), "runtime provenance")
+    coverage = _object(receipt.get("coverage_status"), "coverage")
+    if runtime.get("storage_byteorder") != "little" or coverage.get("pending") != []:
+        raise RuntimeError(
+            "layer-zero bridge requires complete little-endian capture coverage"
+        )
+    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
+        raise RuntimeError("layer-zero bridge has incomplete source provenance")
+    projection = layer_zero_projection(
+        receipt.get("model_args"),
+        receipt.get("encoded_parameters"),
+        receipt.get("steps"),
+    )
+    capture = serialized_capture(receipt)
+    return {
+        "schema_version": 1,
+        "source": {
+            **{field: source[field] for field in SOURCE_FIELDS},
+            "complete_capture_sha256": _sha256(capture),
+            "extractor_sha256": _sha256(Path(__file__).read_bytes()),
+        },
+        **projection,
     }
 
 

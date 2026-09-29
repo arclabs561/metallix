@@ -511,7 +511,10 @@ with exact BF16 residuals and expert IDs under the existing coefficient bounds.
 The retained L3 candidate set and key/KV publications now feed L4's own query,
 selection and attention. Computed L3 residuals and coefficients continue through
 L4 HC/FFN and final logits under the existing source-derived bounds. Earlier L3
-inputs remain source-fed; full-graph native partition qualification remains open.
+inputs remain source-fed. On the upstream side, native token startup, L0 window
+attention, HC and FFN now reach the observed L1 Engram input for all four calls.
+Native L1 Engram/L1–L2 and their join to L3 remain open before full-graph
+partition qualification.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
