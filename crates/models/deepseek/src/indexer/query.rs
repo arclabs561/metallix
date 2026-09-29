@@ -129,6 +129,10 @@ pub struct CandidateQueryLayout {
 }
 
 impl CandidateQueryLayout {
+    pub(crate) const fn input_geometry(self) -> (usize, usize) {
+        (self.index.batches.get(), self.index.hidden_dimension.get())
+    }
+
     /// Validates the shared QR geometry and the supplied index-query geometry.
     pub fn new(
         index: IndexQueryLayout,

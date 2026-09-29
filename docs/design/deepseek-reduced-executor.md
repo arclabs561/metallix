@@ -38,10 +38,13 @@ invalidates itself after any admitted-call failure; reset clears the window
 and cursor. Both established schedules retain their independent source checks.
 
 The remaining assembly owns L1/L2/L3/L4 request state with the preceding-call
-L3 publication. L1 needs a ratio-two owner using its existing compressor and
-key/KV primitives; the ratio-one L3 owner is not a substitute. L3 extraction
-also needs typed candidate-mask projection rather than fixture-selected IDs.
-Weights must be separated from the source cases; synthetic layouts remain explicitly
+L3 publication. `RatioTwoCompressedOwner` now stages the L1 compressor and
+paired key/KV prefixes over typed per-call weights; its partial calls retain
+incomplete groups. `CandidateProjector` now derives L3 masks from supplied
+input and key scores, checking matrix geometry before scoring. These components
+remove the test-owned owner/projection arithmetic, but the complete L1 and L3
+sessions still need extraction, including prior-L3 score-prefix policy and
+cross-component failure invalidation. Weights must be separated from the source cases; synthetic layouts remain explicitly
 bounded. Both established schedules must work. A late failure invalidates the
 request, and restart reconstructs all mutable state from immutable weights.
 No component-local rollback claim is sufficient for the entire request.

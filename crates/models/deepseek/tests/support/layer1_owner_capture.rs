@@ -9,14 +9,16 @@ use deepseek::{
     indexer::{
         bf16::index_scores_bf16_reference,
         cache::{IndexKeyPublicationId, IndexKeyState},
-        compressed_kv::{CompressedKvLayout, prepare_compressed_kv},
-        key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
+        key::IndexKeyWeights,
         query::{
             CandidateQueryLayout, CandidateQueryWeights, IndexQueryDiagnostic, IndexQueryLayout,
             IndexQueryWeights, prepare_candidate_query, prepare_index_query,
         },
     },
     precision::fp32_linear_reference,
+    reduced::{
+        RatioTwoCompressedOwner, RatioTwoOwnerCall, RatioTwoOwnerLayout, RatioTwoOwnerWeights,
+    },
     select_indices,
 };
 use serde::Deserialize;
@@ -316,47 +318,30 @@ fn assert_fp32_projection_envelope(
     Ok(())
 }
 
-fn source_projections(
+fn assert_source_projections(
     case: &Case,
     input: &[u16],
     wkv: &[f32],
     wgate: &[f32],
-) -> (Vec<f32>, Vec<f32>) {
-    assert_eq!(case.input.shape, [1, case.sequence, 128]);
-    assert_eq!(
-        input,
-        bf16(&case.input),
-        "start {} owner input BF16 boundary",
-        case.start_pos
-    );
+    projected: &[f32],
+    gate: &[f32],
+) {
     let input_f32: Vec<_> = input.iter().copied().map(bf16_to_f32).collect();
-    let mut projected = vec![0.0; case.sequence * 64];
-    fp32_linear_reference(&input_f32, wkv, case.sequence, 128, 64, &mut projected)
-        .expect("bounded native WKV projection");
-    assert_fp32_projection_envelope(
-        "WKV",
-        &input_f32,
-        wkv,
-        case.sequence,
-        64,
-        &projected,
-        &fp32(&case.wkv_projection),
-    )
-    .unwrap_or_else(|error| panic!("start {} {error}", case.start_pos));
-    let mut gate = vec![0.0; case.sequence * 64];
-    fp32_linear_reference(&input_f32, wgate, case.sequence, 128, 64, &mut gate)
-        .expect("bounded native gate projection");
-    assert_fp32_projection_envelope(
-        "gate",
-        &input_f32,
-        wgate,
-        case.sequence,
-        64,
-        &gate,
-        &fp32(&case.wgate_projection),
-    )
-    .unwrap_or_else(|error| panic!("start {} {error}", case.start_pos));
-    (projected, gate)
+    for (name, weights, actual, expected) in [
+        ("WKV", wkv, projected, &case.wkv_projection),
+        ("gate", wgate, gate, &case.wgate_projection),
+    ] {
+        assert_fp32_projection_envelope(
+            name,
+            &input_f32,
+            weights,
+            case.sequence,
+            64,
+            actual,
+            &fp32(expected),
+        )
+        .unwrap_or_else(|error| panic!("start {} {error}", case.start_pos));
+    }
 }
 
 fn call_frequencies(all: &[RotaryFrequency], case: &Case) -> Vec<RotaryFrequency> {
@@ -719,11 +704,7 @@ pub(super) struct NativeLayerOneOwnerSession {
     wgate: Vec<f32>,
     wk: Vec<u16>,
     key_norm: Vec<u16>,
-    compressor: CompressorState,
-    key_layout: IndexKeyLayout,
-    kv_layout: CompressedKvLayout,
-    keys: Vec<u16>,
-    kv: Vec<u16>,
+    owner: RatioTwoCompressedOwner,
     score_state: LayerThreeSharedScoreState,
     previous_layer_three_prefix: Option<Vec<u16>>,
     require_previous_layer_three_prefix: bool,
@@ -817,21 +798,30 @@ impl NativeLayerOneOwnerSession {
             wgate: fp32(parameter(&fixture, "layers.1.attn.compressor.wgate.weight")),
             wk: bf16(parameter(&fixture, "layers.1.attn.indexer.wk.weight")),
             key_norm: bf16(parameter(&fixture, "layers.1.attn.indexer.k_norm.weight")),
-            compressor: CompressorState::new(1, 64, 2, &compressor_norm, norm_eps)
-                .expect("source ratio-two compressor"),
-            key_layout: IndexKeyLayout::new(
-                nonzero(1),
-                nonzero(64),
-                nonzero(64),
-                nonzero(16),
-                norm_eps,
+            owner: RatioTwoCompressedOwner::new(
+                RatioTwoOwnerLayout::new(
+                    nonzero(1),
+                    nonzero(128),
+                    nonzero(64),
+                    nonzero(64),
+                    nonzero(16),
+                    nonzero(
+                        fixture
+                            .cases
+                            .iter()
+                            .map(|case| case.start_pos + case.sequence)
+                            .max()
+                            .unwrap()
+                            .div_ceil(2),
+                    ),
+                    norm_eps,
+                )
+                .unwrap(),
+                1,
+                &compressor_norm,
             )
-            .expect("source index-key layout"),
-            kv_layout: CompressedKvLayout::new(nonzero(1), nonzero(64), nonzero(16))
-                .expect("source compressed-KV layout"),
+            .expect("runtime ratio-two owner"),
             fixture,
-            keys: Vec::new(),
-            kv: Vec::new(),
             score_state: LayerThreeSharedScoreState::new(),
             previous_layer_three_prefix: previous_layer_three_prefix.map(ToOwned::to_owned),
             require_previous_layer_three_prefix,
@@ -869,37 +859,43 @@ impl NativeLayerOneOwnerSession {
         {
             panic!("bundle layer-one owner requires a live previous-layer-three prefix");
         }
-        let (projected, gate) = source_projections(case, input, &self.wkv, &self.wgate);
-        let latent = self
-            .compressor
-            .forward(
-                CompressorInput::Gated {
-                    kv: &projected,
-                    scores: &gate,
-                },
-                case.sequence,
-                case.start_pos,
-            )
-            .expect("source ratio-two stream call");
-        assert_latent_matches_source(case, latent.as_deref());
-        if let Some(latent) = &latent {
-            let (prepared_keys, prepared_kv) = self.prepare_latent_publication(case, latent);
-            self.keys.extend_from_slice(&prepared_keys);
-            self.kv.extend_from_slice(&prepared_kv);
+        assert_eq!(case.input.shape, [1, case.sequence, 128]);
+        assert_eq!(input, bf16(&case.input), "native owner input boundary");
+        let mut completed_frequencies = Vec::new();
+        for &position in &case.group_frequency_positions {
+            completed_frequencies
+                .extend_from_slice(&self.all_frequencies[position * 16..(position + 1) * 16]);
         }
-        assert_eq!(
-            self.keys,
-            bf16(&case.index_key_prefix),
-            "start {} owned key prefix",
-            case.start_pos
+        let diagnostic = self
+            .owner
+            .forward(RatioTwoOwnerCall::new(
+                IndexKeyPublicationId::new(1, self.owner.epoch(), self.owner.next_call_id()),
+                case.start_pos,
+                nonzero(case.sequence),
+                input,
+                &completed_frequencies,
+                RatioTwoOwnerWeights::new(
+                    &self.wkv,
+                    &self.wgate,
+                    IndexKeyWeights::new(&self.wk, &self.key_norm),
+                ),
+            ))
+            .expect("runtime ratio-two owner call");
+        assert_source_projections(
+            case,
+            input,
+            &self.wkv,
+            &self.wgate,
+            diagnostic.projected(),
+            diagnostic.gate(),
         );
-        assert_eq!(
-            self.kv,
-            bf16(&case.compressed_kv_prefix),
-            "start {} owned KV prefix",
-            case.start_pos
+        assert_latent_matches_source(case, diagnostic.latent());
+        let latent = diagnostic.latent().map(<[u16]>::to_vec);
+        assert_owner_prefixes(
+            case,
+            self.owner.key_prefix(0).unwrap(),
+            self.owner.kv_prefix(0).unwrap(),
         );
-        assert_eq!(self.keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
         if case.latent.is_none() {
             publish_previous_layer_three_prefix(
@@ -911,9 +907,11 @@ impl NativeLayerOneOwnerSession {
                 self.require_previous_layer_three_prefix,
             );
         }
-        let score_keys = self
-            .score_state
-            .score_keys_for(case, &self.keys, &source_score_keys);
+        let score_keys = self.score_state.score_keys_for(
+            case,
+            self.owner.key_prefix(0).unwrap(),
+            &source_score_keys,
+        );
         let selected_indices = if self.fixture.query_parameters.is_empty() {
             assert_native_score(&self.fixture, case, &self.all_frequencies, &score_keys)
         } else {
@@ -933,29 +931,11 @@ impl NativeLayerOneOwnerSession {
         NativeCase {
             start_pos: case.start_pos,
             latent,
-            key_prefix: self.keys.clone(),
-            kv_prefix: self.kv.clone(),
+            key_prefix: self.owner.key_prefix(0).unwrap().to_vec(),
+            kv_prefix: self.owner.kv_prefix(0).unwrap().to_vec(),
             source_score_key_prefix: source_score_keys,
             selected_indices,
         }
-    }
-
-    fn prepare_latent_publication(&self, case: &Case, latent: &[u16]) -> (Vec<u16>, Vec<u16>) {
-        assert_eq!(case.group_frequency_positions.len(), latent.len() / 64);
-        let mut selected = Vec::new();
-        for &position in &case.group_frequency_positions {
-            selected.extend_from_slice(&self.all_frequencies[position * 16..(position + 1) * 16]);
-        }
-        let prepared_keys = prepare_index_keys(
-            latent,
-            &selected,
-            IndexKeyWeights::new(&self.wk, &self.key_norm),
-            self.key_layout,
-        )
-        .expect("native source-shaped index keys");
-        let prepared_kv = prepare_compressed_kv(latent, &selected, self.kv_layout)
-            .expect("native source-shaped compressed KV");
-        (prepared_keys.post_fp4, prepared_kv.post_fp4)
     }
 
     /// Supplies the complete producer prefix after the preceding L3 call has
@@ -1001,8 +981,8 @@ pub(super) fn request_session_reset_clears_owner_prefixes() -> bool {
     let partial = session.step();
     session.restart_request();
     let cleared = session.previous_layer_three_prefix.is_none()
-        && session.keys.is_empty()
-        && session.kv.is_empty()
+        && session.owner.key_prefix(0).unwrap().is_empty()
+        && session.owner.kv_prefix(0).unwrap().is_empty()
         && session.next_case == 0
         && session
             .score_state
@@ -1017,6 +997,22 @@ pub(super) fn request_session_reset_clears_owner_prefixes() -> bool {
         && reset_first.key_prefix == bf16(&fixture().cases[0].index_key_prefix)
         && reset_first.kv_prefix == bf16(&fixture().cases[0].compressed_kv_prefix)
         && reset_first.selected_indices == i32s(&fixture().cases[0].selected_indices)
+}
+
+fn assert_owner_prefixes(case: &Case, keys: &[u16], kv: &[u16]) {
+    assert_eq!(
+        keys,
+        bf16(&case.index_key_prefix),
+        "start {} owned key prefix",
+        case.start_pos
+    );
+    assert_eq!(
+        kv,
+        bf16(&case.compressed_kv_prefix),
+        "start {} owned KV prefix",
+        case.start_pos
+    );
+    assert_eq!(keys.len(), case.compressed_prefix * 64);
 }
 
 fn assert_latent_matches_source(case: &Case, latent: Option<&[u16]>) {

@@ -16,6 +16,15 @@
 //! # Ok::<(), deepseek::reduced::FinalHeadError>(())
 //! ```
 
+mod ratio_two;
+pub use ratio_two::{
+    RatioTwoCompressedOwner, RatioTwoOwnerCall, RatioTwoOwnerDiagnostic, RatioTwoOwnerError,
+    RatioTwoOwnerLayout, RatioTwoOwnerWeights,
+};
+
+mod candidates;
+pub use candidates::{CandidateProjection, CandidateProjector, CandidateProjectorError};
+
 mod input;
 pub use input::{AttentionInput, AttentionInputError, AttentionInputOutput};
 mod startup;

@@ -114,6 +114,10 @@ pub struct SelectionCall {
 }
 
 impl SelectionCall {
+    pub(crate) const fn score_shape(self) -> (usize, usize) {
+        (self.geometry.positions.get(), self.geometry.key_count.get())
+    }
+
     /// Groups the key publication identity with a validated selection geometry.
     #[must_use]
     pub const fn new(

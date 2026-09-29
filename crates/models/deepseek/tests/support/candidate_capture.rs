@@ -2,7 +2,7 @@
 //!
 //! The fixture provides residual input and already-published index keys.
 //! It qualifies those arithmetic and masking boundaries, not cache ownership or
-//! a complete candidate producer.
+//! a complete request runner.
 
 #![allow(
     dead_code,
@@ -18,14 +18,12 @@ use deepseek::{
     indexer::{
         cache::IndexKeyPublicationId,
         query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
-            IndexQueryWeights, prepare_index_query, prepare_scored_query,
+            CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights,
+            prepare_index_query,
         },
-        selection::{
-            CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates,
-            select_from_candidates,
-        },
+        selection::{CandidateSelection, SelectionCall, SelectionGeometry, select_from_candidates},
     },
+    reduced::CandidateProjector,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -518,9 +516,7 @@ fn generated_candidates_and_scores_from_fixture(
         positions * fixture.model.input_dimension,
         "native attention input shape at start {start}"
     );
-    let prepared = prepare_scored_query(
-        attention_input,
-        &call_frequencies(fixture, start, positions),
+    let projector = CandidateProjector::new(
         CandidateQueryWeights {
             wq_a: Fp8Projection {
                 codes: &wq_a_codes,
@@ -535,10 +531,19 @@ fn generated_candidates_and_scores_from_fixture(
         },
         CandidateQueryLayout::new(index_layout(&fixture.model), fixture.model.norm_epsilon)
             .expect("bounded candidate QR layout"),
-        IndexKeyView::new(native_keys, nonzero(fixture.model.index_head_dimension))
-            .expect("bounded native index-key view"),
-    )
-    .expect("bounded candidate query and score");
+        nonzero(fixture.model.index_head_dimension),
+        nonzero(fixture.model.candidate_topk_blocks),
+        nonzero(fixture.model.candidate_block_size),
+    );
+    let projection = projector
+        .project(
+            attention_input,
+            &call_frequencies(fixture, start, positions),
+            native_keys,
+            call,
+        )
+        .expect("runtime candidate projection");
+    let prepared = projection.scored();
     assert_eq!(
         prepared.query.wq_a,
         case.wq_a_output.bf16(),
@@ -587,15 +592,12 @@ fn generated_candidates_and_scores_from_fixture(
         case.operations.scores_after_head_sum.bf16(),
         "start {start} head sum scores"
     );
-    let scores = prepared.scores;
-    assert_eq!(scores.len(), positions * key_count, "score geometry");
-    let candidates = produce_candidates(
-        &scores,
-        call,
-        fixture.model.candidate_topk_blocks,
-        nonzero(fixture.model.candidate_block_size),
-    )
-    .expect("captured candidate rows");
+    assert_eq!(
+        prepared.scores.len(),
+        positions * key_count,
+        "score geometry"
+    );
+    let candidates = projection.candidates();
     assert_eq!(
         candidates.call(),
         call,
@@ -619,7 +621,8 @@ fn generated_candidates_and_scores_from_fixture(
         case.candidate_mask.bools(),
         "start {start} candidate mask"
     );
-    (candidates, scores)
+    let (prepared, candidates) = projection.into_parts();
+    (candidates, prepared.scores)
 }
 
 pub(super) fn rejects_unmasked_future_candidate() {

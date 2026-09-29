@@ -11,6 +11,16 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- L1 ratio-two compression, key preparation and paired key/KV publication now
+  execute in `RatioTwoCompressedOwner` from live inputs and borrowed weights.
+  Partial calls preserve prefixes while advancing call identity; staged failures
+  remain retryable, and reset advances the epoch. L3 `CandidateProjector`
+  computes query scores and masks from supplied input and keys, with exact
+  row-geometry checks. Both source schedules still reach their existing final
+  logit bounds. Prior-L3 score-prefix policy and complete layer-session assembly
+  remain test-owned. Six independent owner/projector tests cover partial
+  publications, late-error retry, reset epochs and score-matrix geometry.
+
 - `StartupSession` now executes the complete first block from supplied token
   IDs and immutable weights, retaining window attention state across calls.
   Both canonical and alternate startup-to-head compositions use it. Every
@@ -25,7 +35,7 @@ choices without expanding current support claims.
   tokens and weights. Hash history and cursor publish only after success.
   Fixture parsing and source comparisons remain test-owned. Complete request
   assembly, typed request weights and the synthetic token-input CLI are next.
-  All 96 composition tests and four runtime Engram tests pass, including late
+  All 98 composition tests and four runtime Engram tests pass, including late
   gate failure, reset, malformed continuation and partial WKV scale groups.
   Strict DeepSeek Clippy, doctests and documentation checks pass. The canonical
   Metal gate passes DeepSeek and stops at the unchanged Julia encoder mismatch.
