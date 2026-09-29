@@ -366,6 +366,17 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 
 ## Validation
 
+A separate [source partition probe](research/v41-forward-reference.md#partition-experiment)
+compares `5 + 1 + 1` against `4 + 1 + 1 + 1` using fresh models and identical
+synthetic parameters. Baseline head and L3 KV match their frozen oracles.
+Logits match exactly at common endpoints 5, 6 and 7; all 18 recorded final
+cache/state fields match. Intermediate compressor scratch and call-shaped
+candidate/selection state differ and remain recorded. This is source evidence;
+Rust alternate-partition qualification is still open. Seven probe comparison,
+validation and receipt tests pass. The canonical Metal gate still reaches the
+unchanged Julia failure below.
+
+
 The composed L1 path now retains unified Engram, owner, attention and tail
 operands. Its start-six owner call requires the preceding live L3 prefix before
 mutating compressor state. Changed source metadata and weights are rejected;

@@ -72,6 +72,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_v41_candidate_capture.py"], False),
         ([sys.executable, "scripts/test_v41_forward_observers.py"], False),
         ([sys.executable, "scripts/test_v41_reduced_runner_fixture.py"], False),
+        ([sys.executable, "scripts/test_v41_partition_probe.py"], False),
         (["cargo", "fmt", "--check"], False),
         (["cargo", "test", "--workspace", *feature_args], False),
         (

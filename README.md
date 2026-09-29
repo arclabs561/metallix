@@ -495,7 +495,10 @@ Layer four directly consumes committed layer-three key/KV prefixes while computi
 its own query and selection. The unified reduced-runner fixture supplies all
 L0–L4 and head numerical operands in this composition. The partial L1 call
 requires the preceding live L3 publication. Alternate prefill/decode partitions,
-checkpoint loading and production recovery remain gates before a production decoder.
+checkpoint loading and production recovery remain gates before a production
+decoder. A separate [source partition probe](docs/research/v41-forward-reference.md#partition-experiment)
+matched common-endpoint logits and final cache state for `4 + 1 + 1 + 1`, while
+retaining intermediate scratch differences; native qualification remains open.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

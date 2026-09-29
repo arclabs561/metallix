@@ -5,6 +5,44 @@ CPU numerical kernels. Synthetic weights exercise implementation mechanics;
 they do not produce a useful pretrained model. A successful capture is not
 Rust agreement, upstream GPU parity, or checkpoint support.
 
+## Partition experiment
+
+The opt-in source probe compares the same seven token IDs and initialized
+parameters under `5 + 1 + 1` and `4 + 1 + 1 + 1`. Each schedule starts with a
+fresh pinned source graph, shared runtime and model. It reuses the existing
+source loader and CPU kernels without changing the canonical manifest, runner
+or fixed native fixtures:
+
+```sh
+uv run scripts/v41_partition_probe.py --run --output artifacts/v41-partition-probe.json
+```
+
+The output path must be new. Before comparing schedules, the baseline must
+match the frozen final head bits and L3 compressed-KV publication. The probe
+records logits and cache/state identities per call, compares common token
+endpoints, and keeps numerical differences separate from execution failures.
+It downloads no checkpoint; its result is source-only evidence.
+
+The measured `4 + 1 + 1 + 1` run matched baseline logits exactly after 5, 6 and
+7 tokens (maximum absolute difference zero). All 18 recorded cache/state fields
+matched at the final endpoint. Intermediate state was not bit-identical:
+L1 compressor FP32 KV/score scratch differed at endpoints 5 and 6; the shared
+candidate/selection tensors also had different call-shaped dimensions at 5.
+Those differences remain in the receipt rather than being normalized away.
+Matching logits do not prove identical intermediate arithmetic or state.
+
+Receipt SHA-256:
+`45996efe5da9116687c7b6385f65b981490460c100e6ee64db1e87d8a1a56cf1`.
+The owner-local evidence is
+`.agents/receipts/candidate-control/partition-4-1-1-1-state-source.json`;
+the probe records its own source hash, upstream and helper identities, runtime,
+initializer/tokenizer hashes and both schedules.
+
+The Rust reduced runner still accepts only the original `0/5/6` call starts.
+Next, capture alternate intermediate boundaries under their own identity and
+qualify the native consumers against those observations. Do not relabel the
+existing fixture or relax its exact BF16/routing and analytic FP32 checks.
+
 ## Run it
 
 With the pinned source files already retained under `artifacts/`:
