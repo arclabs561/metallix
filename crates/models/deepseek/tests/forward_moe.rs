@@ -3864,3 +3864,44 @@ fn alternate_layer_one_tail_rejects_a_detached_residual_oracle() {
     let (start, residual, pre) = &upstream[0];
     layer_one.step(&(*start, residual.clone()), &(*start, pre.clone()));
 }
+
+fn alternate_layer_two_projection() -> Value {
+    let raw = include_str!("../../../../fixtures/deepseek-v41/partition-layer2-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        "8001ee63770dc17301d93936c86ddd1d8e7c6737315a2882d79dc0a2b2f42355"
+    );
+    serde_json::from_str(raw).unwrap()
+}
+
+#[test]
+fn alternate_partition_native_layer_one_and_two_reach_layer_three_stream() {
+    let one_projection = alternate_layer_one_projection();
+    let two_projection = alternate_layer_two_projection();
+    let startup = layer_zero::alternate_startup_projection();
+    let upstream = layer_zero::native_layer_zero_entries_from_projection(&startup);
+    let publications = partition_owner::alternate_partition_layer_three_publications();
+    let mut one = layer1_join::NativeLayerOneSession::from_alternate(&one_projection, &startup);
+    let mut two =
+        layer2_join::NativeLayerTwoSession::from_alternate(&two_projection, &one_projection);
+    for (index, (start, residual, pre)) in upstream.iter().enumerate() {
+        if matches!(start, 4 | 6) {
+            one.supply_previous_layer_three_prefix(&publications[index - 1].key_prefix);
+        }
+        let entry = one.step(&(*start, residual.clone()), &(*start, pre.clone()));
+        let (output_start, residual, pre) = two.step(&entry, Some(one.last_publication()));
+        assert_eq!(output_start, *start);
+        assert_eq!(pre.len(), residual.len() / 128);
+    }
+}
+
+#[test]
+#[should_panic(expected = "requires a live layer-one publication")]
+fn alternate_layer_two_cannot_fall_back_to_a_canonical_owner() {
+    let projection = alternate_layer_two_projection();
+    let input: Tensor =
+        serde_json::from_value(projection["attention"]["cases"][0]["input"].clone()).unwrap();
+    let mut attention =
+        layer2_attention_capture::NativeLayerTwoAttentionSession::from_alternate(&projection);
+    attention.step_with_publication(&(0, input.bf16()), None);
+}

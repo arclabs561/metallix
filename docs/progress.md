@@ -421,8 +421,13 @@ captured residual after Engram. All four terminal residuals match the observed
 L2 entry exactly; returned HC coefficients pass the existing source-derived
 bounds. A detached residual oracle with a recomputed digest fails the native
 HC handoff check. Eight Python projection controls also reject missing tail
-metadata and detached attention or L2 entry boundaries. L2 and the live per-call
-join to L3 remain open before full native-graph qualification. Owner cancellation/retry checks
+metadata and detached attention or L2 entry boundaries. Native L2 now consumes
+that computed residual and coefficients, requires the live L1 KV/selection
+publication, and runs HC, attention and FFN to the observed L3 Engram stream
+for all four calls. Six persisted Python controls check the L1→L2→L3 boundaries
+and provenance; a native negative control rejects a missing live L1 owner.
+The live per-call join to L3 remains open before full native-graph qualification.
+Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 

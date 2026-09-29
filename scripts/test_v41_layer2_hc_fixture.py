@@ -37,7 +37,19 @@ class T(unittest.TestCase):
             {key: value for key, value in committed.items() if key != "source"},
             {key: value for key, value in self.fixture.items() if key != "source"},
         )
-        changing = {"forward_observers_sha256", "complete_capture_sha256"}
+        current_tools = {
+            "forward_observers_sha256": "v41_forward_observers.py",
+            "runner_sha256": "v41-forward-reference.py",
+            "attention_helper_sha256": "v41_attention_capture.py",
+            "hc_helper_sha256": "v41_layer2_hc_capture.py",
+            "ffn_strict_helper_sha256": "v41_layer2_ffn_capture.py",
+        }
+        changing = {*current_tools, "complete_capture_sha256"}
+        for field, filename in current_tools.items():
+            self.assertEqual(
+                self.fixture["source"][field],
+                hashlib.sha256((S / filename).read_bytes()).hexdigest(),
+            )
         for field in changing:
             self.assertRegex(self.fixture["source"][field], r"^[0-9a-f]{64}$")
         self.assertEqual(

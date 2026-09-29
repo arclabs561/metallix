@@ -32,6 +32,7 @@ SOURCE_FIELDS = (
     "forward_observers_sha256",
 )
 LAYER = "layers.2"
+CANONICAL_SCHEDULE = ((0, 5), (5, 1), (6, 1))
 
 
 def _sha256(raw: bytes) -> str:
@@ -168,29 +169,30 @@ def _coefficients(value: object, label: str, sequence: int) -> dict[str, Any]:
     return record
 
 
-def layer2_ffn_fixture(receipt: dict[str, object]) -> dict[str, object]:
-    """Project the actual source tail from layer-two attention output to Engram3."""
-    if (
-        receipt.get("capture_status")
-        != "completed synthetic source-forward capture; no parity claim"
+def layer2_ffn_projection(
+    model: dict[str, Any],
+    encoded: dict[str, Any],
+    steps: list[object],
+    *,
+    schedule: tuple[tuple[int, int], ...] = CANONICAL_SCHEDULE,
+) -> dict[str, object]:
+    """Project exact L2 FFN-tail boundaries for one supplied call schedule.
+
+    The numerical projection deliberately carries no capture provenance.
+    Wrappers validate and attach canonical or alternate source identity.
+    """
+    if not schedule or any(
+        type(start) is not int
+        or type(sequence) is not int
+        or start < 0
+        or sequence <= 0
+        for start, sequence in schedule
     ):
-        raise RuntimeError("layer-two FFN fixture requires a completed source capture")
-    coverage = receipt.get("coverage_status")
-    source = _object(receipt.get("source"), "source")
-    runtime = _object(receipt.get("runtime"), "runtime")
-    model = _object(receipt.get("model_args"), "model args")
-    encoded = _object(receipt.get("encoded_parameters"), "encoded parameters")
-    steps = receipt.get("steps")
-    if (
-        not isinstance(coverage, dict)
-        or coverage.get("pending") != []
-        or not isinstance(steps, list)
-    ):
-        raise RuntimeError("layer-two FFN fixture requires complete source coverage")
-    if runtime.get("storage_byteorder") != "little":
-        raise RuntimeError("layer-two FFN fixture requires little-endian storage")
-    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
-        raise RuntimeError("layer-two FFN fixture has incomplete source provenance")
+        raise ValueError("layer-two FFN projection requires a valid call schedule")
+    if len(steps) != len(schedule):
+        raise RuntimeError(
+            "layer-two FFN projection call count differs from its schedule"
+        )
     if any(
         model.get(name) != value
         for name, value in {
@@ -208,12 +210,11 @@ def layer2_ffn_fixture(receipt: dict[str, object]) -> dict[str, object]:
     parameters, block_parameters = _parameters(encoded)
 
     cases: list[dict[str, object]] = []
-    for step in steps:
+    for step, (expected_start, sequence) in zip(steps, schedule, strict=True):
         source_step = _object(step, "capture step")
         start = source_step.get("start_pos")
-        sequence = 5 if start == 0 else 1
-        if start not in (0, 5, 6):
-            raise RuntimeError("layer-two FFN fixture requires the pinned trace")
+        if start != expected_start:
+            raise RuntimeError("layer-two FFN capture step differs from its schedule")
         intermediates = _object(source_step.get("intermediates"), "step intermediates")
         calls = source_step.get("hyper_connection_mixes")
         if not isinstance(calls, list):
@@ -336,18 +337,11 @@ def layer2_ffn_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "layer_three_incoming_pre": layer_three_pre,
             }
         )
-    if [case["start_pos"] for case in cases] != [0, 5, 6]:
-        raise RuntimeError(
-            "layer-two FFN fixture must retain prefill and both decode calls"
-        )
+    if [case["start_pos"] for case in cases] != [start for start, _ in schedule]:
+        raise RuntimeError("layer-two FFN cases differ from their supplied schedule")
     return {
         "schema_version": 1,
         "scope": "layer-two source FFN tail from captured post-attention residual to the layer-three Engram stream and block incoming pre-mix; not layer-two attention, layer-one shared-compression production, full-model parity, or serving",
-        "source": {
-            **{field: source[field] for field in SOURCE_FIELDS},
-            "complete_capture_sha256": _sha256(serialized_capture(receipt)),
-            "storage_byteorder": runtime["storage_byteorder"],
-        },
         "model": {
             name: model[name]
             for name in (
@@ -381,6 +375,40 @@ def layer2_ffn_fixture(receipt: dict[str, object]) -> dict[str, object]:
             "output_engram_stream": "exact storage identity",
             "next_pre_layer_three_input": "exact storage identity",
             "hc_coefficients": "source records retained for fixed source-derived envelope checks",
+        },
+    }
+
+
+def layer2_ffn_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Project the actual source tail from layer-two attention output to Engram3."""
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError("layer-two FFN fixture requires a completed source capture")
+    coverage = receipt.get("coverage_status")
+    source = _object(receipt.get("source"), "source")
+    runtime = _object(receipt.get("runtime"), "runtime")
+    model = _object(receipt.get("model_args"), "model args")
+    encoded = _object(receipt.get("encoded_parameters"), "encoded parameters")
+    steps = receipt.get("steps")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("pending") != []
+        or not isinstance(steps, list)
+    ):
+        raise RuntimeError("layer-two FFN fixture requires complete source coverage")
+    if runtime.get("storage_byteorder") != "little":
+        raise RuntimeError("layer-two FFN fixture requires little-endian storage")
+    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
+        raise RuntimeError("layer-two FFN fixture has incomplete source provenance")
+    projection = layer2_ffn_projection(model, encoded, steps)
+    return {
+        **projection,
+        "source": {
+            **{field: source[field] for field in SOURCE_FIELDS},
+            "complete_capture_sha256": _sha256(serialized_capture(receipt)),
+            "storage_byteorder": runtime["storage_byteorder"],
         },
     }
 

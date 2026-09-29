@@ -200,34 +200,28 @@ def _source(receipt: dict[str, object]) -> tuple[dict[str, object], dict[str, ob
     return source, runtime
 
 
-def attention_fixture(
-    receipt: dict[str, object], *, helper_path: Path
+def layer_two_attention_projection(
+    model: dict[str, object],
+    encoded: dict[str, object],
+    steps: list[object],
+    *,
+    schedule: tuple[tuple[int, int], ...] = ((0, 5), (5, 1), (6, 1)),
 ) -> dict[str, object]:
-    """Export exact source boundaries for the fixed layer-two attention graph with borrowed layer-one publication."""
-    if (
-        receipt.get("capture_status")
-        != "completed synthetic source-forward capture; no parity claim"
+    """Project exact L2 attention boundaries for one explicit call schedule.
+
+    This numerical projection carries no capture provenance.  The canonical
+    wrapper below owns that policy; alternate callers must attach and validate
+    their own source identity.
+    """
+    if not schedule or any(
+        type(start) is not int or type(count) is not int or start < 0 or count <= 0
+        for start, count in schedule
     ):
-        raise RuntimeError(
-            "attention fixture export requires a completed source capture"
+        raise ValueError(
+            "layer-two attention projection requires a valid call schedule"
         )
-    coverage = receipt.get("coverage_status")
-    if not isinstance(coverage, dict) or coverage.get("pending") != []:
-        raise RuntimeError(
-            "attention fixture export requires complete capture coverage"
-        )
-    source, runtime = _source(receipt)
-    encoded = receipt.get("encoded_parameters")
-    model_args = receipt.get("model_args")
-    steps = receipt.get("steps")
-    manifest_sha = receipt.get("manifest_canonical_sha256")
-    if (
-        not isinstance(encoded, dict)
-        or not isinstance(model_args, dict)
-        or not isinstance(steps, list)
-        or not isinstance(manifest_sha, str)
-    ):
-        raise TypeError("complete capture has an invalid attention-fixture shape")
+    if len(steps) != len(schedule):
+        raise RuntimeError("attention projection call count differs from its schedule")
 
     parameters = {
         name: _tensor(record, name)
@@ -259,7 +253,7 @@ def attention_fixture(
     frequencies: dict[str, object] | None = None
 
     cases: list[dict[str, object]] = []
-    for step in steps:
+    for step, (expected_start, sequence) in zip(steps, schedule, strict=True):
         if not isinstance(step, dict):
             raise TypeError("complete capture includes an invalid attention step")
         start_pos = step.get("start_pos")
@@ -268,6 +262,10 @@ def attention_fixture(
         hc_calls = step.get("hyper_connection_mixes")
         if not isinstance(start_pos, int) or not isinstance(intermediate, dict):
             raise TypeError("complete capture step lacks attention boundaries")
+        if start_pos != expected_start:
+            raise RuntimeError(
+                "attention projection call order differs from its schedule"
+            )
         if not isinstance(sparse_calls, list) or not isinstance(hc_calls, list):
             raise TypeError("complete capture step lacks sparse or HC observations")
         attention_hc = [
@@ -408,9 +406,7 @@ def attention_fixture(
                 ),
             }
         )
-    if [case["start_pos"] for case in cases] != [0, 5, 6]:
-        raise RuntimeError("attention fixture requires the pinned prefill/decode trace")
-    for case, sequence in zip(cases, (5, 1, 1), strict=True):
+    for case, (_, sequence) in zip(cases, schedule, strict=True):
         if case["input"]["shape"] != [1, sequence, 128] or case["output"]["shape"] != [
             1,
             sequence,
@@ -448,14 +444,14 @@ def attention_fixture(
         "beta_slow",
         "norm_eps",
     )
-    missing_model = [name for name in model_names if name not in model_args]
+    missing_model = [name for name in model_names if name not in model]
     if missing_model:
         raise RuntimeError(
             f"complete capture lacks attention model args: {missing_model}"
         )
     if (
-        tuple(model_args["index_source_layers"]) != (1, 3, 4)
-        or 2 in model_args["index_source_layers"]
+        tuple(model["index_source_layers"]) != (1, 3, 4)
+        or 2 in model["index_source_layers"]
     ):
         raise RuntimeError(
             "layer-two attention fixture has an unexpected Indexer schedule"
@@ -493,21 +489,7 @@ def attention_fixture(
             "and layer-one-published compressed KV; not native attention, Rust "
             "acceptance, or full-model parity"
         ),
-        "source": {
-            "revision": source.get("revision"),
-            "model_sha256": source.get("model_sha256"),
-            "engram_sha256": source.get("engram_sha256"),
-            "kernel_source_sha256": source.get("kernel_source_sha256"),
-            "cpu_backend_sha256": source.get("cpu_backend_sha256"),
-            "loader_sha256": source.get("loader_sha256"),
-            "runner_sha256": source.get("runner_sha256"),
-            "forward_observers_sha256": source.get("forward_observers_sha256"),
-            "attention_helper_sha256": _sha256_bytes(helper_path.read_bytes()),
-            "complete_capture_sha256": _sha256_bytes(_serialized_capture(receipt)),
-            "manifest_canonical_sha256": manifest_sha,
-            "storage_byteorder": runtime.get("storage_byteorder"),
-        },
-        "model": {name: model_args[name] for name in model_names},
+        "model": {name: model[name] for name in model_names},
         "frequency_scope": (
             "full layer-two source freqs_cis schedule captured from the module prehook; exact "
             "complex64 real/imaginary FP32 storage pairs, not recomputed per-case slices"
@@ -526,4 +508,59 @@ def attention_fixture(
             "output_bf16": "exact Attention.forward output after source inverse RoPE and output projections",
             "fixed_before_candidate_execution": True,
         },
+    }
+
+
+def attention_fixture(
+    receipt: dict[str, object], *, helper_path: Path
+) -> dict[str, object]:
+    """Export exact canonical source boundaries for layer-two attention."""
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError(
+            "attention fixture export requires a completed source capture"
+        )
+    coverage = receipt.get("coverage_status")
+    if not isinstance(coverage, dict) or coverage.get("pending") != []:
+        raise RuntimeError(
+            "attention fixture export requires complete capture coverage"
+        )
+    source, runtime = _source(receipt)
+    encoded = receipt.get("encoded_parameters")
+    model_args = receipt.get("model_args")
+    steps = receipt.get("steps")
+    manifest_sha = receipt.get("manifest_canonical_sha256")
+    if (
+        not isinstance(encoded, dict)
+        or not isinstance(model_args, dict)
+        or not isinstance(steps, list)
+        or not isinstance(manifest_sha, str)
+    ):
+        raise TypeError("complete capture has an invalid attention-fixture shape")
+    projection = layer_two_attention_projection(model_args, encoded, steps)
+    return {
+        "schema_version": projection["schema_version"],
+        "scope": projection["scope"],
+        "source": {
+            "revision": source.get("revision"),
+            "model_sha256": source.get("model_sha256"),
+            "engram_sha256": source.get("engram_sha256"),
+            "kernel_source_sha256": source.get("kernel_source_sha256"),
+            "cpu_backend_sha256": source.get("cpu_backend_sha256"),
+            "loader_sha256": source.get("loader_sha256"),
+            "runner_sha256": source.get("runner_sha256"),
+            "forward_observers_sha256": source.get("forward_observers_sha256"),
+            "attention_helper_sha256": _sha256_bytes(helper_path.read_bytes()),
+            "complete_capture_sha256": _sha256_bytes(_serialized_capture(receipt)),
+            "manifest_canonical_sha256": manifest_sha,
+            "storage_byteorder": runtime.get("storage_byteorder"),
+        },
+        "model": projection["model"],
+        "frequency_scope": projection["frequency_scope"],
+        "frequencies": projection["frequencies"],
+        "encoded_parameters": projection["encoded_parameters"],
+        "cases": projection["cases"],
+        "comparison_policy": projection["comparison_policy"],
     }

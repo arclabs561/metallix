@@ -520,8 +520,10 @@ Partial calls consume the correct retained native L3 snapshots, while completed
 groups publish L1’s own keys; fresh-request replay also passes. L3’s inputs in
 this isolated check remain source-fed. L1 HC/FFN now carries computed Engram
 residuals and attention outputs through to the observed L2 entry, retaining
-exact BF16 boundaries and the existing coefficient bounds. L2 and the live
-per-call join to L3 remain open before full-graph partition qualification.
+exact BF16 boundaries and the existing coefficient bounds. Native L2 now consumes
+that residual, coefficients and live L1 KV/selection publication through HC,
+attention and FFN to the observed L3 Engram stream. The live per-call join to L3
+remains open before full-graph partition qualification.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

@@ -321,6 +321,7 @@ pub(super) struct NativeLayerTwoAttentionSession {
     state: LayerAttentionState,
     owner: Option<layer1_owner_capture::NativeLayerOneOwnerSession>,
     next_case: usize,
+    next_start: usize,
 }
 
 impl NativeLayerTwoAttentionSession {
@@ -352,6 +353,21 @@ impl NativeLayerTwoAttentionSession {
         Self::from_root(projection.clone(), false)
     }
 
+    pub(super) fn from_alternate(projection: &Value) -> Self {
+        let attention = &projection["attention"];
+        for name in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(
+                attention[name], projection[name],
+                "alternate L2 attention provenance"
+            );
+        }
+        assert_eq!(
+            attention["runtime"]["storage_byteorder"].as_str(),
+            Some("little")
+        );
+        Self::from_numerical_root(attention.clone(), false)
+    }
+
     fn from_root(root: Value, legacy_owner: bool) -> Self {
         assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
         assert_eq!(
@@ -362,6 +378,10 @@ impl NativeLayerTwoAttentionSession {
             field(field(&root, "source"), "storage_byteorder").as_str(),
             Some("little")
         );
+        Self::from_numerical_root(root, legacy_owner)
+    }
+
+    fn from_numerical_root(root: Value, legacy_owner: bool) -> Self {
         Self {
             frequencies: frequencies(&root),
             weights: weights(&root),
@@ -370,6 +390,7 @@ impl NativeLayerTwoAttentionSession {
                 .then(|| layer1_owner_capture::NativeLayerOneOwnerSession::new(None)),
             root,
             next_case: 0,
+            next_start: 0,
         }
     }
 
@@ -386,8 +407,7 @@ impl NativeLayerTwoAttentionSession {
         let call_id = self.next_case;
         let start = usize_field(case, "start_pos");
         assert_eq!(
-            start,
-            [0, 5, 6][call_id],
+            start, self.next_start,
             "native layer-two attention call order"
         );
         assert_eq!(*supplied_start, start, "captured call start {call_id}");
@@ -442,6 +462,7 @@ impl NativeLayerTwoAttentionSession {
             .expect("native layer-two attention");
         assert_diagnostic(case, &diagnostic);
         self.next_case += 1;
+        self.next_start += positions;
         (start, diagnostic.final_output)
     }
 }

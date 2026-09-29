@@ -50,19 +50,29 @@ class LayerTwoFfnFixtureTest(unittest.TestCase):
             {key: value for key, value in committed.items() if key != "source"},
             {key: value for key, value in self.fixture.items() if key != "source"},
         )
+        current_tools = {
+            "forward_observers_sha256": "v41_forward_observers.py",
+            "runner_sha256": "v41-forward-reference.py",
+        }
+        changing = {*current_tools, "complete_capture_sha256"}
+        for field, filename in current_tools.items():
+            self.assertEqual(
+                self.fixture["source"][field],
+                hashlib.sha256((SCRIPTS / filename).read_bytes()).hexdigest(),
+            )
         self.assertEqual(
             {
                 key: value
                 for key, value in committed["source"].items()
-                if key not in {"forward_observers_sha256", "complete_capture_sha256"}
+                if key not in changing
             },
             {
                 key: value
                 for key, value in self.fixture["source"].items()
-                if key not in {"forward_observers_sha256", "complete_capture_sha256"}
+                if key not in changing
             },
         )
-        for key in ("forward_observers_sha256", "complete_capture_sha256"):
+        for key in changing:
             self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")
 
     def test_terminal_tail_has_both_layer_three_seams(self) -> None:

@@ -25,6 +25,7 @@ PINNED = {
     "engram_sha256": "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897",
     "kernel_source_sha256": "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455",
 }
+CANONICAL_SCHEDULE = ((0, 5), (5, 1), (6, 1))
 
 
 def _load_ffn():
@@ -85,21 +86,27 @@ def _source(receipt: dict[str, object]) -> dict[str, Any]:
     return source
 
 
-def layer2_hc_fixture(receipt: dict[str, object]) -> dict[str, object]:
-    if (
-        receipt.get("capture_status")
-        != "completed synthetic source-forward capture; no parity claim"
+def layer2_hc_projection(
+    model: dict[str, Any],
+    encoded: dict[str, Any],
+    steps: list[object],
+    *,
+    schedule: tuple[tuple[int, int], ...] = CANONICAL_SCHEDULE,
+) -> dict[str, object]:
+    """Project exact L2 HC boundaries for one supplied call schedule.
+
+    The projection deliberately carries no capture provenance. Canonical and
+    alternate wrappers attach their independently validated source identity.
+    """
+    if not schedule or any(
+        type(start) is not int
+        or type(sequence) is not int
+        or start < 0
+        or sequence <= 0
+        for start, sequence in schedule
     ):
-        raise RuntimeError("layer-two HC requires completed capture")
-    if _obj(receipt.get("runtime"), "runtime").get("storage_byteorder") != "little":
-        raise RuntimeError("layer-two HC requires little-endian source storage")
-    if _obj(receipt.get("coverage_status"), "coverage").get("pending") != []:
-        raise RuntimeError("layer-two HC requires complete coverage")
-    source = _source(receipt)
-    model = _obj(receipt.get("model_args"), "model args")
-    encoded = _obj(receipt.get("encoded_parameters"), "encoded parameters")
-    steps = receipt.get("steps")
-    if not isinstance(steps, list) or model.get("norm_eps") is None:
+        raise ValueError("layer-two HC projection requires a valid call schedule")
+    if len(steps) != len(schedule) or model.get("norm_eps") is None:
         raise TypeError("layer-two HC lacks trace or model config")
     parameters = {
         name: _tensor(encoded.get(name), name, dtype=dtype, shape=shape)
@@ -111,7 +118,7 @@ def layer2_hc_fixture(receipt: dict[str, object]) -> dict[str, object]:
         )
     }
     cases = []
-    for step, start, sequence in zip(steps, (0, 5, 6), (5, 1, 1), strict=True):
+    for step, (start, sequence) in zip(steps, schedule, strict=True):
         item = _obj(step, "step")
         if item.get("start_pos") != start:
             raise RuntimeError("layer-two HC trace order changed")
@@ -225,17 +232,11 @@ def layer2_hc_fixture(receipt: dict[str, object]) -> dict[str, object]:
         )
     if model.get("hc_mult") != 2:
         raise RuntimeError("layer-two HC model copy count changed")
+    if [case["start_pos"] for case in cases] != [start for start, _ in schedule]:
+        raise RuntimeError("layer-two HC cases differ from their supplied schedule")
     return {
         "schema_version": 1,
         "scope": "source layer-one output into layer-two attention HC bridge; not native attention or full forward parity",
-        "source": {
-            **source,
-            "hc_helper_sha256": _sha(Path(__file__).read_bytes()),
-            "ffn_strict_helper_sha256": _sha(
-                (SCRIPTS / "v41_layer2_ffn_capture.py").read_bytes()
-            ),
-            "complete_capture_sha256": _sha(_serialized(receipt)),
-        },
         "block_config": {
             "copies": 2,
             "norm_eps": model["norm_eps"],
@@ -244,4 +245,34 @@ def layer2_hc_fixture(receipt: dict[str, object]) -> dict[str, object]:
         },
         "block_parameters": parameters,
         "cases": cases,
+    }
+
+
+def layer2_hc_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError("layer-two HC requires completed capture")
+    if _obj(receipt.get("runtime"), "runtime").get("storage_byteorder") != "little":
+        raise RuntimeError("layer-two HC requires little-endian source storage")
+    if _obj(receipt.get("coverage_status"), "coverage").get("pending") != []:
+        raise RuntimeError("layer-two HC requires complete coverage")
+    source = _source(receipt)
+    model = _obj(receipt.get("model_args"), "model args")
+    encoded = _obj(receipt.get("encoded_parameters"), "encoded parameters")
+    steps = receipt.get("steps")
+    if not isinstance(steps, list):
+        raise TypeError("layer-two HC lacks trace")
+    projection = layer2_hc_projection(model, encoded, steps)
+    return {
+        **projection,
+        "source": {
+            **source,
+            "hc_helper_sha256": _sha(Path(__file__).read_bytes()),
+            "ffn_strict_helper_sha256": _sha(
+                (SCRIPTS / "v41_layer2_ffn_capture.py").read_bytes()
+            ),
+            "complete_capture_sha256": _sha(_serialized(receipt)),
+        },
     }

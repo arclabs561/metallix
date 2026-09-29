@@ -240,6 +240,7 @@ fn check_coefficients(
 fn handoffs(
     fixture: &HcFixture,
     outputs: &[(usize, Vec<u16>)],
+    supplied_entries: Option<&BlockEntries>,
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     assert!(
         (1..=fixture.cases.len()).contains(&outputs.len()),
@@ -253,7 +254,20 @@ fn handoffs(
                 .iter()
                 .find(|case| case.start_pos == *start)
                 .expect("native layer-two attention handoff source start");
-            let residual = case.residual.bf16();
+            let captured_residual = case.residual.bf16();
+            let residual = if let Some(entries) = supplied_entries {
+                let (_, residual, _) = entries
+                    .iter()
+                    .find(|(entry_start, _, _)| entry_start == start)
+                    .expect("supplied native L2 HC residual");
+                assert_eq!(
+                    residual, &captured_residual,
+                    "native L2 HC residual boundary"
+                );
+                residual.as_slice()
+            } else {
+                captured_residual.as_slice()
+            };
             assert_eq!(attention.len() * 2, residual.len());
             let mut joined = Vec::new();
             let mut pre = Vec::new();
@@ -319,7 +333,7 @@ pub(super) fn native_layer_two_entries_from_entries(
     let fixture = hc_fixture();
     let inputs = native_inputs(&fixture, Some(entries));
     let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
-    let attention = handoffs(&fixture, &outputs);
+    let attention = handoffs(&fixture, &outputs, Some(entries));
     layer2_ffn::native_layer_two_entries_from_attention(Some(&attention))
 }
 
@@ -346,6 +360,53 @@ impl NativeLayerTwoSession {
         }
     }
 
+    pub(super) fn from_alternate(projection: &Value, layer_one: &Value) -> Self {
+        for name in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(
+                projection[name], layer_one[name],
+                "alternate L2 source provenance"
+            );
+            for part in ["hc", "ffn", "attention"] {
+                assert_eq!(
+                    projection[part][name], projection[name],
+                    "alternate L2 projection provenance"
+                );
+            }
+        }
+        let fixture: HcFixture = serde_json::from_value(projection["hc"].clone()).unwrap();
+        let ffn: super::LayerTwoFixture =
+            serde_json::from_value(projection["ffn"].clone()).unwrap();
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(ffn.schema_version, 1);
+        assert_eq!(fixture.block_config.copies, 2);
+        assert_eq!(fixture.block_config.hc_sinkhorn_iters, 20);
+        assert_eq!(fixture.block_config.norm_eps.to_bits(), 1e-20_f32.to_bits());
+        assert_eq!(fixture.block_config.hc_eps.to_bits(), 1e-6_f32.to_bits());
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .map(|case| case.start_pos)
+                .collect::<Vec<_>>(),
+            [0, 4, 5, 6]
+        );
+        assert_eq!(
+            ffn.cases
+                .iter()
+                .map(|case| case.start_pos)
+                .collect::<Vec<_>>(),
+            [0, 4, 5, 6]
+        );
+        Self {
+            fixture,
+            ffn,
+            attention: layer2_attention_capture::NativeLayerTwoAttentionSession::from_alternate(
+                projection,
+            ),
+            next_case: 0,
+        }
+    }
+
     pub(super) fn step(
         &mut self,
         (start, residual, incoming): &(usize, Vec<u16>, Vec<f32>),
@@ -358,6 +419,8 @@ impl NativeLayerTwoSession {
             &case.residual.bf16(),
             "native L1 terminal residual at layer-two boundary"
         );
+        assert_eq!(incoming.len(), case.incoming_pre.fp32().len());
+        assert!(incoming.iter().all(|value| value.is_finite()));
         let norm = self.fixture.block_parameters["layers.2.attn_norm.weight"].bf16();
         let input = residual
             .chunks_exact(256)
@@ -379,7 +442,8 @@ impl NativeLayerTwoSession {
         let output = self
             .attention
             .step_with_publication(&(*start, input), live_owner);
-        let handoff = handoffs(&self.fixture, &[output]);
+        let entry = (*start, residual.clone(), incoming.clone());
+        let handoff = handoffs(&self.fixture, &[output], Some(&[entry]));
         let result = layer2_ffn::native_layer_two_entries_from_attention_with_fixture(
             &self.ffn,
             Some(&handoff),
@@ -394,7 +458,7 @@ fn native_layer_two_attention_hc_ffn_reaches_final_logits() {
     let fixture = hc_fixture();
     let inputs = native_inputs(&fixture, None);
     let outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
-    let attention = handoffs(&fixture, &outputs);
+    let attention = handoffs(&fixture, &outputs, None);
     through_final_suffix(layer2_ffn::native_layer_two_entries_from_attention(Some(
         &attention,
     )));
@@ -407,7 +471,7 @@ fn discarded_native_attention_fails_before_ffn() {
     let inputs = native_inputs(&fixture, None);
     let mut outputs = layer2_attention_capture::native_outputs_from_inputs(&inputs);
     outputs[0].1.fill(0);
-    handoffs(&fixture, &outputs);
+    handoffs(&fixture, &outputs, None);
 }
 
 proptest::proptest! {
@@ -424,6 +488,6 @@ proptest::proptest! {
                 outputs[call].1[position * 128..(position + 1) * 128].fill(0);
             }
         }
-        proptest::prop_assert!(std::panic::catch_unwind(|| handoffs(&fixture, &outputs)).is_err());
+        proptest::prop_assert!(std::panic::catch_unwind(|| handoffs(&fixture, &outputs, None)).is_err());
     }
 }
