@@ -66,7 +66,7 @@ operands verbatim, with the source receipt and capture identities. Extraction
 requires completed execution and successful observer controls. These checks
 establish source handoffs, not native alternate-partition support.
 
-### Native alternate L3 owner through post-attention block
+### Native alternate L3 through final head
 
 ```sh
 uv run scripts/v41_partition_owner_capture.py --input artifacts/v41-partition-boundaries.json --output artifacts/v41-partition-owner.json
@@ -114,9 +114,24 @@ HC projection is rejected by the numerical checks, and the existing zero-attenti
 control runs at each call. Extraction rejects detached attention/block/L4
 handoffs and overlapping or misplaced parameter keys.
 
-L3 residual inputs and incoming coefficients remain source-fed. L1 scoring,
-surrounding layers and full-graph final-head agreement remain unqualified for
-the alternate schedule.
+The additive `post_layer_three` projection retains the observed L4 attention,
+selection, HC/FFN and final head. The complete fixture is 1,289,871 bytes, with
+a 2 MiB output cap; all earlier numerical fields are unchanged. Its raw complex
+rotary table remains source data, and extraction verifies the observed L3/L4
+table identity. Fixture validation checks integrity, geometry and handoffs;
+Rust additionally pins the entire fixture digest before numerical execution.
+
+Each native L3 publication retains its actual candidate set, key/KV snapshots
+and identity. L4 computes its own scores and IDs under that candidate set,
+rejecting a stale candidate identity. Native L3 residuals and coefficients form
+L4's attention input and continue into its HC/FFN tail. The head consumes the
+computed tail. Existing terminal, normalization and head bounds govern the FP32
+handoffs and logits; no tolerance is fitted to the alternate run. Captured L4
+inputs, coefficients and logits are comparison targets. A zeroed final norm is
+rejected by the same established bounds.
+
+Earlier L3 residual and attention inputs remain source-fed. Upstream L0–L2,
+Engram and full native-graph qualification remain open for the alternate schedule.
 
 ## Run it
 

@@ -4,17 +4,28 @@
 //! The isolated layer-four test retains its captured entry as a diagnostic.
 //! It is not complete native model execution.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference};
 use deepseek::precision::fp32_linear_reference;
 use deepseek::{
+    RotaryFrequency,
+    attention::layer::{Fp8Projection, LayerAttentionState},
     ffn::FfnSublayerReference,
     hc::{
         HcCoefficients,
         mixing::{hc_post_bf16_reference, hc_pre_bf16_reference},
         projection::project_hc_coefficients,
         split_hc_coefficients,
+    },
+    indexer::{
+        query::{
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
+            IndexQueryWeights, prepare_scored_query,
+        },
+        selection::{
+            SelectionAdapterError, SelectionCall, SelectionGeometry, select_from_candidates,
+        },
     },
     rms_norm_bf16_reference,
 };
@@ -118,6 +129,122 @@ struct AlternatePostAttention {
     comparison_policy: Policy,
     block_parameters: BTreeMap<String, Tensor>,
     block_config: BlockConfig,
+}
+
+#[derive(Deserialize)]
+struct AlternatePartitionL4Fixture {
+    schema_version: u32,
+    source_receipt_sha256: String,
+    source: Source,
+    capture_identity: Value,
+    post_layer_three: AlternatePostLayerThree,
+}
+
+#[derive(Deserialize)]
+struct AlternatePostLayerThree {
+    source_receipt_sha256: String,
+    source: Source,
+    capture_identity: Value,
+    attention: AlternateAttentionFixture,
+    selection: AlternateL4SelectionFixture,
+    tail: AlternateL4Tail,
+    head: AlternateHead,
+}
+
+#[derive(Deserialize)]
+struct AlternateAttentionFixture {
+    model: attention_capture::Model,
+    frequencies: Tensor,
+    encoded_parameters: BTreeMap<String, attention_capture::Tensor>,
+    cases: Vec<attention_capture::Case>,
+}
+
+#[derive(Deserialize)]
+struct AlternateL4SelectionFixture {
+    model: AlternateL4SelectionModel,
+    weights: AlternateL4SelectionWeights,
+    cases: Vec<AlternateL4SelectionCase>,
+}
+
+#[derive(Deserialize)]
+struct AlternateL4SelectionModel {
+    query_rank: usize,
+    index_heads: usize,
+    index_topk: usize,
+}
+
+#[derive(Deserialize)]
+struct AlternateL4SelectionWeights {
+    wq_a_codes: Tensor,
+    wq_a_scales: Tensor,
+    q_norm: Tensor,
+    wq_b_codes: Tensor,
+    wq_b_scales: Tensor,
+    weights_proj: Tensor,
+}
+
+#[derive(Deserialize)]
+struct AlternateL4SelectionCase {
+    start_pos: usize,
+    offset: usize,
+    wq_a: Tensor,
+    qr: Tensor,
+    q_after_rope_fp4: Tensor,
+    weights_proj_output: Tensor,
+    scaled_weights: Tensor,
+    dot_products: Tensor,
+    rectified: Tensor,
+    weighted: Tensor,
+    scores: Tensor,
+    causal_scores: Option<Tensor>,
+    candidate_mask: Tensor,
+    scores_after_candidate_mask: Tensor,
+    indices: Tensor,
+}
+
+#[derive(Deserialize)]
+struct AlternateL4Tail {
+    model: Model,
+    encoded_parameters: BTreeMap<String, Tensor>,
+    cases: Vec<Case>,
+    comparison_policy: Policy,
+    block_parameters: BTreeMap<String, Tensor>,
+    block_config: BlockConfig,
+}
+
+#[derive(Deserialize)]
+struct AlternateHead {
+    norm_weight: Tensor,
+    head_weight: Tensor,
+    norm_epsilon: f32,
+    cases: Vec<AlternateHeadCase>,
+}
+
+#[derive(Deserialize)]
+struct AlternateHeadCase {
+    start_pos: usize,
+    norm_input: Tensor,
+    norm: Tensor,
+    logits: Tensor,
+}
+
+struct AlternateL4RunFixture {
+    attention: AlternateAttentionFixture,
+    selection: AlternateL4SelectionFixture,
+    tail: Fixture,
+    head: AlternateHead,
+}
+
+struct AlternateL4Query {
+    layout: CandidateQueryLayout,
+    query_codes: Vec<u8>,
+    query_scales: Vec<u8>,
+    query_norm: Vec<u16>,
+    index_codes: Vec<u8>,
+    index_scales: Vec<u8>,
+    weights_projection: Vec<u16>,
+    head_dimension: usize,
+    index_topk: usize,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +399,54 @@ impl Tensor {
             .collect()
     }
 
+    fn fp8(&self) -> Vec<u8> {
+        assert!(matches!(
+            self.dtype.as_str(),
+            "torch.float8_e4m3fn" | "torch.float8_e8m0fnu"
+        ));
+        let bytes = self.bytes();
+        assert_eq!(bytes.len(), self.shape.iter().product::<usize>());
+        bytes
+    }
+
+    fn i32(&self) -> Vec<i32> {
+        assert_eq!(self.dtype, "torch.int32");
+        let bytes = self.bytes();
+        assert_eq!(bytes.len(), self.shape.iter().product::<usize>() * 4);
+        bytes
+            .chunks_exact(4)
+            .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+            .collect()
+    }
+
+    fn bools(&self) -> Vec<bool> {
+        assert_eq!(self.dtype, "torch.bool");
+        self.bytes()
+            .into_iter()
+            .map(|value| match value {
+                0 => false,
+                1 => true,
+                _ => panic!("alternate source bool storage"),
+            })
+            .collect()
+    }
+
+    fn frequencies(&self) -> Vec<RotaryFrequency> {
+        assert_eq!(self.dtype, "torch.complex64");
+        let bytes = self.bytes();
+        assert_eq!(bytes.len(), self.shape.iter().product::<usize>() * 8);
+        bytes
+            .chunks_exact(8)
+            .map(|pair| {
+                RotaryFrequency::new(
+                    f32::from_le_bytes(pair[..4].try_into().unwrap()),
+                    f32::from_le_bytes(pair[4..].try_into().unwrap()),
+                )
+                .expect("finite alternate RoPE frequency")
+            })
+            .collect()
+    }
+
     fn indices(&self) -> Vec<usize> {
         assert_eq!(self.dtype, "torch.int64");
         let bytes = self.bytes();
@@ -297,7 +472,7 @@ fn fixture() -> Fixture {
 fn alternate_partition_tail_fixture() -> Fixture {
     const SOURCE_RECEIPT_SHA256: &str =
         "9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906";
-    const FIXTURE_SHA256: &str = "562df6a8b2258968ca5bfc72ae0e5375afc45f14559d5e07d3388b211302498f";
+    const FIXTURE_SHA256: &str = "3e9c27c53e1bb2240912bdb3ee68747b17287d12e9d40fb6cd9d02088f277f68";
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
@@ -358,6 +533,413 @@ fn alternate_partition_tail_fixture() -> Fixture {
     assert_encoded_parameter_schema_for(&fixture, 3);
     validate_block_tail_fixture(&fixture);
     fixture
+}
+
+impl AlternateL4Query {
+    fn new(fixture: &AlternateL4RunFixture) -> Self {
+        let model = &fixture.selection.model;
+        let attention = &fixture.attention.model;
+        let weights = &fixture.selection.weights;
+        let index_layout = IndexQueryLayout::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(attention.dim).unwrap(),
+            NonZeroUsize::new(model.query_rank).unwrap(),
+            NonZeroUsize::new(model.index_heads).unwrap(),
+            NonZeroUsize::new(attention.head_dim).unwrap(),
+            NonZeroUsize::new(attention.rope_head_dim / 2).unwrap(),
+        )
+        .unwrap();
+        Self {
+            layout: CandidateQueryLayout::new(index_layout, attention.norm_eps).unwrap(),
+            query_codes: weights.wq_a_codes.fp8(),
+            query_scales: weights.wq_a_scales.fp8(),
+            query_norm: weights.q_norm.bf16(),
+            index_codes: weights.wq_b_codes.fp8(),
+            index_scales: weights.wq_b_scales.fp8(),
+            weights_projection: weights.weights_proj.bf16(),
+            head_dimension: attention.head_dim,
+            index_topk: model.index_topk,
+        }
+    }
+    fn prepare(
+        &self,
+        input: &[u16],
+        frequencies: &[deepseek::RotaryFrequency],
+        keys: &[u16],
+    ) -> deepseek::indexer::query::ScoredQueryDiagnostic {
+        prepare_scored_query(
+            input,
+            frequencies,
+            CandidateQueryWeights {
+                wq_a: Fp8Projection {
+                    codes: &self.query_codes,
+                    scales: &self.query_scales,
+                },
+                q_norm: &self.query_norm,
+                index: IndexQueryWeights {
+                    wq_b_codes: &self.index_codes,
+                    wq_b_scales: &self.index_scales,
+                    weights_proj: &self.weights_projection,
+                },
+            },
+            self.layout,
+            IndexKeyView::new(keys, NonZeroUsize::new(self.head_dimension).unwrap()).unwrap(),
+        )
+        .expect("alternate L4 own query over committed L3 keys")
+    }
+}
+
+fn alternate_l4_input(
+    l3: &BlockTailOutput,
+    tail_case: &Case,
+    attention_case: &attention_capture::Case,
+    norm_weight: &[u16],
+    epsilon: f32,
+) -> Vec<u16> {
+    assert_eq!(
+        l3.residual,
+        tail_case.block_input.bf16(),
+        "native alternate L3 residual enters L4"
+    );
+    let source_pre = tail_case.block_incoming_pre.fp32();
+    let source_residual = tail_case.block_input.bf16();
+    for (position, envelope) in l3.terminal_envelopes.as_ref().unwrap().iter().enumerate() {
+        assert!(
+            envelope.accepts(
+                &l3.residual[position * 256..(position + 1) * 256],
+                &l3.next_pre[position * 2..(position + 1) * 2],
+                &source_residual[position * 256..(position + 1) * 256],
+                &source_pre[position * 2..(position + 1) * 2],
+            ),
+            "native L3 entry retains its established coefficient bounds"
+        );
+    }
+    let input: Vec<_> = (0..attention_case.input.shape[1])
+        .flat_map(|position| {
+            derive_attention_input(
+                &l3.residual[position * 256..(position + 1) * 256],
+                &l3.next_pre[position * 2..(position + 1) * 2],
+                norm_weight,
+                epsilon,
+            )
+        })
+        .collect();
+    assert_eq!(
+        input,
+        attention_case.input.bf16(),
+        "native alternate L3 tail feeds L4 attention input"
+    );
+    assert_eq!(
+        input,
+        tail_case.attention_input.bf16(),
+        "alternate L4 tail input"
+    );
+    input
+}
+
+fn assert_alternate_l4_query(
+    prepared: &deepseek::indexer::query::ScoredQueryDiagnostic,
+    selection_case: &AlternateL4SelectionCase,
+) {
+    assert_eq!(
+        prepared.query.wq_a,
+        selection_case.wq_a.bf16(),
+        "alternate L4 WQ-A"
+    );
+    assert_eq!(
+        prepared.query.qr,
+        selection_case.qr.bf16(),
+        "alternate L4 QR"
+    );
+    assert_eq!(
+        prepared.query.index.query_post_fp4,
+        selection_case.q_after_rope_fp4.bf16(),
+        "alternate L4 index query"
+    );
+    assert_eq!(
+        prepared.query.index.projected_head_weights,
+        selection_case.weights_proj_output.bf16(),
+        "alternate L4 index weights projection"
+    );
+    assert_eq!(
+        prepared.query.index.scaled_head_weights,
+        selection_case.scaled_weights.bf16(),
+        "alternate L4 scaled index weights"
+    );
+    assert_eq!(
+        prepared.dot_products,
+        selection_case.dot_products.bf16(),
+        "alternate L4 dots"
+    );
+    assert_eq!(
+        prepared.rectified,
+        selection_case.rectified.bf16(),
+        "alternate L4 rectified"
+    );
+    assert_eq!(
+        prepared.weighted,
+        selection_case.weighted.bf16(),
+        "alternate L4 weighted"
+    );
+    assert_eq!(
+        prepared.scores,
+        selection_case.scores.bf16(),
+        "alternate L4 scores"
+    );
+}
+
+fn alternate_l4_selected(
+    prepared: &deepseek::indexer::query::ScoredQueryDiagnostic,
+    selection_case: &AlternateL4SelectionCase,
+    call: SelectionCall,
+    publication: &partition_owner::AlternateLayerThreePublication,
+    stale: Option<&partition_owner::AlternateLayerThreePublication>,
+    index_topk: usize,
+) -> Vec<i32> {
+    let selected = select_from_candidates(
+        &prepared.scores,
+        call,
+        &publication.producer_candidates,
+        index_topk,
+    )
+    .expect("alternate L4 selection from committed L3 candidates");
+    if let Some(stale) = stale {
+        assert!(matches!(
+            select_from_candidates(
+                &prepared.scores,
+                call,
+                &stale.producer_candidates,
+                index_topk,
+            ),
+            Err(SelectionAdapterError::CandidateCallMismatch)
+        ));
+    }
+    if let Some(expected_causal) = &selection_case.causal_scores {
+        assert_eq!(
+            selected.causal_scores,
+            expected_causal.bf16(),
+            "alternate L4 causal scores"
+        );
+    }
+    assert_eq!(
+        selected.masked_scores,
+        selection_case.scores_after_candidate_mask.bf16(),
+        "alternate L4 candidate-masked scores"
+    );
+    assert_eq!(
+        selected.indices,
+        selection_case.indices.i32(),
+        "alternate L4 IDs"
+    );
+    selected.indices
+}
+
+fn alternate_l4_attention_outputs(
+    fixture: &AlternateL4RunFixture,
+    publications: &[partition_owner::AlternateLayerThreePublication],
+    l3_tail: &[BlockTailOutput],
+) -> Vec<Vec<u16>> {
+    assert_eq!(publications.len(), fixture.attention.cases.len());
+    assert_eq!(l3_tail.len(), fixture.attention.cases.len());
+    assert_eq!(fixture.selection.cases.len(), fixture.attention.cases.len());
+    assert_eq!(fixture.tail.cases.len(), fixture.attention.cases.len());
+    let query = AlternateL4Query::new(fixture);
+    let weights = attention_capture::weights_for_layer(&fixture.attention.encoded_parameters, 4);
+    let frequencies = fixture.attention.frequencies.frequencies();
+    let parameters = block_tail_parameters(&fixture.tail);
+    let mut attention_state =
+        LayerAttentionState::new(attention_capture::layout(&fixture.attention.model));
+    fixture
+        .attention
+        .cases
+        .iter()
+        .zip(&fixture.selection.cases)
+        .zip(&fixture.tail.cases)
+        .zip(publications)
+        .zip(l3_tail)
+        .map(
+            |((((attention_case, selection_case), tail_case), publication), l3)| {
+                assert_eq!(attention_case.start_pos, selection_case.start_pos);
+                assert_eq!(attention_case.start_pos, tail_case.start_pos);
+                assert_eq!(attention_case.start_pos, publication.start_pos);
+                let input = alternate_l4_input(
+                    l3,
+                    tail_case,
+                    attention_case,
+                    &parameters.attn_norm,
+                    fixture.tail.block_config.norm_eps,
+                );
+                let geometry = SelectionGeometry::new(
+                    attention_case.start_pos,
+                    NonZeroUsize::new(attention_case.input.shape[1]).unwrap(),
+                    NonZeroUsize::new(publication.key_prefix.len() / query.head_dimension).unwrap(),
+                    NonZeroUsize::new(fixture.attention.model.compress_ratios[4]).unwrap(),
+                    selection_case.offset,
+                )
+                .unwrap();
+                let call = SelectionCall::new(publication.publication, 0, geometry);
+                assert_eq!(
+                    publication.producer_candidates.call(),
+                    call,
+                    "L4 consumes the committed L3 candidate set"
+                );
+                assert_eq!(
+                    publication.producer_candidates.mask(),
+                    selection_case.candidate_mask.bools(),
+                    "L4 producer mask"
+                );
+                let call_frequencies =
+                    attention_capture::call_frequencies(&frequencies, attention_case);
+                let prepared = query.prepare(&input, call_frequencies, &publication.key_prefix);
+                assert_alternate_l4_query(&prepared, selection_case);
+                let stale = publications
+                    .iter()
+                    .find(|other| other.publication != publication.publication);
+                let indices = alternate_l4_selected(
+                    &prepared,
+                    selection_case,
+                    call,
+                    publication,
+                    stale,
+                    query.index_topk,
+                );
+                let diagnostic = attention_capture::forward_with_publication(
+                    &mut attention_state,
+                    &input,
+                    attention_case.start_pos,
+                    publication.publication.epoch(),
+                    publication.publication.call_id(),
+                    3,
+                    &publication.kv_prefix,
+                    &indices,
+                    call_frequencies,
+                    weights.borrowed(),
+                )
+                .expect("alternate committed L3 publication drives L4 attention");
+                attention_capture::assert_diagnostic(attention_case, &diagnostic);
+                diagnostic.final_output
+            },
+        )
+        .collect()
+}
+
+fn alternate_partition_l4_fixture() -> AlternateL4RunFixture {
+    const SOURCE_RECEIPT_SHA256: &str =
+        "9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906";
+    const FIXTURE_SHA256: &str = "3e9c27c53e1bb2240912bdb3ee68747b17287d12e9d40fb6cd9d02088f277f68";
+    let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        FIXTURE_SHA256
+    );
+    let alternate: AlternatePartitionL4Fixture =
+        serde_json::from_str(raw).expect("typed alternate L4 fixture");
+    assert_eq!(alternate.schema_version, 1);
+    assert_eq!(alternate.source_receipt_sha256, SOURCE_RECEIPT_SHA256);
+    assert_eq!(
+        alternate.source.revision,
+        "dba1be0a40aa45a94ad051997016db3960a90277"
+    );
+    assert_eq!(
+        alternate.source.model_sha256,
+        "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
+    );
+    assert_eq!(
+        alternate.post_layer_three.source_receipt_sha256, alternate.source_receipt_sha256,
+        "alternate L4 source receipt"
+    );
+    assert_eq!(
+        alternate.post_layer_three.source, alternate.source,
+        "alternate L4 source provenance"
+    );
+    assert_eq!(
+        alternate.post_layer_three.capture_identity, alternate.capture_identity,
+        "alternate L4 capture identity"
+    );
+    let post = alternate.post_layer_three;
+    let tail = Fixture {
+        schema_version: alternate.schema_version,
+        source: alternate.source,
+        model: post.tail.model,
+        encoded_parameters: post.tail.encoded_parameters,
+        cases: post.tail.cases,
+        comparison_policy: post.tail.comparison_policy,
+        block_parameters: post.tail.block_parameters,
+        block_config: post.tail.block_config,
+    };
+    assert_eq!(
+        tail.cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 4, 5, 6],
+        "alternate L4 tail calls"
+    );
+    assert_encoded_parameter_schema(&tail);
+    validate_block_tail_fixture(&tail);
+    AlternateL4RunFixture {
+        attention: post.attention,
+        selection: post.selection,
+        tail,
+        head: post.head,
+    }
+}
+
+fn assert_alternate_head(head: &AlternateHead, l4_tail: &[BlockTailOutput]) {
+    assert_eq!(head.norm_weight.shape, [128]);
+    assert_eq!(head.head_weight.shape[1], 128);
+    let norm_weight = head.norm_weight.bf16();
+    let head_weight = head.head_weight.fp32();
+    let vocabulary = head.head_weight.shape[0];
+    assert_eq!(head.cases.len(), l4_tail.len());
+    for (case, block) in head.cases.iter().zip(l4_tail) {
+        let positions = case.norm_input.shape[1];
+        assert_eq!(case.norm_input.shape, [1, positions, 128]);
+        assert_eq!(case.norm.shape, case.norm_input.shape);
+        assert_eq!(case.logits.shape, [1, vocabulary]);
+        assert_eq!(block.residual.len(), positions * 256);
+        assert_eq!(block.next_pre.len(), positions * 2);
+        let expected_collapsed = case.norm_input.bf16();
+        let expected_normalized = case.norm.bf16();
+        let mut last_normalized = Vec::new();
+        let mut last_bounds = Vec::new();
+        for position in 0..positions {
+            let (collapsed, normalized) = final_norm_row(
+                &block.residual[position * 256..(position + 1) * 256],
+                &block.next_pre[position * 2..(position + 1) * 2],
+                &norm_weight,
+                head.norm_epsilon,
+            );
+            let envelope = block.terminal_envelopes.as_ref().unwrap()[position]
+                .final_norm_envelope(&norm_weight, head.norm_epsilon);
+            let source_collapsed = &expected_collapsed[position * 128..(position + 1) * 128];
+            let source_normalized = &expected_normalized[position * 128..(position + 1) * 128];
+            assert!(
+                envelope.accepts(&collapsed, source_collapsed, &normalized, source_normalized),
+                "alternate final HC/norm remains inside the established source bounds"
+            );
+            assert!(
+                !envelope.accepts(&collapsed, source_collapsed, &[0; 128], source_normalized),
+                "discarded final normalization must be rejected"
+            );
+            last_bounds = envelope.head_bounds(source_normalized, &head_weight);
+            last_normalized = normalized;
+        }
+        let input: Vec<_> = last_normalized
+            .into_iter()
+            .map(|bits| f32::from_bits(u32::from(bits) << 16))
+            .collect();
+        let source_logits: Vec<_> = case.logits.fp32().into_iter().map(f32::to_bits).collect();
+        assert!(
+            agrees_with_head_oracle(
+                &final_head_logits(&input, &head_weight, vocabulary),
+                &source_logits,
+                &last_bounds,
+            ),
+            "alternate final logits at start {}",
+            case.start_pos
+        );
+    }
 }
 
 fn fixture_from(source: &str) -> Fixture {
@@ -1167,6 +1749,47 @@ fn block_tail_from_entries(
     entries: Option<&[BlockTailOutput]>,
 ) -> Vec<BlockTailOutput> {
     block_tail_from_entries_with_bundle(f, control, verify_contract, entries, None)
+}
+
+fn block_tail_from_supplied_attention(
+    f: &Fixture,
+    supplied_attention: &[Vec<u16>],
+    entries: &[BlockTailOutput],
+) -> Vec<BlockTailOutput> {
+    assert_eq!(supplied_attention.len(), f.cases.len());
+    assert_eq!(entries.len(), f.cases.len());
+    validate_block_tail_fixture(f);
+    let parameters = block_tail_parameters(f);
+    let config = &f.block_config;
+    with_model(f, false, |model| {
+        let ffn = FfnSublayerReference::new(
+            model,
+            &parameters.ffn_norm,
+            &parameters.ffn_projection,
+            &parameters.ffn_scale,
+            &parameters.ffn_base,
+            config.copies,
+            config.norm_eps,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+        )
+        .expect("alternate L4 FFN contract");
+        let context = BlockTailContext {
+            fixture: f,
+            parameters: &parameters,
+            ffn: &ffn,
+            control: BlockControl::NativeAttention,
+            verify_contract: true,
+        };
+        f.cases
+            .iter()
+            .zip(supplied_attention)
+            .zip(entries)
+            .map(|((case, attention), entry)| {
+                run_block_tail_case(&context, case, Some(attention), Some(entry))
+            })
+            .collect()
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2479,6 +3102,26 @@ fn alternate_partition_owner_attention_reaches_layer_four_through_native_layer_t
             "alternate L3 source layer-four entry envelopes"
         );
     }
+}
+
+#[test]
+fn alternate_partition_native_l3_to_l4_tail_reaches_final_logits() {
+    let l3_fixture = alternate_partition_tail_fixture();
+    let publications = partition_owner::alternate_partition_layer_three_publications();
+    let l3_attention: Vec<_> = publications
+        .iter()
+        .map(|publication| publication.attention_output.clone())
+        .collect();
+    let l3_tail = native_layer_three_block_tail_from_entries_with_attention(
+        &l3_fixture,
+        None,
+        None,
+        Some(&l3_attention),
+    );
+    let l4_fixture = alternate_partition_l4_fixture();
+    let l4_attention = alternate_l4_attention_outputs(&l4_fixture, &publications, &l3_tail);
+    let l4_tail = block_tail_from_supplied_attention(&l4_fixture.tail, &l4_attention, &l3_tail);
+    assert_alternate_head(&l4_fixture.head, &l4_tail);
 }
 
 #[test]

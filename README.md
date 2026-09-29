@@ -508,8 +508,10 @@ IDs now drive exact L3 attention agreement through window-cache, sparse and
 final attention outputs, including coordinated reset/replay. These computed outputs
 now feed native L3 HC/FFN and reach the captured L4 entry on all four calls,
 with exact BF16 residuals and expert IDs under the existing coefficient bounds.
-L3 block inputs remain source-fed; full-graph native partition qualification
-remains open.
+The retained L3 candidate set and key/KV publications now feed L4's own query,
+selection and attention. Computed L3 residuals and coefficients continue through
+L4 HC/FFN and final logits under the existing source-derived bounds. Earlier L3
+inputs remain source-fed; full-graph native partition qualification remains open.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

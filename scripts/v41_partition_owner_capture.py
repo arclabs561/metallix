@@ -26,7 +26,7 @@ from v41_partition_boundaries import project_bridges
 
 _SCHEDULE = ((0, 4), (4, 1), (5, 1), (6, 1))
 _MAX_INPUT_BYTES = 16 << 20
-_MAX_OUTPUT_BYTES = 1 << 20
+_MAX_OUTPUT_BYTES = 2 << 20
 _WIDTHS = {
     "torch.bfloat16": 2,
     "torch.float32": 4,
@@ -101,6 +101,17 @@ _BLOCK_PARAMETER_SPECS = {
     "layers.3.hc_ffn_scale": ("torch.float32", [3]),
     "layers.3.attn_norm.weight": ("torch.bfloat16", [128]),
     "layers.3.ffn_norm.weight": ("torch.bfloat16", [128]),
+}
+
+_LAYER_FOUR_BLOCK_PARAMETER_SPECS = {
+    "layers.4.hc_attn_fn": ("torch.float32", [8, 256]),
+    "layers.4.hc_attn_base": ("torch.float32", [8]),
+    "layers.4.hc_attn_scale": ("torch.float32", [3]),
+    "layers.4.hc_ffn_fn": ("torch.float32", [8, 256]),
+    "layers.4.hc_ffn_base": ("torch.float32", [8]),
+    "layers.4.hc_ffn_scale": ("torch.float32", [3]),
+    "layers.4.attn_norm.weight": ("torch.bfloat16", [128]),
+    "layers.4.ffn_norm.weight": ("torch.bfloat16", [128]),
 }
 
 
@@ -198,6 +209,15 @@ def _require_tensor(
     return record
 
 
+def _require_negative_infinity_mask(
+    value: object, label: str, shape: list[int]
+) -> Mapping[str, Any]:
+    record, _ = _tensor(value, label, negative_infinity_only=True)
+    if record["dtype"] != "torch.bfloat16" or record["shape"] != shape:
+        raise CaptureError(f"{label} must have bfloat16 shape {shape}")
+    return record
+
+
 def _same(left: object, right: object, label: str) -> None:
     left_record, left_bytes = _tensor(left, f"{label} left")
     right_record, right_bytes = _tensor(right, f"{label} right")
@@ -260,6 +280,58 @@ def _post_attention_parameters(
         _require_tensor(
             block[name], f"layer-three block parameter {name}", dtype, shape
         )
+    return parameters, block
+
+
+def _layer_four_parameters(
+    encoded: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep exactly the layer-four MoE and HC parameters consumed downstream."""
+    ffn = "layers.4.ffn"
+    routed = tuple(f"{ffn}.experts.{index}" for index in range(4))
+    experts = (*routed, f"{ffn}.shared_experts")
+    names = {
+        f"{ffn}.gate.weight",
+        f"{ffn}.gate.bias",
+        *(
+            f"{expert}.{projection}.{field}"
+            for expert in experts
+            for projection in ("w1", "w2", "w3")
+            for field in ("weight", "scale")
+        ),
+    }
+    parameters = {name: encoded.get(name) for name in names}
+    if any(value is None for value in parameters.values()):
+        raise CaptureError("source layer-four path lacks MoE parameters")
+    specs: dict[str, tuple[str, list[int]]] = {
+        f"{ffn}.gate.weight": ("torch.bfloat16", [4, 128]),
+        f"{ffn}.gate.bias": ("torch.float32", [4]),
+    }
+    for expert in routed:
+        for projection in ("w1", "w2", "w3"):
+            specs[f"{expert}.{projection}.weight"] = (
+                "torch.float4_e2m1fn_x2",
+                [128, 64],
+            )
+            specs[f"{expert}.{projection}.scale"] = ("torch.float8_e8m0fnu", [128, 4])
+    for projection in ("w1", "w2", "w3"):
+        specs[f"{ffn}.shared_experts.{projection}.weight"] = (
+            "torch.float8_e4m3fn",
+            [128, 128],
+        )
+        specs[f"{ffn}.shared_experts.{projection}.scale"] = (
+            "torch.float8_e8m0fnu",
+            [4, 4],
+        )
+    for name, (dtype, shape) in specs.items():
+        _require_tensor(
+            parameters[name], f"layer-four MoE parameter {name}", dtype, shape
+        )
+    block = {name: encoded.get(name) for name in _LAYER_FOUR_BLOCK_PARAMETER_SPECS}
+    if any(value is None for value in block.values()):
+        raise CaptureError("source layer-four path lacks HC parameters")
+    for name, (dtype, shape) in _LAYER_FOUR_BLOCK_PARAMETER_SPECS.items():
+        _require_tensor(block[name], f"layer-four block parameter {name}", dtype, shape)
     return parameters, block
 
 
@@ -430,6 +502,759 @@ def _next_layer_one_prefix(calls: list[Mapping[str, Any]], index: int) -> object
     if next_inputs.get("latent") is not None:
         return None
     return next_inputs.get("shared_index_k_prefix")
+
+
+def _post_layer_three_projection(
+    *,
+    root_source: object,
+    source_receipt_sha256: str,
+    capture_identity: object,
+    actual_model: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    attention_static: Mapping[str, Any],
+    calls: list[Mapping[str, Any]],
+    owner_cases: list[dict[str, object]],
+    layer_three_tail_cases: list[dict[str, object]],
+) -> dict[str, object]:
+    """Project L4's observed consumer path without inventing canonical provenance."""
+    selection_weight_specs = {
+        "wq_a_codes": ("layers.4.attn.wq_a.weight", "torch.float8_e4m3fn", [32, 128]),
+        "wq_a_scales": ("layers.4.attn.wq_a.scale", "torch.float8_e8m0fnu", [1, 4]),
+        "q_norm": ("layers.4.attn.q_norm.weight", "torch.bfloat16", [32]),
+        "wq_b_codes": (
+            "layers.4.attn.indexer.wq_b.weight",
+            "torch.float8_e4m3fn",
+            [128, 32],
+        ),
+        "wq_b_scales": (
+            "layers.4.attn.indexer.wq_b.scale",
+            "torch.float8_e8m0fnu",
+            [4, 1],
+        ),
+        "weights_proj": (
+            "layers.4.attn.indexer.weights_proj.weight",
+            "torch.bfloat16",
+            [2, 128],
+        ),
+    }
+    selection_weights = {
+        name: _require_tensor(
+            parameters.get(path), f"layer-four selection {name}", dtype, shape
+        )
+        for name, (path, dtype, shape) in selection_weight_specs.items()
+    }
+    attention_weights = {
+        f"layers.4.attn.{suffix}": _require_tensor(
+            parameters.get(f"layers.4.attn.{suffix}"),
+            f"layer-four attention weight {suffix}",
+            dtype,
+            shape,
+        )
+        for suffix, (dtype, shape) in _ATTENTION_PARAMETERS.items()
+    }
+    encoded_parameters, block_parameters = _layer_four_parameters(parameters)
+    block_config = {
+        "copies": actual_model.get("hc_mult"),
+        "hc_sinkhorn_iters": actual_model.get("hc_sinkhorn_iters"),
+        "hc_eps": actual_model.get("hc_eps"),
+        "norm_eps": actual_model.get("norm_eps"),
+    }
+    if (
+        block_config
+        != {"copies": 2, "hc_sinkhorn_iters": 20, "hc_eps": 1.0e-6, "norm_eps": 1.0e-20}
+        or type(block_config["copies"]) is not int
+        or type(block_config["hc_sinkhorn_iters"]) is not int
+        or type(block_config["hc_eps"]) is not float
+        or type(block_config["norm_eps"]) is not float
+    ):
+        raise CaptureError("source layer-four HC configuration differs")
+    static = _object(actual_model, "layer-four source model")
+    selection_model = {
+        "query_rank": static.get("q_lora_rank"),
+        "index_heads": static.get("index_n_heads"),
+        "candidate_block_size": static.get("candidate_block_size"),
+        "candidate_topk_blocks": static.get("candidate_topk_blocks"),
+        "index_topk": static.get("index_topk"),
+    }
+    if selection_model != {
+        "query_rank": 32,
+        "index_heads": 2,
+        "candidate_block_size": 1,
+        "candidate_topk_blocks": 2,
+        "index_topk": 1,
+    } or any(type(value) is not int for value in selection_model.values()):
+        raise CaptureError("source layer-four selection geometry differs")
+    attention_cases: list[dict[str, object]] = []
+    selection_cases: list[dict[str, object]] = []
+    tail_cases: list[dict[str, object]] = []
+    head_cases: list[dict[str, object]] = []
+    expected_frequency: Mapping[str, Any] | None = None
+    for call, owner_case, prior_tail, (start_pos, token_count) in zip(
+        calls, owner_cases, layer_three_tail_cases, _SCHEDULE, strict=True
+    ):
+        intermediates = _object(
+            call.get("intermediates"), f"call {start_pos} intermediates"
+        )
+        observation = _object(
+            intermediates.get("layers.4.attn.indexer_observation"),
+            f"call {start_pos} layer-four indexer observation",
+        )
+        inputs = _object(
+            observation.get("inputs"), f"call {start_pos} layer-four indexer inputs"
+        )
+        operations = _object(
+            observation.get("operations"),
+            f"call {start_pos} layer-four indexer operations",
+        )
+        if inputs.get("start_pos") != start_pos or inputs.get("offset") != (
+            4 if start_pos == 0 else 6
+        ):
+            raise CaptureError(
+                f"call {start_pos} layer-four selection geometry differs"
+            )
+        frequency = _require_tensor(
+            inputs.get("frequency_table"),
+            f"call {start_pos} layer-four frequency table",
+            "torch.complex64",
+            [8, 16],
+        )
+        if expected_frequency is None:
+            expected_frequency = frequency
+        else:
+            _same(expected_frequency, frequency, "layer-four selection frequency table")
+        owner = _object(owner_case, f"call {start_pos} layer-three owner")
+        owner_selection = _object(
+            owner.get("selection"), f"call {start_pos} layer-three selection"
+        )
+        key_prefix = _require_tensor(
+            inputs.get("shared_index_k_prefix"),
+            f"call {start_pos} layer-four shared keys",
+            "torch.bfloat16",
+            [1, start_pos + token_count, 64],
+        )
+        candidate_mask = _require_tensor(
+            inputs.get("candidate_mask"),
+            f"call {start_pos} layer-four candidate mask",
+            "torch.bool",
+            [1, token_count, start_pos + token_count],
+        )
+        _same(
+            key_prefix,
+            owner.get("index_key_prefix"),
+            f"call {start_pos} L3-to-L4 key prefix",
+        )
+        _same(
+            candidate_mask,
+            owner_selection.get("candidate_mask"),
+            f"call {start_pos} L3 candidate set to L4",
+        )
+        score_shape = [1, token_count, 2, start_pos + token_count]
+        reduced_shape = [1, token_count, start_pos + token_count]
+        selection: dict[str, object] = {
+            "start_pos": start_pos,
+            "offset": inputs.get("offset"),
+            "wq_a": _require_tensor(
+                intermediates.get("layers.4.attn.wq_a"),
+                f"call {start_pos} layer-four WQ-A",
+                "torch.bfloat16",
+                [1, token_count, 32],
+            ),
+            "qr": _require_tensor(
+                inputs.get("qr"),
+                f"call {start_pos} layer-four QR",
+                "torch.bfloat16",
+                [1, token_count, 32],
+            ),
+            "q_after_rope_fp4": _require_tensor(
+                operations.get("q_after_rope_fp4"),
+                f"call {start_pos} layer-four rotary query",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            "weights_proj_output": _require_tensor(
+                operations.get("weights_proj_output"),
+                f"call {start_pos} layer-four head weights",
+                "torch.bfloat16",
+                [1, token_count, 2],
+            ),
+            "scaled_weights": _require_tensor(
+                operations.get("scaled_weights"),
+                f"call {start_pos} layer-four scaled head weights",
+                "torch.bfloat16",
+                [1, token_count, 2],
+            ),
+            "dot_products": _require_tensor(
+                operations.get("scores_einsum"),
+                f"call {start_pos} layer-four dot products",
+                "torch.bfloat16",
+                score_shape,
+            ),
+            "rectified": _require_tensor(
+                operations.get("scores_after_relu"),
+                f"call {start_pos} layer-four rectified scores",
+                "torch.bfloat16",
+                score_shape,
+            ),
+            "weighted": _require_tensor(
+                operations.get("scores_weighted_per_head"),
+                f"call {start_pos} layer-four weighted scores",
+                "torch.bfloat16",
+                score_shape,
+            ),
+            "scores": _require_tensor(
+                operations.get("scores_after_head_sum"),
+                f"call {start_pos} layer-four scores",
+                "torch.bfloat16",
+                reduced_shape,
+            ),
+            "scores_after_candidate_mask": _require_negative_infinity_mask(
+                operations.get("scores_after_candidate_mask"),
+                f"call {start_pos} layer-four masked scores",
+                reduced_shape,
+            ),
+            "candidate_mask": candidate_mask,
+            "indices": _require_tensor(
+                observation.get("output_indices"),
+                f"call {start_pos} layer-four selected IDs",
+                "torch.int32",
+                [1, token_count, 1],
+            ),
+        }
+        causal = operations.get("scores_after_causal_mask")
+        if start_pos == 0:
+            selection["causal_scores"] = _require_negative_infinity_mask(
+                causal, f"call {start_pos} layer-four causal scores", reduced_shape
+            )
+        elif causal is not None:
+            raise CaptureError(
+                f"call {start_pos} must not retain layer-four causal scores"
+            )
+        else:
+            selection["causal_scores"] = None
+        compressed = _object(
+            intermediates.get("layers.4.attn.compressed"),
+            f"call {start_pos} layer-four compressed",
+        )
+        window = _object(
+            intermediates.get("layers.4.attn.window"),
+            f"call {start_pos} layer-four window",
+        )
+        sparse_calls = call.get("sparse_attention_calls")
+        if not isinstance(sparse_calls, list):
+            raise CaptureError(f"call {start_pos} lacks layer-four sparse attention")
+        sparse = [
+            item
+            for item in sparse_calls
+            if isinstance(item, Mapping) and item.get("layer_id") == 4
+        ]
+        if len(sparse) != 1:
+            raise CaptureError(
+                f"call {start_pos} must retain one layer-four sparse call"
+            )
+        sparse_inputs = _object(
+            sparse[0].get("inputs"), f"call {start_pos} layer-four sparse inputs"
+        )
+        window_positions = token_count if start_pos == 0 else 6
+        attention = {
+            "start_pos": start_pos,
+            "input": _require_tensor(
+                intermediates.get("layers.4.attention_input"),
+                f"call {start_pos} layer-four attention input",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "wq_a_output": selection["wq_a"],
+            "q_norm_output": selection["qr"],
+            "wq_b_pre_rope": _require_tensor(
+                intermediates.get("layers.4.attn.wq_b"),
+                f"call {start_pos} layer-four WQ-B",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "q_after_rope": _require_tensor(
+                sparse_inputs.get("q_after_rope"),
+                f"call {start_pos} layer-four sparse query",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            "prepared_window_kv": _require_tensor(
+                window.get("prepared_window_kv"),
+                f"call {start_pos} layer-four prepared window KV",
+                "torch.bfloat16",
+                [1, token_count, 64],
+            ),
+            "window_kv": _require_tensor(
+                window.get("window_kv"),
+                f"call {start_pos} layer-four window KV",
+                "torch.bfloat16",
+                [1, window_positions, 64],
+            ),
+            "window_indices": _require_tensor(
+                window.get("indices"),
+                f"call {start_pos} layer-four window indices",
+                "torch.int32",
+                [1, token_count, window_positions],
+            ),
+            "window_ring_after": _require_tensor(
+                window.get("ring_after"),
+                f"call {start_pos} layer-four window ring",
+                "torch.bfloat16",
+                [1, 6, 64],
+            ),
+            "compressed_kv": _require_tensor(
+                compressed.get("borrowed_kv"),
+                f"call {start_pos} layer-four borrowed KV",
+                "torch.bfloat16",
+                [1, start_pos + token_count, 64],
+            ),
+            "compressed_indices": _require_tensor(
+                compressed.get("indices"),
+                f"call {start_pos} layer-four compressed indices",
+                "torch.int32",
+                [1, token_count, 1],
+            ),
+            "sparse_output_pre_inverse_rope": _require_tensor(
+                sparse[0].get("output_pre_inverse_rope"),
+                f"call {start_pos} layer-four sparse output",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            "wo_b_input": _require_tensor(
+                intermediates.get("layers.4.attn.wo_b_input"),
+                f"call {start_pos} layer-four WO-B input",
+                "torch.bfloat16",
+                [1, token_count, 64],
+            ),
+            "output": _require_tensor(
+                intermediates.get("layers.4.attn"),
+                f"call {start_pos} layer-four attention output",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+        }
+        _same(
+            attention["input"],
+            intermediates.get("layers.4.attention_input"),
+            f"call {start_pos} L4 attention input",
+        )
+        _same(
+            attention["q_norm_output"],
+            selection["qr"],
+            f"call {start_pos} L4 attention query",
+        )
+        _same(
+            attention["compressed_kv"],
+            owner.get("compressed_kv_prefix"),
+            f"call {start_pos} L3-to-L4 KV prefix",
+        )
+        _same(
+            attention["compressed_indices"],
+            selection["indices"],
+            f"call {start_pos} L4 selected IDs to attention",
+        )
+        hc_calls = call.get("hyper_connection_mixes")
+        if not isinstance(hc_calls, list):
+            raise CaptureError(f"call {start_pos} lacks layer-four HC observations")
+        layer_hc = {
+            item.get("sublayer"): item
+            for item in hc_calls
+            if isinstance(item, Mapping) and item.get("layer_id") == 4
+        }
+        if set(layer_hc) != {"attention", "ffn"}:
+            raise CaptureError(f"call {start_pos} lacks layer-four HC sublayers")
+        attention_hc = _object(
+            layer_hc["attention"], f"call {start_pos} layer-four attention HC"
+        )
+        ffn_hc = _object(layer_hc["ffn"], f"call {start_pos} layer-four FFN HC")
+        terminal = intermediates.get("layers.4")
+        gate = intermediates.get("layers.4.ffn.gate")
+        block_input = _object(
+            intermediates.get("layers.4.block_input"),
+            f"call {start_pos} layer-four block input",
+        )
+        if (
+            not isinstance(terminal, list)
+            or len(terminal) != 2
+            or not isinstance(gate, list)
+            or len(gate) != 2
+        ):
+            raise CaptureError(f"call {start_pos} lacks layer-four terminal boundaries")
+        tail = {
+            "start_pos": start_pos,
+            "input": _require_tensor(
+                intermediates.get("layers.4.ffn_input"),
+                f"call {start_pos} layer-four MoE input",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "gate_weights": _require_tensor(
+                gate[0],
+                f"call {start_pos} layer-four gate weights",
+                "torch.float32",
+                [token_count, 2],
+            ),
+            "gate_indices": _require_tensor(
+                gate[1],
+                f"call {start_pos} layer-four gate indices",
+                "torch.int64",
+                [token_count, 2],
+            ),
+            "output": _require_tensor(
+                intermediates.get("layers.4.ffn"),
+                f"call {start_pos} layer-four MoE output",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "block_input": _require_tensor(
+                block_input.get("residual"),
+                f"call {start_pos} layer-four residual entry",
+                "torch.bfloat16",
+                [1, token_count, 2, 128],
+            ),
+            "block_incoming_pre": _require_tensor(
+                block_input.get("incoming_pre"),
+                f"call {start_pos} layer-four incoming pre",
+                "torch.float32",
+                [1, token_count, 2],
+            ),
+            "attention_input": attention["input"],
+            "attention_output": attention["output"],
+            "after_attention_residual": _require_tensor(
+                intermediates.get("layers.4.after_attention_residual"),
+                f"call {start_pos} layer-four post-attention residual",
+                "torch.bfloat16",
+                [1, token_count, 2, 128],
+            ),
+            "attention_hc_mixes": _require_tensor(
+                _object(
+                    attention_hc.get("inputs"),
+                    f"call {start_pos} layer-four attention HC inputs",
+                ).get("mixes"),
+                f"call {start_pos} layer-four attention HC mixes",
+                "torch.float32",
+                [1, token_count, 8],
+            ),
+            "attention_coefficients": _coefficients(
+                attention_hc.get("outputs"),
+                f"call {start_pos} layer-four attention HC",
+                token_count,
+            ),
+            "ffn_collapsed": _require_tensor(
+                intermediates.get("layers.4.ffn_collapsed"),
+                f"call {start_pos} layer-four collapsed FFN input",
+                "torch.bfloat16",
+                [1, token_count, 128],
+            ),
+            "ffn_hc_mixes": _require_tensor(
+                _object(
+                    ffn_hc.get("inputs"), f"call {start_pos} layer-four FFN HC inputs"
+                ).get("mixes"),
+                f"call {start_pos} layer-four FFN HC mixes",
+                "torch.float32",
+                [1, token_count, 8],
+            ),
+            "ffn_coefficients": _coefficients(
+                ffn_hc.get("outputs"),
+                f"call {start_pos} layer-four FFN HC",
+                token_count,
+            ),
+            "block_output": _require_tensor(
+                terminal[0],
+                f"call {start_pos} layer-four terminal residual",
+                "torch.bfloat16",
+                [1, token_count, 2, 128],
+            ),
+            "block_next_pre": _require_tensor(
+                terminal[1],
+                f"call {start_pos} layer-four terminal pre",
+                "torch.float32",
+                [1, token_count, 2],
+            ),
+        }
+        _same(
+            tail["block_input"],
+            prior_tail["next_block_entry"]["residual"],
+            f"call {start_pos} L3-to-L4 residual",
+        )
+        _same(
+            tail["block_incoming_pre"],
+            prior_tail["next_block_entry"]["incoming_pre"],
+            f"call {start_pos} L3-to-L4 pre",
+        )
+        _same(
+            tail["attention_input"],
+            attention["input"],
+            f"call {start_pos} L4 attention-to-tail input",
+        )
+        _same(
+            tail["attention_output"],
+            attention["output"],
+            f"call {start_pos} L4 attention-to-tail output",
+        )
+        norm_input = _require_tensor(
+            intermediates.get("norm_input"),
+            f"call {start_pos} final norm input",
+            "torch.bfloat16",
+            [1, token_count, 128],
+        )
+        head_cases.append(
+            {
+                "start_pos": start_pos,
+                "norm_input": norm_input,
+                "norm": _require_tensor(
+                    intermediates.get("norm"),
+                    f"call {start_pos} final norm output",
+                    "torch.bfloat16",
+                    [1, token_count, 128],
+                ),
+                "logits": _require_tensor(
+                    intermediates.get("head"),
+                    f"call {start_pos} head logits",
+                    "torch.float32",
+                    [1, 8],
+                ),
+            }
+        )
+        attention_cases.append(attention)
+        selection_cases.append(selection)
+        tail_cases.append(tail)
+    if expected_frequency is None:
+        raise CaptureError("source layer-four frequency table is absent")
+    _same(
+        expected_frequency,
+        attention_static.get("layer_4_freqs_cis"),
+        "layer-four attention and indexer frequency table",
+    )
+    return {
+        "source": root_source,
+        "source_receipt_sha256": source_receipt_sha256,
+        "capture_identity": capture_identity,
+        "attention": {
+            "schema_version": 1,
+            "source": root_source,
+            "model": actual_model,
+            "frequencies": expected_frequency,
+            "encoded_parameters": attention_weights,
+            "cases": attention_cases,
+            "comparison_policy": {
+                "fixed_before_candidate_execution": True,
+                "output_bf16": "exact storage bits",
+                "compressed_kv_and_indices": "live layer-three publication and layer-four computed IDs",
+            },
+        },
+        "selection": {
+            "model": selection_model,
+            "weights": selection_weights,
+            "cases": selection_cases,
+        },
+        "tail": {
+            "model": {name: actual_model[name] for name in _POST_ATTENTION_MODEL},
+            "block_config": block_config,
+            "encoded_parameters": encoded_parameters,
+            "block_parameters": block_parameters,
+            "cases": tail_cases,
+            "comparison_policy": {
+                "output_bf16": "exact storage bits",
+                "route_weight_abs_error_max": 9.5367431640625e-07,
+                "fixed_before_candidate_execution": True,
+                "block_next_pre_abs_error_max": 9.5367431640625e-07,
+            },
+        },
+        "head": {
+            "norm_weight": _require_tensor(
+                parameters.get("norm.weight"),
+                "final norm weight",
+                "torch.bfloat16",
+                [128],
+            ),
+            "head_weight": _require_tensor(
+                parameters.get("head.weight"), "head weight", "torch.float32", [8, 128]
+            ),
+            "norm_epsilon": actual_model.get("norm_eps"),
+            "cases": head_cases,
+        },
+    }
+
+
+def _same_metadata(actual: object, expected: object, label: str) -> None:
+    # JSON encodings distinguish booleans, integers and floating-point scalars.
+    if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(
+        expected, sort_keys=True, allow_nan=False
+    ):
+        raise CaptureError(f"{label} differs from the source contract")
+
+
+def _tensor_geometry_like(
+    actual: object, expected: Mapping[str, Any], label: str
+) -> None:
+    _require_tensor(actual, label, expected["dtype"], expected["shape"])
+
+
+def _validate_suffix_case(
+    owner: Mapping[str, Any],
+    prior_tail: Mapping[str, Any],
+    attention: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    tail: Mapping[str, Any],
+    head: Mapping[str, Any],
+) -> None:
+    start = owner["start_pos"]
+    positions = owner["token_count"]
+    for name, case in (
+        ("attention", attention),
+        ("selection", selection),
+        ("tail", tail),
+        ("head", head),
+    ):
+        _same_metadata(case.get("start_pos"), start, f"L4 {name} call position")
+    _same_metadata(
+        selection.get("offset"), owner["selection"]["offset"], "L4 selection offset"
+    )
+    for name, expected in owner["attention"].items():
+        if name != "start_pos":
+            _tensor_geometry_like(attention.get(name), expected, f"L4 attention {name}")
+    for name, expected in owner["selection"].items():
+        if name in ("offset", "causal_scores"):
+            continue
+        _tensor_geometry_like(selection.get(name), expected, f"L4 selection {name}")
+    shape = [1, positions, start + positions]
+    if start == 0:
+        _require_negative_infinity_mask(
+            selection.get("causal_scores"), "L4 causal scores", shape
+        )
+    elif selection.get("causal_scores") is not None:
+        raise CaptureError("L4 decode cannot contain causal scores")
+    _require_negative_infinity_mask(
+        selection.get("scores_after_candidate_mask"), "L4 masked scores", shape
+    )
+    for name, expected in prior_tail.items():
+        if name in ("start_pos", "next_block_entry"):
+            continue
+        if name in ("attention_coefficients", "ffn_coefficients"):
+            _coefficients(tail.get(name), f"L4 {name}", positions)
+        else:
+            _tensor_geometry_like(tail.get(name), expected, f"L4 tail {name}")
+    for name in ("norm_input", "norm"):
+        _require_tensor(
+            head.get(name), f"head {name}", "torch.bfloat16", [1, positions, 128]
+        )
+    _require_tensor(head.get("logits"), "head logits", "torch.float32", [1, 8])
+    for actual, expected, label in (
+        (
+            selection.get("candidate_mask"),
+            owner["selection"]["candidate_mask"],
+            "L3-to-L4 candidates",
+        ),
+        (attention.get("compressed_kv"), owner["compressed_kv_prefix"], "L3-to-L4 KV"),
+        (
+            attention.get("compressed_indices"),
+            selection.get("indices"),
+            "L4 selected IDs",
+        ),
+        (attention.get("wq_a_output"), selection.get("wq_a"), "L4 WQ-A boundary"),
+        (attention.get("q_norm_output"), selection.get("qr"), "L4 QR boundary"),
+        (tail.get("block_input"), prior_tail["block_output"], "L3-to-L4 residual"),
+        (tail.get("block_incoming_pre"), prior_tail["block_next_pre"], "L3-to-L4 pre"),
+        (tail.get("attention_input"), attention.get("input"), "L4 attention input"),
+        (tail.get("attention_output"), attention.get("output"), "L4 attention output"),
+    ):
+        _same(actual, expected, label)
+
+
+def _validate_post_layer_three(root: Mapping[str, Any]) -> None:
+    suffix = _object(root.get("post_layer_three"), "post-layer-three projection")
+    for name in ("source", "source_receipt_sha256", "capture_identity"):
+        _same_metadata(suffix.get(name), root[name], f"suffix {name}")
+    attention = _object(suffix.get("attention"), "L4 attention")
+    selection = _object(suffix.get("selection"), "L4 selection")
+    tail = _object(suffix.get("tail"), "L4 tail")
+    head = _object(suffix.get("head"), "head")
+    _same_metadata(attention.get("schema_version"), 1, "L4 attention schema")
+    _same_metadata(attention.get("source"), root["source"], "L4 attention source")
+    _same_metadata(
+        attention.get("model"), root["attention_model"], "L4 attention model"
+    )
+    _same_metadata(
+        attention.get("comparison_policy"),
+        {
+            "fixed_before_candidate_execution": True,
+            "output_bf16": "exact storage bits",
+            "compressed_kv_and_indices": "live layer-three publication and layer-four computed IDs",
+        },
+        "L4 attention policy",
+    )
+    _same(
+        attention.get("frequencies"),
+        root["frequencies"],
+        "observed L3 and L4 rotary tables",
+    )
+    _same_metadata(
+        selection.get("model"), root["selection_model"], "L4 selection model"
+    )
+    weights = _object(selection.get("weights"), "L4 selection weights")
+    if set(weights) != set(root["selection_weights"]):
+        raise CaptureError("L4 selection weight keys differ")
+    for name, expected in root["selection_weights"].items():
+        _tensor_geometry_like(weights[name], expected, f"L4 selection weight {name}")
+    attention_weights = _object(
+        attention.get("encoded_parameters"), "L4 attention weights"
+    )
+    expected_weights = {
+        name.replace("layers.3.", "layers.4."): value
+        for name, value in root["attention_weights"].items()
+    }
+    if set(attention_weights) != set(expected_weights):
+        raise CaptureError("L4 attention weight keys differ")
+    for name, expected in expected_weights.items():
+        _tensor_geometry_like(attention_weights[name], expected, name)
+    for query_name, attention_name in (
+        ("wq_a_codes", "wq_a.weight"),
+        ("wq_a_scales", "wq_a.scale"),
+        ("q_norm", "q_norm.weight"),
+    ):
+        _same(
+            weights[query_name],
+            attention_weights[f"layers.4.attn.{attention_name}"],
+            "L4 query weights",
+        )
+    for name in ("model", "block_config", "comparison_policy"):
+        _same_metadata(tail.get(name), root["post_attention"][name], f"L4 tail {name}")
+    encoded = _object(tail.get("encoded_parameters"), "L4 MoE parameters")
+    block = _object(tail.get("block_parameters"), "L4 block parameters")
+    if set(encoded) & set(block) or set(block) != set(
+        _LAYER_FOUR_BLOCK_PARAMETER_SPECS
+    ):
+        raise CaptureError("L4 parameter maps overlap or misplace block keys")
+    expected_encoded, _ = _layer_four_parameters({**encoded, **block})
+    if set(encoded) != set(expected_encoded):
+        raise CaptureError("L4 MoE parameter keys differ")
+    _require_tensor(
+        head.get("norm_weight"), "head norm weight", "torch.bfloat16", [128]
+    )
+    _require_tensor(head.get("head_weight"), "head weight", "torch.float32", [8, 128])
+    _same_metadata(
+        head.get("norm_epsilon"), root["model"]["norm_epsilon"], "head epsilon"
+    )
+    for name, section in (
+        ("attention", attention),
+        ("selection", selection),
+        ("tail", tail),
+        ("head", head),
+    ):
+        if not isinstance(section.get("cases"), list) or len(section["cases"]) != len(
+            _SCHEDULE
+        ):
+            raise CaptureError(f"L4 {name} must retain four calls")
+    for records in zip(
+        root["cases"],
+        root["post_attention"]["cases"],
+        attention["cases"],
+        selection["cases"],
+        tail["cases"],
+        head["cases"],
+        strict=True,
+    ):
+        _validate_suffix_case(*(_object(record, "L4 call") for record in records))
 
 
 def _validate_raw_source(raw: bytes) -> Mapping[str, Any]:
@@ -1098,6 +1923,17 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         attention_static.get("layer_3_freqs_cis"),
         "layer-three attention and indexer frequency table",
     )
+    post_layer_three = _post_layer_three_projection(
+        root_source=root.get("source"),
+        source_receipt_sha256=source_sha256,
+        capture_identity=capture.get("capture_identity"),
+        actual_model=actual_model,
+        parameters=parameters,
+        attention_static=attention_static,
+        calls=calls,
+        owner_cases=cases,
+        layer_three_tail_cases=post_attention_cases,
+    )
 
     fixture: dict[str, object] = {
         "schema_version": 1,
@@ -1127,6 +1963,7 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
                 "block_next_pre_abs_error_max": 9.5367431640625e-07,
             },
         },
+        "post_layer_three": post_layer_three,
         "frequencies": expected_frequency,
         "cases": cases,
     }
@@ -1405,6 +2242,7 @@ def validate_fixture(fixture: object) -> None:
             )
 
     _validate_post_attention(root, cases)
+    _validate_post_layer_three(root)
 
 
 def _read_input(path: Path) -> bytes:

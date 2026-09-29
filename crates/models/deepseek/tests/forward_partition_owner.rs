@@ -24,7 +24,10 @@ use deepseek::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
             IndexQueryWeights, ScoredQueryDiagnostic, prepare_scored_query,
         },
-        selection::{SelectionCall, SelectionGeometry, produce_candidates, select_from_candidates},
+        selection::{
+            CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates,
+            select_from_candidates,
+        },
     },
 };
 use serde::Deserialize;
@@ -109,6 +112,19 @@ struct Selection {
     causal_scores: Option<Tensor>,
     candidate_mask: Tensor,
     indices: Tensor,
+}
+
+/// A committed producer boundary retained for the alternate L4 consumer.
+/// The consumer scores this key prefix with its own query and selects its own
+/// IDs from the retained producer candidates.
+pub(crate) struct AlternateLayerThreePublication {
+    pub(crate) start_pos: usize,
+    pub(crate) publication: IndexKeyPublicationId,
+    pub(crate) input: Vec<u16>,
+    pub(crate) key_prefix: Vec<u16>,
+    pub(crate) kv_prefix: Vec<u16>,
+    pub(crate) producer_candidates: CandidateSelection,
+    pub(crate) attention_output: Vec<u16>,
 }
 
 #[derive(Deserialize)]
@@ -240,7 +256,7 @@ fn fixture() -> Fixture {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
-        "562df6a8b2258968ca5bfc72ae0e5375afc45f14559d5e07d3388b211302498f"
+        "3e9c27c53e1bb2240912bdb3ee68747b17287d12e9d40fb6cd9d02088f277f68"
     );
     let fixture: Fixture = serde_json::from_str(raw).expect("partition owner fixture JSON");
     assert_eq!(fixture.schema_version, 1);
@@ -409,7 +425,7 @@ fn assert_pending_selection(
     pending: &PendingRatioOneCompressedOwner<'_>,
     fixture: &Fixture,
     index: usize,
-) -> Vec<i32> {
+) -> (Vec<i32>, CandidateSelection) {
     let case = &fixture.cases[index];
     let selection = &case.selection;
     let keys = pending.key_prefix(0).expect("staged native key prefix");
@@ -509,10 +525,14 @@ fn assert_pending_selection(
         .is_err(),
         "candidate selection rejects a changed publication identity"
     );
-    selected.indices
+    (selected.indices, candidates)
 }
 
-fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: usize) -> Vec<i32> {
+fn commit_case(
+    owner: &mut RatioOneCompressedOwner,
+    fixture: &Fixture,
+    index: usize,
+) -> (Vec<i32>, CandidateSelection) {
     let case = &fixture.cases[index];
     let frequencies = fixture.frequencies.frequencies();
     let wkv = fixture.weights.wkv.bf16();
@@ -531,7 +551,8 @@ fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: us
             RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &key_norm)),
         ))
         .expect("source-shaped owner preparation");
-    let selected_indices = assert_pending_selection(&pending, fixture, index);
+    let (selected_indices, producer_candidates) =
+        assert_pending_selection(&pending, fixture, index);
     let diagnostic = pending.commit().expect("source-shaped owner commit");
     assert_eq!(
         diagnostic.owner.projected,
@@ -561,7 +582,7 @@ fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: us
             "native committed L3 keys feed the next L1 partial score prefix"
         );
     }
-    selected_indices
+    (selected_indices, producer_candidates)
 }
 
 fn state(owner: &RatioOneCompressedOwner) -> (u64, u64, usize, usize, Vec<u16>, Vec<u16>) {
@@ -579,14 +600,14 @@ fn run_native_owner_attention_partition(
     owner: &mut RatioOneCompressedOwner,
     attention: &mut LayerAttentionState,
     fixture: &Fixture,
-) -> Vec<(usize, Vec<u16>)> {
+) -> Vec<AlternateLayerThreePublication> {
     let frequencies = fixture.frequencies.frequencies();
     let weights = attention_capture::weights_for_layer(&fixture.attention_weights, 3);
     let mut outputs = Vec::with_capacity(fixture.cases.len());
     for index in 0..fixture.cases.len() {
         let case = &fixture.cases[index];
         let attention_case = &case.attention;
-        let selected_indices = commit_case(owner, fixture, index);
+        let (selected_indices, producer_candidates) = commit_case(owner, fixture, index);
         assert_eq!(
             attention_case.input.bf16(),
             case.input.bf16(),
@@ -617,12 +638,34 @@ fn run_native_owner_attention_partition(
         )
         .expect("live owner publication drives layer-three attention");
         attention_capture::assert_diagnostic(attention_case, &diagnostic);
-        outputs.push((start, diagnostic.final_output));
+        outputs.push(AlternateLayerThreePublication {
+            start_pos: start,
+            publication: IndexKeyPublicationId::new(3, owner.epoch(), call_id),
+            input: attention_case.input.bf16(),
+            key_prefix: owner
+                .key_prefix(0)
+                .expect("committed live owner key prefix")
+                .to_vec(),
+            kv_prefix: owner
+                .kv_prefix(0)
+                .expect("committed live owner KV prefix")
+                .to_vec(),
+            producer_candidates,
+            attention_output: diagnostic.final_output,
+        });
     }
     outputs
 }
 
 pub(crate) fn alternate_partition_owner_attention_outputs() -> Vec<(usize, Vec<u16>)> {
+    alternate_partition_layer_three_publications()
+        .into_iter()
+        .map(|publication| (publication.start_pos, publication.attention_output))
+        .collect()
+}
+
+pub(crate) fn alternate_partition_layer_three_publications() -> Vec<AlternateLayerThreePublication>
+{
     let fixture = fixture();
     let mut owner = owner(&fixture);
     let mut attention =
@@ -633,9 +676,35 @@ pub(crate) fn alternate_partition_owner_attention_outputs() -> Vec<(usize, Vec<u
 #[test]
 fn alternate_partition_owner_matches_source_prefixes_and_partial_bridges() {
     let fixture = fixture();
-    let mut owner = owner(&fixture);
-    for index in 0..fixture.cases.len() {
-        commit_case(&mut owner, &fixture, index);
+    let publications = alternate_partition_layer_three_publications();
+    assert_eq!(publications.len(), fixture.cases.len());
+    // Verify retained history after all calls: earlier prefixes and masks must
+    // not become aliases of the final owner's state.
+    for (index, (publication, case)) in publications.iter().zip(&fixture.cases).enumerate() {
+        assert_eq!(publication.start_pos, case.start_pos);
+        assert_eq!(
+            publication.publication,
+            IndexKeyPublicationId::new(3, 0, u64::try_from(index).unwrap())
+        );
+        assert_eq!(publication.input, case.input.bf16());
+        assert_eq!(publication.key_prefix, case.index_key_prefix.bf16());
+        assert_eq!(publication.kv_prefix, case.compressed_kv_prefix.bf16());
+        let geometry = SelectionGeometry::new(
+            case.start_pos,
+            nz(case.token_count),
+            nz(case.start_pos + case.token_count),
+            nz(1),
+            case.selection.offset,
+        )
+        .unwrap();
+        assert_eq!(
+            publication.producer_candidates.call(),
+            SelectionCall::new(publication.publication, 0, geometry)
+        );
+        assert_eq!(
+            publication.producer_candidates.mask(),
+            case.selection.candidate_mask.bools()
+        );
     }
 }
 

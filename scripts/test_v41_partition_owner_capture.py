@@ -288,6 +288,94 @@ class PartitionOwnerCaptureTest(unittest.TestCase):
                 with self.assertRaises(capture.CaptureError):
                     capture.validate_fixture(fixture)
 
+    def test_layer_four_consumes_layer_three_publications_and_block_output(
+        self,
+    ) -> None:
+        capture.validate_fixture(self.fixture)
+        suffix = self.fixture["post_layer_three"]
+        for section in ("attention", "selection", "tail", "head"):
+            self.assertEqual(
+                [case["start_pos"] for case in suffix[section]["cases"]],
+                [0, 4, 5, 6],
+            )
+        for index, owner in enumerate(self.fixture["cases"]):
+            attention = suffix["attention"]["cases"][index]
+            selection = suffix["selection"]["cases"][index]
+            tail = suffix["tail"]["cases"][index]
+            producer_tail = self.fixture["post_attention"]["cases"][index]
+            for consumer, producer in (
+                (selection["candidate_mask"], owner["selection"]["candidate_mask"]),
+                (attention["compressed_kv"], owner["compressed_kv_prefix"]),
+                (attention["compressed_indices"], selection["indices"]),
+                (tail["block_input"], producer_tail["block_output"]),
+                (tail["block_incoming_pre"], producer_tail["block_next_pre"]),
+                (tail["attention_output"], attention["output"]),
+            ):
+                self.assertEqual(consumer["storage_sha256"], producer["storage_sha256"])
+
+    def test_rejects_detached_layer_four_handoffs(self) -> None:
+        for section, field in (
+            ("selection", "candidate_mask"),
+            ("attention", "compressed_kv"),
+            ("attention", "compressed_indices"),
+            ("tail", "block_input"),
+            ("tail", "block_incoming_pre"),
+            ("tail", "attention_output"),
+        ):
+            with self.subTest(section=section, field=field):
+                fixture = copy.deepcopy(self.fixture)
+                tensor = fixture["post_layer_three"][section]["cases"][1][field]
+                raw = bytearray.fromhex(tensor["storage_hex"])
+                raw[0] ^= 1
+                tensor["storage_hex"] = raw.hex()
+                tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
+    def test_rejects_relabelled_suffix_provenance(self) -> None:
+        for path in (
+            ("source", "runner_sha256"),
+            ("source_receipt_sha256",),
+            ("capture_identity", "sha256"),
+        ):
+            with self.subTest(path=path):
+                fixture = copy.deepcopy(self.fixture)
+                section = fixture["post_layer_three"]
+                for key in path[:-1]:
+                    section = section[key]
+                section[path[-1]] = "0" * 64
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
+    def test_rejects_shadowed_layer_four_tail_parameters(self) -> None:
+        fixture = copy.deepcopy(self.fixture)
+        tail = fixture["post_layer_three"]["tail"]
+        name = "layers.4.ffn.gate.weight"
+        tensor = tail["encoded_parameters"][name]
+        tail["block_parameters"][name] = copy.deepcopy(tensor)
+        tensor["storage_sha256"] = "0" * 64
+        with self.assertRaises(capture.CaptureError):
+            capture.validate_fixture(fixture)
+
+    def test_rejects_relabelled_suffix_geometry(self) -> None:
+        for path, replacement in (
+            (("selection", "model", "index_topk"), True),
+            (("tail", "model", "n_shared_experts"), True),
+            (("attention", "model", "o_groups"), True),
+            (("selection", "cases", 0, "start_pos"), False),
+            (("attention", "cases", 0, "start_pos"), False),
+            (("tail", "cases", 0, "start_pos"), False),
+            (("head", "cases", 0, "start_pos"), False),
+        ):
+            with self.subTest(path=path):
+                fixture = copy.deepcopy(self.fixture)
+                section = fixture["post_layer_three"]
+                for key in path[:-1]:
+                    section = section[key]
+                section[path[-1]] = replacement
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
 
 if __name__ == "__main__":
     unittest.main()
