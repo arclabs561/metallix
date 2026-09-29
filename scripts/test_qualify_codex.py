@@ -56,12 +56,14 @@ class QualifyCodexTests(unittest.TestCase):
             {
                 "id": "pointer",
                 "type": "command_execution",
+                "command": "/bin/zsh -c 'cat pointer.txt'",
                 "exit_code": 0,
                 "aggregated_output": "The qualification value is in detail.txt.\n",
             },
             {
                 "id": "detail",
                 "type": "command_execution",
+                "command": "/bin/zsh -c 'cat detail.txt'",
                 "exit_code": 0,
                 "aggregated_output": f"qualification_value={self.value}\n",
             },
@@ -74,16 +76,51 @@ class QualifyCodexTests(unittest.TestCase):
             self.value,
             self.marker,
             required_command_evidence=("detail.txt", self.value),
+            required_command_targets=("pointer.txt", "detail.txt"),
             minimum_command_executions=2,
         )
         self.assertTrue(result["passed"])
         self.assertEqual(result["command_execution_count"], 2)
+
+    def test_pointer_chain_rejects_fabricated_outputs_with_filename_comments(
+        self,
+    ) -> None:
+        stdout = events(
+            {
+                "id": "fabricated-pointer",
+                "type": "command_execution",
+                "command": "/bin/zsh -c 'printf detail.txt # pointer.txt'",
+                "exit_code": 0,
+                "aggregated_output": "The qualification value is in detail.txt.\n",
+            },
+            {
+                "id": "fabricated-detail",
+                "type": "command_execution",
+                "command": f"/bin/zsh -c 'printf {self.value} # detail.txt'",
+                "exit_code": 0,
+                "aggregated_output": f"qualification_value={self.value}\n",
+            },
+            {"id": "message", "type": "agent_message", "text": self.marker},
+        )
+        result = module.assess(
+            0,
+            False,
+            stdout,
+            self.value,
+            self.marker,
+            required_command_evidence=("detail.txt", self.value),
+            required_command_targets=("pointer.txt", "detail.txt"),
+            minimum_command_executions=2,
+        )
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["checks"]["targeted_command_evidence"])
 
     def test_pointer_chain_rejects_one_command_even_with_both_values(self) -> None:
         stdout = events(
             {
                 "id": "combined",
                 "type": "command_execution",
+                "command": "/bin/zsh -c 'cat detail.txt'",
                 "exit_code": 0,
                 "aggregated_output": f"detail.txt\nqualification_value={self.value}\n",
             },
@@ -96,6 +133,7 @@ class QualifyCodexTests(unittest.TestCase):
             self.value,
             self.marker,
             required_command_evidence=("detail.txt", self.value),
+            required_command_targets=("pointer.txt", "detail.txt"),
             minimum_command_executions=2,
         )
         self.assertFalse(result["passed"])
@@ -106,12 +144,14 @@ class QualifyCodexTests(unittest.TestCase):
             {
                 "id": "detail",
                 "type": "command_execution",
+                "command": "/bin/zsh -c 'cat detail.txt'",
                 "exit_code": 0,
                 "aggregated_output": f"qualification_value={self.value}\n",
             },
             {
                 "id": "pointer",
                 "type": "command_execution",
+                "command": "/bin/zsh -c 'cat pointer.txt'",
                 "exit_code": 0,
                 "aggregated_output": "The qualification value is in detail.txt.\n",
             },
@@ -124,6 +164,7 @@ class QualifyCodexTests(unittest.TestCase):
             self.value,
             self.marker,
             required_command_evidence=("detail.txt", self.value),
+            required_command_targets=("pointer.txt", "detail.txt"),
             minimum_command_executions=2,
         )
         self.assertFalse(result["passed"])

@@ -506,9 +506,14 @@ uv run scripts/qualify-codex.py --run --url http://127.0.0.1:18321/v1 \
 
 The qualifier creates a unique fact per trial and requires native command
 execution before the exact final marker and turn completion. The recorded 4B
-run passed three trials under these limits. A strict reassessment verified
-command execution before the exact final marker and terminal completion in all
-three saved traces from Codex CLI 0.153.4. It uses fallback model metadata and
+run passed six trials under these limits: three single-file reads and three
+two-file pointer chains. A strict reassessment verified command execution before
+the exact final marker and terminal completion in all six saved traces from
+Codex CLI 0.153.4. Pointer-chain qualification additionally requires the recorded
+successful direct `cat pointer.txt` command followed by `cat detail.txt`, each
+with its corresponding output; filename comments or fabricated output do not
+satisfy that controlled trace contract. This is event evidence, not a syscall
+trace. It uses fallback model metadata and
 does not qualify general coding, complete tool grammar, steady-state performance,
 or a Codex profile installation.
 

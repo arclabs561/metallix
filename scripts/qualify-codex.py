@@ -191,6 +191,7 @@ def assess(
     value: str,
     marker: str,
     required_command_evidence: tuple[str, ...] = (),
+    required_command_targets: tuple[str, ...] = (),
     minimum_command_executions: int = 1,
 ) -> dict:
     """Require a completed native command execution and the final exact response."""
@@ -200,6 +201,7 @@ def assess(
     command_before_final_marker = False
     required_evidence = required_command_evidence or (value,)
     evidence_index = 0
+    targeted_evidence_index = 0
     turn_completed = False
     terminal_event_is_last = False
     unsupported_shape = parse_error
@@ -248,14 +250,29 @@ def assess(
                     and required_evidence[evidence_index] in output
                 ):
                     evidence_index += 1
+                if required_command_targets:
+                    command = item.get("command")
+                    if not isinstance(command, str):
+                        unsupported_shape = "missing command_execution command"
+                        break
+                    if (
+                        targeted_evidence_index < len(required_command_targets)
+                        and targeted_evidence_index < len(required_evidence)
+                        and command
+                        == f"/bin/zsh -c 'cat {required_command_targets[targeted_evidence_index]}'"
+                        and required_evidence[targeted_evidence_index] in output
+                    ):
+                        targeted_evidence_index += 1
             elif item["type"] == "agent_message":
                 text = item.get("text")
                 if not isinstance(text, str):
                     unsupported_shape = "unsupported agent_message shape"
                     break
                 assistant_messages.append(text)
-                command_before_final_marker = text == marker and evidence_index == len(
-                    required_evidence
+                command_before_final_marker = (
+                    text == marker
+                    and evidence_index == len(required_evidence)
+                    and targeted_evidence_index == len(required_command_targets)
                 )
             elif item["type"] not in {"reasoning", "error", "todo_list"}:
                 unsupported_shape = "unsupported completed item type"
@@ -267,6 +284,8 @@ def assess(
         "successful_command_execution": len(command_outputs)
         >= minimum_command_executions,
         "required_command_evidence": evidence_index == len(required_evidence),
+        "targeted_command_evidence": targeted_evidence_index
+        == len(required_command_targets),
         "command_precedes_final_marker": command_before_final_marker,
         "final_assistant_marker": bool(assistant_messages)
         and assistant_messages[-1] == marker,
@@ -405,6 +424,9 @@ def main() -> int:
                         value,
                         marker,
                         required_command_evidence=evidence,
+                        required_command_targets=("pointer.txt", "detail.txt")
+                        if case == "pointer_chain"
+                        else (),
                         minimum_command_executions=minimum,
                     ),
                 }
