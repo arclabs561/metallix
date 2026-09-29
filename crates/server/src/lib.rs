@@ -24,6 +24,7 @@ mod chat_generation;
 mod chat_tools;
 #[cfg(feature = "metal")]
 mod decision_cli;
+mod deepseek_reduced_cli;
 #[cfg(feature = "metal")]
 mod http_transport;
 mod model_registry;
@@ -174,6 +175,8 @@ fn sampling_configuration(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a fixed five-block scalar `DeepSeek` model from a synthetic artifact.
+    RunDeepseekReduced(deepseek_reduced_cli::ReducedArgs),
     /// Score typed decision options directly with Qwen3, without generating text.
     #[cfg(feature = "metal")]
     Decide(decision_cli::DecisionArgs),
@@ -624,6 +627,7 @@ enum QwenInspectCommand {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::RunDeepseekReduced(args) => args.run(),
         #[cfg(feature = "metal")]
         Command::Decide(args) => args.run(),
         Command::Fetch {

@@ -1216,7 +1216,7 @@ struct BundlePublisherOperands {
 
 enum PublisherOperands {
     Legacy,
-    Bundle(BundlePublisherOperands),
+    Bundle(Box<BundlePublisherOperands>),
 }
 
 /// Test-private request owner for the source-shaped L3 producer and attention.
@@ -1265,7 +1265,7 @@ impl NativeLayerThreePublisher {
             inputs: Vec::new(),
             publications: Vec::new(),
             previous_call_key_prefix: None,
-            operands: PublisherOperands::Bundle(operands),
+            operands: PublisherOperands::Bundle(Box::new(operands)),
         }
     }
 

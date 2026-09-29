@@ -72,6 +72,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_v41_candidate_capture.py"], False),
         ([sys.executable, "scripts/test_v41_forward_observers.py"], False),
         ([sys.executable, "scripts/test_v41_reduced_runner_fixture.py"], False),
+        ([sys.executable, "scripts/test_export_v41_reduced_artifact.py"], False),
         ([sys.executable, "scripts/test_v41_partition_probe.py"], False),
         ([sys.executable, "scripts/test_v41_partition_boundaries.py"], False),
         ([sys.executable, "scripts/test_v41_partition_owner_capture.py"], False),

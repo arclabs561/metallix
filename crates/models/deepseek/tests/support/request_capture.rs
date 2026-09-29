@@ -350,3 +350,50 @@ fn late_l4_failure_poison_requires_whole_request_reconstruction() {
         ));
     });
 }
+
+#[test]
+fn exported_numerical_artifact_matches_both_source_schedules() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let exported = std::process::Command::new("python3")
+        .arg(root.join("scripts/export_v41_reduced_artifact.py"))
+        .arg("--source")
+        .arg(root.join("fixtures/deepseek-v41/reduced-runner-reference.json"))
+        .args(["--output", "-"])
+        .output()
+        .expect("Python 3 is required by the repository check runner");
+    assert!(
+        exported.status.success(),
+        "exporter rejected pinned source: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let artifact = deepseek::reduced::ReducedArtifact::parse(&exported.stdout)
+        .expect("bounded numerical artifact");
+    let projections = canonical_projections();
+    let fixture: super::Fixture =
+        serde_json::from_value(projections["layer4_moe"].clone()).unwrap();
+    let head = canonical_head_oracle();
+    let ids = &canonical_trace()[0];
+    let canonical = artifact.run(ids, 5).expect("artifact canonical request");
+    request_tail::assert_source_outputs(&fixture, &head, &canonical);
+    let alternate = artifact.run(ids, 4).expect("artifact alternate request");
+    request_alternate::assert_source_outputs(&alternate, &head);
+    assert!(artifact.run(ids, 1).is_err());
+    assert!(artifact.run(&[-1, 0], 2).is_err());
+    assert!(artifact.run(&[0, 8], 2).is_err());
+
+    let mut malformed: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    malformed["cases"] = serde_json::json!([]);
+    assert!(
+        deepseek::reduced::ReducedArtifact::parse(&serde_json::to_vec(&malformed).unwrap())
+            .is_err()
+    );
+    malformed.as_object_mut().unwrap().remove("cases");
+    malformed["tensors"]
+        .as_object_mut()
+        .unwrap()
+        .remove("head.weight");
+    assert!(
+        deepseek::reduced::ReducedArtifact::parse(&serde_json::to_vec(&malformed).unwrap())
+            .is_err()
+    );
+}

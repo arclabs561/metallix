@@ -62,13 +62,23 @@ rotary table: source qualification exposed that L0 and L1–L4 tables differ aft
 position zero. Both established schedules pass their final-logit source bounds
 and replay identically after restart. A malformed L4 weight exercises late
 failure after the earlier owners have advanced.
-Weights must be separated from the source cases; synthetic layouts remain explicitly
-bounded. Both established schedules must work. A late failure invalidates the
-request, and restart reconstructs all mutable state from immutable weights.
-No component-local rollback claim is sufficient for the entire request.
+`ReducedArtifact` now admits a self-contained JSON numerical artifact, with
+explicit tensor dtype, shape, little-endian storage and SHA-256. It checks the
+exact operand inventory, finite floating-point values, and bounded dimensions
+before assembling the model. Encoded input is limited to 64 MiB and decoded
+tensors to 32 MiB. Runtime code never reads captured cases or expected outputs.
+The exporter alone extracts immutable numerical operands from the existing
+source bundle; it rejects conflicting projections and keeps L0 rotary separate.
 
-The library path now returns independently checked logits. The next slice is a
-CLI accepting supplied synthetic weights and token IDs. A head-only call is a component
-diagnostic, not token generation. Metal, checkpoint loading and serving follow
-the roadmap's separate gates. Review this extraction after the first executable
-stateful request; do not grow this module into a generic backend abstraction.
+The server-owned `mx run-deepseek-reduced` command accepts this artifact and
+supplied token IDs, executes the scalar request, and returns per-call final-token
+logit bits plus an artifact hash. It is available without Metal. Both established
+schedules pass the unchanged source bounds through exported artifacts, while
+CLI integration checks compare actual JSON output and fail-closed admission.
+
+Options for artifact transport were self-contained JSON or metadata plus a
+separate tensor file. Bounded JSON is selected for this small scalar milestone:
+it gives one hashable input without introducing a checkpoint payload loader.
+This is not the eventual checkpoint format. Broader schedules, Metal,
+checkpoint loading and serving retain the roadmap's separate gates. No generic
+backend abstraction or token-generation claim follows from this executable.

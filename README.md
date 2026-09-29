@@ -514,8 +514,9 @@ This qualifies the fixed reduced `4 + 1 + 1 + 1` composition alongside the
 canonical `5 + 1 + 1` path. `RequestSession` now executes all five blocks and
 the final head within each call, using ordinary typed numerical operands.
 Both schedules match the existing source-derived final-logit bounds and replay
-identically after whole-request restart. Broader schedules, a synthetic-input
-CLI, checkpoint loading and serving remain open. Runtime components under `deepseek::reduced` now own
+identically after whole-request restart. The bounded scalar CLI now accepts
+supplied numerical artifacts and token IDs. Broader schedules, Metal execution,
+checkpoint loading and serving remain open. Runtime components under `deepseek::reduced` now own
 final-head arithmetic, attention HC/FFN block tails, and persistent Engram hashing,
 embedding, projection and gating. They accept supplied operands without fixture
 readers or expected outputs. Engram publishes history only after a successful
@@ -535,6 +536,26 @@ it validates candidate geometry before computing its own query and attention.
 call. Restart reconstructs every owner from immutable operands. L0 retains its
 separate rotary table; L1–L4 use their qualified shared table. Fixture decoding
 and source comparisons remain test-only.
+
+Run the reduced scalar model without Metal or checkpoint downloads:
+
+```sh
+python3 scripts/export_v41_reduced_artifact.py \
+  --source fixtures/deepseek-v41/reduced-runner-reference.json \
+  --output /tmp/metallix-reduced-artifact.json
+cargo run -p server --bin mx -- run-deepseek-reduced \
+  --artifact /tmp/metallix-reduced-artifact.json \
+  --input-ids 0,1,2,3,4,5,6 --prefill-tokens 5
+```
+
+The exporter creates a new file and refuses to overwrite an existing one. Its
+artifact contains configuration and checksummed numerical tensors; captured
+outputs and source acceptance bounds stay in tests. The CLI prints a JSON
+receipt with the artifact SHA-256 and final-token logit bits for each call.
+Use `--prefill-tokens 4` for the alternate qualified schedule. This is bounded
+synthetic execution, with no sampling or text decoding. Admission rejects
+unknown fields/tensors, invalid encodings and oversized artifacts; the encoded
+file limit is 64 MiB and the decoded tensor limit is 32 MiB.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

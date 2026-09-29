@@ -11,6 +11,20 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- `mx run-deepseek-reduced` executes the complete scalar request from an admitted
+  numerical artifact and caller token IDs, without Metal. `ReducedArtifact`
+  checks exact tensor names, encodings, hashes, finite values and size bounds;
+  captured outputs remain test-only. The exporter preserves distinct startup
+  and shared rotary tables and rejects inconsistent source projections. Both
+  established schedules pass the unchanged source bounds through exported
+  weights. Four CLI integration tests check actual JSON logits/hash and rejection
+  of invalid prefill, malformed/unknown-field and oversized artifacts. This is
+  synthetic execution without sampling or text decoding, not checkpoint support.
+  The canonical Metal check passes DeepSeek, including 102 composition tests,
+  and stops at the unchanged Julia hidden-state mismatch. Focused server tests,
+  strict DeepSeek/server Clippy, DeepSeek doctests and documentation pass.
+  Receipt: `.agents/receipts/candidate-control/reduced-cli-full-check.log`.
+
 - `RequestModel`/`RequestSession` now run the complete fixed five-block scalar
   request from token IDs through final logits. All numerical operands are typed;
   fixture readers and expected outputs stay in tests. Both `5+1+1` and `4+1+1+1`
@@ -20,7 +34,7 @@ choices without expanding current support claims.
   after prior owners advance. L0 has its own rotary table; accidentally sharing
   the later-layer table was caught by the new full-request source test.
   `LayerFourSession` consumes L3's actual candidate mask and rejects inconsistent
-  publication geometry. The synthetic-input CLI is next; checkpoint loading,
+  publication geometry. The synthetic-input CLI is now implemented; checkpoint loading,
   Metal and serving are not implemented by this scalar reference.
   Focused receipts: `.agents/receipts/candidate-control/runtime-request-focused.log`
   and `runtime-l4-boundaries.log`. The canonical Metal check passes DeepSeek
@@ -76,7 +90,7 @@ choices without expanding current support claims.
   Engram owns hashing, FP8 embedding/WKV and residual gating over supplied
   tokens and weights. Hash history and cursor publish only after success.
   Fixture parsing and source comparisons remain test-owned. The complete request
-  assembly and typed operands are now implemented; the synthetic token-input CLI is next.
+  assembly, typed operands and the synthetic token-input CLI are now implemented.
   All 98 composition tests and four runtime Engram tests pass, including late
   gate failure, reset, malformed continuation and partial WKV scale groups.
   Strict DeepSeek Clippy, doctests and documentation checks pass. The canonical

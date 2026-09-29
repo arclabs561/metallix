@@ -34,7 +34,9 @@ pub use layer_three::{
     LayerThreeStepOutput,
 };
 
+mod artifact;
 mod candidates;
+pub use artifact::{ArtifactError, MAX_REDUCED_ARTIFACT_BYTES, ReducedArtifact};
 mod request;
 pub use request::{
     BlockDefinition, EngramDefinition, LayerFourDefinition, LayerOneDefinition,
