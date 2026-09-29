@@ -43,8 +43,9 @@ The final head, HC/FFN block tails and persistent Engram arithmetic/state now
 have fixture-independent runtime components. A stateful first-block session
 now accepts caller token IDs and weights through its complete window-attention
 and HC/FFN path. L1 ratio-two owner publication and L3 candidate projection
-are also runtime components. Complete L1–L4 request assembly remains the next
-extraction gate.
+are also runtime components. `LayerThreeSession` joins its owner, selection
+and attention with coordinated invalidation/reset. Complete L1 assembly and
+L1–L4 request orchestration remain the next extraction gates.
 Downstream weights and source checks remain fixture-backed; broader partitions,
 checkpoint loading and Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three

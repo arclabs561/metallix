@@ -29,6 +29,10 @@ use deepseek::{
             select_from_candidates,
         },
     },
+    reduced::{
+        CandidateProjector, LayerThreeCall, LayerThreeConfig, LayerThreeSession,
+        LayerThreeSessionError,
+    },
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -675,26 +679,55 @@ fn native_owner_attention_step(
 /// attention input. The fixture remains an exact boundary oracle.
 pub(crate) struct NativeAlternateLayerThreeSession {
     fixture: Fixture,
-    owner: RatioOneCompressedOwner,
-    attention: LayerAttentionState,
+    runtime: LayerThreeSession,
     next_case: usize,
 }
 
 impl NativeAlternateLayerThreeSession {
     pub(crate) fn new() -> Self {
         let fixture = fixture();
-        let owner = owner(&fixture);
-        let attention =
-            LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
+        let attention_layout = attention_capture::layout(&fixture.attention_model);
+        let config = LayerThreeConfig::new(
+            IndexKeyLayout::new(nz(1), nz(64), nz(64), nz(16), 1.0e-20)
+                .expect("captured owner layout"),
+            nz(128),
+            nz(8),
+            attention_layout,
+            nz(6),
+            nz(fixture.selection_model.index_topk),
+        )
+        .expect("captured layer-three runtime layout");
+        let compressor_norm = fixture.weights.compressor_norm.bf16();
+        let runtime = LayerThreeSession::new(config, 3, &compressor_norm, 1.0e-20)
+            .expect("captured layer-three runtime");
         Self {
             fixture,
-            owner,
-            attention,
+            runtime,
             next_case: 0,
         }
     }
 
     pub(crate) fn step(&mut self, supplied: &(usize, Vec<u16>)) -> AlternateLayerThreePublication {
+        self.step_inner(supplied, false)
+            .expect("source-shaped layer-three runtime step")
+    }
+
+    fn step_with_bad_attention(
+        &mut self,
+        supplied: &(usize, Vec<u16>),
+    ) -> Result<AlternateLayerThreePublication, LayerThreeSessionError> {
+        self.step_inner(supplied, true)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep source-stage assertions alongside the runtime result"
+    )]
+    fn step_inner(
+        &mut self,
+        supplied: &(usize, Vec<u16>),
+        bad_attention: bool,
+    ) -> Result<AlternateLayerThreePublication, LayerThreeSessionError> {
         let case = &self.fixture.cases[self.next_case];
         assert_eq!(
             supplied.0, case.start_pos,
@@ -705,15 +738,118 @@ impl NativeAlternateLayerThreeSession {
             case.input.bf16(),
             "native L3 supplied attention input"
         );
-        let publication = native_owner_attention_step(
-            &mut self.owner,
-            &mut self.attention,
-            &self.fixture,
-            self.next_case,
-            &supplied.1,
+        let frequencies = self.fixture.frequencies.frequencies();
+        let start = case.start_pos;
+        let end = start + case.token_count;
+        let wkv = self.fixture.weights.wkv.bf16();
+        let wk = self.fixture.weights.wk.bf16();
+        let key_norm = self.fixture.weights.key_norm.bf16();
+        let query_codes = self.fixture.selection_weights.wq_a_codes.fp8();
+        let query_scales = self.fixture.selection_weights.wq_a_scales.fp8();
+        let q_norm = self.fixture.selection_weights.q_norm.bf16();
+        let index_codes = self.fixture.selection_weights.wq_b_codes.fp8();
+        let index_scales = self.fixture.selection_weights.wq_b_scales.fp8();
+        let weights_proj = self.fixture.selection_weights.weights_proj.bf16();
+        let candidate = CandidateProjector::new(
+            CandidateQueryWeights {
+                wq_a: Fp8Projection {
+                    codes: &query_codes,
+                    scales: &query_scales,
+                },
+                q_norm: &q_norm,
+                index: IndexQueryWeights {
+                    wq_b_codes: &index_codes,
+                    wq_b_scales: &index_scales,
+                    weights_proj: &weights_proj,
+                },
+            },
+            CandidateQueryLayout::new(
+                IndexQueryLayout::new(nz(1), nz(128), nz(32), nz(2), nz(64), nz(16))
+                    .expect("captured selection layout"),
+                1.0e-20,
+            )
+            .expect("captured candidate query layout"),
+            nz(64),
+            nz(self.fixture.selection_model.candidate_topk_blocks),
+            nz(self.fixture.selection_model.candidate_block_size),
         );
+        let attention_weights =
+            attention_capture::weights_for_layer(&self.fixture.attention_weights, 3);
+        let mut borrowed_attention = attention_weights.borrowed();
+        if bad_attention {
+            borrowed_attention.q_norm = &[];
+        }
+        let output = self.runtime.step(LayerThreeCall::new(
+            &supplied.1,
+            nz(case.token_count),
+            &frequencies[start * 16..end * 16],
+            RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &key_norm)),
+            candidate,
+            borrowed_attention,
+        ))?;
+        assert_query_stages(output.candidate().scored(), &case.selection);
+        let expected_causal = case
+            .selection
+            .causal_scores
+            .as_ref()
+            .map_or_else(|| case.selection.scores.bf16(), Tensor::causal_bf16);
+        assert_eq!(
+            output.candidate().candidates().causal_scores(),
+            expected_causal
+        );
+        assert_eq!(
+            output.candidate().candidates().call(),
+            SelectionCall::new(
+                output.publication(),
+                0,
+                SelectionGeometry::new(
+                    start,
+                    nz(case.token_count),
+                    nz(start + case.token_count),
+                    nz(1),
+                    case.selection.offset
+                )
+                .unwrap(),
+            )
+        );
+        assert_eq!(
+            supplied.1,
+            case.attention.input.bf16(),
+            "owner input crosses attention boundary"
+        );
+        assert_eq!(
+            output.selected_indices(),
+            case.attention.compressed_indices.i32()
+        );
+        if let Some(next_layer_one) = &case.next_layer1_score_prefix {
+            assert_eq!(
+                &output.key_prefix()[..next_layer_one.numel],
+                next_layer_one.bf16(),
+                "runtime L3 publication feeds next L1 partial score prefix"
+            );
+        }
+
+        assert_eq!(
+            output.candidate().candidates().mask(),
+            case.selection.candidate_mask.bools()
+        );
+        assert_eq!(output.selected_indices(), case.selection.indices.i32());
+        assert_eq!(output.owner().owner.projected, case.projected.bf16());
+        assert_eq!(output.owner().owner.latent, case.latent.bf16());
+        assert_eq!(output.key_prefix(), case.index_key_prefix.bf16());
+        assert_eq!(output.kv_prefix(), case.compressed_kv_prefix.bf16());
+        attention_capture::assert_diagnostic(&case.attention, output.attention());
+        let publication = AlternateLayerThreePublication {
+            start_pos: start,
+            publication: output.publication(),
+            input: supplied.1.clone(),
+            key_prefix: output.key_prefix().to_vec(),
+            kv_prefix: output.kv_prefix().to_vec(),
+            producer_candidates: output.candidate().candidates().clone(),
+            attention_output: output.attention().final_output.clone(),
+        };
         self.next_case += 1;
-        publication
+        Ok(publication)
     }
 }
 
@@ -741,11 +877,14 @@ pub(crate) fn alternate_partition_owner_attention_outputs() -> Vec<(usize, Vec<u
 
 pub(crate) fn alternate_partition_layer_three_publications() -> Vec<AlternateLayerThreePublication>
 {
-    let fixture = fixture();
-    let mut owner = owner(&fixture);
-    let mut attention =
-        LayerAttentionState::new(attention_capture::layout(&fixture.attention_model));
-    run_native_owner_attention_partition(&mut owner, &mut attention, &fixture)
+    let mut session = NativeAlternateLayerThreeSession::new();
+    let inputs: Vec<_> = session
+        .fixture
+        .cases
+        .iter()
+        .map(|case| (case.start_pos, case.input.bf16()))
+        .collect();
+    inputs.iter().map(|input| session.step(input)).collect()
 }
 
 #[test]
@@ -792,7 +931,7 @@ fn alternate_partition_owner_publications_drive_native_layer_three_attention() {
 #[test]
 fn live_layer_three_session_uses_supplied_input_before_owner_mutation() {
     let mut session = NativeAlternateLayerThreeSession::new();
-    let before = state(&session.owner);
+    let before = session.runtime.next_start();
     let mut changed = session.fixture.cases[0].input.bf16();
     changed[0] ^= 1;
     assert!(
@@ -802,9 +941,13 @@ fn live_layer_three_session_uses_supplied_input_before_owner_mutation() {
         .is_err()
     );
     assert_eq!(
-        state(&session.owner),
+        session.runtime.next_start(),
         before,
         "rejected input leaves owner unchanged"
+    );
+    assert!(
+        !session.runtime.is_poisoned(),
+        "pre-admission input rejection does not poison runtime"
     );
     assert_eq!(
         session.next_case, 0,
@@ -824,6 +967,50 @@ fn live_layer_three_session_uses_supplied_input_before_owner_mutation() {
         assert_eq!(publication.start_pos, start);
         assert_eq!(publication.input, input);
         assert_eq!(publication.attention_output, expected_attention);
+    }
+}
+
+#[test]
+fn admitted_attention_failure_poisons_then_reset_replays_runtime_owner() {
+    let mut session = NativeAlternateLayerThreeSession::new();
+    let inputs: Vec<_> = session
+        .fixture
+        .cases
+        .iter()
+        .map(|case| (case.start_pos, case.input.bf16()))
+        .collect();
+    let Err(error) = session.step_with_bad_attention(&inputs[0]) else {
+        panic!("malformed attention weight must fail after owner admission");
+    };
+    assert!(matches!(error, LayerThreeSessionError::Attention(_)));
+    assert_eq!(
+        session.runtime.next_start(),
+        4,
+        "owner publication committed before attention failure"
+    );
+    assert!(
+        session.runtime.is_poisoned(),
+        "admitted failure requires reset"
+    );
+    assert!(matches!(
+        session.step_inner(&inputs[0], false),
+        Err(LayerThreeSessionError::Poisoned)
+    ));
+
+    session
+        .runtime
+        .reset()
+        .expect("joint owner and attention reset");
+    assert!(!session.runtime.is_poisoned());
+    assert_eq!(session.runtime.next_start(), 0);
+    for (call_id, input) in inputs.iter().enumerate() {
+        let output = session
+            .step_inner(input, false)
+            .expect("reset runtime exact source replay");
+        assert_eq!(
+            output.publication,
+            IndexKeyPublicationId::new(3, 1, u64::try_from(call_id).unwrap())
+        );
     }
 }
 

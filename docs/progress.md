@@ -11,13 +11,26 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- `LayerThreeSession` now owns the ratio-one compressor/key/KV, candidate
+  projection/selection and attention lifecycle over caller-supplied operands.
+  It derives publication identities and window offsets from live state; both
+  source schedules use it. A malformed owner input and an attention failure
+  after owner commit both require reset, with recovered numerical results and
+  new-epoch publications checked against the source. Constructor checks reject
+  incompatible producer/attention geometry. Focused validation passes all 99
+  `forward_moe` tests, eight alternate-owner tests and the constructor test.
+  The serial Metal check completes DeepSeek and stops at the unchanged Julia
+  `unmasked_control hidden[0]` mismatch (`-0.2049238` versus `-0.20494038`).
+  Receipts: `.agents/receipts/candidate-control/runtime-l3-{focused,full-check}.log`.
+  Complete L1 assembly and request-wide orchestration remain to extract.
+
 - L1 ratio-two compression, key preparation and paired key/KV publication now
   execute in `RatioTwoCompressedOwner` from live inputs and borrowed weights.
   Partial calls preserve prefixes while advancing call identity; staged failures
   remain retryable, and reset advances the epoch. L3 `CandidateProjector`
   computes query scores and masks from supplied input and keys, with exact
   row-geometry checks. Both source schedules still reach their existing final
-  logit bounds. Prior-L3 score-prefix policy and complete layer-session assembly
+  logit bounds. Prior-L3 score-prefix policy and complete request assembly
   remain test-owned. Six independent owner/projector tests cover partial
   publications, late-error retry, reset epochs and score-matrix geometry.
 

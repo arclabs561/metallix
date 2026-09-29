@@ -42,9 +42,14 @@ L3 publication. `RatioTwoCompressedOwner` now stages the L1 compressor and
 paired key/KV prefixes over typed per-call weights; its partial calls retain
 incomplete groups. `CandidateProjector` now derives L3 masks from supplied
 input and key scores, checking matrix geometry before scoring. These components
-remove the test-owned owner/projection arithmetic, but the complete L1 and L3
-sessions still need extraction, including prior-L3 score-prefix policy and
-cross-component failure invalidation. Weights must be separated from the source cases; synthetic layouts remain explicitly
+remove the test-owned owner/projection arithmetic. `LayerThreeSession` now
+joins ratio-one owner preparation, candidate scoring/selection, owner commit
+and attention. It derives publication identity and selection offsets from live
+state. Any admitted failure poisons the session; reset clears both owners and
+advances their epoch together. This does not promise rollback after the owner
+commits and attention fails. Complete L1 assembly and prior-L3 score-prefix
+policy remain to extract, followed by full-request orchestration.
+Weights must be separated from the source cases; synthetic layouts remain explicitly
 bounded. Both established schedules must work. A late failure invalidates the
 request, and restart reconstructs all mutable state from immutable weights.
 No component-local rollback claim is sufficient for the entire request.

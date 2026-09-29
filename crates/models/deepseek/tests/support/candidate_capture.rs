@@ -23,7 +23,7 @@ use deepseek::{
         },
         selection::{CandidateSelection, SelectionCall, SelectionGeometry, select_from_candidates},
     },
-    reduced::CandidateProjector,
+    reduced::{CandidateProjection, CandidateProjector},
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -476,33 +476,16 @@ fn supplied_fixture(raw: &serde_json::Value, expected_capture: &str) -> Fixture 
     fixture
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep source-stage parity assertions in execution order"
-)]
+/// Lends a decoded source candidate projector to one execution without making
+/// its borrowed numerical operands escape the fixture adapter.
 #[allow(
     clippy::similar_names,
     reason = "retain source wq_a and wq_b projection names"
 )]
-fn generated_candidates_and_scores_from_fixture(
+fn with_candidate_projector<R>(
     fixture: &Fixture,
-    start: usize,
-    native_keys: &[u16],
-    call: SelectionCall,
-    attention_input: &[u16],
-    epoch: u64,
-) -> (CandidateSelection, Vec<u16>) {
-    let case = source_case(fixture, start);
-    assert_eq!(
-        call,
-        source_call_from_fixture_in_epoch(fixture, start, epoch),
-        "source selection call at start {start}"
-    );
-    let expected_keys = case.inputs.shared_index_k_prefix.bf16();
-    assert_eq!(
-        native_keys, expected_keys,
-        "native key prefix at start {start}"
-    );
+    body: impl FnOnce(CandidateProjector<'_>) -> R,
+) -> R {
     let parameters = &fixture.encoded_parameters;
     let wq_b_codes = parameters["layers.3.attn.indexer.wq_b.weight"].fp8();
     let wq_b_scales = parameters["layers.3.attn.indexer.wq_b.scale"].fp8();
@@ -510,13 +493,7 @@ fn generated_candidates_and_scores_from_fixture(
     let wq_a_codes = parameters["layers.3.attn.wq_a.weight"].fp8();
     let wq_a_scales = parameters["layers.3.attn.wq_a.scale"].fp8();
     let q_norm = parameters["layers.3.attn.q_norm.weight"].bf16();
-    let positions = case.inputs.x.shape[1];
-    assert_eq!(
-        attention_input.len(),
-        positions * fixture.model.input_dimension,
-        "native attention input shape at start {start}"
-    );
-    let projector = CandidateProjector::new(
+    body(CandidateProjector::new(
         CandidateQueryWeights {
             wq_a: Fp8Projection {
                 codes: &wq_a_codes,
@@ -534,15 +511,51 @@ fn generated_candidates_and_scores_from_fixture(
         nonzero(fixture.model.index_head_dimension),
         nonzero(fixture.model.candidate_topk_blocks),
         nonzero(fixture.model.candidate_block_size),
+    ))
+}
+
+/// Lends the legacy source projector to a live L3 session.
+pub(super) fn with_source_candidate_projector<R>(
+    body: impl FnOnce(CandidateProjector<'_>) -> R,
+) -> R {
+    with_candidate_projector(&fixture(), body)
+}
+
+/// Lends a validated caller-supplied projector to a live L3 session.
+pub(super) fn with_bundle_candidate_projector<R>(
+    raw: &serde_json::Value,
+    expected_capture: &str,
+    body: impl FnOnce(CandidateProjector<'_>) -> R,
+) -> R {
+    with_candidate_projector(&supplied_fixture(raw, expected_capture), body)
+}
+
+fn assert_projection_matches_fixture(
+    fixture: &Fixture,
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    epoch: u64,
+    projection: &CandidateProjection,
+) {
+    let case = source_case(fixture, start);
+    assert_eq!(
+        call,
+        source_call_from_fixture_in_epoch(fixture, start, epoch),
+        "source selection call at start {start}"
     );
-    let projection = projector
-        .project(
-            attention_input,
-            &call_frequencies(fixture, start, positions),
-            native_keys,
-            call,
-        )
-        .expect("runtime candidate projection");
+    assert_eq!(
+        native_keys,
+        case.inputs.shared_index_k_prefix.bf16(),
+        "native key prefix at start {start}"
+    );
+    let positions = case.inputs.x.shape[1];
+    assert_eq!(
+        attention_input.len(),
+        positions * fixture.model.input_dimension,
+        "native attention input shape at start {start}"
+    );
     let prepared = projection.scored();
     assert_eq!(
         prepared.query.wq_a,
@@ -570,7 +583,6 @@ fn generated_candidates_and_scores_from_fixture(
         case.operations.scaled_weights.bf16(),
         "start {start} scaled weights"
     );
-
     let key_count = case.inputs.shared_index_k_prefix.shape[1];
     assert_eq!(
         prepared.dot_products,
@@ -621,8 +633,84 @@ fn generated_candidates_and_scores_from_fixture(
         case.candidate_mask.bools(),
         "start {start} candidate mask"
     );
-    let (prepared, candidates) = projection.into_parts();
-    (candidates, prepared.scores)
+}
+
+/// Checks the live L3 session's candidate result against the legacy source boundary.
+pub(super) fn assert_source_candidate_projection(
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    epoch: u64,
+    projection: &CandidateProjection,
+) {
+    assert_projection_matches_fixture(
+        &fixture(),
+        start,
+        native_keys,
+        call,
+        attention_input,
+        epoch,
+        projection,
+    );
+}
+
+/// Checks the live L3 session's candidate result against a validated bundle boundary.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test boundary makes each independently checked source operand explicit"
+)]
+pub(super) fn assert_bundle_candidate_projection(
+    raw: &serde_json::Value,
+    expected_capture: &str,
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    epoch: u64,
+    projection: &CandidateProjection,
+) {
+    assert_projection_matches_fixture(
+        &supplied_fixture(raw, expected_capture),
+        start,
+        native_keys,
+        call,
+        attention_input,
+        epoch,
+        projection,
+    );
+}
+
+fn generated_candidates_and_scores_from_fixture(
+    fixture: &Fixture,
+    start: usize,
+    native_keys: &[u16],
+    call: SelectionCall,
+    attention_input: &[u16],
+    epoch: u64,
+) -> (CandidateSelection, Vec<u16>) {
+    let positions = source_case(fixture, start).inputs.x.shape[1];
+    with_candidate_projector(fixture, |projector| {
+        let projection = projector
+            .project(
+                attention_input,
+                &call_frequencies(fixture, start, positions),
+                native_keys,
+                call,
+            )
+            .expect("runtime candidate projection");
+        assert_projection_matches_fixture(
+            fixture,
+            start,
+            native_keys,
+            call,
+            attention_input,
+            epoch,
+            &projection,
+        );
+        let (prepared, candidates) = projection.into_parts();
+        (candidates, prepared.scores)
+    })
 }
 
 pub(super) fn rejects_unmasked_future_candidate() {

@@ -47,6 +47,39 @@ pub struct LayerAttentionLayout {
 }
 
 impl LayerAttentionLayout {
+    /// Crate-private geometry accessors let reduced request sessions verify
+    /// that their producer publication matches this attention owner before
+    /// allocating request state.
+    #[must_use]
+    pub(crate) const fn batches(self) -> NonZeroUsize {
+        self.batches
+    }
+
+    #[must_use]
+    pub(crate) const fn hidden_dimension(self) -> NonZeroUsize {
+        self.hidden_dimension
+    }
+
+    #[must_use]
+    pub(crate) const fn head_dimension(self) -> NonZeroUsize {
+        self.head_dimension
+    }
+
+    #[must_use]
+    pub(crate) const fn rope_pairs(self) -> NonZeroUsize {
+        self.rope_pairs
+    }
+
+    #[must_use]
+    pub(crate) const fn window(self) -> NonZeroUsize {
+        self.window
+    }
+
+    #[must_use]
+    pub(crate) fn compression(self) -> Option<(u16, NonZeroUsize)> {
+        self.expected_source_layer.zip(self.compressed_ratio)
+    }
+
     pub(crate) fn is_batch_one_window_only(self, width: usize) -> bool {
         self.batches.get() == 1
             && self.hidden_dimension.get() == width

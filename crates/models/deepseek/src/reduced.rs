@@ -22,6 +22,12 @@ pub use ratio_two::{
     RatioTwoOwnerLayout, RatioTwoOwnerWeights,
 };
 
+mod layer_three;
+pub use layer_three::{
+    LayerThreeCall, LayerThreeConfig, LayerThreeSession, LayerThreeSessionError,
+    LayerThreeStepOutput,
+};
+
 mod candidates;
 pub use candidates::{CandidateProjection, CandidateProjector, CandidateProjectorError};
 

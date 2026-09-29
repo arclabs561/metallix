@@ -522,8 +522,11 @@ step. `StartupSession` now executes caller token IDs through embedding, HC/norm,
 window attention and the first block tail, retaining its window across calls.
 Its late failures require reset. L1's ratio-two compressed owner and L3's
 candidate projection also run from typed operands; partial groups retain their
-state, and candidate masks derive from live scores. Complete L1–L4 request
-orchestration still remains in the test harness.
+state, and candidate masks derive from live scores. `LayerThreeSession` joins
+ratio-one compression, candidate scoring/selection and attention under one
+failure/reset lifecycle. It derives publication identity and window offsets
+from live state and returns owned publications for downstream layers. Complete
+L1–L4 request orchestration still remains in the test harness.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
