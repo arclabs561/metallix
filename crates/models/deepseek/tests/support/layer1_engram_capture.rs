@@ -12,6 +12,8 @@ use deepseek::{
     precision::{ActivationGroup, fp8_linear_runtime_f32, quantize_bf16_activations_e4m3fn},
 };
 use serde_json::Value;
+
+use super::runtime_engram;
 use sha2::{Digest, Sha256};
 
 fn field<'a>(v: &'a Value, key: &str) -> &'a Value {
@@ -132,7 +134,7 @@ pub(crate) fn native_layer_one_block_entries_from_streams(
 /// replaying its bootstrap prefix.
 pub(crate) struct NativeLayerOneEngramSession {
     root: Value,
-    hashes: EngramHashState,
+    runtime: deepseek::reduced::EngramSession,
     next_case: usize,
     next_start: usize,
 }
@@ -199,107 +201,35 @@ impl NativeLayerOneEngramSession {
                 .any(|case| bf16(field(case, "stream")) != bf16(field(case, "output"))),
             "omitting Engram must fail at least one source trace boundary"
         );
-        let engram = field(&root, "engram");
-        let state = field(engram, "hash_state");
-        let layout = field(engram, "layout");
-        let layer_ids = field(layout, "layer_ids").as_array().unwrap();
-        let hash_layout = EngramHashLayout::new(
-            usize_field(layout, "max_ngram_size"),
-            usize_field(layout, "n_heads"),
-            layer_ids.len(),
-            field(state, "pad_id").as_i64().unwrap(),
-            i64s(field(state, "primes")),
-            i64s(field(state, "offsets")),
-            i64s(field(state, "multipliers")),
-        )
-        .unwrap();
-        let capacity = field(&root, "cases")
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|case| usize_field(case, "start_pos") + shape(field(case, "input_ids"))[1])
-            .max()
-            .unwrap();
+        let runtime = runtime_engram::session(&root, 1);
         Self {
             root,
-            hashes: EngramHashState::new(hash_layout, 1, capacity).unwrap(),
+            runtime,
             next_case: 0,
             next_start: 0,
         }
     }
 
-    pub(crate) fn step(
-        &mut self,
-        supplied_stream: Option<&(usize, Vec<u16>)>,
-    ) -> (usize, Vec<u16>) {
-        let model = field(&self.root, "model");
-        let engram = field(&self.root, "engram");
-        let state = field(engram, "hash_state");
-        let layout = field(engram, "layout");
-        let layer_ids = field(layout, "layer_ids").as_array().unwrap();
+    pub(crate) fn step(&mut self, supplied: Option<&(usize, Vec<u16>)>) -> (usize, Vec<u16>) {
         let case = &field(&self.root, "cases").as_array().unwrap()[self.next_case];
         let start = usize_field(case, "start_pos");
         assert_eq!(start, self.next_start, "native Engram call order");
-        // Reject caller input before publishing any token history.
         let captured = bf16(field(case, "stream"));
-        let stream = supplied_stream.map_or(captured.as_slice(), |(supplied_start, supplied)| {
-            assert_eq!(*supplied_start, start, "native Engram stream start");
-            assert_eq!(supplied, &captured, "native Engram stream boundary");
-            supplied.as_slice()
+        let stream = supplied.map_or(captured.as_slice(), |(given, input)| {
+            assert_eq!(*given, start, "native Engram stream start");
+            assert_eq!(input, &captured, "native Engram stream boundary");
+            input.as_slice()
         });
-        let positions = shape(field(case, "input_ids"))[1];
-        let token_map = i64s(field(state, "token_map"));
-        let tokens: Vec<_> = i64s(field(case, "input_ids"))
-            .into_iter()
-            .map(|id| CompressedToken::Live(token_map[usize::try_from(id).unwrap()]))
-            .collect();
-        let all = self
-            .hashes
-            .write_and_hash(&tokens, positions, start)
-            .unwrap();
-        let columns = usize_field(model, "hash_columns");
-        let ids: Vec<_> = all
-            .chunks_exact(layer_ids.len() * columns)
-            .flat_map(|row| row[..columns].iter().copied())
-            .collect();
-        assert_eq!(ids, i64s(field(case, "captured_hash_ids")));
-        let parameters = field(&self.root, "encoded_parameters");
-        let embed_codes = fp8_codes(field(parameters, "layers.1.engram.embed.weight"));
-        let embed_scales = fp8_scales(field(parameters, "layers.1.engram.embed.scale"));
-        let embed_rows = field(layout, "num_embeddings").as_array().unwrap()[0]
-            .as_u64()
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let embed = EngramEmbeddingLayout::new(embed_rows, usize_field(model, "embedding_dim"), 32)
-            .unwrap();
-        let mut looked = vec![0; ids.len() * usize_field(model, "embedding_dim")];
-        engram_embedding_bf16_reference(&ids, &embed_codes, &embed_scales, embed, &mut looked)
-            .unwrap();
-        assert_eq!(looked, bf16(field(case, "embedding")));
-        check_masked_lookup(&ids, &embed_codes, &embed_scales, embed, &looked);
-        let wkv = project_wkv(
-            &looked,
-            positions,
-            columns * usize_field(model, "embedding_dim"),
-            usize_field(model, "wkv_width"),
-            &fp8_codes(field(parameters, "layers.1.engram.wkv.weight")),
-            &fp8_scales(field(parameters, "layers.1.engram.wkv.scale")),
-        );
-        assert_eq!(wkv, bf16(field(case, "wkv_output")));
-        let (key, value) = split_wkv(case, model, &wkv);
-        let q = bf16(field(parameters, "layers.1.engram.q_weight"))
-            .into_iter()
-            .map(f32_from_bf16)
-            .collect::<Vec<_>>();
-        let k = bf16(field(parameters, "layers.1.engram.k_weight"))
-            .into_iter()
-            .map(f32_from_bf16)
-            .collect::<Vec<_>>();
-        let output = gate_output(case, model, stream, &key, &value, &q, &k);
+        let tokens = i64s(field(case, "input_ids"));
+        let output = self
+            .runtime
+            .step(start, &tokens, stream)
+            .expect("native runtime Engram");
+        runtime_engram::assert_output(case, &output);
+        runtime_engram::assert_masked_embedding(&self.root, 1, &output);
         self.next_case += 1;
-        self.next_start += positions;
-        (start, output)
+        self.next_start = self.runtime.next_start();
+        (start, output.output().to_vec())
     }
 }
 
@@ -316,12 +246,8 @@ fn rejected_engram_stream_does_not_publish_hash_history() {
         let following_start = start + shape(field(case, "input_ids"))[1];
         let mut invalid = bf16(field(case, "stream"));
         invalid[0] ^= 1;
-        let mut before = session.hashes.clone();
-        assert!(
-            before
-                .write_and_hash(&[CompressedToken::Live(0)], 1, following_start)
-                .is_err()
-        );
+        let mut before = session.runtime.clone();
+        assert!(before.step(following_start, &[0], &[0; 256]).is_err());
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 session.step(Some(&(start, invalid)));
@@ -329,12 +255,10 @@ fn rejected_engram_stream_does_not_publish_hash_history() {
             .is_err()
         );
         assert_eq!(session.next_case, rejected_case);
-        let mut after = session.hashes.clone();
+        let mut after = session.runtime.clone();
         assert!(
-            after
-                .write_and_hash(&[CompressedToken::Live(0)], 1, following_start)
-                .is_err(),
-            "rejected stream must not make the next token's history available"
+            after.step(following_start, &[0], &[0; 256]).is_err(),
+            "rejected stream must not admit the following start"
         );
         for _ in rejected_case..3 {
             assert_eq!(session.step(None), control.step(None));

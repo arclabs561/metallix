@@ -33,6 +33,18 @@ pub struct FfnSublayerReference<'a> {
 }
 
 impl<'a> FfnSublayerReference<'a> {
+    /// Returns the validated Hyper-Connections copy count for crate-local composition.
+    #[must_use]
+    pub(crate) const fn copies(&self) -> usize {
+        self.copies
+    }
+
+    /// Returns the validated hidden width for crate-local composition.
+    #[must_use]
+    pub(crate) const fn hidden_width(&self) -> usize {
+        self.moe.hidden_width()
+    }
+
     /// Validates static buffer geometry for one FFN sublayer.
     ///
     /// The `norm_weight` length must equal the `MoE` hidden width. The HC

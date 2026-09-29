@@ -1,4 +1,4 @@
-//! Bounded scalar final normalization and output-head execution.
+//! Bounded scalar `DeepSeek` block, Engram, and final-head components.
 //!
 //! This module accepts runtime operands directly. It does not load a
 //! checkpoint or a captured fixture, and it contains no expected-output
@@ -15,6 +15,14 @@
 //! assert_eq!(result.logits(), &[0.816_406_25, 0.0]);
 //! # Ok::<(), deepseek::reduced::FinalHeadError>(())
 //! ```
+
+mod engram;
+pub use engram::{
+    EngramSession, EngramSessionConfig, EngramSessionError, EngramSessionWeights, EngramStepOutput,
+};
+
+mod block;
+pub use block::{BlockTailDiagnostic, BlockTailError, BlockTailReference};
 
 use thiserror::Error;
 

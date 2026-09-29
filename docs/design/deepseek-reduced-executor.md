@@ -25,8 +25,14 @@ bounds. Both existing compositions must consume this implementation and retain
 their unchanged independent source comparisons. Malformed inputs and excessive
 shapes must fail before unbounded allocation.
 
-Subsequent slices extract HC/block and Engram orchestration, then assemble the
-request-owned L1/L2/L3/L4 state with the preceding-call L3 publication. Weights
+The next extracted components are `BlockTailReference` (attention HC post-mix
+and FFN) and `EngramSession` (persistent hashing, embedding, projection and
+residual gating). Engram stages hash history and commits it only after every
+numerical stage succeeds; reset reconstructs pristine history. Fixture decoding
+and every source-stage comparison remain test-owned.
+
+The remaining assembly owns L1/L2/L3/L4 request state with the preceding-call
+L3 publication. Weights
 must be separated from the source cases; synthetic layouts remain explicitly
 bounded. Both established schedules must work. A late failure invalidates the
 request, and restart reconstructs all mutable state from immutable weights.

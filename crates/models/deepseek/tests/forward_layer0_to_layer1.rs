@@ -29,6 +29,8 @@ pub(crate) mod hc_projection_bounds;
     reason = "the bridge test needs the supplied-stream entry helper from the shared Engram fixture oracle"
 )]
 pub(crate) mod layer1_engram_capture;
+#[path = "support/runtime_engram.rs"]
+pub(crate) mod runtime_engram;
 
 const FIXTURE_SHA256: &str = "2a0e294e62565be699c710fdfbf4f52bb63a0e9f3bea8e7eceae8ea11164b862";
 

@@ -11,6 +11,17 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- Reduced runtime components now include `BlockTailReference` and persistent
+  `EngramSession`. The block tail consumes actual attention and residuals;
+  Engram owns hashing, FP8 embedding/WKV and residual gating over supplied
+  tokens and weights. Hash history and cursor publish only after success.
+  Fixture parsing and source comparisons remain test-owned. Complete request
+  assembly, typed request weights and the synthetic token-input CLI are next.
+  All 96 composition tests and four runtime Engram tests pass, including late
+  gate failure, reset, malformed continuation and partial WKV scale groups.
+  Strict DeepSeek Clippy, doctests and documentation checks pass. The canonical
+  Metal gate passes DeepSeek and stops at the unchanged Julia encoder mismatch.
+
 - The first reduced-executor extraction, `deepseek::reduced::FinalHead`, accepts
   only runtime residual/pre-mix and immutable norm/head weights. Both canonical
   and alternate compositions use it under their unchanged source envelopes.
@@ -136,8 +147,12 @@ choices without expanding current support claims.
   replay then separated QKV propagation, rotary transforms and score reduction.
   A balanced-F32 score reduction passed the legacy source test but worsened
   frozen calibration from seven passing cases to six, introducing a new
-  `cal_len5` failure; it too was reverted. Held-out
-  inputs remain unopened; see the
+  `cal_len5` failure; it too was reverted. Subsequent normalization, softmax
+  and value-reduction replay does not support another local arithmetic patch.
+  Numerical changes are paused pending a fidelity-target decision: pinned
+  source-backend compatibility or a separate portable scalar contract. The
+  existing gate stays failing; any new contract needs fresh manifests and
+  preregistered limits. Held-out inputs remain unopened; see the
   [numerical experiment](experiments/julia-accuracy-contract.md). This is not a
   full-checkpoint encoder, Metal implementation, or serving integration; see
   the [Julia contract](research/julia-decision-contract.md).

@@ -7,7 +7,7 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference};
-use deepseek::reduced::FinalHead;
+use deepseek::reduced::{BlockTailReference, FinalHead};
 use deepseek::{
     RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionState},
@@ -1956,17 +1956,6 @@ fn run_block_tail_position(
     let config = &context.fixture.block_config;
     let residual = &data.block_input[position * 256..(position + 1) * 256];
     let row = position * 128..(position + 1) * 128;
-    let attn_coefficients = project_hc_coefficients(
-        residual,
-        &parameters.attn_projection,
-        &parameters.attn_scale,
-        &parameters.attn_base,
-        config.copies,
-        config.norm_eps,
-        config.hc_sinkhorn_iters,
-        config.hc_eps,
-    )
-    .unwrap();
     assert_attention_input(context, case, position, residual, data, &row);
     let attention_row = if matches!(
         context.control,
@@ -1976,40 +1965,53 @@ fn run_block_tail_position(
     } else {
         &data.attention[row.clone()]
     };
-    let mut after_attention = vec![0; 256];
-    hc_post_bf16_reference(
-        attention_row,
-        residual,
-        attn_coefficients.post(),
-        attn_coefficients.comb(),
-        &mut after_attention,
-    )
-    .unwrap();
-    let own_coefficients = project_hc_coefficients(
-        &after_attention,
-        &parameters.ffn_projection,
-        &parameters.ffn_scale,
-        &parameters.ffn_base,
+    let executor = BlockTailReference::new(
+        *context.ffn,
+        &parameters.attn_projection,
+        &parameters.attn_scale,
+        &parameters.attn_base,
         config.copies,
         config.norm_eps,
         config.hc_sinkhorn_iters,
         config.hc_eps,
     )
-    .unwrap();
-    let pre = if context.control == BlockControl::WrongFfnPre {
-        own_coefficients.pre()
+    .expect("bounded native block tail");
+    let diagnostic = executor
+        .forward_token(residual, attention_row)
+        .expect("native block tail");
+    let attn_coefficients = diagnostic.attention_coefficients();
+    let after_attention = diagnostic.after_attention_bf16();
+    // Fault injection remains test-owned: ordinary runtime execution always
+    // supplies the attention pre-mix to FFN, never FFN's newly derived pre-mix.
+    let wrong_result;
+    let result = if context.control == BlockControl::WrongFfnPre {
+        let own_coefficients = project_hc_coefficients(
+            after_attention,
+            &parameters.ffn_projection,
+            &parameters.ffn_scale,
+            &parameters.ffn_base,
+            config.copies,
+            config.norm_eps,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+        )
+        .unwrap();
+        wrong_result = context
+            .ffn
+            .forward_token(after_attention, own_coefficients.pre())
+            .unwrap();
+        &wrong_result
     } else {
-        attn_coefficients.pre()
+        diagnostic.ffn()
     };
-    let result = context.ffn.forward_token(&after_attention, pre).unwrap();
     let terminal_envelope = if context.verify_contract {
         Some(hc_chain_bounds::check_position(
             context.fixture,
             case,
             position,
-            &attn_coefficients,
-            &after_attention,
-            &result,
+            attn_coefficients,
+            after_attention,
+            result,
         ))
     } else {
         None
@@ -3431,44 +3433,41 @@ fn check_layer_three_case(
     let mut terminal = Vec::with_capacity(expected_terminal.len());
     let mut next_pre = Vec::with_capacity(expected_pre.len());
     let mut envelopes = Vec::with_capacity(positions);
+    let executor = BlockTailReference::new(
+        *ffn,
+        &parameters.attn_projection,
+        &parameters.attn_scale,
+        &parameters.attn_base,
+        config.copies,
+        config.norm_eps,
+        config.hc_sinkhorn_iters,
+        config.hc_eps,
+    )
+    .expect("bounded layer-three block tail");
     for position in 0..positions {
         let residual = &block_input[position * 256..(position + 1) * 256];
-        let attn_coefficients = project_hc_coefficients(
-            residual,
-            &parameters.attn_projection,
-            &parameters.attn_scale,
-            &parameters.attn_base,
-            config.copies,
-            config.norm_eps,
-            config.hc_sinkhorn_iters,
-            config.hc_eps,
-        )
-        .expect("layer-three attention HC coefficients");
-        let mut after_attention = vec![0; 256];
-        hc_post_bf16_reference(
-            &attention_output[position * 128..(position + 1) * 128],
-            residual,
-            attn_coefficients.post(),
-            attn_coefficients.comb(),
-            &mut after_attention,
-        )
-        .expect("layer-three attention HC post-mix");
+        let diagnostic = executor
+            .forward_token(
+                residual,
+                &attention_output[position * 128..(position + 1) * 128],
+            )
+            .expect("layer-three native block tail");
+        let attn_coefficients = diagnostic.attention_coefficients();
+        let after_attention = diagnostic.after_attention_bf16();
         assert_eq!(
             after_attention,
-            expected_after_attention[position * 256..(position + 1) * 256],
+            &expected_after_attention[position * 256..(position + 1) * 256],
             "layer-three native attention HC residual at start {} position {position}",
             case.start_pos
         );
-        let result = ffn
-            .forward_token(&after_attention, attn_coefficients.pre())
-            .expect("layer-three native FFN");
+        let result = diagnostic.ffn();
         let envelope = hc_chain_bounds::check_position_for(
             f,
             case,
             position,
-            &attn_coefficients,
-            &after_attention,
-            &result,
+            attn_coefficients,
+            after_attention,
+            result,
             3,
         );
         let source_residual = &next_residual[position * 256..(position + 1) * 256];
@@ -3487,7 +3486,7 @@ fn check_layer_three_case(
             reject_zeroed_layer_three_attention(
                 ffn,
                 residual,
-                &attn_coefficients,
+                attn_coefficients,
                 &envelope,
                 source_residual,
                 source_pre,
@@ -3960,4 +3959,89 @@ fn alternate_layer_three_engram_projection() -> Value {
         "7bbd6d11e0906d98e113075a2e9d7dd34aa7175536be30f20ebfb45aed93daa9"
     );
     serde_json::from_str(raw).unwrap()
+}
+
+#[test]
+fn runtime_block_tail_rejects_invalid_inputs_without_poisoning_operands() {
+    let f = fixture();
+    let parameters = block_tail_parameters(&f);
+    let config = &f.block_config;
+    with_model(&f, false, |model| {
+        let ffn = FfnSublayerReference::new(
+            model,
+            &parameters.ffn_norm,
+            &parameters.ffn_projection,
+            &parameters.ffn_scale,
+            &parameters.ffn_base,
+            config.copies,
+            config.norm_eps,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+        )
+        .unwrap();
+        let make = |copies, iterations, epsilon| {
+            BlockTailReference::new(
+                ffn,
+                &parameters.attn_projection,
+                &parameters.attn_scale,
+                &parameters.attn_base,
+                copies,
+                config.norm_eps,
+                iterations,
+                epsilon,
+            )
+        };
+        assert!(make(1, config.hc_sinkhorn_iters, config.hc_eps).is_err());
+        assert!(make(config.copies, 0, config.hc_eps).is_err());
+        assert!(make(config.copies, usize::MAX, config.hc_eps).is_err());
+        assert!(make(config.copies, config.hc_sinkhorn_iters, f32::NAN).is_err());
+        assert!(
+            BlockTailReference::new(
+                ffn,
+                &parameters.attn_projection[..1],
+                &parameters.attn_scale,
+                &parameters.attn_base,
+                config.copies,
+                config.norm_eps,
+                config.hc_sinkhorn_iters,
+                config.hc_eps,
+            )
+            .is_err()
+        );
+        let executor = make(config.copies, config.hc_sinkhorn_iters, config.hc_eps).unwrap();
+        let residual = f.cases[0].block_input.bf16();
+        let attention = f.cases[0].attention_output.bf16();
+        let expected = executor
+            .forward_token(&residual[..256], &attention[..128])
+            .unwrap();
+        assert!(
+            executor
+                .forward_token(&residual[..255], &attention[..128])
+                .is_err()
+        );
+        assert!(
+            executor
+                .forward_token(&residual[..256], &attention[..127])
+                .is_err()
+        );
+        let mut nonfinite = attention[..128].to_vec();
+        nonfinite[0] = 0x7f80;
+        assert!(
+            executor
+                .forward_token(&residual[..256], &nonfinite)
+                .is_err()
+        );
+        let actual = executor
+            .forward_token(&residual[..256], &attention[..128])
+            .unwrap();
+        assert_eq!(actual.ffn(), expected.ffn());
+        assert_eq!(
+            actual.attention_coefficients(),
+            expected.attention_coefficients()
+        );
+        assert_eq!(
+            actual.after_attention_bf16(),
+            expected.after_attention_bf16()
+        );
+    });
 }

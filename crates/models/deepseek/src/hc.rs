@@ -9,6 +9,9 @@ use thiserror::Error;
 pub mod mixing;
 pub mod projection;
 
+/// Largest Sinkhorn iteration count accepted by the bounded scalar reference.
+pub(crate) const MAX_SINKHORN_ITERATIONS: usize = 64;
+
 /// One token's Hyper-Connection coefficients.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HcCoefficients {
@@ -205,17 +208,16 @@ impl Shape {
         epsilon: f32,
     ) -> Result<Self, HcError> {
         const MAX_COPIES: usize = 16;
-        const MAX_ITERATIONS: usize = 64;
         if copies == 0 || copies > MAX_COPIES {
             return Err(HcError::InvalidCopies {
                 copies,
                 max_copies: MAX_COPIES,
             });
         }
-        if sinkhorn_iterations == 0 || sinkhorn_iterations > MAX_ITERATIONS {
+        if sinkhorn_iterations == 0 || sinkhorn_iterations > MAX_SINKHORN_ITERATIONS {
             return Err(HcError::InvalidIterations {
                 iterations: sinkhorn_iterations,
-                max_iterations: MAX_ITERATIONS,
+                max_iterations: MAX_SINKHORN_ITERATIONS,
             });
         }
         if !epsilon.is_finite() || epsilon <= 0.0 {

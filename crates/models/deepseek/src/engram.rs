@@ -148,6 +148,18 @@ impl EngramHashLayout {
     fn multiplier(&self, layer: usize, lookback: usize) -> i64 {
         self.multipliers[layer * self.max_ngram_size + lookback]
     }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, EngramHashError> {
+        Ok(Self {
+            max_ngram_size: self.max_ngram_size,
+            heads: self.heads,
+            layers: self.layers,
+            compressed_pad_id: self.compressed_pad_id,
+            primes: try_clone_i64s(&self.primes)?,
+            offsets: try_clone_i64s(&self.offsets)?,
+            multipliers: try_clone_i64s(&self.multipliers)?,
+        })
+    }
 }
 
 /// Stateful, bounded compressed-token history for one fixed batch shape.
@@ -303,6 +315,20 @@ impl EngramHashState {
         Ok(output)
     }
 
+    /// Creates a bounded, fallibly allocated state snapshot for a staged caller update.
+    ///
+    /// This is crate-private because request sessions use it to preserve their
+    /// own commit boundary; external callers should continue to use one owned
+    /// hash state directly.
+    pub(crate) fn try_clone(&self) -> Result<Self, EngramHashError> {
+        Ok(Self {
+            layout: self.layout.try_clone()?,
+            batches: self.batches,
+            capacity: self.capacity,
+            history: try_clone_tokens(&self.history)?,
+        })
+    }
+
     fn hash_chunk(
         &self,
         history: &[Option<CompressedToken>],
@@ -379,6 +405,30 @@ impl EngramHashState {
         }
         Ok(output)
     }
+}
+
+fn try_clone_i64s(values: &[i64]) -> Result<Vec<i64>, EngramHashError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(values.len())
+        .map_err(|_| EngramHashError::AllocationFailed {
+            elements: values.len(),
+        })?;
+    cloned.extend_from_slice(values);
+    Ok(cloned)
+}
+
+fn try_clone_tokens(
+    values: &[Option<CompressedToken>],
+) -> Result<Vec<Option<CompressedToken>>, EngramHashError> {
+    let mut cloned = Vec::new();
+    cloned
+        .try_reserve_exact(values.len())
+        .map_err(|_| EngramHashError::AllocationFailed {
+            elements: values.len(),
+        })?;
+    cloned.extend_from_slice(values);
+    Ok(cloned)
 }
 
 /// Invalid input or bounded arithmetic in an Engram hash reference call.
