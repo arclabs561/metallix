@@ -40,7 +40,7 @@ initializer/tokenizer hashes and both schedules.
 
 The Rust reduced runner still accepts only the original `0/5/6` call starts.
 Alternate intermediate boundaries are now captured under their own identity;
-next qualify the native consumers against those observations. Do not relabel the
+the L3 owner is now qualified below, with the surrounding native layers still open. Do not relabel the
 existing fixture or relax its exact BF16/routing and analytic FP32 checks.
 
 
@@ -65,6 +65,27 @@ validator does not require them to equal L3's selection.
 operands verbatim, with the source receipt and capture identities. Extraction
 requires completed execution and successful observer controls. These checks
 establish source handoffs, not native alternate-partition support.
+
+### Native alternate owner
+
+```sh
+uv run scripts/v41_partition_owner_capture.py --input artifacts/v41-partition-boundaries.json --output artifacts/v41-partition-owner.json
+cargo test -p deepseek --test forward_partition_owner
+```
+
+The compact `partition-owner-reference.json` fixture projects actual source
+operands from the untraced-control receipt above. The Rust test pins its full
+file digest and runs production `RatioOneCompressedOwner` over starts 0, 4, 5
+and 6. Native WKV projections, compressor latents, and committed key/KV prefixes
+match the source exactly. After starts 0 and 5, the leading native keys also
+match the next L1 partial call's two-key and three-key score operands.
+
+Rejected out-of-order and malformed late calls leave epoch, call ordinal,
+position and both prefixes unchanged; the valid retry matches the source.
+Reset advances the epoch, clears positions/prefixes, rejects an old publication
+and replays all four calls exactly. These three integration tests exercise the
+native owner only. They do not establish alternate candidate selection,
+attention, L1 scoring or final-head agreement for the full native graph.
 
 ## Run it
 

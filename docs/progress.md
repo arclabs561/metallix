@@ -366,6 +366,17 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 
 ## Validation
 
+The native L3 `RatioOneCompressedOwner` now executes the source `4 + 1 + 1 + 1`
+partition with exact WKV, compressor latent, committed key and KV prefixes.
+Its native keys match the next L1 partial score operands at starts 4 and 6.
+Three integration tests cover the four-call sequence, out-of-order and malformed
+late-call rejection with unchanged owner state and successful retry, plus reset,
+stale-publication rejection and exact replay. Three extractor/fixture tests
+reject malformed geometry, storage, provenance and substituted partial prefixes.
+This qualifies the owner path; alternate candidate selection, attention and the
+full native graph remain open. The existing numerical policy is unchanged.
+
+
 A separate [source partition probe](research/v41-forward-reference.md#partition-experiment)
 compares `5 + 1 + 1` against `4 + 1 + 1 + 1` using fresh models and identical
 synthetic parameters. Baseline head and L3 KV match their frozen oracles.
@@ -376,7 +387,7 @@ An independently controlled capture now verifies all four L1→L2 and L3→L4
 bridges plus the preceding L3→L1 partial-prefix handoff. The unobserved control
 disables both intermediate hooks and kernel tracing; all four calls preserve
 logits and recorded cache identities. A compact source fixture retains these
-operands with provenance. Rust alternate-partition qualification is still open.
+operands with provenance. Full-graph Rust alternate-partition qualification is still open.
 Nine probe tests and six bridge/extraction tests pass. The canonical Metal gate still reaches the
 unchanged Julia failure below.
 
