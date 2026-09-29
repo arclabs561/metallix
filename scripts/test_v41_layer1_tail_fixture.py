@@ -50,12 +50,17 @@ class LayerOneTailFixtureTest(unittest.TestCase):
             "kernel_source_sha256",
             "cpu_backend_sha256",
             "loader_sha256",
-            "runner_sha256",
             "storage_byteorder",
         )
         self.assertEqual(
             {key: committed["source"][key] for key in stable},
             {key: self.fixture["source"][key] for key in stable},
+        )
+        self.assertEqual(
+            self.fixture["source"]["runner_sha256"],
+            hashlib.sha256(
+                (SCRIPTS / "v41-forward-reference.py").read_bytes()
+            ).hexdigest(),
         )
         for key in ("forward_observers_sha256", "complete_capture_sha256"):
             self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")

@@ -45,6 +45,30 @@ class PartitionLayerOneCaptureTest(unittest.TestCase):
             [4, 6, 6, 6],
         )
 
+    def test_tail_and_its_provenance_are_required(self) -> None:
+        for defect in ("missing", "identity"):
+            with self.subTest(defect=defect):
+                fixture = copy.deepcopy(self.fixture)
+                if defect == "missing":
+                    del fixture["tail"]
+                else:
+                    fixture["tail"]["source_receipt_sha256"] = "0" * 64
+                with self.assertRaises(CaptureError):
+                    capture.validate_layer1_join(fixture)
+
+    def test_rejects_detached_tail_attention_and_layer_two_handoffs(self) -> None:
+        for field in (
+            "attention_input",
+            "attention_output",
+            "layer_two_residual",
+            "layer_two_incoming_pre",
+        ):
+            with self.subTest(field=field):
+                fixture = copy.deepcopy(self.fixture)
+                self._mutate_tensor(fixture["tail"]["cases"][1][field])
+                with self.assertRaises(CaptureError):
+                    capture.validate_layer1_join(fixture)
+
     def test_rejects_detached_owner_attention_boundaries(self) -> None:
         paths = (
             ("input",),

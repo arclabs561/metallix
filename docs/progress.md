@@ -415,8 +415,14 @@ supplied for valid continuation. A full replay after request restart preserves
 the alternate fixture and clears supplied snapshots. Zeroing query normalization
 with a recomputed digest fails the numerical check. This component test uses
 retained native L3 snapshots whose inputs remain source-fed; it does not execute
-the full graph in live layer order. L1 HC/FFN, L2 and the live per-call join to L3
-still separate these portions from full native-graph qualification. Owner cancellation/retry checks
+the full graph in live layer order. The persistent L1 session now carries its
+computed Engram residual into attention HC and FFN, rather than rereading the
+captured residual after Engram. All four terminal residuals match the observed
+L2 entry exactly; returned HC coefficients pass the existing source-derived
+bounds. A detached residual oracle with a recomputed digest fails the native
+HC handoff check. Eight Python projection controls also reject missing tail
+metadata and detached attention or L2 entry boundaries. L2 and the live per-call
+join to L3 remain open before full native-graph qualification. Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 

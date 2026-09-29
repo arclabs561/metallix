@@ -265,6 +265,7 @@ fn coefficients(
 fn attention_handoffs(
     fixture: &Fixture,
     outputs: &[(usize, Vec<u16>)],
+    supplied_entries: Option<&BlockEntries>,
 ) -> Vec<(usize, Vec<u16>, Vec<f32>)> {
     assert!(
         (1..=fixture.cases.len()).contains(&outputs.len()),
@@ -283,7 +284,20 @@ fn attention_handoffs(
                 &case.attention_output.bf16(),
                 "native layer-one attention output"
             );
-            let residual = case.residual.bf16();
+            let captured_residual = case.residual.bf16();
+            let residual = if let Some(entries) = supplied_entries {
+                let (_, residual, _) = entries
+                    .iter()
+                    .find(|(entry_start, _, _)| entry_start == start)
+                    .expect("supplied native L1 HC residual");
+                assert_eq!(
+                    residual, &captured_residual,
+                    "native L1 HC residual boundary"
+                );
+                residual.as_slice()
+            } else {
+                captured_residual.as_slice()
+            };
             let mut after_attention = Vec::new();
             let mut pre = Vec::new();
             for (position, row) in residual.chunks_exact(256).enumerate() {
@@ -540,7 +554,7 @@ pub(super) fn native_layer_one_entries_from_block_entries_with_previous_layer_th
             &inputs,
             previous_layer_three_prefix,
         );
-    native_ffn(&fixture, &attention_handoffs(&fixture, &outputs))
+    native_ffn(&fixture, &attention_handoffs(&fixture, &outputs, entries))
 }
 
 pub(super) fn native_layer_one_entries_from_engram_entries(
@@ -626,9 +640,49 @@ impl NativeLayerOneSession {
         }
     }
 
-    /// Supplies L3's complete prior-call publication after L1 start five and
-    /// before L1 start six.  It is deliberately not available to either of
-    /// the earlier L1 calls.
+    pub(super) fn from_alternate(projection: &Value, startup: &Value) -> Self {
+        for name in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(
+                projection["tail"][name], projection[name],
+                "alternate L1 tail provenance"
+            );
+            assert_eq!(
+                projection[name], startup[name],
+                "alternate startup provenance"
+            );
+        }
+        let fixture: Fixture =
+            serde_json::from_value(projection["tail"].clone()).expect("alternate L1 tail");
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(fixture.block_config.copies, 2);
+        assert_eq!(fixture.block_config.norm_eps.to_bits(), 1e-20_f32.to_bits());
+        assert_eq!(fixture.block_config.hc_eps.to_bits(), 1e-6_f32.to_bits());
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .map(|case| case.start_pos)
+                .collect::<Vec<_>>(),
+            [0, 4, 5, 6]
+        );
+        Self {
+            fixture,
+            engram: layer1_engram_capture::NativeLayerOneEngramSession::from_alternate_startup(
+                startup,
+            ),
+            owner: layer1_owner_capture::NativeLayerOneOwnerSession::from_alternate(
+                projection, startup,
+            ),
+            attention: layer1_attention_capture::NativeLayerOneAttentionSession::from_alternate(
+                projection,
+            ),
+            last_publication: None,
+            next_case: 0,
+        }
+    }
+
+    /// Supplies L3's complete preceding-call publication before a partial
+    /// L1 compression group consumes its score keys.
     pub(super) fn supply_previous_layer_three_prefix(&mut self, prefix: &[u16]) {
         self.owner.supply_previous_layer_three_prefix(prefix);
     }
@@ -673,7 +727,8 @@ impl NativeLayerOneSession {
                 .as_ref()
                 .expect("live L1 owner publication"),
         );
-        let handoff = attention_handoffs(&self.fixture, &[attention]);
+        let native_entry = (start, residual, incoming_pre.1.clone());
+        let handoff = attention_handoffs(&self.fixture, &[attention], Some(&[native_entry]));
         let mut output = native_ffn(&self.fixture, &handoff);
         self.next_case += 1;
         output.pop().expect("one native L1 FFN result")
@@ -699,5 +754,5 @@ fn discarded_native_layer_one_attention_fails_before_ffn() {
     let inputs = native_inputs(&fixture, None);
     let mut outputs = layer1_attention_capture::native_outputs_from_inputs(&inputs);
     outputs[0].1.fill(0);
-    attention_handoffs(&fixture, &outputs);
+    attention_handoffs(&fixture, &outputs, None);
 }

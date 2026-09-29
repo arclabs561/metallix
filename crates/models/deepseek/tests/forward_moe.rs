@@ -3769,7 +3769,7 @@ fn alternate_layer_one_projection() -> Value {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-layer1-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
-        "6e98d38d175483cc21a87135ee7b1cd38ed7528a8f4febf210a8c5fc079a52fa"
+        "331f3abfc14c2918e200e9af3de181b1aa619949ace235eb553beb7bc12b6b7f"
     );
     serde_json::from_str(raw).unwrap()
 }
@@ -3828,4 +3828,39 @@ fn alternate_layer_one_query_rejects_changed_native_normalization() {
         .is_err(),
         "native query normalization must affect the numerical gate"
     );
+}
+
+#[test]
+fn alternate_partition_native_layer_one_tail_reaches_layer_two_entry() {
+    let projection = alternate_layer_one_projection();
+    let startup = layer_zero::alternate_startup_projection();
+    let upstream = layer_zero::native_layer_zero_entries_from_projection(&startup);
+    let publications = partition_owner::alternate_partition_layer_three_publications();
+    let mut layer_one = layer1_join::NativeLayerOneSession::from_alternate(&projection, &startup);
+    for (index, (start, residual, pre)) in upstream.iter().enumerate() {
+        if matches!(start, 4 | 6) {
+            layer_one.supply_previous_layer_three_prefix(&publications[index - 1].key_prefix);
+        }
+        let (output_start, output, next_pre) =
+            layer_one.step(&(*start, residual.clone()), &(*start, pre.clone()));
+        assert_eq!(output_start, *start);
+        assert_eq!(next_pre.len(), output.len() / 128);
+        assert_eq!(layer_one.last_publication().start_pos, *start);
+    }
+}
+
+#[test]
+#[should_panic(expected = "native L1 HC residual boundary")]
+fn alternate_layer_one_tail_rejects_a_detached_residual_oracle() {
+    let mut projection = alternate_layer_one_projection();
+    let tensor = &mut projection["tail"]["cases"][0]["residual"];
+    let byte_count = usize::try_from(tensor["numel"].as_u64().unwrap()).unwrap() * 2;
+    let zeros = vec![0_u8; byte_count];
+    tensor["storage_hex"] = Value::String("00".repeat(byte_count));
+    tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&zeros)));
+    let startup = layer_zero::alternate_startup_projection();
+    let upstream = layer_zero::native_layer_zero_entries_from_projection(&startup);
+    let mut layer_one = layer1_join::NativeLayerOneSession::from_alternate(&projection, &startup);
+    let (start, residual, pre) = &upstream[0];
+    layer_one.step(&(*start, residual.clone()), &(*start, pre.clone()));
 }

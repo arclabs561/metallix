@@ -15,9 +15,11 @@ from typing import Any
 
 from v41_layer1_attention_capture import layer_one_attention_projection
 from v41_layer1_owner_capture import _tensor, layer1_owner_projection
+from v41_layer1_tail_capture import layer1_tail_projection
 from v41_partition_owner_capture import CaptureError, partition_owner_fixture
 
 SCHEDULE = ((0, 4, 2, 4, 2), (4, 1, 2, 6, 0), (5, 1, 3, 6, 1), (6, 1, 3, 6, 0))
+TAIL_SCHEDULE = tuple((start, sequence) for start, sequence, *_ in SCHEDULE)
 MAX_FIXTURE_BYTES = 1 << 20
 
 
@@ -136,6 +138,44 @@ def validate_layer1_join(fixture: dict[str, Any]) -> None:
                     "partial layer-one score prefix must not alias own keys"
                 )
 
+    tail = fixture.get("tail")
+    if not isinstance(tail, dict):
+        raise CaptureError("alternate layer-one fixture tail must be an object")
+    for name in ("source", "source_receipt_sha256", "capture_identity"):
+        if fixture.get(name) != tail.get(name):
+            raise CaptureError(f"alternate layer-one tail {name} differs")
+    tail_cases = tail.get("cases")
+    if not isinstance(tail_cases, list) or len(tail_cases) != len(SCHEDULE):
+        raise CaptureError("alternate layer-one tail requires four cases")
+    for tail_case, attention_case, (start, sequence) in zip(
+        tail_cases, attention_cases, TAIL_SCHEDULE, strict=True
+    ):
+        residual = tail_case.get("residual") if isinstance(tail_case, dict) else None
+        if (
+            not isinstance(tail_case, dict)
+            or tail_case.get("start_pos") != start
+            or tail_case.get("attention_input") != attention_case.get("input")
+            or tail_case.get("attention_output") != attention_case.get("output")
+        ):
+            raise CaptureError("alternate layer-one attention-to-tail handoff differs")
+        if not isinstance(residual, dict) or residual.get("shape") != [
+            1,
+            sequence,
+            2,
+            128,
+        ]:
+            raise CaptureError("alternate layer-one tail residual shape differs")
+        for produced, consumed in (
+            ("output", "layer_two_residual"),
+            ("next_pre", "layer_two_incoming_pre"),
+        ):
+            if not isinstance(tail_case.get(produced), dict) or tail_case.get(
+                produced
+            ) != tail_case.get(consumed):
+                raise CaptureError(
+                    "alternate layer-one tail does not feed layer-two entry"
+                )
+
 
 def partition_layer1_fixture(raw: bytes) -> dict[str, Any]:
     """Project the observed 4/1/1/1 L1 owner without rewriting its identity."""
@@ -189,18 +229,44 @@ def partition_layer1_fixture(raw: bytes) -> dict[str, Any]:
             "runtime": {"storage_byteorder": runtime["storage_byteorder"]},
         }
     )
+    tail = layer1_tail_projection(model, encoded, calls, schedule=TAIL_SCHEDULE)
+    tail.update(
+        {
+            "source": owner["source"],
+            "source_receipt_sha256": owner["source_receipt_sha256"],
+            "capture_identity": owner["capture_identity"],
+        }
+    )
+    for source, tail_case, (_, token_count) in zip(
+        calls, tail["cases"], TAIL_SCHEDULE, strict=True
+    ):
+        intermediates = source.get("intermediates")
+        if not isinstance(intermediates, dict):
+            raise CaptureError("alternate layer-one tail call lacks intermediates")
+        engram = _tensor(
+            intermediates.get("layers.1.engram"),
+            "alternate layer-one Engram output",
+            dtype="torch.bfloat16",
+            shape=[1, token_count, 2, 128],
+        )
+        if tail_case.get("residual") != engram:
+            raise CaptureError(
+                "alternate layer-one tail does not consume Engram output"
+            )
     fixture = {
         **projection,
         "scope": (
-            "source alternate layer-one ratio-two owner and query operands for the "
-            "observed 4/1/1/1 partition; partial calls retain the prior published "
-            "key and KV prefixes; not canonical capture metadata or native execution"
+            "source alternate layer-one ratio-two owner, attention, and FFN-tail "
+            "operands for the observed 4/1/1/1 partition; partial calls retain the "
+            "prior published key and KV prefixes; not canonical capture metadata or "
+            "native execution"
         ),
         "source": owner["source"],
         "source_receipt_sha256": owner["source_receipt_sha256"],
         "capture_identity": owner["capture_identity"],
         "query_parameters": _query_parameters(encoded),
         "attention": attention,
+        "tail": tail,
     }
     validate_layer1_join(fixture)
     return fixture
