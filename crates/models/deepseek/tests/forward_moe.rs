@@ -1535,7 +1535,7 @@ impl ReducedLiveRequest {
         ))
         .expect("unified reduced bundle");
         Self {
-            l1: layer1_join::NativeLayerOneSession::new(),
+            l1: layer1_join::NativeLayerOneSession::from_bundle(&bundle),
             l2: layer2_join::NativeLayerTwoSession::from_bundle(&bundle),
             engram3: engram_capture::NativeLayerThreeEngramSession::from_bundle(&bundle),
             l3_fixture: layer_three_fixture_from_bundle(&bundle),
@@ -1698,6 +1698,97 @@ fn completed_reduced_request() -> ReducedLiveRequest {
         );
     }
     request
+}
+
+fn unified_l1_session_fixture() -> (Value, (usize, Vec<u16>, Vec<f32>)) {
+    let bundle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("unified bundle");
+    let stream: Tensor = serde_json::from_value(
+        bundle["projections"]["layer1_engram"]["cases"][0]["stream"].clone(),
+    )
+    .unwrap();
+    let pre: Tensor = serde_json::from_value(
+        bundle["projections"]["layer1_tail"]["cases"][0]["incoming_pre"].clone(),
+    )
+    .unwrap();
+    let input = (0, stream.bf16(), pre.fp32());
+    (bundle, input)
+}
+
+#[test]
+fn unified_l1_rejects_changed_source_metadata() {
+    let (bundle, _) = unified_l1_session_fixture();
+    for name in [
+        "layer1_engram",
+        "layer1_owner",
+        "layer1_attention",
+        "layer1_tail",
+    ] {
+        let mut changed = bundle.clone();
+        changed["projections"][name]["source"]["loader_sha256"] = Value::String("0".repeat(64));
+        assert!(
+            std::panic::catch_unwind(|| layer1_join::NativeLayerOneSession::from_bundle(&changed))
+                .is_err(),
+            "changed source accepted: {name}"
+        );
+    }
+}
+
+#[test]
+fn unified_l1_consumes_supplied_weights() {
+    let (bundle, (start, stream, pre)) = unified_l1_session_fixture();
+    let stream = (start, stream);
+    let pre = (start, pre);
+    for (projection, container, weight) in [
+        (
+            "layer1_engram",
+            "encoded_parameters",
+            "layers.1.engram.q_weight",
+        ),
+        (
+            "layer1_owner",
+            "encoded_parameters",
+            "layers.1.attn.compressor.norm.weight",
+        ),
+        (
+            "layer1_attention",
+            "encoded_parameters",
+            "layers.1.attn.q_norm.weight",
+        ),
+        (
+            "layer1_tail",
+            "block_parameters",
+            "layers.1.ffn_norm.weight",
+        ),
+    ] {
+        let mut changed = bundle.clone();
+        let tensor = &mut changed["projections"][projection][container][weight];
+        let bytes = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
+        tensor["storage_hex"] = Value::String("0".repeat(bytes.len() * 2));
+        tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&bytes)));
+        let mut session = layer1_join::NativeLayerOneSession::from_bundle(&changed);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.step(&stream, &pre)))
+                .is_err(),
+            "changed supplied weight bypassed: {projection}"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "bundle layer-one owner requires a live previous-layer-three prefix")]
+fn unified_l1_requires_live_prior_l3_prefix() {
+    let (bundle, _) = unified_l1_session_fixture();
+    let mut owner = layer1_owner_capture::NativeLayerOneOwnerSession::from_bundle(&bundle);
+    for case in bundle["projections"]["layer1_owner"]["cases"]
+        .as_array()
+        .unwrap()
+    {
+        let input: Tensor = serde_json::from_value(case["input"].clone()).unwrap();
+        owner.step_with_input(&input.bf16());
+    }
 }
 
 fn unified_l2_session_fixture() -> (Value, (usize, Vec<u16>, Vec<f32>)) {

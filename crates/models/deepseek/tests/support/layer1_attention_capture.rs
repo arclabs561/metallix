@@ -339,7 +339,42 @@ pub(super) struct NativeLayerOneAttentionSession {
 
 impl NativeLayerOneAttentionSession {
     pub(super) fn new() -> Self {
-        let root = fixture();
+        Self::from_root(fixture())
+    }
+
+    /// Starts persistent layer-one attention from the caller's unified
+    /// projection, with capture metadata pinned to the checked-in bundle.
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
+        assert_eq!(field(bundle, "schema_version").as_u64(), Some(1));
+        let pinned: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+        ))
+        .expect("pinned reduced bundle metadata");
+        assert_eq!(
+            field(bundle, "source"),
+            field(&pinned, "source"),
+            "bundle source metadata"
+        );
+        let projection = field(field(bundle, "projections"), "layer1_attention");
+        assert_eq!(field(projection, "schema_version").as_u64(), Some(1));
+        assert_eq!(
+            field(projection, "source"),
+            field(&field(&pinned, "projections")["layer1_attention"], "source"),
+            "layer-one attention source metadata"
+        );
+        Self::from_root(projection.clone())
+    }
+
+    fn from_root(root: Value) -> Self {
+        assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
+        assert_eq!(
+            field(field(&root, "source"), "revision").as_str(),
+            Some(REVISION)
+        );
+        assert_eq!(
+            field(field(&root, "source"), "storage_byteorder").as_str(),
+            Some("little")
+        );
         Self {
             frequencies: frequencies(&root),
             weights: weights(&root),

@@ -10,6 +10,7 @@ use deepseek::{
     hc::{HcCoefficients, mixing::hc_post_bf16_reference, projection::project_hc_diagnostics},
 };
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -67,6 +68,42 @@ fn fixture() -> Fixture {
         FIXTURE_SHA256
     );
     let fixture: Fixture = serde_json::from_str(raw).expect("layer-one tail fixture JSON");
+    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(fixture.block_config.copies, 2);
+    assert_eq!(fixture.block_config.norm_eps.to_bits(), 1e-20_f32.to_bits());
+    assert_eq!(fixture.block_config.hc_eps.to_bits(), 1e-6_f32.to_bits());
+    assert_eq!(
+        fixture
+            .cases
+            .iter()
+            .map(|case| case.start_pos)
+            .collect::<Vec<_>>(),
+        [0, 5, 6]
+    );
+    fixture
+}
+
+/// Decodes the L1 tail projection from a unified reduced-runner bundle.
+/// Identity stays bound to the checked-in source record; all retained tail
+/// arithmetic operands are decoded from the caller's projection.
+fn fixture_from_bundle(bundle: &Value) -> Fixture {
+    assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+    let pinned: Value = serde_json::from_str(include_str!(
+        "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+    ))
+    .expect("pinned reduced bundle metadata");
+    assert_eq!(bundle["source"], pinned["source"], "bundle source metadata");
+    let raw = bundle["projections"]["layer1_tail"].clone();
+    assert_eq!(raw["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        raw["source"], pinned["projections"]["layer1_tail"]["source"],
+        "layer1_tail source metadata"
+    );
+    assert_eq!(
+        raw["source"]["complete_capture_sha256"], bundle["source"]["complete_capture_sha256"],
+        "layer1_tail capture"
+    );
+    let fixture: Fixture = serde_json::from_value(raw).expect("bundled layer-one tail fixture");
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.block_config.copies, 2);
     assert_eq!(fixture.block_config.norm_eps.to_bits(), 1e-20_f32.to_bits());
@@ -574,12 +611,16 @@ pub(super) struct NativeLayerOneSession {
 }
 
 impl NativeLayerOneSession {
-    pub(super) fn new() -> Self {
+    /// Starts the persistent L1 join from the caller's unified bundle. Each
+    /// child owns its validated projection for the lifetime of this request.
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
         Self {
-            fixture: fixture(),
-            engram: layer1_engram_capture::NativeLayerOneEngramSession::new(),
-            owner: layer1_owner_capture::NativeLayerOneOwnerSession::new(None),
-            attention: layer1_attention_capture::NativeLayerOneAttentionSession::new(),
+            fixture: fixture_from_bundle(bundle),
+            engram: layer1_engram_capture::NativeLayerOneEngramSession::from_bundle(bundle),
+            owner: layer1_owner_capture::NativeLayerOneOwnerSession::from_bundle(bundle),
+            attention: layer1_attention_capture::NativeLayerOneAttentionSession::from_bundle(
+                bundle,
+            ),
             last_publication: None,
             next_case: 0,
         }

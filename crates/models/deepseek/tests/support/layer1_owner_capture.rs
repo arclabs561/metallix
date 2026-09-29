@@ -16,6 +16,7 @@ use deepseek::{
     select_indices,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const REVISION: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
@@ -111,6 +112,11 @@ fn fixture() -> Fixture {
 
 fn fixture_from_raw(raw: &str, expected_capture: &str) -> Fixture {
     let fixture: Fixture = serde_json::from_str(raw).expect("layer-one owner fixture JSON");
+    validate_fixture(&fixture, expected_capture);
+    fixture
+}
+
+fn validate_fixture(fixture: &Fixture, expected_capture: &str) {
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.source.revision, REVISION);
     assert_eq!(fixture.source.complete_capture_sha256, expected_capture);
@@ -118,7 +124,6 @@ fn fixture_from_raw(raw: &str, expected_capture: &str) -> Fixture {
     assert_eq!(fixture.model.ratio, 2);
     assert_eq!(fixture.model.index_topk, 1);
     assert_eq!(fixture.cases.len(), 3);
-    fixture
 }
 
 fn nonzero(value: usize) -> NonZeroUsize {
@@ -659,15 +664,51 @@ pub(super) struct NativeLayerOneOwnerSession {
     kv: Vec<u16>,
     score_state: LayerThreeSharedScoreState,
     previous_layer_three_prefix: Option<Vec<u16>>,
+    require_previous_layer_three_prefix: bool,
     next_case: usize,
 }
 
 impl NativeLayerOneOwnerSession {
     pub(super) fn new(previous_layer_three_prefix: Option<&[u16]>) -> Self {
+        Self::from_fixture(fixture(), previous_layer_three_prefix, false)
+    }
+
+    /// Decodes the layer-one owner operands from the unified reduced bundle.
+    /// The request must later supply the preceding live L3 key publication
+    /// before processing its start-six partial decode.
+    #[allow(
+        dead_code,
+        reason = "used by the composed forward test, not the standalone owner test binary"
+    )]
+    pub(super) fn from_bundle(bundle: &Value) -> Self {
+        let pinned: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/reduced-runner-reference.json"
+        ))
+        .expect("pinned reduced bundle metadata");
+        assert_eq!(bundle["schema_version"].as_u64(), Some(1));
+        assert_eq!(bundle["source"], pinned["source"], "bundle source metadata");
+        let projection = bundle["projections"]["layer1_owner"].clone();
+        assert_eq!(
+            projection["source"], pinned["projections"]["layer1_owner"]["source"],
+            "layer-one owner source metadata"
+        );
+        let capture = bundle["source"]["complete_capture_sha256"]
+            .as_str()
+            .expect("bundle capture identity");
+        let fixture: Fixture =
+            serde_json::from_value(projection).expect("layer-one owner bundle JSON");
+        validate_fixture(&fixture, capture);
+        Self::from_fixture(fixture, None, true)
+    }
+
+    fn from_fixture(
+        fixture: Fixture,
+        previous_layer_three_prefix: Option<&[u16]>,
+        require_previous_layer_three_prefix: bool,
+    ) -> Self {
         if let Some(prefix) = previous_layer_three_prefix {
             assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
         }
-        let fixture = fixture();
         let compressor_norm = bf16(parameter(&fixture, "layers.1.attn.compressor.norm.weight"));
         let norm_eps = fixture.model.norm_eps;
         Self {
@@ -693,6 +734,7 @@ impl NativeLayerOneOwnerSession {
             kv: Vec::new(),
             score_state: LayerThreeSharedScoreState::new(),
             previous_layer_three_prefix: previous_layer_three_prefix.map(ToOwned::to_owned),
+            require_previous_layer_three_prefix,
             next_case: 0,
         }
     }
@@ -720,6 +762,12 @@ impl NativeLayerOneOwnerSession {
         );
         if case.start_pos == 0 {
             self.score_state.reset();
+        }
+        if case.start_pos == 6
+            && self.require_previous_layer_three_prefix
+            && self.previous_layer_three_prefix.is_none()
+        {
+            panic!("bundle layer-one owner requires a live previous-layer-three prefix");
         }
         let (projected, gate) = source_projections(case, input, &self.wkv, &self.wgate);
         let latent = self
@@ -773,6 +821,7 @@ impl NativeLayerOneOwnerSession {
                 &self.fixture,
                 &source_score_keys,
                 self.previous_layer_three_prefix.as_deref(),
+                self.require_previous_layer_three_prefix,
             );
         }
         let score_keys = self
@@ -864,10 +913,13 @@ fn publish_previous_layer_three_prefix(
     fixture: &Fixture,
     source_score_keys: &[u16],
     previous_layer_three_prefix: Option<&[u16]>,
+    require_previous_layer_three_prefix: bool,
 ) {
     let prefix = if let Some(prefix) = previous_layer_three_prefix {
         assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
         prefix[..source_score_keys.len()].to_vec()
+    } else if require_previous_layer_three_prefix {
+        panic!("bundle layer-one owner requires a live previous-layer-three prefix");
     } else {
         let captured = prior_layer_three_prefix(fixture);
         assert_eq!(captured.len(), source_score_keys.len());

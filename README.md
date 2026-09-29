@@ -42,7 +42,7 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications, tested request invalidation/rebuild, and unified-bundle L0, L2, L3 and L4/head operands with committed L3 key/KV reuse | Test-private fixture-backed operands remain; production recovery and native generation are unfinished |
+| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications, tested request invalidation/rebuild, and unified-bundle operands throughout L0–L4 and the head with committed L3 key/KV reuse | Test-private fixture-backed operands remain; production recovery and native generation are unfinished |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 
@@ -492,10 +492,10 @@ now retains layer-one, layer-two, Engram3 and layer-three state through starts
 bootstrap and final continuation reuse prior outputs without replaying them.
 The request rejects continuation after failure and requires reconstruction.
 Layer four directly consumes committed layer-three key/KV prefixes while computing
-its own query and selection. The unified reduced-runner fixture supplies layer-zero,
-L2 HC/attention/FFN, L3 Engram/owner/attention/tail, L4 attention/selection/MoE
-and head operands. L1 operands still use legacy captures. Alternate prefill/decode partitions, remaining operand
-migration and production recovery remain gates before a production decoder.
+its own query and selection. The unified reduced-runner fixture supplies all
+L0–L4 and head numerical operands in this composition. The partial L1 call
+requires the preceding live L3 publication. Alternate prefill/decode partitions,
+checkpoint loading and production recovery remain gates before a production decoder.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated
