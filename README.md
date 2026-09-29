@@ -512,8 +512,10 @@ The retained L3 candidate set and key/KV publications now feed L4's own query,
 selection and attention. Computed L3 residuals and coefficients continue through
 L4 HC/FFN and final logits under the existing source-derived bounds. Earlier L3
 inputs remain source-fed. On the upstream side, native token startup, L0 window
-attention, HC and FFN now reach the observed L1 Engram input for all four calls.
-Native L1 Engram/L1–L2 and their join to L3 remain open before full-graph
+attention, HC and FFN now feed persistent native L1 Engram for all four calls.
+Its computed outputs and L0 coefficients reach the observed L1 attention input
+exactly, including rejection of a bad stream followed by valid continuation.
+L1 attention/HC/FFN, L2 and their join to L3 remain open before full-graph
 partition qualification.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover

@@ -675,7 +675,7 @@ fn alternate_startup_projection() -> Value {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-startup-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
-        "e541cf0ae0e5c33441585e2960be9e9cd4ea00f3b427ed12c9177c7a3f355b3b"
+        "440503a08fb157cc9c215ce2f3fa8a8ccb31e8cdf608e0558f07e1f57f6206e5"
     );
     let root: Value = serde_json::from_str(raw).expect("alternate startup projection");
     assert_eq!(
@@ -707,6 +707,59 @@ fn alternate_partition_native_startup_reaches_layer_one_stream() {
         assert_eq!(*start, usize_field(case, "start_pos"));
         assert_eq!(residual, &bf16(field(case, "layer_one_engram_stream")));
         assert_eq!(pre.len(), residual.len() / 128);
+    }
+}
+
+#[test]
+fn alternate_partition_native_startup_and_engram_reach_layer_one_attention_input() {
+    let root = alternate_startup_projection();
+    let upstream = native_layer_zero_entries_from_projection(&root);
+    let mut engram =
+        layer1_engram_capture::NativeLayerOneEngramSession::from_alternate_startup(&root);
+    let norm = bf16(field(
+        field(&root, "parameters"),
+        "layers.1.attn_norm.weight",
+    ));
+    for ((start, residual, pre), case) in upstream.iter().zip(root["cases"].as_array().unwrap()) {
+        let (entry_start, entry) = engram.step(Some(&(*start, residual.clone())));
+        assert_eq!(entry_start, *start);
+        assert_eq!(entry, bf16(&case["downstream"]["layer_one_engram_output"]));
+        let mut attention_input = Vec::new();
+        for (residual, pre) in entry.chunks_exact(256).zip(pre.chunks_exact(2)) {
+            let mut collapsed = vec![0; 128];
+            hc_pre_bf16_reference(residual, pre, 128, &mut collapsed).unwrap();
+            let mut normalized = vec![0; 128];
+            rms_norm_bf16_reference(&collapsed, &norm, 1.0e-20, &mut normalized).unwrap();
+            attention_input.extend(normalized);
+        }
+        assert_eq!(
+            attention_input,
+            bf16(&case["downstream"]["layer_one_attention_input"])
+        );
+    }
+}
+
+#[test]
+fn alternate_partition_engram_rejects_bad_stream_then_continues_same_history() {
+    let root = alternate_startup_projection();
+    let upstream = native_layer_zero_entries_from_projection(&root);
+    let mut engram =
+        layer1_engram_capture::NativeLayerOneEngramSession::from_alternate_startup(&root);
+    let mut control =
+        layer1_engram_capture::NativeLayerOneEngramSession::from_alternate_startup(&root);
+    for (index, (start, residual, _)) in upstream.iter().enumerate() {
+        if index == 2 {
+            let mut invalid = residual.clone();
+            invalid[0] ^= 1;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    engram.step(Some(&(*start, invalid)));
+                }))
+                .is_err()
+            );
+        }
+        let input = (*start, residual.clone());
+        assert_eq!(engram.step(Some(&input)), control.step(Some(&input)));
     }
 }
 

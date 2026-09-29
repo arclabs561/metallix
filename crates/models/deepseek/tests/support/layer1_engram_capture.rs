@@ -128,12 +128,13 @@ pub(crate) fn native_layer_one_block_entries_from_streams(
 }
 
 /// Test-private layer-one Engram request session.  The hash history is kept
-/// live so start five and six extend the same source request rather than
+/// live so each decode call extends the same source request rather than
 /// replaying its bootstrap prefix.
 pub(crate) struct NativeLayerOneEngramSession {
     root: Value,
     hashes: EngramHashState,
     next_case: usize,
+    next_start: usize,
 }
 
 impl NativeLayerOneEngramSession {
@@ -162,6 +163,25 @@ impl NativeLayerOneEngramSession {
             field(&field(&pinned, "projections")["layer1_engram"], "source"),
             "layer-one Engram source metadata"
         );
+        Self::from_root(projection.clone())
+    }
+
+    /// Uses only the alternate projection supplied by the hash-pinned caller.
+    pub(crate) fn from_alternate_startup(startup: &Value) -> Self {
+        let projection = field(startup, "layer_one_engram");
+        for metadata in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(field(projection, metadata), field(startup, metadata));
+        }
+        assert_eq!(
+            field(field(startup, "capture_identity"), "schedule"),
+            &serde_json::json!([4, 1, 1, 1])
+        );
+        let cases = field(projection, "cases").as_array().unwrap();
+        assert_eq!(cases.len(), 4);
+        for (case, (start, count)) in cases.iter().zip([(0, 4), (4, 1), (5, 1), (6, 1)]) {
+            assert_eq!(usize_field(case, "start_pos"), start);
+            assert_eq!(shape(field(case, "input_ids")), [1, count]);
+        }
         Self::from_root(projection.clone())
     }
 
@@ -204,6 +224,7 @@ impl NativeLayerOneEngramSession {
             root,
             hashes: EngramHashState::new(hash_layout, 1, capacity).unwrap(),
             next_case: 0,
+            next_start: 0,
         }
     }
 
@@ -218,7 +239,7 @@ impl NativeLayerOneEngramSession {
         let layer_ids = field(layout, "layer_ids").as_array().unwrap();
         let case = &field(&self.root, "cases").as_array().unwrap()[self.next_case];
         let start = usize_field(case, "start_pos");
-        assert_eq!(start, [0, 5, 6][self.next_case], "native Engram call order");
+        assert_eq!(start, self.next_start, "native Engram call order");
         // Reject caller input before publishing any token history.
         let captured = bf16(field(case, "stream"));
         let stream = supplied_stream.map_or(captured.as_slice(), |(supplied_start, supplied)| {
@@ -277,6 +298,7 @@ impl NativeLayerOneEngramSession {
             .collect::<Vec<_>>();
         let output = gate_output(case, model, stream, &key, &value, &q, &k);
         self.next_case += 1;
+        self.next_start += positions;
         (start, output)
     }
 }

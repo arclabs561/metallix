@@ -400,8 +400,14 @@ startup, L0 window attention, HC and FFN on starts 0/4/5/6. The computed termina
 stream matches the observed L1 Engram input exactly; a changed embedding with a
 recomputed storage digest fails the numerical gate. Observed token IDs are joined
 to captured calls by start and count, checked against the experiment input, and
-retain alternate receipt provenance. Native L1 Engram/L1–L2 and their join to L3
-still separate these qualified portions from full native-graph qualification. Owner cancellation/retry checks
+retain alternate receipt provenance. Persistent native L1 Engram now consumes
+those computed streams, matching hash IDs, embedding, FP8 WKV and residual gate
+outputs on every call. Its outputs and native L0 HC coefficients produce the
+observed L1 attention input exactly. A rejected stream at start five leaves the
+same history usable for valid continuation through start six. Nine Python
+controls cover the token join and detached Engram provenance/IDs/input/output.
+L1 attention/HC/FFN, L2 and their join to L3 still separate these qualified
+portions from full native-graph qualification. Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 

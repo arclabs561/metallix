@@ -69,6 +69,47 @@ class PartitionStartupCaptureTest(unittest.TestCase):
         )
         self.assertEqual(token_ids, list(range(7)))
 
+    def test_engram_join_retains_source_identity_and_native_seams(self) -> None:
+        startup.validate_engram_join(self.fixture, self.fixture["layer_one_engram"])
+
+    def test_rejects_detached_engram_boundaries_and_metadata(self) -> None:
+        for defect in (
+            "source",
+            "receipt",
+            "identity",
+            "ids",
+            "stream",
+            "output",
+            "schedule",
+        ):
+            with self.subTest(defect=defect):
+                engram = copy.deepcopy(self.fixture["layer_one_engram"])
+                case = engram["cases"][1]
+                if defect == "source":
+                    engram["source"]["revision"] = "0" * 40
+                elif defect == "receipt":
+                    engram["source_receipt_sha256"] = "0" * 64
+                elif defect == "identity":
+                    engram["capture_identity"]["sha256"] = "0" * 64
+                elif defect == "schedule":
+                    case["start_pos"] = 5
+                else:
+                    field = "input_ids" if defect == "ids" else defect
+                    tensor = case[field]
+                    raw = bytearray.fromhex(tensor["storage_hex"])
+                    raw[0] ^= 1
+                    tensor["storage_hex"] = raw.hex()
+                    tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises(CaptureError):
+                    startup.validate_engram_join(self.fixture, engram)
+
+    def test_engram_join_rejects_matching_absent_provenance(self) -> None:
+        fixture = copy.deepcopy(self.fixture)
+        del fixture["source_receipt_sha256"]
+        del fixture["layer_one_engram"]["source_receipt_sha256"]
+        with self.assertRaises(CaptureError):
+            startup.validate_engram_join(fixture, fixture["layer_one_engram"])
+
     def test_rejects_swapped_capture_calls(self) -> None:
         alternate, token_ids = self.alternate()
         (
