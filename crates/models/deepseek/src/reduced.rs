@@ -35,7 +35,18 @@ pub use layer_three::{
 };
 
 mod candidates;
+mod request;
+pub use request::{
+    BlockDefinition, EngramDefinition, LayerFourDefinition, LayerOneDefinition,
+    LayerThreeDefinition, RequestError, RequestModel, RequestSession, RequestStepOutput,
+    ReusedAttentionDefinition, StartupDefinition,
+};
+mod layer_four;
 pub use candidates::{CandidateProjection, CandidateProjector, CandidateProjectorError};
+pub use layer_four::{
+    LayerFourCall, LayerFourConfig, LayerFourSession, LayerFourSessionError, LayerFourStepOutput,
+    LayerThreePublication,
+};
 
 mod input;
 pub use input::{AttentionInput, AttentionInputError, AttentionInputOutput};
@@ -70,6 +81,12 @@ pub struct FinalHead<'a> {
 }
 
 impl<'a> FinalHead<'a> {
+    /// Returns the fixed HC copy count and hidden width for request composition.
+    #[must_use]
+    pub(crate) const fn geometry(self) -> (usize, usize) {
+        (self.copies, self.width)
+    }
+
     /// Validates the static final-normalization and output-head operands.
     ///
     /// `norm_weight` is BF16 storage `[hidden_width]`; `head_weight` is FP32

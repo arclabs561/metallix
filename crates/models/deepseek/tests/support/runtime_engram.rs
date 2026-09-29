@@ -56,7 +56,8 @@ fn bf16(value: &Value) -> Vec<u16> {
         .collect()
 }
 
-pub(crate) fn session(root: &Value, layer: u64) -> EngramSession {
+/// Decodes immutable source operands so callers can construct fresh request-local sessions.
+pub(crate) fn definition(root: &Value, layer: u64) -> (EngramSessionConfig, EngramSessionWeights) {
     let model = &root["model"];
     let state = &root["engram"]["hash_state"];
     let layout = &root["engram"]["layout"];
@@ -105,6 +106,11 @@ pub(crate) fn session(root: &Value, layer: u64) -> EngramSession {
         bf16(tensor("q_weight")),
         bf16(tensor("k_weight")),
     );
+    (config, weights)
+}
+
+pub(crate) fn session(root: &Value, layer: u64) -> EngramSession {
+    let (config, weights) = definition(root, layer);
     EngramSession::new(config, weights).unwrap()
 }
 

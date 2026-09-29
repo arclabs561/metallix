@@ -21,6 +21,12 @@ pub struct AttentionInput<'a> {
 }
 
 impl<'a> AttentionInput<'a> {
+    /// Returns the fixed HC copy count and normalized hidden width.
+    #[must_use]
+    pub(crate) const fn geometry(self) -> (usize, usize) {
+        (self.copies, self.width)
+    }
+
     /// Validates the normalization weight, HC copy count, and RMS epsilon.
     pub fn new(
         norm_weight: &'a [u16],

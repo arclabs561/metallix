@@ -42,6 +42,12 @@ pub struct LayerThreeConfig {
 }
 
 impl LayerThreeConfig {
+    /// Returns the fixed L3 compressed-attention geometry for request composition.
+    #[must_use]
+    pub(crate) const fn attention_layout(self) -> LayerAttentionLayout {
+        self.attention_layout
+    }
+
     /// Validates the explicitly supplied L3 owner and candidate geometry.
     #[allow(
         clippy::too_many_arguments,

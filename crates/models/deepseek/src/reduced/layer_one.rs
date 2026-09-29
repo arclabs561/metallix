@@ -44,6 +44,12 @@ pub struct LayerOneConfig {
 }
 
 impl LayerOneConfig {
+    /// Returns the fixed L1 compressed-attention geometry for request composition.
+    #[must_use]
+    pub(crate) const fn attention_layout(self) -> LayerAttentionLayout {
+        self.attention_layout
+    }
+
     /// Validates the L1 geometry shared by the ratio-two owner and attention ring.
     pub fn new(
         owner_layout: RatioTwoOwnerLayout,

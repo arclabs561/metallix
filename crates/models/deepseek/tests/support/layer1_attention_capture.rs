@@ -272,7 +272,7 @@ pub(super) fn with_alternate_runtime_attention_operands<R>(
     with_runtime_attention_operands(projection, body)
 }
 
-fn layout(root: &Value) -> LayerAttentionLayout {
+pub(super) fn layout(root: &Value) -> LayerAttentionLayout {
     let model = field(root, "model");
     let ratios = field(model, "compress_ratios").as_array().expect("ratios");
     assert_eq!(ratios[1].as_u64(), Some(2));

@@ -511,10 +511,11 @@ boundaries and discrete routing remain exact. Invalid Engram streams and L3
 owner inputs are rejected before their respective state advances.
 
 This qualifies the fixed reduced `4 + 1 + 1 + 1` composition alongside the
-canonical `5 + 1 + 1` path. The alternate test evaluates the L3/L4 tails and head
-after its upstream call loop; it is not an interleaved production request runner.
-Broader schedules, alternate full-request failure recovery, checkpoint loading
-and serving remain open. Runtime components under `deepseek::reduced` now own
+canonical `5 + 1 + 1` path. `RequestSession` now executes all five blocks and
+the final head within each call, using ordinary typed numerical operands.
+Both schedules match the existing source-derived final-logit bounds and replay
+identically after whole-request restart. Broader schedules, a synthetic-input
+CLI, checkpoint loading and serving remain open. Runtime components under `deepseek::reduced` now own
 final-head arithmetic, attention HC/FFN block tails, and persistent Engram hashing,
 embedding, projection and gating. They accept supplied operands without fixture
 readers or expected outputs. Engram publishes history only after a successful
@@ -528,7 +529,12 @@ failure/reset lifecycle. It derives publication identity and window offsets
 from live state and returns owned publications for downstream layers.
 `LayerOneSession` owns ratio-two compression, direct score selection and attention;
 partial calls require the preceding L3 publication while retaining L1 KV.
-Complete L1–L4 request orchestration still remains in the test harness.
+`LayerFourSession` uses L3's actual committed candidate mask, keys and KV;
+it validates candidate geometry before computing its own query and attention.
+`RequestSession` owns the complete ordering and invalidates any admitted failed
+call. Restart reconstructs every owner from immutable operands. L0 retains its
+separate rotary table; L1–L4 use their qualified shared table. Fixture decoding
+and source comparisons remain test-only.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

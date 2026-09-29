@@ -52,15 +52,23 @@ ownership, query scoring, direct causal selection and attention. Partial groups
 require the preceding L3 publication with matching source, epoch and call ordinal,
 and consume its leading completed-group rows while keeping L1 KV. The session
 derives token/group frequency positions and publication identity from live state.
-Full-request orchestration still needs extraction, including Engram/block-tail
-ordering and coherent recovery across layers.
+`LayerFourSession` now consumes the actual committed L3 candidate mask, keys
+and KV, checking batch, ratio, key count, window offset and publication identity.
+`RequestModel` and `RequestSession` compose the fixed five-block path over ordinary
+operands. Each call reaches the final head before the next call starts. A failed
+admitted call poisons the whole request; restart reconstructs every owner and
+Engram history together, dropping prior publications. Startup retains its own
+rotary table: source qualification exposed that L0 and L1–L4 tables differ after
+position zero. Both established schedules pass their final-logit source bounds
+and replay identically after restart. A malformed L4 weight exercises late
+failure after the earlier owners have advanced.
 Weights must be separated from the source cases; synthetic layouts remain explicitly
 bounded. Both established schedules must work. A late failure invalidates the
 request, and restart reconstructs all mutable state from immutable weights.
 No component-local rollback claim is sufficient for the entire request.
 
-Only after that library path returns independently checked logits should a CLI
-accept supplied synthetic weights and token IDs. A head-only call is a component
+The library path now returns independently checked logits. The next slice is a
+CLI accepting supplied synthetic weights and token IDs. A head-only call is a component
 diagnostic, not token generation. Metal, checkpoint loading and serving follow
 the roadmap's separate gates. Review this extraction after the first executable
 stateful request; do not grow this module into a generic backend abstraction.

@@ -114,8 +114,41 @@ pub struct SelectionCall {
 }
 
 impl SelectionCall {
+    /// Crate-private metadata accessors for request sessions that consume a
+    /// candidate publication from an earlier layer.
+    #[must_use]
+    pub(crate) const fn publication(self) -> IndexKeyPublicationId {
+        self.publication
+    }
+
+    #[must_use]
+    pub(crate) const fn token_start(self) -> usize {
+        self.geometry.token_start
+    }
+
+    #[must_use]
+    pub(crate) const fn positions(self) -> NonZeroUsize {
+        self.geometry.positions
+    }
+
+    #[must_use]
+    pub(crate) const fn batch_index(self) -> usize {
+        self.batch_index
+    }
+
+    #[must_use]
     pub(crate) const fn score_shape(self) -> (usize, usize) {
         (self.geometry.positions.get(), self.geometry.key_count.get())
+    }
+
+    #[must_use]
+    pub(crate) const fn compression_ratio(self) -> NonZeroUsize {
+        self.geometry.compression_ratio
+    }
+
+    #[must_use]
+    pub(crate) const fn offset(self) -> usize {
+        self.geometry.offset
     }
 
     /// Groups the key publication identity with a validated selection geometry.

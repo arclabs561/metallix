@@ -11,6 +11,23 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- `RequestModel`/`RequestSession` now run the complete fixed five-block scalar
+  request from token IDs through final logits. All numerical operands are typed;
+  fixture readers and expected outputs stay in tests. Both `5+1+1` and `4+1+1+1`
+  execute the full path per call and satisfy their existing source-derived final
+  bounds. Each replays identically after an admitted failure and whole-request
+  restart. A malformed L4 weight separately proves late failure invalidation
+  after prior owners advance. L0 has its own rotary table; accidentally sharing
+  the later-layer table was caught by the new full-request source test.
+  `LayerFourSession` consumes L3's actual candidate mask and rejects inconsistent
+  publication geometry. The synthetic-input CLI is next; checkpoint loading,
+  Metal and serving are not implemented by this scalar reference.
+  Focused receipts: `.agents/receipts/candidate-control/runtime-request-focused.log`
+  and `runtime-l4-boundaries.log`. The canonical Metal check passes DeepSeek
+  (including 101 composition tests) and stops at the unchanged Julia
+  `unmasked_control hidden[0]` mismatch. Strict DeepSeek all-target/all-feature
+  Clippy also passes; see `runtime-request-{full-check,clippy}.log`.
+
 - `LayerOneSession` now owns ratio-two compression, query scoring, direct
   causal selection and attention. It derives token and completed-group rotary
   positions from live state. Partial calls validate the preceding L3 publication
@@ -21,8 +38,7 @@ choices without expanding current support claims.
   and rejection of stale L3 epochs. The serial Metal check completes DeepSeek
   and stops at the same Julia numerical mismatch recorded below. Receipts:
   `.agents/receipts/candidate-control/runtime-l1-{composition,full-check}.log`.
-  Whole-request ordering and recovery across Engram, block tails and all layers
-  still need runtime orchestration.
+  This session now feeds the complete request composition above.
 
 - `LayerThreeSession` now owns the ratio-one compressor/key/KV, candidate
   projection/selection and attention lifecycle over caller-supplied operands.
@@ -35,7 +51,7 @@ choices without expanding current support claims.
   The serial Metal check completes DeepSeek and stops at the unchanged Julia
   `unmasked_control hidden[0]` mismatch (`-0.2049238` versus `-0.20494038`).
   Receipts: `.agents/receipts/candidate-control/runtime-l3-{focused,full-check}.log`.
-  Request-wide orchestration remains to extract.
+  Request-wide orchestration is now provided by `RequestSession`.
 
 - L1 ratio-two compression, key preparation and paired key/KV publication now
   execute in `RatioTwoCompressedOwner` from live inputs and borrowed weights.
@@ -44,7 +60,7 @@ choices without expanding current support claims.
   computes query scores and masks from supplied input and keys, with exact
   row-geometry checks. Both source schedules still reach their existing final
   logit bounds. These primitives now feed the runtime L1/L3 sessions; complete
-  request assembly remains test-owned. Six independent owner/projector tests cover partial
+  request assembly is now composed by `RequestSession`. Six independent owner/projector tests cover partial
   publications, late-error retry, reset epochs and score-matrix geometry.
 
 - `StartupSession` now executes the complete first block from supplied token
@@ -53,14 +69,14 @@ choices without expanding current support claims.
   startup, attention and FFN source boundary remains checked. A late FFN
   failure after attention commits poisons the session until reset; both
   schedules replay after reset. `AttentionInput` owns the shared incoming
-  HC collapse and RMSNorm. L1–L4 request assembly is still test-owned.
+  HC collapse and RMSNorm. `RequestSession` now owns the complete assembly.
 
 - Reduced runtime components now include `BlockTailReference` and persistent
   `EngramSession`. The block tail consumes actual attention and residuals;
   Engram owns hashing, FP8 embedding/WKV and residual gating over supplied
   tokens and weights. Hash history and cursor publish only after success.
-  Fixture parsing and source comparisons remain test-owned. Complete request
-  assembly, typed request weights and the synthetic token-input CLI are next.
+  Fixture parsing and source comparisons remain test-owned. The complete request
+  assembly and typed operands are now implemented; the synthetic token-input CLI is next.
   All 98 composition tests and four runtime Engram tests pass, including late
   gate failure, reset, malformed continuation and partial WKV scale groups.
   Strict DeepSeek Clippy, doctests and documentation checks pass. The canonical
@@ -71,7 +87,7 @@ choices without expanding current support claims.
   and alternate compositions use it under their unchanged source envelopes.
   Independent boundary tests exercise non-128 widths, changed supplied inputs
   and weights, malformed/nonfinite inputs and bounded allocation geometry.
-  The stateful token-to-logits runner remains to be extracted; see the
+  The stateful token-to-logits runner is now extracted; see the
   [extraction decision](design/deepseek-reduced-executor.md).
 
 - A frozen four-task/two-seed schedule comparison now separates non-overlap

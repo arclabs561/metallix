@@ -7,10 +7,13 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference};
-use deepseek::reduced::{AttentionInput, BlockTailReference, FinalHead};
+use deepseek::reduced::{
+    AttentionInput, BlockTailReference, FinalHead, LayerFourCall, LayerFourConfig,
+    LayerFourSession, LayerThreePublication,
+};
 use deepseek::{
     RotaryFrequency,
-    attention::layer::{Fp8Projection, LayerAttentionState},
+    attention::layer::Fp8Projection,
     ffn::FfnSublayerReference,
     hc::{
         HcCoefficients,
@@ -19,10 +22,7 @@ use deepseek::{
         split_hc_coefficients,
     },
     indexer::{
-        query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
-            IndexQueryWeights, prepare_scored_query,
-        },
+        query::{CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights},
         selection::{
             SelectionAdapterError, SelectionCall, SelectionGeometry, select_from_candidates,
         },
@@ -65,6 +65,8 @@ mod owner_attention_capture;
 )]
 #[path = "forward_partition_owner.rs"]
 mod partition_owner;
+#[path = "support/request_capture.rs"]
+mod request_capture;
 #[path = "support/rounding_interval.rs"]
 mod rounding_interval;
 
@@ -560,32 +562,6 @@ impl AlternateL4Query {
             index_topk: model.index_topk,
         }
     }
-    fn prepare(
-        &self,
-        input: &[u16],
-        frequencies: &[deepseek::RotaryFrequency],
-        keys: &[u16],
-    ) -> deepseek::indexer::query::ScoredQueryDiagnostic {
-        prepare_scored_query(
-            input,
-            frequencies,
-            CandidateQueryWeights {
-                wq_a: Fp8Projection {
-                    codes: &self.query_codes,
-                    scales: &self.query_scales,
-                },
-                q_norm: &self.query_norm,
-                index: IndexQueryWeights {
-                    wq_b_codes: &self.index_codes,
-                    wq_b_scales: &self.index_scales,
-                    weights_proj: &self.weights_projection,
-                },
-            },
-            self.layout,
-            IndexKeyView::new(keys, NonZeroUsize::new(self.head_dimension).unwrap()).unwrap(),
-        )
-        .expect("alternate L4 own query over committed L3 keys")
-    }
 }
 
 fn alternate_l4_input(
@@ -687,52 +663,10 @@ fn assert_alternate_l4_query(
     );
 }
 
-fn alternate_l4_selected(
-    prepared: &deepseek::indexer::query::ScoredQueryDiagnostic,
-    selection_case: &AlternateL4SelectionCase,
-    call: SelectionCall,
-    publication: &partition_owner::AlternateLayerThreePublication,
-    stale: Option<&partition_owner::AlternateLayerThreePublication>,
-    index_topk: usize,
-) -> Vec<i32> {
-    let selected = select_from_candidates(
-        &prepared.scores,
-        call,
-        &publication.producer_candidates,
-        index_topk,
-    )
-    .expect("alternate L4 selection from committed L3 candidates");
-    if let Some(stale) = stale {
-        assert!(matches!(
-            select_from_candidates(
-                &prepared.scores,
-                call,
-                &stale.producer_candidates,
-                index_topk,
-            ),
-            Err(SelectionAdapterError::CandidateCallMismatch)
-        ));
-    }
-    if let Some(expected_causal) = &selection_case.causal_scores {
-        assert_eq!(
-            selected.causal_scores,
-            expected_causal.bf16(),
-            "alternate L4 causal scores"
-        );
-    }
-    assert_eq!(
-        selected.masked_scores,
-        selection_case.scores_after_candidate_mask.bf16(),
-        "alternate L4 candidate-masked scores"
-    );
-    assert_eq!(
-        selected.indices,
-        selection_case.indices.i32(),
-        "alternate L4 IDs"
-    );
-    selected.indices
-}
-
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the source stage comparisons beside live L4 execution"
+)]
 fn alternate_l4_attention_outputs(
     fixture: &AlternateL4RunFixture,
     publications: &[partition_owner::AlternateLayerThreePublication],
@@ -746,8 +680,14 @@ fn alternate_l4_attention_outputs(
     let weights = attention_capture::weights_for_layer(&fixture.attention.encoded_parameters, 4);
     let frequencies = fixture.attention.frequencies.frequencies();
     let parameters = block_tail_parameters(&fixture.tail);
-    let mut attention_state =
-        LayerAttentionState::new(attention_capture::layout(&fixture.attention.model));
+    let mut attention_state = LayerFourSession::new(
+        LayerFourConfig::new(
+            query.layout,
+            attention_capture::layout(&fixture.attention.model),
+            NonZeroUsize::new(query.index_topk).unwrap(),
+        )
+        .expect("alternate L4 runtime layout"),
+    );
     fixture
         .attention
         .cases
@@ -789,34 +729,63 @@ fn alternate_l4_attention_outputs(
                 );
                 let call_frequencies =
                     attention_capture::call_frequencies(&frequencies, attention_case);
-                let prepared = query.prepare(&input, call_frequencies, &publication.key_prefix);
-                assert_alternate_l4_query(&prepared, selection_case);
+                let query_weights = CandidateQueryWeights {
+                    wq_a: Fp8Projection {
+                        codes: &query.query_codes,
+                        scales: &query.query_scales,
+                    },
+                    q_norm: &query.query_norm,
+                    index: IndexQueryWeights {
+                        wq_b_codes: &query.index_codes,
+                        wq_b_scales: &query.index_scales,
+                        weights_proj: &query.weights_projection,
+                    },
+                };
+                let publication_input = LayerThreePublication::new(
+                    publication.publication,
+                    &publication.key_prefix,
+                    &publication.kv_prefix,
+                    &publication.producer_candidates,
+                );
+                let output = attention_state
+                    .step(LayerFourCall::new(
+                        &input,
+                        call_frequencies,
+                        query_weights,
+                        weights.borrowed(),
+                        publication_input,
+                    ))
+                    .expect("alternate committed L3 publication drives L4 runtime");
+                assert_alternate_l4_query(output.scored(), selection_case);
                 let stale = publications
                     .iter()
                     .find(|other| other.publication != publication.publication);
-                let indices = alternate_l4_selected(
-                    &prepared,
-                    selection_case,
-                    call,
-                    publication,
-                    stale,
-                    query.index_topk,
+                if let Some(stale) = stale {
+                    assert!(matches!(
+                        select_from_candidates(
+                            &output.scored().scores,
+                            call,
+                            &stale.producer_candidates,
+                            query.index_topk,
+                        ),
+                        Err(SelectionAdapterError::CandidateCallMismatch)
+                    ));
+                }
+                if let Some(expected_causal) = &selection_case.causal_scores {
+                    assert_eq!(output.selection().causal_scores, expected_causal.bf16());
+                }
+                assert_eq!(
+                    output.selection().masked_scores,
+                    selection_case.scores_after_candidate_mask.bf16(),
+                    "alternate L4 candidate-masked scores"
                 );
-                let diagnostic = attention_capture::forward_with_publication(
-                    &mut attention_state,
-                    &input,
-                    attention_case.start_pos,
-                    publication.publication.epoch(),
-                    publication.publication.call_id(),
-                    3,
-                    &publication.kv_prefix,
-                    &indices,
-                    call_frequencies,
-                    weights.borrowed(),
-                )
-                .expect("alternate committed L3 publication drives L4 attention");
-                attention_capture::assert_diagnostic(attention_case, &diagnostic);
-                diagnostic.final_output
+                assert_eq!(
+                    output.selection().indices,
+                    selection_case.indices.i32(),
+                    "alternate L4 IDs"
+                );
+                attention_capture::assert_diagnostic(attention_case, output.attention());
+                output.attention().final_output.clone()
             },
         )
         .collect()
@@ -2751,10 +2720,11 @@ fn reduced_l3_bundle_weight_is_consumed_by_final_suffix() {
 
 #[test]
 fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
+    // Candidate weights are consumed before this finish boundary. Their
+    // corruption is checked by unified_l3_publisher_consumes_supplied_weights.
     for defect in [
         "owner_capture",
         "observer_identity",
-        "candidate_weight",
         "l4_norm",
         "head_weight",
     ] {
@@ -2768,12 +2738,6 @@ fn reduced_l4_bundle_rejects_mixed_owner_and_changed_weights() {
             "observer_identity" => {
                 projections["layer3_candidate"]["source"]["forward_observers_sha256"] =
                     Value::String("0".repeat(64));
-            }
-            "candidate_weight" => {
-                let tensor = &mut projections["layer3_candidate"]["encoded_parameters"]["layers.3.attn.q_norm.weight"];
-                let zeros = vec![0_u8; tensor["storage_hex"].as_str().unwrap().len() / 2];
-                tensor["storage_hex"] = Value::String("0".repeat(zeros.len() * 2));
-                tensor["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&zeros)));
             }
             "l4_norm" => {
                 let weight = &mut projections["layer4_moe"]["block_parameters"]["layers.4.ffn_norm.weight"]

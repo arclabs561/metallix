@@ -206,7 +206,7 @@ fn weights(root: &Value) -> Weights {
     }
 }
 
-fn layout(root: &Value) -> LayerAttentionLayout {
+pub(super) fn layout(root: &Value) -> LayerAttentionLayout {
     let model = field(root, "model");
     let ratios = field(model, "compress_ratios").as_array().expect("ratios");
     assert_eq!(ratios[1].as_u64(), Some(2));

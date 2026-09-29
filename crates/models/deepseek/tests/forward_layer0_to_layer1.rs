@@ -497,6 +497,44 @@ fn with_native_layer_zero_moe<R>(root: &Value, body: impl FnOnce(MoEReference<'_
 }
 
 fn with_runtime_startup<R>(root: &Value, body: impl FnOnce(StartupSession<'_>) -> R) -> R {
+    with_runtime_startup_operands(root, |table, norm, epsilon, layout, weights, tail| {
+        body(StartupSession::new(table, norm, epsilon, layout, weights, tail).unwrap())
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "used when nested by the full request integration binary"
+)]
+pub(crate) fn with_runtime_startup_definition<R>(
+    root: &Value,
+    body: impl FnOnce(deepseek::reduced::StartupDefinition<'_>) -> R,
+) -> R {
+    let startup_frequencies = frequencies(&root["cases"][0]["attention"]["frequencies"]);
+    with_runtime_startup_operands(root, |table, norm, epsilon, layout, weights, tail| {
+        body(deepseek::reduced::StartupDefinition::new(
+            table,
+            norm,
+            epsilon,
+            layout,
+            weights,
+            tail,
+            &startup_frequencies,
+        ))
+    })
+}
+
+fn with_runtime_startup_operands<R>(
+    root: &Value,
+    body: impl FnOnce(
+        &[u16],
+        &[u16],
+        f32,
+        LayerAttentionLayout,
+        LayerAttentionWeights<'_>,
+        BlockTailReference<'_>,
+    ) -> R,
+) -> R {
     let parameters = field(root, "parameters");
     let model = field(root, "model");
     let table = bf16(field(parameters, "embed.weight"));
@@ -541,15 +579,12 @@ fn with_runtime_startup<R>(root: &Value, body: impl FnOnce(StartupSession<'_>) -
         )
         .unwrap();
         body(
-            StartupSession::new(
-                &table,
-                &norm,
-                epsilon,
-                window_only_layout(root),
-                attention.borrowed(),
-                tail,
-            )
-            .unwrap(),
+            &table,
+            &norm,
+            epsilon,
+            window_only_layout(root),
+            attention.borrowed(),
+            tail,
         )
     })
 }

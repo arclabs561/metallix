@@ -33,10 +33,13 @@ use deepseek::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
             IndexQueryWeights, ScoredQueryError, prepare_scored_query,
         },
-        selection::{SelectionCall, SelectionGeometry, select_from_candidates},
+        selection::{CandidateSelection, SelectionCall, SelectionGeometry, select_from_candidates},
     },
     precision::{Fp4ActivationMode, requantize_bf16_activations_e2m1},
-    reduced::{LayerThreeCall, LayerThreeConfig, LayerThreeSession},
+    reduced::{
+        LayerFourCall, LayerFourConfig, LayerFourDefinition, LayerFourSession, LayerThreeCall,
+        LayerThreeConfig, LayerThreeDefinition, LayerThreePublication, LayerThreeSession,
+    },
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -840,6 +843,117 @@ fn publication_bundle_operands(bundle: &Value) -> (Value, Value, &str) {
     )
 }
 
+/// Lends decoded bundle-backed L3 producer and L4 consumer operands to one
+/// runtime request construction. Numerical buffers remain owned by this
+/// adapter, so no fixture-derived borrow can escape the callback.
+pub(super) fn with_bundle_runtime_l3_l4_operands<R>(
+    bundle: &Value,
+    body: impl FnOnce(
+        LayerThreeDefinition<'_>,
+        LayerFourDefinition<'_>,
+        &[deepseek::RotaryFrequency],
+    ) -> R,
+) -> R {
+    let l3 = NativeLayerThreePublisher::bundle_operands(bundle);
+    let l3_attention: attention_capture::Fixture =
+        serde_json::from_value(l3.attention.clone()).expect("typed bundled L3 attention");
+    let l3_owner_model = field(&l3.owner, "model");
+    let l3_compressor_weights = field(&l3.compressor, "weights");
+    let l3_owner_weights = field(&l3.owner, "weights");
+    let l3_wkv = bf16(field(l3_compressor_weights, "wkv"));
+    let l3_compressor_norm = bf16(field(l3_compressor_weights, "norm"));
+    let l3_wk = bf16(field(l3_owner_weights, "wk"));
+    let l3_key_norm = bf16(field(l3_owner_weights, "norm"));
+    let l3_key_layout =
+        IndexKeyLayout::new(nonzero(1), nonzero(64), nonzero(64), nonzero(16), 1e-20)
+            .expect("bundled L3 key layout");
+    let l3_config = LayerThreeConfig::new(
+        l3_key_layout,
+        nonzero(128),
+        nonzero(usize_field(l3_owner_model, "cache_capacity")),
+        attention_layout(&l3_attention.model),
+        nonzero(l3_attention.model.window_size),
+        nonzero(1),
+    )
+    .expect("bundled L3 session geometry");
+    let l3_owner = RatioOneOwnerWeights::new(&l3_wkv, IndexKeyWeights::new(&l3_wk, &l3_key_norm));
+    let l3_attention_weights =
+        attention_capture::weights_for_layer(&l3_attention.encoded_parameters, 3);
+
+    let (l4_raw, _l3_candidate, _capture) = publication_bundle_operands(bundle);
+    let l4_attention: attention_capture::Fixture =
+        serde_json::from_value(l4_raw.clone()).expect("typed bundled L4 attention");
+    let l4_model = field(&l4_raw, "model");
+    let l4_parameters = field(&l4_raw, "encoded_parameters");
+    let l4_heads = usize_field(l4_model, "index_n_heads");
+    let l4_head_dimension = usize_field(l4_model, "index_head_dim");
+    let l4_index_layout = IndexQueryLayout::new(
+        nonzero(1),
+        nonzero(usize_field(l4_model, "dim")),
+        nonzero(usize_field(l4_model, "q_lora_rank")),
+        nonzero(l4_heads),
+        nonzero(l4_head_dimension),
+        nonzero(usize_field(l4_model, "rope_head_dim") / 2),
+    )
+    .expect("bundled L4 index layout");
+    let l4_query_codes = fp8(field(l4_parameters, "layers.4.attn.wq_a.weight"));
+    let l4_query_scales = fp8(field(l4_parameters, "layers.4.attn.wq_a.scale"));
+    let l4_query_norm = bf16(field(l4_parameters, "layers.4.attn.q_norm.weight"));
+    let l4_wq_b_codes = fp8(field(l4_parameters, "layers.4.attn.indexer.wq_b.weight"));
+    let l4_wq_b_scales = fp8(field(l4_parameters, "layers.4.attn.indexer.wq_b.scale"));
+    let l4_weights_proj = bf16(field(
+        l4_parameters,
+        "layers.4.attn.indexer.weights_proj.weight",
+    ));
+    let l4_query_weights = CandidateQueryWeights {
+        wq_a: Fp8Projection {
+            codes: &l4_query_codes,
+            scales: &l4_query_scales,
+        },
+        q_norm: &l4_query_norm,
+        index: IndexQueryWeights {
+            wq_b_codes: &l4_wq_b_codes,
+            wq_b_scales: &l4_wq_b_scales,
+            weights_proj: &l4_weights_proj,
+        },
+    };
+    let l4_query_layout = CandidateQueryLayout::new(
+        l4_index_layout,
+        serde_json::from_value(field(l4_model, "norm_eps").clone())
+            .expect("bundled L4 normalization epsilon"),
+    )
+    .expect("bundled L4 query layout");
+    let l4_config = LayerFourConfig::new(
+        l4_query_layout,
+        attention_layout(&l4_attention.model),
+        nonzero(usize_field(l4_model, "index_topk")),
+    )
+    .expect("bundled L4 session geometry");
+    let l4_attention_weights =
+        attention_capture::weights_for_layer(&l4_attention.encoded_parameters, 4);
+    let l3_frequencies = frequencies(&l3_attention);
+    assert_eq!(
+        l3_frequencies,
+        frequencies(&l4_attention),
+        "bundled L3/L4 full RoPE table"
+    );
+
+    candidate_capture::with_bundle_candidate_projector(&l3.candidate, &l3.capture, |candidate| {
+        body(
+            LayerThreeDefinition::new(
+                l3_config,
+                &l3_compressor_norm,
+                1e-20,
+                l3_owner,
+                candidate,
+                l3_attention_weights.borrowed(),
+            ),
+            LayerFourDefinition::new(l4_config, l4_query_weights, l4_attention_weights.borrowed()),
+            &l3_frequencies,
+        )
+    })
+}
+
 fn assert_publication_boundary(
     publication: &NativeLayerThreePublication,
     attention_case: &attention_capture::Case,
@@ -883,6 +997,10 @@ fn assert_publication_boundary(
 
 /// Consumes already committed L3 publication snapshots for L4. It never stages
 /// or commits another ratio-one owner; only L4's own query and selection run.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep the source stage comparisons beside live L4 execution"
+)]
 pub(super) fn native_outputs_from_bundle_publications(
     supplied_inputs: &[(usize, Vec<u16>)],
     bundle: &Value,
@@ -893,7 +1011,7 @@ pub(super) fn native_outputs_from_bundle_publications(
         publications.len(),
         "L4 publication count"
     );
-    let (raw, candidate, capture) = publication_bundle_operands(bundle);
+    let (raw, candidate, _capture) = publication_bundle_operands(bundle);
     let attention: attention_capture::Fixture =
         serde_json::from_value(raw.clone()).expect("typed L4 bundle attention");
     let model = field(&raw, "model");
@@ -920,9 +1038,25 @@ pub(super) fn native_outputs_from_bundle_publications(
         wq_b_scales: &wq_b_scales,
         weights_proj: &weights_proj,
     };
+    let query_codes = fp8(field(parameters, "layers.4.attn.wq_a.weight"));
+    let query_scales = fp8(field(parameters, "layers.4.attn.wq_a.scale"));
+    let query_norm = bf16(field(parameters, "layers.4.attn.q_norm.weight"));
+    let query_layout = CandidateQueryLayout::new(
+        index_layout,
+        serde_json::from_value(field(model, "norm_eps").clone())
+            .expect("L4 source normalization epsilon"),
+    )
+    .expect("L4 candidate query layout");
     let all_frequencies = frequencies(&attention);
     let weights = attention_weights(&attention.encoded_parameters);
-    let mut state = LayerAttentionState::new(attention_layout(&attention.model));
+    let mut state = LayerFourSession::new(
+        LayerFourConfig::new(
+            query_layout,
+            attention_layout(&attention.model),
+            nonzero(usize_field(model, "index_topk")),
+        )
+        .expect("L4 runtime session geometry"),
+    );
     let raw_cases = field(&raw, "cases").as_array().expect("L4 source cases");
     assert_eq!(raw_cases.len(), attention.cases.len());
     assert_eq!(raw_cases.len(), 3, "source partition count");
@@ -942,33 +1076,99 @@ pub(super) fn native_outputs_from_bundle_publications(
         assert_eq!(*start, attention_case.start_pos, "L4 supplied start");
         assert_publication_boundary(publication, attention_case, raw_case, &candidate, call_id);
         assert_eq!(input, &attention_case.input.bf16(), "L4 supplied input");
-        let indices = generated_indices(
-            &raw,
-            raw_case,
-            attention_case,
-            index_layout,
-            index_weights,
-            &publication.key_prefix,
-            publication.publication,
-            &publication.input,
-            input,
-            Some((&candidate, capture)),
+        let source_mask = bools(
+            field(field(raw_case, "indexer"), "inputs")
+                .get("candidate_mask")
+                .unwrap_or_else(|| panic!("L4 source candidate mask")),
         );
-        let diagnostic = forward_with_publication(
-            &mut state,
-            input,
-            *start,
-            0,
-            u64::try_from(call_id).expect("L4 call"),
-            SOURCE_LAYER,
-            &publication.kv_prefix,
-            &indices,
-            call_frequencies(&all_frequencies, attention_case),
-            weights.borrowed(),
-        )
-        .expect("committed L3 publication drives L4 attention");
-        assert_diagnostic(attention_case, &diagnostic);
-        outputs.push(diagnostic.final_output);
+        assert_eq!(
+            publication.producer_candidates.mask(),
+            source_mask,
+            "committed live L3 candidate mask"
+        );
+        let output = state
+            .step(LayerFourCall::new(
+                input,
+                call_frequencies(&all_frequencies, attention_case),
+                CandidateQueryWeights {
+                    wq_a: Fp8Projection {
+                        codes: &query_codes,
+                        scales: &query_scales,
+                    },
+                    q_norm: &query_norm,
+                    index: index_weights,
+                },
+                weights.borrowed(),
+                LayerThreePublication::new(
+                    publication.publication,
+                    &publication.key_prefix,
+                    &publication.kv_prefix,
+                    &publication.producer_candidates,
+                ),
+            ))
+            .expect("committed L3 publication drives L4 runtime attention");
+        let indexer = field(raw_case, "indexer");
+        let operations = field(indexer, "operations");
+        assert_eq!(
+            output.scored().query.wq_a,
+            attention_case.wq_a_output.bf16(),
+            "live L4 WQ-A"
+        );
+        assert_eq!(
+            output.scored().query.qr,
+            attention_case.q_norm_output.bf16(),
+            "live L4 QR"
+        );
+        assert_eq!(
+            output.scored().query.index.query_post_fp4,
+            bf16(field(operations, "q_after_rope_fp4")),
+            "live L4 index query"
+        );
+        assert_eq!(
+            output.scored().query.index.projected_head_weights,
+            bf16(field(operations, "weights_proj_output")),
+            "live L4 index head weights"
+        );
+        assert_eq!(
+            output.scored().query.index.scaled_head_weights,
+            bf16(field(operations, "scaled_weights")),
+            "live L4 scaled head weights"
+        );
+        assert_eq!(
+            output.scored().dot_products,
+            bf16(field(operations, "scores_einsum"))
+        );
+        assert_eq!(
+            output.scored().rectified,
+            bf16(field(operations, "scores_after_relu"))
+        );
+        assert_eq!(
+            output.scored().weighted,
+            bf16(field(operations, "scores_weighted_per_head"))
+        );
+        assert_eq!(
+            output.scored().scores,
+            bf16(field(operations, "scores_after_head_sum"))
+        );
+        if let Some(expected) = operations.get("scores_after_causal_mask") {
+            assert_eq!(
+                output.selection().causal_scores,
+                bf16(expected),
+                "live L4 causal scores"
+            );
+        }
+        assert_eq!(
+            output.selection().masked_scores,
+            bf16(field(operations, "scores_after_candidate_mask")),
+            "live L4 candidate-masked scores"
+        );
+        assert_eq!(
+            output.selection().indices,
+            i32s(field(indexer, "output_indices")),
+            "live L4 selected IDs"
+        );
+        assert_diagnostic(attention_case, output.attention());
+        outputs.push(output.attention().final_output.clone());
     }
     outputs
 }
@@ -999,6 +1199,7 @@ pub(super) struct NativeLayerThreePublication {
     pub(super) input: Vec<u16>,
     pub(super) key_prefix: Vec<u16>,
     pub(super) kv_prefix: Vec<u16>,
+    pub(super) producer_candidates: CandidateSelection,
 }
 
 /// Numerical operands for the persistent L3 producer.  The bundle variant is
@@ -1409,6 +1610,7 @@ impl NativeLayerThreePublisher {
             input: owner_input.to_vec(),
             key_prefix: output.key_prefix().to_vec(),
             kv_prefix: output.kv_prefix().to_vec(),
+            producer_candidates: output.candidate().candidates().clone(),
         });
         if self.next_call == 1 {
             assert_eq!(
