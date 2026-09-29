@@ -5,6 +5,60 @@ model ranking or a performance evaluation of other runtimes. Model cards and
 runtime support matrices are mutable; their claims below are upstream claims,
 not independently reproduced Metallix results.
 
+## September 29 update: evidence that changes the next gates
+
+This update prioritizes September releases, with July/August context where it
+changes a runtime contract. It is a bounded sample of ML directions relevant to
+Metallix, not a comprehensive survey or a ranking. External measurements below
+are upstream reports, not local qualification. Earlier sections retain their
+original review scope.
+
+| Direction and dated primary evidence | What is actually available | Metallix consequence |
+| --- | --- | --- |
+| Small specialized decision models: [Jeff v1.1, September 29](https://github.com/firelex/jeff/blob/f06788292874c21a5b5c41549ac220dd9e15da7f/README.md) | Released Qwen3.5/Gemma4 fine-tunes and serving/training code. The Qwen v1.1 release expands its trained option range; that does not establish calibration on our tasks. | Evaluate a trained decoder readout as a separate candidate after a pinned forward oracle. Existing Qwen3 direct option logits do not imply support. |
+| Typed decision serving: [Ollama v0.35.0, September 28](https://github.com/ollama/ollama/releases/tag/v0.35.0) | A prerelease with `/v1/systemone` for choice, boolean-like `noul`, and ordered score questions; Nimble and Tev1 are named consumers. | A concrete external compatibility target now exists. Compare serialization, option ordering, probability normalization and score semantics before sharing a wire contract. No Ollama dependency or backend support claim follows. |
+| Specialized objectives and data: [Nimble](https://ollama.com/library/nimble) and [Tev1](https://ollama.com/library/tev1) | Qwen3.5-based decision fine-tunes. Nimble documents contrastive examples differing in one deciding fact; Tev1 documents programmatic-policy and routing data. Their training/evaluation sets and option limits differ. | Add contrastive and option-order controls to any future artifact qualification. Keep calibration, task accuracy, numerical parity and API compatibility as separate receipts. Confidence concentration is not correctness probability. |
+| Inference-time control beyond text: [World in World, September 10](https://arxiv.org/abs/2609.11548), [released implementation](https://github.com/Westlake-AGI-Lab/WorldinWorld) | A frozen video backbone receives visual evidence through attention K/V. The released subset supports camera rerendering, bullet time and editing. Its README reports Linux/A100-80GB, roughly 72 GB peak memory and 86 GB weights; streaming and long-video memory remain roadmap items. | Watch the explicit evidence/state interface as prior art for programmable inference. It is not a current Mac workload or a reason to begin a video backend. A smaller locally qualified artifact and named consumer would change that decision. |
+| Backend-specific numerical/quantization contracts: [MLX v0.32.0, July 7](https://github.com/ml-explore/mlx/releases/tag/v0.32.0) | Released changes include an SDPA block-count override and explicit rejection of tensor-scale NVFP4 in Metal qqmm. | Preserve the pinned binding until a blocking operation warrants a separately qualified upgrade. A quantization family name alone does not establish kernel compatibility. |
+
+Our inference from this sample is that useful capability is increasingly spread
+across task-trained readouts, model-specific state, and controlled inference,
+rather than a single text-generation interface. That supports typed task
+boundaries and exact model-owned execution contracts. It does not justify a
+universal tensor API, speculative scheduler, training framework or video stack
+before the current model gates pass. Non-autoregressive/diffusion decoding
+remains a watch item: this pass did not establish a fresh, locally reproducible
+artifact that should displace the current priorities.
+
+### Jeff is a distinct execution contract
+
+Pinned implementation: `firelex/jeff` at
+`f06788292874c21a5b5c41549ac220dd9e15da7f` (September 29).
+Its [Qwen implementation](https://github.com/firelex/jeff/blob/f06788292874c21a5b5c41549ac220dd9e15da7f/src/jeff/model.py)
+serializes each decision through the checkpoint's chat template and prompt
+layout, validates single-token answer codes, left-pads, takes the last hidden
+state, and applies a separately trained 255-way readout. It masks unavailable
+slots, divides logits by a saved positive temperature and applies softmax.
+The readout is initialized from selected LM-head rows but saved independently
+in `readout.safetensors`; substituting the ordinary LM head changes the model.
+The code capacity and the release's trained/served option limit are distinct.
+
+This differs from both Qwen3's current selected-token scorer and Julia's
+bidirectional marker-position decision head. Jeff also contains a separate
+[ModernBERT pairwise cross-encoder](https://github.com/firelex/jeff/blob/f06788292874c21a5b5c41549ac220dd9e15da7f/src/jeff/encoder.py);
+sharing request types does not make those graphs interchangeable. Its
+[JevBench converter](https://github.com/firelex/jeff/blob/f06788292874c21a5b5c41549ac220dd9e15da7f/src/jeff/jevbench.py)
+uses pinned older public-hard data and omits score questions. Treat its reported
+hard result as that diagnostic, not a current official benchmark result.
+
+Next admission test: pin the actual checkpoint, tokenizer/template, answer-code
+mapping, trained readout, temperature and dtype; capture source tokenization,
+masked logits and probabilities on a small fixed suite. Include option
+permutation, option-count boundaries, padding, malformed artifacts and changed
+evidence that flips a label. Benchmark through the chosen benchmark's actual
+scorer with revision and dataset provenance. Do not add a backend enum or a
+new dependency until this experiment has a real consumer.
+
 ## Runtime position
 
 Metallix currently executes Qwen3-0.6B with MLX through Rust, including cached

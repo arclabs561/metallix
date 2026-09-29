@@ -26,6 +26,10 @@ source-pinned encoding, complete published-header checks, six real-tokenizer
 source-parity vectors, and a bounded native 22-layer path. Its numerical
 qualification currently fails, so encoder prefill, checkpoint execution, typed
 decisions, and serving integration remain open.
+JevBench-shaped requests already have a qualified Qwen direct-option-scoring
+bridge. That is benchmark-interface support through a decoder adapter, not
+direct Julia checkpoint support. A Julia result must preserve its source
+encoding, type embedding, marker-position gather, and decision head.
 
 The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
@@ -49,9 +53,13 @@ and attention with coordinated invalidation/reset. `LayerOneSession` now does
 the same for ratio-two ownership and direct selection, including the preceding
 L3 score-prefix rule. `LayerFourSession` consumes the actual L3 candidate mask;
 `RequestSession` composes all layers with whole-request invalidation and restart.
-The next deliverable is a bounded synthetic-weight/token-input CLI.
-Downstream weights and source checks remain fixture-backed; broader partitions,
-checkpoint loading and Metal execution remain open. Native
+The bounded synthetic-weight/token-input CLI now exports and reads one numerical
+artifact, passes existing final-logit source bounds for both schedules, and has
+focused server integration coverage for byte-hash/output agreement and
+fail-closed inputs. The canonical Metal check passes the DeepSeek tests and stops at the unchanged
+Julia numerical mismatch; focused CLI, strict lint and documentation gates pass. Downstream weights and
+source checks remain fixture-backed; broader partitions, checkpoint loading and
+Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
@@ -67,14 +75,16 @@ check, not generation or Codex compatibility evidence.
 ## Position and constraints
 
 Qwen is the usable vertical: resident chat, bounded read tools, experimental
-Responses, and qualified 0.6B/4B controls. DeepSeek's fixed test-private
-canonical and alternate startup-to-head compositions are numerical
-qualification, not a decoder: they retain fixture-backed weights and source
-oracles, while the alternate tail/head runs after the upstream loop. Checkpoint
-loading, broader partitions, interleaved request execution, alternate recovery,
-and Metal execution remain open. Julia's bounded 22-layer path exists but has
-not passed numerical qualification. Its scalar numerical oracle and bounded
-Metal operators are not a complete GPU decoder.
+Responses, and qualified 0.6B/4B controls. DeepSeek's library `RequestSession`
+now interleaves all five blocks and the final head per call. Both established
+synthetic schedules pass source bounds and replay after restart. The bounded
+artifact loader and scalar CLI have focused qualification. The workspace check
+remains red at the unchanged Julia gate; broader partitions and DeepSeek Metal
+execution remain open. Synthetic numerical
+qualification does not establish checkpoint support. Julia's bounded 22-layer
+path exists but has not passed numerical qualification. Its scalar numerical
+oracle and bounded Metal operators are not a complete GPU encoder/decision
+runtime.
 
 Performance work has located a useful next experiment: cache concatenation
 scales with prefix length in standalone graphs. Transpose construction costs
@@ -110,10 +120,13 @@ shared boundary and limits.
 
 The Qwen controller mechanism now has accept/reject, rollback and receipt
 evidence. Its interval example is not the product milestone. The next user-visible
-milestones are complete model execution: native DeepSeek generation and a native
-Julia typed-decision path. Preserve Qwen's working text, tools and decision
-commands while pursuing those consumers. SMC and steering remain research and
-regression surfaces until a concrete application needs them.
+milestones are complete model execution: native DeepSeek generation and, only
+after its numerical gate, a direct Julia typed-decision path. Preserve Qwen's
+working text, tools and decision commands while pursuing those consumers. The
+existing Qwen bridge can qualify JevBench-shaped request and receipt behavior;
+it must identify its decoder route and cannot stand in for Julia checkpoint
+evidence. SMC and steering remain research and regression surfaces until a
+concrete application needs them.
 
 **Open before expensive checkpoint work:** define the target context, acceptable
 first-token latency, minimum useful decode rate and SSD/RAM budget for the
@@ -130,22 +143,27 @@ gate; another broad model survey is not on the critical path.
 
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
-| DeepSeek primary | Add a bounded scalar CLI over `RequestModel` and `RequestSession`, accepting supplied synthetic weights and token IDs. The fixture-independent library now executes L0–L4/head per call, including Engram, live owner publications, partial L1 prior-L3 keys and L4 candidate reuse. Both established schedules match source final-logit bounds and replay after restart. A malformed L4 weight poisons the entire request after earlier owners advanced. | Keep existing numerical bounds and discrete gates; fail closed on malformed input/weight geometry. The executable must not import fixture readers, captured intermediates or expected outputs. | Scalar reference and fixed synthetic shapes first; checkpoint loading, Metal and serving remain separate gates. |
-| Julia secondary | Resolve the bounded 22-layer prototype's numerical qualification before expanding prefill to ordinary typed requests. Consumer: typed decisions. | Preserve the enabled `1e-5` hidden-state gate and qualified two-block/head controls; then qualify longer padded and window-crossing inputs. Keep the preregistered [independent F64 limits](experiments/julia-accuracy-contract.md) fixed. Same-input replay separates QKV/RoPE/score error. Both F64-dot and balanced-F32 trials failed calibration and were reverted; balanced F32 passing the legacy source test was insufficient. Held-out evaluation and promotion remain closed until calibration and independent-reference controls pass. | Reversible CPU reference before Metal or checkpoint loading. |
-| Feasibility and review | Refine DeepSeek residency/selected-byte traffic from existing metadata and source routes in parallel. Consumer: the checkpoint acquisition decision. | Explicit RAM/SSD/context/latency budget; distinguish metadata sensitivity from measured hit rates. | Read-only estimates and bounded local probes. |
-| Qwen maintenance | Keep text/tools/typed decisions and optional controller behavior working. | Existing regression checks; new work needs a concrete bug or representative application requirement. | Reversible fixes; no further scheduling benchmark variants. |
+| DeepSeek primary | Keep the bounded scalar CLI as the single executable consumer of `RequestModel` and `RequestSession`. It now reads an exported numerical artifact and has focused byte-hash/output and fail-closed integration coverage. Next consumer: broader schedule and reduced-Metal qualification. | Existing final-logit source bounds pass for both schedules; focused CLI integration and strict DeepSeek/server Clippy pass. The canonical check has no new DeepSeek failure and stops at the known Julia mismatch; a green workspace claim remains closed. Preserve fail-closed malformed input/weight geometry and keep fixture readers, captured intermediates, and expected outputs out of the executable. | Fixed synthetic shapes and scalar artifact remain reversible; checkpoint loading, Metal, and serving remain separate gates. |
+| Julia secondary | Resolve the numerical fidelity target for the bounded 22-layer prototype before expanding prefill to ordinary typed requests. Consumer: direct Julia decisions. | The fixed calibration source control now matches actual eager attention exactly; this does not clear the full native gate. **Decision-required before further native arithmetic:** retain pinned-source-backend compatibility or record a separately declared portable scalar contract. Preserve the enabled `1e-5` hidden-state gate and qualified two-block/head controls; do not widen limits. Under the selected target, use a calibration-only layer-zero source-oracle control to separate QKV/RoPE/score reconstruction from backend behavior, then qualify longer padded and window-crossing inputs. The head contract is type embedding, two bidirectional encoder layers, marker-position gather, and a scorer, not ordinary pooled classification. Held-out evaluation and promotion remain closed until the chosen calibration and independent-reference controls pass. | Reversible CPU control and contract evidence before Metal or checkpoint loading; changing the fidelity target requires its own recorded decision. |
+| Feasibility and review | Establish DeepSeek route locality before checkpoint acquisition. Consumer: the checkpoint acquisition decision. | Declare RAM/SSD/context/latency envelope; capture an actual source-compatible route trace without expert payloads; replay explicit cache capacities before reading selected real ranges. Keep metadata sensitivity distinct from measured hit rates, bytes, and latency. | Read-only metadata/trace work and bounded local probes; residency, prefetch, and pager policy remain decision-required. |
+| Qwen maintenance | Keep text/tools/typed decisions working; qualify concurrent admission and cancellation under load before a Codex-ready claim. The retained six read-only trials include three pointer chains, now checked against ordered direct file-read events. | Preserve focused protocol/assessor regressions and exact tool-result replay. Separate task quality from protocol failure; no general coding claim from the fixed read trace. | Reversible serving checks; no further scheduling benchmark variants. |
 
 ### Dependency order and stopping gates
 
 1. **Preserve the qualified numerical boundaries.** DeepSeek coefficient comparisons
    use the existing stage-specific policy, with exact downstream BF16 and routing
-   checks. Julia's complete block follows the pinned Transformers RoPE, masking
-   and GEGLU behavior. These gates pass; retain their controls during composition.
-   Stop and diagnose a new mismatch rather than widening tolerances.
+   checks; its reduced request reaches source-qualified final logits. Julia's
+   complete block follows the pinned Transformers RoPE, masking and GEGLU
+   behavior, but its model-level numerical gate fails. Retain its controls and
+   diagnose against the selected fidelity target rather than widening tolerances.
 2. **Compose execution.** DeepSeek gets one bounded stateful runner from tokens
-   to logits, with native previous-call layer-three publication. Julia gets
-   encoder-to-head prefill from its qualified block. A new fixture is
-   justified only by a missing operand or independent oracle for these consumers.
+   to logits, with native previous-call layer-three publication. Its synthetic
+   artifact CLI now passes focused executable gates; qualify broader schedules
+   and device execution independently. The known Julia failure remains visible
+   in the workspace gate and does not become a DeepSeek numerical waiver. Julia may proceed only with its calibration control
+   and selected fidelity target; encoder-to-head prefill is not yet a qualified
+   deliverable. A new fixture is justified only by a missing operand or
+   independent oracle for these consumers.
 3. **Move the qualified graph onto Metal.** Preserve full-output, state, routing
    and failure-atomicity comparisons. This is an execution milestone, not evidence
    that the published checkpoint fits the machine.
@@ -232,6 +250,8 @@ existing product boundary.
 | KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Stepped growth, failure-parity, and matched 0.6B/4B resident requests passed with exact output/token parity. Keep the bounded stepped path and retain the concatenation measurements as a regression control. |
 | DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Reproduce the pinned source for the parity baseline. Never silently substitute owner keys. Decide before claiming complete model parity. |
 | DeepSeek request failure lifecycle | Roll back every owner; or invalidate a failed request and reconstruct all state. | `RequestSession` now implements invalidation and full reconstruction from immutable operands. Both schedules replay through source-qualified logits; malformed L4 execution blocks retries and restart reconstructs the earlier owners. This does not promise component rollback or checkpoint-serving recovery. |
+| DeepSeek checkpoint resource envelope | Acquire/load the checkpoint before locality evidence; or establish the intended RAM/SSD/context/latency envelope, trace source-compatible routes, then measure selected ranges at explicit cache capacities. | Take the latter path. Metadata sensitivity and generic Qwen I/O probes are not a V4.1 serving envelope. Do not start acquisition, a pager, or prefetch policy until this gate has a measured result. |
+| Julia fidelity and benchmark route | Run JevBench-shaped requests through the qualified Qwen decoder bridge; or claim a direct Julia result after its source-compatible encoder/head path qualifies. Separately, choose pinned-source-backend fidelity or a portable scalar contract for the failing Julia numerical gate. | Keep Qwen as the current benchmark-interface route. Record the Julia fidelity target before another arithmetic change; direct Julia scoring remains closed until its marker-gather/head path passes the resulting independent gate. |
 | Native runtime versus upstream integration | Continue the specialized executor; or retain qualification/adapter work and integrate a runtime that demonstrably meets the same target. | Apply the existing architecture pivot using matched evidence, not popularity. |
 | MLX binding upgrade | Keep the qualified pinned stack; or upgrade to unlock a demonstrated blocking operation/performance gain. | Avoid combining an upgrade with a cache-layout change. Qualify an upgrade as its own change before depending on new semantics. |
 | Adapter/config shape, model and engine boundary | Closed typed task adapters; versus a universal tensor/graph interface. | Follow the existing thin-MLX proposal. Decide exact signatures only with concrete consumers; keep manifest versions explicit. |
@@ -239,11 +259,35 @@ existing product boundary.
 
 Do not start production cache replacement until its storage/aliasing contract
 is decided. Do not start full-checkpoint DeepSeek serving until reference
-parity and storage/latency feasibility pass. Do not publish a generic adapter
-API until actual consumers establish the shared interface.
+parity and storage/latency feasibility pass. Do not promote Julia as a direct
+checkpoint adapter until its fidelity target and numerical gate are decided and
+passed. Do not publish a generic adapter API until actual consumers establish
+the shared interface.
 
 ## Research, maintenance and stop rules
 
+The [September 29 evidence update](research/architecture-landscape.md#september-29-update-evidence-that-changes-the-next-gates)
+adds Jeff, Ollama's decision endpoint, Nimble/Tev1, and inference-time visual
+control to the comparison corpus. Immediate order remains DeepSeek device
+qualification, Julia oracle/fidelity resolution, Qwen protocol reliability, and
+route-locality feasibility in parallel. Small trained decoder decision models
+are the next adapter comparison, not automatically a replacement for Julia.
+World/video models and non-autoregressive decoding remain conditional research.
+
+- Keep one executable path for the reduced DeepSeek request: the synthetic
+  artifact binds the CLI to `RequestModel`/`RequestSession`, while source
+  fixtures remain test-owned oracles. Consolidate any duplicate executable
+  runbook around that path; do not add a second fixture-backed runner or general
+  backend seam.
+- Keep the newly inspected Jeff decision checkpoints at watch status. The pinned
+  source at `f06788292874c21a5b5c41549ac220dd9e15da7f` describes a causal decoder
+  with chat-template serialization, tokenizer-validated one-token option codes,
+  a custom trained 255-way final-hidden-state readout, option masking, and fitted-
+  temperature softmax. It is neither raw Qwen option logits nor Julia's
+  bidirectional marker-head path. Admit it only through a separately pinned
+  backend/artifact contract with source-qualified state, layout, precision, and
+  variable-shape controls; its reported hard-task result is a local diagnostic,
+  not an official JevBench result.
 - Refresh model discovery when a chosen implementation needs it or a verified
   architecture release changes the plan. The existing 100-page survey is a
   discovery snapshot, not an obligation to implement every trending model.

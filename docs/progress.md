@@ -11,6 +11,13 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The Qwen/Codex pointer-chain assessor now correlates each required output
+  with its recorded successful direct file-read command, in order. Its focused
+  suite passes 23 tests, including rejection of fabricated outputs with filename
+  comments. All three retained pointer-chain traces pass the strengthened check.
+  This is bounded event-level qualification; concurrent admission and
+  cancellation under load remain separate serving gates.
+
 - The calibration-only Julia source-oracle control now executes pinned eager
   and SDPA layer-zero traces on fixed `cal_len7`. Actual eager attention matches
   the explicit reconstruction exactly; SDPA/eager attended maximum difference
@@ -46,8 +53,8 @@ choices without expanding current support claims.
   publication geometry. The synthetic-input CLI is now implemented; checkpoint loading,
   Metal and serving are not implemented by this scalar reference.
   Focused receipts: `.agents/receipts/candidate-control/runtime-request-focused.log`
-  and `runtime-l4-boundaries.log`. The canonical Metal check passes DeepSeek
-  (including 101 composition tests) and stops at the unchanged Julia
+  and `runtime-l4-boundaries.log`. At that delivery, the canonical Metal check passed DeepSeek
+  (101 composition tests) and stopped at the unchanged Julia
   `unmasked_control hidden[0]` mismatch. Strict DeepSeek all-target/all-feature
   Clippy also passes; see `runtime-request-{full-check,clippy}.log`.
 
@@ -56,7 +63,7 @@ choices without expanding current support claims.
   positions from live state. Partial calls validate the preceding L3 publication
   identity and full key prefix, use its completed-group rows for scores, and
   retain L1's own KV for attention. Both source schedules use this runtime and
-  all 99 `forward_moe` checks pass with unchanged bounds. Two independent runtime
+  all 99 then-current `forward_moe` checks passed with unchanged bounds. Two independent runtime
   tests cover distinct score/KV ownership, late attention failure, reset replay
   and rejection of stale L3 epochs. The serial Metal check completes DeepSeek
   and stops at the same Julia numerical mismatch recorded below. Receipts:
@@ -69,7 +76,7 @@ choices without expanding current support claims.
   source schedules use it. A malformed owner input and an attention failure
   after owner commit both require reset, with recovered numerical results and
   new-epoch publications checked against the source. Constructor checks reject
-  incompatible producer/attention geometry. Focused validation passes all 99
+  incompatible producer/attention geometry. At that delivery, focused validation passed all 99
   `forward_moe` tests, eight alternate-owner tests and the constructor test.
   The serial Metal check completes DeepSeek and stops at the unchanged Julia
   `unmasked_control hidden[0]` mismatch (`-0.2049238` versus `-0.20494038`).
@@ -100,7 +107,7 @@ choices without expanding current support claims.
   tokens and weights. Hash history and cursor publish only after success.
   Fixture parsing and source comparisons remain test-owned. The complete request
   assembly, typed operands and the synthetic token-input CLI are now implemented.
-  All 98 composition tests and four runtime Engram tests pass, including late
+  At that delivery, 98 composition tests and four runtime Engram tests passed, including late
   gate failure, reset, malformed continuation and partial WKV scale groups.
   Strict DeepSeek Clippy, doctests and documentation checks pass. The canonical
   Metal gate passes DeepSeek and stops at the unchanged Julia encoder mismatch.
