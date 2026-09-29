@@ -4,13 +4,17 @@ use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::{
     RotaryFrequency,
+    attention::layer::Fp8Projection,
     compressor::{CompressorInput, CompressorState},
     indexer::{
         bf16::index_scores_bf16_reference,
         cache::{IndexKeyPublicationId, IndexKeyState},
         compressed_kv::{CompressedKvLayout, prepare_compressed_kv},
         key::{IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
-        query::{IndexQueryLayout, IndexQueryWeights, prepare_index_query},
+        query::{
+            CandidateQueryLayout, CandidateQueryWeights, IndexQueryDiagnostic, IndexQueryLayout,
+            IndexQueryWeights, prepare_candidate_query, prepare_index_query,
+        },
     },
     precision::fp32_linear_reference,
     select_indices,
@@ -24,7 +28,7 @@ const CAPTURE_SHA256: &str = "16c949df47afd5cffc5f8ce95612f2d27003dcb23a80c764f7
 const FIXTURE_SHA256: &str = "966122b3fd74fe3f5965d17aad1f863bb67164c69fd66bc52cc7df836db9407a";
 const FP32_UNIT_ROUNDOFF: f64 = 5.960_464_477_539_063e-8;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Fixture {
     schema_version: u32,
     source: Source,
@@ -32,15 +36,17 @@ struct Fixture {
     frequency_table: Tensor,
     encoded_parameters: BTreeMap<String, Tensor>,
     cases: Vec<Case>,
+    #[serde(default)]
+    query_parameters: BTreeMap<String, Tensor>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Source {
     revision: String,
-    complete_capture_sha256: String,
+    complete_capture_sha256: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Model {
     owner_layer: usize,
     ratio: usize,
@@ -48,7 +54,7 @@ struct Model {
     index_topk: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Case {
     start_pos: usize,
     sequence: usize,
@@ -57,6 +63,7 @@ struct Case {
     input: Tensor,
     index_input: Tensor,
     index_qr: Tensor,
+    wq_a_output: Option<Tensor>,
     index_operations: IndexOperations,
     offset: usize,
     selected_indices: Tensor,
@@ -68,7 +75,7 @@ struct Case {
     compressed_kv_prefix: Tensor,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct IndexOperations {
     q_after_rope_fp4: Tensor,
     weights_proj_output: Tensor,
@@ -80,7 +87,7 @@ struct IndexOperations {
     scores_after_causal_mask: Option<Tensor>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Tensor {
     dtype: String,
     shape: Vec<usize>,
@@ -119,7 +126,10 @@ fn fixture_from_raw(raw: &str, expected_capture: &str) -> Fixture {
 fn validate_fixture(fixture: &Fixture, expected_capture: &str) {
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.source.revision, REVISION);
-    assert_eq!(fixture.source.complete_capture_sha256, expected_capture);
+    assert_eq!(
+        fixture.source.complete_capture_sha256.as_deref(),
+        Some(expected_capture)
+    );
     assert_eq!(fixture.model.owner_layer, 1);
     assert_eq!(fixture.model.ratio, 2);
     assert_eq!(fixture.model.index_topk, 1);
@@ -446,6 +456,15 @@ fn assert_native_score(
         layout,
     )
     .expect("native ratio-two index query");
+    assert_score_from_query(fixture, case, keys, &query)
+}
+
+fn assert_score_from_query(
+    fixture: &Fixture,
+    case: &Case,
+    keys: &[u16],
+    query: &IndexQueryDiagnostic,
+) -> Vec<i32> {
     let operations = &case.index_operations;
     assert_eq!(query.query_post_fp4, bf16(&operations.q_after_rope_fp4));
     assert_eq!(
@@ -485,6 +504,62 @@ fn assert_native_score(
     indices
 }
 
+fn alternate_native_selection(
+    fixture: &Fixture,
+    case: &Case,
+    frequencies: &[RotaryFrequency],
+    input: &[u16],
+    keys: &[u16],
+) -> Vec<i32> {
+    let parameters = &fixture.query_parameters;
+    let codes = fp8(&parameters["layers.1.attn.wq_a.weight"]);
+    let scales = fp8(&parameters["layers.1.attn.wq_a.scale"]);
+    let norm = bf16(&parameters["layers.1.attn.q_norm.weight"]);
+    let index_codes = fp8(parameter(fixture, "layers.1.attn.indexer.wq_b.weight"));
+    let index_scales = fp8(parameter(fixture, "layers.1.attn.indexer.wq_b.scale"));
+    let weights = bf16(parameter(
+        fixture,
+        "layers.1.attn.indexer.weights_proj.weight",
+    ));
+    assert_eq!(input, bf16(&case.index_input));
+    let query = prepare_candidate_query(
+        input,
+        &call_frequencies(frequencies, case),
+        CandidateQueryWeights {
+            wq_a: Fp8Projection {
+                codes: &codes,
+                scales: &scales,
+            },
+            q_norm: &norm,
+            index: IndexQueryWeights {
+                wq_b_codes: &index_codes,
+                wq_b_scales: &index_scales,
+                weights_proj: &weights,
+            },
+        },
+        CandidateQueryLayout::new(
+            IndexQueryLayout::new(
+                nonzero(1),
+                nonzero(128),
+                nonzero(32),
+                nonzero(2),
+                nonzero(64),
+                nonzero(16),
+            )
+            .unwrap(),
+            fixture.model.norm_eps,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        query.wq_a,
+        bf16(case.wq_a_output.as_ref().expect("alternate WQ-A oracle"))
+    );
+    assert_eq!(query.qr, bf16(&case.index_qr));
+    assert_score_from_query(fixture, case, keys, &query.index)
+}
+
 struct LayerThreeSharedScoreState {
     layer_three_keys: IndexKeyState,
 }
@@ -507,6 +582,7 @@ impl LayerThreeSharedScoreState {
     }
 
     fn publish_layer_three(&mut self, prefix: &[u16]) {
+        self.reset();
         let epoch = self.layer_three_keys.epoch();
         let call_id = self.layer_three_keys.next_call_id();
         let start = self.layer_three_keys.valid_positions();
@@ -517,31 +593,17 @@ impl LayerThreeSharedScoreState {
     }
 
     fn score_keys_for(&self, case: &Case, owned_keys: &[u16], source_keys: &[u16]) -> Vec<u16> {
-        match case.start_pos {
-            6 => {
-                assert_ne!(
-                    owned_keys, source_keys,
-                    "partial layer-one owner prefix stays distinct"
-                );
-                let previous = self
-                    .layer_three_keys
-                    .prefix(0)
-                    .expect("layer-three shared-key batch");
-                assert_eq!(
-                    previous, source_keys,
-                    "start six previous layer-three score prefix"
-                );
-                previous.to_vec()
-            }
-            0 | 5 => {
-                assert_eq!(
-                    owned_keys, source_keys,
-                    "start {} owned score prefix",
-                    case.start_pos
-                );
-                owned_keys.to_vec()
-            }
-            other => panic!("unexpected layer-one source call start {other}"),
+        if case.latent.is_none() {
+            assert_ne!(
+                owned_keys, source_keys,
+                "partial owner prefix stays distinct"
+            );
+            let previous = self.layer_three_keys.prefix(0).expect("L3 shared keys");
+            assert_eq!(previous, source_keys, "previous L3 score prefix");
+            previous.to_vec()
+        } else {
+            assert_eq!(owned_keys, source_keys, "owned score prefix");
+            owned_keys.to_vec()
         }
     }
 }
@@ -666,6 +728,7 @@ pub(super) struct NativeLayerOneOwnerSession {
     previous_layer_three_prefix: Option<Vec<u16>>,
     require_previous_layer_three_prefix: bool,
     next_case: usize,
+    next_start: usize,
 }
 
 impl NativeLayerOneOwnerSession {
@@ -698,6 +761,43 @@ impl NativeLayerOneOwnerSession {
         let fixture: Fixture =
             serde_json::from_value(projection).expect("layer-one owner bundle JSON");
         validate_fixture(&fixture, capture);
+        Self::from_fixture(fixture, None, true)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "alternate owner is exercised by the composed forward test"
+    )]
+    pub(super) fn from_alternate(projection: &Value, startup: &Value) -> Self {
+        for name in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(projection[name], startup[name], "alternate L1 provenance");
+        }
+        let fixture: Fixture =
+            serde_json::from_value(projection.clone()).expect("alternate L1 owner");
+        assert_eq!(fixture.schema_version, 1);
+        assert_eq!(fixture.source.revision, REVISION);
+        assert!(fixture.source.complete_capture_sha256.is_none());
+        assert_eq!(
+            (
+                fixture.model.owner_layer,
+                fixture.model.ratio,
+                fixture.model.index_topk
+            ),
+            (1, 2, 1)
+        );
+        assert_eq!(fixture.query_parameters.len(), 3);
+        assert_eq!(fixture.cases.len(), 4);
+        for (case, (start, count, partial)) in
+            fixture
+                .cases
+                .iter()
+                .zip([(0, 4, false), (4, 1, true), (5, 1, false), (6, 1, true)])
+        {
+            assert_eq!(
+                (case.start_pos, case.sequence, case.latent.is_none()),
+                (start, count, partial)
+            );
+        }
         Self::from_fixture(fixture, None, true)
     }
 
@@ -736,6 +836,7 @@ impl NativeLayerOneOwnerSession {
             previous_layer_three_prefix: previous_layer_three_prefix.map(ToOwned::to_owned),
             require_previous_layer_three_prefix,
             next_case: 0,
+            next_start: 0,
         }
     }
 
@@ -756,14 +857,13 @@ impl NativeLayerOneOwnerSession {
             .get(self.next_case)
             .expect("native layer-one owner calls exhausted");
         assert_eq!(
-            case.start_pos,
-            [0, 5, 6][self.next_case],
+            case.start_pos, self.next_start,
             "native layer-one owner call order"
         );
         if case.start_pos == 0 {
             self.score_state.reset();
         }
-        if case.start_pos == 6
+        if case.latent.is_none()
             && self.require_previous_layer_three_prefix
             && self.previous_layer_three_prefix.is_none()
         {
@@ -783,23 +883,9 @@ impl NativeLayerOneOwnerSession {
             .expect("source ratio-two stream call");
         assert_latent_matches_source(case, latent.as_deref());
         if let Some(latent) = &latent {
-            assert_eq!(case.group_frequency_positions.len(), latent.len() / 64);
-            let mut selected = Vec::new();
-            for &position in &case.group_frequency_positions {
-                selected
-                    .extend_from_slice(&self.all_frequencies[position * 16..(position + 1) * 16]);
-            }
-            let prepared_keys = prepare_index_keys(
-                latent,
-                &selected,
-                IndexKeyWeights::new(&self.wk, &self.key_norm),
-                self.key_layout,
-            )
-            .expect("native source-shaped index keys");
-            let prepared_kv = prepare_compressed_kv(latent, &selected, self.kv_layout)
-                .expect("native source-shaped compressed KV");
-            self.keys.extend_from_slice(&prepared_keys.post_fp4);
-            self.kv.extend_from_slice(&prepared_kv.post_fp4);
+            let (prepared_keys, prepared_kv) = self.prepare_latent_publication(case, latent);
+            self.keys.extend_from_slice(&prepared_keys);
+            self.kv.extend_from_slice(&prepared_kv);
         }
         assert_eq!(
             self.keys,
@@ -815,11 +901,12 @@ impl NativeLayerOneOwnerSession {
         );
         assert_eq!(self.keys.len(), case.compressed_prefix * 64);
         let source_score_keys = bf16(&case.index_score_key_prefix);
-        if case.start_pos == 6 {
+        if case.latent.is_none() {
             publish_previous_layer_three_prefix(
                 &mut self.score_state,
                 &self.fixture,
                 &source_score_keys,
+                case.start_pos,
                 self.previous_layer_three_prefix.as_deref(),
                 self.require_previous_layer_three_prefix,
             );
@@ -827,8 +914,21 @@ impl NativeLayerOneOwnerSession {
         let score_keys = self
             .score_state
             .score_keys_for(case, &self.keys, &source_score_keys);
-        let selected_indices =
-            assert_native_score(&self.fixture, case, &self.all_frequencies, &score_keys);
+        let selected_indices = if self.fixture.query_parameters.is_empty() {
+            assert_native_score(&self.fixture, case, &self.all_frequencies, &score_keys)
+        } else {
+            alternate_native_selection(
+                &self.fixture,
+                case,
+                &self.all_frequencies,
+                input,
+                &score_keys,
+            )
+        };
+        if case.latent.is_none() {
+            self.previous_layer_three_prefix = None;
+        }
+        self.next_start += case.sequence;
         self.next_case += 1;
         NativeCase {
             start_pos: case.start_pos,
@@ -840,14 +940,37 @@ impl NativeLayerOneOwnerSession {
         }
     }
 
+    fn prepare_latent_publication(&self, case: &Case, latent: &[u16]) -> (Vec<u16>, Vec<u16>) {
+        assert_eq!(case.group_frequency_positions.len(), latent.len() / 64);
+        let mut selected = Vec::new();
+        for &position in &case.group_frequency_positions {
+            selected.extend_from_slice(&self.all_frequencies[position * 16..(position + 1) * 16]);
+        }
+        let prepared_keys = prepare_index_keys(
+            latent,
+            &selected,
+            IndexKeyWeights::new(&self.wk, &self.key_norm),
+            self.key_layout,
+        )
+        .expect("native source-shaped index keys");
+        let prepared_kv = prepare_compressed_kv(latent, &selected, self.kv_layout)
+            .expect("native source-shaped compressed KV");
+        (prepared_keys.post_fp4, prepared_kv.post_fp4)
+    }
+
     /// Supplies the complete producer prefix after the preceding L3 call has
-    /// committed and before L1's start-six partial decode reads it.
+    /// committed and before L1's next partial decode reads it.
     pub(super) fn supply_previous_layer_three_prefix(&mut self, prefix: &[u16]) {
-        assert_eq!(
-            self.next_case, 2,
-            "previous L3 prefix arrives before L1 start six"
+        let case = &self.fixture.cases[self.next_case];
+        assert!(
+            case.latent.is_none(),
+            "prior L3 prefix is only used by partial groups"
         );
-        assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
+        assert_eq!(
+            prefix.len(),
+            case.start_pos * 64,
+            "complete preceding L3 prefix"
+        );
         self.previous_layer_three_prefix = Some(prefix.to_vec());
     }
 
@@ -855,7 +978,11 @@ impl NativeLayerOneOwnerSession {
     /// previous request's supplied L3 publication; this is not an epoch-level
     /// reset contract for the production owners.
     pub(super) fn restart_request(&mut self) {
-        *self = Self::new(None);
+        *self = Self::from_fixture(
+            self.fixture.clone(),
+            None,
+            self.require_previous_layer_three_prefix,
+        );
     }
 }
 
@@ -912,11 +1039,16 @@ fn publish_previous_layer_three_prefix(
     state: &mut LayerThreeSharedScoreState,
     fixture: &Fixture,
     source_score_keys: &[u16],
+    producer_end: usize,
     previous_layer_three_prefix: Option<&[u16]>,
     require_previous_layer_three_prefix: bool,
 ) {
     let prefix = if let Some(prefix) = previous_layer_three_prefix {
-        assert_eq!(prefix.len(), 6 * 64, "complete layer-three score prefix");
+        assert_eq!(
+            prefix.len(),
+            producer_end * 64,
+            "complete preceding L3 score prefix"
+        );
         prefix[..source_score_keys.len()].to_vec()
     } else if require_previous_layer_three_prefix {
         panic!("bundle layer-one owner requires a live previous-layer-three prefix");

@@ -515,8 +515,11 @@ inputs remain source-fed. On the upstream side, native token startup, L0 window
 attention, HC and FFN now feed persistent native L1 Engram for all four calls.
 Its computed outputs and L0 coefficients reach the observed L1 attention input
 exactly, including rejection of a bad stream followed by valid continuation.
-L1 attention/HC/FFN, L2 and their join to L3 remain open before full-graph
-partition qualification.
+Those inputs now drive native L1 compression, query/selection and attention.
+Partial calls consume the correct retained native L3 snapshots, while completed
+groups publish L1’s own keys; fresh-request replay also passes. L3’s inputs in
+this isolated check remain source-fed. L1 HC/FFN, L2 and the live per-call join
+to L3 remain open before full-graph partition qualification.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

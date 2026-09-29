@@ -3764,3 +3764,68 @@ fn numerical_contract_rejects_wrong_hc_handoff() {
 fn numerical_contract_rejects_omitted_attention() {
     block_tail(&fixture(), BlockControl::ZeroAttention, true);
 }
+
+fn alternate_layer_one_projection() -> Value {
+    let raw = include_str!("../../../../fixtures/deepseek-v41/partition-layer1-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        "6e98d38d175483cc21a87135ee7b1cd38ed7528a8f4febf210a8c5fc079a52fa"
+    );
+    serde_json::from_str(raw).unwrap()
+}
+
+#[test]
+fn alternate_partition_native_upstream_reaches_layer_one_attention() {
+    let projection = alternate_layer_one_projection();
+    let startup = layer_zero::alternate_startup_projection();
+    let inputs = layer_zero::alternate_layer_one_inputs();
+    let mut owner =
+        layer1_owner_capture::NativeLayerOneOwnerSession::from_alternate(&projection, &startup);
+    // Isolated component qualification: L3 inputs remain source-fed. Retained
+    // native snapshots enforce the preceding-call boundary, not a live full graph.
+    let publications = partition_owner::alternate_partition_layer_three_publications();
+    for _ in 0..2 {
+        let mut attention =
+            layer1_attention_capture::NativeLayerOneAttentionSession::from_alternate(&projection);
+        for (index, input) in inputs.iter().enumerate() {
+            if matches!(input.0, 4 | 6) {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        owner.step_with_input(&input.1);
+                    }))
+                    .is_err(),
+                    "each partial group requires a fresh preceding L3 publication"
+                );
+                let preceding = &publications[index - 1];
+                assert_eq!(preceding.key_prefix.len(), input.0 * 64);
+                owner.supply_previous_layer_three_prefix(&preceding.key_prefix);
+            }
+            let published = owner.step_with_input(&input.1);
+            assert_eq!(published.start_pos, input.0);
+            assert_eq!(published.latent.is_none(), matches!(input.0, 4 | 6));
+            let output = attention.step(input, &published);
+            assert_eq!(output.0, input.0);
+        }
+        owner.restart_request();
+    }
+}
+
+#[test]
+fn alternate_layer_one_query_rejects_changed_native_normalization() {
+    let mut projection = alternate_layer_one_projection();
+    let norm = &mut projection["query_parameters"]["layers.1.attn.q_norm.weight"];
+    let zeros = vec![0; 64];
+    norm["storage_hex"] = Value::String("00".repeat(64));
+    norm["storage_sha256"] = Value::String(format!("{:x}", Sha256::digest(&zeros)));
+    let startup = layer_zero::alternate_startup_projection();
+    let inputs = layer_zero::alternate_layer_one_inputs();
+    let mut owner =
+        layer1_owner_capture::NativeLayerOneOwnerSession::from_alternate(&projection, &startup);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.step_with_input(&inputs[0].1);
+        }))
+        .is_err(),
+        "native query normalization must affect the numerical gate"
+    );
+}

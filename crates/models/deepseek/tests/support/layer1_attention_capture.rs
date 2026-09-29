@@ -335,6 +335,7 @@ pub(super) struct NativeLayerOneAttentionSession {
     weights: Weights,
     state: LayerAttentionState,
     next_case: usize,
+    next_start: usize,
 }
 
 impl NativeLayerOneAttentionSession {
@@ -365,6 +366,21 @@ impl NativeLayerOneAttentionSession {
         Self::from_root(projection.clone())
     }
 
+    pub(super) fn from_alternate(root: &Value) -> Self {
+        let projection = &root["attention"];
+        for name in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(
+                projection[name], root[name],
+                "alternate attention provenance"
+            );
+        }
+        assert_eq!(
+            projection["runtime"]["storage_byteorder"].as_str(),
+            Some("little")
+        );
+        Self::from_numerical_root(projection.clone())
+    }
+
     fn from_root(root: Value) -> Self {
         assert_eq!(field(&root, "schema_version").as_u64(), Some(1));
         assert_eq!(
@@ -375,12 +391,17 @@ impl NativeLayerOneAttentionSession {
             field(field(&root, "source"), "storage_byteorder").as_str(),
             Some("little")
         );
+        Self::from_numerical_root(root)
+    }
+
+    fn from_numerical_root(root: Value) -> Self {
         Self {
             frequencies: frequencies(&root),
             weights: weights(&root),
             state: LayerAttentionState::new(layout(&root)),
             root,
             next_case: 0,
+            next_start: 0,
         }
     }
 
@@ -392,8 +413,7 @@ impl NativeLayerOneAttentionSession {
         let case = &field(&self.root, "cases").as_array().expect("source cases")[self.next_case];
         let start = usize_field(case, "start_pos");
         assert_eq!(
-            start,
-            [0, 5, 6][self.next_case],
+            start, self.next_start,
             "native layer-one attention call order"
         );
         assert_eq!(
@@ -439,6 +459,7 @@ impl NativeLayerOneAttentionSession {
             .expect("native layer-one attention");
         assert_diagnostic(case, &diagnostic);
         self.next_case += 1;
+        self.next_start += positions;
         (start, diagnostic.final_output)
     }
 }

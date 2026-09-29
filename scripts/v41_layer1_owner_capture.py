@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import struct
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +33,7 @@ SOURCE_FIELDS = (
     "runner_sha256",
     "forward_observers_sha256",
 )
-STARTS = ((0, 5, 2, 5), (5, 1, 3, 6), (6, 1, 3, 6))
+CANONICAL_SCHEDULE = ((0, 5, 2, 5, 2), (5, 1, 3, 6, 1), (6, 1, 3, 6, 0))
 LAYER = "layers.1.attn"
 PINNED_SOURCE = {
     "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
@@ -204,28 +205,53 @@ def _operations(
     }
 
 
-def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
-    """Export exact source records for the layer-one ratio-two publication."""
+def layer1_owner_projection(
+    model: object,
+    encoded: object,
+    steps: object,
+    *,
+    schedule: tuple[tuple[int, int, int, int, int], ...] = CANONICAL_SCHEDULE,
+) -> dict[str, object]:
+    """Project layer-one owner numerical operands for an explicit partition.
+
+    Source provenance is intentionally caller-owned so alternate partitions are
+    never represented as canonical captures.
+    """
+    model = _object(model, "model args")
+    encoded = _object(encoded, "encoded parameters")
     if (
-        receipt.get("capture_status")
-        != "completed synthetic source-forward capture; no parity claim"
+        not schedule
+        or schedule[0][0] != 0
+        or any(
+            type(start) is not int
+            or type(sequence) is not int
+            or type(compressed) is not int
+            or type(offset) is not int
+            or type(published_groups) is not int
+            or sequence <= 0
+            or compressed <= 0
+            or offset < 0
+            or published_groups < 0
+            for start, sequence, compressed, offset, published_groups in schedule
+        )
+        or any(
+            start != previous_start + previous_sequence
+            for (previous_start, previous_sequence, _, _, _), (
+                start,
+                _,
+                _,
+                _,
+                _,
+            ) in pairwise(schedule)
+        )
     ):
         raise RuntimeError(
-            "layer-one owner fixture requires a completed source capture"
+            "layer-one owner projection requires a contiguous schedule from zero"
         )
-    coverage = _object(receipt.get("coverage_status"), "capture coverage")
-    source = _object(receipt.get("source"), "source")
-    runtime = _object(receipt.get("runtime"), "runtime")
-    model = _object(receipt.get("model_args"), "model args")
-    encoded = _object(receipt.get("encoded_parameters"), "encoded parameters")
-    steps = receipt.get("steps")
-    if coverage.get("pending") != [] or not isinstance(steps, list):
-        raise RuntimeError("layer-one owner fixture requires complete capture coverage")
-    if runtime.get("storage_byteorder") != "little":
-        raise RuntimeError("layer-one owner fixture requires little-endian storage")
-    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
-        raise RuntimeError("layer-one owner fixture has incomplete source provenance")
-    _validate_source(source)
+    if not isinstance(steps, list) or len(steps) != len(schedule):
+        raise RuntimeError(
+            "layer-one owner projection requires one step per schedule entry"
+        )
     if (
         tuple(model.get("compress_ratios", ())) != (0, 2, 2, 1, 1)
         or tuple(model.get("kv_source_layers", ())) != (1, 3)
@@ -245,17 +271,16 @@ def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
     ):
         raise RuntimeError("layer-one owner fixture has invalid norm epsilon")
     parameters = _parameters(encoded)
-    if len(steps) != len(STARTS):
-        raise RuntimeError(
-            "layer-one owner fixture requires the pinned three-call trace"
-        )
-
     cases: list[dict[str, object]] = []
     frequency_table: dict[str, Any] | None = None
-    for step, (start, sequence, compressed, offset) in zip(steps, STARTS, strict=True):
+    for step, (start, sequence, compressed, offset, published_groups) in zip(
+        steps, schedule, strict=True
+    ):
         item = _object(step, "capture step")
-        if item.get("start_pos") != start:
-            raise RuntimeError("layer-one owner fixture trace order changed")
+        if item.get("start_pos") != start or (
+            "token_count" in item and item.get("token_count") != sequence
+        ):
+            raise RuntimeError("layer-one owner projection schedule changed")
         intermediates = _object(item.get("intermediates"), "step intermediates")
         indexer = _object(
             intermediates.get(f"{LAYER}.indexer_observation"), "layer-one indexer"
@@ -285,19 +310,18 @@ def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
         elif frequency_table["storage_sha256"] != table["storage_sha256"]:
             raise RuntimeError("layer-one source frequency table changed between calls")
         latent = inputs["latent"]
-        published = start != 6
-        if published:
+        if published_groups:
             latent = _tensor(
                 latent,
                 "layer-one pre-RoPE latent",
                 dtype="torch.bfloat16",
-                shape=[1, 1 if start else 2, 64],
+                shape=[1, published_groups, 64],
             )
             compressor_output = _tensor(
                 intermediates.get(f"{LAYER}.compressor"),
                 "layer-one compressor output",
                 dtype="torch.bfloat16",
-                shape=[1, 1 if start else 2, 64],
+                shape=[1, published_groups, 64],
             )
             if latent["storage_sha256"] != compressor_output["storage_sha256"]:
                 raise RuntimeError("layer-one compressor and Indexer latent disagree")
@@ -313,11 +337,9 @@ def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
             "sequence": sequence,
             "compressed_prefix": compressed,
             "offset": offset,
-            "group_frequency_positions": [0, 2]
-            if start == 0
-            else [4]
-            if start == 5
-            else [],
+            "group_frequency_positions": list(
+                range(0 if start == 0 else start - 1, start + sequence, 2)
+            )[:published_groups],
             "input": _tensor(
                 intermediates.get("layers.1.attention_input"),
                 "layer-one attention input",
@@ -365,7 +387,7 @@ def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 indexer.get("operations"),
                 sequence,
                 compressed,
-                published_groups=1 if start == 5 else 2 if start == 0 else 0,
+                published_groups=published_groups,
             ),
             "selected_indices": _tensor(
                 indexer.get("output_indices"),
@@ -396,15 +418,24 @@ def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
         cases.append(case)
     if frequency_table is None:
         raise RuntimeError("layer-one owner fixture has no frequency table")
-    for field in ("index_key_prefix", "compressed_kv_prefix"):
-        if cases[1][field]["storage_sha256"] != cases[2][field]["storage_sha256"]:
-            raise RuntimeError(
-                f"layer-one partial decode changed published {field.replace('_', ' ')}"
-            )
+    latest_published: dict[str, Any] | None = None
+    for case, (_, _, _, _, published_groups) in zip(cases, schedule, strict=True):
+        if published_groups:
+            latest_published = case
+            continue
+        if latest_published is None:
+            raise RuntimeError("layer-one owner partial call lacks a prior publication")
+        for field in ("index_key_prefix", "compressed_kv_prefix"):
+            if (
+                case[field]["storage_sha256"]
+                != latest_published[field]["storage_sha256"]
+            ):
+                raise RuntimeError(
+                    f"layer-one partial decode changed published {field.replace('_', ' ')}"
+                )
     return {
         "schema_version": 1,
         "scope": "source layer-one ratio-two owner publication; partial decode retains owner key/KV prefixes while source scoring can read a later layer's global shared key prefix; excludes candidate masks, layer-two attention, and native execution",
-        "source": {**source, "complete_capture_sha256": _sha256(_serialized(receipt))},
         "model": {
             "owner_layer": 1,
             "ratio": 2,
@@ -416,6 +447,36 @@ def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
         "frequency_table": frequency_table,
         "encoded_parameters": parameters,
         "cases": cases,
+    }
+
+
+def layer1_owner_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Export exact source records for the layer-one ratio-two publication."""
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError(
+            "layer-one owner fixture requires a completed source capture"
+        )
+    coverage = _object(receipt.get("coverage_status"), "capture coverage")
+    source = _object(receipt.get("source"), "source")
+    runtime = _object(receipt.get("runtime"), "runtime")
+    if coverage.get("pending") != []:
+        raise RuntimeError("layer-one owner fixture requires complete capture coverage")
+    if runtime.get("storage_byteorder") != "little":
+        raise RuntimeError("layer-one owner fixture requires little-endian storage")
+    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
+        raise RuntimeError("layer-one owner fixture has incomplete source provenance")
+    _validate_source(source)
+    projection = layer1_owner_projection(
+        receipt.get("model_args"),
+        receipt.get("encoded_parameters"),
+        receipt.get("steps"),
+    )
+    return {
+        **projection,
+        "source": {**source, "complete_capture_sha256": _sha256(_serialized(receipt))},
     }
 
 

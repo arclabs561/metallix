@@ -671,7 +671,7 @@ pub(crate) fn native_layer_zero_entries_from_projection(
     })
 }
 
-fn alternate_startup_projection() -> Value {
+pub(crate) fn alternate_startup_projection() -> Value {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-startup-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
@@ -710,8 +710,7 @@ fn alternate_partition_native_startup_reaches_layer_one_stream() {
     }
 }
 
-#[test]
-fn alternate_partition_native_startup_and_engram_reach_layer_one_attention_input() {
+pub(crate) fn alternate_layer_one_inputs() -> Vec<(usize, Vec<u16>)> {
     let root = alternate_startup_projection();
     let upstream = native_layer_zero_entries_from_projection(&root);
     let mut engram =
@@ -720,6 +719,7 @@ fn alternate_partition_native_startup_and_engram_reach_layer_one_attention_input
         field(&root, "parameters"),
         "layers.1.attn_norm.weight",
     ));
+    let mut inputs = Vec::new();
     for ((start, residual, pre), case) in upstream.iter().zip(root["cases"].as_array().unwrap()) {
         let (entry_start, entry) = engram.step(Some(&(*start, residual.clone())));
         assert_eq!(entry_start, *start);
@@ -736,7 +736,14 @@ fn alternate_partition_native_startup_and_engram_reach_layer_one_attention_input
             attention_input,
             bf16(&case["downstream"]["layer_one_attention_input"])
         );
+        inputs.push((*start, attention_input));
     }
+    inputs
+}
+
+#[test]
+fn alternate_partition_native_startup_and_engram_reach_layer_one_attention_input() {
+    assert_eq!(alternate_layer_one_inputs().len(), 4);
 }
 
 #[test]

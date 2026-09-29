@@ -76,6 +76,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_v41_partition_boundaries.py"], False),
         ([sys.executable, "scripts/test_v41_partition_owner_capture.py"], False),
         ([sys.executable, "scripts/test_v41_partition_startup_capture.py"], False),
+        ([sys.executable, "scripts/test_v41_partition_layer1_capture.py"], False),
         (["cargo", "fmt", "--check"], False),
         (["cargo", "test", "--workspace", *feature_args], False),
         (

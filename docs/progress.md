@@ -406,8 +406,17 @@ outputs on every call. Its outputs and native L0 HC coefficients produce the
 observed L1 attention input exactly. A rejected stream at start five leaves the
 same history usable for valid continuation through start six. Nine Python
 controls cover the token join and detached Engram provenance/IDs/input/output.
-L1 attention/HC/FFN, L2 and their join to L3 still separate these qualified
-portions from full native-graph qualification. Owner cancellation/retry checks
+Native L1 ratio-two compression, WQ-A/QR/index query, scores, selected IDs and
+attention now consume these derived inputs. Starts four and six require fresh
+preceding L3 key snapshots; starts zero and five publish L1’s own keys. Each
+partial snapshot replaces the bounded score view rather than appending a full
+refreshed prefix. Missing snapshots fail before compressor mutation and can be
+supplied for valid continuation. A full replay after request restart preserves
+the alternate fixture and clears supplied snapshots. Zeroing query normalization
+with a recomputed digest fails the numerical check. This component test uses
+retained native L3 snapshots whose inputs remain source-fed; it does not execute
+the full graph in live layer order. L1 HC/FFN, L2 and the live per-call join to L3
+still separate these portions from full native-graph qualification. Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
 
