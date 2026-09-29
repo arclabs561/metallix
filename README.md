@@ -502,7 +502,7 @@ retaining intermediate scratch differences. An observer-controlled capture now
 verifies L1→L2, L3→L4 and prior L3→L1 bridge operands for that alternate
 schedule. The native L3 owner now matches all four calls exactly through WKV,
 compression, key/KV publication and both partial L3→L1 handoffs, including
-retry/reset checks. Full-graph native partition qualification remains open.
+cancellation/retry/reset checks. Full-graph native partition qualification remains open.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

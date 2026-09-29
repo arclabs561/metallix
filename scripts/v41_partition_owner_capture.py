@@ -36,11 +36,15 @@ _WIDTHS = {
     "torch.complex64": 8,
 }
 _PINNED_SOURCE = {
-    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
-    "model_sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
-    "loader_sha256": "359c4c961bdc8e200e2ccd13e7499974220a8d6942b5f6627316ab54210bef03",
-    "runner_sha256": "7f217a4c42039e6cb55d9914ae095b656ad199a240c585eef11a2d2eace750f0",
+    "cpu_backend_sha256": "b1f1f3cfdb93b674a5f96a114cf45bf5be9ad3a555ae95ac24add567f9f5232e",
+    "engram_sha256": "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897",
     "kernel_source_sha256": "1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455",
+    "loader_sha256": "359c4c961bdc8e200e2ccd13e7499974220a8d6942b5f6627316ab54210bef03",
+    "model_sha256": "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65",
+    "observer_sha256": "c1cf54629878b928e30bde288e3614873863104fc320f71a05c10cae07c3f292",
+    "probe_sha256": "dd8b74bcddb7ef5458d197ff2bf4c3d73f559af4daa9c40c1166ad8cb1c14bc2",
+    "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "runner_sha256": "7f217a4c42039e6cb55d9914ae095b656ad199a240c585eef11a2d2eace750f0",
 }
 
 
@@ -156,6 +160,11 @@ def _validate_raw_source(raw: bytes) -> Mapping[str, Any]:
 def partition_owner_fixture(raw: bytes) -> dict[str, object]:
     """Validate and project one complete, observer-controlled source receipt."""
     root = _validate_raw_source(raw)
+    if (
+        _object(root.get("runtime"), "source runtime").get("storage_byteorder")
+        != "little"
+    ):
+        raise CaptureError("source tensors require little-endian storage")
     bridge = project_bridges(raw)
     source_sha256 = hashlib.sha256(raw).hexdigest()
     if bridge.get("source_receipt_sha256") != source_sha256:
@@ -339,11 +348,12 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
 def validate_fixture(fixture: object) -> None:
     """Check fixture provenance, schedule, geometry, and all retained tensor bytes."""
     root = _object(fixture, "fixture")
-    if root.get("schema_version") != 1:
+    if type(root.get("schema_version")) is not int or root.get("schema_version") != 1:
         raise CaptureError("fixture schema version must be 1")
     if (
         not isinstance(root.get("source_receipt_sha256"), str)
         or len(root["source_receipt_sha256"]) != 64
+        or any(char not in "0123456789abcdef" for char in root["source_receipt_sha256"])
     ):
         raise CaptureError("fixture lacks a source receipt SHA-256")
     source = _object(root.get("source"), "fixture source")
@@ -351,9 +361,25 @@ def validate_fixture(fixture: object) -> None:
         if source.get(name) != expected:
             raise CaptureError(f"fixture source {name} differs from the pinned source")
     identity = _object(root.get("capture_identity"), "fixture capture identity")
-    if identity.get("schedule") != [4, 1, 1, 1]:
+    schedule = identity.get("schedule")
+    if (
+        not isinstance(schedule, list)
+        or any(type(count) is not int for count in schedule)
+        or schedule != [4, 1, 1, 1]
+    ):
         raise CaptureError(
             "fixture capture identity does not pin the alternate schedule"
+        )
+    payload = {"probe_sha256": source["probe_sha256"], "schedule": schedule}
+    expected_identity = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if (
+        identity.get("probe_sha256") != source["probe_sha256"]
+        or identity.get("sha256") != expected_identity
+    ):
+        raise CaptureError(
+            "capture identity does not bind the pinned probe and schedule"
         )
     model = _object(root.get("model"), "fixture model")
     expected_model = {
@@ -366,7 +392,11 @@ def validate_fixture(fixture: object) -> None:
         "owner_layer": 3,
         "norm_epsilon": 1e-20,
     }
-    if model != expected_model:
+    if model != expected_model or any(
+        type(model.get(key)) is not int
+        for key in expected_model
+        if key != "norm_epsilon"
+    ):
         raise CaptureError(
             "fixture model geometry differs from the pinned source model"
         )

@@ -66,6 +66,32 @@ class PartitionOwnerCaptureTest(unittest.TestCase):
                 with self.assertRaises((ValueError, RuntimeError, TypeError)):
                     capture.validate_fixture(fixture)
 
+    def test_rejects_relabelled_capture_identity(self) -> None:
+        mutations = (
+            ("source", "probe_sha256", "0" * 64),
+            ("source", "cpu_backend_sha256", "0" * 64),
+            ("source", "observer_sha256", "0" * 64),
+            ("capture_identity", "probe_sha256", "0" * 64),
+            ("capture_identity", "sha256", "0" * 64),
+            ("capture_identity", "schedule", [4, True, 1, 1]),
+            ("model", "batches", True),
+        )
+        for section, key, value in mutations:
+            with self.subTest(section=section, key=key):
+                fixture = copy.deepcopy(self.fixture)
+                fixture[section][key] = value
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+        for key, value in (
+            ("source_receipt_sha256", "g" * 64),
+            ("schema_version", True),
+        ):
+            with self.subTest(key=key):
+                fixture = copy.deepcopy(self.fixture)
+                fixture[key] = value
+                with self.assertRaises(capture.CaptureError):
+                    capture.validate_fixture(fixture)
+
     def test_rejects_substituted_partial_consumer(self) -> None:
         fixture = copy.deepcopy(self.fixture)
         tensor = fixture["cases"][0]["next_layer1_score_prefix"]

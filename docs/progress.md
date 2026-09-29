@@ -369,10 +369,13 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 The native L3 `RatioOneCompressedOwner` now executes the source `4 + 1 + 1 + 1`
 partition with exact WKV, compressor latent, committed key and KV prefixes.
 Its native keys match the next L1 partial score operands at starts 4 and 6.
-Three integration tests cover the four-call sequence, out-of-order and malformed
+Four integration tests cover the four-call sequence, cancelled prepared decode,
+out-of-order and malformed
 late-call rejection with unchanged owner state and successful retry, plus reset,
-stale-publication rejection and exact replay. Three extractor/fixture tests
-reject malformed geometry, storage, provenance and substituted partial prefixes.
+stale-publication rejection and exact replay. Four extractor/fixture tests
+reject malformed geometry, storage, relabelled capture/probe/backend identities
+and substituted partial prefixes. The extractor binds the probe and schedule
+to the recorded capture hash and requires little-endian storage.
 This qualifies the owner path; alternate candidate selection, attention and the
 full native graph remain open. The existing numerical policy is unchanged.
 

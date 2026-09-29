@@ -272,6 +272,56 @@ fn alternate_partition_owner_matches_source_prefixes_and_partial_bridges() {
 }
 
 #[test]
+fn cancelled_pending_decode_keeps_owner_invisible_and_retryable() {
+    let fixture = fixture();
+    let mut owner = owner(&fixture);
+    commit_case(&mut owner, &fixture, 0);
+    let before = state(&owner);
+    let case = &fixture.cases[1];
+    let frequencies = fixture.frequencies.frequencies();
+    let wkv = fixture.weights.wkv.bf16();
+    let wk = fixture.weights.wk.bf16();
+    let key_norm = fixture.weights.key_norm.bf16();
+    let input = case.input.bf16();
+    let end = case.start_pos + case.token_count;
+    let pending = owner
+        .prepare(RatioOneOwnerCall::new(
+            IndexKeyPublicationId::new(3, owner.epoch(), owner.next_call_id()),
+            case.start_pos,
+            nz(case.token_count),
+            &input,
+            &frequencies[case.start_pos * 16..end * 16],
+            RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &key_norm)),
+        ))
+        .expect("staged source decode");
+    assert_eq!(
+        pending.diagnostic().owner.projected,
+        case.projected.bf16(),
+        "staged native WKV"
+    );
+    assert_eq!(
+        pending.diagnostic().owner.latent,
+        case.latent.bf16(),
+        "staged native compressor"
+    );
+    assert_eq!(
+        pending.key_prefix(0).expect("staged native keys"),
+        case.index_key_prefix.bf16(),
+        "staged native key prefix"
+    );
+    assert_eq!(
+        pending.kv_prefix(0).expect("staged native KV"),
+        case.compressed_kv_prefix.bf16(),
+        "staged native compressed-KV prefix"
+    );
+    drop(pending);
+    assert_eq!(state(&owner), before, "dropped pending decode is invisible");
+    commit_case(&mut owner, &fixture, 1);
+    commit_case(&mut owner, &fixture, 2);
+    commit_case(&mut owner, &fixture, 3);
+}
+
+#[test]
 fn rejected_calls_leave_the_owner_retryable() {
     let fixture = fixture();
     let mut owner = owner(&fixture);
