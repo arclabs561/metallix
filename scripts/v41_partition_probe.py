@@ -26,6 +26,7 @@ import os
 import struct
 import sys
 from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +221,57 @@ def compare_common_endpoints(
     ]
 
 
+def observer_noninterference(
+    observed: Mapping[str, object], control: Mapping[str, object]
+) -> dict[str, object]:
+    """Require alternate observers to preserve each call's logits and caches."""
+    observed_calls = observed.get("calls")
+    control_calls = control.get("calls")
+    if not isinstance(observed_calls, list) or not isinstance(control_calls, list):
+        raise ProbeError("observer runs must retain ordered call records")
+    if len(observed_calls) != len(control_calls):
+        raise ProbeError("observer runs have different call counts")
+    per_call: list[dict[str, object]] = []
+    for index, (left, right) in enumerate(zip(observed_calls, control_calls)):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            raise ProbeError("observer call record is malformed")
+        if left.get("start_pos") != right.get("start_pos") or left.get(
+            "token_count"
+        ) != right.get("token_count"):
+            raise ProbeError("observer runs have different call geometry")
+        comparison = compare_runs(
+            {
+                "terminal_logits": left.get("logits"),
+                "cache_after": left.get("cache_after"),
+            },
+            {
+                "terminal_logits": right.get("logits"),
+                "cache_after": right.get("cache_after"),
+            },
+        )
+        exact = (
+            comparison["terminal"]["exact_bits"]
+            and not comparison["cache"]["changed_fields"]
+            and not comparison["cache"]["missing_from_baseline"]
+            and not comparison["cache"]["missing_from_alternate"]
+        )
+        per_call.append(
+            {
+                "call_index": index,
+                "start_pos": left["start_pos"],
+                "token_count": left["token_count"],
+                "exact_noninterference": exact,
+                "comparison": comparison,
+            }
+        )
+    return {
+        "exact_noninterference": all(
+            item["exact_noninterference"] for item in per_call
+        ),
+        "per_call": per_call,
+    }
+
+
 def _load_runner() -> Any:
     import importlib.util
 
@@ -270,29 +322,40 @@ def _cache_after(
 
 def _source_args(
     runner: Any, graph: Any, manifest: dict[str, Any]
-) -> tuple[Any, Any, dict[str, Any]]:
+) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
     """Use canonical manifest model/token geometry; schedules stay probe-owned."""
     specification = runner.forward_manifest.synthetic_tokenizer_spec(manifest)
     tokenizer = runner.SyntheticTokenizer(
         specification["decoded_tokens"], specification["raw_token_strings"]
     )
     model_args = runner.forward_manifest.model_args(manifest)
-    return graph.ModelArgs(**model_args), tokenizer, specification
+    return graph.ModelArgs(**model_args), tokenizer, specification, model_args
 
 
 def _run_schedule(
-    runner: Any, manifest: dict[str, Any], counts: tuple[int, ...]
+    runner: Any,
+    manifest: dict[str, Any],
+    counts: tuple[int, ...],
+    *,
+    capture: bool = False,
 ) -> dict[str, object]:
     """Run one schedule in a fresh source graph, runtime, and model instance."""
     import torch
 
-    kernel_bundle, _, _ = runner.v41_forward_observers.tracing_kernel_bundle(
-        runner.kernels, runner.source_loader.KERNEL_NAMES, runner.tensor_record
-    )
+    if capture:
+        kernel_bundle, hc_records, sparse_records = (
+            runner.v41_forward_observers.tracing_kernel_bundle(
+                runner.kernels, runner.source_loader.KERNEL_NAMES, runner.tensor_record
+            )
+        )
+    else:
+        kernel_bundle, hc_records, sparse_records = runner.kernels, [], []
     graph = runner.source_loader.load_text_graph(kernel_bundle)
     graph.shared_attn = graph.SharedAttentionRuntime()
     with graph.set_dtype(torch.bfloat16):
-        args, tokenizer, tokenizer_spec = _source_args(runner, graph, manifest)
+        args, tokenizer, tokenizer_spec, model_args = _source_args(
+            runner, graph, manifest
+        )
         model = graph.Transformer(args, tokenizer).eval()
         encoded = runner.initialize_parameters(model)
         initialized_buffers = runner.initialize_runtime_buffers(model)
@@ -302,39 +365,73 @@ def _run_schedule(
                 "pinned input IDs exceed the canonical synthetic vocabulary"
             )
         calls: list[dict[str, object]] = []
+        captured_calls: list[dict[str, object]] = []
         offset = 0
-        with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(SEED)
-            for count in counts:
-                start = offset
-                stop = start + count
-                chunk = input_ids[:, start:stop]
-                output_ids, logits, _ = model(chunk, start_pos=start)
-                if not bool(torch.isfinite(logits).all()):
-                    raise ProbeError(
-                        f"source model produced nonfinite logits at start {start}"
-                    )
-                calls.append(
+
+        def execute_call(count: int, intermediate: Any | None = None) -> None:
+            nonlocal offset
+            start = offset
+            stop = start + count
+            chunk = input_ids[:, start:stop]
+            if intermediate is not None:
+                intermediate.clear()
+                hc_records.clear()
+                sparse_records.clear()
+            output_ids, logits, _ = model(chunk, start_pos=start)
+            if not bool(torch.isfinite(logits).all()):
+                raise ProbeError(
+                    f"source model produced nonfinite logits at start {start}"
+                )
+            calls.append(
+                {
+                    "start_pos": start,
+                    "token_count": count,
+                    "input_ids": runner.tensor_record(chunk, include_storage=True),
+                    "output_ids": runner.tensor_record(
+                        output_ids, include_storage=True
+                    ),
+                    "logits": runner.tensor_record(logits, include_storage=True),
+                    "cache_after": _cache_after(runner, graph, model, stop),
+                }
+            )
+            if intermediate is not None:
+                captured_calls.append(
                     {
                         "start_pos": start,
                         "token_count": count,
-                        "input_ids": runner.tensor_record(chunk, include_storage=True),
-                        "output_ids": runner.tensor_record(
-                            output_ids, include_storage=True
+                        "intermediates": dict(intermediate),
+                        "hyper_connection_mixes": runner.v41_forward_observers.hc_step_receipt(
+                            hc_records, len(model.layers)
                         ),
-                        "logits": runner.tensor_record(logits, include_storage=True),
-                        "cache_after": _cache_after(runner, graph, model, stop),
+                        "sparse_attention_calls": runner.v41_forward_observers.sparse_step_receipt(
+                            sparse_records, len(model.layers)
+                        ),
+                        "caches_after": runner.cache_snapshots(graph, model),
                     }
                 )
-                offset = stop
-        # The pinned source returns final-token logits as [batch, vocab], not
-        # a per-token [batch, sequence, vocab] tensor.
-        terminal = logits
+            offset = stop
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(SEED)
+            hook_scope = (
+                runner.v41_forward_observers.hooks_for(
+                    model,
+                    graph,
+                    runner.tensor_record,
+                    runner.object_record,
+                    runner.MAX_HOOK_RECORDS,
+                )
+                if capture
+                else nullcontext(None)
+            )
+            with hook_scope as intermediate:
+                for count in counts:
+                    execute_call(count, intermediate)
         cache_after = _cache_after(runner, graph, model, offset)
-        return {
+        run: dict[str, object] = {
             "schedule": list(counts),
             "calls": calls,
-            "terminal_logits": runner.tensor_record(terminal, include_storage=True),
+            "terminal_logits": calls[-1]["logits"],
             "cache_after": cache_after,
             "source_cache_observers": {
                 "layer_1_index_k": cache_after.get("layer_1.index_k"),
@@ -344,6 +441,37 @@ def _run_schedule(
             "tokenizer_spec_sha256": _sha256(_canonical(tokenizer_spec)),
             "initialized_buffers": initialized_buffers,
         }
+        if capture:
+            probe_sha = _file_sha256(Path(__file__))
+            run["alternate_capture"] = {
+                "schema_version": 1,
+                "scope": (
+                    "alternate-partition source observations for later extraction; "
+                    "not a canonical complete capture or qualified fixture"
+                ),
+                "capture_identity": {
+                    "probe_sha256": probe_sha,
+                    "schedule": list(counts),
+                    "sha256": _sha256(
+                        _canonical(
+                            {"probe_sha256": probe_sha, "schedule": list(counts)}
+                        )
+                    ),
+                },
+                "encoded_parameters": encoded,
+                "actual_model_args": model_args,
+                "engram": runner.engram_receipt(model, manifest),
+                "attention_static": {
+                    "layer_3_freqs_cis": runner.tensor_record(
+                        model.layers[3].attn.freqs_cis, include_storage=True
+                    ),
+                    "layer_4_freqs_cis": runner.tensor_record(
+                        model.layers[4].attn.freqs_cis, include_storage=True
+                    ),
+                },
+                "calls": captured_calls,
+            }
+        return run
 
 
 def _baseline_oracle() -> dict[str, object]:
@@ -430,7 +558,7 @@ def _source_metadata(runner: Any) -> dict[str, object]:
     }
 
 
-def build_probe() -> dict[str, object]:
+def build_probe(capture_alternate: bool = False) -> dict[str, object]:
     """Execute both named schedules and retain a divergence report or failure."""
     baseline = validate_schedule(BASELINE)
     alternate = validate_schedule(ALTERNATE)
@@ -457,6 +585,7 @@ def build_probe() -> dict[str, object]:
             "alternate_schedule": list(alternate),
             "seed": SEED,
             "fresh_graph_runtime_and_model_per_schedule": True,
+            "capture_alternate": capture_alternate,
             "network": "not used",
             "checkpoint_download": "not used",
         },
@@ -506,7 +635,9 @@ def build_probe() -> dict[str, object]:
             "baseline_oracle": baseline_oracle,
         }
     try:
-        alternate_run = _run_schedule(runner, manifest, alternate)
+        alternate_run = _run_schedule(
+            runner, manifest, alternate, capture=capture_alternate
+        )
     except (
         ArithmeticError,
         AssertionError,
@@ -524,6 +655,40 @@ def build_probe() -> dict[str, object]:
             "baseline_oracle": baseline_oracle,
             "error": {"type": type(error).__name__, "message": str(error)},
         }
+    alternate_control: dict[str, object] | None = None
+    observer_control: dict[str, object] | None = None
+    if capture_alternate:
+        try:
+            alternate_control = _run_schedule(runner, manifest, alternate)
+        except (
+            ArithmeticError,
+            AssertionError,
+            IndexError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return {
+                **common,
+                "status": "source_execution_failed",
+                "failed_schedule": "alternate_unobserved_control",
+                "baseline": baseline_run,
+                "baseline_oracle": baseline_oracle,
+                "alternate": alternate_run,
+                "error": {"type": type(error).__name__, "message": str(error)},
+            }
+        observer_control = observer_noninterference(alternate_run, alternate_control)
+        if not observer_control["exact_noninterference"]:
+            return {
+                **common,
+                "status": "observer_interference_detected",
+                "baseline": baseline_run,
+                "baseline_oracle": baseline_oracle,
+                "alternate": alternate_run,
+                "alternate_unobserved_control": alternate_control,
+                "observer_noninterference": observer_control,
+            }
     if (
         baseline_run["parameter_initializer_sha256"]
         != alternate_run["parameter_initializer_sha256"]
@@ -541,6 +706,14 @@ def build_probe() -> dict[str, object]:
         "baseline_oracle": baseline_oracle,
         "comparison": compare_runs(baseline_run, alternate_run),
         "common_endpoints": compare_common_endpoints(baseline_run, alternate_run),
+        **(
+            {
+                "alternate_unobserved_control": alternate_control,
+                "observer_noninterference": observer_control,
+            }
+            if capture_alternate
+            else {}
+        ),
     }
 
 
@@ -565,11 +738,16 @@ def main(argv: list[str] | None = None) -> int:
         "--run", action="store_true", help="execute the local source probe"
     )
     parser.add_argument("--output", type=Path, required=True, help="new receipt path")
+    parser.add_argument(
+        "--capture-alternate",
+        action="store_true",
+        help="retain full alternate-only source observers and verify they do not interfere",
+    )
     args = parser.parse_args(argv)
     if not args.run:
         parser.error("--run is required to execute the source graph")
     try:
-        receipt = build_probe()
+        receipt = build_probe(capture_alternate=args.capture_alternate)
         _write_new(args.output, receipt)
     except (OSError, ProbeError, ValueError, RuntimeError) as error:
         print(f"partition probe error: {error}", file=sys.stderr)

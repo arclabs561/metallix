@@ -498,7 +498,9 @@ requires the preceding live L3 publication. Alternate prefill/decode partitions,
 checkpoint loading and production recovery remain gates before a production
 decoder. A separate [source partition probe](docs/research/v41-forward-reference.md#partition-experiment)
 matched common-endpoint logits and final cache state for `4 + 1 + 1 + 1`, while
-retaining intermediate scratch differences; native qualification remains open.
+retaining intermediate scratch differences. An observer-controlled capture now
+verifies L1→L2, L3→L4 and prior L3→L1 bridge operands for that alternate
+schedule; native qualification remains open.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

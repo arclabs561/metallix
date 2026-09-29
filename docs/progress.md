@@ -372,8 +372,12 @@ synthetic parameters. Baseline head and L3 KV match their frozen oracles.
 Logits match exactly at common endpoints 5, 6 and 7; all 18 recorded final
 cache/state fields match. Intermediate compressor scratch and call-shaped
 candidate/selection state differ and remain recorded. This is source evidence;
-Rust alternate-partition qualification is still open. Seven probe comparison,
-validation and receipt tests pass. The canonical Metal gate still reaches the
+An independently controlled capture now verifies all four L1→L2 and L3→L4
+bridges plus the preceding L3→L1 partial-prefix handoff. The unobserved control
+disables both intermediate hooks and kernel tracing; all four calls preserve
+logits and recorded cache identities. A compact source fixture retains these
+operands with provenance. Rust alternate-partition qualification is still open.
+Nine probe tests and six bridge/extraction tests pass. The canonical Metal gate still reaches the
 unchanged Julia failure below.
 
 

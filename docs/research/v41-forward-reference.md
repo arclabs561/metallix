@@ -39,9 +39,32 @@ the probe records its own source hash, upstream and helper identities, runtime,
 initializer/tokenizer hashes and both schedules.
 
 The Rust reduced runner still accepts only the original `0/5/6` call starts.
-Next, capture alternate intermediate boundaries under their own identity and
-qualify the native consumers against those observations. Do not relabel the
+Alternate intermediate boundaries are now captured under their own identity;
+next qualify the native consumers against those observations. Do not relabel the
 existing fixture or relax its exact BF16/routing and analytic FP32 checks.
+
+
+The alternate capture is reproducible with an independent unobserved control:
+
+```sh
+uv run scripts/v41_partition_probe.py --run --capture-alternate --output artifacts/v41-partition-boundaries.json
+uv run --python '>=3.12' python scripts/v41_partition_boundaries.py --input artifacts/v41-partition-boundaries.json --output artifacts/v41-partition-bridges.json
+```
+
+The owner-local full capture is
+`.agents/receipts/candidate-control/partition-4-1-1-1-untraced-control-source.json`,
+SHA-256 `9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906`.
+The measured capture preserves every call's logits and recorded cache identities
+against the fresh unobserved control. Its four calls verify byte-identical
+L1→L2 KV/index operands and L3→L4 KV, candidate-mask and shared-key operands.
+The partial L1 call at start 6 consumes exactly the leading three keys from
+L3's preceding six-key publication. L4 computes its own selected IDs; the
+validator does not require them to equal L3's selection.
+
+`fixtures/deepseek-v41/partition-bridge-reference.json` retains those observed
+operands verbatim, with the source receipt and capture identities. Extraction
+requires completed execution and successful observer controls. These checks
+establish source handoffs, not native alternate-partition support.
 
 ## Run it
 

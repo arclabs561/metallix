@@ -124,6 +124,60 @@ class PartitionProbeTest(unittest.TestCase):
         self.assertEqual([item["tokens_processed"] for item in comparisons], [5, 6, 7])
         self.assertTrue(all(item["terminal"]["exact_bits"] for item in comparisons))
 
+    def test_observer_noninterference_requires_each_call_to_match(self) -> None:
+        def run() -> dict:
+            return {
+                "calls": [
+                    {
+                        "start_pos": start,
+                        "token_count": count,
+                        "logits": copy.deepcopy(self.baseline["terminal_logits"]),
+                        "cache_after": copy.deepcopy(self.baseline["cache_after"]),
+                    }
+                    for start, count in ((0, 4), (4, 1), (5, 1), (6, 1))
+                ]
+            }
+
+        observed, control = run(), run()
+        result = probe.observer_noninterference(observed, control)
+        self.assertTrue(result["exact_noninterference"])
+        self.assertEqual(len(result["per_call"]), 4)
+
+        changed_logit = run()
+        self.replace_word({"terminal_logits": changed_logit["calls"][2]["logits"]}, 0)
+        result = probe.observer_noninterference(changed_logit, control)
+        self.assertFalse(result["exact_noninterference"])
+        self.assertFalse(result["per_call"][2]["comparison"]["terminal"]["exact_bits"])
+
+        changed_cache = run()
+        tensor = changed_cache["calls"][1]["cache_after"]["layer_3.compressed_kv"]
+        raw = bytearray.fromhex(tensor["storage_hex"])
+        raw[0] ^= 1
+        tensor["storage_hex"] = raw.hex()
+        tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+        result = probe.observer_noninterference(changed_cache, control)
+        self.assertFalse(result["exact_noninterference"])
+        self.assertEqual(
+            result["per_call"][1]["comparison"]["cache"]["changed_fields"],
+            ["layer_3.compressed_kv"],
+        )
+
+    def test_observer_noninterference_rejects_different_geometry(self) -> None:
+        observed = {
+            "calls": [
+                {
+                    "start_pos": 0,
+                    "token_count": 4,
+                    "logits": self.baseline["terminal_logits"],
+                    "cache_after": self.baseline["cache_after"],
+                }
+            ]
+        }
+        control = copy.deepcopy(observed)
+        control["calls"][0]["token_count"] = 5
+        with self.assertRaises(probe.ProbeError):
+            probe.observer_noninterference(observed, control)
+
     def test_failed_execution_is_not_success_and_receipts_are_not_overwritten(
         self,
     ) -> None:
