@@ -92,6 +92,61 @@ class PartitionOwnerCaptureTest(unittest.TestCase):
                 with self.assertRaises(capture.CaptureError):
                     capture.validate_fixture(fixture)
 
+    def test_selection_geometry_and_causal_boundary(self) -> None:
+        capture.validate_fixture(self.fixture)
+        self.assertEqual(
+            [case["selection"]["offset"] for case in self.fixture["cases"]],
+            [4, 6, 6, 6],
+        )
+        for case in self.fixture["cases"]:
+            selection = case["selection"]
+            self.assertEqual(selection["candidate_mask"]["dtype"], "torch.bool")
+            self.assertEqual(selection["indices"]["shape"], [1, case["token_count"], 1])
+            if case["start_pos"] == 0:
+                self.assertFalse(selection["causal_scores"]["finite"])
+            else:
+                self.assertIsNone(selection["causal_scores"])
+
+    def test_rejects_malformed_selection_operands(self) -> None:
+        for defect in (
+            "offset",
+            "mask",
+            "fp8",
+            "causal_nan",
+            "query_shape",
+            "model",
+            "model_unit",
+        ):
+            with self.subTest(defect=defect):
+                fixture = copy.deepcopy(self.fixture)
+                selection = fixture["cases"][0]["selection"]
+                if defect == "offset":
+                    selection["offset"] = 5
+                elif defect == "query_shape":
+                    selection["qr"]["shape"] = [1, 5, 32]
+                elif defect == "model":
+                    fixture["selection_model"]["index_heads"] = True
+                elif defect == "model_unit":
+                    fixture["selection_model"]["candidate_block_size"] = True
+                else:
+                    if defect == "mask":
+                        tensor, replacement = selection["candidate_mask"], b"\x02"
+                    elif defect == "fp8":
+                        tensor, replacement = (
+                            fixture["selection_weights"]["wq_a_codes"],
+                            b"\x7f",
+                        )
+                    else:
+                        tensor, replacement = selection["causal_scores"], b"\xc0\x7f"
+                    raw = (
+                        replacement
+                        + bytes.fromhex(tensor["storage_hex"])[len(replacement) :]
+                    )
+                    tensor["storage_hex"] = raw.hex()
+                    tensor["storage_sha256"] = hashlib.sha256(raw).hexdigest()
+                with self.assertRaises((ValueError, RuntimeError, TypeError)):
+                    capture.validate_fixture(fixture)
+
     def test_rejects_substituted_partial_consumer(self) -> None:
         fixture = copy.deepcopy(self.fixture)
         tensor = fixture["cases"][0]["next_layer1_score_prefix"]

@@ -34,6 +34,8 @@ _WIDTHS = {
     "torch.int64": 8,
     "torch.bool": 1,
     "torch.complex64": 8,
+    "torch.float8_e4m3fn": 1,
+    "torch.float8_e8m0fnu": 1,
 }
 _PINNED_SOURCE = {
     "cpu_backend_sha256": "b1f1f3cfdb93b674a5f96a114cf45bf5be9ad3a555ae95ac24add567f9f5232e",
@@ -58,7 +60,9 @@ def _object(value: object, label: str) -> Mapping[str, Any]:
     return value
 
 
-def _tensor(value: object, label: str) -> tuple[Mapping[str, Any], bytes]:
+def _tensor(
+    value: object, label: str, *, negative_infinity_only: bool = False
+) -> tuple[Mapping[str, Any], bytes]:
     record = _object(value, label)
     dtype = record.get("dtype")
     shape = record.get("shape")
@@ -73,7 +77,6 @@ def _tensor(value: object, label: str) -> tuple[Mapping[str, Any], bytes]:
         or numel < 0
         or not isinstance(storage_hex, str)
         or not isinstance(digest, str)
-        or record.get("finite") is not True
     ):
         raise CaptureError(f"{label} has malformed tensor metadata")
     if math.prod(shape) != numel:
@@ -86,21 +89,47 @@ def _tensor(value: object, label: str) -> tuple[Mapping[str, Any], bytes]:
         raise CaptureError(f"{label} storage length does not match metadata")
     if hashlib.sha256(raw).hexdigest() != digest:
         raise CaptureError(f"{label} storage hash does not match storage hex")
-    if dtype == "torch.bfloat16" and any(
-        (int.from_bytes(raw[offset : offset + 2], "little") >> 7) & 0xFF == 0xFF
-        for offset in range(0, len(raw), 2)
-    ):
-        raise CaptureError(f"{label} contains nonfinite bfloat16 storage")
-    if dtype == "torch.float32" and not all(
-        math.isfinite(number) for number in struct.unpack(f"<{numel}f", raw)
+    if dtype == "torch.bfloat16":
+        nonfinite = [
+            int.from_bytes(raw[offset : offset + 2], "little")
+            for offset in range(0, len(raw), 2)
+            if (int.from_bytes(raw[offset : offset + 2], "little") >> 7) & 0xFF == 0xFF
+        ]
+        if negative_infinity_only:
+            if (
+                record.get("finite") is not False
+                or not nonfinite
+                or any(word != 0xFF80 for word in nonfinite)
+            ):
+                raise CaptureError(f"{label} must contain only negative infinities")
+        elif record.get("finite") is not True or nonfinite:
+            raise CaptureError(f"{label} contains nonfinite bfloat16 storage")
+    if dtype == "torch.float32" and (
+        record.get("finite") is not True
+        or not all(math.isfinite(number) for number in struct.unpack(f"<{numel}f", raw))
     ):
         raise CaptureError(f"{label} contains nonfinite float32 storage")
-    if dtype == "torch.complex64" and not all(
-        math.isfinite(number) for number in struct.unpack(f"<{numel * 2}f", raw)
+    if dtype == "torch.complex64" and (
+        record.get("finite") is not True
+        or not all(
+            math.isfinite(number) for number in struct.unpack(f"<{numel * 2}f", raw)
+        )
     ):
         raise CaptureError(f"{label} contains nonfinite complex64 storage")
-    if dtype == "torch.bool" and any(byte not in (0, 1) for byte in raw):
+    if dtype == "torch.bool" and (
+        record.get("finite") is not True or any(byte not in (0, 1) for byte in raw)
+    ):
         raise CaptureError(f"{label} contains invalid bool storage")
+    if dtype == "torch.float8_e4m3fn" and (
+        record.get("finite") is not True or any(byte & 0x7F == 0x7F for byte in raw)
+    ):
+        raise CaptureError(f"{label} contains nonfinite E4M3FN storage")
+    if dtype == "torch.float8_e8m0fnu" and (
+        record.get("finite") is not True or 0xFF in raw
+    ):
+        raise CaptureError(f"{label} contains nonfinite E8M0FNU storage")
+    if dtype in {"torch.int32", "torch.int64"} and record.get("finite") is not True:
+        raise CaptureError(f"{label} must be finite")
     return record, raw
 
 
@@ -203,7 +232,50 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         )
         for name, path in weight_paths.items()
     }
+    selection_weight_specs = {
+        "wq_a_codes": ("layers.3.attn.wq_a.weight", "torch.float8_e4m3fn", [32, 128]),
+        "wq_a_scales": ("layers.3.attn.wq_a.scale", "torch.float8_e8m0fnu", [1, 4]),
+        "q_norm": ("layers.3.attn.q_norm.weight", "torch.bfloat16", [32]),
+        "wq_b_codes": (
+            "layers.3.attn.indexer.wq_b.weight",
+            "torch.float8_e4m3fn",
+            [128, 32],
+        ),
+        "wq_b_scales": (
+            "layers.3.attn.indexer.wq_b.scale",
+            "torch.float8_e8m0fnu",
+            [4, 1],
+        ),
+        "weights_proj": (
+            "layers.3.attn.indexer.weights_proj.weight",
+            "torch.bfloat16",
+            [2, 128],
+        ),
+    }
+    selection_weights = {
+        name: _require_tensor(
+            parameters.get(path), f"selection weight {name}", dtype, shape
+        )
+        for name, (path, dtype, shape) in selection_weight_specs.items()
+    }
     actual_model = _object(capture.get("actual_model_args"), "actual model arguments")
+    expected_actual_model = {
+        "max_batch_size": 1,
+        "max_seq_len": 8,
+        "dim": 128,
+        "head_dim": 64,
+        "q_lora_rank": 32,
+        "index_n_heads": 2,
+        "index_head_dim": 64,
+        "candidate_block_size": 1,
+        "candidate_topk_blocks": 2,
+        "index_topk": 1,
+    }
+    if any(
+        actual_model.get(name) != expected
+        for name, expected in expected_actual_model.items()
+    ):
+        raise CaptureError("source selection model geometry differs")
     if (
         actual_model.get("rope_head_dim") != 32
         or actual_model.get("compress_ratios") != [0, 2, 2, 1, 1]
@@ -219,6 +291,13 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         "cache_capacity": actual_model.get("max_seq_len"),
         "owner_layer": 3,
         "norm_epsilon": actual_model.get("norm_eps"),
+    }
+    selection_model = {
+        "query_rank": actual_model.get("q_lora_rank"),
+        "index_heads": actual_model.get("index_n_heads"),
+        "candidate_block_size": actual_model.get("candidate_block_size"),
+        "candidate_topk_blocks": actual_model.get("candidate_topk_blocks"),
+        "index_topk": actual_model.get("index_topk"),
     }
 
     bridge_calls = bridge.get("calls")
@@ -294,6 +373,114 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
             "torch.bfloat16",
             [1, start_pos + token_count, 64],
         )
+        observation = _object(
+            intermediates.get("layers.3.attn.indexer_observation"),
+            f"call {start_pos} indexer observation",
+        )
+        operations = _object(
+            observation.get("operations"), f"call {start_pos} indexer operations"
+        )
+        offset = indexer_inputs.get("offset")
+        if offset != (4 if start_pos == 0 else 6):
+            raise CaptureError(f"call {start_pos} has unexpected indexer offset")
+        end_pos = start_pos + token_count
+        score_shape = [1, token_count, 2, end_pos]
+        reduced_shape = [1, token_count, end_pos]
+        selection: dict[str, object] = {
+            "offset": offset,
+            "wq_a": _require_tensor(
+                intermediates.get("layers.3.attn.wq_a"),
+                f"call {start_pos} WQ-A output",
+                "torch.bfloat16",
+                [1, token_count, 32],
+            ),
+            "qr": _require_tensor(
+                indexer_inputs.get("qr"),
+                f"call {start_pos} normalized query",
+                "torch.bfloat16",
+                [1, token_count, 32],
+            ),
+            "q_after_rope_fp4": _require_tensor(
+                operations.get("q_after_rope_fp4"),
+                f"call {start_pos} rotary query",
+                "torch.bfloat16",
+                [1, token_count, 2, 64],
+            ),
+            "weights_proj_output": _require_tensor(
+                operations.get("weights_proj_output"),
+                f"call {start_pos} head weights",
+                "torch.bfloat16",
+                [1, token_count, 2],
+            ),
+            "scaled_weights": _require_tensor(
+                operations.get("scaled_weights"),
+                f"call {start_pos} scaled head weights",
+                "torch.bfloat16",
+                [1, token_count, 2],
+            ),
+            "dot_products": _require_tensor(
+                operations.get("scores_einsum"),
+                f"call {start_pos} score dot products",
+                "torch.bfloat16",
+                score_shape,
+            ),
+            "rectified": _require_tensor(
+                operations.get("scores_after_relu"),
+                f"call {start_pos} rectified scores",
+                "torch.bfloat16",
+                score_shape,
+            ),
+            "weighted": _require_tensor(
+                operations.get("scores_weighted_per_head"),
+                f"call {start_pos} weighted scores",
+                "torch.bfloat16",
+                score_shape,
+            ),
+            "scores": _require_tensor(
+                operations.get("scores_after_head_sum"),
+                f"call {start_pos} reduced scores",
+                "torch.bfloat16",
+                reduced_shape,
+            ),
+            "candidate_mask": _require_tensor(
+                observation.get("candidate_mask_after"),
+                f"call {start_pos} candidate mask",
+                "torch.bool",
+                reduced_shape,
+            ),
+            "indices": _require_tensor(
+                observation.get("output_indices"),
+                f"call {start_pos} selected indices",
+                "torch.int32",
+                [1, token_count, 1],
+            ),
+        }
+        if start_pos == 0:
+            causal, _ = _tensor(
+                operations.get("scores_after_causal_mask"),
+                "call 0 causal scores",
+                negative_infinity_only=True,
+            )
+            if (
+                causal.get("dtype") != "torch.bfloat16"
+                or causal.get("shape") != reduced_shape
+            ):
+                raise CaptureError("call 0 causal scores have unexpected geometry")
+            selection["causal_scores"] = causal
+        elif "scores_after_causal_mask" in operations:
+            raise CaptureError("decode calls must not retain causal scores")
+        else:
+            selection["causal_scores"] = None
+        _same(
+            selection["qr"],
+            intermediates.get("layers.3.attn.q_norm"),
+            f"call {start_pos} normalized query boundary",
+        )
+        _same(
+            selection["indices"],
+            compressed.get("indices"),
+            f"call {start_pos} selected candidate IDs",
+        )
         bridge_intermediates = _object(
             _object(bridge_call, "bridge call").get("intermediates"),
             "bridge intermediates",
@@ -327,6 +514,7 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
                 "index_key_prefix": index_prefix,
                 "compressed_kv_prefix": borrowed,
                 "next_layer1_score_prefix": next_prefix,
+                "selection": selection,
             }
         )
 
@@ -338,6 +526,8 @@ def partition_owner_fixture(raw: bytes) -> dict[str, object]:
         "capture_identity": capture.get("capture_identity"),
         "model": model,
         "weights": weights,
+        "selection_model": selection_model,
+        "selection_weights": selection_weights,
         "frequencies": expected_frequency,
         "cases": cases,
     }
@@ -410,6 +600,32 @@ def validate_fixture(fixture: object) -> None:
         _require_tensor(
             weights.get(name), f"fixture weight {name}", "torch.bfloat16", shape
         )
+    selection_model = _object(root.get("selection_model"), "fixture selection model")
+    if selection_model != {
+        "query_rank": 32,
+        "index_heads": 2,
+        "candidate_block_size": 1,
+        "candidate_topk_blocks": 2,
+        "index_topk": 1,
+    } or any(type(value) is not int for value in selection_model.values()):
+        raise CaptureError("fixture selection model differs from the pinned source")
+    selection_weights = _object(
+        root.get("selection_weights"), "fixture selection weights"
+    )
+    for name, dtype, shape in (
+        ("wq_a_codes", "torch.float8_e4m3fn", [32, 128]),
+        ("wq_a_scales", "torch.float8_e8m0fnu", [1, 4]),
+        ("q_norm", "torch.bfloat16", [32]),
+        ("wq_b_codes", "torch.float8_e4m3fn", [128, 32]),
+        ("wq_b_scales", "torch.float8_e8m0fnu", [4, 1]),
+        ("weights_proj", "torch.bfloat16", [2, 128]),
+    ):
+        _require_tensor(
+            selection_weights.get(name),
+            f"fixture selection weight {name}",
+            dtype,
+            shape,
+        )
     _require_tensor(
         root.get("frequencies"), "fixture frequencies", "torch.complex64", [8, 16]
     )
@@ -449,6 +665,39 @@ def validate_fixture(fixture: object) -> None:
             "torch.bfloat16",
             [1, start_pos + token_count, 64],
         )
+        selection = _object(item.get("selection"), f"case {start_pos} selection")
+        if selection.get("offset") != (4 if start_pos == 0 else 6):
+            raise CaptureError(f"case {start_pos} selection offset differs")
+        score_shape = [1, token_count, 2, start_pos + token_count]
+        reduced_shape = [1, token_count, start_pos + token_count]
+        for name, dtype, shape in (
+            ("wq_a", "torch.bfloat16", [1, token_count, 32]),
+            ("qr", "torch.bfloat16", [1, token_count, 32]),
+            ("q_after_rope_fp4", "torch.bfloat16", [1, token_count, 2, 64]),
+            ("weights_proj_output", "torch.bfloat16", [1, token_count, 2]),
+            ("scaled_weights", "torch.bfloat16", [1, token_count, 2]),
+            ("dot_products", "torch.bfloat16", score_shape),
+            ("rectified", "torch.bfloat16", score_shape),
+            ("weighted", "torch.bfloat16", score_shape),
+            ("scores", "torch.bfloat16", reduced_shape),
+            ("candidate_mask", "torch.bool", reduced_shape),
+            ("indices", "torch.int32", [1, token_count, 1]),
+        ):
+            _require_tensor(
+                selection.get(name), f"case {start_pos} selection {name}", dtype, shape
+            )
+        causal = selection.get("causal_scores")
+        if start_pos == 0:
+            causal_record, _ = _tensor(
+                causal, "case 0 selection causal scores", negative_infinity_only=True
+            )
+            if (
+                causal_record.get("dtype") != "torch.bfloat16"
+                or causal_record.get("shape") != reduced_shape
+            ):
+                raise CaptureError("case 0 causal score geometry differs")
+        elif causal is not None:
+            raise CaptureError(f"case {start_pos} must not retain causal scores")
         _require_tensor(
             item.get("compressed_kv_prefix"),
             f"case {start_pos} borrowed KV prefix",

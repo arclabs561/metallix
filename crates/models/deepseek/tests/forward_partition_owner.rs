@@ -8,10 +8,19 @@ use std::num::NonZeroUsize;
 
 use deepseek::{
     RotaryFrequency,
+    attention::layer::Fp8Projection,
     indexer::{
         cache::IndexKeyPublicationId,
         key::{IndexKeyLayout, IndexKeyWeights},
-        owner::{RatioOneCompressedOwner, RatioOneOwnerCall, RatioOneOwnerWeights},
+        owner::{
+            PendingRatioOneCompressedOwner, RatioOneCompressedOwner, RatioOneOwnerCall,
+            RatioOneOwnerWeights,
+        },
+        query::{
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
+            IndexQueryWeights, ScoredQueryDiagnostic, prepare_scored_query,
+        },
+        selection::{SelectionCall, SelectionGeometry, produce_candidates, select_from_candidates},
     },
 };
 use serde::Deserialize;
@@ -33,6 +42,8 @@ struct Fixture {
     model: Value,
     weights: Weights,
     frequencies: Tensor,
+    selection_model: SelectionModel,
+    selection_weights: SelectionWeights,
     cases: Vec<Case>,
 }
 
@@ -45,6 +56,25 @@ struct Weights {
 }
 
 #[derive(Deserialize)]
+struct SelectionModel {
+    query_rank: usize,
+    index_heads: usize,
+    candidate_block_size: usize,
+    candidate_topk_blocks: usize,
+    index_topk: usize,
+}
+
+#[derive(Deserialize)]
+struct SelectionWeights {
+    wq_a_codes: Tensor,
+    wq_a_scales: Tensor,
+    q_norm: Tensor,
+    wq_b_codes: Tensor,
+    wq_b_scales: Tensor,
+    weights_proj: Tensor,
+}
+
+#[derive(Deserialize)]
 struct Case {
     start_pos: usize,
     token_count: usize,
@@ -54,6 +84,24 @@ struct Case {
     index_key_prefix: Tensor,
     compressed_kv_prefix: Tensor,
     next_layer1_score_prefix: Option<Tensor>,
+    selection: Selection,
+}
+
+#[derive(Deserialize)]
+struct Selection {
+    offset: usize,
+    wq_a: Tensor,
+    qr: Tensor,
+    q_after_rope_fp4: Tensor,
+    weights_proj_output: Tensor,
+    scaled_weights: Tensor,
+    dot_products: Tensor,
+    rectified: Tensor,
+    weighted: Tensor,
+    scores: Tensor,
+    causal_scores: Option<Tensor>,
+    candidate_mask: Tensor,
+    indices: Tensor,
 }
 
 #[derive(Deserialize)]
@@ -67,8 +115,7 @@ struct Tensor {
 }
 
 impl Tensor {
-    fn bytes(&self, width: usize) -> Vec<u8> {
-        assert!(self.finite, "source tensor must be finite");
+    fn raw_bytes(&self, width: usize) -> Vec<u8> {
         let elements = self.shape.iter().copied().product::<usize>();
         assert_eq!(self.numel, elements, "source tensor element count");
         assert_eq!(self.storage_hex.len(), elements * width * 2, "source bytes");
@@ -85,12 +132,67 @@ impl Tensor {
         bytes
     }
 
+    fn bytes(&self, width: usize) -> Vec<u8> {
+        assert!(self.finite, "source tensor must be finite");
+        self.raw_bytes(width)
+    }
+
     fn bf16(&self) -> Vec<u16> {
         assert_eq!(self.dtype, "torch.bfloat16");
         self.bytes(2)
             .chunks_exact(2)
             .map(|word| u16::from_le_bytes(word.try_into().expect("BF16 word")))
             .collect()
+    }
+
+    fn fp8(&self) -> Vec<u8> {
+        assert!(matches!(
+            self.dtype.as_str(),
+            "torch.float8_e4m3fn" | "torch.float8_e8m0fnu"
+        ));
+        self.bytes(1)
+    }
+
+    fn bools(&self) -> Vec<bool> {
+        assert_eq!(self.dtype, "torch.bool");
+        self.bytes(1)
+            .into_iter()
+            .map(|value| match value {
+                0 => false,
+                1 => true,
+                _ => panic!("source bool storage must contain only 0 or 1"),
+            })
+            .collect()
+    }
+
+    fn i32(&self) -> Vec<i32> {
+        assert_eq!(self.dtype, "torch.int32");
+        self.bytes(4)
+            .chunks_exact(4)
+            .map(|word| i32::from_le_bytes(word.try_into().expect("i32 word")))
+            .collect()
+    }
+
+    fn causal_bf16(&self) -> Vec<u16> {
+        assert!(!self.finite, "causal scores record masking infinities");
+        assert_eq!(self.dtype, "torch.bfloat16");
+        let values: Vec<_> = self
+            .raw_bytes(2)
+            .chunks_exact(2)
+            .map(|word| u16::from_le_bytes(word.try_into().expect("BF16 word")))
+            .collect();
+        assert!(
+            values.iter().all(|&bits| {
+                let value = f32::from_bits(u32::from(bits) << 16);
+                value.is_finite() || bits == 0xff80
+            }),
+            "causal source scores permit only negative infinity"
+        );
+        assert!(
+            values.contains(&0xff80),
+            "causal source scores include masking"
+        );
+        values
     }
 
     fn frequencies(&self) -> Vec<RotaryFrequency> {
@@ -131,7 +233,7 @@ fn fixture() -> Fixture {
     let raw = include_str!("../../../../fixtures/deepseek-v41/partition-owner-reference.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(raw.as_bytes())),
-        "3a788074b5de4597104a673851cddc616a977b47e59fd35b5f383d33372b0a8f"
+        "ff01eebf14cd1045884e9dbb66f97c0c373680304b8b3f9a72ad2500d769d2f0"
     );
     let fixture: Fixture = serde_json::from_str(raw).expect("partition owner fixture JSON");
     assert_eq!(fixture.schema_version, 1);
@@ -165,14 +267,44 @@ fn fixture() -> Fixture {
     assert_eq!(fixture.weights.wk.shape, [64, 64]);
     assert_eq!(fixture.weights.key_norm.shape, [64]);
     assert_eq!(fixture.frequencies.shape, [8, 16]);
+    assert_eq!(fixture.selection_model.query_rank, 32);
+    assert_eq!(fixture.selection_model.index_heads, 2);
+    assert_eq!(fixture.selection_model.candidate_block_size, 1);
+    assert_eq!(fixture.selection_model.candidate_topk_blocks, 2);
+    assert_eq!(fixture.selection_model.index_topk, 1);
+    assert_eq!(fixture.selection_weights.wq_a_codes.shape, [32, 128]);
+    assert_eq!(fixture.selection_weights.wq_a_scales.shape, [1, 4]);
+    assert_eq!(fixture.selection_weights.q_norm.shape, [32]);
+    assert_eq!(fixture.selection_weights.wq_b_codes.shape, [128, 32]);
+    assert_eq!(fixture.selection_weights.wq_b_scales.shape, [4, 1]);
+    assert_eq!(fixture.selection_weights.weights_proj.shape, [2, 128]);
     assert_eq!(fixture.cases.len(), SCHEDULE.len());
-    for (case, &(start, count)) in fixture.cases.iter().zip(SCHEDULE) {
+    for (index, (case, &(start, count))) in fixture.cases.iter().zip(SCHEDULE).enumerate() {
         assert_eq!((case.start_pos, case.token_count), (start, count));
         assert_eq!(case.input.shape, [1, count, 128]);
         assert_eq!(case.projected.shape, [1, count, 64]);
         assert_eq!(case.latent.shape, [1, count, 64]);
         assert_eq!(case.index_key_prefix.shape, [1, start + count, 64]);
         assert_eq!(case.compressed_kv_prefix.shape, [1, start + count, 64]);
+        assert_eq!(case.selection.offset, [4, 6, 6, 6][index]);
+        assert_eq!(case.selection.wq_a.shape, [1, count, 32]);
+        assert_eq!(case.selection.qr.shape, [1, count, 32]);
+        assert_eq!(case.selection.q_after_rope_fp4.shape, [1, count, 2, 64]);
+        assert_eq!(case.selection.weights_proj_output.shape, [1, count, 2]);
+        assert_eq!(case.selection.scaled_weights.shape, [1, count, 2]);
+        assert_eq!(
+            case.selection.dot_products.shape,
+            [1, count, 2, start + count]
+        );
+        assert_eq!(case.selection.rectified.shape, [1, count, 2, start + count]);
+        assert_eq!(case.selection.weighted.shape, [1, count, 2, start + count]);
+        assert_eq!(case.selection.scores.shape, [1, count, start + count]);
+        assert_eq!(
+            case.selection.candidate_mask.shape,
+            [1, count, start + count]
+        );
+        assert_eq!(case.selection.indices.shape, [1, count, 1]);
+        assert_eq!(case.selection.causal_scores.is_some(), start == 0);
         assert_eq!(
             case.next_layer1_score_prefix.is_some(),
             matches!(start, 0 | 5),
@@ -200,6 +332,152 @@ fn owner(fixture: &Fixture) -> RatioOneCompressedOwner {
     .expect("captured ratio-one owner")
 }
 
+fn assert_query_stages(prepared: &ScoredQueryDiagnostic, selection: &Selection) {
+    assert_eq!(prepared.query.wq_a, selection.wq_a.bf16(), "native wq_a");
+    assert_eq!(prepared.query.qr, selection.qr.bf16(), "native QR");
+    assert_eq!(
+        prepared.query.index.query_post_fp4,
+        selection.q_after_rope_fp4.bf16(),
+        "native index Q"
+    );
+    assert_eq!(
+        prepared.query.index.projected_head_weights,
+        selection.weights_proj_output.bf16(),
+        "native head weights"
+    );
+    assert_eq!(
+        prepared.query.index.scaled_head_weights,
+        selection.scaled_weights.bf16(),
+        "native scaled weights"
+    );
+    assert_eq!(
+        prepared.dot_products,
+        selection.dot_products.bf16(),
+        "native dot products"
+    );
+    assert_eq!(
+        prepared.rectified,
+        selection.rectified.bf16(),
+        "native rectified scores"
+    );
+    assert_eq!(
+        prepared.weighted,
+        selection.weighted.bf16(),
+        "native weighted scores"
+    );
+    assert_eq!(
+        prepared.scores,
+        selection.scores.bf16(),
+        "native reduced scores"
+    );
+}
+
+fn assert_pending_selection(
+    pending: &PendingRatioOneCompressedOwner<'_>,
+    fixture: &Fixture,
+    index: usize,
+) {
+    let case = &fixture.cases[index];
+    let selection = &case.selection;
+    let keys = pending.key_prefix(0).expect("staged native key prefix");
+    let positions = case.token_count;
+    let frequencies = fixture.frequencies.frequencies();
+    let input = case.input.bf16();
+    let query_codes = fixture.selection_weights.wq_a_codes.fp8();
+    let query_scales = fixture.selection_weights.wq_a_scales.fp8();
+    let q_norm = fixture.selection_weights.q_norm.bf16();
+    let index_codes = fixture.selection_weights.wq_b_codes.fp8();
+    let index_scales = fixture.selection_weights.wq_b_scales.fp8();
+    let weights_proj = fixture.selection_weights.weights_proj.bf16();
+    let layout = CandidateQueryLayout::new(
+        IndexQueryLayout::new(nz(1), nz(128), nz(32), nz(2), nz(64), nz(16))
+            .expect("captured selection layout"),
+        1.0e-20,
+    )
+    .expect("captured candidate query layout");
+    let geometry = SelectionGeometry::new(
+        case.start_pos,
+        nz(positions),
+        nz(keys.len() / 64),
+        nz(1),
+        selection.offset,
+    )
+    .expect("source selection geometry");
+    let call = SelectionCall::new(pending.publication(), 0, geometry);
+    let prepared = prepare_scored_query(
+        &input,
+        &frequencies[case.start_pos * 16..(case.start_pos + positions) * 16],
+        CandidateQueryWeights {
+            wq_a: Fp8Projection {
+                codes: &query_codes,
+                scales: &query_scales,
+            },
+            q_norm: &q_norm,
+            index: IndexQueryWeights {
+                wq_b_codes: &index_codes,
+                wq_b_scales: &index_scales,
+                weights_proj: &weights_proj,
+            },
+        },
+        layout,
+        IndexKeyView::new(keys, nz(64)).expect("live pending key view"),
+    )
+    .expect("live pending candidate query");
+    assert_query_stages(&prepared, selection);
+    let candidates = produce_candidates(
+        &prepared.scores,
+        call,
+        fixture.selection_model.candidate_topk_blocks,
+        nz(fixture.selection_model.candidate_block_size),
+    )
+    .expect("live native candidates");
+    let expected_causal = selection
+        .causal_scores
+        .as_ref()
+        .map_or_else(|| selection.scores.bf16(), Tensor::causal_bf16);
+    assert_eq!(
+        candidates.causal_scores(),
+        expected_causal,
+        "native causal scores"
+    );
+    assert_eq!(
+        candidates.mask(),
+        selection.candidate_mask.bools(),
+        "native candidate mask"
+    );
+    let selected = select_from_candidates(
+        &prepared.scores,
+        call,
+        &candidates,
+        fixture.selection_model.index_topk,
+    )
+    .expect("live native selection");
+    assert_eq!(
+        selected.indices,
+        selection.indices.i32(),
+        "native selected IDs"
+    );
+    let wrong_call = SelectionCall::new(
+        IndexKeyPublicationId::new(
+            3,
+            pending.publication().epoch(),
+            pending.publication().call_id() + 1,
+        ),
+        0,
+        geometry,
+    );
+    assert!(
+        select_from_candidates(
+            &prepared.scores,
+            wrong_call,
+            &candidates,
+            fixture.selection_model.index_topk
+        )
+        .is_err(),
+        "candidate selection rejects a changed publication identity"
+    );
+}
+
 fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: usize) {
     let case = &fixture.cases[index];
     let frequencies = fixture.frequencies.frequencies();
@@ -209,7 +487,7 @@ fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: us
     let input = case.input.bf16();
     let start = case.start_pos;
     let end = start + case.token_count;
-    let diagnostic = owner
+    let pending = owner
         .prepare(RatioOneOwnerCall::new(
             IndexKeyPublicationId::new(3, owner.epoch(), owner.next_call_id()),
             start,
@@ -218,9 +496,9 @@ fn commit_case(owner: &mut RatioOneCompressedOwner, fixture: &Fixture, index: us
             &frequencies[start * 16..end * 16],
             RatioOneOwnerWeights::new(&wkv, IndexKeyWeights::new(&wk, &key_norm)),
         ))
-        .expect("source-shaped owner preparation")
-        .commit()
-        .expect("source-shaped owner commit");
+        .expect("source-shaped owner preparation");
+    assert_pending_selection(&pending, fixture, index);
+    let diagnostic = pending.commit().expect("source-shaped owner commit");
     assert_eq!(
         diagnostic.owner.projected,
         case.projected.bf16(),
@@ -314,6 +592,7 @@ fn cancelled_pending_decode_keeps_owner_invisible_and_retryable() {
         case.compressed_kv_prefix.bf16(),
         "staged native compressed-KV prefix"
     );
+    assert_pending_selection(&pending, &fixture, 1);
     drop(pending);
     assert_eq!(state(&owner), before, "dropped pending decode is invisible");
     commit_case(&mut owner, &fixture, 1);

@@ -66,7 +66,7 @@ operands verbatim, with the source receipt and capture identities. Extraction
 requires completed execution and successful observer controls. These checks
 establish source handoffs, not native alternate-partition support.
 
-### Native alternate owner
+### Native alternate owner and selection
 
 ```sh
 uv run scripts/v41_partition_owner_capture.py --input artifacts/v41-partition-boundaries.json --output artifacts/v41-partition-owner.json
@@ -81,14 +81,23 @@ and 6. Native WKV projections, compressor latents, and committed key/KV prefixes
 match the source exactly. After starts 0 and 5, the leading native keys also
 match the next L1 partial call's two-key and three-key score operands.
 
+Before committing, `prepare_scored_query` reads the live staged key prefix.
+WQ-A, normalized QR, FP4 query, head weights, dot products, ReLU, weighted and
+head-summed scores all match the source BF16 bits. `produce_candidates` and
+`select_from_candidates` then reproduce the causal scores, boolean mask and
+selected IDs exactly. Captured offsets are 4, 6, 6 and 6; they are not inferred
+from the number of processed tokens. A changed publication identity is rejected.
+The extended fixture adds selection observations without changing the earlier
+owner operands or the source capture identity.
+
 Rejected out-of-order and malformed late calls leave epoch, call ordinal,
 position and both prefixes unchanged; the valid retry matches the source.
 Reset advances the epoch, clears positions/prefixes, rejects an old publication
 and replays all four calls exactly. Dropping a valid prepared decode before
 commit also leaves live state unchanged; retrying its identity succeeds. These
-four integration tests exercise the
-native owner only. They do not establish alternate candidate selection,
-attention, L1 scoring or final-head agreement for the full native graph.
+four integration tests exercise the native owner and selection together. They
+do not establish alternate attention, L1 scoring or final-head agreement for
+the full native graph.
 
 ## Run it
 

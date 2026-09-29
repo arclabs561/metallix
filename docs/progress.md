@@ -369,15 +369,19 @@ gates for candidate retries, steering, SMC, and the DeepSeek producer join.
 The native L3 `RatioOneCompressedOwner` now executes the source `4 + 1 + 1 + 1`
 partition with exact WKV, compressor latent, committed key and KV prefixes.
 Its native keys match the next L1 partial score operands at starts 4 and 6.
+Before commit, staged native keys also feed WQ-A/QR and index-query preparation,
+all BF16 score stages, causal masking, candidate masks and selected IDs. Each
+boundary matches the source exactly across all four calls; selection rejects a
+candidate carrying the wrong publication identity.
 Four integration tests cover the four-call sequence, cancelled prepared decode,
-out-of-order and malformed
-late-call rejection with unchanged owner state and successful retry, plus reset,
-stale-publication rejection and exact replay. Four extractor/fixture tests
-reject malformed geometry, storage, relabelled capture/probe/backend identities
-and substituted partial prefixes. The extractor binds the probe and schedule
-to the recorded capture hash and requires little-endian storage.
-This qualifies the owner path; alternate candidate selection, attention and the
-full native graph remain open. The existing numerical policy is unchanged.
+out-of-order and malformed late-call rejection with unchanged owner state and
+successful retry, plus reset, stale-publication rejection and exact replay.
+Six extractor/fixture tests reject malformed geometry/storage, relabelled
+capture/probe/backend identities, substituted partial prefixes, malformed
+FP8/bool storage and invalid causal scores. The extractor binds the probe and
+schedule to the recorded capture hash and requires little-endian storage.
+This qualifies the owner and selection path; alternate attention and the full
+native graph remain open. The existing numerical policy is unchanged.
 
 
 A separate [source partition probe](research/v41-forward-reference.md#partition-experiment)
