@@ -3905,3 +3905,85 @@ fn alternate_layer_two_cannot_fall_back_to_a_canonical_owner() {
         layer2_attention_capture::NativeLayerTwoAttentionSession::from_alternate(&projection);
     attention.step_with_publication(&(0, input.bf16()), None);
 }
+
+#[test]
+fn alternate_partition_live_upstream_and_owner_reach_final_logits() {
+    let one_projection = alternate_layer_one_projection();
+    let two_projection = alternate_layer_two_projection();
+    let three_projection = alternate_layer_three_engram_projection();
+    let startup = layer_zero::alternate_startup_projection();
+    let upstream = layer_zero::native_layer_zero_entries_from_projection(&startup);
+    let mut one = layer1_join::NativeLayerOneSession::from_alternate(&one_projection, &startup);
+    let mut two =
+        layer2_join::NativeLayerTwoSession::from_alternate(&two_projection, &one_projection);
+    let mut engram = engram_capture::NativeLayerThreeEngramSession::from_alternate(
+        &three_projection,
+        &two_projection,
+    );
+    let mut owner = partition_owner::NativeAlternateLayerThreeSession::new();
+    let three_fixture = alternate_partition_tail_fixture();
+    let mut entries = Vec::new();
+    let mut incoming = Vec::new();
+    let mut publications: Vec<partition_owner::AlternateLayerThreePublication> = Vec::new();
+    for (index, (start, residual, pre)) in upstream.iter().enumerate() {
+        if matches!(start, 4 | 6) {
+            one.supply_previous_layer_three_prefix(&publications[index - 1].key_prefix);
+        }
+        let first = one.step(&(*start, residual.clone()), &(*start, pre.clone()));
+        let (two_start, stream, pre) = two.step(&first, Some(one.last_publication()));
+        entries.push(engram.step(Some(&(two_start, stream))));
+        incoming.push((two_start, pre));
+        let inputs =
+            native_layer_three_attention_inputs_from_entries(&three_fixture, &entries, &incoming);
+        publications.push(owner.step(inputs.last().unwrap()));
+    }
+    let attention: Vec<_> = publications
+        .iter()
+        .map(|publication| publication.attention_output.clone())
+        .collect();
+    let three_tail = native_layer_three_block_tail_from_entries_with_attention(
+        &three_fixture,
+        Some(&entries),
+        Some(&incoming),
+        Some(&attention),
+    );
+    let four_fixture = alternate_partition_l4_fixture();
+    let four_attention = alternate_l4_attention_outputs(&four_fixture, &publications, &three_tail);
+    let four_tail =
+        block_tail_from_supplied_attention(&four_fixture.tail, &four_attention, &three_tail);
+    assert_alternate_head(&four_fixture.head, &four_tail);
+}
+
+#[test]
+fn alternate_layer_three_engram_rejects_bad_stream_then_continues() {
+    let projection = alternate_layer_three_engram_projection();
+    let two = alternate_layer_two_projection();
+    let mut tested =
+        engram_capture::NativeLayerThreeEngramSession::from_alternate(&projection, &two);
+    let mut control =
+        engram_capture::NativeLayerThreeEngramSession::from_alternate(&projection, &two);
+    for (index, case) in projection["cases"].as_array().unwrap().iter().enumerate() {
+        let start = usize::try_from(case["start_pos"].as_u64().unwrap()).unwrap();
+        let stream: Tensor = serde_json::from_value(case["stream"].clone()).unwrap();
+        let valid = (start, stream.bf16());
+        if index == 1 {
+            let mut bad = valid.clone();
+            bad.1[0] ^= 1;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tested.step(Some(&bad))))
+                    .is_err()
+            );
+        }
+        assert_eq!(tested.step(Some(&valid)), control.step(Some(&valid)));
+    }
+}
+
+fn alternate_layer_three_engram_projection() -> Value {
+    let raw =
+        include_str!("../../../../fixtures/deepseek-v41/partition-layer3-engram-reference.json");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(raw.as_bytes())),
+        "7bbd6d11e0906d98e113075a2e9d7dd34aa7175536be30f20ebfb45aed93daa9"
+    );
+    serde_json::from_str(raw).unwrap()
+}

@@ -17,6 +17,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ PARAMETER_LAYOUTS = {
     "layers.3.engram.q_weight": ("torch.bfloat16", [2, 128]),
     "layers.3.engram.k_weight": ("torch.bfloat16", [2, 128]),
 }
+CANONICAL_SCHEDULE = ((0, 5), (5, 1), (6, 1))
 
 
 def _sha256(raw: bytes) -> str:
@@ -126,27 +128,37 @@ def _split_wkv(
     )
 
 
-def engram_fixture(receipt: dict[str, object]) -> dict[str, object]:
-    """Project only source records needed for native layer-three Engram replay."""
+def engram_projection(
+    engram: object,
+    model_args: object,
+    encoded: object,
+    steps: object,
+    *,
+    schedule: tuple[tuple[int, int], ...] = CANONICAL_SCHEDULE,
+) -> dict[str, object]:
+    """Project L3 Engram numerical operands for one contiguous call schedule.
+
+    Canonical and alternate callers attach their own capture provenance after
+    this numerical projection, so alternate receipts cannot pose as canonical.
+    """
+    engram = _require_dict(engram, "engram")
+    encoded = _require_dict(encoded, "encoded parameters")
+    model_args = _require_dict(model_args, "model args")
     if (
-        receipt.get("capture_status")
-        != "completed synthetic source-forward capture; no parity claim"
+        not schedule
+        or schedule[0][0] != 0
+        or any(
+            type(start) is not int or type(count) is not int or count <= 0
+            for start, count in schedule
+        )
+        or any(
+            start != previous_start + previous_count
+            for (previous_start, previous_count), (start, _) in pairwise(schedule)
+        )
     ):
-        raise RuntimeError("Engram fixture export requires a completed source capture")
-    if receipt.get("coverage_status", {}).get("pending") != []:
-        raise RuntimeError("Engram fixture export requires complete capture coverage")
-    source = _require_dict(receipt.get("source"), "source")
-    engram = _require_dict(receipt.get("engram"), "engram")
-    encoded = _require_dict(receipt.get("encoded_parameters"), "encoded parameters")
-    runtime = _require_dict(receipt.get("runtime"), "runtime")
-    model_args = _require_dict(receipt.get("model_args"), "model args")
-    steps = receipt.get("steps")
-    if not isinstance(steps, list):
-        raise TypeError("steps must be an array")
-    if runtime.get("storage_byteorder") != "little":
-        raise RuntimeError("Engram fixture export requires little-endian storage")
-    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
-        raise RuntimeError("Engram fixture has incomplete source provenance")
+        raise RuntimeError("Engram projection requires a contiguous schedule from zero")
+    if not isinstance(steps, list) or len(steps) != len(schedule):
+        raise TypeError("Engram projection requires one step per schedule entry")
 
     layout = _require_dict(engram.get("layout"), "Engram layout")
     hash_state = _require_dict(engram.get("hash_state"), "Engram hash state")
@@ -174,14 +186,12 @@ def engram_fixture(receipt: dict[str, object]) -> dict[str, object]:
         _require_tensor(encoded.get(name), name, dtype=dtype, shape=shape)
 
     cases: list[dict[str, object]] = []
-    for step in steps:
+    for step, (start, sequence) in zip(steps, schedule, strict=True):
         step_record = _require_dict(step, "capture step")
-        start = step_record.get("start_pos")
-        sequence = 5 if start == 0 else 1
-        if start not in (0, 5, 6):
-            raise RuntimeError(
-                "Engram fixture requires the pinned prefill/decode trace"
-            )
+        if step_record.get("start_pos") != start or (
+            "token_count" in step_record and step_record.get("token_count") != sequence
+        ):
+            raise RuntimeError("Engram projection schedule drifted")
         input_ids = _require_tensor(
             step_record.get("input_ids"),
             "step input IDs",
@@ -254,8 +264,8 @@ def engram_fixture(receipt: dict[str, object]) -> dict[str, object]:
                 "block_entry": block_residual,
             }
         )
-    if [case["start_pos"] for case in cases] != [0, 5, 6]:
-        raise RuntimeError("Engram fixture must retain prefill plus both decode steps")
+    if [case["start_pos"] for case in cases] != [start for start, _ in schedule]:
+        raise RuntimeError("Engram projection cases differ from their schedule")
     return {
         "schema_version": 1,
         "scope": (
@@ -263,11 +273,6 @@ def engram_fixture(receipt: dict[str, object]) -> dict[str, object]:
             "gate into the layer-three block entry; not earlier layer residual production, "
             "full-model parity, or production serving"
         ),
-        "source": {
-            **{field: source[field] for field in SOURCE_FIELDS},
-            "complete_capture_sha256": _sha256(serialized_capture(receipt)),
-            "storage_byteorder": runtime["storage_byteorder"],
-        },
         "model": {
             "copies": model_args.get("hc_mult"),
             "dim": model_args.get("dim"),
@@ -288,6 +293,37 @@ def engram_fixture(receipt: dict[str, object]) -> dict[str, object]:
             "wkv_output_bf16": "exact storage bits",
             "key_value": "per-token exact BF16 split of WKV output",
             "output_block_entry": "exact storage identity",
+        },
+    }
+
+
+def engram_fixture(receipt: dict[str, object]) -> dict[str, object]:
+    """Project only source records needed for native layer-three Engram replay."""
+    if (
+        receipt.get("capture_status")
+        != "completed synthetic source-forward capture; no parity claim"
+    ):
+        raise RuntimeError("Engram fixture export requires a completed source capture")
+    if receipt.get("coverage_status", {}).get("pending") != []:
+        raise RuntimeError("Engram fixture export requires complete capture coverage")
+    source = _require_dict(receipt.get("source"), "source")
+    runtime = _require_dict(receipt.get("runtime"), "runtime")
+    if runtime.get("storage_byteorder") != "little":
+        raise RuntimeError("Engram fixture export requires little-endian storage")
+    if any(not isinstance(source.get(field), str) for field in SOURCE_FIELDS):
+        raise RuntimeError("Engram fixture has incomplete source provenance")
+    projection = engram_projection(
+        receipt.get("engram"),
+        receipt.get("model_args"),
+        receipt.get("encoded_parameters"),
+        receipt.get("steps"),
+    )
+    return {
+        **projection,
+        "source": {
+            **{field: source[field] for field in SOURCE_FIELDS},
+            "complete_capture_sha256": _sha256(serialized_capture(receipt)),
+            "storage_byteorder": runtime["storage_byteorder"],
         },
     }
 

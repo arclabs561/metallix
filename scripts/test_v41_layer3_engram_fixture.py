@@ -56,18 +56,24 @@ class LayerThreeEngramFixtureTest(unittest.TestCase):
             "kernel_source_sha256",
             "cpu_backend_sha256",
             "loader_sha256",
-            "runner_sha256",
             "storage_byteorder",
         )
         self.assertEqual(
             {key: committed["source"][key] for key in stable},
             {key: self.fixture["source"][key] for key in stable},
         )
-        # Layer-two instrumentation intentionally changes both these receipt
-        # identities while preserving the historical Engram numerical oracle.
-        for key in ("forward_observers_sha256", "complete_capture_sha256"):
-            self.assertRegex(self.fixture["source"][key], r"^[0-9a-f]{64}$")
-            self.assertNotEqual(committed["source"][key], self.fixture["source"][key])
+        current_tools = {
+            "runner_sha256": "v41-forward-reference.py",
+            "forward_observers_sha256": "v41_forward_observers.py",
+        }
+        for key, filename in current_tools.items():
+            self.assertEqual(
+                self.fixture["source"][key],
+                hashlib.sha256((SCRIPTS / filename).read_bytes()).hexdigest(),
+            )
+        self.assertRegex(
+            self.fixture["source"]["complete_capture_sha256"], r"^[0-9a-f]{64}$"
+        )
 
     def test_wkv_split_and_block_entry_are_exact(self) -> None:
         for case in self.fixture["cases"]:

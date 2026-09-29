@@ -426,7 +426,14 @@ that computed residual and coefficients, requires the live L1 KV/selection
 publication, and runs HC, attention and FFN to the observed L3 Engram stream
 for all four calls. Six persisted Python controls check the L1→L2→L3 boundaries
 and provenance; a native negative control rejects a missing live L1 owner.
-The live per-call join to L3 remains open before full native-graph qualification.
+The alternate composed path now closes that join: persistent L3 Engram consumes
+native L2 output, and a persistent L3 owner/attention session consumes its
+computed HC input. Each L1 partial call reads the preceding publication from
+that same execution, eliminating the source-fed bootstrap on this path. Native
+L3 entries and attention then drive L3/L4 tails and final logits under the
+unchanged bounds. The tails/head execute after the upstream four-call loop;
+this is fixed reduced-fixture qualification, not an interleaved production
+request runner. Broader schedules and alternate full-request recovery remain open.
 Owner cancellation/retry checks
 do not establish atomic rollback across the subsequent attention call. The existing numerical policy is unchanged.
 
@@ -441,7 +448,7 @@ An independently controlled capture now verifies all four L1→L2 and L3→L4
 bridges plus the preceding L3→L1 partial-prefix handoff. The unobserved control
 disables both intermediate hooks and kernel tracing; all four calls preserve
 logits and recorded cache identities. A compact source fixture retains these
-operands with provenance. Full-graph Rust alternate-partition qualification is still open.
+operands with provenance. The native alternate composition now reaches final logits using these operands; production scheduling and recovery remain open.
 Nine probe tests and six bridge/extraction tests pass. The canonical Metal gate still reaches the
 unchanged Julia failure below.
 

@@ -494,36 +494,27 @@ The request rejects continuation after failure and requires reconstruction.
 Layer four directly consumes committed layer-three key/KV prefixes while computing
 its own query and selection. The unified reduced-runner fixture supplies all
 L0–L4 and head numerical operands in this composition. The partial L1 call
-requires the preceding live L3 publication. Alternate prefill/decode partitions,
-checkpoint loading and production recovery remain gates before a production
-decoder. A separate [source partition probe](docs/research/v41-forward-reference.md#partition-experiment)
+requires the preceding live L3 publication. Checkpoint loading and production
+recovery remain gates before a production decoder. A separate [source partition probe](docs/research/v41-forward-reference.md#partition-experiment)
 matched common-endpoint logits and final cache state for `4 + 1 + 1 + 1`, while
-retaining intermediate scratch differences. An observer-controlled capture now
-verifies L1→L2, L3→L4 and prior L3→L1 bridge operands for that alternate
-schedule. The native L3 owner now matches all four calls exactly through WKV,
-compression, key/KV publication and both partial L3→L1 handoffs. Its live staged
-keys now also drive exact query/score, candidate-mask and selected-ID agreement,
-including owner cancellation/retry/reset checks. The committed KV and computed
-IDs now drive exact L3 attention agreement through window-cache, sparse and
-final attention outputs, including coordinated reset/replay. These computed outputs
-now feed native L3 HC/FFN and reach the captured L4 entry on all four calls,
-with exact BF16 residuals and expert IDs under the existing coefficient bounds.
-The retained L3 candidate set and key/KV publications now feed L4's own query,
-selection and attention. Computed L3 residuals and coefficients continue through
-L4 HC/FFN and final logits under the existing source-derived bounds. Earlier L3
-inputs remain source-fed. On the upstream side, native token startup, L0 window
-attention, HC and FFN now feed persistent native L1 Engram for all four calls.
-Its computed outputs and L0 coefficients reach the observed L1 attention input
-exactly, including rejection of a bad stream followed by valid continuation.
-Those inputs now drive native L1 compression, query/selection and attention.
-Partial calls consume the correct retained native L3 snapshots, while completed
-groups publish L1’s own keys; fresh-request replay also passes. L3’s inputs in
-this isolated check remain source-fed. L1 HC/FFN now carries computed Engram
-residuals and attention outputs through to the observed L2 entry, retaining
-exact BF16 boundaries and the existing coefficient bounds. Native L2 now consumes
-that residual, coefficients and live L1 KV/selection publication through HC,
-attention and FFN to the observed L3 Engram stream. The live per-call join to L3
-remains open before full-graph partition qualification.
+retaining intermediate scratch differences. An observer-controlled capture pins
+that alternate schedule's operands independently of the canonical capture.
+
+The alternate native composition now runs token startup, L0, persistent L1
+Engram/owner/attention, L2, and persistent L3 Engram/owner/attention. Partial L1
+calls at starts four and six consume the preceding computed L3 publication;
+completed L1 groups publish their own keys. Native L1 publications drive L2,
+and computed L2 residuals and coefficients drive L3. The resulting L3 residuals,
+attention outputs and key/KV/candidate publications feed the L3/L4 tails and
+head, matching final logits under the existing source-derived bounds. BF16
+boundaries and discrete routing remain exact. Invalid Engram streams and L3
+owner inputs are rejected before their respective state advances.
+
+This qualifies the fixed reduced `4 + 1 + 1 + 1` composition alongside the
+canonical `5 + 1 + 1` path. The alternate test evaluates the L3/L4 tails and head
+after its upstream call loop; it is not an interleaved production request runner.
+Broader schedules, alternate full-request failure recovery, checkpoint loading
+and serving remain open.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

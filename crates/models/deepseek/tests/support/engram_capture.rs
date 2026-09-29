@@ -133,6 +133,7 @@ pub(super) struct NativeLayerThreeEngramSession {
     root: Value,
     hashes: EngramHashState,
     next_case: usize,
+    next_start: usize,
 }
 
 impl NativeLayerThreeEngramSession {
@@ -158,6 +159,16 @@ impl NativeLayerThreeEngramSession {
             field(&field(&pinned, "projections")["layer3_engram"], "source"),
             "layer3 Engram source metadata"
         );
+        Self::from_root(projection.clone())
+    }
+
+    pub(super) fn from_alternate(projection: &Value, layer_two: &Value) -> Self {
+        for name in ["source", "source_receipt_sha256", "capture_identity"] {
+            assert_eq!(
+                projection[name], layer_two[name],
+                "alternate L3 Engram provenance"
+            );
+        }
         Self::from_root(projection.clone())
     }
 
@@ -200,6 +211,7 @@ impl NativeLayerThreeEngramSession {
             root,
             hashes: EngramHashState::new(layout_hash, 1, capacity).unwrap(),
             next_case: 0,
+            next_start: 0,
         }
     }
     pub(super) fn step(&mut self, supplied: Option<&(usize, Vec<u16>)>) -> (usize, Vec<u16>) {
@@ -210,7 +222,7 @@ impl NativeLayerThreeEngramSession {
         let layers = field(layout, "layer_ids").as_array().unwrap();
         let case = &field(&self.root, "cases").as_array().unwrap()[self.next_case];
         let start = usize_field(case, "start_pos");
-        assert_eq!(start, [0, 5, 6][self.next_case], "native Engram call order");
+        assert_eq!(start, self.next_start, "native Engram call order");
         // Reject caller input before publishing any token history.
         let captured = bf16(field(case, "stream"));
         let stream = supplied.map_or(captured.as_slice(), |(given, input)| {
@@ -269,6 +281,7 @@ impl NativeLayerThreeEngramSession {
             .collect::<Vec<_>>();
         let output = gate_output(case, model, stream, &key, &value, &q, &k);
         self.next_case += 1;
+        self.next_start += positions;
         (start, output)
     }
 }

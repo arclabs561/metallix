@@ -78,6 +78,10 @@ def main() -> int:
         ([sys.executable, "scripts/test_v41_partition_startup_capture.py"], False),
         ([sys.executable, "scripts/test_v41_partition_layer1_capture.py"], False),
         ([sys.executable, "scripts/test_v41_partition_layer2_capture.py"], False),
+        (
+            [sys.executable, "scripts/test_v41_partition_layer3_engram_capture.py"],
+            False,
+        ),
         (["cargo", "fmt", "--check"], False),
         (["cargo", "test", "--workspace", *feature_args], False),
         (
