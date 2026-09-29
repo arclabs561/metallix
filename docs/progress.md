@@ -11,6 +11,14 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The first reduced-executor extraction, `deepseek::reduced::FinalHead`, accepts
+  only runtime residual/pre-mix and immutable norm/head weights. Both canonical
+  and alternate compositions use it under their unchanged source envelopes.
+  Independent boundary tests exercise non-128 widths, changed supplied inputs
+  and weights, malformed/nonfinite inputs and bounded allocation geometry.
+  The stateful token-to-logits runner remains to be extracted; see the
+  [extraction decision](design/deepseek-reduced-executor.md).
+
 - A frozen four-task/two-seed schedule comparison now separates non-overlap
   validity from requested count/duration/window adherence. Verified retries
   did not improve task adherence on either local checkpoint: 0/8 for both,

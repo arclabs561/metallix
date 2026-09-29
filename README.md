@@ -514,7 +514,10 @@ This qualifies the fixed reduced `4 + 1 + 1 + 1` composition alongside the
 canonical `5 + 1 + 1` path. The alternate test evaluates the L3/L4 tails and head
 after its upstream call loop; it is not an interleaved production request runner.
 Broader schedules, alternate full-request failure recovery, checkpoint loading
-and serving remain open.
+and serving remain open. The first runtime extraction, `deepseek::reduced::FinalHead`,
+now computes HC collapse, final normalization and logits from caller-supplied
+residuals and weights. Both composition tests use it; stateful token-to-logits
+orchestration still remains in the test harness.
 
 [Resident chat measurements](docs/experiments/chat-performance.md) cover
 repeated CLI/HTTP output agreement at 1983 prompt tokens plus 64 generated

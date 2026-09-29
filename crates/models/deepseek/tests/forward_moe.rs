@@ -7,7 +7,7 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference};
-use deepseek::precision::fp32_linear_reference;
+use deepseek::reduced::FinalHead;
 use deepseek::{
     RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionState},
@@ -891,6 +891,8 @@ fn assert_alternate_head(head: &AlternateHead, l4_tail: &[BlockTailOutput]) {
     let norm_weight = head.norm_weight.bf16();
     let head_weight = head.head_weight.fp32();
     let vocabulary = head.head_weight.shape[0];
+    let executor = FinalHead::new(&norm_weight, &head_weight, vocabulary, 2, head.norm_epsilon)
+        .expect("bounded alternate final head");
     assert_eq!(head.cases.len(), l4_tail.len());
     for (case, block) in head.cases.iter().zip(l4_tail) {
         let positions = case.norm_input.shape[1];
@@ -901,41 +903,35 @@ fn assert_alternate_head(head: &AlternateHead, l4_tail: &[BlockTailOutput]) {
         assert_eq!(block.next_pre.len(), positions * 2);
         let expected_collapsed = case.norm_input.bf16();
         let expected_normalized = case.norm.bf16();
-        let mut last_normalized = Vec::new();
+        let mut last_logits = Vec::new();
         let mut last_bounds = Vec::new();
         for position in 0..positions {
-            let (collapsed, normalized) = final_norm_row(
-                &block.residual[position * 256..(position + 1) * 256],
-                &block.next_pre[position * 2..(position + 1) * 2],
-                &norm_weight,
-                head.norm_epsilon,
-            );
+            let output = executor
+                .forward(
+                    &block.residual[position * 256..(position + 1) * 256],
+                    &block.next_pre[position * 2..(position + 1) * 2],
+                )
+                .expect("native alternate final head");
+            let collapsed = output.collapsed_bf16();
+            let normalized = output.normalized_bf16();
             let envelope = block.terminal_envelopes.as_ref().unwrap()[position]
                 .final_norm_envelope(&norm_weight, head.norm_epsilon);
             let source_collapsed = &expected_collapsed[position * 128..(position + 1) * 128];
             let source_normalized = &expected_normalized[position * 128..(position + 1) * 128];
             assert!(
-                envelope.accepts(&collapsed, source_collapsed, &normalized, source_normalized),
+                envelope.accepts(collapsed, source_collapsed, normalized, source_normalized),
                 "alternate final HC/norm remains inside the established source bounds"
             );
             assert!(
-                !envelope.accepts(&collapsed, source_collapsed, &[0; 128], source_normalized),
+                !envelope.accepts(collapsed, source_collapsed, &[0; 128], source_normalized),
                 "discarded final normalization must be rejected"
             );
             last_bounds = envelope.head_bounds(source_normalized, &head_weight);
-            last_normalized = normalized;
+            last_logits = output.logits().to_vec();
         }
-        let input: Vec<_> = last_normalized
-            .into_iter()
-            .map(|bits| f32::from_bits(u32::from(bits) << 16))
-            .collect();
         let source_logits: Vec<_> = case.logits.fp32().into_iter().map(f32::to_bits).collect();
         assert!(
-            agrees_with_head_oracle(
-                &final_head_logits(&input, &head_weight, vocabulary),
-                &source_logits,
-                &last_bounds,
-            ),
+            agrees_with_head_oracle(&last_logits, &source_logits, &last_bounds,),
             "alternate final logits at start {}",
             case.start_pos
         );
@@ -3544,13 +3540,6 @@ fn reject_zeroed_layer_three_attention(
     );
 }
 
-fn final_head_logits(input: &[f32], weights: &[f32], vocabulary: usize) -> Vec<f32> {
-    let mut output = vec![0.0; vocabulary];
-    fp32_linear_reference(input, weights, 1, 128, vocabulary, &mut output)
-        .expect("native finite FP32 output head");
-    output
-}
-
 fn agrees_with_head_oracle(actual: &[f32], expected: &[u32], bounds: &[f64]) -> bool {
     actual
         .iter()
@@ -3560,20 +3549,6 @@ fn agrees_with_head_oracle(actual: &[f32], expected: &[u32], bounds: &[f64]) -> 
             actual.is_finite()
                 && (f64::from(actual) - f64::from(f32::from_bits(expected))).abs() <= bound
         })
-}
-
-fn final_norm_row(
-    residual: &[u16],
-    pre: &[f32],
-    weights: &[u16],
-    epsilon: f32,
-) -> (Vec<u16>, Vec<u16>) {
-    let mut collapsed = vec![0; 128];
-    hc_pre_bf16_reference(residual, pre, 128, &mut collapsed).expect("native final HC collapse");
-    let mut normalized = vec![0; 128];
-    rms_norm_bf16_reference(&collapsed, weights, epsilon, &mut normalized)
-        .expect("native final normalization");
-    (collapsed, normalized)
 }
 
 #[test]
@@ -3653,6 +3628,14 @@ fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: 
         .copied()
         .map(f32::from_bits)
         .collect();
+    let executor = FinalHead::new(
+        &head.norm_weight_bf16,
+        &weights,
+        head.weight_shape[0],
+        2,
+        f32::from_bits(head.norm_epsilon_bits),
+    )
+    .expect("bounded canonical final head");
     assert_eq!(native.len(), f.cases.len());
     for ((case, block), head_case) in f.cases.iter().zip(native).zip(&head.cases) {
         let positions = case.input.shape[1];
@@ -3677,12 +3660,11 @@ fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: 
         let last = positions - 1;
         let residual = &block.residual[last * 256..(last + 1) * 256];
         let pre = &block.next_pre[last * 2..(last + 1) * 2];
-        let (native_collapsed, native_normalized) = final_norm_row(
-            residual,
-            pre,
-            &head.norm_weight_bf16,
-            f32::from_bits(head.norm_epsilon_bits),
-        );
+        let output = executor
+            .forward(residual, pre)
+            .expect("native canonical final head");
+        let native_collapsed = output.collapsed_bf16();
+        let native_normalized = output.normalized_bf16();
         let source_collapsed = &head_case.collapsed_bf16[last * 128..(last + 1) * 128];
         let source_normalized = &head_case.input_bf16[last * 128..(last + 1) * 128];
         let terminal_envelope = block
@@ -3696,9 +3678,9 @@ fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: 
         );
         assert!(
             final_envelope.accepts(
-                &native_collapsed,
+                native_collapsed,
                 source_collapsed,
-                &native_normalized,
+                native_normalized,
                 source_normalized,
             ),
             "native final HC and RMSNorm rows must stay inside fixed source bounds at start {}",
@@ -3707,7 +3689,7 @@ fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: 
         let zero_normalized = vec![0; 128];
         assert!(
             !final_envelope.accepts(
-                &native_collapsed,
+                native_collapsed,
                 source_collapsed,
                 &zero_normalized,
                 source_normalized,
@@ -3715,17 +3697,9 @@ fn assert_final_suffix_with_head(f: &Fixture, native: &[BlockTailOutput], head: 
             "zeroing final normalization must fail the fixed source bounds at start {}",
             case.start_pos
         );
-        let native_input: Vec<f32> = native_normalized
-            .iter()
-            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
-            .collect();
         let bounds = final_envelope.head_bounds(source_normalized, &weights);
         assert!(
-            agrees_with_head_oracle(
-                &final_head_logits(&native_input, &weights, head.weight_shape[0]),
-                &head_case.logits_fp32_bits,
-                &bounds,
-            ),
+            agrees_with_head_oracle(output.logits(), &head_case.logits_fp32_bits, &bounds,),
             "native layer-four suffix logits at start {}",
             case.start_pos
         );

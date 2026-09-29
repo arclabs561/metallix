@@ -1,5 +1,5 @@
 ---
-status: proposal
+status: historical proposal
 scope: Metallix native MLX backends, DeepSeek Codex readiness, extensibility, and performance
 review-trigger: after the first resident DeepSeek token loop or any change to model acquisition/licensing assumptions
 ---
@@ -10,6 +10,10 @@ This roadmap turns the current qualified-operator work into a usable native
 backend without claiming that the current diagnostics are already a serving
 runtime. It is grounded in the existing execution, attention, sublayer, parity,
 and training design documents plus the pushed implementation through `8d770f4`.
+
+Its loader-first sequencing is historical and is superseded by the current
+[delivery roadmap](../delivery-roadmap.md). Retain this document for its prior
+options and gates; use the delivery roadmap for current priorities.
 
 ## Current position
 

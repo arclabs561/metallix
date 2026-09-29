@@ -20,33 +20,27 @@ local 0.6B and 4B checkpoints. The public-task decision qualification reached
 The interval-scheduling example has qualified optional verification/retry
 mechanics. Keep it as a regression; its small synthetic results do not establish
 model quality and do not justify more task-specific features.
-SMC proposal
-correction and steering pass checkpoint mechanics tests; application quality
-and serving integration remain separate gates. Julia has source-pinned encoding
-and complete published-header checks, plus six real-tokenizer source-parity
-vectors. A native CPU decision head now consumes supplied weights and hidden
-states and matches the five-case synthetic source fixture. A bounded native
-ModernBERT block now matches eight source-backed global/local attention cases.
-Full encoder prefill, checkpoint execution and serving integration remain open.
+SMC proposal correction and steering pass checkpoint mechanics tests;
+application quality and serving integration remain separate gates. Julia has
+source-pinned encoding, complete published-header checks, six real-tokenizer
+source-parity vectors, and a bounded native 22-layer path. Its numerical
+qualification currently fails, so encoder prefill, checkpoint execution, typed
+decisions, and serving integration remain open.
 
 The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
 about 1% short-prompt regression. Matched real 2048-token requests for Qwen3-
 0.6B and 4B preserved output/token parity, so bounded stepped storage is now
-the resident production path. DeepSeek's source gates now cover Engram1,
-layer-one, and exact layer-zero token embeddings; native layer-one attention/HC/FFN now feeds
-the layer-two-to-logits reduced suffix; Engram1 now feeds the native layer-one
-path through the reduced suffix with corruption rejection. Native layer-zero
-window-only attention, HC mixing and RMSNorm/MoE FFN now reproduce its residual
-into Engram1. Native token embedding, HC-copy expansion and identity pre-mix
-now supply the same-trace incoming state. Native HC projection supplies both
-sublayers' coefficients under the existing F32 envelope policy; its native
-layer-one consumer matches the exact BF16 attention input. The unified source
-bundle now feeds layer zero into the native reduced suffix. Live L1–L3 state
-and the previous-call L3 publication now flow through the test-private runner,
-including failure invalidation and fresh reconstruction. Downstream weights and
-source checks remain fixture-backed; broader partitions, checkpoint loading and
-Metal execution remain open. Native
+the resident production path. DeepSeek has fixed, test-private native startup
+through final-head composition for both the canonical 0/5/6 and alternate
+0/4/5/6 schedules. It carries token startup, persistent Engram and L1–L3
+state, the prior L3 publication for L1 partial calls, live L1 owner
+publications into L2, and native L3/L4 tails to the source-qualified final
+head. Failure invalidation and fresh reconstruction remain bounded fixture
+controls. The alternate L3/L4 tails and head still run after the upstream loop;
+interleaved request execution and alternate full-request recovery remain open.
+Downstream weights and source checks remain fixture-backed; broader partitions,
+checkpoint loading and Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
@@ -62,15 +56,13 @@ check, not generation or Codex compatibility evidence.
 ## Position and constraints
 
 Qwen is the usable vertical: resident chat, bounded read tools, experimental
-Responses, and qualified 0.6B/4B controls. DeepSeek's native reduced suffix now
-connects layer-one attention/HC/FFN through layer two and final logits. Layer-one
-initial residual/pre-mix and partial-call layer-three shared score keys still
-cross captured boundaries. The new layer-zero bridge removes the captured FFN
-output; native window-only attention is also joined, with its input reconstructed
-by native HC pre-mix and RMSNorm. Native startup from token IDs supplies the
-incoming residual and identity pre-mix; native coefficient synthesis now reaches
-the exact downstream BF16 consumer boundary in the bounded source cases.
-Its scalar numerical oracle and bounded
+Responses, and qualified 0.6B/4B controls. DeepSeek's fixed test-private
+canonical and alternate startup-to-head compositions are numerical
+qualification, not a decoder: they retain fixture-backed weights and source
+oracles, while the alternate tail/head runs after the upstream loop. Checkpoint
+loading, broader partitions, interleaved request execution, alternate recovery,
+and Metal execution remain open. Julia's bounded 22-layer path exists but has
+not passed numerical qualification. Its scalar numerical oracle and bounded
 Metal operators are not a complete GPU decoder.
 
 Performance work has located a useful next experiment: cache concatenation

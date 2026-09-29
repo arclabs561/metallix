@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod moe;
 pub mod norm;
 pub mod precision;
+pub mod reduced;
 pub mod rotary;
 pub mod routing;
 pub mod selection;
