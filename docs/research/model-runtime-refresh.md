@@ -32,6 +32,30 @@ a larger model or establish coding quality.
 
 ## Performance decisions
 
+### September 30 implementation check
+
+A fresh check found an important qualification boundary in
+[MLX-LM at `a9bd8af`](https://github.com/ml-explore/mlx-lm/blob/a9bd8af5c02118882af735cef60705d2efce9fd0/mlx_lm/models/deepseek_v41.py):
+its `deepseek_v41` adapter declares the target's 5120-wide, 40-layer,
+384-expert geometry, but `ModelArgs.__post_init__` rejects nonempty
+`engram_layer_ids` because Engram is unimplemented. The adapter name therefore
+does not establish support for the pinned complete checkpoint.
+
+[Whallm at `eba1f5b`](https://github.com/yanun0323/Whallm/tree/eba1f5b6b9f7f0b53fac45b13fd916767191a4a6/runtime/deepseek_v4_ssd/deepseek_v41)
+has a separate V4.1 implementation, including Engram, and its
+[tests](https://github.com/yanun0323/Whallm/blob/eba1f5b6b9f7f0b53fac45b13fd916767191a4a6/runtime/tests/test_deepseek_v41.py)
+exercise selected SSD Engram rows and reduced model loading. This source
+inspection did not execute those tests or reproduce checkpoint quality,
+latency or memory use. It remains a concrete upstream comparison candidate.
+
+Its [route recorder](https://github.com/yanun0323/Whallm/blob/eba1f5b6b9f7f0b53fac45b13fd916767191a4a6/runtime/deepseek_v4_ssd/route_trace.py)
+separates prefill histograms from exact per-layer decode routes. Histograms
+cannot recover chronological accesses for an exact LRU replay. Any imported
+trace must retain checkpoint identity, phase and execution ordering; the
+recorder alone does not supply source-compatible routing evidence. Obtaining
+real routes requires actual forward execution or a separately qualified
+capture, not metadata alone.
+
 Keep model loading, prefill, decode, request wall time, first visible token, and
 process memory separate. Retained weights remove repeated loading but do not
 imply faster kernels. Use the [chat performance ledger](../experiments/chat-performance.md)

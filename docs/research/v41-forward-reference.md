@@ -831,8 +831,9 @@ Layer three produces the candidate mask consumed by layer four. The pinned
 prepares its query, reduces weighted scores, masks future compressed positions,
 then selects candidate blocks. The existing `csa2::candidate_mask` implements
 the block-selection rule. The native query, score and mask chain is now joined
-in source-oracle tests, including native producer QR formation. A complete
-candidate-selection runtime adapter remains open.
+in source-oracle tests, including native producer QR formation. The bounded
+`CandidateProjector` and `LayerThreeSession` now execute that chain within the
+reduced request; real-checkpoint integration remains open.
 
 The candidate capture observes layer-three `wq_a`, `q_norm`, and indexer query,
 weight and score stages, alongside the final candidate mask. It is separate

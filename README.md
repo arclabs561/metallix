@@ -42,7 +42,7 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Reduced token-to-logit composition retains live layer-one, layer-two, Engram3 and layer-three state, including shared publications, tested request invalidation/rebuild, and unified-bundle operands throughout L0–L4 and the head with committed L3 key/KV reuse | Test-private fixture-backed operands remain; production recovery and native generation are unfinished |
+| [DeepSeek](docs/progress.md) | Bounded artifact-driven token-to-logit requests through all five reduced blocks, persistent shared state, invalidation/restart, and opt-in mixed CPU/Metal execution | Synthetic parameters and fixed qualified schedules; checkpoint loading, tokenizer/template integration, text decoding and native checkpoint generation remain open |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 
@@ -305,6 +305,13 @@ work. Streaming responses detect client disconnects when an output write fails.
 Non-streaming JSON responses do not write during generation, so a disconnected
 client can occupy the single-request server until generation completes or the
 budget expires. Use streaming when early disconnect detection matters.
+
+The server admits one request at a time with no application queue. While it is
+occupied, new connections receive HTTP 503 with `error.code: "server_busy"`,
+including health and model-list connections. A failed model worker returns
+`model_worker_unavailable`. These are explicit admission failures; the server
+does not automatically retry requests. A slow client can still delay the
+bounded serial acceptor.
 
 A bounded native Codex command-tool run passed six fresh trials against the
 cached 4B checkpoint at `--context-tokens 16384 --kv-budget-mib 8192`:
@@ -572,6 +579,13 @@ rotation on Metal as well, or use it independently with scalar scoring. The
 receipt adds `key_rotary_execution: "metal-fp32"`. Key projection, normalization,
 FP4 staging and other request arithmetic remain scalar. Both schedules retain
 exact key stages, publications and final outputs; this is not a throughput claim.
+
+`--head-execution metal-fp32` independently moves the final vocabulary projection
+to Metal and adds `head_execution: "metal-fp32"` to the mixed-backend receipt.
+HC collapse and normalization keep their BF16 staging. Head logits satisfy the
+existing source-derived error bounds; scalar bit identity is not required.
+This path returns logits to the host and does not establish a resident GPU graph
+or a speed improvement.
 
 The exporter creates a new file and refuses to overwrite an existing one. Its
 artifact contains configuration and checksummed numerical tensors; captured

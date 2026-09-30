@@ -73,13 +73,14 @@ DeepSeek-V4.1 now has a small source-captured reduced path: token IDs, native
 startup, layer-zero attention/HC/FFN, and Engram1 produce the native layer-one
 attention input; native layer one then feeds layer two, Engram3 and the
 layer-three/four suffix through final HC, RMSNorm, and the FP32 head for the
-captured prefill/decode partitions. A unified fixture proves every projection
-derives from one completed source capture, but the Rust composition currently
-consumes only its layer-zero projection. Downstream parameters, numerical
-oracles, attention histories, and shared-key publications remain legacy
-fixture-fed boundaries. This is not a stateful runner, full-model generation,
-Metal parity, or checkpoint support. The next producer-state gap is real
-previous-call layer-three publication with reset/retry behavior. Qwen
+captured prefill/decode partitions. The bounded artifact-driven `RequestSession`
+now consumes unified parameters throughout all five reduced blocks and the
+head, retains producer state and previous-call publications, and supports
+poisoning/restart. The qualified schedules are 5/1/1 and 4/1/1/1; arbitrary
+partitions remain gated by source selection behavior. Scoring and key rotation
+can execute on Metal with host readbacks. This is a synthetic reduced request,
+not checkpoint generation or a fully resident device graph. Actual checkpoint
+loading, tokenizer/template integration and text decoding remain open. Qwen
 correctness still does not establish DeepSeek support. Training techniques
 remain reference material, not an implemented training subsystem.
 
