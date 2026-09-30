@@ -11,6 +11,22 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The prefill-7 cutoff audit now includes a full source capture with exact
+  observer noninterference. L4's final candidate-masked row contains equal zero
+  scores at reachable positions 4 and 6; the pinned source selects 4, but its
+  Top-K API does not promise that choice. Keep the strict-path rejection and
+  continue device qualification on established schedules. See the
+  [tie evidence and policy alternatives](research/v41-forward-reference.md#expanded-first-chunk-sweep).
+
+- The Responses lifecycle now has a real-socket regression for partial text
+  followed by a backend deadline failure. It asserts the complete ordered SSE
+  sequence, the partial delta, exactly one terminal `generation_timeout`
+  failure, and no completion event. The backend is deterministic; this does
+  not establish cancellation during GPU work or concurrent admission.
+  The all-feature server library suite passes 134 tests with 2 ignored; strict
+  server lint passes. Receipts under `.agents/receipts/candidate-control/`:
+  `timeout-lifecycle-server-tests.log` and `timeout-lifecycle-clippy-final.log`.
+
 - The live alternate L3 session now supplies its post-FP4 queries, signed head
   weights and committed key prefixes to the existing Metal index-score kernel
   in a focused qualification. GPU/CPU FP32 scores agree under the existing

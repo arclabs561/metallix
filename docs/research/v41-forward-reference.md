@@ -69,7 +69,32 @@ source by up to `0.005548015236854553`. The native request rejects this schedule
 with `LayerFour → Selection → FinalSelection → AmbiguousCutoffTie`. That is the
 existing reachable-cutoff tie policy: it does not invent a PyTorch Top-K tie
 order. A regression pins the precise rejection; no tie rule or source envelope
-was changed. Investigate source tie semantics before admitting this boundary.
+was changed.
+
+A full observed first-chunk-7 source run localizes the tie to L4's final query.
+After candidate masking its seven BF16 scores are
+`[-inf, -inf, -inf, -inf, 0, -inf, 0]`: positions 4 and 6 are both reachable,
+and `index_topk` is 1. The pinned CPU source selects position 4 (API index 11
+after offset 7). This is an observed choice, not a portable tie rule. The pinned
+`Indexer.forward` applies `topk(sorted=False)` before sorting the selected
+positions; sorting afterward cannot decide which tied candidate was selected.
+The current [PyTorch Top-K documentation](https://docs.pytorch.org/docs/2.14/generated/torch.topk.html)
+explicitly leaves tied indices unstable. Its version is newer than the probe's
+pinned Torch 2.13.0; the source capture is the evidence for that exact runtime.
+
+The observed run matches its independent unobserved control exactly, including
+all recorded final cache identities and terminal logits. Receipt:
+`.agents/receipts/candidate-control/source-prefill-7-boundaries.json`.
+Reproduce with `--run --capture-alternate --prefill-tokens 7` and a new output
+path. This establishes that the source itself encounters a tied cutoff; it does
+not establish that the tie causes the entire schedule-dependent logit change.
+
+Retain rejection in the strict source-agreement path. A future stable
+position-based policy would be an explicit semantic choice requiring downstream
+quality qualification. Emulating one pinned backend's tie behavior would instead
+require a backend-specific oracle across shapes. Neither policy is justified by
+this single capture, and neither is required to continue Metal qualification on
+the established schedules.
 
 Receipts are owner-local under `.agents/receipts/candidate-control/`:
 `source-prefill-{2,3,6,7}-formatted.json`, `reduced-cli-schedule-sweep.json`, and

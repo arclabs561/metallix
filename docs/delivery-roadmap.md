@@ -146,8 +146,11 @@ operator agreement alone is not a complete Metal request.
 The expanded first-chunk sweep establishes terminal stability for 2, 3 and 6;
 per-call qualification is still separate. First-chunk 7 reaches a native L4
 ambiguous cutoff tie while the source completes with changed output. Preserve
-the explicit rejection until the source tie contract is resolved; do not
-expand the qualified schedule set by choosing a convenient tie order.
+the explicit rejection: a full source capture confirms equal zero scores at
+reachable L4 positions 4 and 6, and the source API offers no portable tie order.
+Admission needs an explicit stable policy with quality qualification or a pinned
+backend oracle; it is not a prerequisite for Metal work on established schedules.
+See the [source tie audit](research/v41-forward-reference.md#expanded-first-chunk-sweep).
 
 Use two bounded implementation lanes plus one independent reviewer when useful.
 One owner integrates and runs Cargo/device checks. Research must resolve a named
