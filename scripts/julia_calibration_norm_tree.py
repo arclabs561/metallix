@@ -3,11 +3,13 @@
 # requires-python = ">=3.11"
 # dependencies = ["numpy==2.5.3", "torch==2.13.0"]
 # ///
-"""Replay recorded cal_len7 normalization with a balanced F32 reduction tree.
+"""Replay frozen calibration embedding normalization with a balanced F32 tree.
 
-This fixed-case sensitivity control consumes an existing calibration report;
-it does not independently execute the pinned encoder. Keep output receipts in
-an ignored location. Passing its falsifier does not qualify a runtime change.
+The default replays fixed ``cal_len7``; ``--all-calibration`` applies the
+predeclared no-worse/strict-improvement gate to every frozen calibration case.
+This sensitivity control consumes an existing calibration report and does not
+execute the pinned encoder. Keep output receipts ignored. Passing its
+falsifier does not qualify a runtime change.
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "fixtures/julia-1/accuracy-cases.json"
 WIDTH = 384
-EMBEDDING_SHAPE = (7, WIDTH)
 CASE_IDS = [2, 4, 6, 1, 3, 5, 7]
 CASE_MASK = [True, True, True, True, True, True, True]
 REPORT_MAX_BYTES = 128 * 1024 * 1024
@@ -50,26 +51,6 @@ def read_bounded(path: Path, limit: int, label: str) -> bytes:
     return payload
 
 
-def calibration_case(report: dict[str, Any]) -> dict[str, Any]:
-    cases = report.get("cases")
-    if not isinstance(cases, list):
-        raise TypeError("calibration report cases must be a list")
-    if any(
-        isinstance(case, dict) and case.get("split") == "held_out" for case in cases
-    ):
-        raise ValueError("calibration report must not contain held-out cases")
-    matches = [
-        case
-        for case in cases
-        if isinstance(case, dict)
-        and case.get("name") == "cal_len7"
-        and case.get("split") == "calibration"
-    ]
-    if len(matches) != 1:
-        raise ValueError("calibration report requires exactly one calibration cal_len7")
-    return matches[0]
-
-
 def validate_frozen_case(case: object) -> dict[str, Any]:
     if not isinstance(case, dict):
         raise TypeError("frozen cal_len7 case must be an object")
@@ -92,7 +73,27 @@ def validate_frozen_case(case: object) -> dict[str, Any]:
     return case
 
 
-def frozen_case(expected_manifest_sha256: str) -> dict[str, Any]:
+def validate_frozen_input(case: object) -> dict[str, Any]:
+    if not isinstance(case, dict):
+        raise TypeError("frozen calibration case must be an object")
+    input_ids = case.get("input_ids")
+    attention_mask = case.get("attention_mask")
+    if (
+        not isinstance(input_ids, list)
+        or not input_ids
+        or any(type(token_id) is not int for token_id in input_ids)
+    ):
+        raise ValueError("frozen calibration input IDs must be nonempty integers")
+    if (
+        not isinstance(attention_mask, list)
+        or len(attention_mask) != len(input_ids)
+        or any(type(value) is not bool for value in attention_mask)
+    ):
+        raise ValueError("frozen calibration attention mask is malformed")
+    return case
+
+
+def frozen_calibration_cases(expected_manifest_sha256: str) -> list[dict[str, Any]]:
     payload = read_bounded(MANIFEST, MANIFEST_MAX_BYTES, "accuracy manifest")
     if hashlib.sha256(payload).hexdigest() != expected_manifest_sha256:
         raise ValueError("accuracy manifest identity does not match calibration report")
@@ -105,13 +106,33 @@ def frozen_case(expected_manifest_sha256: str) -> dict[str, Any]:
     matches = [
         case
         for case in manifest["cases"]
-        if isinstance(case, dict)
-        and case.get("name") == "cal_len7"
-        and case.get("split") == "calibration"
+        if isinstance(case, dict) and case.get("split") == "calibration"
     ]
-    if len(matches) != 1:
-        raise ValueError("accuracy manifest requires exactly one calibration cal_len7")
-    return validate_frozen_case(matches[0])
+    names = [case.get("name") for case in matches]
+    if not matches or any(type(name) is not str for name in names):
+        raise ValueError("accuracy manifest calibration cases have invalid names")
+    if len(names) != len(set(names)):
+        raise ValueError("accuracy manifest calibration case names are duplicated")
+    return [validate_frozen_input(case) for case in matches]
+
+
+def calibration_report_cases(
+    report: dict[str, Any], expected_names: set[str]
+) -> dict[str, dict[str, Any]]:
+    cases = report.get("cases")
+    if not isinstance(cases, list) or not all(isinstance(case, dict) for case in cases):
+        raise TypeError("calibration report cases must be objects")
+    if any(case.get("split") == "held_out" for case in cases):
+        raise ValueError("calibration report must not contain held-out cases")
+    calibration = [case for case in cases if case.get("split") == "calibration"]
+    names = [case.get("name") for case in calibration]
+    if (
+        any(type(name) is not str for name in names)
+        or len(names) != len(expected_names)
+        or set(names) != expected_names
+    ):
+        raise ValueError("calibration report cases do not exactly match frozen names")
+    return {case["name"]: case for case in calibration}
 
 
 def tensor(value: object, shape: tuple[int, ...], label: str) -> Any:
@@ -186,6 +207,91 @@ def write_exclusive(path: Path, receipt: dict[str, Any]) -> None:
         output.write(json.dumps(receipt, indent=2) + "\n")
 
 
+def case_result(
+    frozen: dict[str, Any], report_case: dict[str, Any], reference: ModuleType
+) -> dict[str, Any]:
+    positions = len(frozen["input_ids"])
+    embedding_shape = (positions, WIDTH)
+    native = report_case.get("native_f32_vs_f64")
+    source_boundaries = report_case.get("source_f32_boundaries")
+    if not isinstance(native, dict) or not isinstance(source_boundaries, dict):
+        raise TypeError(f"{frozen['name']} report lacks native or source boundaries")
+    native_boundaries = native.get("boundaries")
+    source_embedding = source_boundaries.get("embedding")
+    if not isinstance(native_boundaries, list) or not native_boundaries:
+        raise ValueError(f"{frozen['name']} native embedding boundary is missing")
+    if not isinstance(source_embedding, dict):
+        raise TypeError(f"{frozen['name']} source embedding boundary is invalid")
+    native_embedding = tensor(
+        native_boundaries[0], embedding_shape, f"{frozen['name']} native embedding"
+    )
+    source = tensor(
+        source_embedding.get("value"),
+        embedding_shape,
+        f"{frozen['name']} source embedding",
+    )
+    ids = torch.tensor(frozen["input_ids"], dtype=torch.int64)
+    rows = reference.FULL.ENCODER.values((reference.FULL.VOCAB, WIDTH), 200)[ids]
+    weight = reference.FULL.near_one(201)
+    serial = serial_two_pass(rows, weight)
+    balanced = balanced_two_pass(rows, weight)
+    source_norm = torch.nn.functional.layer_norm(rows, (WIDTH,), weight, None, 1e-5)
+    serial_native = metric(serial, native_embedding)
+    source_identity = metric(source_norm, source)
+    serial_source = metric(serial, source)
+    if serial_native["max_abs"] != 0.0:
+        raise RuntimeError(
+            f"serial two-pass replay does not exactly reproduce {frozen['name']} native embedding"
+        )
+    if source_identity["max_abs"] != 0.0:
+        raise RuntimeError(
+            f"torch LayerNorm does not exactly reproduce {frozen['name']} source embedding"
+        )
+    balanced_source = metric(balanced, source)
+    return {
+        "name": frozen["name"],
+        "positions": positions,
+        "controls": {
+            "serial_two_pass_vs_native": serial_native,
+            "serial_two_pass_vs_source": serial_source,
+            "torch_layer_norm_vs_source": source_identity,
+        },
+        "candidate": {
+            "balanced_two_pass_vs_source": balanced_source,
+            "balanced_two_pass_vs_native": metric(balanced, native_embedding),
+            "no_worse_than_serial_source_max_abs": balanced_source["max_abs"]
+            <= serial_source["max_abs"],
+            "strictly_better_than_serial_source_max_abs": balanced_source["max_abs"]
+            < serial_source["max_abs"],
+        },
+    }
+
+
+def predeclared_gate(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply the all-calibration falsifier to already-validated case results."""
+    if not results:
+        raise ValueError("predeclared calibration gate requires at least one case")
+    controls_exact = all(
+        result["controls"]["serial_two_pass_vs_native"]["max_abs"] == 0.0
+        and result["controls"]["torch_layer_norm_vs_source"]["max_abs"] == 0.0
+        for result in results
+    )
+    no_worse = all(
+        result["candidate"]["no_worse_than_serial_source_max_abs"] for result in results
+    )
+    strict_improvement = any(
+        result["candidate"]["strictly_better_than_serial_source_max_abs"]
+        for result in results
+    )
+    return {
+        "serial_native_and_torch_source_identity_exact": controls_exact,
+        "balanced_no_worse_each_case": no_worse,
+        "balanced_strict_improvement_at_least_one_case": strict_improvement,
+        "passes": controls_exact and no_worse and strict_improvement,
+        "limitation": "this gate is not full encoder acceptance and does not alter runtime arithmetic or frozen accuracy bounds",
+    }
+
+
 def main() -> None:
     global torch
     import torch
@@ -193,6 +299,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--calibration-report", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--all-calibration", action="store_true")
     args = parser.parse_args()
     report_bytes = read_bounded(
         args.calibration_report, REPORT_MAX_BYTES, "calibration report"
@@ -212,73 +319,82 @@ def main() -> None:
         raise ValueError(
             "calibration report weight identity does not match generated F32"
         )
-    case = calibration_case(report)
-    frozen = frozen_case(report["manifest_sha256"])
-    native = case.get("native_f32_vs_f64")
-    source_boundaries = case.get("source_f32_boundaries")
-    if not isinstance(native, dict) or not isinstance(source_boundaries, dict):
-        raise TypeError("cal_len7 report lacks native or source boundaries")
-    native_boundaries = native.get("boundaries")
-    source_embedding = source_boundaries.get("embedding")
-    if not isinstance(native_boundaries, list) or not native_boundaries:
-        raise ValueError("cal_len7 native embedding boundary is missing")
-    if not isinstance(source_embedding, dict):
-        raise TypeError("cal_len7 source embedding boundary is invalid")
-    native_embedding = tensor(native_boundaries[0], EMBEDDING_SHAPE, "native embedding")
-    source = tensor(source_embedding.get("value"), EMBEDDING_SHAPE, "source embedding")
-    ids = torch.tensor(frozen["input_ids"], dtype=torch.int64)
-    rows = reference.FULL.ENCODER.values((reference.FULL.VOCAB, WIDTH), 200)[ids]
-    weight = reference.FULL.near_one(201)
-    serial = serial_two_pass(rows, weight)
-    balanced = balanced_two_pass(rows, weight)
-    source_norm = torch.nn.functional.layer_norm(rows, (WIDTH,), weight, None, 1e-5)
-    serial_native = metric(serial, native_embedding)
-    source_identity = metric(source_norm, source)
-    serial_source = metric(serial, source)
-    if serial_native["max_abs"] != 0.0:
-        raise RuntimeError(
-            "serial two-pass replay does not exactly reproduce native embedding"
-        )
-    if source_identity["max_abs"] != 0.0:
-        raise RuntimeError(
-            "torch LayerNorm does not exactly reproduce source embedding"
-        )
-    if serial_source["max_abs"] != SERIAL_SOURCE_MAX_ABS:
-        raise RuntimeError(
-            "calibration report does not match the frozen serial source gap"
-        )
-    balanced_source = metric(balanced, source)
-    receipt = {
-        "schema_version": 1,
-        "scope": "cal_len7 calibration balanced F32 embedding normalization sensitivity only",
-        "held_out_accessed": False,
-        "identities": {
-            "calibration_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
-            "manifest_sha256": report["manifest_sha256"],
-            "weight_f32_sha256": report["weight_f32_sha256"],
-            "diagnostic_sha256": hashlib.sha256(
-                Path(__file__).read_bytes()
-            ).hexdigest(),
-        },
-        "controls": {
-            "serial_two_pass_vs_native": serial_native,
-            "serial_two_pass_vs_source": serial_source,
-            "torch_layer_norm_vs_source": source_identity,
-        },
-        "candidate": {
-            "topology": "fixed balanced pairwise F32 sum for mean and variance after F32 deviations",
-            "balanced_two_pass_vs_source": balanced_source,
-            "balanced_two_pass_vs_native": metric(balanced, native_embedding),
-            "falsifier": {
-                "strictly_better_than_serial_source_max_abs": balanced_source["max_abs"]
-                < SERIAL_SOURCE_MAX_ABS,
-                "serial_source_max_abs": SERIAL_SOURCE_MAX_ABS,
-                "candidate_source_max_abs": balanced_source["max_abs"],
-                "meaning": "failure rejects this reduction tree as a runtime experiment candidate; it does not alter any acceptance bound",
+    frozen_cases = frozen_calibration_cases(report["manifest_sha256"])
+    report_cases = calibration_report_cases(
+        report, {case["name"] for case in frozen_cases}
+    )
+    selected = (
+        frozen_cases
+        if args.all_calibration
+        else [
+            validate_frozen_case(
+                next(case for case in frozen_cases if case["name"] == "cal_len7")
+            )
+        ]
+    )
+    results = [
+        case_result(case, report_cases[case["name"]], reference) for case in selected
+    ]
+    if not args.all_calibration:
+        result = results[0]
+        serial_source = result["controls"]["serial_two_pass_vs_source"]
+        if serial_source["max_abs"] != SERIAL_SOURCE_MAX_ABS:
+            raise RuntimeError(
+                "calibration report does not match the frozen serial source gap"
+            )
+        balanced_source = result["candidate"]["balanced_two_pass_vs_source"]
+        receipt = {
+            "schema_version": 1,
+            "scope": "cal_len7 calibration balanced F32 embedding normalization sensitivity only",
+            "held_out_accessed": False,
+            "identities": {
+                "calibration_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+                "manifest_sha256": report["manifest_sha256"],
+                "weight_f32_sha256": report["weight_f32_sha256"],
+                "diagnostic_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
             },
-            "limitation": "the source CPU LayerNorm uses its own vectorized reduction; this fixed tree is a sensitivity control, not a claim of source-kernel equivalence",
-        },
-    }
+            "controls": {
+                **result["controls"],
+            },
+            "candidate": {
+                "topology": "fixed balanced pairwise F32 sum for mean and variance after F32 deviations",
+                "balanced_two_pass_vs_source": balanced_source,
+                "balanced_two_pass_vs_native": result["candidate"][
+                    "balanced_two_pass_vs_native"
+                ],
+                "falsifier": {
+                    "strictly_better_than_serial_source_max_abs": balanced_source[
+                        "max_abs"
+                    ]
+                    < SERIAL_SOURCE_MAX_ABS,
+                    "serial_source_max_abs": SERIAL_SOURCE_MAX_ABS,
+                    "candidate_source_max_abs": balanced_source["max_abs"],
+                    "meaning": "failure rejects this reduction tree as a runtime experiment candidate; it does not alter any acceptance bound",
+                },
+                "limitation": "the source CPU LayerNorm uses its own vectorized reduction; this fixed tree is a sensitivity control, not a claim of source-kernel equivalence",
+            },
+        }
+    else:
+        receipt = {
+            "schema_version": 1,
+            "scope": "all frozen calibration cases balanced F32 embedding normalization sensitivity only",
+            "held_out_accessed": False,
+            "identities": {
+                "calibration_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+                "manifest_sha256": report["manifest_sha256"],
+                "weight_f32_sha256": report["weight_f32_sha256"],
+                "diagnostic_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+            },
+            "candidate": {
+                "topology": "fixed balanced pairwise F32 sum for mean and variance after F32 deviations",
+                "predeclared_gate": predeclared_gate(results),
+            },
+            "cases": results,
+        }
     write_exclusive(args.output, receipt)
 
 

@@ -20,28 +20,8 @@ SPEC.loader.exec_module(TREE)
 
 
 class NormalizationTreeInputTest(unittest.TestCase):
-    def test_calibration_case_rejects_held_out_and_duplicates(self) -> None:
+    def test_fixed_cal_len7_input_rejects_nonfrozen_values(self) -> None:
         case = {"name": "cal_len7", "split": "calibration"}
-        report = {"cases": [case]}
-        self.assertEqual(TREE.calibration_case(report)["name"], "cal_len7")
-        with self.assertRaises(ValueError):
-            TREE.calibration_case(
-                {
-                    "cases": [
-                        case,
-                        {"name": "next", "split": "held_out"},
-                    ]
-                }
-            )
-        with self.assertRaises(ValueError):
-            TREE.calibration_case(
-                {
-                    "cases": [
-                        case,
-                        case,
-                    ]
-                }
-            )
         frozen = {
             **case,
             "input_ids": TREE.CASE_IDS,
@@ -83,6 +63,62 @@ class NormalizationTreeInputTest(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text()), {"ok": True})
             with self.assertRaises(FileExistsError):
                 TREE.write_exclusive(output, {"ok": False})
+
+    def test_all_calibration_report_cases_require_exact_names(self) -> None:
+        expected = {"cal_a", "cal_b"}
+        report = {
+            "cases": [
+                {"name": "legacy", "split": "legacy_diagnostic"},
+                {"name": "cal_a", "split": "calibration"},
+                {"name": "cal_b", "split": "calibration"},
+            ]
+        }
+        self.assertEqual(set(TREE.calibration_report_cases(report, expected)), expected)
+        with self.assertRaises(ValueError):
+            TREE.calibration_report_cases({"cases": report["cases"][:-1]}, expected)
+        with self.assertRaises(ValueError):
+            TREE.calibration_report_cases(
+                {
+                    "cases": [
+                        *report["cases"][:-1],
+                        {"name": "cal_a", "split": "calibration"},
+                    ]
+                },
+                expected,
+            )
+        with self.assertRaises(ValueError):
+            TREE.calibration_report_cases(
+                {
+                    "cases": [
+                        *report["cases"],
+                        {"name": "hold", "split": "held_out"},
+                    ]
+                },
+                expected,
+            )
+
+    def test_predeclared_gate_rejects_a_worsened_case(self) -> None:
+        def result(*, no_worse: bool, strict: bool) -> dict[str, object]:
+            return {
+                "controls": {
+                    "serial_two_pass_vs_native": {"max_abs": 0.0},
+                    "torch_layer_norm_vs_source": {"max_abs": 0.0},
+                },
+                "candidate": {
+                    "no_worse_than_serial_source_max_abs": no_worse,
+                    "strictly_better_than_serial_source_max_abs": strict,
+                },
+            }
+
+        passing = TREE.predeclared_gate(
+            [result(no_worse=True, strict=True), result(no_worse=True, strict=False)]
+        )
+        self.assertTrue(passing["passes"])
+        worsened = TREE.predeclared_gate(
+            [result(no_worse=True, strict=True), result(no_worse=False, strict=False)]
+        )
+        self.assertFalse(worsened["balanced_no_worse_each_case"])
+        self.assertFalse(worsened["passes"])
 
 
 if __name__ == "__main__":
