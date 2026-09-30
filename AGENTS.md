@@ -42,3 +42,9 @@ their stated scope only. They do not establish real checkpoint generation,
 whole-request speed, beyond-RAM feasibility or general agent task quality.
 Keep calibration and held-out data separate; do not widen numerical bounds to
 make an implementation pass.
+
+Prioritize a runnable consumer, independent correctness, then measured speed.
+Bounded selected-weight execution may establish loader/operator correctness
+before full-checkpoint feasibility is settled. Do not gate implementation of
+a forward path on route traces that require that same path to exist. Full
+acquisition and residency commitments still require an explicit resource gate.

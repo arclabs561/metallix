@@ -106,10 +106,9 @@ Retained source and data identities (SHA-256):
 
 Receipts: `artifacts/check-v41-storage-spelling-{before,after}.log` and
 `artifacts/check-v41-shard09-{before-absolute,after}.log`. A validated
-INT8 weight/scale pair descriptor is described below; explicitly approved
-payload-slice comparison remains a later gate. Converted raw `F4` storage,
-all-shard coverage, decoded numerical parity and full V4.1 execution remain
-unqualified. The current fixed-width parser still rejects packed FP4 dtype
+INT8 weight/scale pair descriptor and a bounded one-expert payload reader are
+described below. Converted raw `F4` storage, all-shard coverage, general
+checkpoint numerical parity and full V4.1 execution remain unqualified. The current fixed-width parser still rejects packed FP4 dtype
 tags; source INT8 byte storage does not require accepting them.
 
 ### Selected expert-pair metadata
