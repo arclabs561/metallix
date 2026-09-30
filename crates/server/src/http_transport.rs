@@ -606,10 +606,22 @@ mod tests {
     }
 
     #[test]
-    fn response_deadline_fails_closed_before_a_socket_write() {
+    fn response_deadline_failure_drops_connection_and_next_request_recovers() {
         let listener = listener();
         let address = listener.local_addr().unwrap();
-        let client = thread::spawn(move || TcpStream::connect(address).unwrap());
+        let failed_client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            received
+        });
         let (stream, _) = listener.accept().unwrap();
         let mut connection = Connection::accept(
             stream,
@@ -618,10 +630,35 @@ mod tests {
                 ..limits()
             },
         );
+        assert_eq!(connection.read_request().unwrap().path, "/v1/responses");
         connection.begin_response();
         let error = connection.write_all(b"response").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        drop(client.join().unwrap());
+        drop(connection);
+        assert!(failed_client.join().unwrap().is_empty());
+
+        let healthy_client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            received
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut connection = Connection::accept(stream, limits());
+        assert_eq!(connection.read_request().unwrap().path, "/healthz");
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        connection.begin_response();
+        connection.write_all(response).unwrap();
+        connection.flush().unwrap();
+        drop(connection);
+        assert_eq!(healthy_client.join().unwrap(), response);
     }
 
     proptest! {
