@@ -142,9 +142,12 @@ with CPU score/selection controls and a measured cutoff-margin gate. The bounded
 library BF16 scorer also matches every dot, ReLU, weighted and final score
 boundary exactly on the alternate schedule. Shared shape/work/finite-input
 checks precede GPU construction; each stage rejects nonfinite results, and
-finite calls recover after overflow. The scalar runtime remains unchanged.
-Canonical-schedule and request-state qualification are next, before connecting
-the scorer to device request execution. Promote a device execution component only after
+finite calls recover after overflow. An explicit candidate-projector choice now
+runs scoring on Metal inside L3, with alternate-session publication/output parity
+and pre/post-commit failure/reset controls. Canonical L4 score operands also pass
+exact stages, but the complete request still defaults to scalar. Canonical L3,
+L1/L4 device integration and request-level lifecycle qualification remain next.
+Promote a device execution component only after
 its source staging, downstream state and failure behavior remain qualified;
 operator agreement alone is not a complete Metal request.
 
@@ -202,12 +205,13 @@ framework work do not occupy the critical path.
 
 Parallel work has separate exit gates:
 
-- **Qwen:** progress from the passing transport/terminal-event regressions to an
-  actual model request that is cancelled under load, releases its resources and
-  permits a following request. Then choose and qualify bounded admission versus
-  queuing under concurrent arrivals. A deterministic backend stub does not pass
-  this model lifecycle gate. Preserve the existing typed-decision and tool replay
-  controls; useful Qwen delivery need not wait for DeepSeek.
+- **Qwen:** real-model callback cancellation and reuse of the loaded session now
+  pass, with a fresh executor reproducing clean-baseline token IDs. Next qualify
+  socket-driven cancellation under load and measure resource release, then choose
+  bounded admission versus queuing under concurrent arrivals. The callback test
+  does not establish recovery of cancelled KV state or physical memory release.
+  Preserve the existing typed-decision and tool replay controls; useful Qwen
+  delivery need not wait for DeepSeek.
 - **Julia:** retain pinned-source-backend compatibility as the current contract
   while the fidelity decision is pending. A portable scalar contract needs its
   own recorded decision and independent oracle. Do not change native arithmetic,

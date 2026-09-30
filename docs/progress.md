@@ -11,6 +11,42 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- Julia's calibration-only source RoPE capture now reproduces the actual
+  source rotations exactly and leaves observed layer-zero fields bit-identical
+  to an unobserved SDPA run. Native/source QKV and rotated Q/K differ by at most
+  `3.814697265625e-6`; replaying source RoPE on native QKV reduces the rotation
+  difference to `9.5367431640625e-7`. This narrows the calibration diagnosis;
+  the separate full-encoder gate remains failing. See the
+  [source control](research/julia-decision-contract.md#calibration-only-source-control).
+
+- L3 now has an explicit device-scoring path through
+  `CandidateProjector::with_score_execution(IndexScoreExecution::MetalBf16)`.
+  Query preparation, selection, owner publication and attention retain their
+  existing code and source controls. The alternate session matches scalar
+  publications and attention output exactly; malformed candidate geometry
+  poisons before owner commit, while malformed attention poisons after commit.
+  Both reset paths replay successfully. The library scorer also matches every
+  canonical L4 score stage on source-supplied keys. This qualifies a mixed L3
+  component, not a complete device request or canonical L3 session.
+  Receipts under `.agents/receipts/candidate-control/`:
+  `l3-device-session-tests.log` and `l3-device-session-lifecycle.log`.
+  The serial canonical Metal check passes all 104 DeepSeek `forward_moe` tests
+  before stopping at the known Julia `unmasked_control` mismatch. Strict
+  DeepSeek/server Clippy and the CPU-only DeepSeek build pass. Receipts:
+  `l3-qwen-full-check.log`, `l3-qwen-clippy-verified.log` and
+  `l3-scoring-cpu-check.log`.
+
+- A cached Qwen3-0.6B checkpoint now passes the opt-in real-model callback
+  cancellation test: one nonempty generated delta triggers cancellation, then
+  the same loaded session reproduces clean-baseline token IDs for a subsequent
+  request. Each turn constructs a fresh executor; the reused `ChatSession`
+  retains loaded weights and tokenizer. This establishes cooperative callback
+  cancellation and loaded-session reuse, not recovery of the cancelled KV
+  state, GPU preemption, a measured memory-release bound or concurrent admission.
+  Reproduce with `METALLIX_QWEN_MODEL` and the ignored
+  `checkpoint_callback_cancellation_allows_session_reuse` server library test.
+  Receipt: `.agents/receipts/candidate-control/qwen-real-callback-cancellation.log`.
+
 - The live alternate L3 Metal qualification now preserves BF16 staging. On the
   same computed queries, signed weights and committed key prefixes, GPU dot
   products, ReLU, weighted products and final scores match the runtime/source
