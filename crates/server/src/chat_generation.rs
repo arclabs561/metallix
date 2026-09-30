@@ -827,8 +827,8 @@ fn elapsed_ms(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
-        path::Path,
+        env, fs,
+        path::{Path, PathBuf},
         time::{Duration, Instant},
     };
 
@@ -838,9 +838,9 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ChatGenerationError, ChatMessage, ChatRole, ChatToolCall, ChatToolResult,
-        GenerationDeadline, MAX_CHAT_INPUT_BYTES, MAX_CHAT_TEMPLATE_BYTES, ResidentChatLimits,
-        load_template, parse_template, render_generation_prompt,
+        ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
+        ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, MAX_CHAT_TEMPLATE_BYTES,
+        ResidentChatLimits, load_template, parse_template, render_generation_prompt,
     };
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
@@ -1013,6 +1013,70 @@ mod tests {
             stage_deadline.check_at(now + Duration::from_millis(10)),
             Err(ChatGenerationError::DeadlineExceeded)
         ));
+    }
+
+    #[test]
+    #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+    fn checkpoint_callback_cancellation_allows_session_reuse() {
+        let model = env::var_os("METALLIX_QWEN_MODEL")
+            .map(PathBuf::from)
+            .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+        let limits = ResidentChatLimits::from_mib(2_048, 1_024);
+        let mut session = ChatSession::load(&model, limits).expect("checkpoint session load");
+        let load_ms = session.load_ms();
+        let recovery_messages = [ChatMessage::text(
+            ChatRole::User,
+            "Reply with a short recovery acknowledgement.",
+        )];
+        let baseline = session
+            .generate_with_timeout(
+                ChatRequest::new(&recovery_messages, 8),
+                Duration::from_secs(60),
+                &mut |_| Ok(()),
+            )
+            .expect("clean baseline generation");
+        let cancelled_messages = [ChatMessage::text(
+            ChatRole::User,
+            "Reply with a short acknowledgement.",
+        )];
+        let mut cancelled_deltas = Vec::new();
+        let cancelled = session.generate_with_timeout(
+            ChatRequest::new(&cancelled_messages, 32),
+            Duration::from_secs(60),
+            &mut |delta| {
+                cancelled_deltas.push(delta.to_owned());
+                Err(String::from(
+                    "test cancellation after first generated delta",
+                ))
+            },
+        );
+        assert!(matches!(
+            cancelled,
+            Err(ChatGenerationError::Message(message))
+                if message == "test cancellation after first generated delta"
+        ));
+        assert_eq!(cancelled_deltas.len(), 1);
+        assert!(!cancelled_deltas[0].is_empty());
+
+        let recovered = session
+            .generate_with_timeout(
+                ChatRequest::new(&recovery_messages, 8),
+                Duration::from_secs(60),
+                &mut |_| Ok(()),
+            )
+            .expect("fresh generation after callback cancellation");
+        assert_eq!(recovered.metrics.context_tokens, limits.context_tokens());
+        assert_eq!(
+            recovered.metrics.session_load_ms.to_bits(),
+            load_ms.to_bits()
+        );
+        assert!(recovered.metrics.prompt_tokens > 0);
+        assert_eq!(
+            recovered.metrics.generated_tokens,
+            recovered.generated_token_ids.len()
+        );
+        assert!(recovered.metrics.generated_tokens > 0);
+        assert_eq!(recovered.generated_token_ids, baseline.generated_token_ids);
     }
 
     proptest! {
