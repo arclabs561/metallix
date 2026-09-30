@@ -18,6 +18,11 @@ when deliberately curated with reproducible methods and clear limits; session
 logs, private paths, account details and local operating inventories are not.
 Public docs must stand on their own without requiring an ignored receipt.
 
+Filter research by relevance to a named consumer, implementation decision or
+qualification gate. A model or paper mentioned for investigation does not need
+to appear in progress updates or the active roadmap. Keep unrelated findings
+out of those surfaces rather than treating every research lead as a workstream.
+
 Before committing docs, inspect the staged diff for session identifiers,
 personal paths, credentials, machine-specific setup and report-only content.
 Keep implementation status separate from research plans and upstream claims.
