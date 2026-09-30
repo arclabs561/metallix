@@ -175,7 +175,7 @@ fn sampling_configuration(
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a fixed five-block scalar `DeepSeek` model from a synthetic artifact.
+    /// Run a fixed five-block reduced `DeepSeek` model from a synthetic artifact.
     RunDeepseekReduced(deepseek_reduced_cli::ReducedArgs),
     /// Score typed decision options directly with Qwen3, without generating text.
     #[cfg(feature = "metal")]

@@ -129,6 +129,7 @@ pub(super) fn run(
     tensors: &TensorStore,
     ids: &[i64],
     prefill: usize,
+    execution: crate::indexer::query::IndexScoreExecution,
 ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
     if ids.is_empty() || prefill == 0 || prefill > ids.len() {
         return Err(ArtifactError::Invalid(
@@ -202,7 +203,8 @@ pub(super) fn run(
         &shared_frequencies,
         nonzero(config.max_tokens)?,
     )
-    .map_err(ArtifactError::from)?;
+    .map_err(ArtifactError::from)?
+    .with_score_execution(execution);
     let mut request = RequestSession::new(&model).map_err(ArtifactError::from)?;
     let mut outputs = Vec::with_capacity(ids.len() - prefill + 1);
     outputs.push(request.step(&ids[..prefill]).map_err(ArtifactError::from)?);

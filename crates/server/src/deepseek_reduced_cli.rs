@@ -1,4 +1,4 @@
-//! Bounded scalar entry point for one reduced `DeepSeek` request artifact.
+//! Bounded entry point for one reduced `DeepSeek` request artifact.
 
 use std::{
     fs::{self, File},
@@ -8,13 +8,35 @@ use std::{
 };
 
 use clap::Args;
+use deepseek::indexer::query::IndexScoreExecution;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INPUT_IDS: usize = 16;
 
-/// Runs a bounded scalar reduced request from one local artifact.
+/// Bounded index-score execution used by the reduced request diagnostic.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum ScoreExecutionArg {
+    /// Preserve the source-authoritative scalar BF16 stages.
+    #[default]
+    Scalar,
+    /// Run only the bounded BF16 index scorer on Metal.
+    #[cfg(feature = "metal")]
+    MetalBf16,
+}
+
+impl From<ScoreExecutionArg> for IndexScoreExecution {
+    fn from(value: ScoreExecutionArg) -> Self {
+        match value {
+            ScoreExecutionArg::Scalar => Self::Scalar,
+            #[cfg(feature = "metal")]
+            ScoreExecutionArg::MetalBf16 => Self::MetalBf16,
+        }
+    }
+}
+
+/// Runs a bounded reduced request from one local artifact.
 #[derive(Debug, Args)]
 pub(crate) struct ReducedArgs {
     /// Local reduced-request artifact, limited to 64 MiB.
@@ -26,6 +48,9 @@ pub(crate) struct ReducedArgs {
     /// Number of initial IDs admitted as the prefill partition.
     #[arg(long)]
     prefill_tokens: usize,
+    /// Index-score implementation; Metal only covers the bounded BF16 scorer.
+    #[arg(long, value_enum, default_value_t = ScoreExecutionArg::Scalar)]
+    score_execution: ScoreExecutionArg,
 }
 
 impl ReducedArgs {
@@ -47,7 +72,11 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     let artifact = deepseek::reduced::ReducedArtifact::parse(&bytes)
         .map_err(|_| "artifact is not a valid reduced request artifact".to_owned())?;
     let outputs = artifact
-        .run(&args.input_ids, args.prefill_tokens)
+        .run_with_score_execution(
+            &args.input_ids,
+            args.prefill_tokens,
+            args.score_execution.into(),
+        )
         .map_err(|_| "reduced request execution was rejected".to_owned())?;
     let expected_calls = 1 + args.input_ids.len() - args.prefill_tokens;
     if outputs.len() != expected_calls {
@@ -78,14 +107,26 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let rendered = serde_json::to_string(&json!({
-        "schema_version": 1,
-        "operation": "deepseek-reduced-request",
-        "backend": "scalar",
-        "artifact_sha256": artifact_sha256,
-        "calls": calls,
-    }))
-    .map_err(|_| "could not render reduced request response".to_owned())?;
+    let response = match args.score_execution {
+        ScoreExecutionArg::Scalar => json!({
+            "schema_version": 1,
+            "operation": "deepseek-reduced-request",
+            "backend": "scalar",
+            "artifact_sha256": artifact_sha256,
+            "calls": calls,
+        }),
+        #[cfg(feature = "metal")]
+        ScoreExecutionArg::MetalBf16 => json!({
+            "schema_version": 1,
+            "operation": "deepseek-reduced-request",
+            "backend": "mixed-cpu-metal",
+            "score_execution": "metal-bf16",
+            "artifact_sha256": artifact_sha256,
+            "calls": calls,
+        }),
+    };
+    let rendered = serde_json::to_string(&response)
+        .map_err(|_| "could not render reduced request response".to_owned())?;
     println!("{rendered}");
     Ok(())
 }
@@ -134,7 +175,7 @@ fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReducedArgs, read_artifact, validate_args};
+    use super::{ReducedArgs, ScoreExecutionArg, read_artifact, validate_args};
 
     #[test]
     fn rejects_invalid_arguments_before_loading_an_artifact() {
@@ -142,6 +183,7 @@ mod tests {
             artifact: std::path::PathBuf::from("missing"),
             input_ids: vec![0],
             prefill_tokens: 1,
+            score_execution: ScoreExecutionArg::Scalar,
         };
         assert!(validate_args(&args).is_err());
     }

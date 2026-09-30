@@ -459,6 +459,17 @@ fn exported_numerical_artifact_matches_both_source_schedules() {
     request_tail::assert_source_outputs(&fixture, &head, &canonical);
     let alternate = artifact.run(ids, 4).expect("artifact alternate request");
     request_alternate::assert_source_outputs(&alternate, &head);
+    #[cfg(feature = "metal")]
+    {
+        let canonical_metal = artifact
+            .run_with_score_execution(ids, 5, IndexScoreExecution::MetalBf16)
+            .expect("artifact canonical mixed request");
+        request_tail::assert_source_outputs(&fixture, &head, &canonical_metal);
+        let alternate_metal = artifact
+            .run_with_score_execution(ids, 4, IndexScoreExecution::MetalBf16)
+            .expect("artifact alternate mixed request");
+        request_alternate::assert_source_outputs(&alternate_metal, &head);
+    }
     // Endpoint stability is a separate property from per-call source qualification.
     let terminal_bits = |calls: &[deepseek::reduced::RequestStepOutput]| {
         calls

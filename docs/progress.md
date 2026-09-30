@@ -11,6 +11,22 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The numerical artifact API now accepts explicit index-score execution through
+  `ReducedArtifact::run_with_score_execution`; `run` remains scalar. The artifact
+  CLI exposes `--score-execution metal-bf16` in Metal builds, reporting
+  `backend: "mixed-cpu-metal"` and `score_execution: "metal-bf16"`. The scalar
+  receipt remains unchanged. Both fixed schedules pass source-derived bounds
+  through the artifact API and exact scalar-output comparisons through the CLI.
+  CPU-only builds reject the Metal option before artifact reads. Receipts under
+  `.agents/receipts/candidate-control/`: `mixed-artifact-source.log`,
+  `mixed-artifact-cli-metal-final.log` and `mixed-artifact-cli-cpu.log`.
+  Metal also preserves the ambiguous prefill-7 rejection without a success receipt.
+  The canonical serial check passes 105 DeepSeek `forward_moe` tests and stops
+  at the unchanged Julia mismatch (`mixed-artifact-full-check.log`).
+  Strict DeepSeek/server Clippy and the focused CLI unit tests pass
+  (`mixed-artifact-clippy.log`, `mixed-artifact-cli-unit.log`).
+
+
 - The Rust reduced request now accepts
   `RequestModel::with_score_execution(IndexScoreExecution::MetalBf16)` and reports
   that choice through model/session getters. L1, L3 and L4 dispatch to the bounded

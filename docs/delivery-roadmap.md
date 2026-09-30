@@ -149,8 +149,9 @@ exact stages. `RequestModel::with_score_execution` now propagates the explicit
 choice through L1, L3 and L4. Both complete reduced schedules match scalar scores,
 selections, publications and final outputs, preserve independent source bounds,
 and replay after restart. A malformed late L4 attention operand still poisons the
-whole request. This covers mixed execution through the Rust API; artifact/CLI
-selection and a score-device-error injection remain open. Scalar remains default.
+whole request. The artifact API and CLI now expose the same explicit choice;
+Metal receipts identify mixed CPU/Metal execution. A score-device-error injection
+remains open. Scalar remains default.
 Promote a device execution component only after
 its source staging, downstream state and failure behavior remain qualified;
 operator agreement alone is not a complete Metal request.
@@ -171,7 +172,7 @@ gate; another broad model survey is not on the critical path.
 
 | Lane | Next deliverable and consumer | Exit gate | Reversibility |
 | --- | --- | --- | --- |
-| DeepSeek primary | Keep the bounded scalar CLI as the single executable consumer of `RequestModel` and `RequestSession`. It now reads an exported numerical artifact and has focused byte-hash/output and fail-closed integration coverage. Next consumer: broader schedule and reduced-Metal qualification. | Existing final-logit source bounds pass for both schedules; focused CLI integration and strict DeepSeek/server Clippy pass. The canonical check has no new DeepSeek failure and stops at the known Julia mismatch; a green workspace claim remains closed. Preserve fail-closed malformed input/weight geometry and keep fixture readers, captured intermediates, and expected outputs out of the executable. | Fixed synthetic shapes and scalar artifact remain reversible; checkpoint loading, Metal, and serving remain separate gates. |
+| DeepSeek primary | Keep the bounded artifact CLI as the single executable consumer of `RequestModel` and `RequestSession`. It now reads an exported numerical artifact and has focused byte-hash/output and fail-closed integration coverage. It now offers explicit mixed CPU/Metal scoring. Next: remaining reduced arithmetic on Metal and broader schedule qualification. | Existing final-logit source bounds pass for both schedules; focused CLI integration and strict DeepSeek/server Clippy pass. The canonical check has no new DeepSeek failure and stops at the known Julia mismatch; a green workspace claim remains closed. Preserve fail-closed malformed input/weight geometry and keep fixture readers, captured intermediates, and expected outputs out of the executable. | Fixed synthetic shapes and the numerical artifact remain reversible; full GPU arithmetic, checkpoint loading and serving remain separate gates. |
 | Julia secondary | Resolve the numerical fidelity target for the bounded 22-layer prototype before expanding prefill to ordinary typed requests. Consumer: direct Julia decisions. | The fixed calibration source control now matches actual eager attention exactly; this does not clear the full native gate. **Decision-required before further native arithmetic:** retain pinned-source-backend compatibility or record a separately declared portable scalar contract. Preserve the enabled `1e-5` hidden-state gate and qualified two-block/head controls; do not widen limits. Under the selected target, use a calibration-only layer-zero source-oracle control to separate QKV/RoPE/score reconstruction from backend behavior, then qualify longer padded and window-crossing inputs. The head contract is type embedding, two bidirectional encoder layers, marker-position gather, and a scorer, not ordinary pooled classification. Held-out evaluation and promotion remain closed until the chosen calibration and independent-reference controls pass. | Reversible CPU control and contract evidence before Metal or checkpoint loading; changing the fidelity target requires its own recorded decision. |
 | Feasibility and review | Establish DeepSeek route locality before checkpoint acquisition. Consumer: the checkpoint acquisition decision. | Declare RAM/SSD/context/latency envelope; capture an actual source-compatible route trace without expert payloads; replay explicit cache capacities before reading selected real ranges. Keep metadata sensitivity distinct from measured hit rates, bytes, and latency. | Read-only metadata/trace work and bounded local probes; residency, prefetch, and pager policy remain decision-required. |
 | Qwen maintenance | Keep text/tools/typed decisions working; qualify concurrent admission and cancellation under load before a Codex-ready claim. The retained six read-only trials include three pointer chains, now checked against ordered direct file-read events. | Preserve focused protocol/assessor regressions and exact tool-result replay. Separate task quality from protocol failure; no general coding claim from the fixed read trace. | Reversible serving checks; no further scheduling benchmark variants. |
@@ -183,9 +184,8 @@ Next delivery sequence, grounded in `7894d99`, the
 [architecture gates and pivot conditions](architecture.md#pivot-conditions).
 Review after the first request using Metal scoring, any state/parity failure,
 or evidence that the intended checkpoint cannot meet the resource envelope.
-The Rust API now executes a qualified mixed CPU/Metal request. Expose the same
-choice through the reduced artifact CLI next; a complete reduced Metal executor
-follows. Scoring qualification alone does not establish full GPU execution.
+The Rust API and reduced artifact CLI now execute the mixed CPU/Metal request.
+The next implementation gate is the remaining reduced arithmetic on Metal. Scoring qualification alone does not establish full GPU execution.
 
 | Order | Deliverable and consumer | Gate before proceeding |
 | --- | --- | --- |
@@ -195,6 +195,16 @@ follows. Scoring qualification alone does not establish full GPU execution.
 | 3 | Move the remaining reduced request operations onto Metal in dependency order. Consumer: the same token/artifact CLI. | Identify residual CPU computation/transfers on that executable path, then move query/key preparation, attention, block tails/Engram and the head with their existing independent oracles. Complete GPU arithmetic plus routing/cache/reset checks is the exit gate; per-stage readbacks are diagnostic instrumentation, not a throughput implementation. |
 | 4 | Establish useful performance and the checkpoint resource envelope. Consumer: the checkpoint acquisition/residency decision. | Record matched artifact/input/schedule timing and peak memory for scalar and device paths. In parallel, obtain source-compatible route locality evidence and declare hardware, RAM/SSD, context, TTFT and decode-rate limits. A small synthetic graph cannot establish full-checkpoint fit or speed. |
 | 5 | Admit one real checkpoint-to-request vertical, then serving. Consumer: ordinary local generation. | After reference parity and a viable resource plan, qualify actual loading, tokenizer/template, prefill/decode and output behavior together. Serving additionally needs cancellation, admission and bounded-resource recovery. Apply the existing upstream-runtime pivot if a competing implementation meets the same declared target. |
+
+The next bounded candidate within step 3 is index-key RoPE in the existing
+L1/L3 owner path, reusing `rotate_tail_metal`. Compare the actual BF16 `post_rope`
+and FP4 reconstruction against the current source/key-prefix controls on both
+schedules; a small FP32 rotation error alone is insufficient. Qualify owner
+publication and reset behavior, then thread it through the same request/artifact
+consumer. Keep it scalar if exact downstream staging fails. This is a proposed
+integration step, with no timing or GPU-residency claim. A final-head alternative
+needs a new validated FP32 projection; full query preparation additionally needs
+Metal FP8 projection, normalization and FP4 staging.
 
 Steps 1–3 are reversible model-local changes. Integration in step 0 must preserve
 recoverable peer state. Checkpoint acquisition and residency choices in steps 4–5

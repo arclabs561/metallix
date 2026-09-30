@@ -83,13 +83,24 @@ fn export_artifact() -> Vec<u8> {
 }
 
 fn run_cli(artifact: &Path, prefill_tokens: usize) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_mx"))
+    run_cli_with_score_execution(artifact, prefill_tokens, None)
+}
+
+fn run_cli_with_score_execution(
+    artifact: &Path,
+    prefill_tokens: usize,
+    score_execution: Option<&str>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
+    command
         .args(["run-deepseek-reduced", "--artifact"])
         .arg(artifact)
         .args(["--input-ids", "0,1,2,3,4,5,6", "--prefill-tokens"])
-        .arg(prefill_tokens.to_string())
-        .output()
-        .expect("reduced CLI launches")
+        .arg(prefill_tokens.to_string());
+    if let Some(score_execution) = score_execution {
+        command.args(["--score-execution", score_execution]);
+    }
+    command.output().expect("reduced CLI launches")
 }
 
 fn expected_output(artifact: &ReducedArtifact, bytes: &[u8], prefill_tokens: usize) -> Value {
@@ -148,6 +159,57 @@ fn cli_matches_library_artifact_for_both_fixed_partitions() {
         let actual: Value = serde_json::from_slice(&output.stdout).expect("CLI emits JSON");
         assert_eq!(actual, expected_output(&artifact, &bytes, prefill_tokens));
     }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_cli_matches_scalar_library_output_for_both_fixed_partitions() {
+    let bytes = export_artifact();
+    let artifact_file = TempArtifact::from_bytes(&bytes);
+    let artifact = ReducedArtifact::parse(&bytes).expect("exported artifact parses");
+
+    for prefill_tokens in [5, 4] {
+        let output =
+            run_cli_with_score_execution(artifact_file.path(), prefill_tokens, Some("metal-bf16"));
+        assert!(
+            output.status.success(),
+            "CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let actual: Value = serde_json::from_slice(&output.stdout).expect("CLI emits JSON");
+        let mut expected = expected_output(&artifact, &bytes, prefill_tokens);
+        expected["backend"] = json!("mixed-cpu-metal");
+        expected["score_execution"] = json!("metal-bf16");
+        assert_eq!(actual, expected);
+    }
+    // The all-prefill source case has an ambiguous L4 selection tie. Selecting
+    // Metal must preserve that rejection and must not emit a success receipt.
+    let rejected = run_cli_with_score_execution(artifact_file.path(), 7, Some("metal-bf16"));
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("execution was rejected"));
+}
+
+#[test]
+fn invalid_score_execution_rejects_before_artifact_read_or_stdout() {
+    let output = run_cli_with_score_execution(
+        Path::new("missing-artifact"),
+        5,
+        Some("not-an-execution-mode"),
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+}
+
+#[cfg(not(feature = "metal"))]
+#[test]
+fn nonmetal_cli_rejects_metal_score_execution_before_artifact_read_or_stdout() {
+    let output = run_cli_with_score_execution(Path::new("missing-artifact"), 5, Some("metal-bf16"));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
 }
 
 #[test]

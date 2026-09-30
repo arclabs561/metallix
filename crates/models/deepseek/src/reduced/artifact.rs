@@ -1,4 +1,4 @@
-//! Bounded, self-contained numerical artifacts for the scalar reduced request.
+//! Bounded, self-contained numerical artifacts for the reduced request.
 //!
 //! This format contains configuration and named numerical tensors only. It is
 //! distinct from a model checkpoint and never contains reference execution cases.
@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{RequestError, RequestStepOutput};
+use crate::indexer::query::IndexScoreExecution;
 
 mod model;
 
@@ -22,7 +23,7 @@ const MAX_DECODED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TENSOR_ELEMENTS: usize = 1 << 20;
 const MAX_TENSORS: usize = 512;
 
-/// Owned numerical operands for one fixed five-block scalar model.
+/// Owned numerical operands for one fixed five-block reduced model.
 ///
 /// Parsing validates the document, tensor encodings and allocation bounds.
 /// `run` additionally constructs the numerical components and checks their
@@ -74,6 +75,20 @@ impl ReducedArtifact {
         ids: &[i64],
         prefill_tokens: usize,
     ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
+        self.run_with_score_execution(ids, prefill_tokens, IndexScoreExecution::Scalar)
+    }
+
+    /// Runs with an explicit index-score implementation across L1, L3 and L4.
+    ///
+    /// Metal scoring is mixed execution: all other arithmetic remains scalar.
+    /// Every invocation constructs fresh state with the same admission limits as
+    /// [`Self::run`]. The artifact does not retain an execution preference.
+    pub fn run_with_score_execution(
+        &self,
+        ids: &[i64],
+        prefill_tokens: usize,
+        execution: IndexScoreExecution,
+    ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
         if prefill_tokens < 2 || prefill_tokens > ids.len() || ids.len() > self.config.max_tokens {
             return Err(ArtifactError::Invalid(String::from(
                 "require 2 <= prefill_tokens <= input count <= configured max_tokens",
@@ -87,11 +102,11 @@ impl ReducedArtifact {
                 "input token is outside artifact vocabulary",
             )));
         }
-        model::run(&self.config, &self.tensors, ids, prefill_tokens)
+        model::run(&self.config, &self.tensors, ids, prefill_tokens, execution)
     }
 }
 
-/// An invalid reduced numerical artifact or failed scalar request.
+/// An invalid reduced numerical artifact or failed reduced request.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ArtifactError {

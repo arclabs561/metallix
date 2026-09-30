@@ -514,12 +514,13 @@ This qualifies the fixed reduced `4 + 1 + 1 + 1` composition alongside the
 canonical `5 + 1 + 1` path. `RequestSession` now executes all five blocks and
 the final head within each call, using ordinary typed numerical operands.
 Both schedules match the existing source-derived final-logit bounds and replay
-identically after whole-request restart. The bounded scalar CLI now accepts
+identically after whole-request restart. The bounded artifact CLI now accepts
 supplied numerical artifacts and token IDs. The Rust request model can explicitly
 select bounded BF16 Metal scoring across L1, L3 and L4. Both schedules match
 scalar scores, selections, publications and final outputs, pass the source-derived
 bounds, and replay after whole-request restart. This is mixed execution: other
-arithmetic remains on CPU, and the artifact CLI still selects the scalar default.
+arithmetic remains on CPU. The artifact CLI exposes this choice explicitly and
+keeps scalar execution as its default.
 Broader schedules, complete Metal execution, checkpoint loading and serving remain open.
 Runtime components under `deepseek::reduced` now own
 final-head arithmetic, attention HC/FFN block tails, and persistent Engram hashing,
@@ -552,6 +553,20 @@ cargo run -p server --bin mx -- run-deepseek-reduced \
   --artifact /tmp/metallix-reduced-artifact.json \
   --input-ids 0,1,2,3,4,5,6 --prefill-tokens 5
 ```
+
+On Apple Silicon, select Metal index scoring explicitly:
+
+```sh
+cargo run -p server --features metal --bin mx -- run-deepseek-reduced \
+  --artifact /tmp/metallix-reduced-artifact.json \
+  --input-ids 0,1,2,3,4,5,6 --prefill-tokens 5 \
+  --score-execution metal-bf16
+```
+
+This mode reports `backend: "mixed-cpu-metal"` and
+`score_execution: "metal-bf16"`; other arithmetic remains on CPU. The default
+scalar receipt keeps its existing format. Builds without the `metal` feature
+reject the Metal option.
 
 The exporter creates a new file and refuses to overwrite an existing one. Its
 artifact contains configuration and checksummed numerical tensors; captured
