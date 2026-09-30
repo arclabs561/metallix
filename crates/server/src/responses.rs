@@ -6,6 +6,12 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::Path,
     process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
+    thread,
     time::Duration,
 };
 
@@ -196,6 +202,7 @@ fn json_response(mut connection: Connection, status: u16, value: &Value) {
         413 => "Content Too Large",
         417 => "Expectation Failed",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let _ = write!(
@@ -204,6 +211,88 @@ fn json_response(mut connection: Connection, status: u16, value: &Value) {
         body.len()
     );
     let _ = writer.flush();
+}
+
+fn busy_response(connection: Connection) {
+    json_response(
+        connection,
+        503,
+        &json!({"error":{"code":"server_busy","message":"one generation is already active"}}),
+    );
+}
+
+fn unavailable_response(connection: Connection) {
+    json_response(
+        connection,
+        503,
+        &json!({"error":{"code":"model_worker_unavailable","message":"the model worker is unavailable"}}),
+    );
+}
+
+struct Admission {
+    occupied: Arc<AtomicBool>,
+}
+
+struct WorkerLiveness {
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for WorkerLiveness {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+impl Admission {
+    fn try_acquire(occupied: &Arc<AtomicBool>) -> Option<Self> {
+        occupied
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_previous| Self {
+                occupied: Arc::clone(occupied),
+            })
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.occupied.store(false, Ordering::Release);
+    }
+}
+
+struct GenerationJob {
+    connection: Connection,
+    request: Request,
+    messages: Vec<ChatMessage>,
+    tools: Vec<Value>,
+    id: String,
+    generation_timeout: Duration,
+    _admission: Admission,
+}
+
+fn worker_loop(session: &mut dyn ChatBackend, jobs: Receiver<GenerationJob>) {
+    for job in jobs {
+        let GenerationJob {
+            connection,
+            request,
+            messages,
+            tools,
+            id,
+            generation_timeout,
+            _admission,
+        } = job;
+        if let Err(error) = respond(
+            connection,
+            &request,
+            &messages,
+            &tools,
+            session,
+            &id,
+            generation_timeout,
+        ) {
+            eprintln!("response failed: {error}");
+        }
+    }
 }
 
 fn event(writer: &mut dyn Write, sequence: &mut u64, mut value: Value) -> Result<(), String> {
@@ -245,18 +334,95 @@ fn serve_inner(
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
     }
-    let mut session = ChatSession::load(model, limits)?;
-    let session_load_ms = (&session as &dyn ChatBackend).load_ms();
-    let server = TcpListener::bind(address).map_err(|e| e.to_string())?;
+    let (job_sender, job_receiver) = sync_channel(0);
+    let (startup_sender, startup_receiver) = sync_channel(1);
+    let worker_model = model.to_owned();
+    let worker_alive = Arc::new(AtomicBool::new(false));
+    let worker_liveness = Arc::clone(&worker_alive);
+    let worker = thread::spawn(move || {
+        let mut session = match ChatSession::load(&worker_model, limits) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = startup_sender.send(Err(error));
+                return;
+            }
+        };
+        let liveness = WorkerLiveness {
+            alive: worker_liveness,
+        };
+        liveness.alive.store(true, Ordering::Release);
+        let load_ms = (&session as &dyn ChatBackend).load_ms();
+        if startup_sender.send(Ok(load_ms)).is_ok() {
+            worker_loop(&mut session, job_receiver);
+        }
+    });
+    let session_load_ms = match startup_receiver.recv() {
+        Ok(Ok(load_ms)) => load_ms,
+        Ok(Err(error)) => {
+            let _ = worker.join();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = worker.join();
+            return Err(String::from("model worker ended before startup"));
+        }
+    };
+    let server = match TcpListener::bind(address) {
+        Ok(server) => server,
+        Err(error) => {
+            drop(job_sender);
+            let _ = worker.join();
+            return Err(error.to_string());
+        }
+    };
     eprintln!(
         "mx listening on http://{address}; model={model_id}; single request; {} total tokens; kv_budget_bytes={}; load_ms={:.2}",
         limits.context_tokens(),
         limits.kv_budget_bytes(),
         session_load_ms
     );
-    for (index, socket) in server.incoming().enumerate() {
+    let occupied = Arc::new(AtomicBool::new(false));
+    let outcome = serve_listener(
+        &server,
+        model_id,
+        &job_sender,
+        &occupied,
+        &worker_alive,
+        generation_timeout,
+        None,
+    );
+    drop(job_sender);
+    worker
+        .join()
+        .map_err(|_| String::from("model worker panicked"))?;
+    outcome
+}
+
+fn serve_listener(
+    server: &TcpListener,
+    model_id: &str,
+    job_sender: &SyncSender<GenerationJob>,
+    occupied: &Arc<AtomicBool>,
+    worker_alive: &Arc<AtomicBool>,
+    generation_timeout: Duration,
+    request_limit: Option<usize>,
+) -> Result<(), String> {
+    for (index, socket) in server
+        .incoming()
+        .take(request_limit.unwrap_or(usize::MAX))
+        .enumerate()
+    {
         let socket = socket.map_err(|error| error.to_string())?;
-        let mut connection = Connection::accept(socket, TransportLimits::default());
+        let connection = Connection::accept(socket, TransportLimits::default());
+        if !worker_alive.load(Ordering::Acquire) {
+            unavailable_response(connection);
+            return Err(String::from("model worker is unavailable"));
+        }
+        let Some(admission) = Admission::try_acquire(occupied) else {
+            busy_response(connection);
+            continue;
+        };
+        let mut connection = connection;
         let request = match connection.read_request() {
             Ok(request) => request,
             Err(error) => {
@@ -318,16 +484,18 @@ fn serve_inner(
             }
         };
         let id = format!("resp_{}_{}", std::process::id(), index);
-        if let Err(error) = respond(
+        let job = GenerationJob {
             connection,
-            &parsed,
-            &messages,
-            &tools,
-            &mut session,
-            &id,
+            request: parsed,
+            messages,
+            tools,
+            id,
             generation_timeout,
-        ) {
-            eprintln!("response failed: {error}");
+            _admission: admission,
+        };
+        if let Err(error) = job_sender.send(job) {
+            unavailable_response(error.0.connection);
+            return Err(String::from("model worker is unavailable"));
         }
     }
     Ok(())
@@ -575,6 +743,11 @@ mod tests {
         io::Read as _,
         net::{Shutdown, TcpListener, TcpStream},
         process::{Command, Stdio},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc::{Receiver, SyncSender, sync_channel},
+        },
         thread,
         time::Duration,
     };
@@ -602,6 +775,145 @@ mod tests {
             on_token("partial").map_err(ChatGenerationError::Message)?;
             Err(ChatGenerationError::DeadlineExceeded)
         }
+    }
+
+    struct BlockingBackend {
+        turns: usize,
+        entered: SyncSender<()>,
+        release: Receiver<()>,
+    }
+
+    impl ChatBackend for BlockingBackend {
+        fn load_ms(&self) -> f64 {
+            0.0
+        }
+
+        fn generate_with_timeout(
+            &mut self,
+            _request: ChatRequest<'_>,
+            _timeout: Duration,
+            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+            self.turns += 1;
+            let text = if self.turns == 1 {
+                "holding"
+            } else {
+                "recovered"
+            };
+            on_token(text).map_err(ChatGenerationError::Message)?;
+            if self.turns == 1 {
+                self.entered.send(()).map_err(|_| {
+                    ChatGenerationError::Message(String::from("test barrier closed"))
+                })?;
+                self.release
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| {
+                        ChatGenerationError::Message(String::from("test barrier timed out"))
+                    })?;
+            }
+            Ok(crate::chat_generation::ChatGeneration {
+                text: text.into(),
+                generated_token_ids: vec![1],
+                finish_reason: ChatFinishReason::Eos,
+                metrics: crate::chat_generation::ChatGenerationMetrics {
+                    context_tokens: 2_048,
+                    planned_kv_bytes: 0,
+                    session_load_ms: 0.0,
+                    render_ms: 0.0,
+                    prefill_ms: 0.0,
+                    time_to_first_token_ms: Some(0.0),
+                    decode_ms: vec![],
+                    decode_total_ms: 0.0,
+                    prompt_tokens: 1,
+                    generated_tokens: 1,
+                },
+            })
+        }
+    }
+
+    /// Reads one bounded, fixed-length HTTP response without relying on EOF.
+    ///
+    /// Busy admission deliberately responds before consuming a peer's request
+    /// body. A peer that half-closes after writing can therefore observe a
+    /// reset once the complete response has arrived; EOF is not the framing
+    /// boundary for this JSON response.
+    fn fixed_http_response(stream: &mut TcpStream) -> (u16, Vec<u8>) {
+        const MAX_HEADER_BYTES: usize = 16 * 1024;
+        const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+        let mut wire = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            assert!(
+                wire.len() <= MAX_HEADER_BYTES,
+                "fixed response headers exceed {MAX_HEADER_BYTES} bytes"
+            );
+            if let Some(index) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let read = stream
+                .read(&mut chunk)
+                .expect("read fixed response headers");
+            assert!(read > 0, "fixed response ended before headers");
+            wire.extend_from_slice(&chunk[..read]);
+        };
+        assert!(
+            header_end <= MAX_HEADER_BYTES,
+            "fixed response headers exceed {MAX_HEADER_BYTES} bytes"
+        );
+
+        let headers = std::str::from_utf8(&wire[..header_end]).expect("response headers UTF-8");
+        let mut lines = headers.split("\r\n");
+        let status_line = lines.next().expect("response status line");
+        let mut status_parts = status_line.split_whitespace();
+        assert_eq!(
+            status_parts.next(),
+            Some("HTTP/1.1"),
+            "response HTTP version"
+        );
+        let status = status_parts
+            .next()
+            .expect("response status code")
+            .parse::<u16>()
+            .expect("numeric response status");
+        assert!(status_parts.next().is_some(), "response reason phrase");
+
+        let mut content_length = None;
+        for line in lines.take_while(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(':').expect("well-formed response header");
+            if name.eq_ignore_ascii_case("content-length") {
+                let length = value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("numeric content length");
+                assert!(
+                    content_length.replace(length).is_none(),
+                    "response has one content length"
+                );
+            }
+        }
+        let content_length = content_length.expect("fixed response content length");
+        assert!(
+            content_length <= MAX_BODY_BYTES,
+            "fixed response body exceeds {MAX_BODY_BYTES} bytes"
+        );
+        let response_end = header_end
+            .checked_add(content_length)
+            .expect("response length overflow");
+        assert!(
+            wire.len() <= response_end,
+            "response exceeds declared content length"
+        );
+        while wire.len() < response_end {
+            let remaining = response_end - wire.len();
+            let read_len = remaining.min(chunk.len());
+            let read = stream
+                .read(&mut chunk[..read_len])
+                .expect("read fixed response body");
+            assert!(read > 0, "fixed response ended before declared body");
+            wire.extend_from_slice(&chunk[..read]);
+        }
+        (status, wire[header_end..].to_vec())
     }
 
     proptest! {
@@ -746,6 +1058,298 @@ mod tests {
         assert_eq!(events[4]["response"]["error"]["code"], "generation_timeout");
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered socket lifecycle is the assertion under test"
+    )]
+    fn concurrent_arrival_is_rejected_while_worker_holds_the_model_then_recovers() {
+        fn request_body() -> Vec<u8> {
+            serde_json::to_vec(&json!({
+                "model": "control",
+                "input": "hello",
+                "stream": true,
+                "max_output_tokens": 8,
+            }))
+            .expect("request JSON")
+        }
+
+        fn request(stream: &mut TcpStream, body: &[u8]) {
+            write!(
+                stream,
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .expect("request header");
+            stream.write_all(body).expect("request body");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("request half-close");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (job_sender, job_receiver) = sync_channel(0);
+        let (entered_sender, entered_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut backend = BlockingBackend {
+                turns: 0,
+                entered: entered_sender,
+                release: release_receiver,
+            };
+            worker_loop(&mut backend, job_receiver);
+        });
+        let occupied = Arc::new(AtomicBool::new(false));
+        let server_occupied = Arc::clone(&occupied);
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let server_worker_alive = Arc::clone(&worker_alive);
+        let server_sender = job_sender.clone();
+        let server = thread::spawn(move || {
+            serve_listener(
+                &listener,
+                "control",
+                &server_sender,
+                &server_occupied,
+                &server_worker_alive,
+                Duration::from_secs(2),
+                Some(4),
+            )
+        });
+
+        let mut malformed = TcpStream::connect(address).expect("connect malformed request");
+        malformed
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound malformed reads");
+        malformed
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n{",
+            )
+            .expect("write malformed request");
+        malformed
+            .shutdown(Shutdown::Write)
+            .expect("malformed half-close");
+        let mut malformed_wire = Vec::new();
+        malformed
+            .read_to_end(&mut malformed_wire)
+            .expect("read malformed response");
+        assert!(
+            String::from_utf8(malformed_wire)
+                .expect("malformed response UTF-8")
+                .starts_with("HTTP/1.1 400 Bad Request\r\n")
+        );
+
+        let body = request_body();
+        let mut primary = TcpStream::connect(address).expect("connect primary request");
+        primary
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound primary reads");
+        request(&mut primary, &body);
+        let mut primary_prefix = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !primary_prefix
+            .windows(b"response.output_text.delta".len())
+            .any(|window| window == b"response.output_text.delta")
+        {
+            let read = primary.read(&mut chunk).expect("read primary delta");
+            assert!(read > 0, "primary ended before its delta");
+            primary_prefix.extend_from_slice(&chunk[..read]);
+        }
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker holds after the real callback delta");
+
+        let mut busy = TcpStream::connect(address).expect("connect concurrent request");
+        busy.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound busy reads");
+        request(&mut busy, &body);
+        let (busy_status, busy_body) = fixed_http_response(&mut busy);
+        assert_eq!(busy_status, 503);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&busy_body).expect("busy response JSON"),
+            json!({"error":{"code":"server_busy","message":"one generation is already active"}})
+        );
+
+        release_sender.send(()).expect("release worker");
+        primary
+            .read_to_end(&mut primary_prefix)
+            .expect("read primary completion");
+        assert!(
+            String::from_utf8(primary_prefix)
+                .expect("primary UTF-8")
+                .contains(r#""type":"response.completed""#)
+        );
+
+        let mut recovery = TcpStream::connect(address).expect("connect recovery request");
+        recovery
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound recovery reads");
+        request(&mut recovery, &body);
+        let mut recovery_wire = Vec::new();
+        recovery
+            .read_to_end(&mut recovery_wire)
+            .expect("read recovery response");
+        let recovery_wire = String::from_utf8(recovery_wire).expect("recovery UTF-8");
+        assert!(recovery_wire.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(recovery_wire.contains(r#""type":"response.completed""#));
+        assert!(recovery_wire.contains("recovered"));
+
+        server
+            .join()
+            .expect("join bounded acceptor")
+            .expect("acceptor result");
+        drop(job_sender);
+        worker.join().expect("join bounded worker");
+        assert!(!occupied.load(Ordering::Acquire));
+        assert!(worker_alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn generation_error_releases_admission_for_the_next_request() {
+        fn request(address: std::net::SocketAddr) -> String {
+            let body = br#"{"model":"control","input":"hello","stream":true}"#;
+            let mut stream = TcpStream::connect(address).expect("connect request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound request reads");
+            write!(
+                stream,
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .expect("request header");
+            stream.write_all(body).expect("request body");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("request half-close");
+            let mut wire = Vec::new();
+            stream.read_to_end(&mut wire).expect("read response");
+            String::from_utf8(wire).expect("response UTF-8")
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = sync_channel(0);
+        let worker = thread::spawn(move || {
+            let mut backend = DeadlineBackend::default();
+            worker_loop(&mut backend, receiver);
+            backend.calls
+        });
+        let occupied = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let server_occupied = Arc::clone(&occupied);
+        let server_alive = Arc::clone(&alive);
+        let server_sender = sender.clone();
+        let server = thread::spawn(move || {
+            serve_listener(
+                &listener,
+                "control",
+                &server_sender,
+                &server_occupied,
+                &server_alive,
+                Duration::from_secs(2),
+                Some(2),
+            )
+        });
+
+        for _ in 0..2 {
+            let wire = request(address);
+            assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(wire.contains(r#""type":"response.failed""#));
+            assert!(wire.contains(r#""code":"generation_timeout""#));
+        }
+        server
+            .join()
+            .expect("join error acceptor")
+            .expect("error acceptor result");
+        drop(sender);
+        assert_eq!(worker.join().expect("join error worker"), 2);
+        assert!(!occupied.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unavailable_worker_rejects_without_reading_request_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = sync_channel::<GenerationJob>(0);
+        drop(receiver);
+        let occupied = Arc::new(AtomicBool::new(false));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let server_occupied = Arc::clone(&occupied);
+        let server_unavailable = Arc::clone(&unavailable);
+        let server = thread::spawn(move || {
+            serve_listener(
+                &listener,
+                "control",
+                &sender,
+                &server_occupied,
+                &server_unavailable,
+                Duration::from_secs(2),
+                Some(1),
+            )
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect without request headers");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound unavailable read");
+        let mut wire = Vec::new();
+        client
+            .read_to_end(&mut wire)
+            .expect("read unavailable response");
+        let wire = String::from_utf8(wire).expect("unavailable UTF-8");
+        assert!(wire.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(wire.contains(r#""code":"model_worker_unavailable""#));
+        assert!(server.join().expect("join unavailable acceptor").is_err());
+        assert!(!occupied.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropped_worker_receiver_returns_unavailable_after_valid_intake() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = sync_channel::<GenerationJob>(0);
+        drop(receiver);
+        let occupied = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let server_occupied = Arc::clone(&occupied);
+        let server_alive = Arc::clone(&alive);
+        let server = thread::spawn(move || {
+            serve_listener(
+                &listener,
+                "control",
+                &sender,
+                &server_occupied,
+                &server_alive,
+                Duration::from_secs(2),
+                Some(1),
+            )
+        });
+
+        let body = br#"{"model":"control","input":"hello","stream":true}"#;
+        let mut client = TcpStream::connect(address).expect("connect valid request");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound unavailable read");
+        write!(
+            client,
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .expect("valid request header");
+        client.write_all(body).expect("valid request body");
+        client.shutdown(Shutdown::Write).expect("valid half-close");
+        let mut wire = Vec::new();
+        client
+            .read_to_end(&mut wire)
+            .expect("read unavailable response");
+        let wire = String::from_utf8(wire).expect("unavailable UTF-8");
+        assert!(wire.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(wire.contains(r#""code":"model_worker_unavailable""#));
+        assert!(server.join().expect("join unavailable acceptor").is_err());
+        assert!(!occupied.load(Ordering::Acquire));
+    }
+
     mod checkpoint_reset {
         use super::*;
         struct ObservedSession<'a> {
@@ -777,6 +1381,52 @@ mod tests {
             }
         }
 
+        struct BarrierSession {
+            session: ChatSession,
+            entered: SyncSender<()>,
+            release: Receiver<()>,
+        }
+
+        impl ChatBackend for BarrierSession {
+            fn load_ms(&self) -> f64 {
+                self.session.load_ms()
+            }
+
+            fn generate_with_timeout(
+                &mut self,
+                request: ChatRequest<'_>,
+                timeout: Duration,
+                on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+                let hold_after_delta = request.max_tokens == 64;
+                let mut held = false;
+                self.session
+                    .generate_with_timeout(request, timeout, &mut |delta| {
+                        on_token(delta)?;
+                        if hold_after_delta && !held {
+                            held = true;
+                            self.entered
+                                .send(())
+                                .map_err(|_| String::from("busy test barrier closed"))?;
+                            self.release
+                                .recv_timeout(Duration::from_secs(60))
+                                .map_err(|_| String::from("busy test barrier timed out"))?;
+                        }
+                        Ok(())
+                    })
+            }
+        }
+
+        struct ReleaseOnDrop(Option<SyncSender<()>>);
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
         fn body(max_output_tokens: u32) -> Vec<u8> {
             serde_json::to_vec(&json!({
                 "model": "metallix-qwen3",
@@ -791,27 +1441,42 @@ mod tests {
             .expect("test request JSON")
         }
 
+        fn request_stream(address: std::net::SocketAddr, body: &[u8]) -> TcpStream {
+            let mut stream = TcpStream::connect(address).expect("connect loopback server");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("bound client reads");
+            write!(
+                stream,
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .expect("write request header");
+            stream.write_all(body).expect("write request body");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("half-close request");
+            stream
+        }
+
         fn client(address: std::net::SocketAddr, body: Vec<u8>) -> thread::JoinHandle<Vec<u8>> {
             thread::spawn(move || {
-                let mut stream = TcpStream::connect(address).expect("connect loopback server");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(60)))
-                    .expect("bound client reads");
-                write!(
-                    stream,
-                    "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                )
-                .expect("write request header");
-                stream.write_all(&body).expect("write request body");
-                stream
-                    .shutdown(Shutdown::Write)
-                    .expect("half-close request");
+                let mut stream = request_stream(address, &body);
                 let mut wire = Vec::new();
                 stream
                     .read_to_end(&mut wire)
                     .expect("read complete response");
                 wire
+            })
+        }
+
+        fn fixed_response_client(
+            address: std::net::SocketAddr,
+            body: Vec<u8>,
+        ) -> thread::JoinHandle<(u16, Vec<u8>)> {
+            thread::spawn(move || {
+                let mut stream = request_stream(address, &body);
+                fixed_http_response(&mut stream)
             })
         }
 
@@ -962,6 +1627,143 @@ raise RuntimeError("stream exceeded 65536 bytes before a generated text delta")
                 text,
                 usage,
             )
+        }
+
+        #[test]
+        #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+        #[allow(
+            clippy::too_many_lines,
+            reason = "the ordered real-checkpoint lifecycle is the assertion under test"
+        )]
+        fn checkpoint_busy_rejection_after_actual_delta_then_session_recovers() {
+            let model = env::var_os("METALLIX_QWEN_MODEL")
+                .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+            let address = listener.local_addr().expect("listener address");
+            let (job_sender, job_receiver) = sync_channel(0);
+            let (startup_sender, startup_receiver) = sync_channel(1);
+            let (entered_sender, entered_receiver) = sync_channel(1);
+            let (release_sender, release_receiver) = sync_channel(1);
+            let worker = thread::spawn(move || {
+                let session = ChatSession::load(
+                    std::path::Path::new(&model),
+                    ResidentChatLimits::from_mib(2_048, 1_024),
+                );
+                let session = match session {
+                    Ok(session) => session,
+                    Err(error) => {
+                        let _ = startup_sender.send(Err(error));
+                        return;
+                    }
+                };
+                if startup_sender.send(Ok(())).is_ok() {
+                    let mut backend = BarrierSession {
+                        session,
+                        entered: entered_sender,
+                        release: release_receiver,
+                    };
+                    worker_loop(&mut backend, job_receiver);
+                }
+            });
+            match startup_receiver.recv_timeout(Duration::from_secs(60)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => panic!("checkpoint session load: {error}"),
+                Err(error) => panic!("checkpoint worker startup: {error}"),
+            }
+            let occupied = Arc::new(AtomicBool::new(false));
+            let server_occupied = Arc::clone(&occupied);
+            let worker_alive = Arc::new(AtomicBool::new(true));
+            let server_worker_alive = Arc::clone(&worker_alive);
+            let server_sender = job_sender.clone();
+            let server = thread::spawn(move || {
+                serve_listener(
+                    &listener,
+                    "metallix-qwen3",
+                    &server_sender,
+                    &server_occupied,
+                    &server_worker_alive,
+                    Duration::from_secs(60),
+                    Some(4),
+                )
+            });
+
+            let baseline_client = client(address, body(32));
+            let baseline =
+                terminal_text_and_usage(baseline_client.join().expect("baseline client"));
+
+            let mut release = ReleaseOnDrop(Some(release_sender));
+            let primary_body = body(64);
+            let mut primary = TcpStream::connect(address).expect("connect primary request");
+            primary
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("bound primary reads");
+            write!(
+                primary,
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                primary_body.len()
+            )
+            .expect("primary request header");
+            primary
+                .write_all(&primary_body)
+                .expect("primary request body");
+            primary
+                .shutdown(Shutdown::Write)
+                .expect("primary half-close");
+            let mut primary_prefix = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !primary_prefix
+                .windows(b"response.output_text.delta".len())
+                .any(|window| window == b"response.output_text.delta")
+            {
+                let read = primary.read(&mut chunk).expect("read primary delta");
+                assert!(read > 0, "primary ended before an actual delta");
+                primary_prefix.extend_from_slice(&chunk[..read]);
+            }
+            entered_receiver
+                .recv_timeout(Duration::from_secs(60))
+                .expect("worker holds after actual callback delta");
+
+            let busy_client = fixed_response_client(address, body(32));
+            let (busy_status, busy_body) = busy_client.join().expect("busy client");
+            assert_eq!(busy_status, 503);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&busy_body).expect("busy response JSON"),
+                json!({"error":{"code":"server_busy","message":"one generation is already active"}})
+            );
+
+            release
+                .0
+                .take()
+                .expect("release sender")
+                .send(())
+                .expect("release worker");
+            primary
+                .read_to_end(&mut primary_prefix)
+                .expect("read primary completion");
+            let (primary_status, _, primary_usage) = terminal_text_and_usage(primary_prefix);
+            let generated = primary_usage["output_tokens"]
+                .as_u64()
+                .expect("output usage");
+            assert!(generated <= 64, "the primary request retains its token cap");
+            if primary_status == "response.incomplete" {
+                assert_eq!(generated, 64, "incomplete must exhaust the declared cap");
+            }
+
+            let recovery_client = client(address, body(32));
+            let recovery =
+                terminal_text_and_usage(recovery_client.join().expect("recovery client"));
+            assert_eq!(
+                recovery, baseline,
+                "recovery matches the uninterrupted baseline"
+            );
+
+            server
+                .join()
+                .expect("join bounded acceptor")
+                .expect("acceptor result");
+            drop(job_sender);
+            worker.join().expect("join bounded worker");
+            assert!(!occupied.load(Ordering::Acquire));
         }
 
         #[test]
