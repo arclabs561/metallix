@@ -159,9 +159,12 @@ def boundaries(case: dict[str, Any]) -> tuple[dict[str, torch.Tensor], list[str]
 
 
 def layer0_trace(
-    case: dict[str, Any], attention_implementation: str = "sdpa"
+    case: dict[str, Any],
+    attention_implementation: str = "sdpa",
+    capture_rope: bool = False,
 ) -> dict[str, torch.Tensor]:
-    """Capture source layer-zero intermediates through actual module hooks."""
+    """Capture layer-zero hooks, optionally observing the first pinned RoPE call."""
+
     encoder = source_encoder(attention_implementation)
     input_ids = torch.tensor([case["input_ids"]], dtype=torch.int64)
     attention_mask = torch.tensor([case["attention_mask"]], dtype=torch.bool)
@@ -190,10 +193,51 @@ def layer0_trace(
         layer.attn.Wo.register_forward_pre_hook(input_hook("attended")),
         layer.attn.Wo.register_forward_hook(output("wo")),
     ]
-    with torch.inference_mode():
-        encoder(input_ids=input_ids, attention_mask=attention_mask)
-    for hook in hooks:
-        hook.remove()
+    rotary_calls = 0
+
+    def observed_rotary(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal rotary_calls
+        capture_layer_zero = rotary_calls == 0
+        rotary_calls += 1
+        if capture_layer_zero:
+            observed["source_pre_rotary_query"] = query.detach().clone()
+            observed["source_pre_rotary_key"] = key.detach().clone()
+            observed["source_rotary_cos"] = cos.detach().clone()
+            observed["source_rotary_sin"] = sin.detach().clone()
+        rotated_query, rotated_key = original_rotary(
+            query, key, cos, sin, *args, **kwargs
+        )
+        if capture_layer_zero:
+            observed["source_rotary_query"] = rotated_query.detach().clone()
+            observed["source_rotary_key"] = rotated_key.detach().clone()
+        return rotated_query, rotated_key
+
+    if capture_rope:
+        import transformers.models.modernbert.modeling_modernbert as source_module
+
+        original_rotary = source_module.apply_rotary_pos_emb
+        source_module.apply_rotary_pos_emb = observed_rotary
+    try:
+        with torch.inference_mode():
+            encoder(input_ids=input_ids, attention_mask=attention_mask)
+    finally:
+        if capture_rope:
+            source_module.apply_rotary_pos_emb = original_rotary
+            if source_module.apply_rotary_pos_emb is not original_rotary:
+                raise RuntimeError("source RoPE binding was not restored")
+        for hook in hooks:
+            hook.remove()
+    if capture_rope and rotary_calls != LAYERS:
+        raise RuntimeError(
+            f"expected {LAYERS} source RoPE calls, observed {rotary_calls}"
+        )
     observed["post_wo_residual"] = observed["embedding"] + observed["wo"]
     positions = observed["qkv"].shape[0]
     qkv = observed["qkv"].reshape(positions, 3, 6, 64)

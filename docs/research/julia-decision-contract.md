@@ -29,6 +29,30 @@ resolve the full-encoder source-backend compatibility failure or establish a
 portable numerical contract. A fidelity-target decision still precedes another
 native arithmetic experiment.
 
+The source control now captures the actual layer-zero `apply_rotary_pos_emb`
+inputs, cos/sin and outputs, restoring the source binding in `finally`. Its
+captured-operand replay has zero error in both eager and SDPA modes, and the
+observed SDPA layer-zero fields are bit-identical to an unobserved run. Actual
+source rotated Q/K also match the existing reconstructed source rotations
+exactly. This rejects a missing source RoPE operation as the explanation on
+`cal_len7`; it does not localize the separate failing `unmasked_control` case.
+
+With the retained schema-2 native calibration trace, native/source QKV and
+rotated Q/K maximum differences are each `3.814697265625e-6`. Reapplying the
+source RoPE formula to native QKV leaves only `9.5367431640625e-7` difference
+from native rotated Q/K. These are diagnostic observations, not new tolerances
+or an encoder qualification. No held-out input or native arithmetic changed.
+
+```sh
+uv run --offline scripts/julia_calibration_source_oracle.py --run-source \
+  --native-trace .agents/receipts/julia/cal-len7-layer0-native-replay.json \
+  --output /tmp/julia-source-rope-attribution.json
+```
+
+The optional native input is bounded to 2 MiB, requires the calibration case,
+schema and finite tensor shapes, and is recorded by SHA-256. The retained result
+is `.agents/receipts/julia/calibration-source-oracle-rope-attribution.json`.
+
 ## Reproduction identity
 
 The public Hugging Face model API reported the following source revision on

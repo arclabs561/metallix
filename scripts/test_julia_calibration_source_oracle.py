@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,26 @@ class SourceOracleInputTest(unittest.TestCase):
             ORACLE.write_exclusive(path, {"ok": True})
             with self.assertRaises(FileExistsError):
                 ORACLE.write_exclusive(path, {"ok": False})
+
+    def test_native_trace_rejects_wrong_calibration_and_excess_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.json"
+            for trace in (
+                {"schema_version": 1},
+                {"schema_version": 2, "case": "held_out"},
+                {
+                    "schema_version": 2,
+                    "case": "cal_len7",
+                    "attention_layout": "unknown",
+                },
+            ):
+                path.write_text(json.dumps(trace))
+                # Admission must reject this metadata before consulting Torch.
+                with self.assertRaises(ValueError):
+                    ORACLE.load_native_trace(None, path)
+            path.write_bytes(b" " * (ORACLE.NATIVE_TRACE_MAX_BYTES + 1))
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                ORACLE.load_native_trace(None, path)
 
 
 if __name__ == "__main__":

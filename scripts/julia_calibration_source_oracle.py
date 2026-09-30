@@ -25,6 +25,8 @@ CASE = {
 WIDTH, HEADS, HEAD_DIM = 384, 6, 64
 CONTROL_TOLERANCE = 1e-5
 TORCH_THREADS = 1
+NATIVE_TRACE_MAX_BYTES = 2 * 1024 * 1024
+NATIVE_TRACE_SCHEMA_VERSION = 2
 
 
 def sha256(path: Path) -> str:
@@ -48,9 +50,14 @@ def validate_case(case: dict[str, Any]) -> None:
         )
 
 
-def validate_arguments(check_case: bool, run_source: bool, output: Path | None) -> None:
+def validate_arguments(
+    check_case: bool,
+    run_source: bool,
+    output: Path | None,
+    native_trace: Path | None = None,
+) -> None:
     if check_case:
-        if run_source or output is not None:
+        if run_source or output is not None or native_trace is not None:
             raise ValueError("--check-case cannot execute or write a source receipt")
     elif not run_source or output is None:
         raise ValueError("source execution requires --run-source and --output")
@@ -67,7 +74,7 @@ def validate_tensor(
         raise ValueError(f"{label} contains a non-finite value")
 
 
-def validate_trace(torch: Any, trace: dict[str, Any], label: str) -> None:
+def validate_base_trace(torch: Any, trace: dict[str, Any], label: str) -> None:
     positions = len(CASE["input_ids"])
     validate_tensor(torch, trace.get("qkv"), (positions, 3 * WIDTH), f"{label} QKV")
     validate_tensor(
@@ -84,6 +91,91 @@ def validate_trace(torch: Any, trace: dict[str, Any], label: str) -> None:
     )
 
 
+def validate_trace(torch: Any, trace: dict[str, Any], label: str) -> None:
+    positions = len(CASE["input_ids"])
+    validate_base_trace(torch, trace, label)
+    for name in ("source_pre_rotary_query", "source_pre_rotary_key"):
+        validate_tensor(
+            torch,
+            trace.get(name),
+            (1, HEADS, positions, HEAD_DIM),
+            f"{label} {name}",
+        )
+    for name in ("source_rotary_cos", "source_rotary_sin"):
+        validate_tensor(
+            torch,
+            trace.get(name),
+            (1, positions, HEAD_DIM),
+            f"{label} {name}",
+        )
+    for name in ("source_rotary_query", "source_rotary_key"):
+        validate_tensor(
+            torch,
+            trace.get(name),
+            (1, HEADS, positions, HEAD_DIM),
+            f"{label} {name}",
+        )
+
+
+def rotate_half(torch: Any, value: Any) -> Any:
+    half = value.shape[-1] // 2
+    return torch.cat((-value[..., half:], value[..., :half]), dim=-1)
+
+
+def replay_rope(torch: Any, trace: dict[str, Any]) -> tuple[Any, Any]:
+    cos = trace["source_rotary_cos"].unsqueeze(1)
+    sin = trace["source_rotary_sin"].unsqueeze(1)
+    query = trace["source_pre_rotary_query"]
+    key = trace["source_pre_rotary_key"]
+    return (
+        (query * cos) + (rotate_half(torch, query) * sin),
+        (key * cos) + (rotate_half(torch, key) * sin),
+    )
+
+
+def source_rotary_positions(trace: dict[str, Any], name: str) -> Any:
+    return trace[name].squeeze(0).permute(1, 0, 2)
+
+
+def max_abs(left: Any, right: Any) -> float:
+    return (left - right).abs().max().item()
+
+
+def load_native_trace(torch: Any, path: Path) -> tuple[dict[str, Any], str]:
+    with path.open("rb") as source:
+        payload = source.read(NATIVE_TRACE_MAX_BYTES + 1)
+    if len(payload) > NATIVE_TRACE_MAX_BYTES:
+        raise ValueError(f"native trace exceeds {NATIVE_TRACE_MAX_BYTES} bytes")
+    try:
+        trace = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("native trace is not valid JSON") from error
+    if not isinstance(trace, dict):
+        raise TypeError("native trace must be a JSON object")
+    if trace.get("schema_version") != NATIVE_TRACE_SCHEMA_VERSION:
+        raise ValueError(
+            f"native trace schema_version does not match {NATIVE_TRACE_SCHEMA_VERSION}"
+        )
+    if trace.get("case") != CASE["name"]:
+        raise ValueError("native trace case is not the fixed cal_len7 calibration case")
+    if trace.get("attention_layout") != "head_query_key":
+        raise ValueError("native trace attention layout is not head_query_key")
+    positions = len(CASE["input_ids"])
+    if trace.get("attention_shape") != [HEADS, positions, positions]:
+        raise ValueError("native trace attention shape is not exact")
+    for name in ("rotated_query", "rotated_key", "qkv"):
+        try:
+            value = torch.tensor(trace[name], dtype=torch.float32)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"native trace {name} is not a numeric tensor") from error
+        shape = (
+            (positions, 3 * WIDTH) if name == "qkv" else (positions, HEADS, HEAD_DIM)
+        )
+        validate_tensor(torch, value, shape, f"native {name}")
+        trace[name] = value
+    return trace, hashlib.sha256(payload).hexdigest()
+
+
 def write_exclusive(path: Path, receipt: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as output:
@@ -95,8 +187,9 @@ def main() -> None:
     parser.add_argument("--check-case", action="store_true")
     parser.add_argument("--run-source", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--native-trace", type=Path)
     args = parser.parse_args()
-    validate_arguments(args.check_case, args.run_source, args.output)
+    validate_arguments(args.check_case, args.run_source, args.output, args.native_trace)
     if args.check_case:
         validate_case(CASE)
         print(json.dumps({"case": CASE["name"], "held_out_accessed": False}))
@@ -107,10 +200,74 @@ def main() -> None:
     torch.set_num_threads(TORCH_THREADS)
     torch.set_num_interop_threads(TORCH_THREADS)
     full = source_module()
-    eager = full.layer0_trace(CASE, "eager")
-    sdpa = full.layer0_trace(CASE, "sdpa")
+    eager = full.layer0_trace(CASE, "eager", capture_rope=True)
+    sdpa = full.layer0_trace(CASE, "sdpa", capture_rope=True)
+    sdpa_unobserved = full.layer0_trace(CASE, "sdpa")
     validate_trace(torch, eager, "eager")
     validate_trace(torch, sdpa, "SDPA")
+    validate_base_trace(torch, sdpa_unobserved, "unobserved SDPA")
+    eager_replayed_query, eager_replayed_key = replay_rope(torch, eager)
+    sdpa_replayed_query, sdpa_replayed_key = replay_rope(torch, sdpa)
+    rope_replay_gaps = {
+        "eager_query": (eager["source_rotary_query"] - eager_replayed_query)
+        .abs()
+        .max()
+        .item(),
+        "eager_key": (eager["source_rotary_key"] - eager_replayed_key)
+        .abs()
+        .max()
+        .item(),
+        "sdpa_query": (sdpa["source_rotary_query"] - sdpa_replayed_query)
+        .abs()
+        .max()
+        .item(),
+        "sdpa_key": (sdpa["source_rotary_key"] - sdpa_replayed_key).abs().max().item(),
+    }
+    if any(gap != 0.0 for gap in rope_replay_gaps.values()):
+        raise RuntimeError(
+            f"captured source RoPE replay is not exact: {rope_replay_gaps}"
+        )
+    observer_fields = (
+        "embedding",
+        "qkv",
+        "attended",
+        "wo",
+        "post_wo_residual",
+        "rotated_query",
+        "rotated_key",
+        "logits",
+        "probabilities",
+    )
+    observer_gaps = {
+        field: max_abs(sdpa[field], sdpa_unobserved[field]) for field in observer_fields
+    }
+    observer_exact_bits = all(
+        torch.equal(
+            sdpa[field].contiguous().view(torch.int32),
+            sdpa_unobserved[field].contiguous().view(torch.int32),
+        )
+        for field in observer_fields
+    )
+    if not observer_exact_bits:
+        raise RuntimeError(f"RoPE observer changed SDPA trace: {observer_gaps}")
+    actual_vs_reconstructed = {
+        "eager_query": max_abs(
+            source_rotary_positions(eager, "source_rotary_query"),
+            eager["rotated_query"],
+        ),
+        "eager_key": max_abs(
+            source_rotary_positions(eager, "source_rotary_key"),
+            eager["rotated_key"],
+        ),
+        "sdpa_query": max_abs(
+            source_rotary_positions(sdpa, "source_rotary_query"),
+            sdpa["rotated_query"],
+        ),
+        "sdpa_key": max_abs(
+            source_rotary_positions(sdpa, "source_rotary_key"),
+            sdpa["rotated_key"],
+        ),
+    }
     qkv = eager["qkv"].reshape(len(CASE["input_ids"]), 3, HEADS, HEAD_DIM)
     values = qkv[:, 2]
     reconstructed = torch.einsum(
@@ -127,6 +284,40 @@ def main() -> None:
         raise RuntimeError(
             f"explicit eager reconstruction {eager_gap} exceeds {CONTROL_TOLERANCE}"
         )
+    native_comparison = None
+    if args.native_trace is not None:
+        native, native_sha256 = load_native_trace(torch, args.native_trace)
+        native_qkv = native["qkv"].reshape(len(CASE["input_ids"]), 3, HEADS, HEAD_DIM)
+        native_source_rotary = dict(sdpa)
+        native_source_rotary["source_pre_rotary_query"] = (
+            native_qkv[:, 0].permute(1, 0, 2).unsqueeze(0)
+        )
+        native_source_rotary["source_pre_rotary_key"] = (
+            native_qkv[:, 1].permute(1, 0, 2).unsqueeze(0)
+        )
+        native_replayed = replay_rope(torch, native_source_rotary)
+        native_comparison = {
+            "native_vs_source_qkv_max_abs": max_abs(native["qkv"], sdpa["qkv"]),
+            "native_rotary_vs_source_formula_on_native_qkv_max_abs": {
+                name: max_abs(
+                    native["rotated_" + name], value.squeeze(0).permute(1, 0, 2)
+                )
+                for name, value in zip(("query", "key"), native_replayed, strict=True)
+            },
+            "path": str(args.native_trace),
+            "sha256": native_sha256,
+            "schema_version": NATIVE_TRACE_SCHEMA_VERSION,
+            "native_vs_source_actual_rotary_max_abs": {
+                "query": max_abs(
+                    native["rotated_query"],
+                    source_rotary_positions(sdpa, "source_rotary_query"),
+                ),
+                "key": max_abs(
+                    native["rotated_key"],
+                    source_rotary_positions(sdpa, "source_rotary_key"),
+                ),
+            },
+        }
     receipt = {
         "schema_version": 1,
         "scope": "cal_len7 calibration source eager oracle control only",
@@ -144,6 +335,12 @@ def main() -> None:
                 len(CASE["input_ids"]),
             ],
             "attended": [len(CASE["input_ids"]), WIDTH],
+            "source_pre_rotary_query": [1, HEADS, len(CASE["input_ids"]), HEAD_DIM],
+            "source_pre_rotary_key": [1, HEADS, len(CASE["input_ids"]), HEAD_DIM],
+            "source_rotary_cos": [1, len(CASE["input_ids"]), HEAD_DIM],
+            "source_rotary_sin": [1, len(CASE["input_ids"]), HEAD_DIM],
+            "source_rotary_query": [1, HEADS, len(CASE["input_ids"]), HEAD_DIM],
+            "source_rotary_key": [1, HEADS, len(CASE["input_ids"]), HEAD_DIM],
         },
         "source": {
             "modernbert_revision": full.ENCODER.REVISION,
@@ -169,6 +366,11 @@ def main() -> None:
             },
         },
         "control_tolerance": CONTROL_TOLERANCE,
+        "captured_source_rope_replay_max_abs": rope_replay_gaps,
+        "observer_noninterference_max_abs": observer_gaps,
+        "observer_noninterference_exact_bits": observer_exact_bits,
+        "source_actual_vs_existing_reconstructed_rotary_max_abs": actual_vs_reconstructed,
+        "native_trace_comparison": native_comparison,
         "eager_actual_vs_explicit_attended_max_abs": eager_gap,
         "sdpa_actual_vs_eager_actual_attended_max_abs": (
             sdpa["attended"] - eager["attended"]
