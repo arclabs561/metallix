@@ -53,6 +53,34 @@ The optional native input is bounded to 2 MiB, requires the calibration case,
 schema and finite tensor shapes, and is recorded by SHA-256. The retained result
 is `.agents/receipts/julia/calibration-source-oracle-rope-attribution.json`.
 
+The same-input projection comparison now replays the saved `cal_len7` evidence
+with pinned F32 Wqkv. `F.linear` on source embedding rows reproduces captured
+source QKV exactly. Propagating native versus source embedding rows through that
+same operator has maximum difference `4.291534423828125e-6` and RMS
+`9.584398419098913e-7`; the native-QKV residual after applying that operator to
+native embedding rows has maximum `1.1920928955078125e-6` and RMS
+`3.2036961004544736e-7`. The overall QKV maximum remains `3.814697265625e-6`.
+Signed components close exactly, but their maxima and norms do not add.
+
+This is conditional attribution, not proof of a normalization or GEMM cause:
+the input term includes every embedding-path discrepancy and the residual includes
+all projection-side differences. Exact additive closure is bookkeeping; the
+independent control is exact source projection replay. The next calibration probe
+should inspect the embedding boundary before changing native arithmetic.
+The encoder fidelity gate remains open.
+
+```sh
+uv run --offline scripts/julia_calibration_projection_square.py \
+  --calibration-report .agents/receipts/julia/accuracy-calibration-native-f64.json \
+  --native-trace .agents/receipts/julia/cal-len7-layer0-native-replay.json \
+  --source-trace .agents/receipts/julia/cal-len7-layer0-source-f64-v2.json \
+  --output /tmp/julia-projection-square.json
+```
+
+The receipt binds input and weight hashes, rejects held-out reports and requires
+bounded finite calibration shapes. The retained result is
+`.agents/receipts/julia/calibration-projection-square-attribution.json`.
+
 ## Reproduction identity
 
 The public Hugging Face model API reported the following source revision on
