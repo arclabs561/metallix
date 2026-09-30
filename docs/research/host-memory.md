@@ -295,3 +295,33 @@ requested bytes under an explicit RAM budget before selecting a pager or
 acquiring full weights. The illustrative five-token/s target above requires
 at least about 86.5–87.1% of selected expert bytes to hit residency even before
 compute and read amplification; stored capacity fraction cannot establish that.
+
+### Offline route replay contract
+
+`scripts/replay_v41_route_trace.py` now supplies the accounting step once a real
+route trace is available. Both cache capacity and bytes per expert are required
+inputs; no measured hit rate or operator budget is inferred from this machine's
+capacity. It starts with an empty LRU keyed by `(layer, expert)` and reports
+hits, misses, evictions, conditional useful miss bytes and prefill/decode totals.
+Equal expert sizes and sequential accesses in the recorded order are explicit
+simulation assumptions, not a chosen serving policy.
+
+```sh
+uv run scripts/replay_v41_route_trace.py --trace TRACE.json \
+  --expert-cache-bytes BYTES --expert-bytes BYTES --output NEW_REPORT.json
+```
+
+The bounded schema-1 input carries the pinned revision, config and model-source
+hashes, full 5120/40/384/top-6 geometry, and rows containing `request_id`,
+`phase`, `token_position`, `layer` and ordered `expert_ids`. Each token must
+cover layers 0 through 39. Rows retain the supplied chronological router-event
+order, including layer-major prefill; they are never regrouped into token-major
+order. A regression demonstrates that regrouping changes cache hits.
+
+The report hashes the raw trace and labels its source identity
+declared/unverified. Matching declared hashes cannot authenticate the collector
+or its output. Synthetic reduced traces are rejected; a separately qualified
+collector and real forward execution or externally obtained capture are still
+needed. This tool reads no model payloads and measures neither SSD traffic nor
+latency. Engram, dense weights, state, scratch, OS headroom and I/O amplification
+remain outside its cache budget.

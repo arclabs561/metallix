@@ -102,6 +102,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_benchmark_qwen.py"], False),
         ([sys.executable, "scripts/test_compare_qwen.py"], False),
         ([sys.executable, "scripts/test_checkpoint_io.py"], False),
+        ([sys.executable, "scripts/test_replay_v41_route_trace.py"], False),
         ([sys.executable, "scripts/test_qwen_reference_checkpoint.py"], False),
         ([sys.executable, "scripts/test_qualify_chat.py"], False),
         ([sys.executable, "scripts/test_qualify_agent.py"], False),
