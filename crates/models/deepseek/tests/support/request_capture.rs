@@ -14,6 +14,310 @@ use deepseek::reduced::FinalHeadExecution;
 use super::{HeadFixture, attention_capture};
 use serde_json::Value;
 
+fn exported_reduced_artifact() -> Vec<u8> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let exported = std::process::Command::new("python3")
+        .arg(root.join("scripts/export_v41_reduced_artifact.py"))
+        .arg("--source")
+        .arg(root.join("fixtures/deepseek-v41/reduced-runner-reference.json"))
+        .args(["--output", "-"])
+        .output()
+        .expect("Python 3 is required by the repository check runner");
+    assert!(
+        exported.status.success(),
+        "exporter rejected pinned source: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    exported.stdout
+}
+
+fn raw_generation_oracle() -> Value {
+    let raw = include_str!("../../../../../fixtures/deepseek-v41/generation-reference.json");
+    let oracle: Value = serde_json::from_str(raw).expect("generation source oracle JSON");
+    assert_eq!(oracle["schema_version"].as_u64(), Some(1));
+    assert_eq!(oracle["model"]["max_seq_len"].as_u64(), Some(8));
+    assert_eq!(oracle["model"]["vocab_size"].as_u64(), Some(8));
+    assert_eq!(
+        oracle["context_bound"]["admission"].as_str(),
+        Some("prompt_len + max_new_tokens - 1 <= max_seq_len")
+    );
+    assert_eq!(
+        oracle["context_bound"]["final_selected_id_is_not_fed_back"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(oracle["selection"]["eos_token_id"], Value::Null);
+    assert_eq!(oracle["selection"]["max_new_tokens"].as_u64(), Some(2));
+    assert_eq!(
+        oracle["selection"]["policy"].as_str(),
+        Some("finite FP32 logits; maximum value, ties choose lowest token ID")
+    );
+    assert_eq!(
+        oracle["comparison_policy"]["kind"].as_str(),
+        Some("two_fp32_dot_error_bounds")
+    );
+    assert_eq!(
+        oracle["comparison_policy"]["operation_count_per_dot"].as_u64(),
+        Some(256)
+    );
+    assert_eq!(
+        oracle["comparison_policy"]["unit_roundoff_exponent"].as_i64(),
+        Some(-24)
+    );
+
+    let canonical = raw_canonical_bundle();
+    for field in ["revision", "model_sha256", "engram_sha256"] {
+        assert_eq!(
+            oracle["source"][field], canonical["source"][field],
+            "generation source provenance {field}"
+        );
+    }
+    for field in [
+        "cpu_backend_sha256",
+        "kernel_source_sha256",
+        "loader_sha256",
+        "runner_sha256",
+    ] {
+        assert_eq!(
+            oracle["source"][field].as_str().map(str::len),
+            Some(64),
+            "generation source digest {field}"
+        );
+    }
+    oracle
+}
+
+fn source_logits_bits(logits: &Value) -> Vec<u32> {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(logits["dtype"].as_str(), Some("torch.float32"));
+    assert_eq!(logits["finite"].as_bool(), Some(true));
+    assert_eq!(logits["shape"], serde_json::json!([1, 8]));
+    assert_eq!(logits["numel"].as_u64(), Some(8));
+    let storage = logits["storage_hex"]
+        .as_str()
+        .expect("source logits hexadecimal storage");
+    assert_eq!(storage.len(), 2 * 8 * std::mem::size_of::<f32>());
+    let hex_digit = |value: u8| match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    };
+    let bytes: Vec<_> = storage
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| match (hex_digit(pair[0]), hex_digit(pair[1])) {
+            (Some(high), Some(low)) => high * 16 + low,
+            _ => panic!("source logits must use lowercase hexadecimal storage"),
+        })
+        .collect();
+    assert_eq!(bytes.len(), 8 * std::mem::size_of::<f32>());
+    let expected_hash = format!("{:x}", Sha256::digest(&bytes));
+    assert_eq!(
+        logits["storage_sha256"].as_str(),
+        Some(expected_hash.as_str())
+    );
+    bytes
+        .chunks_exact(std::mem::size_of::<u32>())
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+fn source_normalized_bits(normalized: &Value) -> Vec<u16> {
+    use sha2::{Digest, Sha256};
+
+    assert_eq!(normalized["dtype"].as_str(), Some("torch.bfloat16"));
+    assert_eq!(normalized["finite"].as_bool(), Some(true));
+    assert_eq!(normalized["shape"], serde_json::json!([1, 128]));
+    assert_eq!(normalized["numel"].as_u64(), Some(128));
+    let storage = normalized["storage_hex"]
+        .as_str()
+        .expect("source normalized BF16 hexadecimal storage");
+    assert_eq!(storage.len(), 2 * 128 * std::mem::size_of::<u16>());
+    let hex_digit = |value: u8| match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    };
+    let bytes: Vec<_> = storage
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| match (hex_digit(pair[0]), hex_digit(pair[1])) {
+            (Some(high), Some(low)) => high * 16 + low,
+            _ => panic!("source normalized BF16 must use lowercase hexadecimal storage"),
+        })
+        .collect();
+    let expected_hash = format!("{:x}", Sha256::digest(&bytes));
+    assert_eq!(
+        normalized["storage_sha256"].as_str(),
+        Some(expected_hash.as_str())
+    );
+    bytes
+        .chunks_exact(std::mem::size_of::<u16>())
+        .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+fn source_head_weights(oracle: &Value) -> Vec<f32> {
+    use sha2::{Digest, Sha256};
+
+    let source_head = &oracle["source_head"];
+    assert_eq!(source_head["weight_shape"], serde_json::json!([8, 128]));
+    let bits = source_head["weight_fp32_bits"]
+        .as_array()
+        .expect("source head FP32 bits");
+    assert_eq!(bits.len(), 8 * 128);
+    let values: Vec<_> = bits
+        .iter()
+        .map(|bits| {
+            f32::from_bits(
+                u32::try_from(bits.as_u64().expect("source head FP32 bit word"))
+                    .expect("source head FP32 word range"),
+            )
+        })
+        .collect();
+    assert!(values.iter().all(|value| value.is_finite()));
+    let bytes: Vec<_> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let expected_hash = format!("{:x}", Sha256::digest(bytes));
+    assert_eq!(
+        source_head["weight_storage_sha256"].as_str(),
+        Some(expected_hash.as_str())
+    );
+    values
+}
+
+fn frozen_head_bounds(source_normalized: &[u16], weights: &[f32]) -> Vec<f64> {
+    const DOT_OPERATIONS: f64 = 256.0;
+    const U: f64 = 1.0 / 16_777_216.0;
+
+    assert_eq!(source_normalized.len(), 128);
+    assert_eq!(weights.len(), 8 * source_normalized.len());
+    let gamma = DOT_OPERATIONS * U / (1.0 - DOT_OPERATIONS * U);
+    weights
+        .chunks_exact(source_normalized.len())
+        .map(|row| {
+            let magnitude = source_normalized
+                .iter()
+                .zip(row)
+                .map(|(&bits, &weight)| {
+                    f64::from(f32::from_bits(u32::from(bits) << 16)).abs() * f64::from(weight).abs()
+                })
+                .sum::<f64>();
+            (2.0 * gamma * magnitude).next_up()
+        })
+        .collect()
+}
+
+#[test]
+fn reduced_artifact_greedy_generation_matches_independent_source_ids() {
+    let oracle = raw_generation_oracle();
+    let source_head_weights = source_head_weights(&oracle);
+    let artifact = deepseek::reduced::ReducedArtifact::parse(&exported_reduced_artifact())
+        .expect("bounded numerical artifact");
+    let cases = oracle["cases"].as_array().expect("generation source cases");
+    assert_eq!(cases.len(), 2);
+
+    for case in cases {
+        let name = case["name"].as_str().expect("generation case name");
+        let prompt_ids: Vec<_> = case["prompt_ids"]
+            .as_array()
+            .expect("generation prompt IDs")
+            .iter()
+            .map(|id| id.as_i64().expect("generation signed prompt ID"))
+            .collect();
+        let expected_ids: Vec<_> = case["generated_ids"]
+            .as_array()
+            .expect("generation expected IDs")
+            .iter()
+            .map(|id| id.as_i64().expect("generation signed expected ID"))
+            .collect();
+        let selections = case["selections"]
+            .as_array()
+            .expect("generation source selections");
+        assert_eq!(selections.len(), expected_ids.len(), "{name} selections");
+
+        let generated = artifact
+            .generate_greedy(&prompt_ids, None, 2)
+            .expect("bounded source-shaped generation");
+        assert_eq!(generated.generated_ids(), expected_ids, "{name} IDs");
+        assert_eq!(
+            generated.stop_reason(),
+            deepseek::reduced::ReducedGenerationStop::MaxNewTokens,
+            "{name} stop reason"
+        );
+        assert_eq!(case["stop_reason"].as_str(), Some("max_new_tokens"));
+
+        let mut replay_ids = prompt_ids.clone();
+        replay_ids.extend_from_slice(&expected_ids[..expected_ids.len() - 1]);
+        let replay = artifact
+            .run(&replay_ids, prompt_ids.len())
+            .expect("source-shaped native generation replay");
+        assert_eq!(replay.len(), selections.len(), "{name} replay calls");
+
+        for (index, ((output, selection), &expected_id)) in
+            replay.iter().zip(selections).zip(&expected_ids).enumerate()
+        {
+            let input_ids: Vec<_> = selection["input_ids"]
+                .as_array()
+                .expect("source selection input IDs")
+                .iter()
+                .map(|id| id.as_i64().expect("source signed input ID"))
+                .collect();
+            let expected_input = if index == 0 {
+                prompt_ids.as_slice()
+            } else {
+                std::slice::from_ref(&expected_ids[0])
+            };
+            assert_eq!(input_ids, expected_input, "{name} replay input");
+            assert_eq!(selection["selected_id"].as_i64(), Some(expected_id));
+            let source_logits = source_logits_bits(&selection["logits"]);
+            assert!(
+                source_logits
+                    .iter()
+                    .all(|&bits| f32::from_bits(bits).is_finite()),
+                "{name} finite source logits"
+            );
+            let source_best = source_logits
+                .iter()
+                .map(|&bits| f32::from_bits(bits))
+                .enumerate()
+                .max_by(|(left_id, left), (right_id, right)| {
+                    left.partial_cmp(right)
+                        .unwrap()
+                        .then_with(|| right_id.cmp(left_id))
+                })
+                .map(|(id, _)| i64::try_from(id).unwrap())
+                .expect("nonempty source logits");
+            assert_eq!(source_best, expected_id, "{name} source selection");
+
+            let native_logits = output.heads().last().expect("native final head").logits();
+            assert_eq!(
+                native_logits.len(),
+                source_logits.len(),
+                "{name} vocabulary"
+            );
+            assert!(
+                native_logits.iter().all(|value| value.is_finite()),
+                "{name} finite native logits"
+            );
+            let source_normalized = source_normalized_bits(&selection["normalized_bf16"]);
+            let native_head = output.heads().last().expect("native final head");
+            assert_eq!(
+                native_head.normalized_bf16(),
+                source_normalized,
+                "{name} normalized source row"
+            );
+            let bounds = frozen_head_bounds(&source_normalized, &source_head_weights);
+            assert!(
+                super::agrees_with_head_oracle(native_logits, &source_logits, &bounds),
+                "{name} replay logits within frozen source bound"
+            );
+        }
+    }
+}
+
 #[path = "request_alternate.rs"]
 mod request_alternate;
 #[path = "request_tail.rs"]
@@ -582,23 +886,54 @@ fn metal_scored_request_matches_both_source_schedules_and_restarts() {
     }
 }
 
+fn assert_artifact_greedy_self_consistency(
+    artifact: &deepseek::reduced::ReducedArtifact,
+    ids: &[i64],
+    canonical: &[deepseek::reduced::RequestStepOutput],
+) {
+    let greedy = |output: &deepseek::reduced::RequestStepOutput| {
+        let logits = output.heads().last().unwrap().logits();
+        let mut best = 0_usize;
+        for (id, &logit) in logits.iter().enumerate().skip(1) {
+            if logit > logits[best] {
+                best = id;
+            }
+        }
+        i64::try_from(best).unwrap()
+    };
+    let first = greedy(&canonical[0]);
+    let fed_back = artifact
+        .run(&[0, 1, 2, 3, 4, first], 5)
+        .expect("manual selected-token decode");
+    let second = greedy(&fed_back[1]);
+    let generated = artifact
+        .generate_greedy(&ids[..5], None, 2)
+        .expect("bounded artifact generation");
+    assert_eq!(generated.generated_ids(), &[first, second]);
+    assert_eq!(
+        generated.stop_reason(),
+        deepseek::reduced::ReducedGenerationStop::MaxNewTokens
+    );
+    let eos = artifact
+        .generate_greedy(&ids[..5], Some(first), 2)
+        .expect("bounded EOS generation");
+    assert_eq!(eos.generated_ids(), &[first]);
+    assert_eq!(
+        eos.stop_reason(),
+        deepseek::reduced::ReducedGenerationStop::Eos
+    );
+    assert!(artifact.generate_greedy(&ids[..5], None, 0).is_err());
+    assert!(artifact.generate_greedy(&[-1, 1], None, 1).is_err());
+    assert!(artifact.generate_greedy(&ids[..5], Some(-1), 1).is_err());
+    assert!(artifact.generate_greedy(&ids[..5], None, 5).is_err());
+    assert!(artifact.generate_greedy(ids, None, 1).is_err());
+}
+
 #[test]
 fn exported_numerical_artifact_matches_both_source_schedules() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let exported = std::process::Command::new("python3")
-        .arg(root.join("scripts/export_v41_reduced_artifact.py"))
-        .arg("--source")
-        .arg(root.join("fixtures/deepseek-v41/reduced-runner-reference.json"))
-        .args(["--output", "-"])
-        .output()
-        .expect("Python 3 is required by the repository check runner");
-    assert!(
-        exported.status.success(),
-        "exporter rejected pinned source: {}",
-        String::from_utf8_lossy(&exported.stderr)
-    );
-    let artifact = deepseek::reduced::ReducedArtifact::parse(&exported.stdout)
-        .expect("bounded numerical artifact");
+    let exported = exported_reduced_artifact();
+    let artifact =
+        deepseek::reduced::ReducedArtifact::parse(&exported).expect("bounded numerical artifact");
     let projections = canonical_projections();
     let fixture: super::Fixture =
         serde_json::from_value(projections["layer4_moe"].clone()).unwrap();
@@ -608,6 +943,8 @@ fn exported_numerical_artifact_matches_both_source_schedules() {
     request_tail::assert_source_outputs(&fixture, &head, &canonical);
     let alternate = artifact.run(ids, 4).expect("artifact alternate request");
     request_alternate::assert_source_outputs(&alternate, &head);
+    assert_artifact_greedy_self_consistency(&artifact, ids, &canonical);
+
     #[cfg(feature = "metal")]
     {
         let canonical_metal = artifact
@@ -656,7 +993,7 @@ fn exported_numerical_artifact_matches_both_source_schedules() {
     assert!(artifact.run(&[-1, 0], 2).is_err());
     assert!(artifact.run(&[0, 8], 2).is_err());
 
-    let mut malformed: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let mut malformed: Value = serde_json::from_slice(&exported).unwrap();
     malformed["cases"] = serde_json::json!([]);
     assert!(
         deepseek::reduced::ReducedArtifact::parse(&serde_json::to_vec(&malformed).unwrap())

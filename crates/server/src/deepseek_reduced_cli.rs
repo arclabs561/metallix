@@ -113,9 +113,19 @@ pub(crate) struct ReducedArgs {
     /// Comma-delimited token IDs; the fixed reduced path accepts at most 16.
     #[arg(long, value_delimiter = ',', required = true)]
     input_ids: Vec<i64>,
-    /// Number of initial IDs admitted as the prefill partition.
-    #[arg(long)]
-    prefill_tokens: usize,
+    /// Number of initial IDs admitted as the replay prefill partition.
+    #[arg(
+        long,
+        required_unless_present = "generation_max_new_tokens",
+        conflicts_with = "generation_max_new_tokens"
+    )]
+    prefill_tokens: Option<usize>,
+    /// Generate this many greedy IDs instead of replaying a fixed request partition.
+    #[arg(long, conflicts_with = "prefill_tokens")]
+    generation_max_new_tokens: Option<usize>,
+    /// Optional EOS ID which stops greedy generation after it is selected.
+    #[arg(long, requires = "generation_max_new_tokens")]
+    generation_eos_token_id: Option<i64>,
     /// Index-score implementation; Metal only covers the bounded BF16 scorer.
     #[arg(long, value_enum, default_value_t = ScoreExecutionArg::Scalar)]
     score_execution: ScoreExecutionArg,
@@ -148,16 +158,46 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     let artifact_sha256 = format!("{:x}", Sha256::digest(&bytes));
     let artifact = deepseek::reduced::ReducedArtifact::parse(&bytes)
         .map_err(|_| "artifact is not a valid reduced request artifact".to_owned())?;
+    if let Some(max_new_tokens) = args.generation_max_new_tokens {
+        let generation = artifact
+            .generate_greedy(
+                &args.input_ids,
+                args.generation_eos_token_id,
+                max_new_tokens,
+            )
+            .map_err(|_| "reduced generation was rejected".to_owned())?;
+        let stop_reason = match generation.stop_reason() {
+            deepseek::reduced::ReducedGenerationStop::Eos => "eos",
+            deepseek::reduced::ReducedGenerationStop::MaxNewTokens => "max_new_tokens",
+            _ => return Err("reduced generation returned an unknown stop reason".to_owned()),
+        };
+        let response = json!({
+            "schema_version": 1,
+            "operation": "deepseek-reduced-greedy-generation",
+            "backend": "scalar",
+            "artifact_sha256": artifact_sha256,
+            "generated_ids": generation.generated_ids(),
+            "stop_reason": stop_reason,
+        });
+        let rendered = serde_json::to_string(&response)
+            .map_err(|_| "could not render reduced generation response".to_owned())?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    let prefill_tokens = args
+        .prefill_tokens
+        .ok_or_else(|| "prefill tokens are required for reduced request replay".to_owned())?;
     let outputs = artifact
         .run_with_key_preparation_execution(
             &args.input_ids,
-            args.prefill_tokens,
+            prefill_tokens,
             args.score_execution.into(),
             key_preparation_execution(args),
             args.head_execution.into(),
         )
         .map_err(|_| "reduced request execution was rejected".to_owned())?;
-    let expected_calls = 1 + args.input_ids.len() - args.prefill_tokens;
+    let expected_calls = 1 + args.input_ids.len() - prefill_tokens;
     if outputs.len() != expected_calls {
         return Err("reduced request returned an invalid call count".to_owned());
     }
@@ -165,11 +205,11 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
         .iter()
         .enumerate()
         .map(|(call, output)| {
-            let positions = if call == 0 { args.prefill_tokens } else { 1 };
+            let positions = if call == 0 { prefill_tokens } else { 1 };
             let start = if call == 0 {
                 0
             } else {
-                args.prefill_tokens + call - 1
+                prefill_tokens + call - 1
             };
             let logits = output
                 .heads()
@@ -242,7 +282,39 @@ fn validate_args(args: &ReducedArgs) -> Result<(), String> {
     if args.input_ids.len() > MAX_INPUT_IDS {
         return Err(format!("input accepts at most {MAX_INPUT_IDS} IDs"));
     }
-    if !(2..=args.input_ids.len()).contains(&args.prefill_tokens) {
+    if let Some(max_new_tokens) = args.generation_max_new_tokens {
+        if args.input_ids.len() < 2 {
+            return Err("generation prompt requires at least two input IDs".to_owned());
+        }
+        if max_new_tokens == 0 {
+            return Err("generation max new tokens must be nonzero".to_owned());
+        }
+        let occupied_positions = args
+            .input_ids
+            .len()
+            .checked_add(max_new_tokens - 1)
+            .ok_or_else(|| "generation position count overflow".to_owned())?;
+        if occupied_positions > MAX_INPUT_IDS {
+            return Err(format!(
+                "generation prompt and max new tokens exceed {MAX_INPUT_IDS}-token capacity"
+            ));
+        }
+        if args.generation_eos_token_id.is_some_and(|id| id < 0) {
+            return Err("generation EOS token ID must be nonnegative".to_owned());
+        }
+        if args.key_rotary_execution.is_some()
+            || args.key_preparation_execution.is_some()
+            || !matches!(args.score_execution, ScoreExecutionArg::Scalar)
+            || !matches!(args.head_execution, HeadExecutionArg::Scalar)
+        {
+            return Err("reduced generation does not support execution overrides".to_owned());
+        }
+        return Ok(());
+    }
+    let prefill_tokens = args
+        .prefill_tokens
+        .ok_or_else(|| "prefill tokens are required for reduced request replay".to_owned())?;
+    if !(2..=args.input_ids.len()).contains(&prefill_tokens) {
         return Err(
             "prefill token count must be at least two and no more than the input count".to_owned(),
         );
@@ -300,7 +372,9 @@ mod tests {
         let args = ReducedArgs {
             artifact: std::path::PathBuf::from("missing"),
             input_ids: vec![0],
-            prefill_tokens: 1,
+            prefill_tokens: Some(1),
+            generation_max_new_tokens: None,
+            generation_eos_token_id: None,
             score_execution: ScoreExecutionArg::Scalar,
             key_rotary_execution: None,
             key_preparation_execution: None,
@@ -314,7 +388,9 @@ mod tests {
         let args = ReducedArgs {
             artifact: std::path::PathBuf::from("missing"),
             input_ids: vec![0, 1],
-            prefill_tokens: 2,
+            prefill_tokens: Some(2),
+            generation_max_new_tokens: None,
+            generation_eos_token_id: None,
             score_execution: ScoreExecutionArg::Scalar,
             key_rotary_execution: Some(KeyRotaryExecutionArg::Scalar),
             key_preparation_execution: None,
@@ -331,7 +407,9 @@ mod tests {
         let args = ReducedArgs {
             artifact: std::path::PathBuf::from("missing"),
             input_ids: vec![0, 1],
-            prefill_tokens: 2,
+            prefill_tokens: Some(2),
+            generation_max_new_tokens: None,
+            generation_eos_token_id: None,
             score_execution: ScoreExecutionArg::Scalar,
             key_rotary_execution: None,
             key_preparation_execution: Some(KeyPreparationExecutionArg::Scalar),
@@ -349,7 +427,9 @@ mod tests {
         let args = ReducedArgs {
             artifact: std::path::PathBuf::from("missing"),
             input_ids: vec![0, 1],
-            prefill_tokens: 2,
+            prefill_tokens: Some(2),
+            generation_max_new_tokens: None,
+            generation_eos_token_id: None,
             score_execution: ScoreExecutionArg::Scalar,
             key_rotary_execution: Some(KeyRotaryExecutionArg::Scalar),
             #[cfg(feature = "metal")]

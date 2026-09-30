@@ -59,6 +59,13 @@ MAX_ATTENTION_FIXTURE_BYTES = 512 << 10
 # Layer zero retains both HC coefficient calls and the exact same-trace Engram
 # handoff, but remains bounded below the complete receipt cap.
 MAX_LAYER_ZERO_TO_LAYER_ONE_FIXTURE_BYTES = 576 << 10
+# A generation receipt contains only two small vocab logits per default case;
+# keep a separate cap so it cannot quietly become another full-forward capture.
+MAX_GENERATION_ORACLE_BYTES = 64 << 10
+GENERATION_PROMPTS = (
+    ("prefill_five", (0, 1, 2, 3, 4)),
+    ("prefill_four", (0, 1, 2, 3)),
+)
 
 sys.path.insert(0, str(SCRIPTS))
 import v41_attention_capture
@@ -598,6 +605,543 @@ def run_capture() -> dict[str, object]:
         "attention_static": attention_static,
         "steps": steps,
         "candidate_filtering": candidates,
+    }
+
+
+def _generation_admission(
+    prompt_ids: tuple[int, ...],
+    max_new_tokens: int,
+    *,
+    vocab_size: int,
+    max_seq_len: int,
+    eos_token_id: int | None,
+) -> None:
+    """Reject an invalid request before it can partially mutate source caches.
+
+    The final selected token is returned but never re-entered into the model, so
+    a request of ``n`` new tokens consumes at most ``prompt + n - 1`` model
+    positions.  This matches the reduced Rust generation preflight contract.
+    """
+    if len(prompt_ids) < 2:
+        raise ValueError("generation prompt must contain at least two token IDs")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
+    if len(prompt_ids) + max_new_tokens - 1 > max_seq_len:
+        raise ValueError(
+            "generation request exceeds max_seq_len before its final selection"
+        )
+    for index, token_id in enumerate(prompt_ids):
+        if not 0 <= token_id < vocab_size:
+            raise ValueError(f"prompt token {index} lies outside the source vocabulary")
+    if eos_token_id is not None and not 0 <= eos_token_id < vocab_size:
+        raise ValueError("eos_token_id lies outside the source vocabulary")
+
+
+def _lowest_id_argmax(logits: torch.Tensor) -> int:
+    """Choose a finite final-position logit, resolving ties by the lowest ID."""
+    if logits.ndim != 2 or logits.size(0) != 1:
+        raise RuntimeError(
+            "source generation requires one batch of final-position logits"
+        )
+    if logits.dtype != torch.float32:
+        raise RuntimeError("source generation requires FP32 final-position logits")
+    row = logits[0]
+    if not bool(torch.isfinite(row).all()):
+        raise RuntimeError("source generation produced nonfinite final-position logits")
+    maximum = row.max()
+    tied = torch.nonzero(row == maximum, as_tuple=False).flatten()
+    if tied.numel() == 0:
+        raise RuntimeError("finite source logits have no argmax")
+    return int(tied.min().item())
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return _sha256_bytes(
+        json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    )
+
+
+def _generation_case(
+    model: torch.nn.Module,
+    *,
+    name: str,
+    prompt_ids: tuple[int, ...],
+    max_new_tokens: int,
+    eos_token_id: int | None,
+) -> dict[str, object]:
+    """Run one cache-respecting greedy source decode without source sampling."""
+    selections: list[dict[str, object]] = []
+    generated_ids: list[int] = []
+    next_input = torch.tensor([prompt_ids], dtype=torch.int64)
+    start_pos = 0
+    for selection_index in range(max_new_tokens):
+        normalized_rows: list[torch.Tensor] = []
+
+        def capture_normalized_row(
+            _module: torch.nn.Module,
+            inputs: tuple[torch.Tensor, ...],
+            rows: list[torch.Tensor] = normalized_rows,
+        ) -> None:
+            if len(inputs) != 1:
+                raise RuntimeError("source output head received an unexpected input")
+            rows.append(inputs[0][:, -1].detach().cpu().contiguous())
+
+        hook = model.head.register_forward_pre_hook(capture_normalized_row)
+        try:
+            _source_output_ids, logits, _main_hidden = model(
+                next_input, start_pos=start_pos
+            )
+        finally:
+            hook.remove()
+        if len(normalized_rows) != 1:
+            raise RuntimeError(
+                "source generation did not expose one normalized head row"
+            )
+        normalized_row = normalized_rows[0]
+        if normalized_row.dtype != torch.bfloat16 or list(normalized_row.shape) != [
+            1,
+            128,
+        ]:
+            raise RuntimeError(
+                "source generation normalized head row has an invalid BF16 layout"
+            )
+        selected_id = _lowest_id_argmax(logits)
+        selections.append(
+            {
+                "selection_index": selection_index,
+                "start_pos": start_pos,
+                "input_ids": [int(token_id) for token_id in next_input[0].tolist()],
+                "normalized_bf16": tensor_record(normalized_row, include_storage=True),
+                "logits": tensor_record(logits, include_storage=True),
+                "selected_id": selected_id,
+            }
+        )
+        generated_ids.append(selected_id)
+        if eos_token_id is not None and selected_id == eos_token_id:
+            return {
+                "name": name,
+                "prompt_ids": list(prompt_ids),
+                "generated_ids": generated_ids,
+                "selections": selections,
+                "stop_reason": "eos",
+            }
+        if selection_index + 1 == max_new_tokens:
+            break
+        # Feed only selections which must produce a later output.  The final
+        # selected ID remains output-only, which is also why admission reserves
+        # one fewer cache position than generated IDs.
+        next_input = torch.tensor([[selected_id]], dtype=torch.int64)
+        start_pos = len(prompt_ids) + len(generated_ids) - 1
+    return {
+        "name": name,
+        "prompt_ids": list(prompt_ids),
+        "generated_ids": generated_ids,
+        "selections": selections,
+        "stop_reason": "max_new_tokens",
+    }
+
+
+def run_generation_oracle(
+    *, max_new_tokens: int = 2, eos_token_id: int | None = None
+) -> dict[str, object]:
+    """Execute the bounded V4.1 source greedy loop for two fixed prompts.
+
+    This is independent source execution, initialized from deterministic
+    synthetic parameters.  It deliberately does not consume ``run_capture``
+    output or any Rust values as expected results.
+    """
+    manifest = forward_manifest.manifest()
+    validation = forward_manifest.validate_manifest(
+        manifest, require_execution_ready=True
+    )
+    kernel_bytes = (SCRIPTS / "v41_cpu_kernels.py").read_bytes()
+    if (
+        _sha256_bytes((ROOT / "artifacts" / "v41-kernel-pinned.py").read_bytes())
+        != KERNEL_SHA256
+    ):
+        raise RuntimeError(
+            "retained upstream kernel hash differs from the capture contract"
+        )
+    graph = source_loader.load_text_graph(kernels)
+    model_args = forward_manifest.model_args(manifest)
+    encoded_parameters_sha256: str | None = None
+    parameter_count: int | None = None
+    initialized_buffers: list[str] | None = None
+    source_head: dict[str, object] | None = None
+    cases: list[dict[str, object]] = []
+    with graph.set_dtype(torch.bfloat16):
+        for _name, prompt_ids in GENERATION_PROMPTS:
+            _generation_admission(
+                prompt_ids,
+                max_new_tokens,
+                vocab_size=model_args["vocab_size"],
+                max_seq_len=model_args["max_seq_len"],
+                eos_token_id=eos_token_id,
+            )
+        # Each prompt owns a fresh source model and shared-attention runtime.
+        # Resetting tensor caches alone would leave graph-global candidate state
+        # from the first prompt observable to the second one.
+        for name, prompt_ids in GENERATION_PROMPTS:
+            graph.shared_attn = graph.SharedAttentionRuntime()
+            args, tokenizer = executable_args(graph, manifest)
+            model = graph.Transformer(args, tokenizer).eval()
+            encoded_parameters = initialize_parameters(model)
+            current_parameter_sha256 = _canonical_json_sha256(encoded_parameters)
+            current_buffers = initialize_runtime_buffers(model)
+            head_weight = encoded_parameters.get("head.weight")
+            if not isinstance(head_weight, dict):
+                raise TypeError("source generation lacks FP32 output-head weights")
+            current_source_head = {
+                "weight_shape": head_weight.get("shape"),
+                "weight_fp32_bits": _storage_bits(
+                    head_weight, width=4, dtype="torch.float32"
+                ),
+                "weight_storage_sha256": head_weight.get("storage_sha256"),
+            }
+            if encoded_parameters_sha256 is None:
+                encoded_parameters_sha256 = current_parameter_sha256
+                parameter_count = len(encoded_parameters)
+                initialized_buffers = current_buffers
+                source_head = current_source_head
+            elif (
+                current_parameter_sha256 != encoded_parameters_sha256
+                or len(encoded_parameters) != parameter_count
+                or current_buffers != initialized_buffers
+                or current_source_head != source_head
+            ):
+                raise RuntimeError(
+                    "source generation cases did not initialize identically"
+                )
+            cases.append(
+                _generation_case(
+                    model,
+                    name=name,
+                    prompt_ids=prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    eos_token_id=eos_token_id,
+                )
+            )
+    if (
+        encoded_parameters_sha256 is None
+        or parameter_count is None
+        or initialized_buffers is None
+        or source_head is None
+    ):
+        raise RuntimeError("generation oracle did not initialize a source case")
+    return {
+        "schema_version": 1,
+        "status": "completed synthetic source greedy generation; no Rust parity claim",
+        "scope": (
+            "two bounded cache-respecting greedy source decodes; no checkpoint, "
+            "tokenizer-template, GPU, throughput, or serving claim"
+        ),
+        "selection": {
+            "policy": "finite FP32 logits; maximum value, ties choose lowest token ID",
+            "source_sample_is_not_used": True,
+            "eos_token_id": eos_token_id,
+            "max_new_tokens": max_new_tokens,
+        },
+        "context_bound": {
+            "max_seq_len": args.max_seq_len,
+            "admission": "prompt_len + max_new_tokens - 1 <= max_seq_len",
+            "final_selected_id_is_not_fed_back": True,
+        },
+        "source": {
+            "revision": SOURCE_REVISION,
+            "model_sha256": source_loader.MODEL_SHA256,
+            "engram_sha256": source_loader.ENGRAM_SHA256,
+            "loader_sha256": _sha256_bytes(
+                (SCRIPTS / "v41_source_loader.py").read_bytes()
+            ),
+            "runner_sha256": _sha256_bytes(Path(__file__).read_bytes()),
+            "kernel_source_sha256": KERNEL_SHA256,
+            "cpu_backend_sha256": _sha256_bytes(kernel_bytes),
+        },
+        "parameter_identity": {
+            "initializer": "deterministic sine plus exact encoded FP8/packed-FP4 storage",
+            "parameter_count": parameter_count,
+            "encoded_parameters_canonical_sha256": encoded_parameters_sha256,
+            "model_args_canonical_sha256": _canonical_json_sha256(model_args),
+            "initialized_cache_buffers": initialized_buffers,
+        },
+        "source_head": source_head,
+        "kernel_substitutions": {
+            "module": "scripts/v41_cpu_kernels.py",
+            "functions": list(source_loader.KERNEL_NAMES),
+            "preserved_boundaries": "BF16, E8M0 FP8, E4M3 and packed E2M1x2 storage",
+            "not_a_claim": [
+                "upstream GPU-kernel parity",
+                "released-checkpoint execution",
+            ],
+        },
+        "manifest_canonical_sha256": _canonical_json_sha256(manifest),
+        "manifest_validation": validation,
+        "model": {"vocab_size": args.vocab_size, "max_seq_len": args.max_seq_len},
+        "cases": cases,
+    }
+
+
+def _generation_fixture_logit(record: object, *, vocab_size: int) -> dict[str, object]:
+    """Validate and retain the exact small FP32 vector needed for replay."""
+    if not isinstance(record, dict):
+        raise TypeError("generation fixture logits must be an object")
+    if (
+        record.get("dtype") != "torch.float32"
+        or record.get("shape") != [1, vocab_size]
+        or record.get("numel") != vocab_size
+        or record.get("finite") is not True
+    ):
+        raise RuntimeError("generation fixture logits have an invalid FP32 layout")
+    storage_hex = record.get("storage_hex")
+    storage_sha256 = record.get("storage_sha256")
+    if not isinstance(storage_hex, str) or not isinstance(storage_sha256, str):
+        raise TypeError("generation fixture logits require exact storage identity")
+    raw = bytes.fromhex(storage_hex)
+    if len(raw) != vocab_size * 4 or _sha256_bytes(raw) != storage_sha256:
+        raise RuntimeError("generation fixture logits have inconsistent storage")
+    values = struct.unpack(f"<{vocab_size}f", raw)
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError("generation fixture logits encode a nonfinite value")
+    return {
+        "dtype": "torch.float32",
+        "shape": [1, vocab_size],
+        "numel": vocab_size,
+        "finite": True,
+        "storage_hex": storage_hex,
+        "storage_sha256": storage_sha256,
+    }
+
+
+def _generation_fixture_bf16_row(record: object) -> dict[str, object]:
+    if not isinstance(record, dict):
+        raise TypeError("generation fixture normalized row must be an object")
+    if (
+        record.get("dtype") != "torch.bfloat16"
+        or record.get("shape") != [1, 128]
+        or record.get("numel") != 128
+        or record.get("finite") is not True
+    ):
+        raise RuntimeError(
+            "generation fixture normalized row has an invalid BF16 layout"
+        )
+    storage_hex = record.get("storage_hex")
+    storage_sha256 = record.get("storage_sha256")
+    if not isinstance(storage_hex, str) or not isinstance(storage_sha256, str):
+        raise TypeError("generation fixture normalized row requires exact storage")
+    raw = bytes.fromhex(storage_hex)
+    if len(raw) != 256 or _sha256_bytes(raw) != storage_sha256:
+        raise RuntimeError("generation fixture normalized row has inconsistent storage")
+    return {
+        "dtype": "torch.bfloat16",
+        "shape": [1, 128],
+        "numel": 128,
+        "finite": True,
+        "storage_hex": storage_hex,
+        "storage_sha256": storage_sha256,
+    }
+
+
+def generation_fixture(receipt: object) -> dict[str, object]:
+    """Project a private source receipt into the durable replay oracle.
+
+    The projection keeps only the four final-position vectors and the provenance
+    that makes those values interpretable.  It intentionally drops runtime and
+    manifest diagnostics, initialized-cache names, and all uncaptured source
+    execution detail.
+    """
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        raise TypeError("generation fixture requires a schema-version-one receipt")
+    model = receipt.get("model")
+    source = receipt.get("source")
+    parameters = receipt.get("parameter_identity")
+    source_head = receipt.get("source_head")
+    selection = receipt.get("selection")
+    context_bound = receipt.get("context_bound")
+    substitutions = receipt.get("kernel_substitutions")
+    cases = receipt.get("cases")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            model,
+            source,
+            parameters,
+            source_head,
+            selection,
+            context_bound,
+            substitutions,
+        )
+    ) or not isinstance(cases, list):
+        raise TypeError("generation receipt lacks a required compact-fixture field")
+    vocab_size = model.get("vocab_size")
+    max_seq_len = model.get("max_seq_len")
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise RuntimeError("generation fixture requires a positive vocabulary size")
+    if not isinstance(max_seq_len, int) or max_seq_len <= 0:
+        raise RuntimeError("generation fixture requires a positive context limit")
+    if (
+        source_head.get("weight_shape") != [vocab_size, 128]
+        or not isinstance(source_head.get("weight_fp32_bits"), list)
+        or len(source_head["weight_fp32_bits"]) != vocab_size * 128
+        or not isinstance(source_head.get("weight_storage_sha256"), str)
+    ):
+        raise RuntimeError("generation fixture lacks exact source output-head weights")
+    if (
+        selection.get("policy")
+        != "finite FP32 logits; maximum value, ties choose lowest token ID"
+    ):
+        raise RuntimeError(
+            "generation fixture requires the explicit lowest-ID argmax policy"
+        )
+    if selection.get("source_sample_is_not_used") is not True:
+        raise RuntimeError("generation fixture must not use source sampling")
+    max_new_tokens = selection.get("max_new_tokens")
+    if not isinstance(max_new_tokens, int) or max_new_tokens <= 0:
+        raise RuntimeError("generation fixture has an invalid token budget")
+    if context_bound.get("final_selected_id_is_not_fed_back") is not True:
+        raise RuntimeError("generation fixture must retain terminal feedback semantics")
+    expected_prompts = {name: list(prompt) for name, prompt in GENERATION_PROMPTS}
+    if len(cases) != len(expected_prompts):
+        raise RuntimeError("generation fixture must retain both bounded prompts")
+    compact_cases: list[dict[str, object]] = []
+    for case in cases:
+        if not isinstance(case, dict):
+            raise TypeError("generation receipt contains a non-object case")
+        name = case.get("name")
+        prompt_ids = case.get("prompt_ids")
+        generated_ids = case.get("generated_ids")
+        selections = case.get("selections")
+        stop_reason = case.get("stop_reason")
+        if not isinstance(name, str) or prompt_ids != expected_prompts.pop(name, None):
+            raise RuntimeError(
+                "generation fixture case prompt is not the fixed source prompt"
+            )
+        if not isinstance(generated_ids, list) or not isinstance(selections, list):
+            raise TypeError("generation fixture case has invalid selections")
+        if (
+            len(generated_ids) != len(selections)
+            or not 1 <= len(selections) <= max_new_tokens
+        ):
+            raise RuntimeError("generation fixture case has an invalid selection count")
+        if stop_reason not in ("eos", "max_new_tokens"):
+            raise RuntimeError("generation fixture case has an invalid stop reason")
+        expected_start = 0
+        expected_input = prompt_ids
+        compact_selections: list[dict[str, object]] = []
+        for index, (selected, step) in enumerate(
+            zip(generated_ids, selections, strict=True)
+        ):
+            if not isinstance(selected, int) or not 0 <= selected < vocab_size:
+                raise RuntimeError(
+                    "generation fixture selected ID lies outside the vocabulary"
+                )
+            if not isinstance(step, dict):
+                raise TypeError("generation fixture step must be an object")
+            if (
+                step.get("selection_index") != index
+                or step.get("start_pos") != expected_start
+            ):
+                raise RuntimeError(
+                    "generation fixture has a noncontiguous decode schedule"
+                )
+            if (
+                step.get("input_ids") != expected_input
+                or step.get("selected_id") != selected
+            ):
+                raise RuntimeError(
+                    "generation fixture feedback does not match its selection"
+                )
+            normalized = _generation_fixture_bf16_row(step.get("normalized_bf16"))
+            logits = _generation_fixture_logit(
+                step.get("logits"), vocab_size=vocab_size
+            )
+            values = struct.unpack(
+                f"<{vocab_size}f", bytes.fromhex(logits["storage_hex"])
+            )
+            maximum = max(values)
+            if selected != min(
+                index for index, value in enumerate(values) if value == maximum
+            ):
+                raise RuntimeError(
+                    "generation fixture selected ID is not the lowest-ID argmax"
+                )
+            compact_selections.append(
+                {
+                    "start_pos": expected_start,
+                    "input_ids": expected_input,
+                    "normalized_bf16": normalized,
+                    "logits": logits,
+                    "selected_id": selected,
+                }
+            )
+            expected_start += len(expected_input)
+            expected_input = [selected]
+        if stop_reason == "max_new_tokens" and len(selections) != max_new_tokens:
+            raise RuntimeError("generation fixture token-budget stop is premature")
+        compact_cases.append(
+            {
+                "name": name,
+                "prompt_ids": prompt_ids,
+                "generated_ids": generated_ids,
+                "selections": compact_selections,
+                "stop_reason": stop_reason,
+            }
+        )
+    if expected_prompts:
+        raise RuntimeError("generation fixture omitted a fixed source prompt")
+    required_source = (
+        "revision",
+        "model_sha256",
+        "engram_sha256",
+        "loader_sha256",
+        "runner_sha256",
+        "kernel_source_sha256",
+        "cpu_backend_sha256",
+    )
+    if any(not isinstance(source.get(key), str) for key in required_source):
+        raise TypeError("generation fixture source identity is incomplete")
+    required_parameters = (
+        "initializer",
+        "parameter_count",
+        "encoded_parameters_canonical_sha256",
+        "model_args_canonical_sha256",
+    )
+    if any(key not in parameters for key in required_parameters):
+        raise TypeError("generation fixture parameter identity is incomplete")
+    return {
+        "schema_version": 1,
+        "scope": (
+            "bounded synthetic V4.1 source greedy replay oracle; not checkpoint, GPU, "
+            "throughput, tokenizer-template, or serving evidence"
+        ),
+        "selection": {
+            "policy": selection["policy"],
+            "eos_token_id": selection.get("eos_token_id"),
+            "max_new_tokens": max_new_tokens,
+            "source_sample_is_not_used": True,
+        },
+        "context_bound": {
+            "max_seq_len": max_seq_len,
+            "admission": context_bound.get("admission"),
+            "final_selected_id_is_not_fed_back": True,
+        },
+        "source": {key: source[key] for key in required_source},
+        "parameter_identity": {key: parameters[key] for key in required_parameters},
+        "source_head": source_head,
+        "comparison_policy": {
+            "kind": "two_fp32_dot_error_bounds",
+            "unit_roundoff_exponent": -24,
+            "operation_count_per_dot": 256,
+            "bound": "abs_error <= 2 * gamma(operation_count_per_dot) * sum_i(abs(x_i * w_i))",
+            "reason": (
+                "exact source normalized BF16 rows and FP32 head weights are retained; "
+                "the envelope is fixed before any Rust candidate execution"
+            ),
+        },
+        "kernel_substitutions": substitutions,
+        "model": {"vocab_size": vocab_size, "max_seq_len": max_seq_len},
+        "cases": compact_cases,
     }
 
 
@@ -1174,12 +1718,63 @@ def main() -> int:
             "Engram input fixture"
         ),
     )
+    parser.add_argument(
+        "--generation-oracle-output",
+        type=Path,
+        help=(
+            "write the compact independent source greedy-generation receipt for "
+            "the fixed five-token and four-token prompts"
+        ),
+    )
+    parser.add_argument(
+        "--generation-max-new-tokens",
+        type=int,
+        default=2,
+        help="number of greedy output IDs per generation-oracle case (default: 2)",
+    )
+    parser.add_argument(
+        "--generation-eos-token-id",
+        type=int,
+        help="optional synthetic EOS ID for generation-oracle stopping",
+    )
+    parser.add_argument(
+        "--generation-fixture-input",
+        type=Path,
+        help="read a private generation-oracle receipt to project into a compact fixture",
+    )
+    parser.add_argument(
+        "--generation-fixture-output",
+        type=Path,
+        help="write the compact durable generation-replay fixture",
+    )
     args = parser.parse_args()
-    receipt = run_capture()
-    artifact_bytes = serialized_capture(receipt)
-    if len(artifact_bytes) > MAX_CAPTURE_BYTES:
-        raise RuntimeError(f"capture exceeds {MAX_CAPTURE_BYTES} byte receipt cap")
+    if (args.generation_fixture_input is None) != (
+        args.generation_fixture_output is None
+    ):
+        parser.error(
+            "--generation-fixture-input and --generation-fixture-output must be supplied together"
+        )
+    capture_requested = any(
+        output is not None
+        for output in (
+            args.output,
+            args.head_fixture_output,
+            args.moe_fixture_output,
+            args.layer3_moe_fixture_output,
+            args.attention_fixture_output,
+            args.layer3_to_layer1_fixture_output,
+            args.layer0_to_layer1_fixture_output,
+        )
+    )
+    receipt: dict[str, object] | None = None
+    artifact_bytes: bytes | None = None
+    if capture_requested or args.generation_oracle_output is None:
+        receipt = run_capture()
+        artifact_bytes = serialized_capture(receipt)
+        if len(artifact_bytes) > MAX_CAPTURE_BYTES:
+            raise RuntimeError(f"capture exceeds {MAX_CAPTURE_BYTES} byte receipt cap")
     if args.output is not None:
+        assert receipt is not None and artifact_bytes is not None
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_bytes(artifact_bytes)
         print(
@@ -1196,6 +1791,7 @@ def main() -> int:
             )
         )
     if args.head_fixture_output is not None:
+        assert receipt is not None
         fixture = head_fixture(receipt)
         # The public fixture contains exact per-scalar encodings.  Compact JSON
         # keeps that audit surface below its deliberately small size cap.
@@ -1225,6 +1821,7 @@ def main() -> int:
             )
         )
     if args.moe_fixture_output is not None:
+        assert receipt is not None
         fixture = moe_fixture(receipt)
         fixture_bytes = (
             json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -1252,6 +1849,7 @@ def main() -> int:
             )
         )
     if args.layer3_moe_fixture_output is not None:
+        assert receipt is not None
         fixture = moe_fixture(receipt, layer=3)
         fixture_bytes = (
             json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -1279,6 +1877,7 @@ def main() -> int:
             )
         )
     if args.attention_fixture_output is not None:
+        assert receipt is not None
         fixture = v41_attention_capture.attention_fixture(
             receipt, helper_path=SCRIPTS / "v41_attention_capture.py"
         )
@@ -1308,6 +1907,7 @@ def main() -> int:
             )
         )
     if args.layer3_to_layer1_fixture_output is not None:
+        assert receipt is not None
         fixture = v41_index_key_capture.layer3_to_layer1_fixture(receipt)
         fixture_bytes = (
             json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -1335,6 +1935,7 @@ def main() -> int:
             )
         )
     if args.layer0_to_layer1_fixture_output is not None:
+        assert receipt is not None
         fixture = v41_layer0_to_layer1_capture.layer0_to_layer1_fixture(receipt)
         fixture_bytes = (
             json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -1361,14 +1962,74 @@ def main() -> int:
                 sort_keys=True,
             )
         )
+    if args.generation_oracle_output is not None:
+        generation = run_generation_oracle(
+            max_new_tokens=args.generation_max_new_tokens,
+            eos_token_id=args.generation_eos_token_id,
+        )
+        generation_bytes = (
+            json.dumps(
+                generation, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            + "\n"
+        ).encode("utf-8")
+        if len(generation_bytes) >= MAX_GENERATION_ORACLE_BYTES:
+            raise RuntimeError(
+                f"generation oracle is {len(generation_bytes)} bytes; it must stay below "
+                f"{MAX_GENERATION_ORACLE_BYTES} bytes"
+            )
+        args.generation_oracle_output.parent.mkdir(parents=True, exist_ok=True)
+        args.generation_oracle_output.write_bytes(generation_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(generation_bytes),
+                    "bytes": len(generation_bytes),
+                    "cases": len(generation["cases"]),
+                    "path": str(args.generation_oracle_output),
+                    "status": "source_greedy_generation_oracle",
+                },
+                sort_keys=True,
+            )
+        )
+    if args.generation_fixture_input is not None:
+        assert args.generation_fixture_output is not None
+        generation_receipt = json.loads(args.generation_fixture_input.read_text())
+        fixture = generation_fixture(generation_receipt)
+        fixture_bytes = (
+            json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        if len(fixture_bytes) >= MAX_GENERATION_ORACLE_BYTES:
+            raise RuntimeError(
+                f"generation fixture is {len(fixture_bytes)} bytes; it must stay below "
+                f"{MAX_GENERATION_ORACLE_BYTES} bytes"
+            )
+        args.generation_fixture_output.parent.mkdir(parents=True, exist_ok=True)
+        args.generation_fixture_output.write_bytes(fixture_bytes)
+        print(
+            json.dumps(
+                {
+                    "artifact_sha256": _sha256_bytes(fixture_bytes),
+                    "bytes": len(fixture_bytes),
+                    "path": str(args.generation_fixture_output),
+                    "status": "source_greedy_generation_fixture",
+                },
+                sort_keys=True,
+            )
+        )
     if (
         args.output is None
         and args.head_fixture_output is None
         and args.moe_fixture_output is None
+        and args.layer3_moe_fixture_output is None
         and args.attention_fixture_output is None
         and args.layer3_to_layer1_fixture_output is None
         and args.layer0_to_layer1_fixture_output is None
+        and args.generation_oracle_output is None
+        and args.generation_fixture_output is None
     ):
+        assert artifact_bytes is not None
         print(artifact_bytes.decode("utf-8"), end="")
     return 0
 

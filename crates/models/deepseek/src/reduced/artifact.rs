@@ -36,6 +36,37 @@ pub struct ReducedArtifact {
     tensors: TensorStore,
 }
 
+/// Why bounded reduced-artifact generation stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReducedGenerationStop {
+    /// The selected next token matched the caller-provided EOS ID.
+    Eos,
+    /// The caller-provided generated-token budget was consumed.
+    MaxNewTokens,
+}
+
+/// IDs produced by one bounded greedy reduced-artifact generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReducedGeneration {
+    generated_ids: Vec<i64>,
+    stop_reason: ReducedGenerationStop,
+}
+
+impl ReducedGeneration {
+    /// Returns generated IDs only; the prompt is retained by the caller.
+    #[must_use]
+    pub fn generated_ids(&self) -> &[i64] {
+        &self.generated_ids
+    }
+
+    /// Returns the explicit stopping condition for this bounded generation.
+    #[must_use]
+    pub const fn stop_reason(&self) -> ReducedGenerationStop {
+        self.stop_reason
+    }
+}
+
 impl ReducedArtifact {
     /// Parses a size-bounded, versioned artifact with checksummed tensors.
     pub fn parse(bytes: &[u8]) -> Result<Self, ArtifactError> {
@@ -181,6 +212,136 @@ impl ReducedArtifact {
             head_execution,
         )
     }
+
+    /// Generates bounded greedy IDs from one prompt with a retained request session.
+    ///
+    /// The prompt must contain the ratio-two owner prefill of at least two IDs.
+    /// At most `max_new_tokens - 1` selected IDs are fed back through decode:
+    /// the final selected ID is returned directly from its preceding logits.
+    /// This exact capacity accounting allows a prompt plus generated output to
+    /// occupy all configured positions without admitting an unused decode step.
+    /// Equal finite logits choose the lower vocabulary ID deterministically.
+    pub fn generate_greedy(
+        &self,
+        prompt_ids: &[i64],
+        eos_token_id: Option<i64>,
+        max_new_tokens: usize,
+    ) -> Result<ReducedGeneration, ArtifactError> {
+        validate_generation_input(&self.config, prompt_ids, eos_token_id, max_new_tokens)?;
+        model::with_request_model(
+            &self.config,
+            &self.tensors,
+            IndexScoreExecution::Scalar,
+            IndexKeyPreparationExecution::Scalar,
+            FinalHeadExecution::Scalar,
+            |model| {
+                let mut request = super::RequestSession::new(model)?;
+                let mut output = request.step(prompt_ids)?;
+                let mut generated_ids = Vec::with_capacity(max_new_tokens);
+                loop {
+                    let next = greedy_token(last_logits(&output)?)?;
+                    generated_ids.push(next);
+                    if eos_token_id == Some(next) {
+                        return Ok(ReducedGeneration {
+                            generated_ids,
+                            stop_reason: ReducedGenerationStop::Eos,
+                        });
+                    }
+                    if generated_ids.len() == max_new_tokens {
+                        return Ok(ReducedGeneration {
+                            generated_ids,
+                            stop_reason: ReducedGenerationStop::MaxNewTokens,
+                        });
+                    }
+                    output = request.step(&[next])?;
+                }
+            },
+        )
+    }
+}
+
+fn validate_generation_input(
+    config: &ArtifactConfig,
+    prompt_ids: &[i64],
+    eos_token_id: Option<i64>,
+    max_new_tokens: usize,
+) -> Result<(), ArtifactError> {
+    if prompt_ids.len() < 2 || prompt_ids.len() > config.max_tokens {
+        return Err(ArtifactError::Invalid(String::from(
+            "generation prompt requires 2 through configured max_tokens IDs",
+        )));
+    }
+    if max_new_tokens == 0 {
+        return Err(ArtifactError::Invalid(String::from(
+            "generation max_new_tokens must be nonzero",
+        )));
+    }
+    let forward_positions = prompt_ids
+        .len()
+        .checked_add(max_new_tokens - 1)
+        .ok_or_else(|| ArtifactError::Invalid(String::from("generation position overflow")))?;
+    if forward_positions > config.max_tokens {
+        return Err(ArtifactError::Invalid(String::from(
+            "generation prompt and max_new_tokens exceed configured request capacity",
+        )));
+    }
+    validate_token_ids(prompt_ids, config.vocabulary, "generation prompt")?;
+    if let Some(eos_token_id) = eos_token_id {
+        validate_token_ids(&[eos_token_id], config.vocabulary, "generation EOS")?;
+    }
+    Ok(())
+}
+
+fn validate_token_ids(
+    ids: &[i64],
+    vocabulary: usize,
+    field: &'static str,
+) -> Result<(), ArtifactError> {
+    if ids
+        .iter()
+        .any(|&id| usize::try_from(id).map_or(true, |id| id >= vocabulary))
+    {
+        return Err(ArtifactError::Invalid(format!(
+            "{field} token is outside artifact vocabulary"
+        )));
+    }
+    Ok(())
+}
+
+fn last_logits(output: &RequestStepOutput) -> Result<&[f32], ArtifactError> {
+    output
+        .heads()
+        .last()
+        .map(super::FinalHeadOutput::logits)
+        .ok_or_else(|| {
+            ArtifactError::Invalid(String::from("request produced no final-head logits"))
+        })
+}
+
+fn greedy_token(logits: &[f32]) -> Result<i64, ArtifactError> {
+    let (&first, rest) = logits
+        .split_first()
+        .ok_or_else(|| ArtifactError::Invalid(String::from("final-head logits are empty")))?;
+    if !first.is_finite() {
+        return Err(ArtifactError::Invalid(String::from(
+            "final-head logits contain a nonfinite value",
+        )));
+    }
+    let mut best_index = 0_usize;
+    let mut best_value = first;
+    for (offset, &value) in rest.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(ArtifactError::Invalid(String::from(
+                "final-head logits contain a nonfinite value",
+            )));
+        }
+        if value > best_value {
+            best_index = offset + 1;
+            best_value = value;
+        }
+    }
+    i64::try_from(best_index)
+        .map_err(|_| ArtifactError::Invalid(String::from("vocabulary ID exceeds i64")))
 }
 
 /// An invalid reduced numerical artifact or failed reduced request.
@@ -577,5 +738,13 @@ mod tests {
         let mut with_oracle = tensor;
         with_oracle["expected_output"] = json!([0]);
         assert!(serde_json::from_value::<RawTensor>(with_oracle).is_err());
+    }
+
+    #[test]
+    fn greedy_selection_is_lower_id_stable_and_rejects_nonfinite_logits() {
+        assert_eq!(greedy_token(&[4.0, 4.0, 3.0]).unwrap(), 0);
+        assert_eq!(greedy_token(&[-2.0, 1.0, 1.0]).unwrap(), 1);
+        assert!(greedy_token(&[]).is_err());
+        assert!(greedy_token(&[0.0, f32::NAN]).is_err());
     }
 }

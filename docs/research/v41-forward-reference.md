@@ -5,6 +5,32 @@ CPU numerical kernels. Synthetic weights exercise implementation mechanics;
 they do not produce a useful pretrained model. A successful capture is not
 Rust agreement, upstream GPU parity, or checkpoint support.
 
+## Autoregressive reduced generation
+
+The numerical artifact supports scalar greedy generation through
+`ReducedArtifact::generate_greedy` and the existing `mx run-deepseek-reduced`
+command. One request session owns prefill and selected-token feedback. EOS and
+token-budget stops return explicit reasons; equal finite logits choose the
+lowest token ID. Admission reserves `prompt_len + max_new_tokens - 1` positions.
+
+Regenerate the independent source oracle and compact test fixture with:
+
+```sh
+uv run scripts/v41-forward-reference.py \
+  --generation-oracle-output /tmp/v41-generation-oracle.json
+uv run scripts/v41-forward-reference.py \
+  --generation-fixture-input /tmp/v41-generation-oracle.json \
+  --generation-fixture-output fixtures/deepseek-v41/generation-reference.json
+uv run scripts/test_v41_generation_oracle.py
+```
+
+Each prompt starts a fresh pinned source model and shared runtime. The fixture
+retains selected IDs, exact FP32 logits, source normalized BF16 rows and head
+weights, plus source and initialized-parameter identities. It uses the existing
+head dot-product error policy without fitting a tolerance to the new outputs.
+The six explicit CPU kernel substitutions and synthetic parameters remain part
+of its scope; this is not upstream GPU parity or released-checkpoint generation.
+
 ## Partition experiment
 
 The opt-in source probe compares the same seven token IDs and initialized

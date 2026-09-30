@@ -8,7 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use deepseek::reduced::{MAX_REDUCED_ARTIFACT_BYTES, ReducedArtifact};
+use deepseek::reduced::{MAX_REDUCED_ARTIFACT_BYTES, ReducedArtifact, ReducedGenerationStop};
 #[cfg(feature = "metal")]
 use deepseek::{
     indexer::{
@@ -165,6 +165,31 @@ fn run_cli_with_key_preparation_execution(
     command.output().expect("reduced CLI launches")
 }
 
+fn run_cli_generation(
+    artifact: &Path,
+    prompt_ids: &[i64],
+    max_new_tokens: usize,
+    eos_token_id: Option<i64>,
+) -> Output {
+    let prompt_ids = prompt_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
+    command
+        .args(["run-deepseek-reduced", "--artifact"])
+        .arg(artifact)
+        .args(["--input-ids", &prompt_ids, "--generation-max-new-tokens"])
+        .arg(max_new_tokens.to_string());
+    if let Some(eos_token_id) = eos_token_id {
+        command
+            .args(["--generation-eos-token-id"])
+            .arg(eos_token_id.to_string());
+    }
+    command.output().expect("reduced CLI launches")
+}
+
 fn expected_output(artifact: &ReducedArtifact, bytes: &[u8], prefill_tokens: usize) -> Value {
     let ids = [0, 1, 2, 3, 4, 5, 6];
     let outputs = artifact
@@ -209,6 +234,31 @@ fn expected_output_for_calls(
         "backend": "scalar",
         "artifact_sha256": format!("{:x}", Sha256::digest(bytes)),
         "calls": calls,
+    })
+}
+
+fn expected_generation_output(
+    artifact: &ReducedArtifact,
+    bytes: &[u8],
+    prompt_ids: &[i64],
+    max_new_tokens: usize,
+    eos_token_id: Option<i64>,
+) -> Value {
+    let generation = artifact
+        .generate_greedy(prompt_ids, eos_token_id, max_new_tokens)
+        .expect("scalar artifact generation succeeds");
+    let stop_reason = match generation.stop_reason() {
+        ReducedGenerationStop::Eos => "eos",
+        ReducedGenerationStop::MaxNewTokens => "max_new_tokens",
+        _ => panic!("unknown generation stop reason"),
+    };
+    json!({
+        "schema_version": 1,
+        "operation": "deepseek-reduced-greedy-generation",
+        "backend": "scalar",
+        "artifact_sha256": format!("{:x}", Sha256::digest(bytes)),
+        "generated_ids": generation.generated_ids(),
+        "stop_reason": stop_reason,
     })
 }
 
@@ -289,6 +339,115 @@ fn cli_matches_library_artifact_for_both_fixed_partitions() {
         let actual: Value =
             serde_json::from_slice(&explicit_scalar.stdout).expect("CLI emits JSON");
         assert_eq!(actual, expected_output(&artifact, &bytes, prefill_tokens));
+    }
+}
+
+#[test]
+fn cli_greedy_generation_matches_library_and_reports_its_stop_reason() {
+    let bytes = export_artifact();
+    let artifact_file = TempArtifact::from_bytes(&bytes);
+    let artifact = ReducedArtifact::parse(&bytes).expect("exported artifact parses");
+    let prompt_ids = [0, 1, 2, 3, 4];
+
+    let output = run_cli_generation(artifact_file.path(), &prompt_ids, 2, None);
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("CLI emits JSON"),
+        expected_generation_output(&artifact, &bytes, &prompt_ids, 2, None)
+    );
+}
+
+#[test]
+fn cli_greedy_generation_stops_at_the_requested_eos_id() {
+    let bytes = export_artifact();
+    let artifact_file = TempArtifact::from_bytes(&bytes);
+    let artifact = ReducedArtifact::parse(&bytes).expect("exported artifact parses");
+    let prompt_ids = [0, 1, 2, 3, 4];
+    let eos_token_id = artifact
+        .generate_greedy(&prompt_ids, None, 1)
+        .expect("scalar artifact generation succeeds")
+        .generated_ids()[0];
+
+    let output = run_cli_generation(artifact_file.path(), &prompt_ids, 2, Some(eos_token_id));
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).expect("CLI emits JSON"),
+        expected_generation_output(&artifact, &bytes, &prompt_ids, 2, Some(eos_token_id))
+    );
+}
+
+#[test]
+fn generation_mode_rejects_replay_or_execution_selection_before_artifact_read() {
+    let mut conflicting = Command::new(env!("CARGO_BIN_EXE_mx"));
+    let conflicting = conflicting
+        .args(["run-deepseek-reduced", "--artifact", "missing-artifact"])
+        .args(["--input-ids", "0,1", "--prefill-tokens", "2"])
+        .args(["--generation-max-new-tokens", "1"])
+        .output()
+        .expect("reduced CLI launches");
+    assert!(!conflicting.status.success());
+    assert!(conflicting.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("cannot be used"));
+
+    let mut selected = Command::new(env!("CARGO_BIN_EXE_mx"));
+    let selected = selected
+        .args(["run-deepseek-reduced", "--artifact", "missing-artifact"])
+        .args(["--input-ids", "0,1", "--generation-max-new-tokens", "1"])
+        .args(["--key-rotary-execution", "scalar"])
+        .output()
+        .expect("reduced CLI launches");
+    assert!(!selected.status.success());
+    assert!(selected.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&selected.stderr).contains("execution overrides"));
+}
+
+#[test]
+fn generation_arguments_reject_before_artifact_read() {
+    for (input_ids, max_new_tokens, eos_token_id, error) in [
+        ("0", "1", None, "generation prompt requires at least two"),
+        (
+            "0,1",
+            "0",
+            None,
+            "generation max new tokens must be nonzero",
+        ),
+        (
+            "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
+            "2",
+            None,
+            "generation prompt and max new tokens exceed 16-token capacity",
+        ),
+        (
+            "0,1",
+            "1",
+            Some("-1"),
+            "generation EOS token ID must be nonnegative",
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
+        command
+            .args(["run-deepseek-reduced", "--artifact", "missing-artifact"])
+            .args(["--input-ids", input_ids, "--generation-max-new-tokens"])
+            .arg(max_new_tokens);
+        if let Some(eos_token_id) = eos_token_id {
+            command.arg(format!("--generation-eos-token-id={eos_token_id}"));
+        }
+        let output = command.output().expect("reduced CLI launches");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(error), "stderr: {stderr}");
+        assert!(!stderr.contains("artifact cannot be inspected"));
     }
 }
 

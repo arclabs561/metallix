@@ -123,22 +123,19 @@ pub(super) fn tensor_names(config: &ArtifactConfig) -> BTreeSet<String> {
     names
 }
 
-/// Builds and runs the fixed five-block synthetic request without fixture data.
-pub(super) fn run(
+/// Lends the fixed five-block synthetic request without fixture data.
+///
+/// Construction owns temporary decoded routing and frequency operands, so the
+/// callback keeps every borrow valid while retaining one request session over
+/// a prefill and later decode steps.
+pub(super) fn with_request_model<T>(
     config: &ArtifactConfig,
     tensors: &TensorStore,
-    ids: &[i64],
-    prefill: usize,
     execution: crate::indexer::query::IndexScoreExecution,
     key_preparation_execution: IndexKeyPreparationExecution,
     head_execution: FinalHeadExecution,
-) -> Result<Vec<RequestStepOutput>, ArtifactError> {
-    if ids.is_empty() || prefill == 0 || prefill > ids.len() {
-        return Err(ArtifactError::Invalid(
-            "prefill must be nonzero and no larger than the supplied IDs".into(),
-        ));
-    }
-
+    body: impl FnOnce(&RequestModel<'_>) -> Result<T, ArtifactError>,
+) -> Result<T, ArtifactError> {
     let startup_frequencies = frequencies(config, tensors, "rotary.startup")?;
     let shared_frequencies = frequencies(config, tensors, "rotary.shared")?;
     let routed_zero = routed(config, tensors, STARTUP_LAYER)?;
@@ -209,17 +206,44 @@ pub(super) fn run(
     .with_score_execution(execution)
     .with_key_preparation_execution(key_preparation_execution)
     .with_head_execution(head_execution);
-    let mut request = RequestSession::new(&model).map_err(ArtifactError::from)?;
-    let mut outputs = Vec::with_capacity(ids.len() - prefill + 1);
-    outputs.push(request.step(&ids[..prefill]).map_err(ArtifactError::from)?);
-    for id in &ids[prefill..] {
-        outputs.push(
-            request
-                .step(std::slice::from_ref(id))
-                .map_err(ArtifactError::from)?,
-        );
+    body(&model)
+}
+
+/// Builds and runs the fixed five-block synthetic request over supplied IDs.
+pub(super) fn run(
+    config: &ArtifactConfig,
+    tensors: &TensorStore,
+    ids: &[i64],
+    prefill: usize,
+    execution: crate::indexer::query::IndexScoreExecution,
+    key_preparation_execution: IndexKeyPreparationExecution,
+    head_execution: FinalHeadExecution,
+) -> Result<Vec<RequestStepOutput>, ArtifactError> {
+    if ids.is_empty() || prefill == 0 || prefill > ids.len() {
+        return Err(ArtifactError::Invalid(
+            "prefill must be nonzero and no larger than the supplied IDs".into(),
+        ));
     }
-    Ok(outputs)
+    with_request_model(
+        config,
+        tensors,
+        execution,
+        key_preparation_execution,
+        head_execution,
+        |model| {
+            let mut request = RequestSession::new(model).map_err(ArtifactError::from)?;
+            let mut outputs = Vec::with_capacity(ids.len() - prefill + 1);
+            outputs.push(request.step(&ids[..prefill]).map_err(ArtifactError::from)?);
+            for id in &ids[prefill..] {
+                outputs.push(
+                    request
+                        .step(std::slice::from_ref(id))
+                        .map_err(ArtifactError::from)?,
+                );
+            }
+            Ok(outputs)
+        },
+    )
 }
 
 fn block<'a>(

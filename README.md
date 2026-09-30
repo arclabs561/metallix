@@ -42,7 +42,7 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Bounded artifact-driven token-to-logit requests through all five reduced blocks, persistent shared state, invalidation/restart, and opt-in mixed CPU/Metal execution | Synthetic parameters and fixed qualified schedules; checkpoint loading, tokenizer/template integration, text decoding and native checkpoint generation remain open |
+| [DeepSeek](docs/progress.md) | Reduced-model greedy token generation, five-block requests with persistent shared state, bounded selected-expert checkpoint reads, and opt-in mixed CPU/Metal replay | Reduced generation uses synthetic parameters; selected expert execution is not full-model loading. Tokenizer/template integration, text decoding and native checkpoint generation remain open |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
 
@@ -566,6 +566,23 @@ cargo run -p server --bin mx -- run-deepseek-reduced \
   --artifact /tmp/metallix-reduced-artifact.json \
   --input-ids 0,1,2,3,4,5,6 --prefill-tokens 5
 ```
+
+Generate new IDs from the prompt through one retained scalar request session:
+
+```sh
+cargo run -p server --bin mx -- run-deepseek-reduced \
+  --artifact /tmp/metallix-reduced-artifact.json \
+  --input-ids 0,1,2,3,4 --generation-max-new-tokens 2
+```
+
+The receipt contains `generated_ids` and `stop_reason`. Optional
+`--generation-eos-token-id` stops after selecting that ID. Generation uses
+lowest-ID greedy tie breaking and reserves only the prompt plus IDs actually
+fed back (`prompt_len + max_new_tokens - 1`). It is scalar-only and cannot be
+combined with replay `--prefill-tokens` or key-placement overrides. Score/head
+selection must remain scalar. The artifact has
+synthetic weights and no text tokenizer; this command does not serve the released
+checkpoint.
 
 On Apple Silicon, select Metal index scoring explicitly:
 
