@@ -59,6 +59,25 @@ class SourceOracleInputTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exceeds"):
                 ORACLE.load_native_trace(None, path)
 
+    def test_native_embedding_trace_rejects_wrong_case_and_excess_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "embedding.json"
+            for trace in (
+                {"schema_version": 2},
+                {"schema_version": 1, "case": "held_out"},
+                {
+                    "schema_version": 1,
+                    "case": "cal_len7",
+                    "input_ids": [1],
+                },
+            ):
+                path.write_text(json.dumps(trace))
+                with self.assertRaises(ValueError):
+                    ORACLE.load_native_embedding_trace(None, path)
+            path.write_bytes(b" " * (ORACLE.NATIVE_TRACE_MAX_BYTES + 1))
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                ORACLE.load_native_embedding_trace(None, path)
+
 
 if __name__ == "__main__":
     unittest.main()

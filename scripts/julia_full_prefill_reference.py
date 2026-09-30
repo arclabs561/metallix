@@ -189,6 +189,7 @@ def layer0_trace(
     layer = encoder.layers[0]
     hooks = [
         encoder.embeddings.register_forward_hook(output("embedding")),
+        encoder.embeddings.tok_embeddings.register_forward_hook(output("lookup")),
         layer.attn.Wqkv.register_forward_hook(output("qkv")),
         layer.attn.Wo.register_forward_pre_hook(input_hook("attended")),
         layer.attn.Wo.register_forward_hook(output("wo")),

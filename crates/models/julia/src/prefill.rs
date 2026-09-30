@@ -523,6 +523,59 @@ fn write_cal_len7_layer0_trace() {
 }
 
 #[test]
+#[ignore = "writes opt-in cal_len7 embedding lookup trace to JULIA_DIAGNOSTIC_OUTPUT"]
+fn write_cal_len7_embedding_trace() {
+    fn rows(value: &[f32]) -> Vec<&[f32]> {
+        value.chunks_exact(WIDTH).collect()
+    }
+
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/julia-1/accuracy-cases.json"
+    ))
+    .unwrap();
+    let case = manifest["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"].as_str() == Some("cal_len7"))
+        .unwrap();
+    let input = EncoderInput {
+        input_ids: case["input_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_u64().unwrap())
+            .collect(),
+        attention_mask: case["attention_mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_bool().unwrap())
+            .collect(),
+    };
+    let encoder = full_encoder();
+    let lookup = encoder.lookup_rows_for_trace(&input).unwrap();
+    let mut boundaries = encoder.forward_boundaries(&input).unwrap();
+    let embedding = boundaries.remove(0);
+    let path = std::env::var("JULIA_DIAGNOSTIC_OUTPUT")
+        .expect("set JULIA_DIAGNOSTIC_OUTPUT to an owner-local diagnostic path");
+    std::fs::write(
+        path,
+        json!({
+            "schema_version": 1,
+            "case": "cal_len7",
+            "input_ids": input.input_ids,
+            "attention_mask": input.attention_mask,
+            "lookup": rows(&lookup),
+            "embedding": rows(&embedding),
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+}
+
+#[test]
 fn full_encoder_rejects_malformed_rows_layers_ids_and_masks() {
     let mut weights = full_weights();
     weights.token_rows.pop();

@@ -27,6 +27,7 @@ CONTROL_TOLERANCE = 1e-5
 TORCH_THREADS = 1
 NATIVE_TRACE_MAX_BYTES = 2 * 1024 * 1024
 NATIVE_TRACE_SCHEMA_VERSION = 2
+NATIVE_EMBEDDING_TRACE_SCHEMA_VERSION = 1
 
 
 def sha256(path: Path) -> str:
@@ -55,9 +56,15 @@ def validate_arguments(
     run_source: bool,
     output: Path | None,
     native_trace: Path | None = None,
+    native_embedding_trace: Path | None = None,
 ) -> None:
     if check_case:
-        if run_source or output is not None or native_trace is not None:
+        if (
+            run_source
+            or output is not None
+            or native_trace is not None
+            or native_embedding_trace is not None
+        ):
             raise ValueError("--check-case cannot execute or write a source receipt")
     elif not run_source or output is None:
         raise ValueError("source execution requires --run-source and --output")
@@ -76,6 +83,7 @@ def validate_tensor(
 
 def validate_base_trace(torch: Any, trace: dict[str, Any], label: str) -> None:
     positions = len(CASE["input_ids"])
+    validate_tensor(torch, trace.get("lookup"), (positions, WIDTH), f"{label} lookup")
     validate_tensor(torch, trace.get("qkv"), (positions, 3 * WIDTH), f"{label} QKV")
     validate_tensor(
         torch, trace.get("logits"), (HEADS, positions, positions), f"{label} logits"
@@ -176,6 +184,40 @@ def load_native_trace(torch: Any, path: Path) -> tuple[dict[str, Any], str]:
     return trace, hashlib.sha256(payload).hexdigest()
 
 
+def load_native_embedding_trace(torch: Any, path: Path) -> tuple[dict[str, Any], str]:
+    with path.open("rb") as source:
+        payload = source.read(NATIVE_TRACE_MAX_BYTES + 1)
+    if len(payload) > NATIVE_TRACE_MAX_BYTES:
+        raise ValueError(
+            f"native embedding trace exceeds {NATIVE_TRACE_MAX_BYTES} bytes"
+        )
+    try:
+        trace = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("native embedding trace is not valid JSON") from error
+    if not isinstance(trace, dict):
+        raise TypeError("native embedding trace must be a JSON object")
+    if trace.get("schema_version") != NATIVE_EMBEDDING_TRACE_SCHEMA_VERSION:
+        raise ValueError("native embedding trace schema_version does not match 1")
+    if trace.get("case") != CASE["name"]:
+        raise ValueError("native embedding trace case is not cal_len7")
+    if trace.get("input_ids") != CASE["input_ids"]:
+        raise ValueError("native embedding trace input IDs do not match cal_len7")
+    if trace.get("attention_mask") != CASE["attention_mask"]:
+        raise ValueError("native embedding trace mask does not match cal_len7")
+    positions = len(CASE["input_ids"])
+    for name in ("lookup", "embedding"):
+        try:
+            value = torch.tensor(trace[name], dtype=torch.float32)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"native embedding trace {name} is not a numeric tensor"
+            ) from error
+        validate_tensor(torch, value, (positions, WIDTH), f"native {name}")
+        trace[name] = value
+    return trace, hashlib.sha256(payload).hexdigest()
+
+
 def write_exclusive(path: Path, receipt: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as output:
@@ -188,8 +230,15 @@ def main() -> None:
     parser.add_argument("--run-source", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--native-trace", type=Path)
+    parser.add_argument("--native-embedding-trace", type=Path)
     args = parser.parse_args()
-    validate_arguments(args.check_case, args.run_source, args.output, args.native_trace)
+    validate_arguments(
+        args.check_case,
+        args.run_source,
+        args.output,
+        args.native_trace,
+        args.native_embedding_trace,
+    )
     if args.check_case:
         validate_case(CASE)
         print(json.dumps({"case": CASE["name"], "held_out_accessed": False}))
@@ -229,6 +278,7 @@ def main() -> None:
         )
     observer_fields = (
         "embedding",
+        "lookup",
         "qkv",
         "attended",
         "wo",
@@ -318,6 +368,29 @@ def main() -> None:
                 ),
             },
         }
+    native_embedding_comparison = None
+    if args.native_embedding_trace is not None:
+        native_embedding, native_embedding_sha256 = load_native_embedding_trace(
+            torch, args.native_embedding_trace
+        )
+        generated_lookup = full.ENCODER.values((full.VOCAB, WIDTH), 200)[
+            torch.tensor(CASE["input_ids"], dtype=torch.int64)
+        ]
+        source_lookup_identity = max_abs(sdpa["lookup"], generated_lookup)
+        if source_lookup_identity != 0.0:
+            raise RuntimeError(
+                "captured source lookup does not exactly reproduce generated F32 rows"
+            )
+        native_embedding_comparison = {
+            "path": str(args.native_embedding_trace),
+            "sha256": native_embedding_sha256,
+            "schema_version": NATIVE_EMBEDDING_TRACE_SCHEMA_VERSION,
+            "source_lookup_vs_generated_rows_max_abs": source_lookup_identity,
+            "native_vs_source_actual_max_abs": {
+                "lookup": max_abs(native_embedding["lookup"], sdpa["lookup"]),
+                "embedding": max_abs(native_embedding["embedding"], sdpa["embedding"]),
+            },
+        }
     receipt = {
         "schema_version": 1,
         "scope": "cal_len7 calibration source eager oracle control only",
@@ -371,6 +444,7 @@ def main() -> None:
         "observer_noninterference_exact_bits": observer_exact_bits,
         "source_actual_vs_existing_reconstructed_rotary_max_abs": actual_vs_reconstructed,
         "native_trace_comparison": native_comparison,
+        "native_embedding_trace_comparison": native_embedding_comparison,
         "eager_actual_vs_explicit_attended_max_abs": eager_gap,
         "sdpa_actual_vs_eager_actual_attended_max_abs": (
             sdpa["attended"] - eager["attended"]

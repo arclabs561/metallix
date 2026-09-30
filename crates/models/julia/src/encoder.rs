@@ -355,14 +355,7 @@ impl JuliaEncoder {
         {
             return Err(JuliaEncoderError::FullWork);
         }
-        let mut hidden = Vec::with_capacity(positions * WIDTH);
-        for &token_id in &input.input_ids {
-            let row = self
-                .token_ids
-                .binary_search(&token_id)
-                .map_err(|_| JuliaEncoderError::TokenId(token_id))?;
-            hidden.extend_from_slice(&self.token_rows[row * WIDTH..(row + 1) * WIDTH]);
-        }
+        let mut hidden = self.lookup_rows(input)?;
         hidden = norm_rows(&hidden, &self.embedding_norm_weight, "embedding norm")?;
         record_boundary(&mut boundaries, &hidden);
         for (layer, block) in self.layers.iter().enumerate() {
@@ -377,6 +370,26 @@ impl JuliaEncoder {
         hidden = norm_rows(&hidden, &self.final_norm_weight, "final norm")?;
         record_boundary(&mut boundaries, &hidden);
         Ok(hidden)
+    }
+
+    fn lookup_rows(&self, input: &EncoderInput) -> Result<Vec<f32>, JuliaEncoderError> {
+        let mut hidden = Vec::with_capacity(input.input_ids.len() * WIDTH);
+        for &token_id in &input.input_ids {
+            let row = self
+                .token_ids
+                .binary_search(&token_id)
+                .map_err(|_| JuliaEncoderError::TokenId(token_id))?;
+            hidden.extend_from_slice(&self.token_rows[row * WIDTH..(row + 1) * WIDTH]);
+        }
+        Ok(hidden)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup_rows_for_trace(
+        &self,
+        input: &EncoderInput,
+    ) -> Result<Vec<f32>, JuliaEncoderError> {
+        self.lookup_rows(input)
     }
 }
 

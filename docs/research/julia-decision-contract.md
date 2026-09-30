@@ -65,8 +65,8 @@ Signed components close exactly, but their maxima and norms do not add.
 This is conditional attribution, not proof of a normalization or GEMM cause:
 the input term includes every embedding-path discrepancy and the residual includes
 all projection-side differences. Exact additive closure is bookkeeping; the
-independent control is exact source projection replay. The next calibration probe
-should inspect the embedding boundary before changing native arithmetic.
+independent control is exact source projection replay. A subsequent calibration
+probe inspects the embedding boundary before changing native arithmetic.
 The encoder fidelity gate remains open.
 
 ```sh
@@ -80,6 +80,11 @@ uv run --offline scripts/julia_calibration_projection_square.py \
 The receipt binds input and weight hashes, rejects held-out reports and requires
 bounded finite calibration shapes. The retained result is
 `.agents/receipts/julia/calibration-projection-square-attribution.json`.
+
+The calibration-only lookup/normalization probe now checks the raw embedding
+lookup separately from normalization. Its result narrows the numerical diagnosis;
+the full encoder fidelity gate remains open. Generated diagnostic receipts remain
+local and outside version control.
 
 ## Reproduction identity
 
