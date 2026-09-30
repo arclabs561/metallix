@@ -206,6 +206,39 @@ class PartitionProbeTest(unittest.TestCase):
             with self.subTest(schedule=invalid), self.assertRaises(probe.ProbeError):
                 probe.validate_schedule(invalid)
 
+    def test_alternate_prefill_sweep_is_bounded_and_default_compatible(self) -> None:
+        self.assertEqual(probe.alternate_schedule(), probe.ALTERNATE)
+        self.assertEqual(probe.alternate_schedule(2), (2, 1, 1, 1, 1, 1))
+        self.assertEqual(probe.alternate_schedule(7), (7,))
+        for invalid in (True, False, 1, 8, 2.0, "4", None):
+            with (
+                self.subTest(prefill_tokens=invalid),
+                self.assertRaises(probe.ProbeError),
+            ):
+                probe.alternate_schedule(invalid)
+
+    def test_cli_forwards_alternate_prefill_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            with patch.object(
+                probe,
+                "build_probe",
+                return_value={"status": "completed_source_partition_experiment"},
+            ) as build:
+                self.assertEqual(
+                    probe.main(
+                        [
+                            "--run",
+                            "--output",
+                            str(path),
+                            "--prefill-tokens",
+                            "3",
+                        ]
+                    ),
+                    0,
+                )
+            build.assert_called_once_with(capture_alternate=False, prefill_tokens=3)
+
 
 if __name__ == "__main__":
     unittest.main()

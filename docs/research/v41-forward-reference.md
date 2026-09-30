@@ -38,10 +38,43 @@ The owner-local evidence is
 the probe records its own source hash, upstream and helper identities, runtime,
 initializer/tokenizer hashes and both schedules.
 
-The Rust reduced runner still accepts only the original `0/5/6` call starts.
-Alternate intermediate boundaries are now captured under their own identity;
-the L3 owner is now qualified below, with the surrounding native layers still open. Do not relabel the
+The native scalar `RequestSession` and numerical-artifact CLI now execute both
+established schedules through all five blocks and the final head. Alternate
+intermediate boundaries retain their own capture identity. Do not relabel the
 existing fixture or relax its exact BF16/routing and analytic FP32 checks.
+
+### Expanded first-chunk sweep
+
+The same probe accepts `--prefill-tokens 2` through `7`, followed by one-token
+calls until all seven fixed IDs are consumed; the default remains 4. This
+explores schedule sensitivity without changing the canonical manifest:
+
+```sh
+uv run --offline scripts/v41_partition_probe.py --run --prefill-tokens 2 \
+  --output artifacts/v41-prefill-2.json
+```
+
+Fresh source runs with first chunks 2, 3, and 6 each reproduce the frozen baseline
+terminal logits exactly. The numerical-artifact CLI also produces terminal
+bits identical to its canonical first-chunk 5 run for each of these schedules.
+Their terminal native/source maximum absolute difference is
+`0.0026171356439590454`, unchanged across these endpoints; earlier calls in this
+sweep differ by at most `9.5367431640625e-7`. These are observed differences,
+not new tolerance choices or complete per-call source qualification. Native
+endpoint stability is now a regression property, separate from the existing
+canonical/alternate source-envelope assertions.
+
+First-chunk 7 is different: its source terminal logits differ from the canonical
+source by up to `0.005548015236854553`. The native request rejects this schedule
+with `LayerFour → Selection → FinalSelection → AmbiguousCutoffTie`. That is the
+existing reachable-cutoff tie policy: it does not invent a PyTorch Top-K tie
+order. A regression pins the precise rejection; no tie rule or source envelope
+was changed. Investigate source tie semantics before admitting this boundary.
+
+Receipts are owner-local under `.agents/receipts/candidate-control/`:
+`source-prefill-{2,3,6,7}-formatted.json`, `reduced-cli-schedule-sweep.json`, and
+`schedule-sweep-comparison.json`. Each source receipt pins the helper/source,
+initializer, tokenizer and baseline oracle; no checkpoint payload was loaded.
 
 
 The alternate capture is reproducible with an independent unobserved control:

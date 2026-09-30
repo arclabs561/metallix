@@ -552,7 +552,10 @@ The exporter creates a new file and refuses to overwrite an existing one. Its
 artifact contains configuration and checksummed numerical tensors; captured
 outputs and source acceptance bounds stay in tests. The CLI prints a JSON
 receipt with the artifact SHA-256 and final-token logit bits for each call.
-Use `--prefill-tokens 4` for the alternate qualified schedule. This is bounded
+Use `--prefill-tokens 4` for the alternate qualified schedule. The expanded
+[first-chunk sweep](docs/research/v41-forward-reference.md#expanded-first-chunk-sweep)
+checks terminal stability for sizes 2, 3 and 6; size 7 rejects an ambiguous L4
+selection tie. Those additional sizes do not yet have full per-call qualification. This is bounded
 synthetic execution, with no sampling or text decoding. Admission rejects
 unknown fields/tensors, invalid encodings and oversized artifacts; the encoded
 file limit is 64 MiB and the decoded tensor limit is 32 MiB.

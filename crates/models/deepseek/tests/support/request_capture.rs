@@ -377,6 +377,39 @@ fn exported_numerical_artifact_matches_both_source_schedules() {
     request_tail::assert_source_outputs(&fixture, &head, &canonical);
     let alternate = artifact.run(ids, 4).expect("artifact alternate request");
     request_alternate::assert_source_outputs(&alternate, &head);
+    // Endpoint stability is a separate property from per-call source qualification.
+    let terminal_bits = |calls: &[deepseek::reduced::RequestStepOutput]| {
+        calls
+            .last()
+            .unwrap()
+            .heads()
+            .last()
+            .unwrap()
+            .logits()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    for prefill in [2, 3, 6] {
+        let calls = artifact.run(ids, prefill).expect("bounded prefill sweep");
+        assert_eq!(calls.len(), ids.len() - prefill + 1);
+        assert_eq!(terminal_bits(&calls), terminal_bits(&canonical));
+    }
+
+    // This otherwise-valid schedule reaches a reachable L4 cutoff tie. Keep
+    // the qualification policy fail-closed instead of inventing source Top-K order.
+    assert!(matches!(
+        artifact.run(ids, 7),
+        Err(deepseek::reduced::ArtifactError::Request(
+            deepseek::reduced::RequestError::LayerFour(
+                deepseek::reduced::LayerFourSessionError::Selection(
+                    deepseek::indexer::selection::SelectionAdapterError::FinalSelection(
+                        deepseek::selection::SelectionError::AmbiguousCutoffTie
+                    )
+                )
+            )
+        ))
+    ));
     assert!(artifact.run(ids, 1).is_err());
     assert!(artifact.run(&[-1, 0], 2).is_err());
     assert!(artifact.run(&[0, 8], 2).is_err());

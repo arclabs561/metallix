@@ -35,6 +35,7 @@ SCRIPTS = ROOT / "scripts"
 INPUT_IDS = (0, 1, 2, 3, 4, 5, 6)
 BASELINE = (5, 1, 1)
 ALTERNATE = (4, 1, 1, 1)
+DEFAULT_PREFILL_TOKENS = 4
 MAX_OUTPUT_BYTES = 16 << 20
 SEED = 941
 
@@ -67,6 +68,21 @@ def validate_schedule(counts: object) -> tuple[int, ...]:
     if sum(normalized) != len(INPUT_IDS):
         raise ProbeError("schedule must cover the seven pinned input IDs exactly")
     return normalized
+
+
+def validate_prefill_tokens(value: object) -> int:
+    """Admit only the bounded first chunk for the exploratory alternate sweep."""
+    if type(value) is not int or not 2 <= value <= len(INPUT_IDS):
+        raise ProbeError("prefill tokens must be an integer from 2 through 7")
+    return value
+
+
+def alternate_schedule(
+    prefill_tokens: object = DEFAULT_PREFILL_TOKENS,
+) -> tuple[int, ...]:
+    """Build the alternate first chunk followed by one-token source calls."""
+    prefill = validate_prefill_tokens(prefill_tokens)
+    return validate_schedule((prefill,) + (1,) * (len(INPUT_IDS) - prefill))
 
 
 def _tensor_words(record: object, label: str) -> tuple[list[int], list[int]]:
@@ -558,10 +574,13 @@ def _source_metadata(runner: Any) -> dict[str, object]:
     }
 
 
-def build_probe(capture_alternate: bool = False) -> dict[str, object]:
+def build_probe(
+    capture_alternate: bool = False,
+    prefill_tokens: object = DEFAULT_PREFILL_TOKENS,
+) -> dict[str, object]:
     """Execute both named schedules and retain a divergence report or failure."""
     baseline = validate_schedule(BASELINE)
-    alternate = validate_schedule(ALTERNATE)
+    alternate = alternate_schedule(prefill_tokens)
     runner = _load_runner()
     if (
         _file_sha256(ROOT / "artifacts" / "v41-kernel-pinned.py")
@@ -743,11 +762,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="retain full alternate-only source observers and verify they do not interfere",
     )
+    parser.add_argument(
+        "--prefill-tokens",
+        type=int,
+        default=DEFAULT_PREFILL_TOKENS,
+        help="alternate first chunk size from 2 through 7; defaults to 4",
+    )
     args = parser.parse_args(argv)
     if not args.run:
         parser.error("--run is required to execute the source graph")
     try:
-        receipt = build_probe(capture_alternate=args.capture_alternate)
+        receipt = build_probe(
+            capture_alternate=args.capture_alternate,
+            prefill_tokens=args.prefill_tokens,
+        )
         _write_new(args.output, receipt)
     except (OSError, ProbeError, ValueError, RuntimeError) as error:
         print(f"partition probe error: {error}", file=sys.stderr)
