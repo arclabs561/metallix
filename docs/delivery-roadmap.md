@@ -7,10 +7,42 @@ local agents, programmable inference, then broader MLX capabilities. Grounded in
 [performance evidence](experiments/chat-performance.md), and
 [sampling gates](research/sampling-next-gates.md).
 
-Review baseline: `ebf5ba3`. Review this sequence after each milestone, a failed
+Review baseline: `9506015`. Review this sequence after each milestone, a failed
 feasibility gate, a materially better upstream runtime, or a change to the
 pinned MLX binding. This proposal records sequencing; it does not declare new
 interfaces stable or turn synthetic parity into model support.
+
+## Goal alignment and delivery priorities
+
+The primary goal remains useful DeepSeek-V4.1 generation on one Mac, including
+models larger than RAM. Qwen supplies a usable local control and nearer-term
+serving value. Typed decisions (including the Qwen JevBench-shaped bridge and
+future direct Julia) and programmable inference are real product goals, but
+mechanism tests do not establish useful applications or model support.
+
+The reduced five-block oracle and artifact CLI are delivered for the two fixed
+schedules. Explicit Metal scoring and key rotation reach that CLI and preserve
+numerical/state controls. The next milestone is complete reduced device execution;
+real checkpoint generation follows a separate reference and resource gate.
+Avoid a percentage-complete estimate: the remaining work includes unresolved
+feasibility, not just a countable list of operators.
+
+| Priority | Remaining outcome | Completion evidence |
+| --- | --- | --- |
+| P0 integration | Deliver the accumulated owned lane into an agreed integration baseline. | At review the clean lane is 84 commits ahead of local main; shared main has peer edits. Classify both, integrate in an owned checkout, preserve recoverable peer state and rerun gates. Local commit evidence alone does not establish release delivery. |
+| P0 feasibility | Establish what useful DeepSeek execution must fit and how fast it must be. | Declare target machine, RAM/SSD budget, context, TTFT and minimum decode rate. Obtain source-compatible routing evidence, replay explicit capacities and measure selected ranges before acquisition/residency commitments. Synthetic routes and operator parity do not settle this. |
+| P1 DeepSeek execution | Finish the reduced device path, then one real checkpoint-to-generation vertical. | Inventory residual CPU work/readbacks; move connected stages through the existing artifact consumer, preserving source bounds and state/reset checks. Measure matched whole-request timing/memory. Proceed to real loading/tokenization/prefill/decode only after reference and feasibility gates. |
+| Parallel Qwen delivery | Make the working serial service predictable under multiple clients and slow/disconnected readers. | Callback and real socket-reset recovery are delivered. Choose busy rejection versus bounded queuing, qualify backpressure/concurrent arrivals, observe resource release, then evaluate held-out agent tasks before a Codex-ready claim. |
+| Parallel Julia decisions | Qualify the native encoder and actual marker-gather/head path. | Resolve the calibration mismatch under a recorded fidelity target, then pass independent/held-out gates and checkpoint-to-decision tests. Qwen bridge results remain decoder-route results. |
+| Later programmable inference | Deliver a concrete task that benefits from constraints, branching, verification or particles. | Show task quality and total latency/resources against a baseline; retain existing mechanism tests. Further hierarchy/router, training, multimodal and generic framework work waits for a named consumer. |
+
+Feasibility and integration deserve attention now, alongside bounded execution
+work. The next port should close a connected request boundary; choose its scope
+from residual computation/transfers rather than whichever leaf is easiest.
+Do not start full checkpoint acquisition or a pager/prefetch policy until the
+resource envelope and reference gate are satisfied. Recheck the existing
+[upstream-runtime pivot](architecture.md#pivot-conditions) against that same
+declared target before committing to a larger native serving implementation.
 
 ## Current checkpoint
 
@@ -59,7 +91,7 @@ focused server integration coverage for byte-hash/output agreement and
 fail-closed inputs. The canonical Metal check passes the DeepSeek tests and stops at the unchanged
 Julia numerical mismatch; focused CLI, strict lint and documentation gates pass. Downstream weights and
 source checks remain fixture-backed; broader partitions, checkpoint loading and
-Metal execution remain open. Native
+complete Metal execution remain open. Native
 Responses tool-result replay passed three JSON and three SSE trials, and three
 tool-stream disconnect recoveries passed. See the
 [measurement ledger](experiments/chat-performance.md) and
@@ -78,18 +110,19 @@ Qwen is the usable vertical: resident chat, bounded read tools, experimental
 Responses, and qualified 0.6B/4B controls. DeepSeek's library `RequestSession`
 now interleaves all five blocks and the final head per call. Both established
 synthetic schedules pass source bounds and replay after restart. The bounded
-artifact loader and scalar CLI have focused qualification. The workspace check
-remains red at the unchanged Julia gate; broader partitions and DeepSeek Metal
+artifact loader and scalar-default CLI have focused qualification, including
+explicit mixed Metal scoring and key rotation. The workspace check
+remains red at the unchanged Julia gate; broader partitions and complete DeepSeek device
 execution remain open. Synthetic numerical
 qualification does not establish checkpoint support. Julia's bounded 22-layer
 path exists but has not passed numerical qualification. Its scalar numerical
 oracle and bounded Metal operators are not a complete GPU encoder/decision
 runtime.
 
-Performance work has located a useful next experiment: cache concatenation
-scales with prefix length in standalone graphs. Transpose construction costs
-under 0.3% of measured decode, and the earlier argmax replacement failed its
-serving comparison. Neither should be reopened without new evidence.
+The cache work already led to the qualified bounded stepped resident path.
+Retain its matched baseline and growth-boundary controls; another cache study
+is not the next delivery milestone. The measured transpose and rejected argmax
+experiments likewise need new evidence before reopening.
 
 Keep three completion milestones separate:
 
@@ -179,22 +212,19 @@ gate; another broad model survey is not on the critical path.
 
 ### Dependency order and stopping gates
 
-Next delivery sequence, grounded in `7894d99`, the
+Revised delivery sequence, grounded in `9506015`, the
 [reduced-executor decision](design/deepseek-reduced-executor.md), and the
 [architecture gates and pivot conditions](architecture.md#pivot-conditions).
-Review after the first request using Metal scoring, any state/parity failure,
-or evidence that the intended checkpoint cannot meet the resource envelope.
-The Rust API and reduced artifact CLI now execute the mixed CPU/Metal request.
-The next implementation gate is the remaining reduced arithmetic on Metal. Scoring qualification alone does not establish full GPU execution.
+Scoring qualification, request dispatch, key rotation and artifact/CLI selection
+are delivered for both fixed schedules. Do not requeue them as new milestones.
 
 | Order | Deliverable and consumer | Gate before proceeding |
 | --- | --- | --- |
-| 0 | Reconcile the completed isolated lane with the intended integration branch. Consumer: a reproducible project baseline. | Establish checkout ownership, classify peer edits and local commits, integrate in an owned checkout, and rerun the relevant gates. Preserve the known Julia failure explicitly. Do not mutate the peer-owned dirty main checkout or discard its work. |
-| 1 | Qualify the library BF16 scorer on canonical as well as alternate operands. Consumer: the scored-query path. | Exact existing BF16/routing controls pass on both schedules; malformed input, overflow and recovery remain covered. Retain the prefill-7 tie rejection. Stop adding score microbenchmarks unless they resolve a named integration uncertainty. |
-| 2 | Add an explicit DeepSeek-local device-scoring route: scored-query preparation → L3 projector/session → L1/L4 → request. Consumer: the reduced artifact CLI. | First compare an L3 session using device scoring against its scalar counterpart, including committed state and failures. Then the actual request must invoke Metal scoring and preserve final-logit source bounds, publication identity and candidate/selection results on both schedules. A late device error invalidates the whole request; restart reconstructs state and reproduces the clean result. Make backend choice observable; report this as mixed execution. |
-| 3 | Move the remaining reduced request operations onto Metal in dependency order. Consumer: the same token/artifact CLI. | Identify residual CPU computation/transfers on that executable path, then move query/key preparation, attention, block tails/Engram and the head with their existing independent oracles. Complete GPU arithmetic plus routing/cache/reset checks is the exit gate; per-stage readbacks are diagnostic instrumentation, not a throughput implementation. |
-| 4 | Establish useful performance and the checkpoint resource envelope. Consumer: the checkpoint acquisition/residency decision. | Record matched artifact/input/schedule timing and peak memory for scalar and device paths. In parallel, obtain source-compatible route locality evidence and declare hardware, RAM/SSD, context, TTFT and decode-rate limits. A small synthetic graph cannot establish full-checkpoint fit or speed. |
-| 5 | Admit one real checkpoint-to-request vertical, then serving. Consumer: ordinary local generation. | After reference parity and a viable resource plan, qualify actual loading, tokenizer/template, prefill/decode and output behavior together. Serving additionally needs cancellation, admission and bounded-resource recovery. Apply the existing upstream-runtime pivot if a competing implementation meets the same declared target. |
+| 0 | Reconcile the completed isolated lane with the intended integration branch. Consumer: a reproducible baseline. | Establish checkout ownership, classify peer edits/local commits, integrate in an owned checkout and rerun gates. Preserve the known Julia failure and dirty peer state. |
+| 1, parallel with 2 | Establish the checkpoint feasibility contract. Consumer: acquisition/residency decision. | Declare RAM/SSD/context/TTFT/decode limits; obtain source-compatible routes, replay explicit capacities, then measure selected real ranges. No full download, pager or prefetch policy before this decision and the reference gate. |
+| 2 | Complete reduced Metal execution through the existing artifact CLI. Consumer: an executable numerical and performance baseline. | Inventory CPU work and transfers; move connected query/key preparation, attention, block tails/Engram and head stages. Retain independent source/routing/cache/failure controls. End with whole-request scalar/device timing and observed memory. Host readbacks remain a performance limitation. |
+| 3 | One actual checkpoint-to-request vertical. Consumer: ordinary local generation. | After 1 and 2, qualify loading, tokenizer/template, prefill/decode, output and declared resource/latency limits together. Apply the upstream pivot if another runtime meets that same target. |
+| 4 | Bounded serving and agent use. Consumer: repeatable local applications. | Cancellation, admission, resource recovery and held-out task outcomes pass for that adapter. Qwen can qualify these independently while DeepSeek execution continues. |
 
 Index-key RoPE now uses `rotate_tail_metal` through an explicit independent
 L1/L3 owner choice. Both schedules match all key BF16/FP4 stages, downstream
@@ -206,11 +236,10 @@ exact downstream staging gates before request integration. Full query preparatio
 also needs Metal FP8 projection and FP4 staging; the final head needs a validated
 FP32 projection. Avoid adding more standalone diagnostic entry points.
 
-Steps 1–3 are reversible model-local changes. Integration in step 0 must preserve
-recoverable peer state. Checkpoint acquisition and residency choices in steps 4–5
-are consequential resource commitments. Do not start full-checkpoint acquisition
-until the resource plan is decided and the architecture's reference-parity gate
-passes. Do not make the default path Metal until the request-level gate passes.
+Reduced execution work is reversible and model-local. Integration must preserve
+recoverable peer state. Checkpoint acquisition and residency choices are
+consequential resource commitments. Keep scalar defaults until the proposed
+device path has the required request parity and measured benefit.
 
 Use a small execution budget: one DeepSeek implementation owner, one independent
 Qwen/feasibility owner when there is concrete work, and an independent reviewer.
@@ -253,6 +282,10 @@ or universal tensor framework is needed for the next model-execution milestone.
 These remain accepted future directions rather than implicit parallel work.
 
 ### Performance adoption contract
+
+The stepped-cache adoption described above is complete for its qualified Qwen
+workloads. The following is the retained evaluation contract for future changes,
+not an instruction to repeat the completed experiment.
 
 The capacity candidate must use the pinned binding's actual semantics. A
 functional slice update is not evidence of buffer donation or reduced copying.
@@ -311,8 +344,8 @@ existing product boundary.
 | --- | --- | --- |
 | KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Stepped growth, failure-parity, and matched 0.6B/4B resident requests passed with exact output/token parity. Keep the bounded stepped path and retain the concatenation measurements as a regression control. |
 | DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Reproduce the pinned source for the parity baseline. Never silently substitute owner keys. Decide before claiming complete model parity. |
-| DeepSeek device-path selection, `src/indexer/query.rs` and `src/reduced/**` | Explicit per-operation Metal siblings keep each surface obvious but multiply call paths; a DeepSeek-local immutable execution choice centralizes dispatch but touches request construction. | Decide at step 2 after the call-site survey. Prefer one model-local choice carried through the request, preserving the scalar default and existing validation/state logic. No engine-wide backend trait; keep the diagnostic scorer's readbacks explicit until a separately qualified resident form replaces them. |
-| Qwen concurrent admission, Responses/chat serving | Reject while busy; or queue a bounded number of requests with deadlines and cancellation. | Decide after real model cancellation/recovery is measured. Start from bounded single-model admission; no unbounded queue or concurrent mutation of one session. Record the accepted policy before changing the serial serving loop. |
+| DeepSeek next connected device stage, `src/indexer/**` and `src/reduced/**` | Continue key/query preparation, or choose a larger connected attention/tail boundary based on the remaining CPU/transfer inventory. | Model-local immutable score/key-rotation choices are already implemented. Preserve those defaults and state rules; choose the next boundary for request delivery and measured benefit. No engine-wide backend trait or additional standalone diagnostic product. |
+| Qwen concurrent admission, Responses/chat serving | Reject while busy; or queue a bounded number of requests with deadlines and cancellation. | Callback and socket-reset recovery are measured. Recommend explicit busy rejection as the smallest first policy; use a bounded queue only for a demonstrated waiting-client requirement. No unbounded queue or concurrent mutation of one session. Record the accepted policy before changing the serial serving loop. |
 | DeepSeek request failure lifecycle | Roll back every owner; or invalidate a failed request and reconstruct all state. | `RequestSession` now implements invalidation and full reconstruction from immutable operands. Both schedules replay through source-qualified logits; malformed L4 execution blocks retries and restart reconstructs the earlier owners. This does not promise component rollback or checkpoint-serving recovery. |
 | DeepSeek checkpoint resource envelope | Acquire/load the checkpoint before locality evidence; or establish the intended RAM/SSD/context/latency envelope, trace source-compatible routes, then measure selected ranges at explicit cache capacities. | Take the latter path. Metadata sensitivity and generic Qwen I/O probes are not a V4.1 serving envelope. Do not start acquisition, a pager, or prefetch policy until this gate has a measured result. |
 | Julia fidelity and benchmark route | Run JevBench-shaped requests through the qualified Qwen decoder bridge; or claim a direct Julia result after its source-compatible encoder/head path qualifies. Separately, choose pinned-source-backend fidelity or a portable scalar contract for the failing Julia numerical gate. | Keep Qwen as the current benchmark-interface route. Record the Julia fidelity target before another arithmetic change; direct Julia scoring remains closed until its marker-gather/head path passes the resulting independent gate. |

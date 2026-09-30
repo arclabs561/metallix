@@ -18,7 +18,9 @@ model-specific shapes, state lifetimes, precision choices, and device graphs.
 Today the workspace pins `mlx-rs 0.25.3`. MLX arrays and graph execution live in
 the Qwen and DeepSeek crates. Qwen has the working decoder; DeepSeek has
 source-grounded scalar and bounded Metal operators plus a connected reduced
-suffix. `engine::sampling::sample_categorical` already supplies a stateless
+five-block request and head. The artifact CLI exposes mixed scoring/key rotation;
+complete device and real-checkpoint execution remain separate gates.
+`engine::sampling::sample_categorical` already supplies a stateless
 categorical policy. The shared engine now also exposes a bounded SMC primitive
 for log-weight normalization, ESS, deterministic systematic resampling, and
 absorbing particle state. Model/cache transitions remain adapter-owned; this
