@@ -570,8 +570,37 @@ fn response_value(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Read as _,
+        net::{Shutdown, TcpListener, TcpStream},
+        thread,
+        time::Duration,
+    };
+
     use super::*;
     use proptest::prelude::*;
+
+    #[derive(Default)]
+    struct DeadlineBackend {
+        calls: usize,
+    }
+
+    impl ChatBackend for DeadlineBackend {
+        fn load_ms(&self) -> f64 {
+            0.0
+        }
+
+        fn generate_with_timeout(
+            &mut self,
+            _request: ChatRequest<'_>,
+            _timeout: Duration,
+            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+            self.calls += 1;
+            on_token("partial").map_err(ChatGenerationError::Message)?;
+            Err(ChatGenerationError::DeadlineExceeded)
+        }
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
@@ -635,6 +664,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn streaming_generation_deadline_emits_one_terminal_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let body = br#"{"model":"control","input":"hello","stream":true}"#;
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            stream.shutdown(Shutdown::Write).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut connection = Connection::accept(stream, TransportLimits::default());
+        let wire_request = connection.read_request().unwrap();
+        let request: Request = serde_json::from_slice(&wire_request.body).unwrap();
+        let messages = messages(&request).unwrap();
+        let tools = tools(&request).unwrap();
+        let mut backend = DeadlineBackend::default();
+
+        respond(
+            connection,
+            &request,
+            &messages,
+            &tools,
+            &mut backend,
+            "deadline",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(backend.calls, 1);
+
+        let wire = String::from_utf8(client.join().unwrap()).unwrap();
+        let (headers, payload) = wire.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        let events: Vec<Value> = payload
+            .split("\n\n")
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| {
+                let (_, data) = frame.split_once('\n').unwrap();
+                serde_json::from_str(data.strip_prefix("data: ").unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("response.created"),
+                Some("response.output_item.added"),
+                Some("response.content_part.added"),
+                Some("response.output_text.delta"),
+                Some("response.failed"),
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence_number"].as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4)]
+        );
+        assert_eq!(events[3]["delta"], "partial");
+        assert_eq!(events[4]["response"]["status"], "failed");
+        assert_eq!(events[4]["response"]["error"]["code"], "generation_timeout");
     }
 
     #[test]
