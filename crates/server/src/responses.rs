@@ -571,8 +571,10 @@ fn response_value(
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
         io::Read as _,
         net::{Shutdown, TcpListener, TcpStream},
+        process::{Command, Stdio},
         thread,
         time::Duration,
     };
@@ -742,6 +744,308 @@ mod tests {
         assert_eq!(events[3]["delta"], "partial");
         assert_eq!(events[4]["response"]["status"], "failed");
         assert_eq!(events[4]["response"]["error"]["code"], "generation_timeout");
+    }
+
+    mod checkpoint_reset {
+        use super::*;
+        struct ObservedSession<'a> {
+            session: &'a mut ChatSession,
+            callback_failed: bool,
+            generation_failed: bool,
+        }
+        impl ChatBackend for ObservedSession<'_> {
+            fn load_ms(&self) -> f64 {
+                self.session.load_ms()
+            }
+            fn generate_with_timeout(
+                &mut self,
+                request: ChatRequest<'_>,
+                timeout: Duration,
+                on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+                let mut failed = false;
+                let result = self
+                    .session
+                    .generate_with_timeout(request, timeout, &mut |delta| {
+                        let written = on_token(delta);
+                        failed |= written.is_err();
+                        written
+                    });
+                self.callback_failed = failed;
+                self.generation_failed = matches!(&result, Err(ChatGenerationError::Message(_)));
+                result
+            }
+        }
+
+        fn body(max_output_tokens: u32) -> Vec<u8> {
+            serde_json::to_vec(&json!({
+                "model": "metallix-qwen3",
+                "input": if max_output_tokens == 64 {
+                    "Count from one to one hundred, writing every number in words."
+                } else { "Reply with a short recovery acknowledgement." },
+                "stream": true,
+                "max_output_tokens": max_output_tokens,
+                "temperature": 0,
+                "store": false,
+            }))
+            .expect("test request JSON")
+        }
+
+        fn client(address: std::net::SocketAddr, body: Vec<u8>) -> thread::JoinHandle<Vec<u8>> {
+            thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).expect("connect loopback server");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(60)))
+                    .expect("bound client reads");
+                write!(
+                    stream,
+                    "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write request header");
+                stream.write_all(&body).expect("write request body");
+                stream
+                    .shutdown(Shutdown::Write)
+                    .expect("half-close request");
+                let mut wire = Vec::new();
+                stream
+                    .read_to_end(&mut wire)
+                    .expect("read complete response");
+                wire
+            })
+        }
+
+        fn reset_after_delta(
+            address: std::net::SocketAddr,
+            body: Vec<u8>,
+        ) -> thread::JoinHandle<Vec<u8>> {
+            thread::spawn(move || {
+                const RESET_AFTER_DELTA: &str = r#"
+import json
+import socket
+import struct
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+body = sys.stdin.buffer.read()
+if len(body) > 1_048_576:
+    raise RuntimeError("request body is too large")
+request = (
+    b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
+    + str(len(body)).encode("ascii")
+    + b"\r\n\r\n"
+    + body
+)
+stream = socket.create_connection((host, port), timeout=60)
+stream.settimeout(60)
+stream.sendall(request)
+stream.shutdown(socket.SHUT_WR)
+raw = bytearray()
+while len(raw) <= 65_536:
+    chunk = stream.recv(min(1_024, 65_537 - len(raw)))
+    if not chunk:
+        raise RuntimeError("stream ended before a generated text delta")
+    raw.extend(chunk)
+    payload = bytes(raw).split(b"\r\n\r\n", 1)
+    if len(payload) != 2:
+        continue
+    for frame in payload[1].split(b"\n\n")[:-1]:
+        data = next((line[6:] for line in frame.splitlines() if line.startswith(b"data: ")), None)
+        if data is None:
+            continue
+        event = json.loads(data)
+        if event.get("type") == "response.output_text.delta" and isinstance(event.get("delta"), str) and event["delta"]:
+            stream.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            stream.close()
+            sys.stdout.buffer.write(raw)
+            raise SystemExit(0)
+raise RuntimeError("stream exceeded 65536 bytes before a generated text delta")
+"#;
+                let host = address.ip().to_string();
+                let port = address.port().to_string();
+                let mut child = Command::new("python3")
+                    .args(["-c", RESET_AFTER_DELTA, &host, &port])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("start bounded reset client");
+                std::io::Write::write_all(child.stdin.as_mut().expect("reset client stdin"), &body)
+                    .expect("write reset request body");
+                let output = child.wait_with_output().expect("wait for reset client");
+                assert!(
+                    output.status.success(),
+                    "reset client failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output.stdout
+            })
+        }
+
+        fn accepted_request(listener: &TcpListener) -> (Connection, Request, Vec<ChatMessage>) {
+            let (stream, _) = listener.accept().expect("accept loopback request");
+            let mut connection = Connection::accept(stream, TransportLimits::default());
+            let wire = connection.read_request().expect("read request");
+            let request: Request = serde_json::from_slice(&wire.body).expect("parse request");
+            let messages = messages(&request).expect("prepare request messages");
+            (connection, request, messages)
+        }
+
+        fn terminal_text_and_usage(wire: Vec<u8>) -> (String, String, Value) {
+            let wire = String::from_utf8(wire).expect("SSE response is UTF-8");
+            let (headers, payload) = wire.split_once("\r\n\r\n").expect("SSE headers");
+            assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+            let events: Vec<Value> = payload
+                .split("\n\n")
+                .filter(|frame| !frame.is_empty())
+                .map(|frame| {
+                    let (_, data) = frame.split_once('\n').expect("SSE event data");
+                    serde_json::from_str(data.strip_prefix("data: ").expect("SSE data prefix"))
+                        .expect("SSE event JSON")
+                })
+                .collect();
+            assert!(
+                events.len() >= 6,
+                "complete stream has its lifecycle events"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["sequence_number"].as_u64())
+                    .collect::<Vec<_>>(),
+                (0..events.len())
+                    .map(|index| Some(index as u64))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(events[0]["type"], "response.created");
+            assert_eq!(events[1]["type"], "response.output_item.added");
+            assert_eq!(events[2]["type"], "response.content_part.added");
+            let terminal = events.last().expect("terminal event");
+            assert!(
+                matches!(
+                    terminal["type"].as_str(),
+                    Some("response.completed" | "response.incomplete")
+                ),
+                "stream must end completed or capped incomplete"
+            );
+            let response = terminal["response"].clone();
+            let text = response["output"][0]["content"][0]["text"]
+                .as_str()
+                .expect("terminal assistant text")
+                .to_owned();
+            let deltas = events
+                .iter()
+                .filter(|event| event["type"] == "response.output_text.delta")
+                .map(|event| event["delta"].as_str().expect("text delta"))
+                .collect::<String>();
+            assert_eq!(deltas, text, "stream deltas reconstruct terminal text");
+            let usage = response["usage"].clone();
+            assert!(
+                usage["input_tokens"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+            );
+            assert!(
+                usage["output_tokens"]
+                    .as_u64()
+                    .is_some_and(|value| value > 0)
+            );
+            assert_eq!(
+                usage["total_tokens"].as_u64(),
+                Some(
+                    usage["input_tokens"].as_u64().expect("input tokens")
+                        + usage["output_tokens"].as_u64().expect("output tokens")
+                )
+            );
+            (
+                terminal["type"].as_str().expect("terminal type").to_owned(),
+                text,
+                usage,
+            )
+        }
+
+        #[test]
+        #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+        fn checkpoint_stream_reset_after_delta_allows_fresh_response() {
+            let model = env::var_os("METALLIX_QWEN_MODEL")
+                .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+            let limits = ResidentChatLimits::from_mib(2_048, 1_024);
+            let mut session = ChatSession::load(std::path::Path::new(&model), limits)
+                .expect("checkpoint session load");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+            let address = listener.local_addr().expect("listener address");
+
+            let baseline_client = client(address, body(32));
+            let (connection, request, messages) = accepted_request(&listener);
+            respond(
+                connection,
+                &request,
+                &messages,
+                &[],
+                &mut session,
+                "baseline",
+                Duration::from_secs(60),
+            )
+            .expect("uninterrupted baseline response");
+            let baseline =
+                terminal_text_and_usage(baseline_client.join().expect("baseline client"));
+
+            let reset_client = reset_after_delta(address, body(64));
+            let (connection, request, messages) = accepted_request(&listener);
+            let mut observed = ObservedSession {
+                session: &mut session,
+                callback_failed: false,
+                generation_failed: false,
+            };
+            let reset_error = respond(
+                connection,
+                &request,
+                &messages,
+                &[],
+                &mut observed,
+                "reset",
+                Duration::from_secs(60),
+            )
+            .expect_err("post-delta TCP reset must fail a later stream write");
+            assert!(
+                !reset_error.is_empty(),
+                "reset failure carries transport context"
+            );
+            assert!(
+                observed.callback_failed,
+                "reset must reach the generation callback"
+            );
+            assert!(
+                observed.generation_failed,
+                "generation must propagate the callback failure"
+            );
+            let reset_prefix = reset_client.join().expect("reset client");
+            assert!(
+                reset_prefix
+                    .windows(b"response.output_text.delta".len())
+                    .any(|window| window == b"response.output_text.delta"),
+                "client observed a real generated delta before resetting"
+            );
+
+            let recovery_client = client(address, body(32));
+            let (connection, request, messages) = accepted_request(&listener);
+            respond(
+                connection,
+                &request,
+                &messages,
+                &[],
+                &mut session,
+                "recovery",
+                Duration::from_secs(60),
+            )
+            .expect("fresh response after reset");
+            let recovery =
+                terminal_text_and_usage(recovery_client.join().expect("recovery client"));
+            assert_eq!(
+                recovery, baseline,
+                "fresh response matches uninterrupted baseline"
+            );
+        }
     }
 
     #[test]
