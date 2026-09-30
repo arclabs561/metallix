@@ -141,6 +141,30 @@ misassigned mates, dtypes, ranks, zero dimensions, scale dimensions, grouping,
 and logical-width overflow. These do not allocate tensor payloads. Local
 execution receipt: `artifacts/check-v41-pair-shard09.log`.
 
+### Bounded selected-expert execution
+
+`V41ExpertI8ScalePairs` validates W1/W2/W3 for one routed expert and full
+header/index agreement for its shard. `read_local_shard` opens the file,
+reparses its bounded header, checks the declared file length and rebinds all six
+cached tensor ranges before reading them. Payload allocation is limited by the
+caller and a 32 MiB ceiling. W1/W3 must share geometry, W2 must transpose that
+geometry, and E8M0 NaN codes are rejected. This validates local structure; the
+caller must separately authenticate revision and payload bytes.
+
+For the pinned source INT8 layout above, the three returned packed-byte/scale
+pairs can construct `Fp4ExpertWeights`. Its `forward_token` checks the BF16
+input and work budget, then applies W1/W3, source-positioned SwiGLU and W2.
+An optional route weight is applied inside SwiGLU before W2. The pinned
+converter's representation-preserving FP4 branch establishes the low-nibble-first
+layout; the reader itself does not infer packing from the INT8 dtype.
+
+The expert path computes each FP32 projection once into private result storage.
+The public caller-buffer FP4 reference retains its unchanged-on-error contract.
+Neither API performs routing, adds shared experts, or establishes full-checkpoint
+generation. Synthetic file tests cover budget, truncation, header/range rebinding
+and scale rejection; independently sourced payload/output comparisons remain a
+separate qualification for each chosen checkpoint and input.
+
 ## Next numerical join: FP4 linear runtime contract
 
 Source: pinned V4.1

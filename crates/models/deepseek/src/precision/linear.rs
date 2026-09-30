@@ -62,6 +62,12 @@ pub enum Fp4LinearError {
         /// Failing derived buffer role.
         field: &'static str,
     },
+    /// A private staged FP32 result buffer could not be reserved.
+    #[error("could not allocate {elements} FP32 FP4 linear result elements")]
+    AllocationFailed {
+        /// Requested result elements.
+        elements: usize,
+    },
     /// An E4M3FN activation code denotes NaN.
     #[error("nonfinite E4M3FN activation at element {element}")]
     NonFiniteActivation {
@@ -162,6 +168,56 @@ pub fn fp4_linear_runtime_f32(
     Ok(())
 }
 
+/// Computes one checked FP32 FP4 linear result into owned staging storage.
+///
+/// This crate-private leaf shares the direct-runtime validation and scalar
+/// block order with [`fp4_linear_runtime_f32`], but retains no caller buffer.
+/// It permits composed leaves that do not expose partial output to compute each
+/// scalar result only once.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the direct runtime-buffer contract keeps each shape and scale role explicit"
+)]
+pub(crate) fn fp4_linear_runtime_f32_owned(
+    activation_codes: &[u8],
+    activation_scales: &[u8],
+    weight_codes: &[u8],
+    weight_scales: &[u8],
+    rows: usize,
+    reduction: usize,
+    outputs: usize,
+    activation_group: ActivationGroup,
+) -> Result<Vec<f32>, Fp4LinearError> {
+    let shape = LinearShape::new(rows, reduction, outputs, activation_group)?;
+    shape.validate_input_lengths(
+        activation_codes,
+        activation_scales,
+        weight_codes,
+        weight_scales,
+    )?;
+    validate_codes(activation_codes, activation_scales, weight_scales)?;
+    let output_elements = shape.output_elements()?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_elements)
+        .map_err(|_| Fp4LinearError::AllocationFailed {
+            elements: output_elements,
+        })?;
+    for row in 0..shape.rows {
+        for column in 0..shape.outputs {
+            output.push(shape.compute(
+                activation_codes,
+                activation_scales,
+                weight_codes,
+                weight_scales,
+                row,
+                column,
+            )?);
+        }
+    }
+    Ok(output)
+}
+
 #[derive(Clone, Copy)]
 struct LinearShape {
     rows: usize,
@@ -207,6 +263,22 @@ impl LinearShape {
         weight_scales: &[u8],
         output: &[f32],
     ) -> Result<(), Fp4LinearError> {
+        self.validate_input_lengths(
+            activation_codes,
+            activation_scales,
+            weight_codes,
+            weight_scales,
+        )?;
+        check_length("output", Some(self.output_elements()?), output.len())
+    }
+
+    fn validate_input_lengths(
+        self,
+        activation_codes: &[u8],
+        activation_scales: &[u8],
+        weight_codes: &[u8],
+        weight_scales: &[u8],
+    ) -> Result<(), Fp4LinearError> {
         check_length(
             "activation_codes",
             self.rows.checked_mul(self.reduction),
@@ -227,7 +299,13 @@ impl LinearShape {
             self.outputs.checked_mul(self.weight_blocks_per_row),
             weight_scales.len(),
         )?;
-        check_length("output", self.rows.checked_mul(self.outputs), output.len())
+        Ok(())
+    }
+
+    fn output_elements(self) -> Result<usize, Fp4LinearError> {
+        self.rows
+            .checked_mul(self.outputs)
+            .ok_or(Fp4LinearError::ShapeOverflow { field: "output" })
     }
 
     fn compute(
@@ -314,7 +392,9 @@ fn validate_codes(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
+    use super::{
+        ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32, fp4_linear_runtime_f32_owned,
+    };
 
     const ONE: u8 = 0x38;
     const NEG_ONE: u8 = 0xb8;
@@ -355,6 +435,66 @@ mod tests {
         // Output 0: 16*1*1 + 16*2*(1/2) = 32.
         // Output 1: 32*1*2 + 32*2*1 = 128.
         assert_bits_eq(&output, &[32.0, 128.0]);
+    }
+
+    #[test]
+    fn owned_result_matches_public_buffer_and_preserves_input_errors() {
+        let activations = [ONE; 64];
+        let activation_scales = [127, 128];
+        let mut weights = [0x11; 64];
+        weights[32..].fill(0x22);
+        let weight_scales = [127, 126, 128, 127];
+        let mut public = [0.0; 2];
+        fp4_linear_runtime_f32(
+            &activations,
+            &activation_scales,
+            &weights,
+            &weight_scales,
+            1,
+            64,
+            2,
+            ActivationGroup::Elements32,
+            &mut public,
+        )
+        .expect("public scalar result");
+        let owned = fp4_linear_runtime_f32_owned(
+            &activations,
+            &activation_scales,
+            &weights,
+            &weight_scales,
+            1,
+            64,
+            2,
+            ActivationGroup::Elements32,
+        )
+        .expect("owned scalar result");
+        assert_bits_eq(&owned, &public);
+        assert_eq!(
+            fp4_linear_runtime_f32_owned(
+                &activations,
+                &activation_scales,
+                &weights,
+                &[255, 127, 127, 127],
+                1,
+                64,
+                2,
+                ActivationGroup::Elements32,
+            ),
+            Err(Fp4LinearError::NonFiniteWeightScale { index: 0 })
+        );
+        assert_eq!(
+            fp4_linear_runtime_f32_owned(
+                &[ONE; 32],
+                &[127],
+                &[0x11; 32],
+                &[127, 254],
+                1,
+                32,
+                2,
+                ActivationGroup::Elements32,
+            ),
+            Err(Fp4LinearError::ValueOverflow { row: 0, output: 1 })
+        );
     }
 
     #[test]

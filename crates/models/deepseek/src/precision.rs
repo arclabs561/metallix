@@ -19,6 +19,7 @@ pub use fp32_linear::{Fp32LinearError, MAX_FP32_LINEAR_ELEMENTS, fp32_linear_ref
 mod activation;
 pub use activation::{ActivationQuantError, quantize_bf16_activations_e4m3fn};
 mod linear;
+pub(crate) use linear::fp4_linear_runtime_f32_owned;
 pub use linear::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
 mod fp8_linear;
 pub use fp8_linear::{Fp8LinearError, fp8_linear_runtime_f32};

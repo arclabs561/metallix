@@ -22,8 +22,10 @@ pub mod startup;
 pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
 pub use checkpoint::{
-    V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection, V41SafetensorsHeader,
-    V41SafetensorsHeaderError, V41StorageDtype, V41TensorRange,
+    MAX_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,
+    V41ExpertI8ScalePairs, V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
+    V41ExpertProjectionPayload, V41SafetensorsHeader, V41SafetensorsHeaderError, V41StorageDtype,
+    V41TensorRange,
 };
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]

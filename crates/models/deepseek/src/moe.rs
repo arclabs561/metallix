@@ -10,7 +10,7 @@ use thiserror::Error;
 use crate::{
     precision::{
         ActivationGroup, ActivationQuantError, Fp4LinearError, Fp8LinearError, bf16_to_f32,
-        f32_to_bf16_rne, fp4_linear_runtime_f32, fp8_linear_runtime_f32,
+        f32_to_bf16_rne, fp4_linear_runtime_f32_owned, fp8_linear_runtime_f32,
         quantize_bf16_activations_e4m3fn,
     },
     routing::{ExpertRoute, FlashGateProjectionError, flash_bf16_gate_routes},
@@ -123,6 +123,43 @@ impl<'a> Fp4ExpertWeights<'a> {
             hidden_width,
             intermediate_width,
         })
+    }
+
+    /// Executes one checked routed FP4 expert over a BF16 hidden token.
+    ///
+    /// This is the routed-expert leaf only: it does not select a route, add a
+    /// shared expert, or accumulate across experts. A supplied route weight is
+    /// applied within the source `SwiGLU` stage before W2, matching
+    /// [`MoEReference::forward_token`].
+    pub fn forward_token(
+        &self,
+        input_bf16: &[u16],
+        swiglu_limit: f32,
+        route_weight: Option<f32>,
+    ) -> Result<Vec<u16>, MoEError> {
+        if input_bf16.len() != self.hidden_width {
+            return Err(MoEError::Length {
+                field: "input_bf16",
+                actual: input_bf16.len(),
+                expected: self.hidden_width,
+            });
+        }
+        if !swiglu_limit.is_finite() || swiglu_limit < 0.0 {
+            return Err(MoEError::InvalidSwiGluLimit);
+        }
+        if route_weight.is_some_and(|weight| !weight.is_finite() || weight < 0.0) {
+            return Err(MoEError::InvalidRouteWeight);
+        }
+        validate_expert_work(self.hidden_width, self.intermediate_width)?;
+        for (element, &bits) in input_bf16.iter().enumerate() {
+            if !bf16_to_f32(bits).is_finite() {
+                return Err(MoEError::NonFinite {
+                    stage: "FP4 expert input",
+                    element,
+                });
+            }
+        }
+        project_fp4_expert(input_bf16, self, swiglu_limit, route_weight)
     }
 }
 
@@ -292,12 +329,8 @@ impl<'a> MoEReference<'a> {
                 .routed
                 .get(route.expert_index())
                 .ok_or(MoEError::RouteOutOfRange)?;
-            let output = project_fp4_expert(
-                input_bf16,
-                expert,
-                self.config.swiglu_limit,
-                Some(route.weight()),
-            )?;
+            let output =
+                expert.forward_token(input_bf16, self.config.swiglu_limit, Some(route.weight()))?;
             accumulate_bf16(&mut accumulator, &output, "routed accumulation")?;
             selected_outputs.push(output);
         }
@@ -382,6 +415,9 @@ pub enum MoEError {
     /// Route scale must be finite and positive.
     #[error("MoE route scale must be finite and positive")]
     InvalidRouteScale,
+    /// A direct routed-expert weight must be finite and nonnegative.
+    #[error("FP4 expert route weight must be finite and nonnegative")]
+    InvalidRouteWeight,
     /// The reference needs at least one routed expert.
     #[error("MoE requires at least one routed expert")]
     NoRoutedExperts,
@@ -531,6 +567,18 @@ fn checked_product(field: &'static str, left: usize, right: usize) -> Result<usi
         .ok_or(MoEError::ShapeOverflow { field })
 }
 
+fn validate_expert_work(hidden_width: usize, intermediate_width: usize) -> Result<(), MoEError> {
+    let projection = checked_product("expert work", hidden_width, intermediate_width)?;
+    let work = projection.checked_mul(3).ok_or(MoEError::WorkOverflow)?;
+    if work > MAX_MOE_WORK {
+        return Err(MoEError::WorkTooLarge {
+            elements: work,
+            max: MAX_MOE_WORK,
+        });
+    }
+    Ok(())
+}
+
 fn allocate_u8(field: &'static str, length: usize) -> Result<Vec<u8>, MoEError> {
     let mut result = Vec::new();
     result
@@ -565,8 +613,7 @@ fn fp4_projection(
         &mut activation_codes,
         &mut activation_scales,
     )?;
-    let mut projected = allocate_f32("FP4 projection", output_width)?;
-    fp4_linear_runtime_f32(
+    let projected = fp4_linear_runtime_f32_owned(
         &activation_codes,
         &activation_scales,
         codes,
@@ -575,7 +622,6 @@ fn fp4_projection(
         input.len(),
         output_width,
         ActivationGroup::Elements32,
-        &mut projected,
     )?;
     narrow_row(&projected, "FP4 linear output")
 }
@@ -815,6 +861,78 @@ mod tests {
             .expect("finite source-order expert");
         assert_eq!(first, vec![0x4290; WIDTH]); // BF16 72.
         assert_eq!(second, vec![0x4250; WIDTH]); // BF16 52.
+    }
+
+    #[test]
+    fn fp4_expert_leaf_matches_existing_composition_and_rejects_preflight_errors() {
+        let buffers = fp4_buffers();
+        let expert = Fp4ExpertWeights::new(
+            WIDTH,
+            WIDTH,
+            &buffers.w1,
+            &buffers.w1_scales,
+            &buffers.w2,
+            &buffers.w2_scales,
+            &buffers.w3,
+            &buffers.w3_scales,
+        )
+        .expect("complete packed FP4 expert");
+        let input = [0x3f80; WIDTH];
+        assert_eq!(
+            expert
+                .forward_token(&input, 4.0, Some(0.3))
+                .expect("checked FP4 expert leaf"),
+            project_fp4_expert(&input, &expert, 4.0, Some(0.3))
+                .expect("existing FP4 expert composition"),
+        );
+        assert!(matches!(
+            expert.forward_token(&input[..WIDTH - 1], 4.0, None),
+            Err(MoEError::Length {
+                field: "input_bf16",
+                ..
+            })
+        ));
+        let mut nonfinite = input;
+        nonfinite[3] = 0x7f80;
+        assert!(matches!(
+            expert.forward_token(&nonfinite, 4.0, None),
+            Err(MoEError::NonFinite {
+                stage: "FP4 expert input",
+                element: 3,
+            })
+        ));
+        assert!(matches!(
+            expert.forward_token(&input, f32::NAN, None),
+            Err(MoEError::InvalidSwiGluLimit)
+        ));
+        assert!(matches!(
+            expert.forward_token(&input, 4.0, Some(-0.1)),
+            Err(MoEError::InvalidRouteWeight)
+        ));
+    }
+
+    #[test]
+    fn fp4_expert_leaf_rejects_work_before_encoded_projection_buffers() {
+        const HIDDEN: usize = 5_120;
+        const INTERMEDIATE: usize = 17_504;
+        let expert = Fp4ExpertWeights {
+            w1_codes: &[],
+            w1_scales: &[],
+            w2_codes: &[],
+            w2_scales: &[],
+            w3_codes: &[],
+            w3_scales: &[],
+            hidden_width: HIDDEN,
+            intermediate_width: INTERMEDIATE,
+        };
+        let input = vec![0x3f80; HIDDEN];
+        assert!(matches!(
+            expert.forward_token(&input, 0.0, None),
+            Err(MoEError::WorkTooLarge {
+                elements,
+                max: super::MAX_MOE_WORK,
+            }) if elements == 3 * HIDDEN * INTERMEDIATE
+        ));
     }
 
     #[test]

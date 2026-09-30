@@ -1,10 +1,11 @@
-//! Bounded, header-only DeepSeek-V4.1 safetensors validation.
+//! Bounded DeepSeek-V4.1 safetensors metadata and selected-expert payload reads.
 //!
 //! This module consumes an already-bounded safetensors JSON header and a
-//! declared shard length. It never opens a file, reads payload bytes, or
-//! infers a checkpoint's packed-runtime layout. In particular, packed FP4
-//! representations remain unsupported until a separate file-layout contract
-//! establishes their storage and scale association.
+//! declared shard length. Header parsing itself never opens a file or reads
+//! payload bytes. The selected-expert reader separately revalidates one local
+//! shard header and reads six named ranges under an explicit allocation cap.
+//! It returns raw packed bytes only; source packing and runtime execution stay
+//! outside this module's contract.
 
 use std::{collections::BTreeMap, ops::Range};
 
@@ -16,10 +17,14 @@ use crate::manifest::V41SafetensorsIndex;
 pub mod mlx;
 pub use mlx::{LayerZeroAttentionActivation, LayerZeroQkvResident};
 mod source_fp4;
-pub use source_fp4::{V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection};
+pub use source_fp4::{
+    MAX_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,
+    V41ExpertI8ScalePairs, V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
+    V41ExpertProjectionPayload,
+};
 
 const SAFETENSORS_PREFIX_BYTES: u64 = 8;
-const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
+pub(super) const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A fixed-width storage dtype established by the held safetensors contract.
 ///

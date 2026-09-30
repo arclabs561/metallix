@@ -1,18 +1,36 @@
-//! Selected source-I8 expert weight/scale metadata, without payload decoding.
+//! Selected source-I8 expert weight/scale metadata and bounded payload reads.
 //!
 //! The pinned converter treats source `I8` expert weights as packed pairs: a
 //! `[N, P]` source tensor describes a logical `[N, 2P]` matrix with one E8M0
 //! scale per 32 logical reduction elements. This descriptor establishes only
-//! that selected header and index metadata has that shape. It does not read a
-//! file, identify a revision, decode payload bytes, establish nibble order, or
-//! support other checkpoint layouts.
+//! that selected header and index metadata has that shape. The pair descriptor
+//! does not read a file, identify a revision, decode payload bytes, establish
+//! a packing convention, or support other checkpoint layouts. The separate
+//! three-pair reader verifies the local header again and returns only its six
+//! exact raw ranges; execution must bind those bytes to a separately qualified
+//! source-packing contract.
+
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use thiserror::Error;
 
-use super::{V41SafetensorsHeader, V41StorageDtype, V41TensorRange};
+use super::{
+    MAX_HEADER_BYTES, V41SafetensorsHeader, V41SafetensorsHeaderError, V41StorageDtype,
+    V41TensorRange,
+};
 use crate::manifest::V41SafetensorsIndex;
 
 const WEIGHT_GROUP: u64 = 32;
+
+/// The largest payload a one-expert reader may materialize.
+///
+/// Callers supply their own stricter limit. This ceiling prevents a malformed
+/// microartifact request from becoming a whole-checkpoint allocation.
+pub const MAX_EXPERT_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The canonical routed-expert projection named by a source checkpoint tensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +163,333 @@ impl V41ExpertI8ScalePair {
     pub const fn logical_shape(&self) -> [u64; 2] {
         self.logical_shape
     }
+}
+
+/// The three validated packed projections for one exact routed expert.
+///
+/// This binds selected `w1`, `w2`, and `w3` pairs to one layer, expert, index
+/// shard, and safetensors header. It reads a bounded payload but does not
+/// establish source packing or execute the expert.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V41ExpertI8ScalePairs {
+    w1: V41ExpertI8ScalePair,
+    w2: V41ExpertI8ScalePair,
+    w3: V41ExpertI8ScalePair,
+}
+
+impl V41ExpertI8ScalePairs {
+    /// Validates all three canonical projection pairs for one routed expert.
+    pub fn parse(
+        header: &V41SafetensorsHeader,
+        index: &V41SafetensorsIndex,
+        shard: &str,
+        layer: u64,
+        expert: u64,
+    ) -> Result<Self, V41ExpertPayloadError> {
+        header
+            .validate_index_shard(index, shard)
+            .map_err(V41ExpertPayloadError::HeaderIndex)?;
+        let prefix = format!("layers.{layer}.ffn.experts.{expert}");
+        let w1 = V41ExpertI8ScalePair::parse(header, index, shard, &format!("{prefix}.w1.weight"))?;
+        let w2 = V41ExpertI8ScalePair::parse(header, index, shard, &format!("{prefix}.w2.weight"))?;
+        let w3 = V41ExpertI8ScalePair::parse(header, index, shard, &format!("{prefix}.w3.weight"))?;
+        validate_expert_geometry(&w1, &w2, &w3)?;
+        Ok(Self { w1, w2, w3 })
+    }
+
+    /// Returns the exact first gate projection metadata.
+    #[must_use]
+    pub const fn w1(&self) -> &V41ExpertI8ScalePair {
+        &self.w1
+    }
+
+    /// Returns the exact down projection metadata.
+    #[must_use]
+    pub const fn w2(&self) -> &V41ExpertI8ScalePair {
+        &self.w2
+    }
+
+    /// Returns the exact up projection metadata.
+    #[must_use]
+    pub const fn w3(&self) -> &V41ExpertI8ScalePair {
+        &self.w3
+    }
+
+    /// Returns the group-aligned hidden width shared by `w1` and `w3`.
+    #[must_use]
+    pub const fn hidden_width(&self) -> u64 {
+        self.w1.logical_shape()[1]
+    }
+
+    /// Returns the group-aligned routed-expert intermediate width.
+    #[must_use]
+    pub const fn intermediate_width(&self) -> u64 {
+        self.w1.logical_shape()[0]
+    }
+
+    /// Reads exactly the six selected payload intervals from a local shard.
+    ///
+    /// The file's bounded prefix/header is reparsed and compared with `header`
+    /// before payload allocation or reading. Its regular-file length must equal
+    /// the header's declared complete shard length. The selected intervals are
+    /// budgeted before allocating any returned buffer.
+    pub fn read_local_shard(
+        &self,
+        shard: &Path,
+        header: &V41SafetensorsHeader,
+        max_bytes: u64,
+    ) -> Result<V41ExpertI8ScalePayload, V41ExpertPayloadError> {
+        let total_bytes = self.total_payload_bytes()?;
+        if total_bytes > max_bytes || total_bytes > MAX_EXPERT_PAYLOAD_BYTES {
+            return Err(V41ExpertPayloadError::PayloadBudget {
+                requested_bytes: total_bytes,
+                max_bytes: max_bytes.min(MAX_EXPERT_PAYLOAD_BYTES),
+            });
+        }
+        let mut file = File::open(shard).map_err(V41ExpertPayloadError::Io)?;
+        let metadata = file.metadata().map_err(V41ExpertPayloadError::Io)?;
+        if !metadata.is_file() {
+            return Err(V41ExpertPayloadError::NotRegularFile);
+        }
+        if metadata.len() != header.file_bytes() {
+            return Err(V41ExpertPayloadError::ShardLength {
+                actual_bytes: metadata.len(),
+                expected_bytes: header.file_bytes(),
+            });
+        }
+        let actual_header = read_and_parse_header(&mut file, metadata.len())?;
+        if actual_header != *header {
+            return Err(V41ExpertPayloadError::HeaderMismatch);
+        }
+        self.bind_header(&actual_header)?;
+        let w1 = read_pair(&mut file, &self.w1)?;
+        let w2 = read_pair(&mut file, &self.w2)?;
+        let w3 = read_pair(&mut file, &self.w3)?;
+        Ok(V41ExpertI8ScalePayload { w1, w2, w3 })
+    }
+
+    fn total_payload_bytes(&self) -> Result<u64, V41ExpertPayloadError> {
+        [&self.w1, &self.w2, &self.w3]
+            .into_iter()
+            .try_fold(0_u64, |total, pair| {
+                total
+                    .checked_add(pair.weight_range().byte_length())
+                    .and_then(|value| value.checked_add(pair.scale_range().byte_length()))
+                    .ok_or(V41ExpertPayloadError::PayloadLengthOverflow)
+            })
+    }
+
+    fn bind_header(&self, header: &V41SafetensorsHeader) -> Result<(), V41ExpertPayloadError> {
+        for pair in [&self.w1, &self.w2, &self.w3] {
+            let weight = header.tensor(pair.weight_name()).ok_or_else(|| {
+                V41ExpertPayloadError::PairHeaderMismatch {
+                    tensor: pair.weight_name().to_owned(),
+                }
+            })?;
+            let scale = header.tensor(pair.scale_name()).ok_or_else(|| {
+                V41ExpertPayloadError::PairHeaderMismatch {
+                    tensor: pair.scale_name().to_owned(),
+                }
+            })?;
+            if weight != pair.weight_range() {
+                return Err(V41ExpertPayloadError::PairHeaderMismatch {
+                    tensor: pair.weight_name().to_owned(),
+                });
+            }
+            if scale != pair.scale_range() {
+                return Err(V41ExpertPayloadError::PairHeaderMismatch {
+                    tensor: pair.scale_name().to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact packed bytes for one projection of a selected routed expert.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V41ExpertProjectionPayload {
+    weight: Vec<u8>,
+    scales: Vec<u8>,
+}
+
+impl V41ExpertProjectionPayload {
+    /// Returns exact packed source-I8 bytes in header range order.
+    #[must_use]
+    pub fn weight(&self) -> &[u8] {
+        &self.weight
+    }
+
+    /// Returns exact E8M0 bytes in header range order.
+    #[must_use]
+    pub fn scales(&self) -> &[u8] {
+        &self.scales
+    }
+}
+
+/// Exact bounded payload bytes for `w1`, `w2`, and `w3` of one expert.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V41ExpertI8ScalePayload {
+    w1: V41ExpertProjectionPayload,
+    w2: V41ExpertProjectionPayload,
+    w3: V41ExpertProjectionPayload,
+}
+
+impl V41ExpertI8ScalePayload {
+    /// Returns first gate projection bytes.
+    #[must_use]
+    pub const fn w1(&self) -> &V41ExpertProjectionPayload {
+        &self.w1
+    }
+
+    /// Returns down projection bytes.
+    #[must_use]
+    pub const fn w2(&self) -> &V41ExpertProjectionPayload {
+        &self.w2
+    }
+
+    /// Returns up projection bytes.
+    #[must_use]
+    pub const fn w3(&self) -> &V41ExpertProjectionPayload {
+        &self.w3
+    }
+}
+
+/// A local selected-expert payload did not meet the bounded source contract.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum V41ExpertPayloadError {
+    /// The selected header and index do not agree for the named shard.
+    #[error("selected expert header/index identity failed: {0}")]
+    HeaderIndex(V41SafetensorsHeaderError),
+    /// One selected pair is malformed or assigned differently by the index.
+    #[error("selected expert pair failed: {0}")]
+    Pair(#[from] V41ExpertI8ScalePairError),
+    /// Selected projections do not form the expected one-expert geometry.
+    #[error("selected expert projections do not have w1/w3 equal and w2 transposed geometry")]
+    ProjectionGeometry,
+    /// Selected ranges exceed the caller's or reader's allocation cap.
+    #[error(
+        "selected expert payload needs {requested_bytes} bytes, above the {max_bytes}-byte limit"
+    )]
+    PayloadBudget {
+        requested_bytes: u64,
+        max_bytes: u64,
+    },
+    /// Summing selected ranges overflowed before allocation.
+    #[error("selected expert payload length overflowed")]
+    PayloadLengthOverflow,
+    /// The supplied shard path is not a regular file.
+    #[error("selected expert shard is not a regular file")]
+    NotRegularFile,
+    /// Local shard length differs from supplied header's declared length.
+    #[error("selected expert shard length is {actual_bytes}, expected {expected_bytes}")]
+    ShardLength {
+        actual_bytes: u64,
+        expected_bytes: u64,
+    },
+    /// Local bounded header differs from the header that selected the ranges.
+    #[error("selected expert shard header differs from supplied header")]
+    HeaderMismatch,
+    /// A cached selected range no longer matches the revalidated shard header.
+    #[error("selected expert cached range differs from revalidated header tensor {tensor}")]
+    PairHeaderMismatch {
+        /// Exact selected tensor whose cached range is stale or absent.
+        tensor: String,
+    },
+    /// The local bounded header is malformed.
+    #[error("could not parse selected expert shard header: {0}")]
+    Header(#[from] V41SafetensorsHeaderError),
+    /// An exact local-range read failed.
+    #[error("could not read selected expert payload: {0}")]
+    Io(#[source] std::io::Error),
+    /// Reserving one already-budgeted selected range failed.
+    #[error("could not allocate selected expert payload range")]
+    Allocation,
+    /// An E8M0 scale code denotes NaN.
+    #[error("selected expert {projection:?} scale {index} is nonfinite")]
+    NonFiniteScale {
+        projection: V41ExpertProjection,
+        index: usize,
+    },
+}
+
+fn validate_expert_geometry(
+    w1: &V41ExpertI8ScalePair,
+    w2: &V41ExpertI8ScalePair,
+    w3: &V41ExpertI8ScalePair,
+) -> Result<(), V41ExpertPayloadError> {
+    let same_identity = [w1, w2, w3].into_iter().all(|pair| {
+        pair.layer() == w1.layer() && pair.expert() == w1.expert() && pair.shard() == w1.shard()
+    });
+    let [intermediate, hidden] = w1.logical_shape();
+    if !same_identity
+        || w1.projection() != V41ExpertProjection::W1
+        || w2.projection() != V41ExpertProjection::W2
+        || w3.projection() != V41ExpertProjection::W3
+        || w3.logical_shape() != [intermediate, hidden]
+        || w2.logical_shape() != [hidden, intermediate]
+    {
+        return Err(V41ExpertPayloadError::ProjectionGeometry);
+    }
+    Ok(())
+}
+
+fn read_and_parse_header(
+    file: &mut File,
+    file_bytes: u64,
+) -> Result<V41SafetensorsHeader, V41ExpertPayloadError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(V41ExpertPayloadError::Io)?;
+    let mut prefix = [0_u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(V41ExpertPayloadError::Io)?;
+    let header_bytes = u64::from_le_bytes(prefix);
+    if header_bytes > MAX_HEADER_BYTES {
+        return Err(V41SafetensorsHeaderError::HeaderTooLarge { header_bytes }.into());
+    }
+    let header_len = usize::try_from(header_bytes)
+        .map_err(|_| V41SafetensorsHeaderError::HeaderTooLarge { header_bytes })?;
+    let mut prefixed_header = Vec::with_capacity(8 + header_len);
+    prefixed_header.extend_from_slice(&prefix);
+    prefixed_header.resize(8 + header_len, 0);
+    file.read_exact(&mut prefixed_header[8..])
+        .map_err(V41ExpertPayloadError::Io)?;
+    V41SafetensorsHeader::parse_prefixed_header(&prefixed_header, file_bytes)
+        .map_err(V41ExpertPayloadError::Header)
+}
+
+fn read_pair(
+    file: &mut File,
+    pair: &V41ExpertI8ScalePair,
+) -> Result<V41ExpertProjectionPayload, V41ExpertPayloadError> {
+    let weight = read_range(file, pair.weight_range())?;
+    let scales = read_range(file, pair.scale_range())?;
+    if let Some((index, _)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, code)| **code == u8::MAX)
+    {
+        return Err(V41ExpertPayloadError::NonFiniteScale {
+            projection: pair.projection(),
+            index,
+        });
+    }
+    Ok(V41ExpertProjectionPayload { weight, scales })
+}
+
+fn read_range(file: &mut File, range: &V41TensorRange) -> Result<Vec<u8>, V41ExpertPayloadError> {
+    let length = usize::try_from(range.byte_length())
+        .map_err(|_| V41ExpertPayloadError::PayloadLengthOverflow)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| V41ExpertPayloadError::Allocation)?;
+    bytes.resize(length, 0);
+    file.seek(SeekFrom::Start(range.file_range().start))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(V41ExpertPayloadError::Io)?;
+    Ok(bytes)
 }
 
 /// A selected source-I8 expert pair does not meet the bounded metadata contract.
@@ -318,10 +663,21 @@ fn validate_shapes(
 
 #[cfg(test)]
 mod tests {
-    use super::{V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertProjection};
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{Seek, SeekFrom, Write},
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{
+        V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertI8ScalePairs,
+        V41ExpertPayloadError, V41ExpertProjection,
+    };
     use crate::{checkpoint::V41SafetensorsHeader, manifest::V41SafetensorsIndex};
 
     const SHARD: &str = "model-00009-of-00048.safetensors";
+    static TEST_SHARD_ID: AtomicU64 = AtomicU64::new(0);
 
     fn header(
         weight_name: &str,
@@ -558,6 +914,218 @@ mod tests {
         assert!(matches!(
             V41ExpertI8ScalePair::parse(&header, &index, SHARD, name),
             Err(V41ExpertI8ScalePairError::LogicalReductionOverflow)
+        ));
+    }
+
+    struct TestShard {
+        path: PathBuf,
+        header: V41SafetensorsHeader,
+        index: V41SafetensorsIndex,
+        header_json: String,
+    }
+
+    impl Drop for TestShard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn expert_shard(layer: u64, w2_shape: [u64; 2], swap_outer_names: bool) -> TestShard {
+        let tensors = [
+            ("w1", [32, 32], [32, 2], 0x11_u8, vec![127; 64]),
+            (
+                "w2",
+                w2_shape,
+                [w2_shape[0], w2_shape[1] * 2 / 32],
+                0x22,
+                vec![
+                    127;
+                    usize::try_from(w2_shape[0] * w2_shape[1] * 2 / 32).expect("small scales")
+                ],
+            ),
+            ("w3", [32, 32], [32, 2], 0x33, vec![127; 64]),
+        ];
+        let names = if swap_outer_names {
+            ["w3", "w2", "w1"]
+        } else {
+            ["w1", "w2", "w3"]
+        };
+        let mut offset = 0_u64;
+        let mut entries = Vec::new();
+        let mut payload = Vec::new();
+        let mut mappings = Vec::new();
+        for ((_, shape, scale_shape, byte, scales), projection) in tensors.into_iter().zip(names) {
+            let name = format!("layers.{layer}.ffn.experts.11.{projection}");
+            let weight_name = format!("{name}.weight");
+            let scale_name = format!("{name}.scale");
+            let weight_bytes = shape[0] * shape[1];
+            let scale_bytes = scale_shape[0] * scale_shape[1];
+            assert_eq!(
+                u64::try_from(scales.len()).expect("small scales"),
+                scale_bytes
+            );
+            entries.push(format!(
+                r#""{weight_name}":{{"dtype":"I8","shape":[{},{}],"data_offsets":[{offset},{}]}}"#,
+                shape[0],
+                shape[1],
+                offset + weight_bytes
+            ));
+            offset += weight_bytes;
+            entries.push(format!(
+                r#""{scale_name}":{{"dtype":"F8_E8M0FNU","shape":[{},{}],"data_offsets":[{offset},{}]}}"#,
+                scale_shape[0], scale_shape[1], offset + scale_bytes
+            ));
+            offset += scale_bytes;
+            mappings.push(format!(r#""{weight_name}":"{SHARD}""#));
+            mappings.push(format!(r#""{scale_name}":"{SHARD}""#));
+            payload.extend(vec![
+                byte;
+                usize::try_from(weight_bytes).expect("small weight")
+            ]);
+            payload.extend(scales);
+        }
+        let header_json = format!("{{{}}}", entries.join(","));
+        let file_bytes = 8 + u64::try_from(header_json.len()).expect("small header") + offset;
+        let header = V41SafetensorsHeader::parse(header_json.as_bytes(), file_bytes)
+            .expect("valid synthetic expert header");
+        let index = V41SafetensorsIndex::parse(&format!(
+            r#"{{"metadata":{{"total_size":{file_bytes}}},"weight_map":{{{}}}}}"#,
+            mappings.join(",")
+        ))
+        .expect("valid synthetic expert index");
+        let path = std::env::temp_dir().join(format!(
+            "metallix-v41-expert-payload-{}-{}.safetensors",
+            std::process::id(),
+            TEST_SHARD_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = File::create(&path).expect("create synthetic shard");
+        file.write_all(&(header_json.len() as u64).to_le_bytes())
+            .expect("write prefix");
+        file.write_all(header_json.as_bytes())
+            .expect("write header");
+        file.write_all(&payload).expect("write payload");
+        TestShard {
+            path,
+            header,
+            index,
+            header_json,
+        }
+    }
+
+    fn pairs(shard: &TestShard) -> V41ExpertI8ScalePairs {
+        V41ExpertI8ScalePairs::parse(&shard.header, &shard.index, SHARD, 7, 11)
+            .expect("valid selected expert")
+    }
+
+    #[test]
+    fn reads_exact_six_ranges_only_after_local_header_identity_check() {
+        let shard = expert_shard(7, [64, 16], false);
+        let pairs = pairs(&shard);
+        let payload = pairs
+            .read_local_shard(&shard.path, &shard.header, 10_000)
+            .expect("bounded six-range read");
+        assert_eq!(payload.w1().weight(), vec![0x11; 1_024]);
+        assert_eq!(payload.w1().scales(), vec![127; 64]);
+        assert_eq!(payload.w2().weight(), vec![0x22; 1_024]);
+        assert_eq!(payload.w2().scales(), vec![127; 64]);
+        assert_eq!(payload.w3().weight(), vec![0x33; 1_024]);
+        assert_eq!(payload.w3().scales(), vec![127; 64]);
+    }
+
+    #[test]
+    fn rejects_budget_before_local_payload_allocation() {
+        let shard = expert_shard(7, [64, 16], false);
+        let pairs = pairs(&shard);
+        let error = pairs
+            .read_local_shard(&shard.path, &shard.header, 1)
+            .expect_err("six ranges exceed one byte");
+        assert!(matches!(error, V41ExpertPayloadError::PayloadBudget { .. }));
+    }
+
+    #[test]
+    fn rejects_a_valid_but_stale_supplied_header_before_payload_read() {
+        let shard = expert_shard(7, [64, 16], false);
+        let pairs = pairs(&shard);
+        let stale_json = shard.header_json.replacen("layers.7", "layers.8", 1);
+        assert_eq!(stale_json.len(), shard.header_json.len());
+        let stale_header =
+            V41SafetensorsHeader::parse(stale_json.as_bytes(), shard.header.file_bytes())
+                .expect("same-sized stale header remains structurally valid");
+        assert!(matches!(
+            pairs.read_local_shard(&shard.path, &stale_header, 10_000),
+            Err(V41ExpertPayloadError::HeaderMismatch)
+        ));
+    }
+
+    #[test]
+    fn rejects_cached_pairs_from_a_different_compatible_shard_header() {
+        let first = expert_shard(7, [64, 16], false);
+        let replacement = expert_shard(8, [64, 16], false);
+        assert_eq!(first.header.file_bytes(), replacement.header.file_bytes());
+        let pairs = pairs(&first);
+        assert!(matches!(
+            pairs.read_local_shard(&replacement.path, &replacement.header, 10_000),
+            Err(V41ExpertPayloadError::PairHeaderMismatch { tensor })
+                if tensor == "layers.7.ffn.experts.11.w1.weight"
+        ));
+    }
+
+    #[test]
+    fn rejects_cached_ranges_when_same_names_and_length_have_permuted_offsets() {
+        let first = expert_shard(7, [64, 16], false);
+        let replacement = expert_shard(7, [64, 16], true);
+        assert_eq!(first.header.file_bytes(), replacement.header.file_bytes());
+        assert_eq!(first.index.tensor_count(), replacement.index.tensor_count());
+        let pairs = pairs(&first);
+        assert!(matches!(
+            pairs.read_local_shard(&replacement.path, &replacement.header, 10_000),
+            Err(V41ExpertPayloadError::PairHeaderMismatch { tensor })
+                if tensor == "layers.7.ffn.experts.11.w1.weight"
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_shard_before_payload_read() {
+        let shard = expert_shard(7, [64, 16], false);
+        let pairs = pairs(&shard);
+        OpenOptions::new()
+            .write(true)
+            .open(&shard.path)
+            .expect("open synthetic shard")
+            .set_len(shard.header.file_bytes() - 1)
+            .expect("truncate synthetic shard");
+        assert!(matches!(
+            pairs.read_local_shard(&shard.path, &shard.header, 10_000),
+            Err(V41ExpertPayloadError::ShardLength { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_nonfinite_selected_scale_without_returning_payload() {
+        let shard = expert_shard(7, [64, 16], false);
+        let pairs = pairs(&shard);
+        let offset = pairs.w3().scale_range().file_range().start;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&shard.path)
+            .expect("open synthetic shard");
+        file.seek(SeekFrom::Start(offset)).expect("seek scale");
+        file.write_all(&[u8::MAX]).expect("write NaN scale");
+        assert!(matches!(
+            pairs.read_local_shard(&shard.path, &shard.header, 10_000),
+            Err(V41ExpertPayloadError::NonFiniteScale {
+                projection: V41ExpertProjection::W3,
+                index: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_w2_that_is_not_the_w1_w3_transpose() {
+        let shard = expert_shard(7, [32, 32], false);
+        assert!(matches!(
+            V41ExpertI8ScalePairs::parse(&shard.header, &shard.index, SHARD, 7, 11),
+            Err(V41ExpertPayloadError::ProjectionGeometry)
         ));
     }
 }
