@@ -115,6 +115,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_julia_prefill_fixture.py"], False),
         ([sys.executable, "scripts/test_julia_full_prefill_fixture.py"], False),
         ([sys.executable, "scripts/test_julia_calibration_source_oracle.py"], False),
+        ([sys.executable, "scripts/test_julia_calibration_norm_tree.py"], False),
         (
             [sys.executable, "scripts/test_julia_calibration_projection_square.py"],
             False,
