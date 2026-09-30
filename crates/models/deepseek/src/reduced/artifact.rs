@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{RequestError, RequestStepOutput};
-use crate::indexer::query::IndexScoreExecution;
+use crate::indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution};
 
 mod model;
 
@@ -75,7 +75,12 @@ impl ReducedArtifact {
         ids: &[i64],
         prefill_tokens: usize,
     ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
-        self.run_with_score_execution(ids, prefill_tokens, IndexScoreExecution::Scalar)
+        self.run_with_execution(
+            ids,
+            prefill_tokens,
+            IndexScoreExecution::Scalar,
+            IndexKeyRotaryExecution::Scalar,
+        )
     }
 
     /// Runs with an explicit index-score implementation across L1, L3 and L4.
@@ -88,6 +93,25 @@ impl ReducedArtifact {
         ids: &[i64],
         prefill_tokens: usize,
         execution: IndexScoreExecution,
+    ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
+        self.run_with_execution(
+            ids,
+            prefill_tokens,
+            execution,
+            IndexKeyRotaryExecution::Scalar,
+        )
+    }
+
+    /// Runs with explicit index-score and index-key rotary implementations.
+    ///
+    /// Both device choices are bounded mixed-execution diagnostics; all other
+    /// arithmetic remains scalar and the artifact retains neither preference.
+    pub fn run_with_execution(
+        &self,
+        ids: &[i64],
+        prefill_tokens: usize,
+        score_execution: IndexScoreExecution,
+        key_rotary_execution: IndexKeyRotaryExecution,
     ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
         if prefill_tokens < 2 || prefill_tokens > ids.len() || ids.len() > self.config.max_tokens {
             return Err(ArtifactError::Invalid(String::from(
@@ -102,7 +126,14 @@ impl ReducedArtifact {
                 "input token is outside artifact vocabulary",
             )));
         }
-        model::run(&self.config, &self.tensors, ids, prefill_tokens, execution)
+        model::run(
+            &self.config,
+            &self.tensors,
+            ids,
+            prefill_tokens,
+            score_execution,
+            key_rotary_execution,
+        )
     }
 }
 

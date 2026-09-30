@@ -17,6 +17,7 @@ use crate::{
     },
     indexer::{
         cache::{IndexKeyPublicationId, IndexKeyStateError},
+        key::IndexKeyRotaryExecution,
         query::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexScoreExecution,
             ScoredQueryDiagnostic, ScoredQueryError, prepare_scored_query_with_execution,
@@ -286,6 +287,16 @@ impl LayerOneSession {
     #[must_use]
     pub const fn with_score_execution(mut self, score_execution: IndexScoreExecution) -> Self {
         self.score_execution = score_execution;
+        self
+    }
+
+    /// Selects the index-key rotary implementation for subsequent calls.
+    #[must_use]
+    pub fn with_key_rotary_execution(
+        mut self,
+        key_rotary_execution: IndexKeyRotaryExecution,
+    ) -> Self {
+        self.owner = self.owner.with_key_rotary_execution(key_rotary_execution);
         self
     }
 

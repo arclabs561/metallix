@@ -293,6 +293,28 @@ fn fixture() -> Fixture {
     fixture
 }
 
+#[cfg(feature = "metal")]
+fn assert_metal_keys(
+    latent: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: IndexKeyWeights<'_>,
+    layout: IndexKeyLayout,
+    prepared: &deepseek::indexer::key::IndexKeyDiagnostic,
+) {
+    use deepseek::indexer::key::{
+        IndexKeyRotaryExecution, prepare_index_keys_with_rotary_execution,
+    };
+    let device = prepare_index_keys_with_rotary_execution(
+        latent,
+        frequencies,
+        weights,
+        layout,
+        IndexKeyRotaryExecution::MetalFp32,
+    )
+    .expect("captured keys with Metal rotation");
+    assert_eq!(&device, prepared, "all BF16/FP4 stages");
+}
+
 #[test]
 fn native_owner_keys_match_captured_cache_append_regions() {
     let fixture = fixture();
@@ -345,6 +367,14 @@ fn native_owner_keys_match_captured_cache_append_regions() {
             layout,
         )
         .expect("native captured owner-key preparation");
+        #[cfg(feature = "metal")]
+        assert_metal_keys(
+            &latent,
+            &frequencies[case.start_pos * 16..(case.start_pos + positions) * 16],
+            weights,
+            layout,
+            &prepared,
+        );
         assert_eq!(
             prepared.post_fp4,
             cache[start..end],

@@ -91,6 +91,15 @@ fn run_cli_with_score_execution(
     prefill_tokens: usize,
     score_execution: Option<&str>,
 ) -> Output {
+    run_cli_with_execution(artifact, prefill_tokens, score_execution, None)
+}
+
+fn run_cli_with_execution(
+    artifact: &Path,
+    prefill_tokens: usize,
+    score_execution: Option<&str>,
+    key_rotary_execution: Option<&str>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
     command
         .args(["run-deepseek-reduced", "--artifact"])
@@ -99,6 +108,9 @@ fn run_cli_with_score_execution(
         .arg(prefill_tokens.to_string());
     if let Some(score_execution) = score_execution {
         command.args(["--score-execution", score_execution]);
+    }
+    if let Some(key_rotary_execution) = key_rotary_execution {
+        command.args(["--key-rotary-execution", key_rotary_execution]);
     }
     command.output().expect("reduced CLI launches")
 }
@@ -189,6 +201,50 @@ fn metal_cli_matches_scalar_library_output_for_both_fixed_partitions() {
     assert!(!rejected.status.success());
     assert!(rejected.stdout.is_empty());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("execution was rejected"));
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_key_rotation_alone_and_with_scores_matches_scalar_cli() {
+    let bytes = export_artifact();
+    let file = TempArtifact::from_bytes(&bytes);
+    let artifact = ReducedArtifact::parse(&bytes).unwrap();
+    for score in ["scalar", "metal-bf16"] {
+        for prefill in [4, 5] {
+            let output =
+                run_cli_with_execution(file.path(), prefill, Some(score), Some("metal-fp32"));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let mut expected = expected_output(&artifact, &bytes, prefill);
+            expected["backend"] = json!("mixed-cpu-metal");
+            expected["score_execution"] = json!(score);
+            expected["key_rotary_execution"] = json!("metal-fp32");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                expected
+            );
+        }
+        let rejected = run_cli_with_execution(file.path(), 7, Some(score), Some("metal-fp32"));
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+    }
+}
+
+#[test]
+fn unavailable_key_rotation_rejects_before_artifact_read() {
+    let value = if cfg!(feature = "metal") {
+        "unknown"
+    } else {
+        "metal-fp32"
+    };
+    let output = run_cli_with_execution(Path::new("missing-artifact"), 5, None, Some(value));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
 }
 
 #[test]

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use deepseek::indexer::query::IndexScoreExecution;
+use deepseek::indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution};
 
 use super::{HeadFixture, attention_capture};
 use serde_json::Value;
@@ -121,6 +121,7 @@ fn tail_definition(projection: &Value) -> request_tail::TailDefinition {
 fn with_canonical_request_model(
     corrupt_l4: bool,
     execution: IndexScoreExecution,
+    key_rotary: IndexKeyRotaryExecution,
     body: impl FnOnce(&deepseek::reduced::RequestModel<'_>, &super::Fixture, &HeadFixture, &[i64]),
 ) {
     let mut bundle = raw_canonical_bundle();
@@ -206,7 +207,7 @@ fn with_canonical_request_model(
                                     [deepseek::reduced::EngramDefinition::new(e1.0, e1.1), deepseek::reduced::EngramDefinition::new(e3.0, e3.1)],
                                     l1, l2, layer_three, layer_four, final_head,
                                     frequencies, std::num::NonZeroUsize::new(7).unwrap(),
-                                ).expect("canonical request model").with_score_execution(execution);
+                                ).expect("canonical request model").with_score_execution(execution).with_key_rotary_execution(key_rotary);
                                 body(&model, &l4_tail, &head, &trace[0]);
                             });
                                 },
@@ -228,6 +229,7 @@ fn check_request_recovery(
     use deepseek::reduced::{RequestError, RequestSession};
     let mut request = RequestSession::new(model).unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
+    assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
     let run_canonical = |request: &mut RequestSession<'_>| {
         [
             request.step(&ids[..5]).unwrap(),
@@ -244,6 +246,7 @@ fn check_request_recovery(
     // prefill published both owner chains and both Engram histories.
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
+    assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
     request.step(&ids[..5]).unwrap();
     assert!(matches!(
         request.step(&[-1]),
@@ -257,6 +260,7 @@ fn check_request_recovery(
     ));
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
+    assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
     assert_eq!(request.next_start(), 0);
     let replay = run_canonical(&mut request);
     request_tail::assert_source_outputs(fixture, head, &replay);
@@ -283,6 +287,7 @@ fn check_alternate_recovery(
     use deepseek::reduced::{RequestError, RequestSession};
     let mut request = RequestSession::new(model).unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
+    assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
     let run = |request: &mut RequestSession<'_>| {
         [
             request.step(&ids[..4]).unwrap(),
@@ -295,6 +300,7 @@ fn check_alternate_recovery(
     request_alternate::assert_source_outputs(&outputs, head);
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
+    assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
     request.step(&ids[..4]).unwrap();
     request.step(&ids[4..5]).unwrap();
     assert!(matches!(
@@ -307,6 +313,7 @@ fn check_alternate_recovery(
     ));
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
+    assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
     let replay = run(&mut request);
     request_alternate::assert_source_outputs(&replay, head);
     for (original, replayed) in outputs.iter().zip(&replay) {
@@ -329,6 +336,7 @@ fn runtime_request_matches_both_source_schedules_and_restarts() {
     with_canonical_request_model(
         false,
         IndexScoreExecution::Scalar,
+        IndexKeyRotaryExecution::Scalar,
         |model, fixture, head, ids| {
             check_request_recovery(model, fixture, head, ids);
             check_alternate_recovery(model, head, ids);
@@ -338,14 +346,15 @@ fn runtime_request_matches_both_source_schedules_and_restarts() {
 
 #[test]
 fn late_l4_failure_poison_requires_whole_request_reconstruction() {
-    check_late_l4_failure(IndexScoreExecution::Scalar);
+    check_late_l4_failure(IndexScoreExecution::Scalar, IndexKeyRotaryExecution::Scalar);
 }
 
-fn check_late_l4_failure(execution: IndexScoreExecution) {
+fn check_late_l4_failure(execution: IndexScoreExecution, key_rotary: IndexKeyRotaryExecution) {
     use deepseek::reduced::{RequestError, RequestSession};
-    with_canonical_request_model(true, execution, |model, _, _, ids| {
+    with_canonical_request_model(true, execution, key_rotary, |model, _, _, ids| {
         let mut request = RequestSession::new(model).unwrap();
         assert_eq!(request.score_execution(), model.score_execution());
+        assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
         assert!(matches!(
             request.step(&ids[..5]),
             Err(RequestError::LayerFour(_))
@@ -358,6 +367,7 @@ fn check_late_l4_failure(execution: IndexScoreExecution) {
         ));
         request.restart().unwrap();
         assert_eq!(request.score_execution(), model.score_execution());
+        assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
         assert_eq!(request.next_start(), 0);
         assert!(!request.is_poisoned());
         // The immutable malformed L4 weight stays malformed. Reaching L4 again
@@ -373,14 +383,27 @@ fn check_late_l4_failure(execution: IndexScoreExecution) {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_scored_request_matches_both_source_schedules_and_restarts() {
-    with_canonical_request_model(
-        false,
-        IndexScoreExecution::MetalBf16,
-        |model, fixture, head, ids| {
-            assert_eq!(model.score_execution(), IndexScoreExecution::MetalBf16);
+    for (score, key_rotary) in [
+        (
+            IndexScoreExecution::MetalBf16,
+            IndexKeyRotaryExecution::Scalar,
+        ),
+        (
+            IndexScoreExecution::Scalar,
+            IndexKeyRotaryExecution::MetalFp32,
+        ),
+        (
+            IndexScoreExecution::MetalBf16,
+            IndexKeyRotaryExecution::MetalFp32,
+        ),
+    ] {
+        with_canonical_request_model(false, score, key_rotary, |model, fixture, head, ids| {
+            assert_eq!(model.score_execution(), score);
+            assert_eq!(model.key_rotary_execution(), key_rotary);
             let scalar_model = model
                 .clone()
-                .with_score_execution(IndexScoreExecution::Scalar);
+                .with_score_execution(IndexScoreExecution::Scalar)
+                .with_key_rotary_execution(IndexKeyRotaryExecution::Scalar);
             for prefill in [4, 5] {
                 let mut scalar = deepseek::reduced::RequestSession::new(&scalar_model).unwrap();
                 let mut metal = deepseek::reduced::RequestSession::new(model).unwrap();
@@ -390,6 +413,19 @@ fn metal_scored_request_matches_both_source_schedules_and_restarts() {
                     let actual = metal.step(call).unwrap();
                     assert_eq!(actual.heads(), expected.heads());
                     assert_eq!(actual.residual(), expected.residual());
+                    assert_eq!(actual.layer_three().owner(), expected.layer_three().owner());
+                    assert_eq!(
+                        actual.layer_one().owner().index_keys(),
+                        expected.layer_one().owner().index_keys()
+                    );
+                    assert_eq!(
+                        actual.layer_one().key_prefix(),
+                        expected.layer_one().key_prefix()
+                    );
+                    assert_eq!(
+                        actual.layer_one().kv_prefix(),
+                        expected.layer_one().kv_prefix()
+                    );
                     assert_eq!(actual.layer_one().scored(), expected.layer_one().scored());
                     assert_eq!(
                         actual.layer_one().selected_indices(),
@@ -428,9 +464,9 @@ fn metal_scored_request_matches_both_source_schedules_and_restarts() {
             }
             check_request_recovery(model, fixture, head, ids);
             check_alternate_recovery(model, head, ids);
-        },
-    );
-    check_late_l4_failure(IndexScoreExecution::MetalBf16);
+        });
+        check_late_l4_failure(score, key_rotary);
+    }
 }
 
 #[test]

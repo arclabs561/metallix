@@ -17,7 +17,7 @@ use crate::{
     },
     indexer::{
         cache::{IndexKeyPublicationId, IndexKeyStateError},
-        key::IndexKeyLayout,
+        key::{IndexKeyLayout, IndexKeyRotaryExecution},
         owner::{
             RatioOneCompressedOwner, RatioOneCompressedOwnerDiagnostic,
             RatioOneCompressedOwnerError, RatioOneOwnerCall, RatioOneOwnerWeights,
@@ -257,6 +257,16 @@ impl LayerThreeSession {
             owner,
             lifecycle: Lifecycle::Healthy,
         })
+    }
+
+    /// Selects the index-key rotary implementation for subsequent calls.
+    #[must_use]
+    pub fn with_key_rotary_execution(
+        mut self,
+        key_rotary_execution: IndexKeyRotaryExecution,
+    ) -> Self {
+        self.owner = self.owner.with_key_rotary_execution(key_rotary_execution);
+        self
     }
 
     /// Computes one L3 partition. Every admitted failure poisons the session.

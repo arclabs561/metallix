@@ -19,8 +19,27 @@ use crate::{
     rms_norm_bf16_reference, rotate_tail,
 };
 
+#[cfg(feature = "metal")]
+use crate::{RotaryMetalError, rotate_tail_metal};
+
 const MAX_INDEX_KEY_ELEMENTS: usize = MAX_BF16_LINEAR_ELEMENTS;
 const MAX_INDEX_KEY_WORK: usize = 1 << 24;
+
+/// Rotary implementation selected by a model-local index-key caller.
+///
+/// Scalar FP32 rotation is the source-authoritative default. The optional
+/// Metal variant is a bounded `DeepSeek` diagnostic and does not establish a
+/// general execution-backend contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IndexKeyRotaryExecution {
+    /// Rotate the BF16-expanded key tail with the scalar FP32 reference.
+    #[default]
+    Scalar,
+    /// Rotate the same FP32 tail with the bounded MLX Metal diagnostic.
+    #[cfg(feature = "metal")]
+    MetalFp32,
+}
 
 /// Explicit source geometry for a compressed-latent index-key preparation.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -193,6 +212,9 @@ pub enum IndexKeyError {
     Norm(#[from] RmsNormError),
     #[error(transparent)]
     Rotary(#[from] RotaryError),
+    #[cfg(feature = "metal")]
+    #[error(transparent)]
+    MetalRotary(#[from] RotaryMetalError),
     #[error(transparent)]
     Fp4(#[from] Fp4ActivationError),
     #[error("index-key latent length is {actual}; expected a nonempty multiple of {stride}")]
@@ -253,6 +275,28 @@ pub fn prepare_index_keys(
     weights: IndexKeyWeights<'_>,
     layout: IndexKeyLayout,
 ) -> Result<IndexKeyDiagnostic, IndexKeyError> {
+    prepare_index_keys_with_rotary_execution(
+        latent,
+        frequencies,
+        weights,
+        layout,
+        IndexKeyRotaryExecution::Scalar,
+    )
+}
+
+/// Prepares source-shaped FP4 index keys using the selected bounded rotary path.
+///
+/// This keeps the scalar projection, normalization, BF16 narrowing, and FP4
+/// reconstruction boundaries identical to [`prepare_index_keys`]. Metal
+/// rotation is a diagnostic CPU-to-GPU round trip; it does not make key-cache
+/// storage or the remaining stages device resident.
+pub fn prepare_index_keys_with_rotary_execution(
+    latent: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: IndexKeyWeights<'_>,
+    layout: IndexKeyLayout,
+    rotary_execution: IndexKeyRotaryExecution,
+) -> Result<IndexKeyDiagnostic, IndexKeyError> {
     let shape = Shape::new(latent, frequencies, weights, layout)?;
     validate_finite(latent, "latent")?;
     validate_finite(weights.wk, "wk")?;
@@ -278,7 +322,13 @@ pub fn prepare_index_keys(
 
     let mut post_rope = reserve(shape.key_elements, "post_rope")?;
     post_rope.copy_from_slice(&normalized);
-    rotate_key_tail(&mut post_rope, frequencies, layout, shape.positions)?;
+    rotate_key_tail(
+        &mut post_rope,
+        frequencies,
+        layout,
+        shape.positions,
+        rotary_execution,
+    )?;
 
     let mut post_fp4 = reserve(shape.key_elements, "post_fp4")?;
     requantize_bf16_activations_e2m1(
@@ -375,6 +425,7 @@ fn rotate_key_tail(
     frequencies: &[RotaryFrequency],
     layout: IndexKeyLayout,
     positions: usize,
+    execution: IndexKeyRotaryExecution,
 ) -> Result<(), IndexKeyError> {
     let prefix = layout.key_dimension.get() - layout.rope_pairs.get() * 2;
     let tail_elements = product(
@@ -396,12 +447,18 @@ fn rotate_key_tail(
         NonZeroUsize::new(1).expect("one key head"),
         layout.rope_pairs,
     )?;
-    rotate_tail(
-        &mut tail,
-        rotary_layout,
-        frequencies,
-        RotaryDirection::Forward,
-    )?;
+    match execution {
+        IndexKeyRotaryExecution::Scalar => rotate_tail(
+            &mut tail,
+            rotary_layout,
+            frequencies,
+            RotaryDirection::Forward,
+        )?,
+        #[cfg(feature = "metal")]
+        IndexKeyRotaryExecution::MetalFp32 => {
+            tail = rotate_tail_metal(&tail, rotary_layout, frequencies, RotaryDirection::Forward)?;
+        }
+    }
     for (row, (key, rotated_tail)) in output
         .chunks_exact_mut(layout.key_dimension.get())
         .zip(tail.chunks_exact(layout.rope_pairs.get() * 2))
@@ -461,6 +518,10 @@ mod tests {
     use super::{
         IndexKeyError, IndexKeyLayout, IndexKeyLayoutError, IndexKeyWeights, prepare_index_keys,
     };
+    #[cfg(feature = "metal")]
+    use super::{IndexKeyRotaryExecution, prepare_index_keys_with_rotary_execution};
+    #[cfg(feature = "metal")]
+    use crate::GPU_TEST_LOCK;
     use crate::RotaryFrequency;
 
     fn nz(value: usize) -> NonZeroUsize {
@@ -498,6 +559,55 @@ mod tests {
         assert_eq!(diagnostic.post_rope[30], bf16(-3.0 * inverse_rms));
         assert_eq!(diagnostic.post_rope[31], bf16(2.0 * inverse_rms));
         assert_eq!(diagnostic.post_fp4.len(), 32);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_rotary_preserves_simple_staged_key_boundaries() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let mut wk = vec![0_u16; 32 * 16];
+        wk[30 * 16] = bf16(2.0);
+        wk[31 * 16 + 1] = bf16(3.0);
+        let mut latent = vec![0_u16; 16];
+        latent[0] = bf16(1.0);
+        latent[1] = bf16(1.0);
+        let frequencies = [RotaryFrequency::new(0.0, 1.0).expect("finite frequency")];
+        let norm = [bf16(1.0); 32];
+        let weights = IndexKeyWeights::new(&wk, &norm);
+        let scalar = prepare_index_keys(&latent, &frequencies, weights, layout())
+            .expect("finite scalar staged key");
+        let metal = prepare_index_keys_with_rotary_execution(
+            &latent,
+            &frequencies,
+            weights,
+            layout(),
+            IndexKeyRotaryExecution::MetalFp32,
+        )
+        .expect("finite Metal rotated staged key");
+        assert_eq!(metal, scalar);
+        let overflowing = [RotaryFrequency::new(f32::MAX, f32::MAX).unwrap()];
+        assert!(matches!(
+            prepare_index_keys_with_rotary_execution(
+                &latent,
+                &overflowing,
+                weights,
+                layout(),
+                IndexKeyRotaryExecution::MetalFp32,
+            ),
+            Err(IndexKeyError::NonFiniteRotary { .. })
+        ));
+        assert_eq!(
+            prepare_index_keys_with_rotary_execution(
+                &latent,
+                &frequencies,
+                weights,
+                layout(),
+                IndexKeyRotaryExecution::MetalFp32,
+            )
+            .unwrap(),
+            scalar,
+            "finite call recovers after Metal rotary overflow",
+        );
     }
 
     #[test]

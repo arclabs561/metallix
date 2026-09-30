@@ -16,6 +16,7 @@ use crate::{
     },
     indexer::{
         cache::IndexKeyPublicationId,
+        key::IndexKeyRotaryExecution,
         query::{CandidateQueryLayout, CandidateQueryWeights, IndexScoreExecution},
     },
 };
@@ -157,9 +158,11 @@ impl<'a> LayerOneDefinition<'a> {
     fn session(
         self,
         score_execution: IndexScoreExecution,
+        key_rotary_execution: IndexKeyRotaryExecution,
     ) -> Result<LayerOneSession, RequestError> {
         Ok(LayerOneSession::new(self.config, self.compressor_norm)?
-            .with_score_execution(score_execution))
+            .with_score_execution(score_execution)
+            .with_key_rotary_execution(key_rotary_execution))
     }
 }
 
@@ -195,13 +198,17 @@ impl<'a> LayerThreeDefinition<'a> {
         }
     }
 
-    fn session(self) -> Result<LayerThreeSession, RequestError> {
+    fn session(
+        self,
+        key_rotary_execution: IndexKeyRotaryExecution,
+    ) -> Result<LayerThreeSession, RequestError> {
         Ok(LayerThreeSession::new(
             self.config,
             3,
             self.compressor_norm,
             self.compressor_epsilon,
-        )?)
+        )?
+        .with_key_rotary_execution(key_rotary_execution))
     }
 }
 
@@ -262,6 +269,7 @@ pub struct RequestModel<'a> {
     frequencies: &'a [RotaryFrequency],
     max_tokens: NonZeroUsize,
     score_execution: IndexScoreExecution,
+    key_rotary_execution: IndexKeyRotaryExecution,
 }
 
 impl<'a> RequestModel<'a> {
@@ -294,6 +302,7 @@ impl<'a> RequestModel<'a> {
             frequencies,
             max_tokens,
             score_execution: IndexScoreExecution::Scalar,
+            key_rotary_execution: IndexKeyRotaryExecution::Scalar,
         };
         model.validate()?;
         Ok(model)
@@ -313,6 +322,22 @@ impl<'a> RequestModel<'a> {
     #[must_use]
     pub const fn score_execution(&self) -> IndexScoreExecution {
         self.score_execution
+    }
+
+    /// Selects the index-key rotary implementation for L1 and L3 owners.
+    #[must_use]
+    pub const fn with_key_rotary_execution(
+        mut self,
+        key_rotary_execution: IndexKeyRotaryExecution,
+    ) -> Self {
+        self.key_rotary_execution = key_rotary_execution;
+        self
+    }
+
+    /// Returns the model-local index-key rotary implementation.
+    #[must_use]
+    pub const fn key_rotary_execution(&self) -> IndexKeyRotaryExecution {
+        self.key_rotary_execution
     }
 
     fn validate(&self) -> Result<(), RequestError> {
@@ -385,8 +410,10 @@ impl<'a> RequestModel<'a> {
         let _ = self.startup.session()?;
         let _ = self.engrams[0].session()?;
         let _ = self.engrams[1].session()?;
-        let _ = self.layer_one.session(self.score_execution)?;
-        let _ = self.layer_three.session()?;
+        let _ = self
+            .layer_one
+            .session(self.score_execution, self.key_rotary_execution)?;
+        let _ = self.layer_three.session(self.key_rotary_execution)?;
         let _ = self.layer_four.session(self.score_execution);
         Ok(())
     }
@@ -423,10 +450,12 @@ impl<'a> RequestSession<'a> {
             model,
             startup: model.startup.session()?,
             engram_one: model.engrams[0].session()?,
-            layer_one: model.layer_one.session(model.score_execution)?,
+            layer_one: model
+                .layer_one
+                .session(model.score_execution, model.key_rotary_execution)?,
             layer_two: LayerAttentionState::new(model.layer_two.layout),
             engram_three: model.engrams[1].session()?,
-            layer_three: model.layer_three.session()?,
+            layer_three: model.layer_three.session(model.key_rotary_execution)?,
             layer_four: model.layer_four.session(model.score_execution),
             prior_layer_three: None,
             next_start: 0,
@@ -449,6 +478,12 @@ impl<'a> RequestSession<'a> {
     #[must_use]
     pub const fn score_execution(&self) -> IndexScoreExecution {
         self.model.score_execution()
+    }
+
+    /// Returns the index-key rotary implementation retained across request restart.
+    #[must_use]
+    pub const fn key_rotary_execution(&self) -> IndexKeyRotaryExecution {
+        self.model.key_rotary_execution()
     }
 
     /// Drops every request-local publication and reconstructs pristine inner state.

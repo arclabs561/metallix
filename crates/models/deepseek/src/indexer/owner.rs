@@ -22,7 +22,10 @@ use super::{
         CompressedKvDiagnostic, CompressedKvError, CompressedKvLayout, CompressedKvLayoutError,
         prepare_compressed_kv,
     },
-    key::{IndexKeyDiagnostic, IndexKeyError, IndexKeyLayout, IndexKeyWeights, prepare_index_keys},
+    key::{
+        IndexKeyDiagnostic, IndexKeyError, IndexKeyLayout, IndexKeyRotaryExecution,
+        IndexKeyWeights, prepare_index_keys_with_rotary_execution,
+    },
 };
 
 const MAX_RATIO_ONE_OWNER_WORK: usize = 1 << 24;
@@ -153,6 +156,7 @@ pub struct RatioOneIndexKeyOwner {
     keys: IndexKeyState,
     layout: IndexKeyLayout,
     input_dimension: NonZeroUsize,
+    rotary_execution: IndexKeyRotaryExecution,
 }
 
 /// Fully prepared but not yet committed ratio-one owner progress.
@@ -325,6 +329,13 @@ impl RatioOneCompressedOwner {
             compressed_kv,
             compressed_kv_layout,
         })
+    }
+
+    /// Selects the immutable index-key rotary implementation for later calls.
+    #[must_use]
+    pub fn with_key_rotary_execution(mut self, rotary_execution: IndexKeyRotaryExecution) -> Self {
+        self.key_owner = self.key_owner.with_key_rotary_execution(rotary_execution);
+        self
     }
 
     /// Stages source-coupled index keys and compressed KV without publishing them.
@@ -563,7 +574,15 @@ impl RatioOneIndexKeyOwner {
             keys,
             layout,
             input_dimension,
+            rotary_execution: IndexKeyRotaryExecution::Scalar,
         })
+    }
+
+    /// Selects the immutable index-key rotary implementation for later calls.
+    #[must_use]
+    pub fn with_key_rotary_execution(mut self, rotary_execution: IndexKeyRotaryExecution) -> Self {
+        self.rotary_execution = rotary_execution;
+        self
     }
 
     /// Stages and atomically commits one ratio-one owner-layer publication.
@@ -623,8 +642,13 @@ impl RatioOneIndexKeyOwner {
                 call.token_start,
             )?
             .ok_or(RatioOneIndexKeyOwnerError::MissingLatent)?;
-        let prepared =
-            prepare_index_keys(&latent, call.frequencies, call.weights.key, self.layout)?;
+        let prepared = prepare_index_keys_with_rotary_execution(
+            &latent,
+            call.frequencies,
+            call.weights.key,
+            self.layout,
+            self.rotary_execution,
+        )?;
         Ok(StagedRatioOneOwner {
             compressor: staged_compressor,
             diagnostic: RatioOneOwnerDiagnostic {

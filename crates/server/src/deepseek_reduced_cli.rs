@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Args;
-use deepseek::indexer::query::IndexScoreExecution;
+use deepseek::indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -36,6 +36,25 @@ impl From<ScoreExecutionArg> for IndexScoreExecution {
     }
 }
 
+/// Key rotation remains independent of score execution for qualification.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum KeyRotaryExecutionArg {
+    #[default]
+    Scalar,
+    #[cfg(feature = "metal")]
+    MetalFp32,
+}
+
+impl From<KeyRotaryExecutionArg> for IndexKeyRotaryExecution {
+    fn from(value: KeyRotaryExecutionArg) -> Self {
+        match value {
+            KeyRotaryExecutionArg::Scalar => Self::Scalar,
+            #[cfg(feature = "metal")]
+            KeyRotaryExecutionArg::MetalFp32 => Self::MetalFp32,
+        }
+    }
+}
+
 /// Runs a bounded reduced request from one local artifact.
 #[derive(Debug, Args)]
 pub(crate) struct ReducedArgs {
@@ -51,6 +70,9 @@ pub(crate) struct ReducedArgs {
     /// Index-score implementation; Metal only covers the bounded BF16 scorer.
     #[arg(long, value_enum, default_value_t = ScoreExecutionArg::Scalar)]
     score_execution: ScoreExecutionArg,
+    /// Index-key rotation only; other key preparation remains scalar.
+    #[arg(long, value_enum, default_value_t = KeyRotaryExecutionArg::Scalar)]
+    key_rotary_execution: KeyRotaryExecutionArg,
 }
 
 impl ReducedArgs {
@@ -72,10 +94,11 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     let artifact = deepseek::reduced::ReducedArtifact::parse(&bytes)
         .map_err(|_| "artifact is not a valid reduced request artifact".to_owned())?;
     let outputs = artifact
-        .run_with_score_execution(
+        .run_with_execution(
             &args.input_ids,
             args.prefill_tokens,
             args.score_execution.into(),
+            args.key_rotary_execution.into(),
         )
         .map_err(|_| "reduced request execution was rejected".to_owned())?;
     let expected_calls = 1 + args.input_ids.len() - args.prefill_tokens;
@@ -107,8 +130,8 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let response = match args.score_execution {
-        ScoreExecutionArg::Scalar => json!({
+    let response = match (args.score_execution, args.key_rotary_execution) {
+        (ScoreExecutionArg::Scalar, KeyRotaryExecutionArg::Scalar) => json!({
             "schema_version": 1,
             "operation": "deepseek-reduced-request",
             "backend": "scalar",
@@ -116,11 +139,24 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
             "calls": calls,
         }),
         #[cfg(feature = "metal")]
-        ScoreExecutionArg::MetalBf16 => json!({
+        (ScoreExecutionArg::MetalBf16, KeyRotaryExecutionArg::Scalar) => json!({
             "schema_version": 1,
             "operation": "deepseek-reduced-request",
             "backend": "mixed-cpu-metal",
             "score_execution": "metal-bf16",
+            "artifact_sha256": artifact_sha256,
+            "calls": calls,
+        }),
+        #[cfg(feature = "metal")]
+        (score, KeyRotaryExecutionArg::MetalFp32) => json!({
+            "schema_version": 1,
+            "operation": "deepseek-reduced-request",
+            "backend": "mixed-cpu-metal",
+            "score_execution": match score {
+                ScoreExecutionArg::Scalar => "scalar",
+                ScoreExecutionArg::MetalBf16 => "metal-bf16",
+            },
+            "key_rotary_execution": "metal-fp32",
             "artifact_sha256": artifact_sha256,
             "calls": calls,
         }),
@@ -175,7 +211,9 @@ fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReducedArgs, ScoreExecutionArg, read_artifact, validate_args};
+    use super::{
+        KeyRotaryExecutionArg, ReducedArgs, ScoreExecutionArg, read_artifact, validate_args,
+    };
 
     #[test]
     fn rejects_invalid_arguments_before_loading_an_artifact() {
@@ -184,6 +222,7 @@ mod tests {
             input_ids: vec![0],
             prefill_tokens: 1,
             score_execution: ScoreExecutionArg::Scalar,
+            key_rotary_execution: KeyRotaryExecutionArg::Scalar,
         };
         assert!(validate_args(&args).is_err());
     }
