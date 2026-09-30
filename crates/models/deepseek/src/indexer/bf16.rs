@@ -10,7 +10,7 @@ use std::num::NonZeroUsize;
 use thiserror::Error;
 
 #[cfg(feature = "metal")]
-use mlx_rs::{Array, Dtype, StreamOrDevice, ops};
+use mlx_rs::{Array, Dtype, StreamOrDevice, ops, transforms};
 
 use crate::precision::{
     Bf16LinearError, MAX_BF16_LINEAR_ELEMENTS, bf16_linear_reference, bf16_to_f32, f32_to_bf16_rne,
@@ -245,7 +245,7 @@ pub fn index_scores_bf16_reference(
 
 /// Qualifies the V4.1 BF16 index-score stages on Metal for one prepared query.
 ///
-/// This is a bounded device diagnostic, not a runtime replacement or arbitrary
+/// This is a bounded device path, not a general backend replacement or arbitrary
 /// hardware-parity claim. `query` is `[heads, head_dim]`, `keys` is
 /// `[positions, head_dim]`, and `head_weights` is `[heads]`. It retains the
 /// scalar reference's shared CPU work and BF16-buffer caps, keeps BF16 after
@@ -272,20 +272,30 @@ pub fn index_scores_bf16_metal(
     let weights = metal_bf16_array(head_weights, &[heads, 1], &stream)?;
     let zero = metal_bf16_array(&[0], &[], &stream)?;
     let dot = query.matmul_device(keys.transpose_device(&stream)?, &stream)?;
-    let dot_products = metal_bf16_read(&dot, shape.matrix_elements, "dot_products", &stream)?;
-    validate_metal_matrix(&dot_products, shape, "dot product")?;
     let negative = dot.lt_device(&zero, &stream)?;
     let rectified = ops::r#where_device(&negative, &zero, &dot, &stream)?;
-    let rectified_bits = metal_bf16_read(&rectified, shape.matrix_elements, "rectified", &stream)?;
-    validate_metal_matrix(&rectified_bits, shape, "rectified")?;
     let weighted = rectified.multiply_device(&weights, &stream)?;
-    let weighted_bits = metal_bf16_read(&weighted, shape.matrix_elements, "weighted", &stream)?;
-    validate_metal_matrix(&weighted_bits, shape, "weighted")?;
     let scores = weighted
         .as_dtype_device(Dtype::Float32, &stream)?
         .sum_axis_device(0, false, &stream)?
         .as_dtype_device(Dtype::Bfloat16, &stream)?;
-    let scores = metal_bf16_read(&scores, shape.positions, "scores", &stream)?;
+    // Each Uint16 view is an observable BF16 stage boundary. Evaluate them
+    // together before host reads so MLX completes one graph while retaining
+    // all four staged diagnostics and their original narrowing points.
+    let dot_words = metal_bf16_words(&dot, &stream)?;
+    let rectified_words = metal_bf16_words(&rectified, &stream)?;
+    let weighted_words = metal_bf16_words(&weighted, &stream)?;
+    let score_words = metal_bf16_words(&scores, &stream)?;
+    transforms::eval([&dot_words, &rectified_words, &weighted_words, &score_words])?;
+
+    // Preserve the source-stage error order after the shared device barrier.
+    let dot_products = metal_bf16_read(&dot_words, shape.matrix_elements, "dot_products")?;
+    validate_metal_matrix(&dot_products, shape, "dot product")?;
+    let rectified_bits = metal_bf16_read(&rectified_words, shape.matrix_elements, "rectified")?;
+    validate_metal_matrix(&rectified_bits, shape, "rectified")?;
+    let weighted_bits = metal_bf16_read(&weighted_words, shape.matrix_elements, "weighted")?;
+    validate_metal_matrix(&weighted_bits, shape, "weighted")?;
+    let scores = metal_bf16_read(&score_words, shape.positions, "scores")?;
     validate_metal_scores(&scores)?;
     Ok(Bf16IndexScoreDiagnostic {
         dot_products,
@@ -306,13 +316,10 @@ fn metal_bf16_array(
 
 #[cfg(feature = "metal")]
 fn metal_bf16_read(
-    array: &Array,
+    words: &Array,
     elements: usize,
     field: &'static str,
-    stream: &StreamOrDevice,
 ) -> Result<Vec<u16>, Bf16MetalScoreError> {
-    let words = array.view_dtype_device(Dtype::Uint16, stream)?;
-    words.eval()?;
     let words = words.as_slice::<u16>();
     if words.len() != elements {
         return Err(Bf16IndexScoreError::Linear(Bf16LinearError::Length {
@@ -325,6 +332,12 @@ fn metal_bf16_read(
     let mut output = reserve(elements, field)?;
     output.copy_from_slice(words);
     Ok(output)
+}
+
+/// Returns an observable uint16 view for one BF16 stage before joint evaluation.
+#[cfg(feature = "metal")]
+fn metal_bf16_words(array: &Array, stream: &StreamOrDevice) -> Result<Array, Bf16MetalScoreError> {
+    Ok(array.view_dtype_device(Dtype::Uint16, stream)?)
 }
 
 #[cfg(feature = "metal")]

@@ -579,7 +579,9 @@ cargo run -p server --features metal --bin mx -- run-deepseek-reduced \
 This mode reports `backend: "mixed-cpu-metal"` and
 `score_execution: "metal-bf16"`; other arithmetic remains on CPU. The default
 scalar receipt keeps its existing format. Builds without the `metal` feature
-reject the Metal options. Add `--key-rotary-execution metal-fp32` to run index-key
+reject the Metal options. Metal scoring evaluates its four BF16 stage views
+together, then reads and validates each intermediate in source order.
+Add `--key-rotary-execution metal-fp32` to run index-key
 rotation on Metal as well, or use it independently with scalar scoring. The
 receipt adds `key_rotary_execution: "metal-fp32"`. Key projection, normalization,
 FP4 staging and other request arithmetic remain scalar. Both schedules retain
