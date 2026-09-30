@@ -4,8 +4,8 @@
 //! [`Indexer.forward`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/model.py#L558):
 //! query/key dot product, `ReLU`, signed per-head weighting, then head sum.
 //! The existing FP32 functions consume post-RoPE FP32 operands and do not claim
-//! BF16/FP4 parity. [`bf16`] provides a separate CPU-only source-staging
-//! reference for prepared BF16 operands. [`query`] and [`key`] prepare their
+//! BF16/FP4 parity. [`bf16`] provides a separate scalar source-staging
+//! reference and bounded Metal diagnostic for prepared BF16 operands. [`query`] and [`key`] prepare their
 //! respective operands through source-shaped quantization. [`cache`] owns a
 //! separate request-local prefix of prepared owner-layer keys. [`selection`]
 //! composes candidate masking and final selection over supplied BF16 scores;

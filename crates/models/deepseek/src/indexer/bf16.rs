@@ -9,6 +9,9 @@ use std::num::NonZeroUsize;
 
 use thiserror::Error;
 
+#[cfg(feature = "metal")]
+use mlx_rs::{Array, Dtype, StreamOrDevice, ops};
+
 use crate::precision::{
     Bf16LinearError, MAX_BF16_LINEAR_ELEMENTS, bf16_linear_reference, bf16_to_f32, f32_to_bf16_rne,
 };
@@ -129,6 +132,19 @@ pub enum Bf16IndexScoreError {
     },
 }
 
+/// Errors from the bounded Metal BF16 score-stage qualification.
+#[cfg(feature = "metal")]
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum Bf16MetalScoreError {
+    /// Shared BF16 shape, finite-input, allocation, or stage validation failed.
+    #[error(transparent)]
+    Reference(#[from] Bf16IndexScoreError),
+    /// MLX could not construct, evaluate, or read the Metal graph.
+    #[error("MLX Metal BF16 index-score evaluation failed: {0}")]
+    Mlx(#[from] mlx_rs::error::Exception),
+}
+
 /// Computes source-compatible BF16 V4.1 index scores for one query position.
 ///
 /// `query` is row-major `[heads, head_dim]`, `keys` is row-major
@@ -225,6 +241,121 @@ pub fn index_scores_bf16_reference(
         weighted,
         scores,
     })
+}
+
+/// Qualifies the V4.1 BF16 index-score stages on Metal for one prepared query.
+///
+/// This is a bounded device diagnostic, not a runtime replacement or arbitrary
+/// hardware-parity claim. `query` is `[heads, head_dim]`, `keys` is
+/// `[positions, head_dim]`, and `head_weights` is `[heads]`. It retains the
+/// scalar reference's shared CPU work and BF16-buffer caps, keeps BF16 after
+/// dot, rectification, and signed weighting, promotes only the head reduction
+/// to FP32, and narrows its result back to BF16. The scalar reference remains
+/// the source staging authority.
+#[cfg(feature = "metal")]
+pub fn index_scores_bf16_metal(
+    query: &[u16],
+    keys: &[u16],
+    head_weights: &[u16],
+    head_dim: NonZeroUsize,
+) -> Result<Bf16IndexScoreDiagnostic, Bf16MetalScoreError> {
+    let shape = Shape::new(query, keys, head_weights, head_dim)?;
+    validate_finite(query, "query")?;
+    validate_finite(keys, "keys")?;
+    validate_finite(head_weights, "head_weights")?;
+    let heads = metal_dimension(shape.heads, "heads")?;
+    let positions = metal_dimension(shape.positions, "positions")?;
+    let dimension = metal_dimension(shape.dimension, "head dimension")?;
+    let stream = StreamOrDevice::gpu();
+    let query = metal_bf16_array(query, &[heads, dimension], &stream)?;
+    let keys = metal_bf16_array(keys, &[positions, dimension], &stream)?;
+    let weights = metal_bf16_array(head_weights, &[heads, 1], &stream)?;
+    let zero = metal_bf16_array(&[0], &[], &stream)?;
+    let dot = query.matmul_device(keys.transpose_device(&stream)?, &stream)?;
+    let dot_products = metal_bf16_read(&dot, shape.matrix_elements, "dot_products", &stream)?;
+    validate_metal_matrix(&dot_products, shape, "dot product")?;
+    let negative = dot.lt_device(&zero, &stream)?;
+    let rectified = ops::r#where_device(&negative, &zero, &dot, &stream)?;
+    let rectified_bits = metal_bf16_read(&rectified, shape.matrix_elements, "rectified", &stream)?;
+    validate_metal_matrix(&rectified_bits, shape, "rectified")?;
+    let weighted = rectified.multiply_device(&weights, &stream)?;
+    let weighted_bits = metal_bf16_read(&weighted, shape.matrix_elements, "weighted", &stream)?;
+    validate_metal_matrix(&weighted_bits, shape, "weighted")?;
+    let scores = weighted
+        .as_dtype_device(Dtype::Float32, &stream)?
+        .sum_axis_device(0, false, &stream)?
+        .as_dtype_device(Dtype::Bfloat16, &stream)?;
+    let scores = metal_bf16_read(&scores, shape.positions, "scores", &stream)?;
+    validate_metal_scores(&scores)?;
+    Ok(Bf16IndexScoreDiagnostic {
+        dot_products,
+        rectified: rectified_bits,
+        weighted: weighted_bits,
+        scores,
+    })
+}
+
+#[cfg(feature = "metal")]
+fn metal_bf16_array(
+    values: &[u16],
+    shape: &[i32],
+    stream: &StreamOrDevice,
+) -> Result<Array, Bf16MetalScoreError> {
+    Ok(Array::from_slice(values, shape).view_dtype_device(Dtype::Bfloat16, stream)?)
+}
+
+#[cfg(feature = "metal")]
+fn metal_bf16_read(
+    array: &Array,
+    elements: usize,
+    field: &'static str,
+    stream: &StreamOrDevice,
+) -> Result<Vec<u16>, Bf16MetalScoreError> {
+    let words = array.view_dtype_device(Dtype::Uint16, stream)?;
+    words.eval()?;
+    let words = words.as_slice::<u16>();
+    if words.len() != elements {
+        return Err(Bf16IndexScoreError::Linear(Bf16LinearError::Length {
+            field,
+            actual: words.len(),
+            expected: elements,
+        })
+        .into());
+    }
+    let mut output = reserve(elements, field)?;
+    output.copy_from_slice(words);
+    Ok(output)
+}
+
+#[cfg(feature = "metal")]
+fn validate_metal_matrix(
+    values: &[u16],
+    shape: Shape,
+    stage: &'static str,
+) -> Result<(), Bf16MetalScoreError> {
+    if let Some(flat) = values
+        .iter()
+        .position(|&bits| !bf16_to_f32(bits).is_finite())
+    {
+        return Err(shape.intermediate_error(stage, flat).into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn validate_metal_scores(values: &[u16]) -> Result<(), Bf16MetalScoreError> {
+    if let Some(position) = values
+        .iter()
+        .position(|&bits| !bf16_to_f32(bits).is_finite())
+    {
+        return Err(Bf16IndexScoreError::NonFiniteOutput { position }.into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn metal_dimension(value: usize, field: &'static str) -> Result<i32, Bf16MetalScoreError> {
+    i32::try_from(value).map_err(|_| Bf16IndexScoreError::ShapeOverflow { field }.into())
 }
 
 #[derive(Clone, Copy)]

@@ -138,12 +138,13 @@ concrete; an unspecified performance target cannot establish usable serving.
 
 The next device slice now has a passing live-L3 index-score qualification:
 computed queries and committed owner keys reach the existing Metal kernel,
-with CPU score/selection controls and a measured cutoff-margin gate. A separate
-test-only BF16-staged GPU graph also matches every dot, ReLU, weighted and final
-score boundary exactly on the alternate schedule. The scalar runtime remains
-unchanged. The next integration gate is a bounded device scorer with validated
-inputs and failure behavior, followed by canonical-schedule and request-state
-qualification. Promote a device execution component only after
+with CPU score/selection controls and a measured cutoff-margin gate. The bounded
+library BF16 scorer also matches every dot, ReLU, weighted and final score
+boundary exactly on the alternate schedule. Shared shape/work/finite-input
+checks precede GPU construction; each stage rejects nonfinite results, and
+finite calls recover after overflow. The scalar runtime remains unchanged.
+Canonical-schedule and request-state qualification are next, before connecting
+the scorer to device request execution. Promote a device execution component only after
 its source staging, downstream state and failure behavior remain qualified;
 operator agreement alone is not a complete Metal request.
 

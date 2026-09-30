@@ -15,9 +15,19 @@ choices without expanding current support claims.
   same computed queries, signed weights and committed key prefixes, GPU dot
   products, ReLU, weighted products and final scores match the runtime/source
   diagnostics bit for bit at each boundary. Head reduction explicitly promotes
-  BF16 products to FP32 before summing and narrowing. This is a test-only graph
-  for the alternate synthetic schedule, not a runtime backend or arbitrary-shape
-  parity claim. Focused receipt:
+  BF16 products to FP32 before summing and narrowing. The graph is now exposed
+  as `deepseek::indexer::bf16::index_scores_bf16_metal`, a bounded library
+  diagnostic. It reuses scalar shape/work caps, validates finite operands before
+  GPU construction, preserves negative zero in ReLU, and rejects nonfinite
+  intermediates/results. Malformed-input and overflow/recovery regressions pass;
+  the live qualifier now calls this API directly. This is not a request backend
+  or arbitrary-shape parity claim. Focused library receipt:
+  `.agents/receipts/candidate-control/bounded-bf16-metal-tests.log`.
+  The library pass also retains 103 passing forward composition tests, the
+  unchanged Julia failure, strict lint and a successful CPU-only build;
+  receipts in the same directory are `bounded-bf16-metal-full-check.log`,
+  `bounded-bf16-metal-clippy.log` and `bounded-bf16-cpu-check.log`.
+  Prior private-graph receipt:
   `.agents/receipts/candidate-control/live-l3-bf16-metal.log`.
   The canonical Metal check passes all 103 DeepSeek forward composition tests
   before the unchanged Julia failure; strict DeepSeek lint passes. Companion
