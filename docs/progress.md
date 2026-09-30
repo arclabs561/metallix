@@ -11,6 +11,23 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The Rust reduced request now accepts
+  `RequestModel::with_score_execution(IndexScoreExecution::MetalBf16)` and reports
+  that choice through model/session getters. L1, L3 and L4 dispatch to the bounded
+  Metal scorer; restart preserves the choice. On canonical 5/1/1 and alternate
+  4/1/1/1 schedules, scores, selections, publications, final heads and residuals
+  match scalar execution exactly, while independent source bounds still pass.
+  Invalid-token poisoning/restart and malformed late-L4 attention/reconstruction
+  controls also pass with this choice. These failures are not injected GPU faults.
+  Other arithmetic remains CPU, and the artifact CLI still uses scalar execution.
+  Focused receipt: `.agents/receipts/candidate-control/mixed-request-focused.log`.
+  The serial canonical Metal check passes all 105 DeepSeek `forward_moe` tests
+  and stops at the unchanged Julia `unmasked_control` mismatch; see
+  `.agents/receipts/candidate-control/mixed-request-full-check.log`.
+  Strict all-feature/all-target DeepSeek Clippy and the CPU-only build pass
+  (`mixed-request-clippy.log` and `mixed-request-cpu-check.log` in that directory).
+
+
 - Julia's calibration-only source RoPE capture now reproduces the actual
   source rotations exactly and leaves observed layer-zero fields bit-identical
   to an unobserved SDPA run. Native/source QKV and rotated Q/K differ by at most

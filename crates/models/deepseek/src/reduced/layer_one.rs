@@ -18,8 +18,8 @@ use crate::{
     indexer::{
         cache::{IndexKeyPublicationId, IndexKeyStateError},
         query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, ScoredQueryDiagnostic,
-            ScoredQueryError, prepare_scored_query,
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexScoreExecution,
+            ScoredQueryDiagnostic, ScoredQueryError, prepare_scored_query_with_execution,
         },
     },
     precision::bf16_to_f32,
@@ -253,6 +253,7 @@ struct PreparedCall<'a> {
 /// this type does not claim cross-owner rollback.
 pub struct LayerOneSession {
     config: LayerOneConfig,
+    score_execution: IndexScoreExecution,
     owner: RatioTwoCompressedOwner,
     attention: LayerAttentionState,
     expected_epoch: u64,
@@ -269,11 +270,23 @@ impl LayerOneSession {
             RatioTwoCompressedOwner::new(config.owner_layout, SOURCE_LAYER, compressor_norm)?;
         Ok(Self {
             config,
+            score_execution: IndexScoreExecution::Scalar,
             attention: LayerAttentionState::new(config.attention_layout),
             expected_epoch: owner.epoch(),
             owner,
             lifecycle: Lifecycle::Healthy,
         })
+    }
+
+    /// Selects the score-stage implementation for subsequent calls.
+    ///
+    /// Construction remains scalar by default so direct users retain the
+    /// source-authoritative path. This model-local choice has no effect on
+    /// owner, attention, or reset state.
+    #[must_use]
+    pub const fn with_score_execution(mut self, score_execution: IndexScoreExecution) -> Self {
+        self.score_execution = score_execution;
+        self
     }
 
     /// Computes one L1 partition. Every admitted error poisons this session.
@@ -314,12 +327,13 @@ impl LayerOneSession {
             call.previous_layer_three,
         )?;
         let keys = IndexKeyView::new(&score_key_prefix, self.config.owner_layout.key_dimension())?;
-        let scored = prepare_scored_query(
+        let scored = prepare_scored_query_with_execution(
             call.input,
             prepared.token_frequencies,
             call.query_weights,
             call.query_layout,
             keys,
+            self.score_execution,
         )?;
         let offset = if prepared.start == 0 {
             call.positions.get()

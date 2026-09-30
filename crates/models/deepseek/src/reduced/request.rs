@@ -16,7 +16,7 @@ use crate::{
     },
     indexer::{
         cache::IndexKeyPublicationId,
-        query::{CandidateQueryLayout, CandidateQueryWeights},
+        query::{CandidateQueryLayout, CandidateQueryWeights, IndexScoreExecution},
     },
 };
 
@@ -154,8 +154,12 @@ impl<'a> LayerOneDefinition<'a> {
         }
     }
 
-    fn session(self) -> Result<LayerOneSession, RequestError> {
-        Ok(LayerOneSession::new(self.config, self.compressor_norm)?)
+    fn session(
+        self,
+        score_execution: IndexScoreExecution,
+    ) -> Result<LayerOneSession, RequestError> {
+        Ok(LayerOneSession::new(self.config, self.compressor_norm)?
+            .with_score_execution(score_execution))
     }
 }
 
@@ -224,8 +228,8 @@ impl<'a> LayerFourDefinition<'a> {
         }
     }
 
-    fn session(self) -> LayerFourSession {
-        LayerFourSession::new(self.config)
+    fn session(self, score_execution: IndexScoreExecution) -> LayerFourSession {
+        LayerFourSession::new(self.config).with_score_execution(score_execution)
     }
 }
 
@@ -257,6 +261,7 @@ pub struct RequestModel<'a> {
     head: FinalHead<'a>,
     frequencies: &'a [RotaryFrequency],
     max_tokens: NonZeroUsize,
+    score_execution: IndexScoreExecution,
 }
 
 impl<'a> RequestModel<'a> {
@@ -288,9 +293,26 @@ impl<'a> RequestModel<'a> {
             head,
             frequencies,
             max_tokens,
+            score_execution: IndexScoreExecution::Scalar,
         };
         model.validate()?;
         Ok(model)
+    }
+
+    /// Selects the index-score implementation for every indexed request layer.
+    ///
+    /// [`Self::new`] preserves scalar BF16 staging. The alternate choice is a
+    /// bounded `DeepSeek` diagnostic and is rebuilt unchanged on restart.
+    #[must_use]
+    pub const fn with_score_execution(mut self, score_execution: IndexScoreExecution) -> Self {
+        self.score_execution = score_execution;
+        self
+    }
+
+    /// Returns the model-local score-stage implementation.
+    #[must_use]
+    pub const fn score_execution(&self) -> IndexScoreExecution {
+        self.score_execution
     }
 
     fn validate(&self) -> Result<(), RequestError> {
@@ -363,9 +385,9 @@ impl<'a> RequestModel<'a> {
         let _ = self.startup.session()?;
         let _ = self.engrams[0].session()?;
         let _ = self.engrams[1].session()?;
-        let _ = self.layer_one.session()?;
+        let _ = self.layer_one.session(self.score_execution)?;
         let _ = self.layer_three.session()?;
-        let _ = self.layer_four.session();
+        let _ = self.layer_four.session(self.score_execution);
         Ok(())
     }
 }
@@ -401,11 +423,11 @@ impl<'a> RequestSession<'a> {
             model,
             startup: model.startup.session()?,
             engram_one: model.engrams[0].session()?,
-            layer_one: model.layer_one.session()?,
+            layer_one: model.layer_one.session(model.score_execution)?,
             layer_two: LayerAttentionState::new(model.layer_two.layout),
             engram_three: model.engrams[1].session()?,
             layer_three: model.layer_three.session()?,
-            layer_four: model.layer_four.session(),
+            layer_four: model.layer_four.session(model.score_execution),
             prior_layer_three: None,
             next_start: 0,
             poisoned: false,
@@ -421,6 +443,12 @@ impl<'a> RequestSession<'a> {
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// Returns the score-stage implementation retained across request restart.
+    #[must_use]
+    pub const fn score_execution(&self) -> IndexScoreExecution {
+        self.model.score_execution()
     }
 
     /// Drops every request-local publication and reconstructs pristine inner state.
@@ -551,7 +579,10 @@ impl<'a> RequestSession<'a> {
             NonZeroUsize::new(ids.len()).expect("nonempty ids"),
             frequencies,
             self.model.layer_three.owner_weights,
-            self.model.layer_three.candidate,
+            self.model
+                .layer_three
+                .candidate
+                .with_score_execution(self.model.score_execution),
             self.model.layer_three.attention_weights,
         ))?;
         let TailOutputs {

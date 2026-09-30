@@ -515,11 +515,12 @@ canonical `5 + 1 + 1` path. `RequestSession` now executes all five blocks and
 the final head within each call, using ordinary typed numerical operands.
 Both schedules match the existing source-derived final-logit bounds and replay
 identically after whole-request restart. The bounded scalar CLI now accepts
-supplied numerical artifacts and token IDs. L3 candidate projectors can now
-explicitly select bounded BF16 Metal scoring, with matching source stages,
-publications and attention output on the alternate schedule. Canonical L4 score
-operands also pass exact stage checks. The default full request remains scalar. Broader schedules,
-complete Metal execution, checkpoint loading and serving remain open.
+supplied numerical artifacts and token IDs. The Rust request model can explicitly
+select bounded BF16 Metal scoring across L1, L3 and L4. Both schedules match
+scalar scores, selections, publications and final outputs, pass the source-derived
+bounds, and replay after whole-request restart. This is mixed execution: other
+arithmetic remains on CPU, and the artifact CLI still selects the scalar default.
+Broader schedules, complete Metal execution, checkpoint loading and serving remain open.
 Runtime components under `deepseek::reduced` now own
 final-head arithmetic, attention HC/FFN block tails, and persistent Engram hashing,
 embedding, projection and gating. They accept supplied operands without fixture

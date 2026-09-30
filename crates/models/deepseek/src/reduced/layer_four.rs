@@ -13,8 +13,8 @@ use crate::{
     indexer::{
         cache::IndexKeyPublicationId,
         query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, ScoredQueryDiagnostic,
-            ScoredQueryError, prepare_scored_query,
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexScoreExecution,
+            ScoredQueryDiagnostic, ScoredQueryError, prepare_scored_query_with_execution,
         },
         selection::{
             CandidateSelection, SelectionAdapterError, SelectionDiagnostic, select_from_candidates,
@@ -156,6 +156,7 @@ impl LayerFourStepOutput {
 /// Persistent L4 attention state. An admitted failure poisons the request.
 pub struct LayerFourSession {
     config: LayerFourConfig,
+    score_execution: IndexScoreExecution,
     attention: LayerAttentionState,
     next_start: usize,
     poisoned: bool,
@@ -168,9 +169,21 @@ impl LayerFourSession {
         Self {
             attention: LayerAttentionState::new(config.attention_layout),
             config,
+            score_execution: IndexScoreExecution::Scalar,
             next_start: 0,
             poisoned: false,
         }
+    }
+
+    /// Selects the score-stage implementation for subsequent calls.
+    ///
+    /// Construction remains scalar by default so direct users retain the
+    /// source-authoritative path. This model-local choice has no effect on
+    /// attention state or reset behavior.
+    #[must_use]
+    pub const fn with_score_execution(mut self, score_execution: IndexScoreExecution) -> Self {
+        self.score_execution = score_execution;
+        self
     }
 
     /// Computes one L4 partition from a committed L3 publication.
@@ -253,12 +266,13 @@ impl LayerFourSession {
                 expected: expected_offset,
             });
         }
-        let scored = prepare_scored_query(
+        let scored = prepare_scored_query_with_execution(
             call.input,
             call.frequencies,
             call.query_weights,
             self.config.query_layout,
             keys,
+            self.score_execution,
         )?;
         let selection = select_from_candidates(
             &scored.scores,

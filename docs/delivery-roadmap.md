@@ -145,8 +145,12 @@ checks precede GPU construction; each stage rejects nonfinite results, and
 finite calls recover after overflow. An explicit candidate-projector choice now
 runs scoring on Metal inside L3, with alternate-session publication/output parity
 and pre/post-commit failure/reset controls. Canonical L4 score operands also pass
-exact stages, but the complete request still defaults to scalar. Canonical L3,
-L1/L4 device integration and request-level lifecycle qualification remain next.
+exact stages. `RequestModel::with_score_execution` now propagates the explicit
+choice through L1, L3 and L4. Both complete reduced schedules match scalar scores,
+selections, publications and final outputs, preserve independent source bounds,
+and replay after restart. A malformed late L4 attention operand still poisons the
+whole request. This covers mixed execution through the Rust API; artifact/CLI
+selection and a score-device-error injection remain open. Scalar remains default.
 Promote a device execution component only after
 its source staging, downstream state and failure behavior remain qualified;
 operator agreement alone is not a complete Metal request.
@@ -179,8 +183,9 @@ Next delivery sequence, grounded in `7894d99`, the
 [architecture gates and pivot conditions](architecture.md#pivot-conditions).
 Review after the first request using Metal scoring, any state/parity failure,
 or evidence that the intended checkpoint cannot meet the resource envelope.
-The next milestone is an executable mixed CPU/Metal request; a complete reduced
-Metal executor follows. A scorer diagnostic does not establish either milestone.
+The Rust API now executes a qualified mixed CPU/Metal request. Expose the same
+choice through the reduced artifact CLI next; a complete reduced Metal executor
+follows. Scoring qualification alone does not establish full GPU execution.
 
 | Order | Deliverable and consumer | Gate before proceeding |
 | --- | --- | --- |
