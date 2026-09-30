@@ -581,6 +581,8 @@ This mode reports `backend: "mixed-cpu-metal"` and
 scalar receipt keeps its existing format. Builds without the `metal` feature
 reject the Metal options. Metal scoring evaluates its four BF16 stage views
 together, then reads and validates each intermediate in source order.
+Scalar and mixed paths share the CPU BF16-to-E4M3 activation quantizer. Its
+ordered nearest-code search preserves round-to-nearest-even and signed zero.
 Add `--key-rotary-execution metal-fp32` to run index-key
 rotation on Metal as well, or use it independently with scalar scoring. The
 receipt adds `key_rotary_execution: "metal-fp32"`. Key projection, normalization,

@@ -202,6 +202,34 @@ fn encode_e4m3fn_rne(value: f32) -> u8 {
     debug_assert!(value.is_finite() && (-FP8_MAX..=FP8_MAX).contains(&value));
     let sign = if value.is_sign_negative() { 0x80 } else { 0 };
     let magnitude = f64::from(value.abs());
+    let mut lower = 0_u8;
+    let mut upper = 0x7e_u8;
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if f64::from(decode_e4m3fn(middle)) < magnitude {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    let upper_distance = (magnitude - f64::from(decode_e4m3fn(upper))).abs();
+    let lower = upper.saturating_sub(1);
+    let lower_distance = (magnitude - f64::from(decode_e4m3fn(lower))).abs();
+    let best_code = if upper_distance < lower_distance
+        || (upper_distance.to_bits() == lower_distance.to_bits() && upper & 1 == 0)
+    {
+        upper
+    } else {
+        lower
+    };
+    sign | best_code
+}
+
+#[cfg(test)]
+fn encode_e4m3fn_rne_bruteforce(value: f32) -> u8 {
+    debug_assert!(value.is_finite() && (-FP8_MAX..=FP8_MAX).contains(&value));
+    let sign = if value.is_sign_negative() { 0x80 } else { 0 };
+    let magnitude = f64::from(value.abs());
     let mut best_code = 0_u8;
     let mut best_distance = magnitude;
     for code in 1_u8..=0x7e {
@@ -219,8 +247,8 @@ fn encode_e4m3fn_rne(value: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivationGroup, ActivationQuantError, decode_bf16, decode_e4m3fn, encode_e4m3fn_rne,
-        quantize_bf16_activations_e4m3fn,
+        ActivationGroup, ActivationQuantError, FP8_MAX, decode_bf16, decode_e4m3fn,
+        encode_e4m3fn_rne, encode_e4m3fn_rne_bruteforce, quantize_bf16_activations_e4m3fn,
     };
     use crate::precision::fp4_linear_runtime_f32;
 
@@ -296,6 +324,21 @@ mod tests {
                 upper | 0x80,
                 "negative above midpoint {lower:#04x}"
             );
+        }
+    }
+
+    #[test]
+    fn binary_rne_matches_bruteforce_for_every_finite_bf16_value_after_clamping() {
+        for bits in 0_u16..=u16::MAX {
+            let value = decode_bf16(bits);
+            if value.is_finite() {
+                let clamped = value.clamp(-FP8_MAX, FP8_MAX);
+                assert_eq!(
+                    encode_e4m3fn_rne(clamped),
+                    encode_e4m3fn_rne_bruteforce(clamped),
+                    "BF16 bits {bits:#06x}"
+                );
+            }
         }
     }
 
