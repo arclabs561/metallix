@@ -10,6 +10,8 @@ pub(crate) mod attention_capture;
 
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
+#[cfg(feature = "metal")]
+use deepseek::reduced::LayerThreeStepOutput;
 use deepseek::{
     RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionState},
@@ -37,6 +39,11 @@ use deepseek::{
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+// This integration binary is separate from the library's unit-test process,
+// so it needs its own guard for MLX's process-global device state.
+#[cfg(feature = "metal")]
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const SOURCE_RECEIPT_SHA256: &str =
     "9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906";
@@ -425,6 +432,141 @@ fn assert_query_stages(prepared: &ScoredQueryDiagnostic, selection: &Selection) 
     );
 }
 
+/// Qualifies only the live L3 FP32 score reduction on Metal.
+///
+/// The request continues to use the source-shaped BF16 scorer, candidate mask,
+/// and CPU selection. This guard proves that the same post-FP4 runtime query,
+/// signed weights, and owner-published keys reach the existing Metal primitive.
+#[cfg(feature = "metal")]
+fn assert_metal_l3_scores(output: &LayerThreeStepOutput, case: &Case) {
+    use deepseek::{index_scores_f32, index_scores_reference, select_indices};
+
+    const HEADS: usize = 2;
+    const HEAD_DIMENSION: usize = 64;
+    const INDEX_TOPK: usize = 1;
+
+    let prepared = output.candidate().scored();
+    let query = &prepared.query.index.query_post_fp4;
+    let weights = &prepared.query.index.scaled_head_weights;
+    let keys = output.key_prefix();
+    let key_count = keys.len() / HEAD_DIMENSION;
+    assert_eq!(keys.len(), key_count * HEAD_DIMENSION, "live L3 key rows");
+    assert_eq!(query.len(), case.token_count * HEADS * HEAD_DIMENSION);
+    assert_eq!(weights.len(), case.token_count * HEADS);
+    assert_eq!(key_count, case.start_pos + case.token_count);
+
+    let keys: Vec<_> = keys.iter().copied().map(bf16_to_f32).collect();
+    let candidates = output.candidate().candidates();
+    assert_eq!(candidates.mask().len(), case.token_count * key_count);
+    assert_eq!(
+        output.selected_indices().len(),
+        case.token_count * INDEX_TOPK
+    );
+
+    for position in 0..case.token_count {
+        let query_start = position * HEADS * HEAD_DIMENSION;
+        let weight_start = position * HEADS;
+        let query: Vec<_> = query[query_start..query_start + HEADS * HEAD_DIMENSION]
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect();
+        let weights: Vec<_> = weights[weight_start..weight_start + HEADS]
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect();
+        let cpu = index_scores_reference(&query, &keys, &weights, nz(HEAD_DIMENSION))
+            .expect("bounded CPU L3 score reference");
+        let metal = index_scores_f32(&query, &keys, &weights, nz(HEAD_DIMENSION))
+            .expect("Metal L3 score reduction");
+        assert_eq!(
+            metal.len(),
+            cpu.len(),
+            "L3 score count at position {position}"
+        );
+        let mut max_error = 0.0_f32;
+        for (key, (&metal, &cpu)) in metal.iter().zip(&cpu).enumerate() {
+            let error = (metal - cpu).abs();
+            let tolerance = 1.0e-4_f32 + 1.0e-5_f32 * cpu.abs();
+            assert!(
+                error <= tolerance,
+                "Metal L3 score position {position}, key {key}: {metal} != {cpu} within {tolerance}"
+            );
+            max_error = max_error.max(error);
+        }
+
+        let reachable = case.start_pos + position + 1;
+        let mask = &candidates.mask()[position * key_count..(position + 1) * key_count];
+        let cpu_masked: Vec<_> = cpu
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(key, score)| {
+                if key < reachable && mask[key] {
+                    score
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+            .collect();
+        let cpu_indices = select_indices(&cpu_masked, reachable, INDEX_TOPK, case.selection.offset)
+            .expect("strict CPU L3 candidate cutoff for Metal qualification");
+        assert_eq!(
+            cpu_indices,
+            output.selected_indices()[position * INDEX_TOPK..(position + 1) * INDEX_TOPK],
+            "CPU selection uses the live L3 candidate mask at position {position}"
+        );
+        assert_selection_margin(&cpu_masked[..reachable], max_error, position);
+        let masked: Vec<_> = metal
+            .into_iter()
+            .enumerate()
+            .map(|(key, score)| {
+                if key < reachable && mask[key] {
+                    score
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+            .collect();
+        let indices = select_indices(&masked, reachable, INDEX_TOPK, case.selection.offset)
+            .expect("strict live L3 candidate cutoff for Metal qualification");
+        assert_eq!(
+            indices,
+            output.selected_indices()[position * INDEX_TOPK..(position + 1) * INDEX_TOPK],
+            "Metal L3 selection uses the live candidate mask at position {position}"
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+fn assert_selection_margin(masked_scores: &[f32], max_error: f32, position: usize) {
+    let mut best = f32::NEG_INFINITY;
+    let mut runner_up = f32::NEG_INFINITY;
+    for &score in masked_scores {
+        if score > best {
+            runner_up = best;
+            best = score;
+        } else if score > runner_up {
+            runner_up = score;
+        }
+    }
+    // One finite candidate has no competing cutoff. Future/masked rows do not
+    // participate in the margin of the remaining reachable candidates.
+    if runner_up.is_finite() {
+        let margin = best - runner_up;
+        assert!(
+            margin > 2.0 * max_error,
+            "CPU L3 cutoff position {position} has margin {margin}, no larger than twice observed GPU error {max_error}"
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
 fn assert_pending_selection(
     pending: &PendingRatioOneCompressedOwner<'_>,
     fixture: &Fixture,
@@ -719,14 +861,32 @@ impl NativeAlternateLayerThreeSession {
         self.step_inner(supplied, true)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep source-stage assertions alongside the runtime result"
-    )]
+    #[cfg(feature = "metal")]
+    fn step_with_metal_score_qualification(
+        &mut self,
+        supplied: &(usize, Vec<u16>),
+    ) -> AlternateLayerThreePublication {
+        self.step_inner_with_metal_score_qualification(supplied, false, true)
+            .expect("native L3 Metal score qualification")
+    }
+
     fn step_inner(
         &mut self,
         supplied: &(usize, Vec<u16>),
         bad_attention: bool,
+    ) -> Result<AlternateLayerThreePublication, LayerThreeSessionError> {
+        self.step_inner_with_metal_score_qualification(supplied, bad_attention, false)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep source-stage assertions alongside the runtime result"
+    )]
+    fn step_inner_with_metal_score_qualification(
+        &mut self,
+        supplied: &(usize, Vec<u16>),
+        bad_attention: bool,
+        qualify_metal_scores: bool,
     ) -> Result<AlternateLayerThreePublication, LayerThreeSessionError> {
         let case = &self.fixture.cases[self.next_case];
         assert_eq!(
@@ -839,6 +999,12 @@ impl NativeAlternateLayerThreeSession {
         assert_eq!(output.key_prefix(), case.index_key_prefix.bf16());
         assert_eq!(output.kv_prefix(), case.compressed_kv_prefix.bf16());
         attention_capture::assert_diagnostic(&case.attention, output.attention());
+        #[cfg(feature = "metal")]
+        if qualify_metal_scores {
+            assert_metal_l3_scores(&output, case);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = qualify_metal_scores;
         let publication = AlternateLayerThreePublication {
             start_pos: start,
             publication: output.publication(),
@@ -926,6 +1092,27 @@ fn alternate_partition_owner_matches_source_prefixes_and_partial_bridges() {
 fn alternate_partition_owner_publications_drive_native_layer_three_attention() {
     let outputs = alternate_partition_owner_attention_outputs();
     assert_eq!(outputs.len(), SCHEDULE.len());
+}
+
+/// Exercises the existing Metal index reduction with every committed, live L3
+/// prefix in the alternate partition. The CPU BF16 path remains the runtime
+/// scorer and source oracle; this is a numerical qualification only.
+#[cfg(feature = "metal")]
+#[test]
+fn alternate_partition_live_l3_metal_scores_match_cpu_and_selection() {
+    let _guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut session = NativeAlternateLayerThreeSession::new();
+    let inputs: Vec<_> = session
+        .fixture
+        .cases
+        .iter()
+        .map(|case| (case.start_pos, case.input.bf16()))
+        .collect();
+    for input in &inputs {
+        let _publication = session.step_with_metal_score_qualification(input);
+    }
 }
 
 #[test]
