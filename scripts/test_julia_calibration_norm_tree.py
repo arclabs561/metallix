@@ -120,6 +120,47 @@ class NormalizationTreeInputTest(unittest.TestCase):
         self.assertFalse(worsened["balanced_no_worse_each_case"])
         self.assertFalse(worsened["passes"])
 
+    def test_propagation_gate_rejects_a_worsened_boundary(self) -> None:
+        def case(*, no_worse: bool, strict: bool) -> dict[str, object]:
+            return {
+                "controls": {
+                    "scalar_boundaries_match_saved_native_bits": True,
+                    "balanced_embedding_matches_python_control": True,
+                },
+                "boundaries": [
+                    {
+                        "no_worse_than_scalar_source_max_abs": no_worse,
+                        "strictly_better_than_scalar_source_max_abs": strict,
+                    }
+                ],
+            }
+
+        passing = TREE.propagation_gate(
+            [case(no_worse=True, strict=True), case(no_worse=True, strict=False)]
+        )
+        self.assertTrue(passing["passes"])
+        worsened = TREE.propagation_gate(
+            [case(no_worse=True, strict=True), case(no_worse=False, strict=False)]
+        )
+        self.assertFalse(worsened["balanced_no_worse_every_calibration_boundary"])
+        self.assertFalse(worsened["passes"])
+
+    def test_propagation_receipt_requires_exact_calibration_names(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "protocol_schema": 1,
+            "cases": [{"name": "one"}, {"name": "two"}],
+        }
+        self.assertEqual(
+            set(TREE.propagation_native_cases(payload, {"one", "two"})),
+            {"one", "two"},
+        )
+        with self.assertRaises(ValueError):
+            TREE.propagation_native_cases(
+                {**payload, "cases": [{"name": "one"}, {"name": "one"}]},
+                {"one", "two"},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

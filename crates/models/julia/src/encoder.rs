@@ -328,8 +328,33 @@ impl JuliaEncoder {
     fn forward_inner(
         &self,
         input: &EncoderInput,
-        mut boundaries: Option<&mut Vec<Vec<f32>>>,
+        boundaries: Option<&mut Vec<Vec<f32>>>,
     ) -> Result<Vec<f32>, JuliaEncoderError> {
+        let positions = Self::validate_prefill_input(input)?;
+        let hidden = norm_rows(
+            &self.lookup_rows(input)?,
+            &self.embedding_norm_weight,
+            "embedding norm",
+        )?;
+        self.forward_from_embedding_inner(input, positions, hidden, boundaries)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_boundaries_from_embedding(
+        &self,
+        input: &EncoderInput,
+        embedding: Vec<f32>,
+    ) -> Result<Vec<Vec<f32>>, JuliaEncoderError> {
+        let positions = Self::validate_prefill_input(input)?;
+        // Keep test-only injection subject to the same selected-token admission
+        // as the public prefill path, even though it supplies the post-lookup rows.
+        self.lookup_rows(input)?;
+        let mut boundaries = Vec::with_capacity(FULL_ENCODER_LAYERS + 2);
+        self.forward_from_embedding_inner(input, positions, embedding, Some(&mut boundaries))?;
+        Ok(boundaries)
+    }
+
+    fn validate_prefill_input(input: &EncoderInput) -> Result<usize, JuliaEncoderError> {
         let positions = input.input_ids.len();
         if positions == 0 || positions > MAX_PREFILL_POSITIONS {
             return Err(JuliaEncoderError::PrefillPositions(positions));
@@ -355,8 +380,17 @@ impl JuliaEncoder {
         {
             return Err(JuliaEncoderError::FullWork);
         }
-        let mut hidden = self.lookup_rows(input)?;
-        hidden = norm_rows(&hidden, &self.embedding_norm_weight, "embedding norm")?;
+        Ok(positions)
+    }
+
+    fn forward_from_embedding_inner(
+        &self,
+        input: &EncoderInput,
+        positions: usize,
+        mut hidden: Vec<f32>,
+        mut boundaries: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Vec<f32>, JuliaEncoderError> {
+        length("prefill embedding", &hidden, positions * WIDTH)?;
         record_boundary(&mut boundaries, &hidden);
         for (layer, block) in self.layers.iter().enumerate() {
             hidden = block.forward(&EncoderBlockInput {

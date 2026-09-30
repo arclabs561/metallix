@@ -6,6 +6,7 @@ use crate::{
     HeadLayerWeights, HeadWeights, JuliaEncoder, ScorerWeights, WIDTH,
 };
 use serde_json::{Value, json};
+use std::{fs::OpenOptions, io::Write};
 
 fn values(length: usize, ordinal: usize) -> Vec<f32> {
     (0..length)
@@ -53,6 +54,49 @@ fn full_weights() -> FullEncoderWeights {
 
 fn full_encoder() -> JuliaEncoder {
     JuliaEncoder::new(full_weights()).unwrap()
+}
+
+fn pairwise_sum(mut values: Vec<f32>) -> f32 {
+    while values.len() > 1 {
+        let pairs = values.len() / 2;
+        let mut next = Vec::with_capacity(pairs + values.len() % 2);
+        for pair in values[..pairs * 2].chunks_exact(2) {
+            next.push(pair[0] + pair[1]);
+        }
+        if values.len() % 2 == 1 {
+            next.push(*values.last().unwrap());
+        }
+        values = next;
+    }
+    values[0]
+}
+
+fn balanced_embedding_norm(rows: &[f32], weight: &[f32]) -> Vec<f32> {
+    rows.chunks_exact(WIDTH)
+        .flat_map(|row| {
+            let mean = pairwise_sum(row.to_vec()) / 384.0;
+            let deviations: Vec<f32> = row.iter().map(|value| *value - mean).collect();
+            let variance =
+                pairwise_sum(deviations.iter().map(|value| value * value).collect()) / 384.0;
+            let inverse = (variance + 1e-5).sqrt().recip();
+            deviations
+                .into_iter()
+                .zip(weight.iter())
+                .map(move |(value, scale)| value * inverse * scale)
+        })
+        .collect()
+}
+
+fn write_new_diagnostic(path: &std::path::Path, value: &Value) {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .expect("JULIA_DIAGNOSTIC_OUTPUT must name a fresh owner-local path");
+    output
+        .write_all(value.to_string().as_bytes())
+        .and_then(|()| output.write_all(b"\n"))
+        .expect("write Julia diagnostic output");
 }
 
 fn head_layer(base: usize) -> HeadLayerWeights {
@@ -228,6 +272,48 @@ fn full_encoder_then_head_matches_frozen_sdpa_source() {
             assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
         }
     }
+}
+
+#[test]
+fn injected_embedding_uses_the_normal_prefill_loop_and_admission_checks() {
+    let encoder = full_encoder();
+    let input = EncoderInput {
+        input_ids: vec![2, 4],
+        attention_mask: vec![true, true],
+    };
+    let scalar = encoder.forward_boundaries(&input).unwrap();
+    assert_eq!(
+        encoder
+            .forward_boundaries_from_embedding(&input, scalar[0].clone())
+            .unwrap(),
+        scalar
+    );
+    assert!(matches!(
+        encoder.forward_boundaries_from_embedding(&input, vec![0.0]),
+        Err(crate::JuliaEncoderError::Length {
+            field: "prefill embedding",
+            ..
+        })
+    ));
+    let mut nonfinite = vec![0.0; 2 * WIDTH];
+    nonfinite[0] = f32::NAN;
+    assert!(matches!(
+        encoder.forward_boundaries_from_embedding(&input, nonfinite),
+        Err(crate::JuliaEncoderError::NonFinite {
+            field: "prefill embedding",
+            ..
+        })
+    ));
+    assert_eq!(
+        encoder.forward_boundaries_from_embedding(
+            &EncoderInput {
+                input_ids: vec![99],
+                attention_mask: vec![true],
+            },
+            vec![0.0; WIDTH],
+        ),
+        Err(crate::JuliaEncoderError::TokenId(99))
+    );
 }
 
 #[test]
@@ -434,6 +520,76 @@ fn write_accuracy_calibration_outputs() {
             + "\n",
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "writes opt-in paired scalar/balanced embedding propagation outputs to JULIA_DIAGNOSTIC_OUTPUT"]
+fn write_accuracy_calibration_embedding_tree_outputs() {
+    fn rows(value: &[f32]) -> Vec<&[f32]> {
+        value.chunks_exact(WIDTH).collect()
+    }
+
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/julia-1/accuracy-cases.json"
+    ))
+    .unwrap();
+    let weights = full_weights();
+    let encoder = JuliaEncoder::new(weights.clone()).unwrap();
+    let cases: Vec<Value> = manifest["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["split"].as_str() == Some("calibration"))
+        .map(|case| {
+            let input = EncoderInput {
+                input_ids: case["input_ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.as_u64().unwrap())
+                    .collect(),
+                attention_mask: case["attention_mask"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item.as_bool().unwrap())
+                    .collect(),
+            };
+            let lookup = encoder.lookup_rows_for_trace(&input).unwrap();
+            let scalar_boundaries = encoder.forward_boundaries(&input).unwrap();
+            let balanced_embedding =
+                balanced_embedding_norm(&lookup, &weights.embedding_norm_weight);
+            let balanced_boundaries = encoder
+                .forward_boundaries_from_embedding(&input, balanced_embedding.clone())
+                .unwrap();
+            json!({
+                "name": case["name"],
+                "input_ids": input.input_ids,
+                "attention_mask": input.attention_mask,
+                "scalar_boundaries": scalar_boundaries
+                    .iter()
+                    .map(|boundary| rows(boundary))
+                    .collect::<Vec<_>>(),
+                "balanced_embedding": rows(&balanced_embedding),
+                "balanced_boundaries": balanced_boundaries
+                    .iter()
+                    .map(|boundary| rows(boundary))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let path = std::env::var("JULIA_DIAGNOSTIC_OUTPUT")
+        .expect("set JULIA_DIAGNOSTIC_OUTPUT to a fresh owner-local diagnostic path");
+    write_new_diagnostic(
+        std::path::Path::new(&path),
+        &json!({
+            "schema_version": 1,
+            "protocol_schema": 1,
+            "manifest_sha256": "e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82",
+            "weight_f32_sha256": "db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68",
+            "cases": cases,
+        }),
+    );
 }
 
 #[test]

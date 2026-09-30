@@ -86,6 +86,29 @@ lookup separately from normalization. Its result narrows the numerical diagnosis
 the full encoder fidelity gate remains open. Generated diagnostic receipts remain
 local and outside version control.
 
+The normalization-tree diagnostic can also compare propagation through the
+ordinary native encoder blocks and final normalization. A test-only embedding
+override exports paired scalar and balanced-tree boundaries for the frozen
+calibration split. The comparator requires every scalar boundary to match the
+saved native baseline bit-for-bit and the injected embedding to match the
+independent Python tree before interpreting downstream differences.
+
+```sh
+JULIA_DIAGNOSTIC_OUTPUT=/tmp/julia-embedding-propagation.json \
+  cargo test -p julia --release write_accuracy_calibration_embedding_tree_outputs -- --ignored
+uv run --offline scripts/julia_calibration_norm_tree.py --all-calibration \
+  --calibration-report /path/to/calibration-report.json \
+  --propagation-native-output /tmp/julia-embedding-propagation.json \
+  --output /tmp/julia-embedding-propagation-comparison.json
+```
+
+Use a calibration report from the pinned native/source comparison and fresh
+output paths. The result's `candidate.predeclared_gate.passes` requires no
+worse maximum source error at every case and boundary, with at least one strict
+improvement. Successful report generation does not imply that this gate passed.
+This is a sensitivity diagnostic; it neither promotes a runtime arithmetic
+change nor substitutes for full-encoder qualification or held-out evaluation.
+
 ## Reproduction identity
 
 The public Hugging Face model API reported the following source revision on

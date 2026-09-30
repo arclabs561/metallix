@@ -25,6 +25,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "fixtures/julia-1/accuracy-cases.json"
 WIDTH = 384
+LAYERS = 22
 CASE_IDS = [2, 4, 6, 1, 3, 5, 7]
 CASE_MASK = [True, True, True, True, True, True, True]
 REPORT_MAX_BYTES = 128 * 1024 * 1024
@@ -32,6 +33,10 @@ MANIFEST_MAX_BYTES = 1024 * 1024
 # The already-frozen cal_len7 native-versus-source embedding maximum.  This is
 # a diagnostic falsifier, not an acceptance tolerance or a runtime policy.
 SERIAL_SOURCE_MAX_ABS = 5.960464477539062e-7
+
+
+def stage_names() -> tuple[str, ...]:
+    return ("embedding", *(f"layer_{layer}" for layer in range(LAYERS)), "final_norm")
 
 
 def load_module(name: str, filename: str) -> ModuleType:
@@ -292,6 +297,155 @@ def predeclared_gate(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def propagation_native_cases(
+    payload: dict[str, Any], expected_names: set[str]
+) -> dict[str, dict[str, Any]]:
+    if payload.get("schema_version") != 1 or payload.get("protocol_schema") != 1:
+        raise ValueError("propagation receipt schema does not match")
+    cases = payload.get("cases")
+    if not isinstance(cases, list) or not all(isinstance(case, dict) for case in cases):
+        raise TypeError("propagation receipt cases must be objects")
+    names = [case.get("name") for case in cases]
+    if (
+        any(type(name) is not str for name in names)
+        or len(names) != len(expected_names)
+        or set(names) != expected_names
+    ):
+        raise ValueError("propagation receipt cases do not exactly match calibration")
+    return {case["name"]: case for case in cases}
+
+
+def exact_tensor(left: Any, right: Any, label: str) -> None:
+    if left.dtype != torch.float32 or right.dtype != torch.float32:
+        raise TypeError(f"{label} requires F32 tensors")
+    if tuple(left.shape) != tuple(right.shape):
+        raise ValueError(f"{label} shapes do not match")
+    if not torch.equal(
+        left.contiguous().view(torch.int32), right.contiguous().view(torch.int32)
+    ):
+        raise RuntimeError(f"{label} is not bit-exact")
+
+
+def propagation_case_result(
+    frozen: dict[str, Any],
+    report_case: dict[str, Any],
+    propagation_case: dict[str, Any],
+    reference: ModuleType,
+) -> dict[str, Any]:
+    positions = len(frozen["input_ids"])
+    shape = (positions, WIDTH)
+    stages = stage_names()
+    if (
+        propagation_case.get("input_ids") != frozen["input_ids"]
+        or propagation_case.get("attention_mask") != frozen["attention_mask"]
+    ):
+        raise ValueError(f"{frozen['name']} propagation input does not match manifest")
+    native = report_case.get("native_f32_vs_f64")
+    source_boundaries = report_case.get("source_f32_boundaries")
+    if not isinstance(native, dict) or not isinstance(source_boundaries, dict):
+        raise TypeError(f"{frozen['name']} report lacks source/native boundaries")
+    saved_scalar = native.get("boundaries")
+    scalar = propagation_case.get("scalar_boundaries")
+    balanced = propagation_case.get("balanced_boundaries")
+    if (
+        not isinstance(saved_scalar, list)
+        or not isinstance(scalar, list)
+        or not isinstance(balanced, list)
+        or len(saved_scalar) != len(stages)
+        or len(scalar) != len(stages)
+        or len(balanced) != len(stages)
+    ):
+        raise ValueError(f"{frozen['name']} propagation boundary count is not exact")
+    rows = reference.FULL.ENCODER.values((reference.FULL.VOCAB, WIDTH), 200)[
+        torch.tensor(frozen["input_ids"], dtype=torch.int64)
+    ]
+    expected_balanced_embedding = balanced_two_pass(rows, reference.FULL.near_one(201))
+    emitted_balanced_embedding = tensor(
+        propagation_case.get("balanced_embedding"),
+        shape,
+        f"{frozen['name']} balanced embedding",
+    )
+    exact_tensor(
+        emitted_balanced_embedding,
+        expected_balanced_embedding,
+        f"{frozen['name']} balanced embedding versus Python control",
+    )
+    results = []
+    for index, stage in enumerate(stages):
+        source_record = source_boundaries.get(stage)
+        if not isinstance(source_record, dict):
+            raise TypeError(f"{frozen['name']} source {stage} is invalid")
+        source = tensor(
+            source_record.get("value"), shape, f"{frozen['name']} source {stage}"
+        )
+        saved = tensor(
+            saved_scalar[index], shape, f"{frozen['name']} saved scalar {stage}"
+        )
+        scalar_value = tensor(scalar[index], shape, f"{frozen['name']} scalar {stage}")
+        balanced_value = tensor(
+            balanced[index], shape, f"{frozen['name']} balanced {stage}"
+        )
+        exact_tensor(
+            scalar_value,
+            saved,
+            f"{frozen['name']} scalar {stage} versus saved native baseline",
+        )
+        if index == 0:
+            exact_tensor(
+                balanced_value,
+                emitted_balanced_embedding,
+                f"{frozen['name']} injected balanced embedding",
+            )
+        scalar_source = metric(scalar_value, source)
+        balanced_source = metric(balanced_value, source)
+        results.append(
+            {
+                "stage": stage,
+                "scalar_vs_source": scalar_source,
+                "balanced_vs_source": balanced_source,
+                "no_worse_than_scalar_source_max_abs": balanced_source["max_abs"]
+                <= scalar_source["max_abs"],
+                "strictly_better_than_scalar_source_max_abs": balanced_source["max_abs"]
+                < scalar_source["max_abs"],
+            }
+        )
+    return {
+        "name": frozen["name"],
+        "positions": positions,
+        "controls": {
+            "scalar_boundaries_match_saved_native_bits": True,
+            "balanced_embedding_matches_python_control": True,
+        },
+        "boundaries": results,
+    }
+
+
+def propagation_gate(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Apply the predeclared all-case full-propagation falsifier."""
+    if not results:
+        raise ValueError("propagation gate requires at least one calibration case")
+    controls_exact = all(
+        result["controls"]["scalar_boundaries_match_saved_native_bits"]
+        and result["controls"]["balanced_embedding_matches_python_control"]
+        for result in results
+    )
+    boundaries = [boundary for result in results for boundary in result["boundaries"]]
+    no_worse = all(
+        boundary["no_worse_than_scalar_source_max_abs"] for boundary in boundaries
+    )
+    strict_improvement = any(
+        boundary["strictly_better_than_scalar_source_max_abs"]
+        for boundary in boundaries
+    )
+    return {
+        "scalar_baseline_and_balanced_embedding_controls_exact": controls_exact,
+        "balanced_no_worse_every_calibration_boundary": no_worse,
+        "balanced_strict_improvement_at_least_one_boundary": strict_improvement,
+        "passes": controls_exact and no_worse and strict_improvement,
+        "limitation": "this sensitivity gate is not full encoder acceptance and does not alter runtime arithmetic or frozen accuracy bounds",
+    }
+
+
 def main() -> None:
     global torch
     import torch
@@ -300,7 +454,10 @@ def main() -> None:
     parser.add_argument("--calibration-report", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--all-calibration", action="store_true")
+    parser.add_argument("--propagation-native-output", type=Path)
     args = parser.parse_args()
+    if args.propagation_native_output is not None and not args.all_calibration:
+        raise ValueError("propagation output requires --all-calibration")
     report_bytes = read_bounded(
         args.calibration_report, REPORT_MAX_BYTES, "calibration report"
     )
@@ -332,10 +489,64 @@ def main() -> None:
             )
         ]
     )
-    results = [
-        case_result(case, report_cases[case["name"]], reference) for case in selected
-    ]
-    if not args.all_calibration:
+    if args.propagation_native_output is not None:
+        propagation_bytes = read_bounded(
+            args.propagation_native_output,
+            REPORT_MAX_BYTES,
+            "propagation native output",
+        )
+        try:
+            propagation_payload = json.loads(propagation_bytes)
+        except json.JSONDecodeError as error:
+            raise ValueError("propagation native output is not valid JSON") from error
+        if not isinstance(propagation_payload, dict):
+            raise TypeError("propagation native output must be a JSON object")
+        if (
+            propagation_payload.get("manifest_sha256") != report["manifest_sha256"]
+            or propagation_payload.get("weight_f32_sha256")
+            != report["weight_f32_sha256"]
+        ):
+            raise ValueError("propagation native output identity does not match report")
+        propagation_cases = propagation_native_cases(
+            propagation_payload, {case["name"] for case in frozen_cases}
+        )
+        results = [
+            propagation_case_result(
+                case,
+                report_cases[case["name"]],
+                propagation_cases[case["name"]],
+                reference,
+            )
+            for case in selected
+        ]
+        receipt = {
+            "schema_version": 1,
+            "scope": "all frozen calibration cases balanced F32 embedding normalization propagation sensitivity only",
+            "held_out_accessed": False,
+            "identities": {
+                "calibration_report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+                "propagation_native_output_sha256": hashlib.sha256(
+                    propagation_bytes
+                ).hexdigest(),
+                "manifest_sha256": report["manifest_sha256"],
+                "weight_f32_sha256": report["weight_f32_sha256"],
+                "diagnostic_sha256": hashlib.sha256(
+                    Path(__file__).read_bytes()
+                ).hexdigest(),
+            },
+            "candidate": {
+                "topology": "fixed balanced pairwise F32 embedding mean and variance; existing Rust encoder blocks and final norm",
+                "predeclared_gate": propagation_gate(results),
+            },
+            "cases": results,
+        }
+    else:
+        results = [
+            case_result(case, report_cases[case["name"]], reference)
+            for case in selected
+        ]
+        receipt = None
+    if args.propagation_native_output is None and not args.all_calibration:
         result = results[0]
         serial_source = result["controls"]["serial_two_pass_vs_source"]
         if serial_source["max_abs"] != SERIAL_SOURCE_MAX_ABS:
@@ -376,7 +587,7 @@ def main() -> None:
                 "limitation": "the source CPU LayerNorm uses its own vectorized reduction; this fixed tree is a sensitivity control, not a claim of source-kernel equivalence",
             },
         }
-    else:
+    elif args.propagation_native_output is None:
         receipt = {
             "schema_version": 1,
             "scope": "all frozen calibration cases balanced F32 embedding normalization sensitivity only",
