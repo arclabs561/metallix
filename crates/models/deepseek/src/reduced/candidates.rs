@@ -13,8 +13,8 @@ use crate::{
     RotaryFrequency,
     indexer::{
         query::{
-            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, ScoredQueryDiagnostic,
-            ScoredQueryError, prepare_scored_query,
+            CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexScoreExecution,
+            ScoredQueryDiagnostic, ScoredQueryError, prepare_scored_query_with_execution,
         },
         selection::{
             CandidateSelection, SelectionAdapterError, SelectionCall, SelectionDiagnostic,
@@ -31,6 +31,7 @@ pub struct CandidateProjector<'a> {
     key_head_dimension: NonZeroUsize,
     topk_blocks: NonZeroUsize,
     block_size: NonZeroUsize,
+    score_execution: IndexScoreExecution,
 }
 
 impl<'a> CandidateProjector<'a> {
@@ -49,7 +50,18 @@ impl<'a> CandidateProjector<'a> {
             key_head_dimension,
             topk_blocks,
             block_size,
+            score_execution: IndexScoreExecution::Scalar,
         }
+    }
+
+    /// Selects an immutable model-local score-stage implementation.
+    ///
+    /// [`Self::new`] remains source-authoritative scalar staging. Metal is an
+    /// explicit `DeepSeek` diagnostic choice, not a generic execution backend.
+    #[must_use]
+    pub const fn with_score_execution(mut self, score_execution: IndexScoreExecution) -> Self {
+        self.score_execution = score_execution;
+        self
     }
 
     /// Derives scores and a causal candidate mask for one caller-provided publication.
@@ -89,7 +101,14 @@ impl<'a> CandidateProjector<'a> {
         }
 
         let keys = IndexKeyView::new(keys, self.key_head_dimension)?;
-        let scored = prepare_scored_query(input, frequencies, self.weights, self.layout, keys)?;
+        let scored = prepare_scored_query_with_execution(
+            input,
+            frequencies,
+            self.weights,
+            self.layout,
+            keys,
+            self.score_execution,
+        )?;
         let candidates = produce_candidates(
             &scored.scores,
             call,

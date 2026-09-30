@@ -248,6 +248,20 @@ fn score_positions(
             nonzero(dimension),
         )
         .expect("bounded production BF16 score chain");
+        #[cfg(feature = "metal")]
+        {
+            let metal = deepseek::indexer::bf16::index_scores_bf16_metal(
+                &query[query_start..query_start + heads * dimension],
+                keys,
+                &head_weights[weight_start..weight_start + heads],
+                nonzero(dimension),
+            )
+            .expect("bounded Metal score chain on canonical source operands");
+            assert_eq!(
+                metal, diagnostic,
+                "canonical score stages at position {position}"
+            );
+        }
         stages.dot_products.extend(diagnostic.dot_products);
         stages.rectified.extend(diagnostic.rectified);
         stages.weighted.extend(diagnostic.weighted);

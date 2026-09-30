@@ -25,12 +25,48 @@ use crate::{
     rotate_tail,
 };
 
+#[cfg(feature = "metal")]
+use super::bf16::{Bf16MetalScoreError, index_scores_bf16_metal};
 use super::{
     MAX_INDEX_REFERENCE_TERMS,
-    bf16::{Bf16IndexScoreError, index_scores_bf16_reference},
+    bf16::{Bf16IndexScoreDiagnostic, Bf16IndexScoreError, index_scores_bf16_reference},
 };
 
 const MAX_INDEX_QUERY_ELEMENTS: usize = 1 << 20;
+
+/// Immutable score-stage implementation selected by a model-local caller.
+///
+/// Scalar BF16 staging is the default source-authoritative path. The optional
+/// Metal variant is a bounded `DeepSeek` diagnostic and does not make a general
+/// execution-backend contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IndexScoreExecution {
+    /// Use the scalar BF16 source-staging reference.
+    #[default]
+    Scalar,
+    /// Evaluate the same BF16 stages with the bounded MLX Metal diagnostic.
+    #[cfg(feature = "metal")]
+    MetalBf16,
+}
+
+impl IndexScoreExecution {
+    fn score(
+        self,
+        query: &[u16],
+        keys: &[u16],
+        head_weights: &[u16],
+        head_dimension: NonZeroUsize,
+    ) -> Result<Bf16IndexScoreDiagnostic, ScoredQueryError> {
+        match self {
+            Self::Scalar => index_scores_bf16_reference(query, keys, head_weights, head_dimension)
+                .map_err(ScoredQueryError::Score),
+            #[cfg(feature = "metal")]
+            Self::MetalBf16 => index_scores_bf16_metal(query, keys, head_weights, head_dimension)
+                .map_err(ScoredQueryError::MetalScore),
+        }
+    }
+}
 
 /// Explicit source geometry for one index-query preparation call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -387,6 +423,10 @@ pub enum ScoredQueryError {
     /// One bounded BF16 score row rejected the preflighted request.
     #[error(transparent)]
     Score(#[from] Bf16IndexScoreError),
+    /// The bounded Metal BF16 score diagnostic rejected one preflighted row.
+    #[cfg(feature = "metal")]
+    #[error(transparent)]
+    MetalScore(#[from] Bf16MetalScoreError),
     /// A bounded aggregate diagnostic buffer could not be reserved.
     #[error("could not allocate {elements} BF16 scored index-query {field} elements")]
     AllocationFailed {
@@ -436,6 +476,29 @@ pub fn prepare_scored_query(
     layout: CandidateQueryLayout,
     keys: IndexKeyView<'_>,
 ) -> Result<ScoredQueryDiagnostic, ScoredQueryError> {
+    prepare_scored_query_with_execution(
+        x,
+        frequencies,
+        weights,
+        layout,
+        keys,
+        IndexScoreExecution::Scalar,
+    )
+}
+
+/// Prepares candidate-query boundaries then runs the chosen BF16 score stage.
+///
+/// This keeps the scalar default available through [`prepare_scored_query`].
+/// Metal remains an explicit model-local diagnostic choice; this function does
+/// not create a generic backend abstraction or cache/selection policy.
+pub fn prepare_scored_query_with_execution(
+    x: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: CandidateQueryWeights<'_>,
+    layout: CandidateQueryLayout,
+    keys: IndexKeyView<'_>,
+    execution: IndexScoreExecution,
+) -> Result<ScoredQueryDiagnostic, ScoredQueryError> {
     let positions = validate_scored_request(x, layout, keys)?;
     let query = prepare_candidate_query(x, frequencies, weights, layout)?;
     let heads = layout.index.heads.get();
@@ -452,7 +515,7 @@ pub fn prepare_scored_query(
     for position in 0..positions {
         let query_start = position * query_width;
         let weight_start = position * heads;
-        let score = index_scores_bf16_reference(
+        let score = execution.score(
             &query.index.query_post_fp4[query_start..query_start + query_width],
             keys.values,
             &query.index.scaled_head_weights[weight_start..weight_start + heads],

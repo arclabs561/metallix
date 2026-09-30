@@ -24,7 +24,7 @@ use deepseek::{
         },
         query::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexQueryLayout,
-            IndexQueryWeights, ScoredQueryDiagnostic, prepare_scored_query,
+            IndexQueryWeights, IndexScoreExecution, ScoredQueryDiagnostic, prepare_scored_query,
         },
         selection::{
             CandidateSelection, SelectionCall, SelectionGeometry, produce_candidates,
@@ -128,6 +128,7 @@ struct Selection {
 /// A committed producer boundary retained for the alternate L4 consumer.
 /// The consumer scores this key prefix with its own query and selects its own
 /// IDs from the retained producer candidates.
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct AlternateLayerThreePublication {
     pub(crate) start_pos: usize,
     pub(crate) publication: IndexKeyPublicationId,
@@ -872,6 +873,8 @@ pub(crate) struct NativeAlternateLayerThreeSession {
     fixture: Fixture,
     runtime: LayerThreeSession,
     next_case: usize,
+    score_execution: IndexScoreExecution,
+    candidate_key_dimension: usize,
 }
 
 impl NativeAlternateLayerThreeSession {
@@ -895,6 +898,8 @@ impl NativeAlternateLayerThreeSession {
             fixture,
             runtime,
             next_case: 0,
+            score_execution: IndexScoreExecution::Scalar,
+            candidate_key_dimension: 64,
         }
     }
 
@@ -978,10 +983,11 @@ impl NativeAlternateLayerThreeSession {
                 1.0e-20,
             )
             .expect("captured candidate query layout"),
-            nz(64),
+            nz(self.candidate_key_dimension),
             nz(self.fixture.selection_model.candidate_topk_blocks),
             nz(self.fixture.selection_model.candidate_block_size),
-        );
+        )
+        .with_score_execution(self.score_execution);
         let attention_weights =
             attention_capture::weights_for_layer(&self.fixture.attention_weights, 3);
         let mut borrowed_attention = attention_weights.borrowed();
@@ -1209,7 +1215,61 @@ fn live_layer_three_session_uses_supplied_input_before_owner_mutation() {
 
 #[test]
 fn admitted_attention_failure_poisons_then_reset_replays_runtime_owner() {
+    assert_attention_failure_recovery(IndexScoreExecution::Scalar);
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_scored_l3_session_matches_scalar_and_recovers_after_late_failure() {
+    let _guard = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut scalar = NativeAlternateLayerThreeSession::new();
+    let mut metal = NativeAlternateLayerThreeSession::new();
+    metal.score_execution = IndexScoreExecution::MetalBf16;
+    let inputs: Vec<_> = scalar
+        .fixture
+        .cases
+        .iter()
+        .map(|case| (case.start_pos, case.input.bf16()))
+        .collect();
+    for input in &inputs {
+        // Both calls retain independent exact source-stage assertions. The
+        // device result must also publish precisely the same downstream state.
+        assert_eq!(metal.step(input), scalar.step(input));
+        assert_eq!(metal.runtime.next_start(), scalar.runtime.next_start());
+        assert!(!metal.runtime.is_poisoned());
+    }
+    assert_attention_failure_recovery(IndexScoreExecution::MetalBf16);
+    let mut rejected = NativeAlternateLayerThreeSession::new();
+    rejected.score_execution = IndexScoreExecution::MetalBf16;
+    rejected.candidate_key_dimension = 32;
+    assert!(matches!(
+        rejected.step_inner(&inputs[0], false),
+        Err(LayerThreeSessionError::Candidate(
+            deepseek::reduced::CandidateProjectorError::CallGeometry { .. }
+        ))
+    ));
+    assert_eq!(
+        rejected.runtime.next_start(),
+        0,
+        "candidate rejection precedes owner commit"
+    );
+    assert!(rejected.runtime.is_poisoned());
+    assert!(matches!(
+        rejected.step_inner(&inputs[0], false),
+        Err(LayerThreeSessionError::Poisoned)
+    ));
+    rejected.runtime.reset().unwrap();
+    rejected.candidate_key_dimension = 64;
+    for input in &inputs {
+        rejected.step(input);
+    }
+}
+
+fn assert_attention_failure_recovery(execution: IndexScoreExecution) {
     let mut session = NativeAlternateLayerThreeSession::new();
+    session.score_execution = execution;
     let inputs: Vec<_> = session
         .fixture
         .cases
