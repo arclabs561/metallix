@@ -32,7 +32,7 @@ feasibility, not just a countable list of operators.
 | P0 integration | Deliver the accumulated owned lane into an agreed integration baseline. | Classify outstanding changes, integrate from a clean owned checkout, preserve recoverable peer state and rerun gates. Local commit evidence alone does not establish release delivery. |
 | P0 feasibility | Establish what useful DeepSeek execution must fit and how fast it must be. | Declare target machine, RAM/SSD budget, context, TTFT and minimum decode rate. Obtain source-compatible routing evidence, replay explicit capacities and measure selected ranges before acquisition/residency commitments. Synthetic routes and operator parity do not settle this. |
 | P1 DeepSeek execution | Finish the reduced device path, then one real checkpoint-to-generation vertical. | Inventory residual CPU work/readbacks; move connected stages through the existing artifact consumer, preserving source bounds and state/reset checks. Measure matched whole-request timing/memory. Proceed to real loading/tokenization/prefill/decode only after reference and feasibility gates. |
-| Parallel Qwen delivery | Make the working serial service predictable under multiple clients and slow/disconnected readers. | Busy rejection, concurrent-arrival recovery and real socket-reset recovery are qualified. Next qualify slow-reader backpressure, observe resource release and evaluate held-out agent tasks before a Codex-ready claim. |
+| Parallel Qwen delivery | Make the working serial service predictable under multiple clients and slow/disconnected readers. | Busy rejection, concurrent-arrival recovery and real socket-reset recovery are qualified. A bounded synthetic backend also verifies actual socket backpressure, admission release and same-worker recovery. Next observe model-resource release and evaluate held-out agent tasks before a Codex-ready claim. |
 | Parallel Julia decisions | Qualify the native encoder and actual marker-gather/head path. | Resolve the calibration mismatch under a recorded fidelity target, then pass independent/held-out gates and checkpoint-to-decision tests. Qwen bridge results remain decoder-route results. |
 | Later programmable inference | Deliver a concrete task that benefits from constraints, branching, verification or particles. | Show task quality and total latency/resources against a baseline; retain existing mechanism tests. Further hierarchy/router, training, multimodal and generic framework work waits for a named consumer. |
 
@@ -208,7 +208,7 @@ gate; another broad model survey is not on the critical path.
 | DeepSeek primary | Keep the bounded artifact CLI as the single executable consumer of `RequestModel` and `RequestSession`. It now reads an exported numerical artifact and has focused byte-hash/output and fail-closed integration coverage. It offers explicit mixed CPU/Metal scoring, key rotation and final vocabulary projection. Next: remaining reduced arithmetic on Metal and matched whole-request measurements. | Existing final-logit source bounds pass for both schedules; focused CLI integration and strict DeepSeek/server Clippy pass. The canonical check has no new DeepSeek failure and stops at the known Julia mismatch; a green workspace claim remains closed. Preserve fail-closed malformed input/weight geometry and keep fixture readers, captured intermediates, and expected outputs out of the executable. | Fixed synthetic shapes and the numerical artifact remain reversible; full GPU arithmetic, checkpoint loading and serving remain separate gates. |
 | Julia secondary | Retain pinned-source numerical compatibility for the bounded 22-layer prototype before expanding prefill to ordinary typed requests. Consumer: direct Julia decisions. | The fixed calibration source control now matches actual eager attention exactly; this does not clear the full native gate. Pinned-source-backend compatibility remains the target; changing to a portable scalar contract requires a separate decision. Preserve the enabled `1e-5` hidden-state gate and qualified two-block/head controls; do not widen limits. Under the selected target, use a calibration-only layer-zero source-oracle control to separate QKV/RoPE/score reconstruction from backend behavior, then qualify longer padded and window-crossing inputs. The head contract is type embedding, two bidirectional encoder layers, marker-position gather, and a scorer, not ordinary pooled classification. Held-out evaluation and promotion remain closed until the chosen calibration and independent-reference controls pass. | Reversible CPU control and contract evidence before Metal or checkpoint loading; changing the fidelity target requires its own recorded decision. |
 | Feasibility and review | Establish DeepSeek route locality before checkpoint acquisition. Consumer: the checkpoint acquisition decision. | Declare RAM/SSD/context/latency envelope; obtain a qualified source-compatible route-only trace from actual execution; use the offline ordered replay tool at explicit cache capacities before reading selected real ranges. Keep metadata sensitivity distinct from measured hit rates, bytes, and latency. | Read-only metadata/trace work and bounded local probes; residency, prefetch, and pager policy remain decision-required. |
-| Qwen maintenance | Keep text/tools/typed decisions working; extend qualified busy admission and cancellation to slow-reader backpressure and resource recovery before a Codex-ready claim. The retained six read-only trials include three pointer chains, now checked against ordered direct file-read events. | Preserve focused protocol/assessor regressions and exact tool-result replay. Separate task quality from protocol failure; no general coding claim from the fixed read trace. | Reversible serving checks; no further scheduling benchmark variants. |
+| Qwen maintenance | Keep text/tools/typed decisions working; extend qualified admission, cancellation and synthetic slow-reader recovery to observed model-resource recovery before a Codex-ready claim. The retained six read-only trials include three pointer chains, now checked against ordered direct file-read events. | Preserve focused protocol/assessor regressions and exact tool-result replay. Separate task quality from protocol failure; no general coding claim from the fixed read trace. | Reversible serving checks; no further scheduling benchmark variants. |
 
 ### Dependency order and stopping gates
 
@@ -232,7 +232,10 @@ scores/publications and final outputs, with restart/reconstruction controls.
 The same choice reaches the artifact CLI; score-only behavior remains unchanged.
 This is still host-to-device-to-host staging, with no timing or GPU-residency
 claim. The final vocabulary projection now has a source-bounded Metal FP32
-replacement. Measure matched whole requests before selecting the next stage.
+replacement. Use matched whole-CLI measurements to establish the baseline, then
+separate startup/artifact loading from request computation and device waits before
+selecting the next connected stage. A fresh-process CLI comparison does not
+establish steady-state request throughput or a kernel-level bottleneck.
 Key projection/normalization still needs exact downstream BF16/FP4 staging
 gates; full query preparation also needs Metal FP8 projection and FP4 staging.
 Avoid adding more standalone diagnostic entry points.
@@ -254,8 +257,10 @@ Parallel work has separate exit gates:
   pass. The reset reaches the generation callback; a fresh executor on the same
   loaded session reproduces baseline response text, terminal status and usage.
   Single-worker busy rejection and concurrent-arrival recovery also pass.
-  Next qualify actual backpressure and measure resource release. These tests do not
-  establish recovery of cancelled KV state or physical memory release.
+  A bounded synthetic backend now qualifies actual socket backpressure: the
+  streaming write fails, admission is released, and the same worker serves a new
+  request. Next measure model-resource release. These tests do not establish
+  recovery of cancelled KV state or physical memory release.
   Preserve the existing typed-decision and tool replay controls; useful Qwen
   delivery need not wait for DeepSeek.
 - **Julia:** retain pinned-source-backend compatibility as the current contract.

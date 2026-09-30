@@ -313,6 +313,11 @@ including health and model-list connections. A failed model worker returns
 does not automatically retry requests. A slow client can still delay the
 bounded serial acceptor.
 
+A bounded transport regression fills a non-reading client's socket until the
+streaming callback fails, then verifies admission release and a successful
+request on the same worker. Its synthetic backend qualifies transport recovery;
+physical model-memory release and held-out task quality remain separate gates.
+
 A bounded native Codex command-tool run passed six fresh trials against the
 cached 4B checkpoint at `--context-tokens 16384 --kv-budget-mib 8192`:
 three single-file reads and three two-file pointer chains. Each chain required

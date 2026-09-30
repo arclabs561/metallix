@@ -407,13 +407,39 @@ fn serve_listener(
     generation_timeout: Duration,
     request_limit: Option<usize>,
 ) -> Result<(), String> {
+    serve_listener_with_limits(
+        server,
+        model_id,
+        job_sender,
+        occupied,
+        worker_alive,
+        generation_timeout,
+        TransportLimits::default(),
+        request_limit,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "private transport-limit seam shares the production acceptor with bounded socket tests"
+)]
+fn serve_listener_with_limits(
+    server: &TcpListener,
+    model_id: &str,
+    job_sender: &SyncSender<GenerationJob>,
+    occupied: &Arc<AtomicBool>,
+    worker_alive: &Arc<AtomicBool>,
+    generation_timeout: Duration,
+    transport_limits: TransportLimits,
+    request_limit: Option<usize>,
+) -> Result<(), String> {
     for (index, socket) in server
         .incoming()
         .take(request_limit.unwrap_or(usize::MAX))
         .enumerate()
     {
         let socket = socket.map_err(|error| error.to_string())?;
-        let connection = Connection::accept(socket, TransportLimits::default());
+        let connection = Connection::accept(socket, transport_limits);
         if !worker_alive.load(Ordering::Acquire) {
             unavailable_response(connection);
             return Err(String::from("model worker is unavailable"));
@@ -742,14 +768,14 @@ mod tests {
         env,
         io::Read as _,
         net::{Shutdown, TcpListener, TcpStream},
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
             mpsc::{Receiver, SyncSender, sync_channel},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::*;
@@ -781,6 +807,127 @@ mod tests {
         turns: usize,
         entered: SyncSender<()>,
         release: Receiver<()>,
+    }
+
+    struct BackpressureBackend {
+        turns: usize,
+        started: SyncSender<()>,
+        write_failure: SyncSender<(Duration, String)>,
+    }
+
+    impl ChatBackend for BackpressureBackend {
+        fn load_ms(&self) -> f64 {
+            0.0
+        }
+
+        fn generate_with_timeout(
+            &mut self,
+            _request: ChatRequest<'_>,
+            _timeout: Duration,
+            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+            self.turns += 1;
+            if self.turns == 1 {
+                self.started
+                    .send(())
+                    .map_err(|_| ChatGenerationError::Message(String::from("test start closed")))?;
+                let payload = "x".repeat(256 * 1024);
+                for _ in 0..32 {
+                    let began = Instant::now();
+                    if let Err(error) = on_token(&payload) {
+                        self.write_failure
+                            .send((began.elapsed(), error.clone()))
+                            .map_err(|_| {
+                                ChatGenerationError::Message(String::from("test result closed"))
+                            })?;
+                        return Err(ChatGenerationError::Message(error));
+                    }
+                }
+                return Err(ChatGenerationError::Message(String::from(
+                    "bounded backpressure payload was fully accepted",
+                )));
+            }
+            on_token("recovered").map_err(ChatGenerationError::Message)?;
+            Ok(crate::chat_generation::ChatGeneration {
+                text: String::from("recovered"),
+                generated_token_ids: vec![1],
+                finish_reason: ChatFinishReason::Eos,
+                metrics: crate::chat_generation::ChatGenerationMetrics {
+                    context_tokens: 2_048,
+                    planned_kv_bytes: 0,
+                    session_load_ms: 0.0,
+                    render_ms: 0.0,
+                    prefill_ms: 0.0,
+                    time_to_first_token_ms: Some(0.0),
+                    decode_ms: vec![],
+                    decode_total_ms: 0.0,
+                    prompt_tokens: 1,
+                    generated_tokens: 1,
+                },
+            })
+        }
+    }
+
+    struct StalledReader {
+        child: Option<Child>,
+    }
+
+    impl StalledReader {
+        fn start(address: std::net::SocketAddr) -> Self {
+            const STALLED_READER: &str = r#"
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+body = b'{"model":"control","input":"hold","stream":true}'
+request = (
+    b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: "
+    + str(len(body)).encode("ascii")
+    + b"\r\n\r\n"
+    + body
+)
+stream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+stream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+stream.settimeout(2)
+stream.connect((host, port))
+stream.sendall(request)
+stream.shutdown(socket.SHUT_WR)
+if sys.stdin.buffer.read(1) != b"r":
+    raise RuntimeError("slow-reader release was not received")
+stream.close()
+"#;
+            let host = address.ip().to_string();
+            let port = address.port().to_string();
+            let child = Command::new("python3")
+                .args(["-c", STALLED_READER, &host, &port])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start bounded slow reader");
+            Self { child: Some(child) }
+        }
+
+        fn release(&mut self) {
+            let mut child = self.child.take().expect("slow reader remains running");
+            std::io::Write::write_all(child.stdin.as_mut().expect("slow reader stdin"), b"r")
+                .expect("release slow reader");
+            let output = child.wait_with_output().expect("wait for slow reader");
+            assert!(
+                output.status.success(),
+                "slow reader failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    impl Drop for StalledReader {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 
     impl ChatBackend for BlockingBackend {
@@ -1202,6 +1349,113 @@ mod tests {
         worker.join().expect("join bounded worker");
         assert!(!occupied.load(Ordering::Acquire));
         assert!(worker_alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the ordered slow-reader and recovery lifecycle is the assertion under test"
+    )]
+    fn slow_reader_write_deadline_releases_admission_and_worker_recovers() {
+        const WRITE_IDLE: Duration = Duration::from_millis(250);
+        const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
+
+        fn wait_for_admission_release(occupied: &AtomicBool) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while occupied.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "write failure did not release admission"
+                );
+                thread::yield_now();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (job_sender, job_receiver) = sync_channel(0);
+        let (started_sender, started_receiver) = sync_channel(1);
+        let (failure_sender, failure_receiver) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut backend = BackpressureBackend {
+                turns: 0,
+                started: started_sender,
+                write_failure: failure_sender,
+            };
+            worker_loop(&mut backend, job_receiver);
+            backend.turns
+        });
+        let occupied = Arc::new(AtomicBool::new(false));
+        let server_occupied = Arc::clone(&occupied);
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let server_worker_alive = Arc::clone(&worker_alive);
+        let server_sender = job_sender.clone();
+        let server = thread::spawn(move || {
+            serve_listener_with_limits(
+                &listener,
+                "control",
+                &server_sender,
+                &server_occupied,
+                &server_worker_alive,
+                Duration::from_secs(2),
+                TransportLimits {
+                    write_idle: WRITE_IDLE,
+                    response_deadline: RESPONSE_DEADLINE,
+                    ..TransportLimits::default()
+                },
+                Some(2),
+            )
+        });
+
+        let mut stalled_reader = StalledReader::start(address);
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker begins the stalled response");
+        let (elapsed, error) = failure_receiver
+            .recv_timeout(RESPONSE_DEADLINE + Duration::from_secs(1))
+            .expect("stalled response reports a callback write failure");
+        let lower_error = error.to_ascii_lowercase();
+        let pressure_error = lower_error.contains("timed out")
+            || lower_error.contains("would block")
+            || lower_error.contains("temporarily unavailable");
+        assert!(
+            elapsed >= WRITE_IDLE || pressure_error,
+            "callback failed before the write idle bound without a pressure error: {error} after {elapsed:?}"
+        );
+        stalled_reader.release();
+        wait_for_admission_release(&occupied);
+
+        let body = br#"{"model":"control","input":"recover","stream":true}"#;
+        let mut recovery = TcpStream::connect(address).expect("connect recovery request");
+        recovery
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound recovery reads");
+        write!(
+            recovery,
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .expect("recovery request header");
+        recovery.write_all(body).expect("recovery request body");
+        recovery
+            .shutdown(Shutdown::Write)
+            .expect("recovery half-close");
+        let mut recovery_wire = Vec::new();
+        recovery
+            .read_to_end(&mut recovery_wire)
+            .expect("read recovery response");
+        let recovery_wire = String::from_utf8(recovery_wire).expect("recovery response UTF-8");
+        assert!(recovery_wire.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(recovery_wire.contains(r#""type":"response.completed""#));
+        assert!(recovery_wire.contains("recovered"));
+
+        server
+            .join()
+            .expect("join bounded acceptor")
+            .expect("acceptor result");
+        drop(job_sender);
+        assert_eq!(worker.join().expect("join worker"), 2);
+        assert!(!occupied.load(Ordering::Acquire));
     }
 
     #[test]
