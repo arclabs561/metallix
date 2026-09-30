@@ -162,8 +162,9 @@ def layer0_trace(
     case: dict[str, Any],
     attention_implementation: str = "sdpa",
     capture_rope: bool = False,
+    embedding_override: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Capture layer-zero hooks, optionally observing the first pinned RoPE call."""
+    """Capture layer-zero hooks, optionally replacing the source embedding output."""
 
     encoder = source_encoder(attention_implementation)
     input_ids = torch.tensor([case["input_ids"]], dtype=torch.int64)
@@ -178,6 +179,34 @@ def layer0_trace(
 
         return hook
 
+    def layer_output(name: str):
+        def hook(_: torch.nn.Module, __: tuple[object, ...], value: object) -> None:
+            if not isinstance(value, tuple) or not value:
+                raise TypeError(f"unexpected {name} output envelope")
+            hidden = value[0]
+            if not isinstance(hidden, torch.Tensor):
+                raise TypeError(f"unexpected {name} hidden output")
+            observed[name] = hidden.detach().squeeze(0).clone()
+
+        return hook
+
+    def embedding_output(
+        _: torch.nn.Module, __: tuple[object, ...], value: object
+    ) -> torch.Tensor | None:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("unexpected embedding output")
+        if embedding_override is None:
+            observed["embedding"] = value.detach().squeeze(0).clone()
+            return None
+        expected = (len(case["input_ids"]), WIDTH)
+        if (
+            embedding_override.dtype != torch.float32
+            or tuple(embedding_override.shape) != expected
+        ):
+            raise ValueError("embedding override must be an F32 selected embedding")
+        observed["embedding"] = embedding_override.detach().clone()
+        return embedding_override.unsqueeze(0)
+
     def input_hook(name: str):
         def hook(_: torch.nn.Module, value: tuple[object, ...]) -> None:
             if not value or not isinstance(value[0], torch.Tensor):
@@ -188,8 +217,9 @@ def layer0_trace(
 
     layer = encoder.layers[0]
     hooks = [
-        encoder.embeddings.register_forward_hook(output("embedding")),
+        encoder.embeddings.register_forward_hook(embedding_output),
         encoder.embeddings.tok_embeddings.register_forward_hook(output("lookup")),
+        layer.register_forward_hook(layer_output("layer_0")),
         layer.attn.Wqkv.register_forward_hook(output("qkv")),
         layer.attn.Wo.register_forward_pre_hook(input_hook("attended")),
         layer.attn.Wo.register_forward_hook(output("wo")),

@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["torch==2.13.0", "transformers==5.0.0"]
 # ///
-"""Pinned-source eager attention control for the fixed cal_len7 calibration case."""
+"""Pinned-source controls for fixed cal_len7 and cal_len2 calibration probes."""
 
 from __future__ import annotations
 
@@ -22,12 +22,21 @@ CASE = {
     "input_ids": [2, 4, 6, 1, 3, 5, 7],
     "attention_mask": [True, True, True, True, True, True, True],
 }
+LEN2_CASE = {
+    "name": "cal_len2",
+    "input_ids": [6, 1],
+    "attention_mask": [True, True],
+}
 WIDTH, HEADS, HEAD_DIM = 384, 6, 64
 CONTROL_TOLERANCE = 1e-5
 TORCH_THREADS = 1
 NATIVE_TRACE_MAX_BYTES = 2 * 1024 * 1024
+CALIBRATION_REPORT_MAX_BYTES = 128 * 1024 * 1024
 NATIVE_TRACE_SCHEMA_VERSION = 2
 NATIVE_EMBEDDING_TRACE_SCHEMA_VERSION = 1
+LEN2_INTERVENTION_SCHEMA_VERSION = 1
+MANIFEST_SHA256 = "e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82"
+WEIGHT_SHA256 = "db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68"
 
 
 def sha256(path: Path) -> str:
@@ -39,6 +48,16 @@ def source_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("julia_full_prefill_reference", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load Julia full-prefill source control")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def normalization_tree_module() -> ModuleType:
+    path = ROOT / "scripts/julia_calibration_norm_tree.py"
+    spec = importlib.util.spec_from_file_location("julia_calibration_norm_tree", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load Julia normalization-tree control")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -218,6 +237,331 @@ def load_native_embedding_trace(torch: Any, path: Path) -> tuple[dict[str, Any],
     return trace, hashlib.sha256(payload).hexdigest()
 
 
+def validate_len2_intervention_arguments(
+    run_len2_intervention: bool,
+    output: Path | None,
+    native_trace: Path | None,
+    calibration_report: Path | None,
+    check_case: bool,
+    run_source: bool,
+    legacy_native_trace: Path | None,
+    native_embedding_trace: Path | None,
+) -> None:
+    if not run_len2_intervention:
+        if native_trace is not None or calibration_report is not None:
+            raise ValueError(
+                "--len2-native-trace and --len2-calibration-report require --run-len2-intervention"
+            )
+        return
+    if (
+        output is None
+        or native_trace is None
+        or calibration_report is None
+        or check_case
+        or run_source
+        or legacy_native_trace is not None
+        or native_embedding_trace is not None
+    ):
+        raise ValueError(
+            "--run-len2-intervention requires its trace, report, and output without legacy modes"
+        )
+
+
+def read_bounded(path: Path, limit: int, label: str) -> bytes:
+    with path.open("rb") as source:
+        payload = source.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"{label} exceeds {limit} bytes")
+    return payload
+
+
+def as_f32_tensor(torch: Any, value: object, shape: tuple[int, ...], label: str) -> Any:
+    try:
+        result = torch.tensor(value, dtype=torch.float32)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} is not a numeric tensor") from error
+    validate_tensor(torch, result, shape, label)
+    return result
+
+
+def require_exact_f32_bits(torch: Any, left: Any, right: Any, label: str) -> None:
+    if tuple(left.shape) != tuple(right.shape) or not torch.equal(
+        left.contiguous().view(torch.int32), right.contiguous().view(torch.int32)
+    ):
+        raise RuntimeError(f"{label} is not F32-bit-exact")
+
+
+def comparison_metric(torch: Any, left: Any, right: Any) -> dict[str, float | int]:
+    difference = (left.to(torch.float64) - right.to(torch.float64)).abs().flatten()
+    maximum, index = difference.max(dim=0)
+    return {
+        "max_abs": maximum.item(),
+        "flat_index": index.item(),
+        "count": difference.numel(),
+    }
+
+
+def load_len2_intervention_trace(torch: Any, path: Path) -> tuple[dict[str, Any], str]:
+    payload = read_bounded(
+        path, NATIVE_TRACE_MAX_BYTES, "native len2 intervention trace"
+    )
+    try:
+        trace = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("native len2 intervention trace is not valid JSON") from error
+    if not isinstance(trace, dict):
+        raise TypeError("native len2 intervention trace must be a JSON object")
+    if (
+        trace.get("schema_version") != LEN2_INTERVENTION_SCHEMA_VERSION
+        or trace.get("case") != LEN2_CASE["name"]
+        or trace.get("input_ids") != LEN2_CASE["input_ids"]
+        or trace.get("attention_mask") != LEN2_CASE["attention_mask"]
+        or trace.get("manifest_sha256") != MANIFEST_SHA256
+        or trace.get("weight_f32_sha256") != WEIGHT_SHA256
+    ):
+        raise ValueError("native len2 intervention trace does not bind frozen cal_len2")
+    positions = len(LEN2_CASE["input_ids"])
+    shapes = {
+        "qkv": (positions, 3 * WIDTH),
+        "rotated_query": (positions, HEADS, HEAD_DIM),
+        "rotated_key": (positions, HEADS, HEAD_DIM),
+        "logits": (HEADS, positions, positions),
+        "probabilities": (HEADS, positions, positions),
+        "attended": (positions, WIDTH),
+        "post_wo_residual": (positions, WIDTH),
+        "output": (positions, WIDTH),
+    }
+    for branch in ("scalar", "balanced"):
+        record = trace.get(branch)
+        if not isinstance(record, dict) or not isinstance(record.get("trace"), dict):
+            raise TypeError(f"native {branch} intervention record is malformed")
+        record["embedding"] = as_f32_tensor(
+            torch,
+            record.get("embedding"),
+            (positions, WIDTH),
+            f"native {branch} embedding",
+        )
+        values = record["trace"]
+        if values.get("attention_layout") != "head_query_key" or values.get(
+            "attention_shape"
+        ) != [HEADS, positions, positions]:
+            raise ValueError(f"native {branch} attention layout is invalid")
+        for name, shape in shapes.items():
+            values[name] = as_f32_tensor(
+                torch, values.get(name), shape, f"native {branch} {name}"
+            )
+    return trace, hashlib.sha256(payload).hexdigest()
+
+
+def load_len2_cached_calibration_case(
+    torch: Any, path: Path
+) -> tuple[dict[str, Any], str]:
+    payload = read_bounded(path, CALIBRATION_REPORT_MAX_BYTES, "calibration report")
+    try:
+        report = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise ValueError("calibration report is not valid JSON") from error
+    if (
+        not isinstance(report, dict)
+        or report.get("manifest_sha256") != MANIFEST_SHA256
+        or report.get("weight_f32_sha256") != WEIGHT_SHA256
+    ):
+        raise ValueError("calibration report does not bind frozen identities")
+    matches = [
+        case
+        for case in report.get("cases", [])
+        if isinstance(case, dict)
+        and case.get("name") == LEN2_CASE["name"]
+        and case.get("split") == "calibration"
+    ]
+    if len(matches) != 1:
+        raise ValueError("calibration report requires one cal_len2 calibration case")
+    case = matches[0]
+    native = case.get("native_f32_vs_f64")
+    source = case.get("source_f32_boundaries")
+    if (
+        not isinstance(native, dict)
+        or not isinstance(source, dict)
+        or not isinstance(native.get("boundaries"), list)
+        or len(native["boundaries"]) != 24
+    ):
+        raise ValueError(
+            "calibration report lacks exact cal_len2 source/native boundaries"
+        )
+    positions = len(LEN2_CASE["input_ids"])
+    case["cached_native_embedding"] = as_f32_tensor(
+        torch, native["boundaries"][0], (positions, WIDTH), "cached native embedding"
+    )
+    case["cached_native_layer0"] = as_f32_tensor(
+        torch, native["boundaries"][1], (positions, WIDTH), "cached native layer_0"
+    )
+    for name in ("embedding", "layer_0"):
+        value = source.get(name)
+        if not isinstance(value, dict):
+            raise TypeError(f"cached source {name} is invalid")
+        case[f"cached_source_{name}"] = as_f32_tensor(
+            torch,
+            value.get("value"),
+            (positions, WIDTH),
+            f"cached source {name}",
+        )
+    return case, hashlib.sha256(payload).hexdigest()
+
+
+def run_len2_intervention(
+    torch: Any, native_path: Path, calibration_path: Path, output: Path
+) -> None:
+    native, native_sha256 = load_len2_intervention_trace(torch, native_path)
+    cached, calibration_sha256 = load_len2_cached_calibration_case(
+        torch, calibration_path
+    )
+    full = source_module()
+    tree = normalization_tree_module()
+    tree.torch = torch
+    ordinary = full.layer0_trace(LEN2_CASE, "sdpa", capture_rope=True)
+    scalar = full.layer0_trace(
+        LEN2_CASE,
+        "sdpa",
+        capture_rope=True,
+        embedding_override=native["scalar"]["embedding"],
+    )
+    balanced = full.layer0_trace(
+        LEN2_CASE,
+        "sdpa",
+        capture_rope=True,
+        embedding_override=native["balanced"]["embedding"],
+    )
+    positions = len(LEN2_CASE["input_ids"])
+    for label, trace in (
+        ("ordinary source", ordinary),
+        ("scalar same-input source", scalar),
+        ("balanced same-input source", balanced),
+    ):
+        for name, shape in {
+            "embedding": (positions, WIDTH),
+            "qkv": (positions, 3 * WIDTH),
+            "attended": (positions, WIDTH),
+            "post_wo_residual": (positions, WIDTH),
+            "layer_0": (positions, WIDTH),
+        }.items():
+            validate_tensor(torch, trace.get(name), shape, f"{label} {name}")
+    require_exact_f32_bits(
+        torch,
+        native["scalar"]["embedding"],
+        cached["cached_native_embedding"],
+        "scalar native embedding versus cached baseline",
+    )
+    require_exact_f32_bits(
+        torch,
+        native["scalar"]["trace"]["output"],
+        cached["cached_native_layer0"],
+        "scalar native layer_0 versus cached baseline",
+    )
+    require_exact_f32_bits(
+        torch,
+        ordinary["embedding"],
+        cached["cached_source_embedding"],
+        "ordinary source embedding versus cached baseline",
+    )
+    require_exact_f32_bits(
+        torch,
+        ordinary["layer_0"],
+        cached["cached_source_layer_0"],
+        "ordinary source layer_0 versus cached baseline",
+    )
+    require_exact_f32_bits(
+        torch,
+        scalar["embedding"],
+        native["scalar"]["embedding"],
+        "source scalar intervention embedding",
+    )
+    require_exact_f32_bits(
+        torch,
+        balanced["embedding"],
+        native["balanced"]["embedding"],
+        "source balanced intervention embedding",
+    )
+    generated_lookup = full.ENCODER.values((full.VOCAB, WIDTH), 200)[
+        torch.tensor(LEN2_CASE["input_ids"], dtype=torch.int64)
+    ]
+    require_exact_f32_bits(
+        torch,
+        ordinary["lookup"],
+        generated_lookup,
+        "ordinary source lookup versus generated rows",
+    )
+    expected_balanced_embedding = tree.balanced_two_pass(
+        generated_lookup, full.near_one(201)
+    )
+    require_exact_f32_bits(
+        torch,
+        native["balanced"]["embedding"],
+        expected_balanced_embedding,
+        "native balanced embedding versus independent Python tree",
+    )
+    stages = {
+        "qkv": "qkv",
+        "attended": "attended",
+        "post_wo_residual": "post_wo_residual",
+        "layer_0_output": "output",
+    }
+    comparisons = {}
+    for stage, native_name in stages.items():
+        source_name = "layer_0" if stage == "layer_0_output" else native_name
+        comparisons[stage] = {
+            "scalar_native_vs_same_input_source": comparison_metric(
+                torch, native["scalar"]["trace"][native_name], scalar[source_name]
+            ),
+            "balanced_native_vs_same_input_source": comparison_metric(
+                torch,
+                native["balanced"]["trace"][native_name],
+                balanced[source_name],
+            ),
+            "source_balanced_vs_scalar_input_effect": comparison_metric(
+                torch, balanced[source_name], scalar[source_name]
+            ),
+            "native_balanced_vs_scalar_total_effect": comparison_metric(
+                torch,
+                native["balanced"]["trace"][native_name],
+                native["scalar"]["trace"][native_name],
+            ),
+            "ordinary_source_vs_scalar_input_effect": comparison_metric(
+                torch, scalar[source_name], ordinary[source_name]
+            ),
+        }
+    write_exclusive(
+        output,
+        {
+            "schema_version": 1,
+            "scope": "cal_len2 layer-zero scalar/balanced embedding intervention, stagewise association only",
+            "held_out_accessed": False,
+            "case": LEN2_CASE,
+            "identities": {
+                "native_trace_sha256": native_sha256,
+                "calibration_report_sha256": calibration_sha256,
+                "manifest_sha256": MANIFEST_SHA256,
+                "weight_f32_sha256": WEIGHT_SHA256,
+                "full_prefill_reference_sha256": sha256(
+                    ROOT / "scripts/julia_full_prefill_reference.py"
+                ),
+                "normalization_tree_control_sha256": sha256(
+                    ROOT / "scripts/julia_calibration_norm_tree.py"
+                ),
+                "oracle_script_sha256": sha256(Path(__file__)),
+            },
+            "controls": {
+                "scalar_native_matches_cached_baseline_bits": True,
+                "ordinary_source_matches_cached_baseline_bits": True,
+                "source_scalar_embedding_matches_native_bits": True,
+                "source_balanced_embedding_matches_native_bits": True,
+                "native_balanced_embedding_matches_python_tree_bits": True,
+            },
+            "comparisons": comparisons,
+            "interpretation": "scalar and balanced source replays separate same-input native/source arithmetic gaps from the pure source response to the changed embedding; stagewise association does not establish a causal operator attribution or authorize a runtime change",
+        },
+    )
+
+
 def write_exclusive(path: Path, receipt: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as output:
@@ -231,7 +575,32 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--native-trace", type=Path)
     parser.add_argument("--native-embedding-trace", type=Path)
+    parser.add_argument("--run-len2-intervention", action="store_true")
+    parser.add_argument("--len2-native-trace", type=Path)
+    parser.add_argument("--len2-calibration-report", type=Path)
     args = parser.parse_args()
+    validate_len2_intervention_arguments(
+        args.run_len2_intervention,
+        args.output,
+        args.len2_native_trace,
+        args.len2_calibration_report,
+        args.check_case,
+        args.run_source,
+        args.native_trace,
+        args.native_embedding_trace,
+    )
+    if args.run_len2_intervention:
+        import torch
+
+        torch.set_num_threads(TORCH_THREADS)
+        torch.set_num_interop_threads(TORCH_THREADS)
+        run_len2_intervention(
+            torch,
+            args.len2_native_trace,
+            args.len2_calibration_report,
+            args.output,
+        )
+        return
     validate_arguments(
         args.check_case,
         args.run_source,

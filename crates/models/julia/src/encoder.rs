@@ -111,6 +111,8 @@ pub(crate) struct Layer0Trace {
     pub probabilities: Vec<f32>,
     pub attended: Vec<f32>,
     pub post_wo_residual: Vec<f32>,
+    #[cfg(test)]
+    pub output: Vec<f32>,
 }
 
 impl EncoderBlock {
@@ -143,8 +145,16 @@ impl EncoderBlock {
             probabilities: Vec::new(),
             attended: Vec::new(),
             post_wo_residual: Vec::new(),
+            #[cfg(test)]
+            output: Vec::new(),
         };
-        self.forward_inner(input, Some(&mut trace))?;
+        let output = self.forward_inner(input, Some(&mut trace))?;
+        #[cfg(test)]
+        {
+            trace.output = output;
+        }
+        #[cfg(not(test))]
+        drop(output);
         Ok(trace)
     }
 

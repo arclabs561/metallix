@@ -292,6 +292,31 @@ uv run .agents/receipts/julia/embedding_norm_diagnostic.py \
   --output /absolute/path/embedding-norm-diagnostic.json
 ```
 
+### `cal_len2` same-input intervention control
+
+The rejected balanced-embedding propagation experiment first worsened at layer
+zero for `cal_len2`. A calibration-only source control therefore compares the
+same layer in three pinned-SDPA runs: its ordinary source embedding, the
+captured native scalar embedding, and the captured balanced-tree embedding.
+It requires bit-exact binding of the scalar native/source baselines, each
+source override, and the balanced native embedding against the pre-existing
+Python balanced-tree control. It then records QKV, pre-`Wo` attention output,
+post-`Wo` residual, and full layer output. This separates same-input
+native/source arithmetic differences from the source response to the changed
+embedding; it is stagewise association, not a runtime change or causal proof.
+
+Reproduce it with fresh owner-local outputs only:
+
+```sh
+JULIA_DIAGNOSTIC_OUTPUT=/absolute/path/cal-len2-native.json \
+  cargo test -p julia write_cal_len2_layer0_embedding_intervention_trace -- --ignored
+uv run scripts/julia_calibration_source_oracle.py \
+  --run-len2-intervention \
+  --len2-native-trace /absolute/path/cal-len2-native.json \
+  --len2-calibration-report /absolute/path/accuracy-calibration-native-f64.json \
+  --output /absolute/path/cal-len2-source.json
+```
+
 ### Softmax and value-reduction replay
 
 The calibration-only `scripts/julia_calibration_attention_replay.py` compares

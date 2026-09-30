@@ -78,6 +78,56 @@ class SourceOracleInputTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exceeds"):
                 ORACLE.load_native_embedding_trace(None, path)
 
+    def test_len2_intervention_admission_rejects_mixed_modes(self) -> None:
+        native = Path("native.json")
+        report = Path("calibration.json")
+        output = Path("receipt.json")
+        ORACLE.validate_len2_intervention_arguments(
+            True, output, native, report, False, False, None, None
+        )
+        with self.assertRaises(ValueError):
+            ORACLE.validate_len2_intervention_arguments(
+                True, output, native, report, True, False, None, None
+            )
+        with self.assertRaises(ValueError):
+            ORACLE.validate_len2_intervention_arguments(
+                True, output, native, report, False, True, None, None
+            )
+        with self.assertRaises(ValueError):
+            ORACLE.validate_len2_intervention_arguments(
+                True, output, native, report, False, False, Path("legacy.json"), None
+            )
+        with self.assertRaisesRegex(ValueError, "require --run-len2-intervention"):
+            ORACLE.validate_len2_intervention_arguments(
+                False, output, native, report, False, True, None, None
+            )
+
+    def test_len2_intervention_trace_rejects_nonfrozen_case_before_torch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.json"
+            path.write_text(json.dumps({"schema_version": 1, "case": "held_out"}))
+            with self.assertRaises(ValueError):
+                ORACLE.load_len2_intervention_trace(None, path)
+            path.write_bytes(b" " * (ORACLE.NATIVE_TRACE_MAX_BYTES + 1))
+            with self.assertRaisesRegex(ValueError, "exceeds"):
+                ORACLE.load_len2_intervention_trace(None, path)
+
+    def test_len2_intervention_rejects_duplicate_cached_case_before_torch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "calibration.json"
+            case = {"name": "cal_len2", "split": "calibration"}
+            path.write_text(
+                json.dumps(
+                    {
+                        "manifest_sha256": ORACLE.MANIFEST_SHA256,
+                        "weight_f32_sha256": ORACLE.WEIGHT_SHA256,
+                        "cases": [case, case],
+                    }
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "requires one cal_len2"):
+                ORACLE.load_len2_cached_calibration_case(None, path)
+
 
 if __name__ == "__main__":
     unittest.main()

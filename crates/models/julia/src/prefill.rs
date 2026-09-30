@@ -1,5 +1,6 @@
 //! Test-private source parity for a two-layer encoded prefix and Julia head.
 
+use crate::encoder::Layer0Trace;
 use crate::{
     ATTENTION_HEADS, DecisionHead, ENCODER_FF_WIDTH, EncoderBlock, EncoderBlockInput,
     EncoderBlockWeights, EncoderInput, FEED_FORWARD_WIDTH, FullEncoderWeights, HeadInput,
@@ -97,6 +98,46 @@ fn write_new_diagnostic(path: &std::path::Path, value: &Value) {
         .write_all(value.to_string().as_bytes())
         .and_then(|()| output.write_all(b"\n"))
         .expect("write Julia diagnostic output");
+}
+
+fn trace_rows(value: &[f32], width: usize) -> Vec<&[f32]> {
+    value.chunks_exact(width).collect()
+}
+
+fn trace_heads_queries_keys(value: &[f32], positions: usize) -> Vec<Vec<Vec<f32>>> {
+    (0..ATTENTION_HEADS)
+        .map(|head| {
+            (0..positions)
+                .map(|query| {
+                    (0..positions)
+                        .map(|key| value[(query * ATTENTION_HEADS + head) * positions + key])
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn trace_positions_heads_dimensions(value: &[f32]) -> Vec<Vec<&[f32]>> {
+    value
+        .chunks_exact(WIDTH)
+        .map(|position| position.chunks_exact(WIDTH / ATTENTION_HEADS).collect())
+        .collect()
+}
+
+fn layer0_trace_value(trace: &Layer0Trace, positions: usize) -> Value {
+    json!({
+        "qkv": trace_rows(&trace.qkv, 3 * WIDTH),
+        "rotated_query": trace_positions_heads_dimensions(&trace.rotated_query),
+        "rotated_key": trace_positions_heads_dimensions(&trace.rotated_key),
+        "logits": trace_heads_queries_keys(&trace.logits, positions),
+        "probabilities": trace_heads_queries_keys(&trace.probabilities, positions),
+        "attention_layout": "head_query_key",
+        "attention_shape": [ATTENTION_HEADS, positions, positions],
+        "attended": trace_rows(&trace.attended, WIDTH),
+        "post_wo_residual": trace_rows(&trace.post_wo_residual, WIDTH),
+        "output": trace_rows(&trace.output, WIDTH),
+    })
 }
 
 fn head_layer(base: usize) -> HeadLayerWeights {
@@ -676,6 +717,81 @@ fn write_cal_len7_layer0_trace() {
             + "\n",
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "writes opt-in cal_len2 scalar/balanced layer-zero intervention trace to JULIA_DIAGNOSTIC_OUTPUT"]
+fn write_cal_len2_layer0_embedding_intervention_trace() {
+    let manifest: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/julia-1/accuracy-cases.json"
+    ))
+    .unwrap();
+    let case = manifest["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"].as_str() == Some("cal_len2"))
+        .unwrap();
+    let input = EncoderInput {
+        input_ids: case["input_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_u64().unwrap())
+            .collect(),
+        attention_mask: case["attention_mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_bool().unwrap())
+            .collect(),
+    };
+    let weights = full_weights();
+    let encoder = JuliaEncoder::new(weights.clone()).unwrap();
+    let mut scalar_boundaries = encoder.forward_boundaries(&input).unwrap();
+    let scalar_embedding = scalar_boundaries.remove(0);
+    let balanced_embedding = balanced_embedding_norm(
+        &encoder.lookup_rows_for_trace(&input).unwrap(),
+        &weights.embedding_norm_weight,
+    );
+    let block = EncoderBlock::new(weights.layers[0].clone()).unwrap();
+    let scalar = block
+        .forward_layer0_trace(&EncoderBlockInput {
+            hidden: scalar_embedding.clone(),
+            positions: input.input_ids.len(),
+            attention_mask: input.attention_mask.clone(),
+            layer: 0,
+        })
+        .unwrap();
+    let balanced = block
+        .forward_layer0_trace(&EncoderBlockInput {
+            hidden: balanced_embedding.clone(),
+            positions: input.input_ids.len(),
+            attention_mask: input.attention_mask.clone(),
+            layer: 0,
+        })
+        .unwrap();
+    let path = std::env::var("JULIA_DIAGNOSTIC_OUTPUT")
+        .expect("set JULIA_DIAGNOSTIC_OUTPUT to a fresh owner-local diagnostic path");
+    write_new_diagnostic(
+        std::path::Path::new(&path),
+        &json!({
+            "schema_version": 1,
+            "case": "cal_len2",
+            "input_ids": input.input_ids,
+            "attention_mask": input.attention_mask,
+            "manifest_sha256": "e41b492e7ec8e0b0545515eda40fae63d4b1f87ea8fb54545acb277911f62b82",
+            "weight_f32_sha256": "db22ef523c79b55a019a8e62f8b096157035af0945d380a9bbe6bab5586cdf68",
+            "scalar": {
+                "embedding": trace_rows(&scalar_embedding, WIDTH),
+                "trace": layer0_trace_value(&scalar, 2),
+            },
+            "balanced": {
+                "embedding": trace_rows(&balanced_embedding, WIDTH),
+                "trace": layer0_trace_value(&balanced, 2),
+            },
+        }),
+    );
 }
 
 #[test]
