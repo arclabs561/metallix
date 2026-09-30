@@ -11,6 +11,19 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The live alternate L3 Metal qualification now preserves BF16 staging. On the
+  same computed queries, signed weights and committed key prefixes, GPU dot
+  products, ReLU, weighted products and final scores match the runtime/source
+  diagnostics bit for bit at each boundary. Head reduction explicitly promotes
+  BF16 products to FP32 before summing and narrowing. This is a test-only graph
+  for the alternate synthetic schedule, not a runtime backend or arbitrary-shape
+  parity claim. Focused receipt:
+  `.agents/receipts/candidate-control/live-l3-bf16-metal.log`.
+  The canonical Metal check passes all 103 DeepSeek forward composition tests
+  before the unchanged Julia failure; strict DeepSeek lint passes. Companion
+  receipts are `live-l3-bf16-full-check.log` and `live-l3-bf16-clippy-final.log` in the
+  same directory.
+
 - The prefill-7 cutoff audit now includes a full source capture with exact
   observer noninterference. L4's final candidate-masked row contains equal zero
   scores at reachable positions 4 and 6; the pinned source selects 4, but its

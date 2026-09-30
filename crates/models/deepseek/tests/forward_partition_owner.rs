@@ -562,6 +562,99 @@ fn assert_selection_margin(masked_scores: &[f32], max_error: f32, position: usiz
     }
 }
 
+/// Replays the source's BF16 score-stage boundaries on the GPU for this live
+/// L3 publication. This remains a fixture-shape diagnostic: the CPU BF16
+/// reference retains the runtime and source-oracle contract.
+#[cfg(feature = "metal")]
+fn assert_metal_bf16_l3_score_stages(output: &LayerThreeStepOutput, case: &Case) {
+    use mlx_rs::{Array, Dtype, StreamOrDevice, ops};
+
+    const HEADS: usize = 2;
+    const HEAD_DIMENSION: usize = 64;
+
+    let prepared = output.candidate().scored();
+    let query = &prepared.query.index.query_post_fp4;
+    let weights = &prepared.query.index.scaled_head_weights;
+    let key_count = output.key_prefix().len() / HEAD_DIMENSION;
+    let keys: Vec<_> = output
+        .key_prefix()
+        .iter()
+        .copied()
+        .map(bf16_to_f32)
+        .collect();
+    let stream = StreamOrDevice::gpu();
+    let bf16 = |values: &[f32], shape: &[i32]| {
+        Array::from_slice(values, shape)
+            .as_dtype_device(Dtype::Bfloat16, &stream)
+            .expect("stage BF16 values on Metal")
+    };
+    let bits = |array: &Array| {
+        let bits = array
+            .view_dtype_device(Dtype::Uint16, &stream)
+            .expect("view Metal BF16 bits");
+        bits.eval().expect("evaluate Metal BF16 stage");
+        bits.as_slice::<u16>().to_vec()
+    };
+    let keys = bf16(&keys, &[i32::try_from(key_count).expect("key count"), 64]);
+    let zero = bf16(&[0.0], &[]);
+
+    for position in 0..case.token_count {
+        let query_start = position * HEADS * HEAD_DIMENSION;
+        let weight_start = position * HEADS;
+        let query: Vec<_> = query[query_start..query_start + HEADS * HEAD_DIMENSION]
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect();
+        let weights: Vec<_> = weights[weight_start..weight_start + HEADS]
+            .iter()
+            .copied()
+            .map(bf16_to_f32)
+            .collect();
+        let query = bf16(&query, &[2, 64]);
+        let weights = bf16(&weights, &[2, 1]);
+        let dot = query
+            .matmul_device(
+                keys.transpose_device(&stream).expect("transpose L3 keys"),
+                &stream,
+            )
+            .expect("Metal BF16 L3 dot products");
+        let rectified = ops::maximum_device(&dot, &zero, &stream).expect("Metal BF16 ReLU");
+        let weighted = rectified
+            .multiply_device(&weights, &stream)
+            .expect("Metal BF16 signed weighting");
+        let scores = weighted
+            .as_dtype_device(Dtype::Float32, &stream)
+            .expect("promote BF16 heads")
+            .sum_axis_device(0, false, &stream)
+            .expect("sum promoted heads")
+            .as_dtype_device(Dtype::Bfloat16, &stream)
+            .expect("narrow L3 score sum to BF16");
+        let matrix = position * HEADS * key_count;
+        assert_eq!(
+            bits(&dot),
+            prepared.dot_products[matrix..matrix + HEADS * key_count],
+            "Metal BF16 L3 dot stage at position {position}"
+        );
+        assert_eq!(
+            bits(&rectified),
+            prepared.rectified[matrix..matrix + HEADS * key_count],
+            "Metal BF16 L3 ReLU stage at position {position}"
+        );
+        assert_eq!(
+            bits(&weighted),
+            prepared.weighted[matrix..matrix + HEADS * key_count],
+            "Metal BF16 L3 weighted stage at position {position}"
+        );
+        let score_start = position * key_count;
+        assert_eq!(
+            bits(&scores),
+            prepared.scores[score_start..score_start + key_count],
+            "Metal BF16 L3 score stage at position {position}"
+        );
+    }
+}
+
 #[cfg(feature = "metal")]
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
@@ -1001,6 +1094,7 @@ impl NativeAlternateLayerThreeSession {
         attention_capture::assert_diagnostic(&case.attention, output.attention());
         #[cfg(feature = "metal")]
         if qualify_metal_scores {
+            assert_metal_bf16_l3_score_stages(&output, case);
             assert_metal_l3_scores(&output, case);
         }
         #[cfg(not(feature = "metal"))]

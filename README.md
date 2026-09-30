@@ -515,8 +515,11 @@ canonical `5 + 1 + 1` path. `RequestSession` now executes all five blocks and
 the final head within each call, using ordinary typed numerical operands.
 Both schedules match the existing source-derived final-logit bounds and replay
 identically after whole-request restart. The bounded scalar CLI now accepts
-supplied numerical artifacts and token IDs. Broader schedules, Metal execution,
-checkpoint loading and serving remain open. Runtime components under `deepseek::reduced` now own
+supplied numerical artifacts and token IDs. A test-only Metal L3 scorer now
+matches the alternate schedule's BF16 dot, ReLU, weighting and final-score
+boundaries exactly; the request runtime remains scalar. Broader schedules,
+complete Metal execution, checkpoint loading and serving remain open.
+Runtime components under `deepseek::reduced` now own
 final-head arithmetic, attention HC/FFN block tails, and persistent Engram hashing,
 embedding, projection and gating. They accept supplied operands without fixture
 readers or expected outputs. Engram publishes history only after a successful
