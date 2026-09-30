@@ -15,9 +15,9 @@ use crate::{
     moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference},
     reduced::{
         AttentionInput, BlockDefinition, BlockTailReference, EngramDefinition, EngramSessionConfig,
-        EngramSessionWeights, FinalHead, LayerFourConfig, LayerFourDefinition, LayerOneConfig,
-        LayerOneDefinition, LayerThreeConfig, LayerThreeDefinition, RatioTwoOwnerLayout,
-        RatioTwoOwnerWeights, RequestModel, RequestSession, RequestStepOutput,
+        EngramSessionWeights, FinalHead, FinalHeadExecution, LayerFourConfig, LayerFourDefinition,
+        LayerOneConfig, LayerOneDefinition, LayerThreeConfig, LayerThreeDefinition,
+        RatioTwoOwnerLayout, RatioTwoOwnerWeights, RequestModel, RequestSession, RequestStepOutput,
         ReusedAttentionDefinition, StartupDefinition,
     },
 };
@@ -131,6 +131,7 @@ pub(super) fn run(
     prefill: usize,
     execution: crate::indexer::query::IndexScoreExecution,
     key_rotary_execution: IndexKeyRotaryExecution,
+    head_execution: FinalHeadExecution,
 ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
     if ids.is_empty() || prefill == 0 || prefill > ids.len() {
         return Err(ArtifactError::Invalid(
@@ -206,7 +207,8 @@ pub(super) fn run(
     )
     .map_err(ArtifactError::from)?
     .with_score_execution(execution)
-    .with_key_rotary_execution(key_rotary_execution);
+    .with_key_rotary_execution(key_rotary_execution)
+    .with_head_execution(head_execution);
     let mut request = RequestSession::new(&model).map_err(ArtifactError::from)?;
     let mut outputs = Vec::with_capacity(ids.len() - prefill + 1);
     outputs.push(request.step(&ids[..prefill]).map_err(ArtifactError::from)?);

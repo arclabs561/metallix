@@ -71,7 +71,26 @@ use crate::{
     precision::{Fp32LinearError, MAX_FP32_LINEAR_ELEMENTS, bf16_to_f32, fp32_linear_reference},
 };
 
-/// Borrowed immutable operands for one scalar final normalization and head.
+#[cfg(feature = "metal")]
+use mlx_rs::{Array, StreamOrDevice};
+
+/// Output-projection implementation selected by a model-local final head.
+///
+/// Scalar FP32 projection is the source-authoritative default. The optional
+/// Metal variant replaces only the final vocabulary projection; HC collapse
+/// and RMS normalization retain their established BF16 staging.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FinalHeadExecution {
+    /// Use the bounded scalar FP32 projection reference.
+    #[default]
+    Scalar,
+    /// Use the bounded MLX Metal FP32 vocabulary projection.
+    #[cfg(feature = "metal")]
+    MetalFp32,
+}
+
+/// Borrowed immutable operands for one final normalization and head.
 #[derive(Clone, Copy, Debug)]
 pub struct FinalHead<'a> {
     norm_weight: &'a [u16],
@@ -80,6 +99,7 @@ pub struct FinalHead<'a> {
     copies: usize,
     epsilon: f32,
     width: usize,
+    execution: FinalHeadExecution,
 }
 
 impl<'a> FinalHead<'a> {
@@ -168,7 +188,21 @@ impl<'a> FinalHead<'a> {
             copies,
             epsilon,
             width,
+            execution: FinalHeadExecution::Scalar,
         })
+    }
+
+    /// Selects the immutable final vocabulary-projection implementation.
+    #[must_use]
+    pub const fn with_execution(mut self, execution: FinalHeadExecution) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    /// Returns the final vocabulary-projection implementation.
+    #[must_use]
+    pub const fn execution(self) -> FinalHeadExecution {
+        self.execution
     }
 
     /// Collapses, normalizes, and projects one copy-major token residual.
@@ -210,16 +244,28 @@ impl<'a> FinalHead<'a> {
 
         let mut normalized_f32 = allocate_f32("normalized_f32", self.width)?;
         normalized_f32.extend(normalized_bf16.iter().copied().map(bf16_to_f32));
-        let mut logits = allocate_f32("logits", self.vocabulary)?;
-        logits.resize(self.vocabulary, 0.0);
-        fp32_linear_reference(
-            &normalized_f32,
-            self.head_weight,
-            1,
-            self.width,
-            self.vocabulary,
-            &mut logits,
-        )?;
+        let logits = match self.execution {
+            FinalHeadExecution::Scalar => {
+                let mut logits = allocate_f32("logits", self.vocabulary)?;
+                logits.resize(self.vocabulary, 0.0);
+                fp32_linear_reference(
+                    &normalized_f32,
+                    self.head_weight,
+                    1,
+                    self.width,
+                    self.vocabulary,
+                    &mut logits,
+                )?;
+                logits
+            }
+            #[cfg(feature = "metal")]
+            FinalHeadExecution::MetalFp32 => project_logits_metal(
+                &normalized_f32,
+                self.head_weight,
+                self.vocabulary,
+                self.width,
+            )?,
+        };
 
         Ok(FinalHeadOutput {
             collapsed_bf16,
@@ -227,6 +273,71 @@ impl<'a> FinalHead<'a> {
             logits,
         })
     }
+}
+
+/// Runs one validated FP32 vocabulary projection through MLX Metal.
+///
+/// The enclosing [`FinalHead`] has already checked the operand lengths, finite
+/// static weights, and bounded vocabulary-by-width product. This helper repeats
+/// its dynamic input and signed-dimension checks before constructing an MLX
+/// graph, and returns host-owned logits because the request tail remains CPU
+/// staged.
+#[cfg(feature = "metal")]
+fn project_logits_metal(
+    input: &[f32],
+    weights: &[f32],
+    vocabulary: usize,
+    width: usize,
+) -> Result<Vec<f32>, FinalHeadError> {
+    if input.len() != width {
+        return Err(FinalHeadError::Length {
+            field: "normalized_f32",
+            actual: input.len(),
+            expected: width,
+        });
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(FinalHeadError::NonFiniteProjectionInput);
+    }
+    let expected_weights = checked_product(vocabulary, width, "head_weight")?;
+    if weights.len() != expected_weights {
+        return Err(FinalHeadError::Length {
+            field: "head_weight",
+            actual: weights.len(),
+            expected: expected_weights,
+        });
+    }
+    let rows = i32::try_from(vocabulary).map_err(|_| FinalHeadError::MetalDimension {
+        field: "vocabulary",
+    })?;
+    let columns =
+        i32::try_from(width).map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
+    let stream = StreamOrDevice::gpu();
+    let weights = Array::from_slice(weights, &[rows, columns]);
+    let input = Array::from_slice(input, &[columns, 1]);
+    let logits = weights
+        .matmul_device(&input, &stream)
+        .map_err(|error| FinalHeadError::Metal {
+            message: error.to_string(),
+        })?;
+    logits.eval().map_err(|error| FinalHeadError::Metal {
+        message: error.to_string(),
+    })?;
+    let values = logits.as_slice::<f32>();
+    if values.len() != vocabulary {
+        return Err(FinalHeadError::MetalOutputLength {
+            actual: values.len(),
+            expected: vocabulary,
+        });
+    }
+    if let Some((element, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(FinalHeadError::NonFiniteMetalOutput { element });
+    }
+    Ok(values.to_vec())
 }
 
 /// Owned observations from one final normalization and output-head call.
@@ -333,6 +444,35 @@ pub enum FinalHeadError {
     #[error("final head output weight at element {element} is non-finite")]
     NonFiniteHeadWeight {
         /// Weight element index.
+        element: usize,
+    },
+    /// The normalized FP32 row passed to the device projection is not finite.
+    #[error("final head normalized projection input is non-finite")]
+    NonFiniteProjectionInput,
+    /// A bounded final-head dimension cannot be represented by the device API.
+    #[error("final head device dimension {field} exceeds the backend limit")]
+    MetalDimension {
+        /// Dimension that could not be represented.
+        field: &'static str,
+    },
+    /// The device backend rejected final-head projection execution.
+    #[error("final head Metal projection failed: {message}")]
+    Metal {
+        /// Backend error rendered without operand contents.
+        message: String,
+    },
+    /// The device projection returned an unexpected number of logits.
+    #[error("final head Metal output length is {actual}, expected {expected}")]
+    MetalOutputLength {
+        /// Actual output element count.
+        actual: usize,
+        /// Expected vocabulary size.
+        expected: usize,
+    },
+    /// The device projection produced a NaN or infinity.
+    #[error("final head Metal output at element {element} is non-finite")]
+    NonFiniteMetalOutput {
+        /// Output element index.
         element: usize,
     },
     /// A temporary output row could not be reserved.

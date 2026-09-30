@@ -8,7 +8,10 @@ use std::{
 };
 
 use clap::Args;
-use deepseek::indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution};
+use deepseek::{
+    indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution},
+    reduced::FinalHeadExecution,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -55,6 +58,25 @@ impl From<KeyRotaryExecutionArg> for IndexKeyRotaryExecution {
     }
 }
 
+/// Final-head execution remains independent of indexed-layer diagnostics.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum HeadExecutionArg {
+    #[default]
+    Scalar,
+    #[cfg(feature = "metal")]
+    MetalFp32,
+}
+
+impl From<HeadExecutionArg> for FinalHeadExecution {
+    fn from(value: HeadExecutionArg) -> Self {
+        match value {
+            HeadExecutionArg::Scalar => Self::Scalar,
+            #[cfg(feature = "metal")]
+            HeadExecutionArg::MetalFp32 => Self::MetalFp32,
+        }
+    }
+}
+
 /// Runs a bounded reduced request from one local artifact.
 #[derive(Debug, Args)]
 pub(crate) struct ReducedArgs {
@@ -73,6 +95,9 @@ pub(crate) struct ReducedArgs {
     /// Index-key rotation only; other key preparation remains scalar.
     #[arg(long, value_enum, default_value_t = KeyRotaryExecutionArg::Scalar)]
     key_rotary_execution: KeyRotaryExecutionArg,
+    /// Final-head implementation; Metal covers only the bounded FP32 head.
+    #[arg(long, value_enum, default_value_t = HeadExecutionArg::Scalar)]
+    head_execution: HeadExecutionArg,
 }
 
 impl ReducedArgs {
@@ -94,11 +119,12 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     let artifact = deepseek::reduced::ReducedArtifact::parse(&bytes)
         .map_err(|_| "artifact is not a valid reduced request artifact".to_owned())?;
     let outputs = artifact
-        .run_with_execution(
+        .run_with_head_execution(
             &args.input_ids,
             args.prefill_tokens,
             args.score_execution.into(),
             args.key_rotary_execution.into(),
+            args.head_execution.into(),
         )
         .map_err(|_| "reduced request execution was rejected".to_owned())?;
     let expected_calls = 1 + args.input_ids.len() - args.prefill_tokens;
@@ -130,41 +156,39 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let response = match (args.score_execution, args.key_rotary_execution) {
-        (ScoreExecutionArg::Scalar, KeyRotaryExecutionArg::Scalar) => json!({
-            "schema_version": 1,
-            "operation": "deepseek-reduced-request",
-            "backend": "scalar",
-            "artifact_sha256": artifact_sha256,
-            "calls": calls,
-        }),
-        #[cfg(feature = "metal")]
-        (ScoreExecutionArg::MetalBf16, KeyRotaryExecutionArg::Scalar) => json!({
-            "schema_version": 1,
-            "operation": "deepseek-reduced-request",
-            "backend": "mixed-cpu-metal",
-            "score_execution": "metal-bf16",
-            "artifact_sha256": artifact_sha256,
-            "calls": calls,
-        }),
-        #[cfg(feature = "metal")]
-        (score, KeyRotaryExecutionArg::MetalFp32) => json!({
-            "schema_version": 1,
-            "operation": "deepseek-reduced-request",
-            "backend": "mixed-cpu-metal",
-            "score_execution": match score {
-                ScoreExecutionArg::Scalar => "scalar",
-                ScoreExecutionArg::MetalBf16 => "metal-bf16",
-            },
-            "key_rotary_execution": "metal-fp32",
-            "artifact_sha256": artifact_sha256,
-            "calls": calls,
-        }),
-    };
+    let response = json!({
+        "schema_version": 1,
+        "operation": "deepseek-reduced-request",
+        "backend": "scalar",
+        "artifact_sha256": artifact_sha256,
+        "calls": calls,
+    });
+    #[cfg(feature = "metal")]
+    let response = execution_metadata(response, args);
     let rendered = serde_json::to_string(&response)
         .map_err(|_| "could not render reduced request response".to_owned())?;
     println!("{rendered}");
     Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn execution_metadata(mut response: serde_json::Value, args: &ReducedArgs) -> serde_json::Value {
+    let score = matches!(args.score_execution, ScoreExecutionArg::MetalBf16);
+    let key = matches!(args.key_rotary_execution, KeyRotaryExecutionArg::MetalFp32);
+    let head = matches!(args.head_execution, HeadExecutionArg::MetalFp32);
+    if score || key || head {
+        response["backend"] = json!("mixed-cpu-metal");
+    }
+    if score || key {
+        response["score_execution"] = json!(if score { "metal-bf16" } else { "scalar" });
+    }
+    if key {
+        response["key_rotary_execution"] = json!("metal-fp32");
+    }
+    if head {
+        response["head_execution"] = json!("metal-fp32");
+    }
+    response
 }
 
 fn validate_args(args: &ReducedArgs) -> Result<(), String> {
@@ -212,7 +236,8 @@ fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyRotaryExecutionArg, ReducedArgs, ScoreExecutionArg, read_artifact, validate_args,
+        HeadExecutionArg, KeyRotaryExecutionArg, ReducedArgs, ScoreExecutionArg, read_artifact,
+        validate_args,
     };
 
     #[test]
@@ -223,6 +248,7 @@ mod tests {
             prefill_tokens: 1,
             score_execution: ScoreExecutionArg::Scalar,
             key_rotary_execution: KeyRotaryExecutionArg::Scalar,
+            head_execution: HeadExecutionArg::Scalar,
         };
         assert!(validate_args(&args).is_err());
     }

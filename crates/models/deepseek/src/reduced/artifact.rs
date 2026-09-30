@@ -12,7 +12,7 @@ use serde::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{RequestError, RequestStepOutput};
+use super::{FinalHeadExecution, RequestError, RequestStepOutput};
 use crate::indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution};
 
 mod model;
@@ -113,6 +113,27 @@ impl ReducedArtifact {
         score_execution: IndexScoreExecution,
         key_rotary_execution: IndexKeyRotaryExecution,
     ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
+        self.run_with_head_execution(
+            ids,
+            prefill_tokens,
+            score_execution,
+            key_rotary_execution,
+            FinalHeadExecution::Scalar,
+        )
+    }
+
+    /// Runs with explicit index-score, index-key rotary, and final-head choices.
+    ///
+    /// Every device choice is an independently selectable mixed-execution
+    /// diagnostic. The artifact retains no execution preference between calls.
+    pub fn run_with_head_execution(
+        &self,
+        ids: &[i64],
+        prefill_tokens: usize,
+        score_execution: IndexScoreExecution,
+        key_rotary_execution: IndexKeyRotaryExecution,
+        head_execution: FinalHeadExecution,
+    ) -> Result<Vec<RequestStepOutput>, ArtifactError> {
         if prefill_tokens < 2 || prefill_tokens > ids.len() || ids.len() > self.config.max_tokens {
             return Err(ArtifactError::Invalid(String::from(
                 "require 2 <= prefill_tokens <= input count <= configured max_tokens",
@@ -133,6 +154,7 @@ impl ReducedArtifact {
             prefill_tokens,
             score_execution,
             key_rotary_execution,
+            head_execution,
         )
     }
 }

@@ -24,10 +24,10 @@ use crate::{
 use super::{
     AttentionInput, AttentionInputError, AttentionInputOutput, BlockTailDiagnostic, BlockTailError,
     BlockTailReference, EngramSession, EngramSessionConfig, EngramSessionError,
-    EngramSessionWeights, EngramStepOutput, FinalHead, FinalHeadError, FinalHeadOutput,
-    LayerFourCall, LayerFourConfig, LayerFourSession, LayerFourSessionError, LayerFourStepOutput,
-    LayerOneCall, LayerOneConfig, LayerOneSession, LayerOneSessionError, LayerOneStepOutput,
-    LayerThreeCall, LayerThreeConfig, LayerThreePublication, LayerThreeSession,
+    EngramSessionWeights, EngramStepOutput, FinalHead, FinalHeadError, FinalHeadExecution,
+    FinalHeadOutput, LayerFourCall, LayerFourConfig, LayerFourSession, LayerFourSessionError,
+    LayerFourStepOutput, LayerOneCall, LayerOneConfig, LayerOneSession, LayerOneSessionError,
+    LayerOneStepOutput, LayerThreeCall, LayerThreeConfig, LayerThreePublication, LayerThreeSession,
     LayerThreeSessionError, LayerThreeStepOutput, PreviousLayerThreeKeys, RatioTwoOwnerWeights,
     StartupSession, StartupSessionError, StartupStepOutput,
 };
@@ -340,6 +340,22 @@ impl<'a> RequestModel<'a> {
         self.key_rotary_execution
     }
 
+    /// Selects the final vocabulary-projection implementation.
+    ///
+    /// [`Self::new`] preserves scalar FP32 projection. The selected immutable
+    /// head is retained unchanged when a request restarts.
+    #[must_use]
+    pub const fn with_head_execution(mut self, execution: FinalHeadExecution) -> Self {
+        self.head = self.head.with_execution(execution);
+        self
+    }
+
+    /// Returns the model-local final vocabulary-projection implementation.
+    #[must_use]
+    pub const fn head_execution(&self) -> FinalHeadExecution {
+        self.head.execution()
+    }
+
     fn validate(&self) -> Result<(), RequestError> {
         let (_, width) = self.blocks[0].geometry();
         let copies = self.blocks[0].geometry().0;
@@ -484,6 +500,12 @@ impl<'a> RequestSession<'a> {
     #[must_use]
     pub const fn key_rotary_execution(&self) -> IndexKeyRotaryExecution {
         self.model.key_rotary_execution()
+    }
+
+    /// Returns the final projection implementation retained across request restart.
+    #[must_use]
+    pub const fn head_execution(&self) -> FinalHeadExecution {
+        self.model.head_execution()
     }
 
     /// Drops every request-local publication and reconstructs pristine inner state.

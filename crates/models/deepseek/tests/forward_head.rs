@@ -10,6 +10,9 @@ use deepseek::precision::fp32_linear_reference;
 use deepseek::{hc::mixing::hc_pre_bf16_reference, rms_norm_bf16_reference};
 use serde::Deserialize;
 
+#[cfg(feature = "metal")]
+use deepseek::reduced::{FinalHead, FinalHeadExecution};
+
 const WIDTH: usize = 128;
 const VOCAB: usize = 8;
 
@@ -268,6 +271,58 @@ fn native_final_hc_collapse_norm_and_head_match_source_forward() {
             ),
             "native tail logits at start {}",
             case.start_pos
+        );
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_final_head_matches_source_forward_boundary() {
+    let fixture = fixture();
+    let weights: Vec<f32> = fixture
+        .weight_fp32_bits
+        .iter()
+        .copied()
+        .map(f32::from_bits)
+        .collect();
+    let head = FinalHead::new(
+        &fixture.norm_weight_bf16,
+        &weights,
+        VOCAB,
+        2,
+        f32::from_bits(fixture.norm_epsilon_bits),
+    )
+    .expect("source final-head operands")
+    .with_execution(FinalHeadExecution::MetalFp32);
+
+    for case in &fixture.cases {
+        let position = case.input_shape[1] - 1;
+        let residual = &case.final_block_bf16[position * 2 * WIDTH..(position + 1) * 2 * WIDTH];
+        let pre: Vec<f32> = case.final_pre_fp32_bits[position * 2..(position + 1) * 2]
+            .iter()
+            .copied()
+            .map(f32::from_bits)
+            .collect();
+        let output = head.forward(residual, &pre).expect("Metal final head");
+        assert_eq!(
+            output.collapsed_bf16(),
+            &case.collapsed_bf16[position * WIDTH..(position + 1) * WIDTH],
+            "exact BF16 collapse at start {}",
+            case.start_pos
+        );
+        assert_eq!(
+            output.normalized_bf16(),
+            &case.input_bf16[position * WIDTH..(position + 1) * WIDTH],
+            "exact BF16 normalization at start {}",
+            case.start_pos
+        );
+        let input = inputs(case, position);
+        let limits = bounds(&input, &weights, &fixture.comparison_policy);
+        assert!(
+            agrees(output.logits(), &case.logits_fp32_bits, &limits),
+            "Metal source-bound head logits at start {}: actual={:?}, bounds={limits:?}",
+            case.start_pos,
+            output.logits(),
         );
     }
 }
