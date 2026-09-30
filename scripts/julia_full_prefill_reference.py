@@ -163,8 +163,9 @@ def layer0_trace(
     attention_implementation: str = "sdpa",
     capture_rope: bool = False,
     embedding_override: torch.Tensor | None = None,
+    qkv_override: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Capture layer-zero hooks, optionally replacing the source embedding output."""
+    """Capture layer zero, optionally replacing its embedding or `Wqkv` output."""
 
     encoder = source_encoder(attention_implementation)
     input_ids = torch.tensor([case["input_ids"]], dtype=torch.int64)
@@ -207,6 +208,20 @@ def layer0_trace(
         observed["embedding"] = embedding_override.detach().clone()
         return embedding_override.unsqueeze(0)
 
+    def qkv_output(
+        _: torch.nn.Module, __: tuple[object, ...], value: object
+    ) -> torch.Tensor | None:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("unexpected Wqkv output")
+        if qkv_override is None:
+            observed["qkv"] = value.detach().squeeze(0).clone()
+            return None
+        expected = (len(case["input_ids"]), 3 * WIDTH)
+        if qkv_override.dtype != torch.float32 or tuple(qkv_override.shape) != expected:
+            raise ValueError("Wqkv override must be an F32 selected QKV tensor")
+        observed["qkv"] = qkv_override.detach().clone()
+        return qkv_override.unsqueeze(0)
+
     def input_hook(name: str):
         def hook(_: torch.nn.Module, value: tuple[object, ...]) -> None:
             if not value or not isinstance(value[0], torch.Tensor):
@@ -220,7 +235,7 @@ def layer0_trace(
         encoder.embeddings.register_forward_hook(embedding_output),
         encoder.embeddings.tok_embeddings.register_forward_hook(output("lookup")),
         layer.register_forward_hook(layer_output("layer_0")),
-        layer.attn.Wqkv.register_forward_hook(output("qkv")),
+        layer.attn.Wqkv.register_forward_hook(qkv_output),
         layer.attn.Wo.register_forward_pre_hook(input_hook("attended")),
         layer.attn.Wo.register_forward_hook(output("wo")),
     ]

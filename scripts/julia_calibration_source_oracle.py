@@ -301,6 +301,47 @@ def comparison_metric(torch: Any, left: Any, right: Any) -> dict[str, float | in
     }
 
 
+def qkv_override_gate(
+    comparisons: dict[str, dict[str, dict[str, float | int]]],
+) -> dict[str, Any]:
+    """Apply the fixed stagewise non-inferiority check for the QKV intervention."""
+    stages = ("attended", "post_wo_residual", "layer_0_output")
+    results = []
+    for stage in stages:
+        values = comparisons.get(stage)
+        if not isinstance(values, dict):
+            raise TypeError(f"QKV override comparison lacks {stage}")
+        baseline = values.get("scalar_native_vs_same_input_source")
+        candidate = values.get("scalar_native_vs_qkv_override_source")
+        if not isinstance(baseline, dict) or not isinstance(candidate, dict):
+            raise TypeError(f"QKV override comparison lacks {stage} metrics")
+        baseline_max = baseline.get("max_abs")
+        candidate_max = candidate.get("max_abs")
+        if type(baseline_max) not in {float, int} or type(candidate_max) not in {
+            float,
+            int,
+        }:
+            raise TypeError(f"QKV override comparison {stage} has invalid maxima")
+        results.append(
+            {
+                "stage": stage,
+                "baseline_max_abs": baseline_max,
+                "override_max_abs": candidate_max,
+                "no_worse": candidate_max <= baseline_max,
+                "strict_improvement": candidate_max < baseline_max,
+            }
+        )
+    no_worse = all(result["no_worse"] for result in results)
+    strict_improvement = any(result["strict_improvement"] for result in results)
+    return {
+        "stages": results,
+        "no_worse_each_downstream_stage": no_worse,
+        "strict_improvement_at_least_one_downstream_stage": strict_improvement,
+        "passes": no_worse and strict_improvement,
+        "limitation": "stage maxima can occur at different coordinates, so this necessary diagnostic gate does not establish QKV projection as the dominant error source",
+    }
+
+
 def load_len2_intervention_trace(torch: Any, path: Path) -> tuple[dict[str, Any], str]:
     payload = read_bounded(
         path, NATIVE_TRACE_MAX_BYTES, "native len2 intervention trace"
@@ -425,6 +466,13 @@ def run_len2_intervention(
         capture_rope=True,
         embedding_override=native["scalar"]["embedding"],
     )
+    scalar_qkv_override = full.layer0_trace(
+        LEN2_CASE,
+        "sdpa",
+        capture_rope=True,
+        embedding_override=native["scalar"]["embedding"],
+        qkv_override=native["scalar"]["trace"]["qkv"],
+    )
     balanced = full.layer0_trace(
         LEN2_CASE,
         "sdpa",
@@ -435,6 +483,7 @@ def run_len2_intervention(
     for label, trace in (
         ("ordinary source", ordinary),
         ("scalar same-input source", scalar),
+        ("scalar QKV-override source", scalar_qkv_override),
         ("balanced same-input source", balanced),
     ):
         for name, shape in {
@@ -477,6 +526,18 @@ def run_len2_intervention(
     )
     require_exact_f32_bits(
         torch,
+        scalar_qkv_override["embedding"],
+        native["scalar"]["embedding"],
+        "source scalar QKV-override embedding",
+    )
+    require_exact_f32_bits(
+        torch,
+        scalar_qkv_override["qkv"],
+        native["scalar"]["trace"]["qkv"],
+        "source scalar QKV override",
+    )
+    require_exact_f32_bits(
+        torch,
         balanced["embedding"],
         native["balanced"]["embedding"],
         "source balanced intervention embedding",
@@ -512,6 +573,11 @@ def run_len2_intervention(
             "scalar_native_vs_same_input_source": comparison_metric(
                 torch, native["scalar"]["trace"][native_name], scalar[source_name]
             ),
+            "scalar_native_vs_qkv_override_source": comparison_metric(
+                torch,
+                native["scalar"]["trace"][native_name],
+                scalar_qkv_override[source_name],
+            ),
             "balanced_native_vs_same_input_source": comparison_metric(
                 torch,
                 native["balanced"]["trace"][native_name],
@@ -529,6 +595,7 @@ def run_len2_intervention(
                 torch, scalar[source_name], ordinary[source_name]
             ),
         }
+    qkv_gate = qkv_override_gate(comparisons)
     write_exclusive(
         output,
         {
@@ -553,11 +620,13 @@ def run_len2_intervention(
                 "scalar_native_matches_cached_baseline_bits": True,
                 "ordinary_source_matches_cached_baseline_bits": True,
                 "source_scalar_embedding_matches_native_bits": True,
+                "source_scalar_qkv_override_matches_native_bits": True,
                 "source_balanced_embedding_matches_native_bits": True,
                 "native_balanced_embedding_matches_python_tree_bits": True,
             },
             "comparisons": comparisons,
-            "interpretation": "scalar and balanced source replays separate same-input native/source arithmetic gaps from the pure source response to the changed embedding; stagewise association does not establish a causal operator attribution or authorize a runtime change",
+            "qkv_override_gate": qkv_gate,
+            "interpretation": "scalar and balanced source replays separate same-input native/source arithmetic gaps from the pure source response to the changed embedding; the QKV override is a necessary stagewise discriminator, not dominance proof or runtime authorization",
         },
     )
 

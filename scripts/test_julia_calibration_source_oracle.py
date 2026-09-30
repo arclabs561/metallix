@@ -128,6 +128,39 @@ class SourceOracleInputTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires one cal_len2"):
                 ORACLE.load_len2_cached_calibration_case(None, path)
 
+    def test_qkv_override_gate_rejects_a_worsened_downstream_stage(self) -> None:
+        def comparisons(
+            *,
+            candidate_attended: float,
+            candidate_residual: float,
+            candidate_output: float,
+        ) -> dict[str, dict[str, dict[str, float]]]:
+            return {
+                stage: {
+                    "scalar_native_vs_same_input_source": {"max_abs": baseline},
+                    "scalar_native_vs_qkv_override_source": {"max_abs": candidate},
+                }
+                for stage, baseline, candidate in (
+                    ("attended", 2.0, candidate_attended),
+                    ("post_wo_residual", 3.0, candidate_residual),
+                    ("layer_0_output", 4.0, candidate_output),
+                )
+            }
+
+        passing = ORACLE.qkv_override_gate(
+            comparisons(
+                candidate_attended=1.0, candidate_residual=3.0, candidate_output=4.0
+            )
+        )
+        self.assertTrue(passing["passes"])
+        worsened = ORACLE.qkv_override_gate(
+            comparisons(
+                candidate_attended=1.0, candidate_residual=3.1, candidate_output=3.0
+            )
+        )
+        self.assertFalse(worsened["no_worse_each_downstream_stage"])
+        self.assertFalse(worsened["passes"])
+
 
 if __name__ == "__main__":
     unittest.main()
