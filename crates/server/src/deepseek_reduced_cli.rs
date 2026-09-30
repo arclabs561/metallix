@@ -9,7 +9,10 @@ use std::{
 
 use clap::Args;
 use deepseek::{
-    indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution},
+    indexer::{
+        key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
+        query::IndexScoreExecution,
+    },
     reduced::FinalHeadExecution,
 };
 use serde_json::json;
@@ -58,6 +61,30 @@ impl From<KeyRotaryExecutionArg> for IndexKeyRotaryExecution {
     }
 }
 
+/// Complete index-key preparation remains independent of score and head execution.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum KeyPreparationExecutionArg {
+    Scalar,
+    #[cfg(feature = "metal")]
+    #[value(name = "metal-rotary-fp32")]
+    MetalRotaryFp32,
+    #[cfg(feature = "metal")]
+    #[value(name = "metal-prefp4")]
+    MetalPreFp4,
+}
+
+impl From<KeyPreparationExecutionArg> for IndexKeyPreparationExecution {
+    fn from(value: KeyPreparationExecutionArg) -> Self {
+        match value {
+            KeyPreparationExecutionArg::Scalar => Self::Scalar,
+            #[cfg(feature = "metal")]
+            KeyPreparationExecutionArg::MetalRotaryFp32 => Self::MetalRotaryFp32,
+            #[cfg(feature = "metal")]
+            KeyPreparationExecutionArg::MetalPreFp4 => Self::MetalPreFp4,
+        }
+    }
+}
+
 /// Final-head execution remains independent of indexed-layer diagnostics.
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 enum HeadExecutionArg {
@@ -92,9 +119,12 @@ pub(crate) struct ReducedArgs {
     /// Index-score implementation; Metal only covers the bounded BF16 scorer.
     #[arg(long, value_enum, default_value_t = ScoreExecutionArg::Scalar)]
     score_execution: ScoreExecutionArg,
-    /// Index-key rotation only; other key preparation remains scalar.
-    #[arg(long, value_enum, default_value_t = KeyRotaryExecutionArg::Scalar)]
-    key_rotary_execution: KeyRotaryExecutionArg,
+    /// Legacy index-key rotation diagnostic; conflicts with complete key preparation.
+    #[arg(long, value_enum)]
+    key_rotary_execution: Option<KeyRotaryExecutionArg>,
+    /// Complete key preparation diagnostic; Metal runs through pre-FP4 staging.
+    #[arg(long, value_enum)]
+    key_preparation_execution: Option<KeyPreparationExecutionArg>,
     /// Final-head implementation; Metal covers only the bounded FP32 head.
     #[arg(long, value_enum, default_value_t = HeadExecutionArg::Scalar)]
     head_execution: HeadExecutionArg,
@@ -119,11 +149,11 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     let artifact = deepseek::reduced::ReducedArtifact::parse(&bytes)
         .map_err(|_| "artifact is not a valid reduced request artifact".to_owned())?;
     let outputs = artifact
-        .run_with_head_execution(
+        .run_with_key_preparation_execution(
             &args.input_ids,
             args.prefill_tokens,
             args.score_execution.into(),
-            args.key_rotary_execution.into(),
+            key_preparation_execution(args),
             args.head_execution.into(),
         )
         .map_err(|_| "reduced request execution was rejected".to_owned())?;
@@ -174,16 +204,27 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
 #[cfg(feature = "metal")]
 fn execution_metadata(mut response: serde_json::Value, args: &ReducedArgs) -> serde_json::Value {
     let score = matches!(args.score_execution, ScoreExecutionArg::MetalBf16);
-    let key = matches!(args.key_rotary_execution, KeyRotaryExecutionArg::MetalFp32);
+    let rotary = matches!(
+        args.key_rotary_execution,
+        Some(KeyRotaryExecutionArg::MetalFp32)
+    );
+    let preparation = match args.key_preparation_execution {
+        Some(KeyPreparationExecutionArg::Scalar) | None => None,
+        Some(KeyPreparationExecutionArg::MetalRotaryFp32) => Some("metal-rotary-fp32"),
+        Some(KeyPreparationExecutionArg::MetalPreFp4) => Some("metal-prefp4"),
+    };
     let head = matches!(args.head_execution, HeadExecutionArg::MetalFp32);
-    if score || key || head {
+    if score || rotary || preparation.is_some() || head {
         response["backend"] = json!("mixed-cpu-metal");
     }
-    if score || key {
+    if score || rotary {
         response["score_execution"] = json!(if score { "metal-bf16" } else { "scalar" });
     }
-    if key {
+    if rotary {
         response["key_rotary_execution"] = json!("metal-fp32");
+    }
+    if let Some(preparation) = preparation {
+        response["key_preparation_execution"] = json!(preparation);
     }
     if head {
         response["head_execution"] = json!("metal-fp32");
@@ -192,6 +233,9 @@ fn execution_metadata(mut response: serde_json::Value, args: &ReducedArgs) -> se
 }
 
 fn validate_args(args: &ReducedArgs) -> Result<(), String> {
+    if args.key_rotary_execution.is_some() && args.key_preparation_execution.is_some() {
+        return Err("key rotary execution conflicts with key preparation execution".to_owned());
+    }
     if args.input_ids.iter().any(|&id| id < 0) {
         return Err("input token IDs must be nonnegative".to_owned());
     }
@@ -204,6 +248,17 @@ fn validate_args(args: &ReducedArgs) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn key_preparation_execution(args: &ReducedArgs) -> IndexKeyPreparationExecution {
+    args.key_preparation_execution
+        .map(Into::into)
+        .or_else(|| {
+            args.key_rotary_execution.map(|execution| {
+                IndexKeyPreparationExecution::from(IndexKeyRotaryExecution::from(execution))
+            })
+        })
+        .unwrap_or(IndexKeyPreparationExecution::Scalar)
 }
 
 fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
@@ -236,8 +291,8 @@ fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeadExecutionArg, KeyRotaryExecutionArg, ReducedArgs, ScoreExecutionArg, read_artifact,
-        validate_args,
+        HeadExecutionArg, KeyPreparationExecutionArg, KeyRotaryExecutionArg, ReducedArgs,
+        ScoreExecutionArg, key_preparation_execution, read_artifact, validate_args,
     };
 
     #[test]
@@ -247,7 +302,60 @@ mod tests {
             input_ids: vec![0],
             prefill_tokens: 1,
             score_execution: ScoreExecutionArg::Scalar,
-            key_rotary_execution: KeyRotaryExecutionArg::Scalar,
+            key_rotary_execution: None,
+            key_preparation_execution: None,
+            head_execution: HeadExecutionArg::Scalar,
+        };
+        assert!(validate_args(&args).is_err());
+    }
+
+    #[test]
+    fn legacy_rotary_maps_to_key_preparation() {
+        let args = ReducedArgs {
+            artifact: std::path::PathBuf::from("missing"),
+            input_ids: vec![0, 1],
+            prefill_tokens: 2,
+            score_execution: ScoreExecutionArg::Scalar,
+            key_rotary_execution: Some(KeyRotaryExecutionArg::Scalar),
+            key_preparation_execution: None,
+            head_execution: HeadExecutionArg::Scalar,
+        };
+        assert_eq!(
+            key_preparation_execution(&args),
+            deepseek::indexer::key::IndexKeyPreparationExecution::Scalar
+        );
+    }
+
+    #[test]
+    fn explicit_scalar_key_preparation_preserves_scalar_selection() {
+        let args = ReducedArgs {
+            artifact: std::path::PathBuf::from("missing"),
+            input_ids: vec![0, 1],
+            prefill_tokens: 2,
+            score_execution: ScoreExecutionArg::Scalar,
+            key_rotary_execution: None,
+            key_preparation_execution: Some(KeyPreparationExecutionArg::Scalar),
+            head_execution: HeadExecutionArg::Scalar,
+        };
+        assert!(validate_args(&args).is_ok());
+        assert_eq!(
+            key_preparation_execution(&args),
+            deepseek::indexer::key::IndexKeyPreparationExecution::Scalar
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_key_execution_flags() {
+        let args = ReducedArgs {
+            artifact: std::path::PathBuf::from("missing"),
+            input_ids: vec![0, 1],
+            prefill_tokens: 2,
+            score_execution: ScoreExecutionArg::Scalar,
+            key_rotary_execution: Some(KeyRotaryExecutionArg::Scalar),
+            #[cfg(feature = "metal")]
+            key_preparation_execution: Some(KeyPreparationExecutionArg::MetalPreFp4),
+            #[cfg(not(feature = "metal"))]
+            key_preparation_execution: Some(KeyPreparationExecutionArg::Scalar),
             head_execution: HeadExecutionArg::Scalar,
         };
         assert!(validate_args(&args).is_err());

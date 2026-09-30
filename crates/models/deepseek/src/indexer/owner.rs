@@ -23,8 +23,8 @@ use super::{
         prepare_compressed_kv,
     },
     key::{
-        IndexKeyDiagnostic, IndexKeyError, IndexKeyLayout, IndexKeyRotaryExecution,
-        IndexKeyWeights, prepare_index_keys_with_rotary_execution,
+        IndexKeyDiagnostic, IndexKeyError, IndexKeyLayout, IndexKeyPreparationExecution,
+        IndexKeyRotaryExecution, IndexKeyWeights, prepare_index_keys_with_execution,
     },
 };
 
@@ -156,7 +156,7 @@ pub struct RatioOneIndexKeyOwner {
     keys: IndexKeyState,
     layout: IndexKeyLayout,
     input_dimension: NonZeroUsize,
-    rotary_execution: IndexKeyRotaryExecution,
+    preparation_execution: IndexKeyPreparationExecution,
 }
 
 /// Fully prepared but not yet committed ratio-one owner progress.
@@ -331,11 +331,22 @@ impl RatioOneCompressedOwner {
         })
     }
 
-    /// Selects the immutable index-key rotary implementation for later calls.
+    /// Selects the immutable complete index-key preparation implementation for later calls.
     #[must_use]
-    pub fn with_key_rotary_execution(mut self, rotary_execution: IndexKeyRotaryExecution) -> Self {
-        self.key_owner = self.key_owner.with_key_rotary_execution(rotary_execution);
+    pub fn with_key_preparation_execution(
+        mut self,
+        preparation_execution: IndexKeyPreparationExecution,
+    ) -> Self {
+        self.key_owner = self
+            .key_owner
+            .with_key_preparation_execution(preparation_execution);
         self
+    }
+
+    /// Selects the legacy rotary-only implementation through its preparation mapping.
+    #[must_use]
+    pub fn with_key_rotary_execution(self, rotary_execution: IndexKeyRotaryExecution) -> Self {
+        self.with_key_preparation_execution(rotary_execution.into())
     }
 
     /// Stages source-coupled index keys and compressed KV without publishing them.
@@ -574,15 +585,35 @@ impl RatioOneIndexKeyOwner {
             keys,
             layout,
             input_dimension,
-            rotary_execution: IndexKeyRotaryExecution::Scalar,
+            preparation_execution: IndexKeyPreparationExecution::Scalar,
         })
     }
 
-    /// Selects the immutable index-key rotary implementation for later calls.
+    /// Selects the immutable complete index-key preparation implementation for later calls.
     #[must_use]
-    pub fn with_key_rotary_execution(mut self, rotary_execution: IndexKeyRotaryExecution) -> Self {
-        self.rotary_execution = rotary_execution;
+    pub const fn with_key_preparation_execution(
+        mut self,
+        preparation_execution: IndexKeyPreparationExecution,
+    ) -> Self {
+        self.preparation_execution = preparation_execution;
         self
+    }
+
+    /// Selects the legacy rotary-only implementation through its preparation mapping.
+    #[must_use]
+    pub const fn with_key_rotary_execution(
+        self,
+        rotary_execution: IndexKeyRotaryExecution,
+    ) -> Self {
+        match rotary_execution {
+            IndexKeyRotaryExecution::Scalar => {
+                self.with_key_preparation_execution(IndexKeyPreparationExecution::Scalar)
+            }
+            #[cfg(feature = "metal")]
+            IndexKeyRotaryExecution::MetalFp32 => {
+                self.with_key_preparation_execution(IndexKeyPreparationExecution::MetalRotaryFp32)
+            }
+        }
     }
 
     /// Stages and atomically commits one ratio-one owner-layer publication.
@@ -642,12 +673,12 @@ impl RatioOneIndexKeyOwner {
                 call.token_start,
             )?
             .ok_or(RatioOneIndexKeyOwnerError::MissingLatent)?;
-        let prepared = prepare_index_keys_with_rotary_execution(
+        let prepared = prepare_index_keys_with_execution(
             &latent,
             call.frequencies,
             call.weights.key,
             self.layout,
-            self.rotary_execution,
+            self.preparation_execution,
         )?;
         Ok(StagedRatioOneOwner {
             compressor: staged_compressor,

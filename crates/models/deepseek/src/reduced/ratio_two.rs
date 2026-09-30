@@ -21,7 +21,8 @@ use crate::{
         },
         key::{
             IndexKeyDiagnostic, IndexKeyError, IndexKeyLayout, IndexKeyLayoutError,
-            IndexKeyRotaryExecution, IndexKeyWeights, prepare_index_keys_with_rotary_execution,
+            IndexKeyPreparationExecution, IndexKeyRotaryExecution, IndexKeyWeights,
+            prepare_index_keys_with_execution,
         },
     },
     precision::{Fp32LinearError, MAX_FP32_LINEAR_ELEMENTS, bf16_to_f32, fp32_linear_reference},
@@ -273,7 +274,7 @@ pub struct RatioTwoCompressedOwner {
     kv: CompressedKvState,
     key_layout: IndexKeyLayout,
     kv_layout: CompressedKvLayout,
-    rotary_execution: IndexKeyRotaryExecution,
+    preparation_execution: IndexKeyPreparationExecution,
 }
 
 impl RatioTwoCompressedOwner {
@@ -312,18 +313,35 @@ impl RatioTwoCompressedOwner {
             kv,
             key_layout,
             kv_layout,
-            rotary_execution: IndexKeyRotaryExecution::Scalar,
+            preparation_execution: IndexKeyPreparationExecution::Scalar,
         })
     }
 
-    /// Selects the immutable index-key rotary implementation for later calls.
+    /// Selects the immutable complete index-key preparation implementation for later calls.
+    #[must_use]
+    pub const fn with_key_preparation_execution(
+        mut self,
+        preparation_execution: IndexKeyPreparationExecution,
+    ) -> Self {
+        self.preparation_execution = preparation_execution;
+        self
+    }
+
+    /// Selects the legacy rotary-only implementation through its preparation mapping.
     #[must_use]
     pub const fn with_key_rotary_execution(
-        mut self,
+        self,
         rotary_execution: IndexKeyRotaryExecution,
     ) -> Self {
-        self.rotary_execution = rotary_execution;
-        self
+        match rotary_execution {
+            IndexKeyRotaryExecution::Scalar => {
+                self.with_key_preparation_execution(IndexKeyPreparationExecution::Scalar)
+            }
+            #[cfg(feature = "metal")]
+            IndexKeyRotaryExecution::MetalFp32 => {
+                self.with_key_preparation_execution(IndexKeyPreparationExecution::MetalRotaryFp32)
+            }
+        }
     }
 
     fn validate_call_identity(
@@ -421,12 +439,12 @@ impl RatioTwoCompressedOwner {
             call.token_start,
         )?;
         let (index_keys, compressed_kv) = if let Some(latent) = latent.as_deref() {
-            let index_keys = prepare_index_keys_with_rotary_execution(
+            let index_keys = prepare_index_keys_with_execution(
                 latent,
                 call.completed_frequencies,
                 call.weights.index_key,
                 self.key_layout,
-                self.rotary_execution,
+                self.preparation_execution,
             )?;
             let compressed_kv =
                 prepare_compressed_kv(latent, call.completed_frequencies, self.kv_layout)?;

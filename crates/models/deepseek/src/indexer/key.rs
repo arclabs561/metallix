@@ -22,6 +22,9 @@ use crate::{
 #[cfg(feature = "metal")]
 use crate::{RotaryMetalError, rotate_tail_metal};
 
+#[cfg(feature = "metal")]
+use mlx_rs::{Array, Dtype, StreamOrDevice, ops::indexing::TryIndexOp, transforms};
+
 const MAX_INDEX_KEY_ELEMENTS: usize = MAX_BF16_LINEAR_ELEMENTS;
 const MAX_INDEX_KEY_WORK: usize = 1 << 24;
 
@@ -39,6 +42,35 @@ pub enum IndexKeyRotaryExecution {
     /// Rotate the same FP32 tail with the bounded MLX Metal diagnostic.
     #[cfg(feature = "metal")]
     MetalFp32,
+}
+
+/// Complete implementation selected for bounded index-key preparation.
+///
+/// [`Self::Scalar`] remains the source-authoritative default. The Metal
+/// choices are explicit diagnostics. Qualification covers captured operands;
+/// they do not promise arbitrary BF16 matrix-reduction parity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IndexKeyPreparationExecution {
+    /// Use scalar projection, normalization, rotary, and FP4 staging.
+    #[default]
+    Scalar,
+    /// Retain scalar projection/normalization and use the prior Metal rotary diagnostic.
+    #[cfg(feature = "metal")]
+    MetalRotaryFp32,
+    /// Keep projection, normalization, and rotary connected on Metal before scalar FP4 staging.
+    #[cfg(feature = "metal")]
+    MetalPreFp4,
+}
+
+impl From<IndexKeyRotaryExecution> for IndexKeyPreparationExecution {
+    fn from(value: IndexKeyRotaryExecution) -> Self {
+        match value {
+            IndexKeyRotaryExecution::Scalar => Self::Scalar,
+            #[cfg(feature = "metal")]
+            IndexKeyRotaryExecution::MetalFp32 => Self::MetalRotaryFp32,
+        }
+    }
 }
 
 /// Explicit source geometry for a compressed-latent index-key preparation.
@@ -215,6 +247,9 @@ pub enum IndexKeyError {
     #[cfg(feature = "metal")]
     #[error(transparent)]
     MetalRotary(#[from] RotaryMetalError),
+    #[cfg(feature = "metal")]
+    #[error(transparent)]
+    MetalPreparation(#[from] MetalKeyPreparationError),
     #[error(transparent)]
     Fp4(#[from] Fp4ActivationError),
     #[error("index-key latent length is {actual}; expected a nonempty multiple of {stride}")]
@@ -253,6 +288,34 @@ pub enum IndexKeyError {
     },
 }
 
+/// Errors from bounded connected Metal index-key preparation.
+#[cfg(feature = "metal")]
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum MetalKeyPreparationError {
+    /// MLX could not construct, evaluate, or read the bounded preparation graph.
+    #[error("MLX Metal index-key preparation failed: {0}")]
+    Mlx(#[from] mlx_rs::error::Exception),
+    /// A staged BF16 readback did not retain its validated source shape.
+    #[error("Metal index-key {stage} readback has {actual} elements, expected {expected}")]
+    Readback {
+        /// Source-stage boundary.
+        stage: &'static str,
+        /// Readback element count.
+        actual: usize,
+        /// Expected source-shape element count.
+        expected: usize,
+    },
+    /// A finite validated input produced a nonfinite staged BF16 result.
+    #[error("Metal index-key {stage} has nonfinite BF16 at element {element}")]
+    NonFinite {
+        /// Source-stage boundary.
+        stage: &'static str,
+        /// Flat staged element.
+        element: usize,
+    },
+}
+
 /// Prepares source-shaped FP4 index keys from immutable compressor latents.
 ///
 /// `latent` is BF16 `[batch, compressed_position, latent_dimension]` and
@@ -275,12 +338,12 @@ pub fn prepare_index_keys(
     weights: IndexKeyWeights<'_>,
     layout: IndexKeyLayout,
 ) -> Result<IndexKeyDiagnostic, IndexKeyError> {
-    prepare_index_keys_with_rotary_execution(
+    prepare_index_keys_with_execution(
         latent,
         frequencies,
         weights,
         layout,
-        IndexKeyRotaryExecution::Scalar,
+        IndexKeyPreparationExecution::Scalar,
     )
 }
 
@@ -291,6 +354,77 @@ pub fn prepare_index_keys(
 /// rotation is a diagnostic CPU-to-GPU round trip; it does not make key-cache
 /// storage or the remaining stages device resident.
 pub fn prepare_index_keys_with_rotary_execution(
+    latent: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: IndexKeyWeights<'_>,
+    layout: IndexKeyLayout,
+    rotary_execution: IndexKeyRotaryExecution,
+) -> Result<IndexKeyDiagnostic, IndexKeyError> {
+    prepare_index_keys_with_execution(
+        latent,
+        frequencies,
+        weights,
+        layout,
+        rotary_execution.into(),
+    )
+}
+
+/// Prepares source-shaped FP4 index keys using the selected bounded preparation path.
+///
+/// All variants retain the source-observed BF16 stage boundaries and scalar FP4
+/// reconstruction. `MetalPreFp4` is qualified
+/// only for the captured V4.1 operands in this module's fixture, rather than
+/// for arbitrary BF16 matrix reductions.
+pub fn prepare_index_keys_with_execution(
+    latent: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: IndexKeyWeights<'_>,
+    layout: IndexKeyLayout,
+    execution: IndexKeyPreparationExecution,
+) -> Result<IndexKeyDiagnostic, IndexKeyError> {
+    match execution {
+        IndexKeyPreparationExecution::Scalar => prepare_index_keys_scalar(
+            latent,
+            frequencies,
+            weights,
+            layout,
+            IndexKeyRotaryExecution::Scalar,
+        ),
+        #[cfg(feature = "metal")]
+        IndexKeyPreparationExecution::MetalRotaryFp32 => prepare_index_keys_scalar(
+            latent,
+            frequencies,
+            weights,
+            layout,
+            IndexKeyRotaryExecution::MetalFp32,
+        ),
+        #[cfg(feature = "metal")]
+        IndexKeyPreparationExecution::MetalPreFp4 => {
+            let shape = Shape::new(latent, frequencies, weights, layout)?;
+            validate_finite(latent, "latent")?;
+            validate_finite(weights.wk, "wk")?;
+            validate_finite(weights.norm, "norm")?;
+            let stages =
+                prepare_index_key_stages_metal(latent, frequencies, weights, layout, shape)?;
+            let mut post_fp4 = reserve(shape.key_elements, "post_fp4")?;
+            requantize_bf16_activations_e2m1(
+                &stages.post_rope,
+                shape.rows,
+                layout.key_dimension.get(),
+                Fp4ActivationMode::Index32E8m0,
+                &mut post_fp4,
+            )?;
+            Ok(IndexKeyDiagnostic {
+                projected: stages.projected,
+                normalized: stages.normalized,
+                post_rope: stages.post_rope,
+                post_fp4,
+            })
+        }
+    }
+}
+
+fn prepare_index_keys_scalar(
     latent: &[u16],
     frequencies: &[RotaryFrequency],
     weights: IndexKeyWeights<'_>,
@@ -511,6 +645,137 @@ fn reserve(elements: usize, field: &'static str) -> Result<Vec<u16>, IndexKeyErr
     Ok(output)
 }
 
+#[cfg(feature = "metal")]
+struct MetalKeyStages {
+    projected: Vec<u16>,
+    normalized: Vec<u16>,
+    post_rope: Vec<u16>,
+}
+
+#[cfg(feature = "metal")]
+fn prepare_index_key_stages_metal(
+    latent: &[u16],
+    frequencies: &[RotaryFrequency],
+    weights: IndexKeyWeights<'_>,
+    layout: IndexKeyLayout,
+    shape: Shape,
+) -> Result<MetalKeyStages, MetalKeyPreparationError> {
+    let rows = i32::try_from(shape.rows).expect("bounded key rows fit MLX dimensions");
+    let latent_dim = i32::try_from(layout.latent_dimension.get())
+        .expect("bounded latent width fits MLX dimensions");
+    let key_dim =
+        i32::try_from(layout.key_dimension.get()).expect("bounded key width fits MLX dimensions");
+    let batches = i32::try_from(layout.batches.get()).expect("bounded batches fit MLX dimensions");
+    let positions = i32::try_from(shape.positions).expect("bounded positions fit MLX dimensions");
+    let pairs =
+        i32::try_from(layout.rope_pairs.get()).expect("bounded RoPE pairs fit MLX dimensions");
+    let prefix = key_dim - pairs * 2;
+    let stream = StreamOrDevice::gpu();
+    let latent = Array::from_slice(latent, &[rows, latent_dim])
+        .view_dtype_device(Dtype::Bfloat16, &stream)?;
+    let wk = Array::from_slice(weights.wk, &[key_dim, latent_dim])
+        .view_dtype_device(Dtype::Bfloat16, &stream)?;
+    let projected = latent
+        .matmul_device(wk.transpose_device(&stream)?, &stream)?
+        .as_dtype_device(Dtype::Bfloat16, &stream)?;
+
+    // Match the scalar stage boundary: normalization consumes the narrowed
+    // projection, performs FP32 arithmetic, then narrows once to BF16.
+    let projected_f32 = projected.as_dtype_device(Dtype::Float32, &stream)?;
+    let width = Array::from_slice(
+        &[f32::from(u16::try_from(layout.key_dimension.get()).expect(
+            "validated RMSNorm width fits source FP32 conversion",
+        ))],
+        &[],
+    );
+    let epsilon = Array::from_slice(&[layout.norm_epsilon], &[]);
+    let inverse_rms = projected_f32
+        .square_device(&stream)?
+        .sum_axis_device(1, true, &stream)?
+        .divide_device(&width, &stream)?
+        .add_device(&epsilon, &stream)?
+        .rsqrt_device(&stream)?;
+    let norm = Array::from_slice(weights.norm, &[key_dim])
+        .view_dtype_device(Dtype::Bfloat16, &stream)?
+        .as_dtype_device(Dtype::Float32, &stream)?;
+    let normalized = projected_f32
+        .multiply_device(&inverse_rms, &stream)?
+        .multiply_device(&norm, &stream)?
+        .as_dtype_device(Dtype::Bfloat16, &stream)?;
+
+    let normalized_f32 = normalized.as_dtype_device(Dtype::Float32, &stream)?;
+    let prefix_values = normalized_f32.try_index_device((.., 0..prefix), &stream)?;
+    let tail = normalized_f32
+        .try_index_device((.., prefix..key_dim), &stream)?
+        .reshape_device(&[batches, positions, 1, pairs, 2], &stream)?;
+    let real = tail.try_index_device((.., .., .., .., 0_i32), &stream)?;
+    let imaginary = tail.try_index_device((.., .., .., .., 1_i32), &stream)?;
+    let frequency_real = frequencies
+        .iter()
+        .map(|frequency| frequency.real())
+        .collect::<Vec<_>>();
+    let frequency_imaginary = frequencies
+        .iter()
+        .map(|frequency| frequency.imaginary())
+        .collect::<Vec<_>>();
+    let frequency_real = Array::from_slice(&frequency_real, &[1, positions, 1, pairs]);
+    let frequency_imaginary = Array::from_slice(&frequency_imaginary, &[1, positions, 1, pairs]);
+    let output_real = real
+        .multiply_device(&frequency_real, &stream)?
+        .subtract_device(
+            &imaginary.multiply_device(&frequency_imaginary, &stream)?,
+            &stream,
+        )?;
+    let output_imaginary = real
+        .multiply_device(&frequency_imaginary, &stream)?
+        .add_device(
+            &imaginary.multiply_device(&frequency_real, &stream)?,
+            &stream,
+        )?;
+    let rotated_tail =
+        mlx_rs::ops::stack_axis_device(&[&output_real, &output_imaginary], -1, &stream)?
+            .reshape_device(&[rows, pairs * 2], &stream)?;
+    let post_rope =
+        mlx_rs::ops::concatenate_axis_device(&[&prefix_values, &rotated_tail], 1, &stream)?
+            .as_dtype_device(Dtype::Bfloat16, &stream)?;
+
+    let projected_words = projected.view_dtype_device(Dtype::Uint16, &stream)?;
+    let normalized_words = normalized.view_dtype_device(Dtype::Uint16, &stream)?;
+    let post_rope_words = post_rope.view_dtype_device(Dtype::Uint16, &stream)?;
+    transforms::eval([&projected_words, &normalized_words, &post_rope_words])?;
+    let projected = read_metal_key_stage(&projected_words, "projected", shape.key_elements)?;
+    let normalized = read_metal_key_stage(&normalized_words, "normalized", shape.key_elements)?;
+    let post_rope = read_metal_key_stage(&post_rope_words, "post_rope", shape.key_elements)?;
+    Ok(MetalKeyStages {
+        projected,
+        normalized,
+        post_rope,
+    })
+}
+
+#[cfg(feature = "metal")]
+fn read_metal_key_stage(
+    words: &Array,
+    stage: &'static str,
+    expected: usize,
+) -> Result<Vec<u16>, MetalKeyPreparationError> {
+    let values = words.as_slice::<u16>();
+    if values.len() != expected {
+        return Err(MetalKeyPreparationError::Readback {
+            stage,
+            actual: values.len(),
+            expected,
+        });
+    }
+    if let Some(element) = values
+        .iter()
+        .position(|&bits| !bf16_to_f32(bits).is_finite())
+    {
+        return Err(MetalKeyPreparationError::NonFinite { stage, element });
+    }
+    Ok(values.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -519,10 +784,15 @@ mod tests {
         IndexKeyError, IndexKeyLayout, IndexKeyLayoutError, IndexKeyWeights, prepare_index_keys,
     };
     #[cfg(feature = "metal")]
-    use super::{IndexKeyRotaryExecution, prepare_index_keys_with_rotary_execution};
+    use super::{
+        IndexKeyPreparationExecution, IndexKeyRotaryExecution, MetalKeyPreparationError,
+        prepare_index_keys_with_execution, prepare_index_keys_with_rotary_execution,
+    };
     #[cfg(feature = "metal")]
     use crate::GPU_TEST_LOCK;
     use crate::RotaryFrequency;
+    #[cfg(feature = "metal")]
+    use serde::Deserialize;
 
     fn nz(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("nonzero test dimension")
@@ -607,6 +877,240 @@ mod tests {
             .unwrap(),
             scalar,
             "finite call recovers after Metal rotary overflow",
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_key_candidate_preserves_simple_staged_key_boundaries() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let mut wk = vec![0_u16; 32 * 16];
+        wk[30 * 16] = bf16(2.0);
+        wk[31 * 16 + 1] = bf16(3.0);
+        let mut latent = vec![0_u16; 16];
+        latent[0] = bf16(1.0);
+        latent[1] = bf16(1.0);
+        let frequencies = [RotaryFrequency::new(0.0, 1.0).expect("finite frequency")];
+        let norm = [bf16(1.0); 32];
+        let weights = IndexKeyWeights::new(&wk, &norm);
+        let scalar = prepare_index_keys(&latent, &frequencies, weights, layout())
+            .expect("finite scalar staged key");
+        let candidate = prepare_index_keys_with_execution(
+            &latent,
+            &frequencies,
+            weights,
+            layout(),
+            IndexKeyPreparationExecution::MetalPreFp4,
+        )
+        .expect("finite connected Metal key preparation");
+        assert_eq!(
+            candidate, scalar,
+            "all BF16 and scalar FP4 stage boundaries"
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_pre_fp4_preserves_preflight_and_reports_staged_overflow() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        assert!(matches!(
+            prepare_index_keys_with_execution(
+                &[0; 15],
+                &[],
+                IndexKeyWeights::new(&[], &[]),
+                layout(),
+                IndexKeyPreparationExecution::MetalPreFp4,
+            ),
+            Err(IndexKeyError::LatentLength {
+                actual: 15,
+                stride: 16,
+            })
+        ));
+        let mut wk = vec![0_u16; 32 * 16];
+        wk[0] = 0x7f7f; // Largest finite BF16; multiplying by two overflows the staged result.
+        let mut latent = vec![0_u16; 16];
+        latent[0] = bf16(2.0);
+        assert!(matches!(
+            prepare_index_keys_with_execution(
+                &latent,
+                &[RotaryFrequency::new(1.0, 0.0).expect("finite frequency")],
+                IndexKeyWeights::new(&wk, &[bf16(1.0); 32]),
+                layout(),
+                IndexKeyPreparationExecution::MetalPreFp4,
+            ),
+            Err(IndexKeyError::MetalPreparation(
+                MetalKeyPreparationError::NonFinite {
+                    stage: "projected",
+                    element: 0,
+                }
+            ))
+        ));
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Deserialize)]
+    struct SourceKeyFixture {
+        model: SourceKeyModel,
+        weights: SourceKeyWeights,
+        frequencies: SourceKeyTensor,
+        cases: Vec<SourceKeyCase>,
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Deserialize)]
+    struct SourceKeyModel {
+        batches: usize,
+        latent_dimension: usize,
+        key_dimension: usize,
+        rope_pairs: usize,
+        norm_epsilon: f32,
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Deserialize)]
+    struct SourceKeyWeights {
+        wk: SourceKeyTensor,
+        norm: SourceKeyTensor,
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Deserialize)]
+    struct SourceKeyCase {
+        start_pos: usize,
+        latent: SourceKeyTensor,
+        index_cache_after: SourceKeyTensor,
+    }
+
+    #[cfg(feature = "metal")]
+    #[derive(Deserialize)]
+    struct SourceKeyTensor {
+        dtype: String,
+        shape: Vec<usize>,
+        storage_hex: String,
+    }
+
+    #[cfg(feature = "metal")]
+    impl SourceKeyTensor {
+        fn bf16(&self) -> Vec<u16> {
+            assert_eq!(self.dtype, "torch.bfloat16");
+            assert_eq!(self.storage_hex.len() % 4, 0, "BF16 hex words");
+            self.storage_hex
+                .as_bytes()
+                .chunks_exact(4)
+                .map(|word| {
+                    let low =
+                        u8::from_str_radix(std::str::from_utf8(&word[..2]).expect("hex UTF-8"), 16)
+                            .expect("hex byte");
+                    let high =
+                        u8::from_str_radix(std::str::from_utf8(&word[2..]).expect("hex UTF-8"), 16)
+                            .expect("hex byte");
+                    u16::from_le_bytes([low, high])
+                })
+                .collect()
+        }
+
+        fn frequencies(&self) -> Vec<RotaryFrequency> {
+            assert_eq!(self.dtype, "torch.complex64");
+            assert_eq!(self.storage_hex.len() % 16, 0, "complex FP32 hex words");
+            self.storage_hex
+                .as_bytes()
+                .chunks_exact(16)
+                .map(|word| {
+                    let bytes = |start| {
+                        std::array::from_fn(|offset| {
+                            u8::from_str_radix(
+                                std::str::from_utf8(
+                                    &word[start + offset * 2..start + offset * 2 + 2],
+                                )
+                                .expect("hex UTF-8"),
+                                16,
+                            )
+                            .expect("hex byte")
+                        })
+                    };
+                    RotaryFrequency::new(f32::from_le_bytes(bytes(0)), f32::from_le_bytes(bytes(8)))
+                        .expect("finite source frequency")
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_key_candidate_matches_source_key_cache_and_scalar_stages() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let fixture: SourceKeyFixture = serde_json::from_str(include_str!(
+            "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
+        ))
+        .expect("source key fixture");
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .map(|case| case.start_pos)
+                .collect::<Vec<_>>(),
+            [0, 5, 6]
+        );
+        assert_eq!(fixture.weights.wk.shape, [64, 64]);
+        assert_eq!(fixture.weights.norm.shape, [64]);
+        assert_eq!(fixture.frequencies.shape, [8, 16]);
+        let layout = IndexKeyLayout::new(
+            nz(fixture.model.batches),
+            nz(fixture.model.latent_dimension),
+            nz(fixture.model.key_dimension),
+            nz(fixture.model.rope_pairs),
+            fixture.model.norm_epsilon,
+        )
+        .expect("source key layout");
+        let wk = fixture.weights.wk.bf16();
+        let norm = fixture.weights.norm.bf16();
+        let frequencies = fixture.frequencies.frequencies();
+        let weights = IndexKeyWeights::new(&wk, &norm);
+        let mut wrong_frequency_detected = false;
+        for case in fixture.cases {
+            let latent = case.latent.bf16();
+            let positions = latent.len() / fixture.model.latent_dimension;
+            let source_frequencies = &frequencies[case.start_pos * fixture.model.rope_pairs
+                ..(case.start_pos + positions) * fixture.model.rope_pairs];
+            let scalar = prepare_index_keys(&latent, source_frequencies, weights, layout)
+                .expect("source scalar key preparation");
+            let candidate = prepare_index_keys_with_execution(
+                &latent,
+                source_frequencies,
+                weights,
+                layout,
+                IndexKeyPreparationExecution::MetalPreFp4,
+            )
+            .expect("source connected Metal key preparation");
+            assert_eq!(
+                candidate, scalar,
+                "all source BF16/FP4 stages at {}",
+                case.start_pos
+            );
+            let cache = case.index_cache_after.bf16();
+            let start = case.start_pos * fixture.model.key_dimension;
+            let end = (case.start_pos + positions) * fixture.model.key_dimension;
+            assert_eq!(
+                candidate.post_fp4,
+                cache[start..end],
+                "source cache append at {}",
+                case.start_pos
+            );
+            if case.start_pos != 0 {
+                let wrong = prepare_index_keys_with_execution(
+                    &latent,
+                    &frequencies[..fixture.model.rope_pairs],
+                    weights,
+                    layout,
+                    IndexKeyPreparationExecution::MetalPreFp4,
+                )
+                .expect("wrong but finite Metal preparation frequency");
+                wrong_frequency_detected |= wrong.post_fp4 != candidate.post_fp4;
+            }
+        }
+        assert!(
+            wrong_frequency_detected,
+            "source fixture detects replayed position-zero RoPE"
         );
     }
 

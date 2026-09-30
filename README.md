@@ -589,6 +589,14 @@ receipt adds `key_rotary_execution: "metal-fp32"`. Key projection, normalization
 FP4 staging and other request arithmetic remain scalar. Both schedules retain
 exact key stages, publications and final outputs; this is not a throughput claim.
 
+`--key-preparation-execution metal-prefp4` instead runs the complete bounded
+index-key projection, normalization and rotary preparation on Metal before the
+scalar FP4 stage. It conflicts with the legacy rotary-only flag and records
+`key_preparation_execution: "metal-prefp4"`. The captured schedules retain
+exact key stages and publications. This is an experimental placement diagnostic,
+not a default speed optimization or a claim of general BF16 reduction parity;
+the request graph and weights are not kept resident on the device.
+
 `--head-execution metal-fp32` independently moves the final vocabulary projection
 to Metal and adds `head_execution: "metal-fp32"` to the mixed-backend receipt.
 HC collapse and normalization keep their BF16 staging. Head logits satisfy the

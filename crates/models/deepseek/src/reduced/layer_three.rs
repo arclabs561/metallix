@@ -17,7 +17,7 @@ use crate::{
     },
     indexer::{
         cache::{IndexKeyPublicationId, IndexKeyStateError},
-        key::{IndexKeyLayout, IndexKeyRotaryExecution},
+        key::{IndexKeyLayout, IndexKeyPreparationExecution, IndexKeyRotaryExecution},
         owner::{
             RatioOneCompressedOwner, RatioOneCompressedOwnerDiagnostic,
             RatioOneCompressedOwnerError, RatioOneOwnerCall, RatioOneOwnerWeights,
@@ -259,14 +259,22 @@ impl LayerThreeSession {
         })
     }
 
-    /// Selects the index-key rotary implementation for subsequent calls.
+    /// Selects the complete index-key preparation implementation for subsequent calls.
     #[must_use]
-    pub fn with_key_rotary_execution(
+    pub fn with_key_preparation_execution(
         mut self,
-        key_rotary_execution: IndexKeyRotaryExecution,
+        key_preparation_execution: IndexKeyPreparationExecution,
     ) -> Self {
-        self.owner = self.owner.with_key_rotary_execution(key_rotary_execution);
+        self.owner = self
+            .owner
+            .with_key_preparation_execution(key_preparation_execution);
         self
+    }
+
+    /// Selects the legacy rotary-only implementation through its preparation mapping.
+    #[must_use]
+    pub fn with_key_rotary_execution(self, key_rotary_execution: IndexKeyRotaryExecution) -> Self {
+        self.with_key_preparation_execution(key_rotary_execution.into())
     }
 
     /// Computes one L3 partition. Every admitted failure poisons the session.

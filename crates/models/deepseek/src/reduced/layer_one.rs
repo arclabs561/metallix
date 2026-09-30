@@ -17,7 +17,7 @@ use crate::{
     },
     indexer::{
         cache::{IndexKeyPublicationId, IndexKeyStateError},
-        key::IndexKeyRotaryExecution,
+        key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
         query::{
             CandidateQueryLayout, CandidateQueryWeights, IndexKeyView, IndexScoreExecution,
             ScoredQueryDiagnostic, ScoredQueryError, prepare_scored_query_with_execution,
@@ -290,14 +290,22 @@ impl LayerOneSession {
         self
     }
 
-    /// Selects the index-key rotary implementation for subsequent calls.
+    /// Selects the complete index-key preparation implementation for subsequent calls.
     #[must_use]
-    pub fn with_key_rotary_execution(
+    pub fn with_key_preparation_execution(
         mut self,
-        key_rotary_execution: IndexKeyRotaryExecution,
+        key_preparation_execution: IndexKeyPreparationExecution,
     ) -> Self {
-        self.owner = self.owner.with_key_rotary_execution(key_rotary_execution);
+        self.owner = self
+            .owner
+            .with_key_preparation_execution(key_preparation_execution);
         self
+    }
+
+    /// Selects the legacy rotary-only implementation through its preparation mapping.
+    #[must_use]
+    pub fn with_key_rotary_execution(self, key_rotary_execution: IndexKeyRotaryExecution) -> Self {
+        self.with_key_preparation_execution(key_rotary_execution.into())
     }
 
     /// Computes one L1 partition. Every admitted error poisons this session.

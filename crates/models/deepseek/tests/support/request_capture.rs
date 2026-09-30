@@ -5,7 +5,10 @@
 
 use std::collections::BTreeMap;
 
-use deepseek::indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution};
+use deepseek::indexer::{
+    key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
+    query::IndexScoreExecution,
+};
 use deepseek::reduced::FinalHeadExecution;
 
 use super::{HeadFixture, attention_capture};
@@ -123,6 +126,7 @@ fn with_canonical_request_model(
     corrupt_l4: bool,
     execution: IndexScoreExecution,
     key_rotary: IndexKeyRotaryExecution,
+    key_preparation: Option<IndexKeyPreparationExecution>,
     head_execution: FinalHeadExecution,
     body: impl FnOnce(&deepseek::reduced::RequestModel<'_>, &super::Fixture, &HeadFixture, &[i64]),
 ) {
@@ -210,6 +214,10 @@ fn with_canonical_request_model(
                                     l1, l2, layer_three, layer_four, final_head,
                                     frequencies, std::num::NonZeroUsize::new(7).unwrap(),
                                 ).expect("canonical request model").with_score_execution(execution).with_key_rotary_execution(key_rotary).with_head_execution(head_execution);
+                                let model = match key_preparation {
+                                    Some(key_preparation) => model.with_key_preparation_execution(key_preparation),
+                                    None => model,
+                                };
                                 body(&model, &l4_tail, &head, &trace[0]);
                             });
                                 },
@@ -232,6 +240,10 @@ fn check_request_recovery(
     let mut request = RequestSession::new(model).unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
     assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+    assert_eq!(
+        request.key_preparation_execution(),
+        model.key_preparation_execution()
+    );
     assert_eq!(request.head_execution(), model.head_execution());
     let run_canonical = |request: &mut RequestSession<'_>| {
         [
@@ -250,6 +262,10 @@ fn check_request_recovery(
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
     assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+    assert_eq!(
+        request.key_preparation_execution(),
+        model.key_preparation_execution()
+    );
     assert_eq!(request.head_execution(), model.head_execution());
     request.step(&ids[..5]).unwrap();
     assert!(matches!(
@@ -265,6 +281,10 @@ fn check_request_recovery(
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
     assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+    assert_eq!(
+        request.key_preparation_execution(),
+        model.key_preparation_execution()
+    );
     assert_eq!(request.head_execution(), model.head_execution());
     assert_eq!(request.next_start(), 0);
     let replay = run_canonical(&mut request);
@@ -293,6 +313,10 @@ fn check_alternate_recovery(
     let mut request = RequestSession::new(model).unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
     assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+    assert_eq!(
+        request.key_preparation_execution(),
+        model.key_preparation_execution()
+    );
     assert_eq!(request.head_execution(), model.head_execution());
     let run = |request: &mut RequestSession<'_>| {
         [
@@ -307,6 +331,10 @@ fn check_alternate_recovery(
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
     assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+    assert_eq!(
+        request.key_preparation_execution(),
+        model.key_preparation_execution()
+    );
     assert_eq!(request.head_execution(), model.head_execution());
     request.step(&ids[..4]).unwrap();
     request.step(&ids[4..5]).unwrap();
@@ -321,6 +349,10 @@ fn check_alternate_recovery(
     request.restart().unwrap();
     assert_eq!(request.score_execution(), model.score_execution());
     assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+    assert_eq!(
+        request.key_preparation_execution(),
+        model.key_preparation_execution()
+    );
     assert_eq!(request.head_execution(), model.head_execution());
     let replay = run(&mut request);
     request_alternate::assert_source_outputs(&replay, head);
@@ -345,6 +377,7 @@ fn runtime_request_matches_both_source_schedules_and_restarts() {
         false,
         IndexScoreExecution::Scalar,
         IndexKeyRotaryExecution::Scalar,
+        None,
         FinalHeadExecution::Scalar,
         |model, fixture, head, ids| {
             check_request_recovery(model, fixture, head, ids);
@@ -358,6 +391,7 @@ fn late_l4_failure_poison_requires_whole_request_reconstruction() {
     check_late_l4_failure(
         IndexScoreExecution::Scalar,
         IndexKeyRotaryExecution::Scalar,
+        None,
         FinalHeadExecution::Scalar,
     );
 }
@@ -365,6 +399,7 @@ fn late_l4_failure_poison_requires_whole_request_reconstruction() {
 fn check_late_l4_failure(
     execution: IndexScoreExecution,
     key_rotary: IndexKeyRotaryExecution,
+    key_preparation: Option<IndexKeyPreparationExecution>,
     head_execution: FinalHeadExecution,
 ) {
     use deepseek::reduced::{RequestError, RequestSession};
@@ -372,11 +407,16 @@ fn check_late_l4_failure(
         true,
         execution,
         key_rotary,
+        key_preparation,
         head_execution,
         |model, _, _, ids| {
             let mut request = RequestSession::new(model).unwrap();
             assert_eq!(request.score_execution(), model.score_execution());
             assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+            assert_eq!(
+                request.key_preparation_execution(),
+                model.key_preparation_execution()
+            );
             assert_eq!(request.head_execution(), model.head_execution());
             assert!(matches!(
                 request.step(&ids[..5]),
@@ -391,6 +431,10 @@ fn check_late_l4_failure(
             request.restart().unwrap();
             assert_eq!(request.score_execution(), model.score_execution());
             assert_eq!(request.key_rotary_execution(), model.key_rotary_execution());
+            assert_eq!(
+                request.key_preparation_execution(),
+                model.key_preparation_execution()
+            );
             assert_eq!(request.head_execution(), model.head_execution());
             assert_eq!(request.next_start(), 0);
             assert!(!request.is_poisoned());
@@ -412,41 +456,63 @@ fn check_late_l4_failure(
     reason = "one ordered source-bound request and restart comparison"
 )]
 fn metal_scored_request_matches_both_source_schedules_and_restarts() {
-    for (score, key_rotary, head_execution) in [
+    for (score, key_rotary, key_preparation, head_execution) in [
         (
             IndexScoreExecution::MetalBf16,
             IndexKeyRotaryExecution::Scalar,
+            None,
             FinalHeadExecution::Scalar,
         ),
         (
             IndexScoreExecution::Scalar,
             IndexKeyRotaryExecution::MetalFp32,
+            None,
             FinalHeadExecution::Scalar,
         ),
         (
             IndexScoreExecution::MetalBf16,
             IndexKeyRotaryExecution::MetalFp32,
+            None,
             FinalHeadExecution::Scalar,
         ),
         (
             IndexScoreExecution::Scalar,
             IndexKeyRotaryExecution::Scalar,
+            None,
             FinalHeadExecution::MetalFp32,
+        ),
+        (
+            IndexScoreExecution::Scalar,
+            IndexKeyRotaryExecution::Scalar,
+            Some(IndexKeyPreparationExecution::MetalPreFp4),
+            FinalHeadExecution::Scalar,
         ),
     ] {
         with_canonical_request_model(
             false,
             score,
             key_rotary,
+            key_preparation,
             head_execution,
             |model, fixture, head, ids| {
                 assert_eq!(model.score_execution(), score);
-                assert_eq!(model.key_rotary_execution(), key_rotary);
+                assert_eq!(
+                    model.key_preparation_execution(),
+                    key_preparation.unwrap_or_else(|| key_rotary.into())
+                );
+                assert_eq!(
+                    model.key_rotary_execution(),
+                    if key_preparation == Some(IndexKeyPreparationExecution::MetalPreFp4) {
+                        IndexKeyRotaryExecution::MetalFp32
+                    } else {
+                        key_rotary
+                    }
+                );
                 assert_eq!(model.head_execution(), head_execution);
                 let scalar_model = model
                     .clone()
                     .with_score_execution(IndexScoreExecution::Scalar)
-                    .with_key_rotary_execution(IndexKeyRotaryExecution::Scalar)
+                    .with_key_preparation_execution(IndexKeyPreparationExecution::Scalar)
                     .with_head_execution(FinalHeadExecution::Scalar);
                 for prefill in [4, 5] {
                     let mut scalar = deepseek::reduced::RequestSession::new(&scalar_model).unwrap();
@@ -512,7 +578,7 @@ fn metal_scored_request_matches_both_source_schedules_and_restarts() {
                 check_alternate_recovery(model, head, ids);
             },
         );
-        check_late_l4_failure(score, key_rotary, head_execution);
+        check_late_l4_failure(score, key_rotary, key_preparation, head_execution);
     }
 }
 

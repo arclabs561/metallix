@@ -11,7 +11,10 @@ use std::{
 use deepseek::reduced::{MAX_REDUCED_ARTIFACT_BYTES, ReducedArtifact};
 #[cfg(feature = "metal")]
 use deepseek::{
-    indexer::{key::IndexKeyRotaryExecution, query::IndexScoreExecution},
+    indexer::{
+        key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
+        query::IndexScoreExecution,
+    },
     reduced::FinalHeadExecution,
 };
 use serde_json::{Value, json};
@@ -139,6 +142,29 @@ fn run_cli_with_all_execution(
     command.output().expect("reduced CLI launches")
 }
 
+fn run_cli_with_key_preparation_execution(
+    artifact: &Path,
+    prefill_tokens: usize,
+    score_execution: Option<&str>,
+    key_preparation_execution: &str,
+    head_execution: Option<&str>,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
+    command
+        .args(["run-deepseek-reduced", "--artifact"])
+        .arg(artifact)
+        .args(["--input-ids", "0,1,2,3,4,5,6", "--prefill-tokens"])
+        .arg(prefill_tokens.to_string())
+        .args(["--key-preparation-execution", key_preparation_execution]);
+    if let Some(score_execution) = score_execution {
+        command.args(["--score-execution", score_execution]);
+    }
+    if let Some(head_execution) = head_execution {
+        command.args(["--head-execution", head_execution]);
+    }
+    command.output().expect("reduced CLI launches")
+}
+
 fn expected_output(artifact: &ReducedArtifact, bytes: &[u8], prefill_tokens: usize) -> Value {
     let ids = [0, 1, 2, 3, 4, 5, 6];
     let outputs = artifact
@@ -207,6 +233,28 @@ fn expected_output_with_head_execution(
     expected_output_for_calls(bytes, prefill_tokens, &outputs)
 }
 
+#[cfg(feature = "metal")]
+fn expected_output_with_key_preparation_execution(
+    artifact: &ReducedArtifact,
+    bytes: &[u8],
+    prefill_tokens: usize,
+    score_execution: IndexScoreExecution,
+    key_preparation_execution: IndexKeyPreparationExecution,
+    head_execution: FinalHeadExecution,
+) -> Value {
+    let ids = [0, 1, 2, 3, 4, 5, 6];
+    let outputs = artifact
+        .run_with_key_preparation_execution(
+            &ids,
+            prefill_tokens,
+            score_execution,
+            key_preparation_execution,
+            head_execution,
+        )
+        .expect("selected artifact request succeeds");
+    expected_output_for_calls(bytes, prefill_tokens, &outputs)
+}
+
 #[test]
 fn cli_matches_library_artifact_for_both_fixed_partitions() {
     let bytes = export_artifact();
@@ -223,6 +271,23 @@ fn cli_matches_library_artifact_for_both_fixed_partitions() {
         );
         assert!(output.stderr.is_empty());
         let actual: Value = serde_json::from_slice(&output.stdout).expect("CLI emits JSON");
+        assert_eq!(actual, expected_output(&artifact, &bytes, prefill_tokens));
+
+        let explicit_scalar = run_cli_with_key_preparation_execution(
+            artifact_file.path(),
+            prefill_tokens,
+            None,
+            "scalar",
+            None,
+        );
+        assert!(
+            explicit_scalar.status.success(),
+            "CLI failed: {}",
+            String::from_utf8_lossy(&explicit_scalar.stderr)
+        );
+        assert!(explicit_scalar.stderr.is_empty());
+        let actual: Value =
+            serde_json::from_slice(&explicit_scalar.stdout).expect("CLI emits JSON");
         assert_eq!(actual, expected_output(&artifact, &bytes, prefill_tokens));
     }
 }
@@ -283,6 +348,62 @@ fn metal_key_rotation_alone_and_with_scores_matches_scalar_cli() {
             );
         }
         let rejected = run_cli_with_execution(file.path(), 7, Some(score), Some("metal-fp32"));
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_key_preparation_receipt_and_execution_match_selected_library() {
+    let bytes = export_artifact();
+    let file = TempArtifact::from_bytes(&bytes);
+    let artifact = ReducedArtifact::parse(&bytes).unwrap();
+    for score in [IndexScoreExecution::Scalar, IndexScoreExecution::MetalBf16] {
+        let score_arg = if score == IndexScoreExecution::Scalar {
+            "scalar"
+        } else {
+            "metal-bf16"
+        };
+        for prefill in [4, 5] {
+            let output = run_cli_with_key_preparation_execution(
+                file.path(),
+                prefill,
+                Some(score_arg),
+                "metal-prefp4",
+                None,
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty());
+            let mut expected = expected_output_with_key_preparation_execution(
+                &artifact,
+                &bytes,
+                prefill,
+                score,
+                IndexKeyPreparationExecution::MetalPreFp4,
+                FinalHeadExecution::Scalar,
+            );
+            expected["backend"] = json!("mixed-cpu-metal");
+            expected["key_preparation_execution"] = json!("metal-prefp4");
+            if score == IndexScoreExecution::MetalBf16 {
+                expected["score_execution"] = json!(score_arg);
+            }
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                expected
+            );
+        }
+        let rejected = run_cli_with_key_preparation_execution(
+            file.path(),
+            7,
+            Some(score_arg),
+            "metal-prefp4",
+            None,
+        );
         assert!(!rejected.status.success());
         assert!(rejected.stdout.is_empty());
     }
@@ -363,6 +484,36 @@ fn unavailable_key_rotation_rejects_before_artifact_read() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+}
+
+#[test]
+fn unavailable_key_preparation_rejects_before_artifact_read() {
+    let value = if cfg!(feature = "metal") {
+        "unknown"
+    } else {
+        "metal-prefp4"
+    };
+    let output =
+        run_cli_with_key_preparation_execution(Path::new("missing-artifact"), 5, None, value, None);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn conflicting_key_execution_flags_reject_before_artifact_read() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
+    let output = command
+        .args(["run-deepseek-reduced", "--artifact", "missing-artifact"])
+        .args(["--input-ids", "0,1", "--prefill-tokens", "2"])
+        .args(["--key-rotary-execution", "scalar"])
+        .args(["--key-preparation-execution", "metal-prefp4"])
+        .output()
+        .expect("reduced CLI launches");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts"));
 }
 
 #[test]

@@ -16,7 +16,7 @@ use crate::{
     },
     indexer::{
         cache::IndexKeyPublicationId,
-        key::IndexKeyRotaryExecution,
+        key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
         query::{CandidateQueryLayout, CandidateQueryWeights, IndexScoreExecution},
     },
 };
@@ -158,11 +158,11 @@ impl<'a> LayerOneDefinition<'a> {
     fn session(
         self,
         score_execution: IndexScoreExecution,
-        key_rotary_execution: IndexKeyRotaryExecution,
+        key_preparation_execution: IndexKeyPreparationExecution,
     ) -> Result<LayerOneSession, RequestError> {
         Ok(LayerOneSession::new(self.config, self.compressor_norm)?
             .with_score_execution(score_execution)
-            .with_key_rotary_execution(key_rotary_execution))
+            .with_key_preparation_execution(key_preparation_execution))
     }
 }
 
@@ -200,7 +200,7 @@ impl<'a> LayerThreeDefinition<'a> {
 
     fn session(
         self,
-        key_rotary_execution: IndexKeyRotaryExecution,
+        key_preparation_execution: IndexKeyPreparationExecution,
     ) -> Result<LayerThreeSession, RequestError> {
         Ok(LayerThreeSession::new(
             self.config,
@@ -208,7 +208,7 @@ impl<'a> LayerThreeDefinition<'a> {
             self.compressor_norm,
             self.compressor_epsilon,
         )?
-        .with_key_rotary_execution(key_rotary_execution))
+        .with_key_preparation_execution(key_preparation_execution))
     }
 }
 
@@ -269,7 +269,7 @@ pub struct RequestModel<'a> {
     frequencies: &'a [RotaryFrequency],
     max_tokens: NonZeroUsize,
     score_execution: IndexScoreExecution,
-    key_rotary_execution: IndexKeyRotaryExecution,
+    key_preparation_execution: IndexKeyPreparationExecution,
 }
 
 impl<'a> RequestModel<'a> {
@@ -302,7 +302,7 @@ impl<'a> RequestModel<'a> {
             frequencies,
             max_tokens,
             score_execution: IndexScoreExecution::Scalar,
-            key_rotary_execution: IndexKeyRotaryExecution::Scalar,
+            key_preparation_execution: IndexKeyPreparationExecution::Scalar,
         };
         model.validate()?;
         Ok(model)
@@ -324,20 +324,52 @@ impl<'a> RequestModel<'a> {
         self.score_execution
     }
 
-    /// Selects the index-key rotary implementation for L1 and L3 owners.
+    /// Selects the complete index-key preparation implementation for L1 and L3 owners.
     #[must_use]
-    pub const fn with_key_rotary_execution(
+    pub const fn with_key_preparation_execution(
         mut self,
-        key_rotary_execution: IndexKeyRotaryExecution,
+        key_preparation_execution: IndexKeyPreparationExecution,
     ) -> Self {
-        self.key_rotary_execution = key_rotary_execution;
+        self.key_preparation_execution = key_preparation_execution;
         self
     }
 
-    /// Returns the model-local index-key rotary implementation.
+    /// Selects the legacy rotary-only implementation through its preparation mapping.
+    #[must_use]
+    pub const fn with_key_rotary_execution(
+        self,
+        key_rotary_execution: IndexKeyRotaryExecution,
+    ) -> Self {
+        match key_rotary_execution {
+            IndexKeyRotaryExecution::Scalar => {
+                self.with_key_preparation_execution(IndexKeyPreparationExecution::Scalar)
+            }
+            #[cfg(feature = "metal")]
+            IndexKeyRotaryExecution::MetalFp32 => {
+                self.with_key_preparation_execution(IndexKeyPreparationExecution::MetalRotaryFp32)
+            }
+        }
+    }
+
+    /// Returns the model-local complete index-key preparation implementation.
+    #[must_use]
+    pub const fn key_preparation_execution(&self) -> IndexKeyPreparationExecution {
+        self.key_preparation_execution
+    }
+
+    /// Returns the rotary component of the model-local key preparation implementation.
+    ///
+    /// [`Self::key_preparation_execution`] remains authoritative because it
+    /// also distinguishes projection and normalization placement.
     #[must_use]
     pub const fn key_rotary_execution(&self) -> IndexKeyRotaryExecution {
-        self.key_rotary_execution
+        match self.key_preparation_execution {
+            IndexKeyPreparationExecution::Scalar => IndexKeyRotaryExecution::Scalar,
+            #[cfg(feature = "metal")]
+            IndexKeyPreparationExecution::MetalRotaryFp32 => IndexKeyRotaryExecution::MetalFp32,
+            #[cfg(feature = "metal")]
+            IndexKeyPreparationExecution::MetalPreFp4 => IndexKeyRotaryExecution::MetalFp32,
+        }
     }
 
     /// Selects the final vocabulary-projection implementation.
@@ -428,8 +460,8 @@ impl<'a> RequestModel<'a> {
         let _ = self.engrams[1].session()?;
         let _ = self
             .layer_one
-            .session(self.score_execution, self.key_rotary_execution)?;
-        let _ = self.layer_three.session(self.key_rotary_execution)?;
+            .session(self.score_execution, self.key_preparation_execution)?;
+        let _ = self.layer_three.session(self.key_preparation_execution)?;
         let _ = self.layer_four.session(self.score_execution);
         Ok(())
     }
@@ -468,10 +500,10 @@ impl<'a> RequestSession<'a> {
             engram_one: model.engrams[0].session()?,
             layer_one: model
                 .layer_one
-                .session(model.score_execution, model.key_rotary_execution)?,
+                .session(model.score_execution, model.key_preparation_execution)?,
             layer_two: LayerAttentionState::new(model.layer_two.layout),
             engram_three: model.engrams[1].session()?,
-            layer_three: model.layer_three.session(model.key_rotary_execution)?,
+            layer_three: model.layer_three.session(model.key_preparation_execution)?,
             layer_four: model.layer_four.session(model.score_execution),
             prior_layer_three: None,
             next_start: 0,
@@ -500,6 +532,12 @@ impl<'a> RequestSession<'a> {
     #[must_use]
     pub const fn key_rotary_execution(&self) -> IndexKeyRotaryExecution {
         self.model.key_rotary_execution()
+    }
+
+    /// Returns the complete index-key preparation implementation retained across restart.
+    #[must_use]
+    pub const fn key_preparation_execution(&self) -> IndexKeyPreparationExecution {
+        self.model.key_preparation_execution()
     }
 
     /// Returns the final projection implementation retained across request restart.
