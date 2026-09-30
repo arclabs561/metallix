@@ -196,15 +196,15 @@ The next implementation gate is the remaining reduced arithmetic on Metal. Scori
 | 4 | Establish useful performance and the checkpoint resource envelope. Consumer: the checkpoint acquisition/residency decision. | Record matched artifact/input/schedule timing and peak memory for scalar and device paths. In parallel, obtain source-compatible route locality evidence and declare hardware, RAM/SSD, context, TTFT and decode-rate limits. A small synthetic graph cannot establish full-checkpoint fit or speed. |
 | 5 | Admit one real checkpoint-to-request vertical, then serving. Consumer: ordinary local generation. | After reference parity and a viable resource plan, qualify actual loading, tokenizer/template, prefill/decode and output behavior together. Serving additionally needs cancellation, admission and bounded-resource recovery. Apply the existing upstream-runtime pivot if a competing implementation meets the same declared target. |
 
-The next bounded candidate within step 3 is index-key RoPE in the existing
-L1/L3 owner path, reusing `rotate_tail_metal`. Compare the actual BF16 `post_rope`
-and FP4 reconstruction against the current source/key-prefix controls on both
-schedules; a small FP32 rotation error alone is insufficient. Qualify owner
-publication and reset behavior, then thread it through the same request/artifact
-consumer. Keep it scalar if exact downstream staging fails. This is a proposed
-integration step, with no timing or GPU-residency claim. A final-head alternative
-needs a new validated FP32 projection; full query preparation additionally needs
-Metal FP8 projection, normalization and FP4 staging.
+Index-key RoPE now uses `rotate_tail_metal` through an explicit independent
+L1/L3 owner choice. Both schedules match all key BF16/FP4 stages, downstream
+scores/publications and final outputs, with restart/reconstruction controls.
+The same choice reaches the artifact CLI; score-only behavior remains unchanged.
+This is still host-to-device-to-host staging, with no timing or GPU-residency
+claim. The next arithmetic work is bounded key projection/normalization, with
+exact downstream staging gates before request integration. Full query preparation
+also needs Metal FP8 projection and FP4 staging; the final head needs a validated
+FP32 projection. Avoid adding more standalone diagnostic entry points.
 
 Steps 1–3 are reversible model-local changes. Integration in step 0 must preserve
 recoverable peer state. Checkpoint acquisition and residency choices in steps 4–5
@@ -220,11 +220,12 @@ framework work do not occupy the critical path.
 
 Parallel work has separate exit gates:
 
-- **Qwen:** real-model callback cancellation and reuse of the loaded session now
-  pass, with a fresh executor reproducing clean-baseline token IDs. Next qualify
-  socket-driven cancellation under load and measure resource release, then choose
-  bounded admission versus queuing under concurrent arrivals. The callback test
-  does not establish recovery of cancelled KV state or physical memory release.
+- **Qwen:** real-model callback cancellation and loopback TCP-reset recovery now
+  pass. The reset reaches the generation callback; a fresh executor on the same
+  loaded session reproduces baseline response text, terminal status and usage.
+  Next qualify actual backpressure and measure resource release, then choose
+  bounded admission versus queuing under concurrent arrivals. These tests do not
+  establish recovery of cancelled KV state or physical memory release.
   Preserve the existing typed-decision and tool replay controls; useful Qwen
   delivery need not wait for DeepSeek.
 - **Julia:** retain pinned-source-backend compatibility as the current contract

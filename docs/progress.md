@@ -11,6 +11,39 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- Index-key rotation now has an independent Metal choice, from
+  `IndexKeyRotaryExecution::MetalFp32` through both owner paths, request and
+  `ReducedArtifact::run_with_execution` to `--key-rotary-execution metal-fp32`.
+  Key rotation alone, scoring alone and their combination preserve exact key
+  stages, scores, publications and final outputs on both schedules; request
+  poison/restart controls pass. Scalar and score-only API/receipt behavior stays
+  compatible. A Metal rotation that overflows finite BF16 is rejected, and a
+  following finite call recovers. This leaf check does not inject a hardware fault.
+  Focused receipts: `key-rotary-capture.log`,
+  `key-rotary-request-verified.log`, `key-rotary-cli-metal.log` and
+  `key-rotary-cli-cpu.log` under `.agents/receipts/candidate-control/`.
+  Strict DeepSeek/server Clippy passes (`key-rotary-qwen-clippy-verified.log`).
+  The serial canonical check passes all 105 `forward_moe` tests and stops at
+  the unchanged Julia `unmasked_control` mismatch
+  (`key-rotary-qwen-full-check-verified.log`).
+
+- The cached Qwen3-0.6B checkpoint passes actual socket-reset recovery: a loopback
+  client parses a nonempty SSE delta and resets the connection, the write failure
+  reaches the real generation callback and propagates from generation, then the
+  same loaded session returns a fresh response identical to the uninterrupted
+  baseline text, terminal status and usage. The ignored test uses Python's
+  standard socket API for the reset and Rust's actual transport/model path.
+  It does not qualify backpressure, GPU preemption or physical memory release.
+  Receipt: `.agents/receipts/candidate-control/qwen-real-socket-callback-reset-final.log`.
+
+- Julia's calibration-only same-input projection comparison reproduces source
+  QKV exactly with pinned `F.linear`. Embedding-input propagation has RMS
+  `9.584398419098913e-7`, versus `3.2036961004544736e-7` for the projection-side
+  residual. This conditionally separates input and projection differences; it
+  does not prove a normalization/GEMM cause or clear the encoder gate. See the
+  [calibration source control](research/julia-decision-contract.md#calibration-only-source-control).
+
+
 - The numerical artifact API now accepts explicit index-score execution through
   `ReducedArtifact::run_with_score_execution`; `run` remains scalar. The artifact
   CLI exposes `--score-execution metal-bf16` in Metal builds, reporting

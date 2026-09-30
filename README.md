@@ -516,7 +516,8 @@ the final head within each call, using ordinary typed numerical operands.
 Both schedules match the existing source-derived final-logit bounds and replay
 identically after whole-request restart. The bounded artifact CLI now accepts
 supplied numerical artifacts and token IDs. The Rust request model can explicitly
-select bounded BF16 Metal scoring across L1, L3 and L4. Both schedules match
+select bounded BF16 Metal scoring across L1, L3 and L4 and Metal key rotation
+inside the L1/L3 owners. Each option and their combination match
 scalar scores, selections, publications and final outputs, pass the source-derived
 bounds, and replay after whole-request restart. This is mixed execution: other
 arithmetic remains on CPU. The artifact CLI exposes this choice explicitly and
@@ -566,7 +567,11 @@ cargo run -p server --features metal --bin mx -- run-deepseek-reduced \
 This mode reports `backend: "mixed-cpu-metal"` and
 `score_execution: "metal-bf16"`; other arithmetic remains on CPU. The default
 scalar receipt keeps its existing format. Builds without the `metal` feature
-reject the Metal option.
+reject the Metal options. Add `--key-rotary-execution metal-fp32` to run index-key
+rotation on Metal as well, or use it independently with scalar scoring. The
+receipt adds `key_rotary_execution: "metal-fp32"`. Key projection, normalization,
+FP4 staging and other request arithmetic remain scalar. Both schedules retain
+exact key stages, publications and final outputs; this is not a throughput claim.
 
 The exporter creates a new file and refuses to overwrite an existing one. Its
 artifact contains configuration and checksummed numerical tensors; captured
