@@ -1,7 +1,8 @@
 # Programmatic inference frontiers
 
 Status: research direction; no feature in this note is implied to be
-implemented. Checked 2026-09-22 with primary papers, author research posts,
+implemented. Initial review 2026-09-22; contrastive decision models checked
+2026-09-30. Sources are primary papers, author research posts,
 and public implementation documentation. This note is a source ledger and
 design input, not a ranking of methods.
 
@@ -176,6 +177,33 @@ typed evidence and keep the distinction between “candidate scored well” and
 “candidate is correct.” A recursive controller or SMC policy should be able to
 use the signal without pretending it is a probability of correctness.
 
+## Contrastive decision models
+
+[CLM-v0.1-8B](https://huggingface.co/Contrastive-LM/CLM-v0.1-8B)
+uses a frozen Qwen3-8B encoder with last-token pooling and separate trainable
+state/action projection heads. Normalized projected embeddings are compared
+with a learned logit scale. Its contrastive objective and cached action
+representations make it relevant to candidate ranking and verifiers; it is
+not a replacement for autoregressive generation or the Julia encoder contract.
+The model revision reviewed is `e939398d4556fcd9400c76fa8c5a513202f42b0a`.
+
+The upstream [head implementation](https://github.com/Contrastive-LM/CLM/blob/bb42c6c5bf914fd449bed2f6ca65be80602cb1f7/src/clm/heads.py)
+and [fine-tuning entry point](https://github.com/Contrastive-LM/CLM/blob/bb42c6c5bf914fd449bed2f6ca65be80602cb1f7/train/finetune.py)
+support a useful narrow training boundary: frozen encoder embeddings feeding
+trainable heads. The published `.pt` checkpoint needs a trusted conversion
+and an explicit tensor manifest before native import. A small head does not
+remove the cost of encoding new states with the 8B backbone.
+
+A first Metallix experiment should fix encoder revision, tokenizer, pooling,
+head weights, normalization and candidate ordering; prove head parity on
+frozen embeddings; then measure a held-out ranking task against the raw encoder
+and existing decision route. A native encoder path and action-cache invalidation
+need their own tests. Probabilities remain relative to the candidate set and
+must not be presented as calibrated correctness. This is a proposed adapter
+qualification, not implemented CLM support. Reading covered the model card,
+repository overview, heads and training entry point, not independent benchmark
+reproduction.
+
 ## Gates before making this functional
 
 1. **Observation gate:** capture a small set of model activations with exact
@@ -200,4 +228,3 @@ their reported quality and cost do not establish Apple-Silicon behavior. No
 claim here establishes that activation steering is robust across model
 families, that internal explanations are faithful, or that online parameter
 updates are safe. Those are explicit open questions.
-

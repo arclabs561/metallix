@@ -6,6 +6,41 @@ Silicon Mac from distributed techniques that become relevant only after a
 future multi-accelerator pivot. Serving cache optimization is a separate
 problem: saved training activations are not an inference KV cache.
 
+## Qualify one adaptation workflow before general training
+
+Support for externally trained checkpoints/adapters, local head fine-tuning,
+and full-model training are separate deliverables. A proposed first local
+workflow is frozen embeddings plus a trained scorer or projection, followed
+by LoRA where gradients through an encoder are actually required. The
+[CLM training path](https://github.com/Contrastive-LM/CLM/blob/bb42c6c5bf914fd449bed2f6ca65be80602cb1f7/train/finetune.py)
+is concrete heads-only prior art. Decoder supervision, contrastive state/action
+losses and diffusion denoising objectives should remain model-owned; one
+inference interface does not establish a common training recipe.
+
+## Matryoshka versus learned projection
+
+[ZeroEntropy's article](https://zeroentropy.dev/articles/matryoshka-is-dead/),
+reviewed 2026-09-30, reports that learned fixed projection tiers outperform
+its Matryoshka-trained zembed-1 variants on its internal retrieval evaluation.
+The comparison uses 22 datasets and Gemini-derived relevance judgments; the
+authors acknowledge shared-failure risk and pending human/alternative-judge
+checks. This is useful vendor evidence, not a theorem that the objective is
+universally inferior.
+
+The [original Matryoshka paper](https://arxiv.org/html/2205.13147v4) trains a
+chosen set of nested prefix dimensions. Untrained intermediate prefix lengths
+are an empirical generalization, not a lossless guarantee. Its operational
+advantage is that one stored vector can support several retrieval widths.
+ZeroEntropy's published fixed projections instead require the appropriate
+learned transform and renormalization; a prefix slice is not interchangeable.
+
+For a named embedding consumer, compare full-width output, learned projections
+and Matryoshka tiers on held-out retrieval or decision quality at the same
+storage budget. Decision heads need compatibility/retraining checks after any
+projection. These techniques can reduce stored-vector size and search work;
+they do not by themselves reduce encoder forward work, model weights or KV
+memory, and they do not accelerate the present DeepSeek request graph.
+
 ## Memory is an accounting problem before it is a kernel problem
 
 Start with a measured peak, but use a budget to identify the likely term to

@@ -40,6 +40,37 @@ environment/inference sections were read, but the OpenReview paper was not
 available through the source renderer.  These limits deliberately bound the
 claims above.
 
+## DiffusionGemma and structured reads
+
+The [DiffusionGemma model card](https://huggingface.co/google/diffusiongemma-26B-A4B-it),
+reviewed 2026-09-30, supplies a concrete encoder/decoder case: a causal encoder
+caches prompt context, a bidirectional decoder denoises a token canvas, and a
+completed canvas is encoded into the context for later blocks. The model has
+25.2B total parameters and 3.8B active parameters; active count does not imply
+that only those weights need storage. Its reported H100 generation speeds do
+not establish Apple-Silicon performance.
+
+The [community decision endpoint](https://huggingface.co/spaces/victor/DiffusionGemma-free-endpoint)
+uses seeded answer slots to expose Jev-style yes/no, choice and score requests.
+The underlying [vLLM structured-read change](https://github.com/vllm-project/vllm/pull/57250)
+merged on 2026-09-22; the endpoint's statement that it remains unmerged is stale.
+The PR provides a prototype `/v1/systemone` example server, not a standard vLLM
+endpoint contract. Reads can pin template positions, request specific label
+logprobs and stop without committing the canvas. Labels must occupy one token;
+client-side mapping can represent longer option names. One denoising read is
+distinct from policies that take multiple noisy reads or generate reasoning
+first. None establishes answer calibration by itself.
+
+This is useful upstream comparison material for Metallix's typed-decision
+consumer. Native support would require the complete model-local encoder,
+canvas, mask, cache and denoising contract; it cannot reuse a causal next-token
+mask unchanged. First compare fixed public decision cases, quality, total
+latency and number of reads against an existing route. The endpoint's remote
+A100 measurements and its own probability descriptions are not native runtime
+qualification. Reading covered the model card, endpoint documentation and
+merged PR description/test plan; no endpoint load test or native reproduction
+was performed.
+
 ## Why a decoder-shaped interface is wrong
 
 An AR decoder advances a prefix with `p(token | prefix)`, normally stops at an
@@ -64,10 +95,10 @@ policy over a masked model*, not evidence that LLaDA was trained as a
 block-causal model or that its Transformer has a reusable causal-prefix cache.
 The project itself says its sampling does not yet leverage KV cache.
 
-A genuinely trained block-causal diffusion architecture would be a separate,
-unverified future case: it may have a committed causal prefix representation,
-but must demonstrate the model mask and cache validity before it shares an AR
-prefix optimization.  These distinctions are why a future service contract
+An explicit encoder/decoder diffusion architecture such as DiffusionGemma is
+another case: its committed context representation must demonstrate model mask
+and cache validity before it shares an AR prefix optimization in Metallix.
+These distinctions are why a future service contract
 should ask an adapter for capacity and progress, not prescribe
 `decode_one_token`.
 
