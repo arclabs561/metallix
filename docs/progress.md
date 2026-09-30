@@ -11,6 +11,30 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The live alternate L3 session now supplies its post-FP4 queries, signed head
+  weights and committed key prefixes to the existing Metal index-score kernel
+  in a focused qualification. GPU/CPU FP32 scores agree under the existing
+  operator tolerance; both masked selections match the source-shaped runtime
+  IDs. For contested rows, the CPU cutoff margin exceeds twice the observed
+  GPU/CPU error. The request still executes through the CPU BF16 scorer; this
+  qualifies one device primitive on live operands, not a Metal request graph.
+  Validation receipts under `.agents/receipts/candidate-control/`:
+  `schedule-metal-full-check.log` and `schedule-metal-clippy.log`.
+  The workspace check retains the Julia failure.
+
+- The expanded source/native first-chunk sweep checks sizes 2, 3 and 6 against the
+  canonical endpoint: source logits are bit-identical to source canonical,
+  and native logits are bit-identical to native canonical. Full per-call gates
+  remain open. Size 7 changes the source terminal output and native L4 rejects
+  an ambiguous reachable Top-K tie under its existing policy. The exact error
+  and endpoint-stability properties now have regression checks. See the
+  [sweep evidence](research/v41-forward-reference.md#expanded-first-chunk-sweep).
+
+- Transport recovery now has a deterministic response-write timeout test:
+  the expired connection sends no bytes, then a fresh connection receives an
+  exact complete response. This covers connection isolation, not cancellation
+  during GPU work or concurrent model admission.
+
 - The Qwen/Codex pointer-chain assessor now correlates each required output
   with its recorded successful direct file-read command, in order. Its focused
   suite passes 23 tests, including rejection of fabricated outputs with filename

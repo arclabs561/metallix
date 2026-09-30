@@ -136,6 +136,19 @@ concrete; an unspecified performance target cannot establish usable serving.
 
 ## Immediate parallel work
 
+The next device slice now has a passing live-L3 index-score qualification:
+computed queries and committed owner keys reach the existing Metal kernel,
+with CPU score/selection controls and a measured cutoff-margin gate. The scalar
+runtime remains unchanged. Promote a device execution component only after
+its source staging, downstream state and failure behavior remain qualified;
+operator agreement alone is not a complete Metal request.
+
+The expanded first-chunk sweep establishes terminal stability for 2, 3 and 6;
+per-call qualification is still separate. First-chunk 7 reaches a native L4
+ambiguous cutoff tie while the source completes with changed output. Preserve
+the explicit rejection until the source tie contract is resolved; do not
+expand the qualified schedule set by choosing a convenient tie order.
+
 Use two bounded implementation lanes plus one independent reviewer when useful.
 One owner integrates and runs Cargo/device checks. Research must resolve a named
 implementation uncertainty and produce a pin, contract correction, or executable
