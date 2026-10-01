@@ -152,6 +152,24 @@ uv run scripts/julia_accuracy_reference.py \
   --write-report /absolute/path/accuracy-calibration-native-f64.json > /dev/null
 ```
 
+### Reusing native rotary values
+
+The CPU block computes rotated Q and K once per position and reuses them across
+attention pairs. It preserves the F32 rotary expressions and dot-product
+accumulation order. The extra scratch is two `positions × 384` F32 arrays;
+the full-prefill limit of eight positions needs 24 KiB. This removes repeated
+rotary calculations without changing the numerical contract or closing the
+full-encoder qualification gate.
+
+`precomputed_rotations_preserve_direct_logits_and_masks` compares every logit
+bit with direct per-pair rotation, including global attention, the local-window
+boundary and the source's finite all-masked-query behavior. The existing frozen
+block-source tests continue to cover the composed output. Run both with:
+
+```sh
+cargo test -p julia --release encoder::tests::
+```
+
 ### Rejected QK-reduction experiment
 
 The `cal_len7` layer-0 trace located the excess before softmax: native raw QKV

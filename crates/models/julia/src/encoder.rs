@@ -451,6 +451,9 @@ fn attention(
     mut trace: Option<&mut AttentionTrace>,
 ) -> Result<Vec<f32>, JuliaEncoderError> {
     let mut out = vec![0.0; positions * WIDTH];
+    // Rotate each Q/K once; keep the dot-product accumulation order unchanged.
+    let rotated_query = rotated_part(qkv, positions, 0);
+    let rotated_key = rotated_part(qkv, positions, 1);
     let scale = HEAD_WIDTH_F32.sqrt().recip();
     let local = !layer.is_multiple_of(3);
     for query in 0..positions {
@@ -466,11 +469,8 @@ fn attention(
                 }
                 let mut dot = 0.0;
                 for dim in 0..HEAD_WIDTH {
-                    let q = rope(qkv[qkv_index(query, 0, head, dim)], dim, query);
-                    let k = rope(qkv[qkv_index(key, 1, head, dim)], dim, key);
-                    // rotate_half needs the matching other half; replace values below.
-                    let q = q + rope_rotation(qkv, query, 0, head, dim);
-                    let k = k + rope_rotation(qkv, key, 1, head, dim);
+                    let q = rotated_query[query * WIDTH + head * HEAD_WIDTH + dim];
+                    let k = rotated_key[key * WIDTH + head * HEAD_WIDTH + dim];
                     dot += q * k;
                 }
                 logits[key] = dot * scale;
@@ -707,6 +707,54 @@ mod tests {
             .find(|case| case["name"] == name)
             .unwrap_or_else(|| panic!("missing fixture case {name}"))
             .clone()
+    }
+
+    #[test]
+    fn precomputed_rotations_preserve_direct_logits_and_masks() {
+        for (positions, layer, only_last_key) in [(3, 0, false), (66, 1, true), (66, 3, true)] {
+            let qkv = values(positions * 3 * WIDTH, 7);
+            let mask: Vec<bool> = (0..positions)
+                .map(|key| !only_last_key || key == positions - 1)
+                .collect();
+            let mut trace = AttentionTrace {
+                logits: Vec::new(),
+                probabilities: Vec::new(),
+            };
+            attention(&qkv, positions, &mask, layer, Some(&mut trace)).unwrap();
+            for query in 0..positions {
+                for head in 0..ATTENTION_HEADS {
+                    for key in 0..positions {
+                        let allowed =
+                            mask[key] && (layer.is_multiple_of(3) || query.abs_diff(key) <= 64);
+                        let expected = if allowed {
+                            let mut dot = 0.0;
+                            for dim in 0..HEAD_WIDTH {
+                                let q = rope(qkv[qkv_index(query, 0, head, dim)], dim, query)
+                                    + rope_rotation(&qkv, query, 0, head, dim);
+                                let k = rope(qkv[qkv_index(key, 1, head, dim)], dim, key)
+                                    + rope_rotation(&qkv, key, 1, head, dim);
+                                dot += q * k;
+                            }
+                            dot * HEAD_WIDTH_F32.sqrt().recip()
+                        } else {
+                            f32::MIN
+                        };
+                        let index = (query * ATTENTION_HEADS + head) * positions + key;
+                        assert_eq!(trace.logits[index].to_bits(), expected.to_bits());
+                    }
+                }
+            }
+            if layer == 1 {
+                // The source's finite additive mask yields uniform probabilities
+                // when this local query cannot reach the sole unmasked key.
+                let uniform = 1.0 / small_index(positions);
+                assert!(
+                    trace.probabilities[..positions]
+                        .iter()
+                        .all(|value| value.to_bits() == uniform.to_bits())
+                );
+            }
+        }
     }
 
     #[test]
