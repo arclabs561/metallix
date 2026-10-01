@@ -478,6 +478,23 @@ a CPU-reference artifact, not a correctness requirement for the Metal path.
 The native result is a scalar CPU reference taking about 2.2 s for three
 tokens in release mode; it qualifies arithmetic, not speed.
 
+### Into the layer-zero feed-forward
+
+The same real tensors now carry through the attention Hyper-Connection update,
+the FFN mix, FFN normalization and expert routing. Starting from native
+attention output, all three positions select the same six routed experts as
+the source, with route weights within 1.3e-5. Normalized FFN input differs at
+44 of 15,360 BF16 values.
+
+Two controls locate those differences. Native `hc_post` reproduces the source
+exactly when given the source's coefficients. The coefficients themselves
+come from an FP32 projection over 20,480 values that Torch sends through BLAS;
+no tested accumulation order reproduces its bits, though both results agree
+with a float64 reference to within 5e-6 relative error. These are the same
+reduction-order effects as `wo_a`, not arithmetic defects, and they leave
+routing unchanged here. Routing agreement on three tokens does not establish
+it for all inputs: a near-tied expert score could select a different expert.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
