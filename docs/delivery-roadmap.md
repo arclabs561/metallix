@@ -23,8 +23,11 @@ mechanism tests do not establish useful applications or model support.
 The reduced five-block oracle and artifact CLI are delivered for the two fixed
 schedules. Explicit Metal scoring and key rotation reach that CLI and preserve
 numerical/state controls. Scalar autoregressive feedback now matches independent
-source continuations for two prompts, and bounded selected-expert payloads can
-execute through the scalar FP4 path. The next milestone joins actual checkpoint
+source continuations for two prompts. Bounded real checkpoint execution now
+joins six selected FP4 experts and the shared FP8 expert; the synthetic-input
+MoE comparison preserves source-selected IDs and all observed BF16 outputs
+([scope and numerical limits](research/quantization-precision.md#bounded-selected-expert-execution)).
+The next milestone joins actual checkpoint
 components into a request. Complete device placement is an optimization
 milestone, not a prerequisite for proving that generation works.
 Avoid a percentage-complete estimate: the remaining work includes unresolved
@@ -230,7 +233,7 @@ and artifact/CLI selection are delivered for both fixed schedules. Do not requeu
 | --- | --- | --- |
 | 0 | Reconcile the completed isolated lane with the intended integration branch. Consumer: a reproducible baseline. | Establish checkout ownership, classify peer edits/local commits, integrate in an owned checkout and rerun gates. Preserve the known Julia failure and dirty peer state. |
 | 1, parallel with 2 | Establish the checkpoint feasibility contract. Consumer: acquisition/residency decision. | Declare RAM/SSD/context/TTFT/decode limits; qualify bounded selected-range reads while building the forward path; obtain source-compatible routes and replay explicit capacities before residency decisions. No full download, pager or prefetch policy before this decision and the reference gate. |
-| 2 | Complete reduced autoregressive generation and bounded real expert execution. Consumer: an executable correctness baseline. | Feed selected IDs through one retained session; compare independent source IDs and logits. Bind selected checkpoint ranges to their header and index, enforce allocation limits, and compare actual expert output with source execution. These qualify their bounded scope, not full-model generation. |
+| 2 | Retain reduced autoregressive generation and bounded real MoE execution as correctness baselines. | Reduced continuations and selected real-weight MoE outputs have independent source comparisons. Preserve checkpoint byte identities, allocation limits and route/state checks when joining these components. The synthetic-input MoE result does not qualify a model-produced hidden state or full-model generation. |
 | 3 | One actual checkpoint-to-request vertical, then optimize its bottlenecks. Consumer: ordinary local generation. | Extend the verified execution path under explicit resource caps. Full acquisition requires 1; correctness requires independent reference evidence from 2. Qualify tokenizer/template, prefill/decode and output together, then improve connected arithmetic and residency against measured latency/memory. Complete Metal placement is not a correctness prerequisite. Apply the upstream pivot against the same target. |
 | 4 | Bounded serving and agent use. Consumer: repeatable local applications. | Cancellation, admission, resource recovery and held-out task outcomes pass for that adapter. Qwen can qualify these independently while DeepSeek execution continues. |
 

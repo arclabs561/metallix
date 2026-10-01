@@ -164,6 +164,24 @@ generation. Synthetic file tests cover budget, truncation, header/range rebindin
 and scale rejection; independently sourced payload/output comparisons remain a
 separate qualification for each chosen checkpoint and input.
 
+`V41SharedExpertFp8ScalePairs` provides the corresponding shared-expert reader
+for E4M3FN weights and E8M0 scales covering 32-by-32 blocks. It checks all three
+projection geometries, rebinds the local header/ranges and enforces the caller's
+aggregate raw-byte limit with a 64 MiB ceiling. Invalid weight and scale codes
+are rejected before returning the payloads.
+
+`MoEReference::new_sparse` connects selected routed payloads with the shared
+expert while preserving the full logical gate-ID table. All selected slots
+must exist before any expert arithmetic starts. A bounded layer-zero comparison
+using the pinned checkpoint above and BF16 input
+`(arange(5120) % 17 - 8) / 16` agrees on all six selected IDs. Every routed
+expert, shared expert and final output agrees bit-for-bit with the pinned
+source graph using explicit CPU kernel substitutions. Routing weights have a
+maximum absolute difference of `2.9802322387695312e-8`, so the complete FP32
+computation is not claimed bit-exact. This qualifies that synthetic-input MoE
+boundary; model-produced hidden states, CUDA parity and checkpoint generation
+remain separate gates.
+
 ## Next numerical join: FP4 linear runtime contract
 
 Source: pinned V4.1
