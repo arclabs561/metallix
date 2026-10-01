@@ -244,6 +244,60 @@ fn two_block_prefix_then_head_matches_frozen_source_scores() {
 }
 
 #[test]
+#[ignore = "diagnostic: writes full-encoder error distribution to JULIA_ERROR_OUTPUT"]
+fn write_full_encoder_error_distribution() {
+    let path = std::env::var("JULIA_ERROR_OUTPUT").expect("JULIA_ERROR_OUTPUT");
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/julia-1/full-prefill-reference.json"
+    ))
+    .unwrap();
+    let encoder = full_encoder();
+    let mut report = Vec::new();
+    for case in fixture["cases"].as_array().unwrap() {
+        let input = EncoderInput {
+            input_ids: case["input_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect(),
+            attention_mask: case["attention_mask"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_bool().unwrap())
+                .collect(),
+        };
+        let hidden = encoder.forward(&input).unwrap();
+        let expected: Vec<f32> = case["expected_hidden"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| serde_json::from_value::<f32>(v.clone()).unwrap())
+            })
+            .collect();
+        let errors: Vec<f32> = hidden
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .collect();
+        let over = errors.iter().filter(|e| **e > 1e-5).count();
+        let max = errors.iter().copied().fold(0.0_f32, f32::max);
+        let rows: Vec<f32> = errors
+            .chunks(WIDTH)
+            .map(|r| r.iter().copied().fold(0.0_f32, f32::max))
+            .collect();
+        report.push(serde_json::json!({"case": case["name"], "elements": errors.len(), "over_1e-5": over, "max_abs": max, "row_max_abs": rows, "hidden": hidden,
+            "mean_abs": errors.iter().map(|e| f64::from(*e)).sum::<f64>() / f64::from(u32::try_from(errors.len()).unwrap())}));
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+}
+
+#[test]
 fn full_encoder_then_head_matches_frozen_sdpa_source() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/julia-1/full-prefill-reference.json"

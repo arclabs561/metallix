@@ -109,6 +109,36 @@ improvement. Successful report generation does not imply that this gate passed.
 This is a sensitivity diagnostic; it neither promotes a runtime arithmetic
 change nor substitutes for full-encoder qualification or held-out evaluation.
 
+## Float64 accuracy reference for the full encoder
+
+The full-encoder gate requires native hidden states within `1e-5` of a single
+FP32 SDPA source run. Four of five synthetic cases pass. `unmasked_control`
+fails: 592 of 3,072 values exceed the gate, maximum `3.3e-5`.
+
+Running the same pinned source model in float64 (eager attention) gives an
+accuracy reference independent of FP32 reduction order. Against it, on valid
+positions:
+
+| Case | Native | Source FP32 SDPA (fixture) | Source FP32 eager |
+| --- | ---: | ---: | ---: |
+| `padded_base` | 3.2e-6 | 1.9e-6 | 2.1e-6 |
+| `unmasked_control` | 1.2e-5 | 2.4e-5 | 2.6e-5 |
+| `no_padding` | 7.7e-6 | 3.5e-6 | 2.9e-6 |
+
+On the failing case, native is about twice as close to the float64 result as
+the fixture it is gated against. The `1e-5` gate is narrower than the spread
+between two FP32 source implementations of the same model on that case, and
+measures agreement with one rounding path rather than accuracy. Whether to
+gate against a float64 reference instead is a contract decision; the current
+gate and tolerance are unchanged.
+
+```sh
+JULIA_ERROR_OUTPUT=/tmp/julia-native.json \
+  cargo test -p julia --release write_full_encoder_error_distribution -- --ignored
+NATIVE=/tmp/julia-native.json OUT=/tmp/julia-f64.json \
+  uv run --offline scripts/julia_full_prefill_f64_oracle.py
+```
+
 ## Reproduction identity
 
 The public Hugging Face model API reported the following source revision on
