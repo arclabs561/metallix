@@ -952,6 +952,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn applies_decoded_matrix_to_hidden_state_on_mlx() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
         let output = super::apply_affine_matrix_mlx(&[1.0, 2.0, 3.0, 4.0], 2, 2, &[2.0, 3.0])
             .expect("matrix projection");
         assert_eq!(output.shape(), [2, 1]);
@@ -961,6 +962,7 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn resident_qkv_metal_projection_matches_cpu_oracle() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
         let mut resident = sample_resident();
         resident.wq_a[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);
         resident.wkv[..super::LayerZeroQkvResident::HIDDEN_WIDTH].fill(1.0);

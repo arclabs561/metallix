@@ -7,12 +7,22 @@ use deepseek::indexer::bf16::{
     Bf16IndexScoreError, Bf16MetalScoreError, index_scores_bf16_metal, index_scores_bf16_reference,
 };
 
+// MLX device state is process-global; serialize this binary's device calls.
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn gpu() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn dimension(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap()
 }
 
 #[test]
 fn rejects_malformed_and_nonfinite_inputs() {
+    let _gpu = gpu();
     assert!(matches!(
         index_scores_bf16_metal(&[], &[0x3f80], &[0x3f80], dimension(1)),
         Err(Bf16MetalScoreError::Reference(
@@ -61,6 +71,7 @@ fn rejects_malformed_and_nonfinite_inputs() {
 
 #[test]
 fn device_rejects_overflow_then_accepts_a_fresh_finite_call() {
+    let _gpu = gpu();
     // Exercise three distinct boundaries: dot, signed multiplication, head sum.
     for (query, keys, weights, stage) in [
         (

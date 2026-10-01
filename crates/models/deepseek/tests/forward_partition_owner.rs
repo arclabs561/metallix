@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 // This integration binary is separate from the library's unit-test process,
 // so it needs its own guard for MLX's process-global device state.
 #[cfg(feature = "metal")]
-static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const SOURCE_RECEIPT_SHA256: &str =
     "9613150fea8010a7435dab0443a1f9e0d73fd8d0f32455b8d67dd572617f3906";

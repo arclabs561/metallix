@@ -760,6 +760,10 @@ fn check_late_l4_failure(
     reason = "one ordered source-bound request and restart comparison"
 )]
 fn metal_scored_request_matches_both_source_schedules_and_restarts() {
+    #[cfg(feature = "metal")]
+    let _gpu = super::partition_owner::GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for (score, key_rotary, key_preparation, head_execution) in [
         (
             IndexScoreExecution::MetalBf16,
@@ -931,6 +935,10 @@ fn assert_artifact_greedy_self_consistency(
 
 #[test]
 fn exported_numerical_artifact_matches_both_source_schedules() {
+    #[cfg(feature = "metal")]
+    let _gpu = super::partition_owner::GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exported = exported_reduced_artifact();
     let artifact =
         deepseek::reduced::ReducedArtifact::parse(&exported).expect("bounded numerical artifact");
