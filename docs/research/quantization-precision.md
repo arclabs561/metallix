@@ -495,6 +495,26 @@ reduction-order effects as `wo_a`, not arithmetic defects, and they leave
 routing unchanged here. Routing agreement on three tokens does not establish
 it for all inputs: a near-tied expert score could select a different expert.
 
+### Complete real block zero
+
+The routed and shared experts now run on the real layer-zero FFN input. The
+three positions select 16 distinct routed experts (300.8 MB of FP4 payload).
+Given the source's FFN input, the native MoE output matches the source
+bit-exactly for all three positions, including the shared FP8 expert. The
+remaining Hyper-Connection update then differs at 67 of 61,440 BF16 values,
+the same BLAS-ordered coefficient projection described above.
+
+Running the entire native chain from the shared embedding startup, block zero's
+output agrees with the source at cosine 0.9999998, with maximum absolute
+difference 0.00098 on values up to 1.09. These differences come only from
+reduction order inside BLAS-backed source operations, not from a mismatched
+equation, and expert selection was unchanged.
+
+The native scalar CPU reference takes about 4 seconds for this block on three
+tokens (2.2 s attention, 1.8 s experts) in release mode. That is a correctness
+baseline. Forty such layers would take roughly a minute per token, which is
+why the hot paths need Metal implementations before serving.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
