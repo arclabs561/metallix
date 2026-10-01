@@ -194,15 +194,16 @@ pub fn project_hc_diagnostics(
         sinkhorn_iterations,
         hc_epsilon,
     )?;
-    let mut sum_squares = 0.0_f32;
+    let mut squares = Vec::with_capacity(residual.len());
     for (index, &bits) in residual.iter().enumerate() {
         let value = bf16_to_f32(bits);
         finite_input("residual", index, value)?;
         let square = value * value;
         finite(square, "square", index)?;
-        sum_squares += square;
-        finite(sum_squares, "sum", index)?;
+        squares.push(square);
     }
+    let sum_squares = crate::norm::torch_cpu_sum(&squares);
+    finite(sum_squares, "sum", residual.len() - 1)?;
     let mean = sum_squares / shape.residual_len_f32;
     finite(mean, "mean", 0)?;
     let variance = mean + norm_epsilon;

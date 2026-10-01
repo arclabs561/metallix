@@ -1,11 +1,14 @@
 //! Bounded scalar BF16 `RMSNorm` reference for V4.1 text sublayers.
 //!
 //! This follows the pinned `RMSNorm.forward` sequence: promote BF16 storage to
-//! FP32, square and mean, add epsilon, reciprocal-square-root, multiply the
+//! FP32, square and mean in Torch CPU cascade order, add epsilon, reciprocal-square-root, multiply the
 //! normalized input by the learned weight, then round back to BF16. It is not
 //! a checkpoint reader, GPU kernel, or reduction-order parity claim.
 
 use thiserror::Error;
+
+mod cascade;
+pub(crate) use cascade::torch_cpu_sum;
 
 /// Maximum hidden width accepted by one scalar `RMSNorm` call.
 pub const MAX_RMS_NORM_WIDTH: usize = 16_384;
@@ -78,7 +81,7 @@ pub fn rms_norm_bf16_reference(
     output_bf16: &mut [u16],
 ) -> Result<(), RmsNormError> {
     let width = validate_shape(input_bf16, weight_bf16, epsilon, output_bf16)?;
-    let mut sum_squares = 0.0_f32;
+    let mut squares = Vec::with_capacity(width);
     for (element, &bits) in input_bf16.iter().enumerate() {
         let value = bf16_to_f32(bits);
         if !value.is_finite() {
@@ -91,13 +94,15 @@ pub fn rms_norm_bf16_reference(
                 element,
             });
         }
-        sum_squares += square;
-        if !sum_squares.is_finite() {
-            return Err(RmsNormError::ValueOverflow {
-                stage: "sum",
-                element,
-            });
-        }
+        squares.push(square);
+    }
+    // Nonnegative terms: an infinite partial sum makes the total infinite.
+    let sum_squares = torch_cpu_sum(&squares);
+    if !sum_squares.is_finite() {
+        return Err(RmsNormError::ValueOverflow {
+            stage: "sum",
+            element: width - 1,
+        });
     }
     for (element, &bits) in weight_bf16.iter().enumerate() {
         if !bf16_to_f32(bits).is_finite() {

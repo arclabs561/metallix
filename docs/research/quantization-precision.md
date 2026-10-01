@@ -430,6 +430,28 @@ This joins residual-derived HC coefficients and supplied incoming pre to the
 quantized FFN. Actual checkpoint weights and the attention/cache path remain
 outside this synthetic composition; scalar arithmetic is not kernel parity.
 
+## RMS reduction order
+
+BF16 RMSNorm parity depends on how the FP32 mean of squares is summed. The
+pinned source computes `x.square().mean(-1)` with Torch's single-threaded CPU
+cascade: four-lane vectors, four row accumulators and a four-level cascade
+whose level width is `max(4, ceil_log2(n) / 4)`. Ordered scalar accumulation
+rounded differently on real layer-zero checkpoint rows, which changed 6 of
+15,360 normalized BF16 values and 534 of 3,840 downstream FP8 query-projection
+values.
+
+`norm::torch_cpu_sum` reproduces that order and is now used by the BF16 norm
+and Hyper-Connection projection references. With it, actual checkpoint startup
+through the layer-zero query prefix (HC collapse, attention norm, `wq_a` and
+query norm for three positions) matches the source exactly. The lane count was
+the only platform constant chosen on calibration data; four fresh 64-row
+held-out sets then matched Torch's mean bits on every row. Pairwise,
+64-lane and float64 alternatives each failed at least one held-out set and
+were rejected.
+
+This qualifies Torch CPU arithmetic order, not mathematical accuracy or GPU
+parity. A Metal reduction must be checked against this reference separately.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
