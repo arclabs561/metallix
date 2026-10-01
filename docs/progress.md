@@ -11,6 +11,23 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- Both canonical checks now pass end to end: `uv run scripts/check.py` and
+  `uv run scripts/check.py --metal`. The Julia full encoder is gated against a
+  float64 reference ([details](research/julia-decision-contract.md#float64-accuracy-reference-for-the-full-encoder));
+  every unserialized in-process Metal test now shares a GPU lock; and the checks
+  are clean under Rust 1.99. Entries below that end at the Julia
+  `unmasked_control` mismatch predate this change.
+
+- Real DeepSeek-V4.1 block zero runs natively on actual checkpoint tensors for
+  a three-token prefill: selected-embedding startup, Hyper-Connection mixing,
+  window attention, expert routing and 16 routed FP4 experts plus the shared
+  FP8 expert. Each stage matches the pinned source exactly given the source's
+  input; the fully native chain agrees at cosine 0.9999998, with remaining
+  differences from BLAS-ordered source reductions. The four large attention
+  projections also match exactly on Metal. See
+  [quantization and precision](research/quantization-precision.md#real-layer-zero-attention).
+  Generation and later layers remain open.
+
 - Index-key rotation now has an independent Metal choice, from
   `IndexKeyRotaryExecution::MetalFp32` through both owner paths, request and
   `ReducedArtifact::run_with_execution` to `--key-rotary-execution metal-fp32`.
