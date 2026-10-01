@@ -515,6 +515,30 @@ tokens (2.2 s attention, 1.8 s experts) in release mode. That is a correctness
 baseline. Forty such layers would take roughly a minute per token, which is
 why the hot paths need Metal implementations before serving.
 
+### First Metal measurement on real projections
+
+The four real layer-zero FP8 attention projections (`wq_a`, `wq_b`, `wkv`,
+`wo_b`) were run on Metal through MLX as resident FP32 weights, dequantized
+once from their FP8 codes and E8M0 block scales. Activations are quantized to
+E4M3 in groups of 32 exactly as the source does, then reconstructed. For three
+tokens, every output matches the source BF16 values exactly (118,944 values):
+
+| Projection | Shape | Metal median (3 tokens) |
+| --- | --- | ---: |
+| `wq_a` | 1280 x 5120 | 0.44 ms |
+| `wq_b` | 32768 x 1280 | 0.98 ms |
+| `wkv` | 512 x 5120 | 0.26 ms |
+| `wo_b` | 5120 x 8192 | 0.89 ms |
+
+The scalar CPU reference takes about 5.8 s for `wq_b` alone. A BF16 weight
+copy halved `wq_b` time but no longer matched the source exactly, so FP32 is
+the qualified baseline. These timings cover one synchronous operation each,
+including host transfer and readback; they exclude activation quantization on
+the host and are not a whole-layer or whole-request result. FP32 residency is
+also four times the FP8 storage (about 0.48 GB for these four tensors), which
+will not scale to all 40 layers within one Mac's memory. A packed-FP8 or FP4
+Metal path must keep this exact-match gate.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
