@@ -30,6 +30,32 @@ tool round trips, and serving measurements, alongside source-grounded DeepSeek
 forward integration. A successful protocol test on the control does not qualify
 a larger model or establish coding quality.
 
+## October prioritization
+
+Re-checked 2026-10-01 against live Hub API metadata (trending, all-time and
+30-day likes, and MLX-tagged listings) and each candidate's `config.json`.
+Download counts are cumulative and favor older models; trending reflects the
+last week. Priority weighs a concrete local consumer, fit on one Mac, and how
+much each model reuses or extends what Metallix already qualifies.
+
+| Model | Architecture (config) | Checkpoint / license | Reuse and new work | Priority |
+| --- | --- | --- | --- | --- |
+| [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | `qwen3_5`, 64 layers: 48 linear-attention (GatedDeltaNet) + 16 full; GQA 24/4 | 55.6 GB BF16, Apache-2.0; most-liked trending open model (6.9M downloads) | New recurrent-state layer and cache semantics; dense, fits in memory at BF16 | **P1**: the most-used modern local model, and the hybrid-state design every newer Qwen variant builds on |
+| [Gemma 4 31B](https://huggingface.co/google/gemma-4-31B-it) | `gemma4`, 60 layers: 50 sliding (window 1024) + 10 full; GQA 32/16 | 62.5 GB, Apache-2.0; 9.8M downloads | Sliding/global KV and a second independent tokenizer/template; no recurrent state | **P2**: a large-user-base dense model that exercises the attention-window path without new state types |
+| [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B) | Plain `LlamaForCausalLM`, 42 layers, GQA 16/2 | ~4 GB BF16, Apache-2.0; 0.9M downloads in weeks | Smallest new adapter; proves the loader is not Qwen-specific | **P2**: cheap second architecture and a fast tool-calling control |
+| [MiMo-V2.6-Flash](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) | `mimo_v2`, 48 layers, 256 experts / top-8, sliding window 128, FP8 128x128 blocks | 177.7 GB FP8, MIT | Shares FP8 block decoding, MoE routing and windowed attention with DeepSeek; larger than RAM like DeepSeek | **P3**: the natural second larger-than-RAM MoE once DeepSeek's offload path works |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `qwen4_exp`, 48 layers (36 linear + 12 full), 512 experts / top-10 | 360 GB, non-standard license | Combines Qwen3.8's hybrid state with sparse attention and very wide MoE | **P4**: after Qwen3.8-27B; license needs review |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | `glm5_next`, 45 layers (34 linear + 11 DeepSeek-style sparse attention), 288 experts, FP8 | 328 GB, MIT | Reuses DeepSeek sparse-attention work plus linear attention | **P4**: valuable only after both DeepSeek and Qwen3.8 hybrids work |
+| [Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) | `kimi_k3`, 93 layers, 896 experts | compressed-tensors; very large | Exceeds a single Mac's SSD-streaming budget for useful speed | Deferred |
+| [Ternary-Bonsai-2-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) | Qwen3.8-27B layout with ternary + Hadamard weights | 2-bit MLX, Apache-2.0; top of trending | A codec on top of Qwen3.8-27B | Follows Qwen3.8-27B; reuse its hybrid adapter |
+
+Two architecture families dominate current demand: hybrid linear/full
+attention (Qwen3.8, GLM-5.3, Qwen3.8-Flash-Next, Bonsai) and large FP8 MoE
+(DeepSeek, MiMo, GLM-5.3). DeepSeek work covers the second family's FP8 and
+routing pieces; recurrent hybrid state is the main missing capability, which
+is why Qwen3.8-27B ranks first among new models. Gemma 4 and MiniCPM5 are the
+lowest-cost checks that adapters generalize beyond the Qwen control.
+
 ## Performance decisions
 
 ### September 30 implementation check
