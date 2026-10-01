@@ -55,6 +55,9 @@ checkpoint identity. These are building blocks for checkpoint execution.
 only selected embedding rows are present, including repeated requests. It
 performs the bounded CPU embedding/HC startup equation; it does not execute
 the transformer blocks or establish generation throughput.
+The public `attention::layer::prepare_attention_qr` boundary reuses the native
+FP8 query projection and BF16 query normalization on prepared activations.
+It preserves activation limits; callers must budget weight storage and work.
 
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.

@@ -291,7 +291,7 @@ pub struct Fp8Projection<'a> {
 /// it. Keeping that seam explicit lets a candidate source reuse the exact
 /// `wq_a` then `RMSNorm` path without constructing an attention cache owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AttentionQrLayout {
+pub struct AttentionQrLayout {
     batches: NonZeroUsize,
     hidden_dimension: NonZeroUsize,
     q_rank: NonZeroUsize,
@@ -300,7 +300,10 @@ pub(crate) struct AttentionQrLayout {
 
 impl AttentionQrLayout {
     /// Validates the bounded, stateless QR prefix geometry.
-    pub(crate) fn new(
+    ///
+    /// The bounds cover activation elements, not resident weight bytes or
+    /// projection work. Callers must admit those resources independently.
+    pub fn new(
         batches: NonZeroUsize,
         hidden_dimension: NonZeroUsize,
         q_rank: NonZeroUsize,
@@ -349,16 +352,41 @@ impl AttentionQrLayout {
 
 /// Borrowed parameters for attention's stateless QR prefix.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct AttentionQrWeights<'a> {
+pub struct AttentionQrWeights<'a> {
     pub(crate) wq_a: Fp8Projection<'a>,
     pub(crate) q_norm: &'a [u16],
 }
 
+impl<'a> AttentionQrWeights<'a> {
+    /// Borrows the FP8 query projection and BF16 normalization row.
+    ///
+    /// [`prepare_attention_qr`] validates their exact lengths and numerical
+    /// values against the supplied layout when executing the projection.
+    #[must_use]
+    pub const fn new(wq_a: Fp8Projection<'a>, q_norm: &'a [u16]) -> Self {
+        Self { wq_a, q_norm }
+    }
+}
+
 /// BF16 stages shared by attention query preparation and a candidate source.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AttentionQrDiagnostic {
+pub struct AttentionQrDiagnostic {
     pub(crate) wq_a: Vec<u16>,
     pub(crate) qr: Vec<u16>,
+}
+
+impl AttentionQrDiagnostic {
+    /// Returns the BF16 projection in `[batch, position, q_rank]` order.
+    #[must_use]
+    pub fn wq_a_bf16(&self) -> &[u16] {
+        &self.wq_a
+    }
+
+    /// Returns the normalized BF16 query prefix in projection row order.
+    #[must_use]
+    pub fn qr_bf16(&self) -> &[u16] {
+        &self.qr
+    }
 }
 
 /// Borrowed weights needed by the source-shaped attention path.
@@ -1101,7 +1129,13 @@ impl LayerAttentionLayout {
 /// `input` is BF16 `[batch, position, hidden_dimension]`. The returned
 /// diagnostics retain the BF16 `wq_a` projection and subsequent `RMSNorm`
 /// result, which are also the source indexer's `qr` operand.
-pub(crate) fn prepare_attention_qr(
+/// The caller supplies already collapsed, attention-normalized input. This
+/// function does not apply Hyper-Connections, load weights, mutate a cache,
+/// expand query heads, or execute sparse attention.
+///
+/// Activation storage is bounded; callers must separately budget checkpoint
+/// weight bytes and projection work. Errors return no partial diagnostic.
+pub fn prepare_attention_qr(
     input: &[u16],
     weights: AttentionQrWeights<'_>,
     layout: AttentionQrLayout,
@@ -1526,6 +1560,34 @@ mod tests {
         assert_eq!(result.qr.len(), 32);
         assert!(result.wq_a.iter().all(|&bits| bits == 0x4200));
         assert!(result.qr.iter().all(|&bits| bits == 0x3f80));
+    }
+
+    #[test]
+    fn stateless_qr_consumes_connected_attention_input_in_token_order() {
+        let norm = [0x3f80; 32];
+        let input =
+            crate::reduced::AttentionInput::new(&norm, 4, 1e-5).expect("four-copy attention input");
+        let mut normalized = Vec::new();
+        for value in [0x3f80, 0xbf80, 0x3f80] {
+            let prepared = input
+                .forward(&[value; 4 * 32], &[0.25; 4])
+                .expect("connected collapse and attention norm");
+            assert_eq!(prepared.collapsed_bf16(), &[value; 32]);
+            normalized.extend_from_slice(prepared.normalized_bf16());
+        }
+        let weights = AttentionQrWeights::new(qr_weights().wq_a, &norm);
+        let result = prepare_attention_qr(&normalized, weights, qr_layout())
+            .expect("multi-token stateless QR");
+        let expected_projection: Vec<_> = [0x4200, 0xc200, 0x4200]
+            .into_iter()
+            .flat_map(|value| [value; 32])
+            .collect();
+        let expected_qr: Vec<_> = [0x3f80, 0xbf80, 0x3f80]
+            .into_iter()
+            .flat_map(|value| [value; 32])
+            .collect();
+        assert_eq!(result.wq_a_bf16(), expected_projection);
+        assert_eq!(result.qr_bf16(), expected_qr);
     }
 
     #[test]
