@@ -452,6 +452,32 @@ were rejected.
 This qualifies Torch CPU arithmetic order, not mathematical accuracy or GPU
 parity. A Metal reduction must be checked against this reference separately.
 
+## Real layer-zero attention
+
+Native window attention now runs on all twelve real layer-zero attention
+tensors for a three-token prefill. Given the source-matched attention input, it
+matches the pinned source bit-exactly at the second query projection (`wq_b`),
+query RoPE, window KV preparation and ring update, window indices, and the
+sparse-attention output. `wo_a` is dequantized from FP8 to BF16 exactly as the
+pinned converter does (32x32 E8M0 blocks); the native and source BF16 weights
+are byte-identical.
+
+The final attention output differs at 117 of 15,360 BF16 values, each at most
+0.0039 (one BF16 step), with cosine similarity 1.0. The divergence enters at
+the grouped BF16 `wo_a` product: the source's Torch CPU einsum reduces through
+Accelerate BLAS in an undocumented order, and ordered FP32 accumulation
+rounds 8 of 24,576 intermediate values differently, all by one BF16 step and
+with exact (float64) results near rounding midpoints. Feeding the source's
+`wo_a` result into native activation quantization and FP8 `wo_b` reproduces
+the source output exactly, so `wo_b` is qualified.
+
+No tested accumulation order (block sizes 8-512, whole FP32, BF16 partial
+sums) reproduces the BLAS result on calibration data, so `wo_a` is accepted at
+one-BF16-step agreement rather than bit parity. Matching a vendor BLAS order is
+a CPU-reference artifact, not a correctness requirement for the Metal path.
+The native result is a scalar CPU reference taking about 2.2 s for three
+tokens in release mode; it qualifies arithmetic, not speed.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
