@@ -15,7 +15,8 @@ interfaces stable or turn synthetic parity into model support.
 ## Goal alignment and delivery priorities
 
 The primary goal remains useful DeepSeek-V4.1 generation on one Mac, including
-models larger than RAM. Qwen supplies a usable local control and nearer-term
+models larger than RAM. The deployment target is local Metal on Apple Silicon;
+hosted inference and multi-Mac results do not satisfy this goal. Qwen supplies a usable local control and nearer-term
 serving value. Typed decisions (including the Qwen JevBench-shaped bridge and
 future direct Julia) and programmable inference are real product goals, but
 mechanism tests do not establish useful applications or model support.
@@ -50,6 +51,24 @@ Bounded selected-weight reads and correctness execution may proceed before
 full-checkpoint feasibility is established. Actual route locality depends on a
 working forward path; do not make those measurements a prerequisite for
 implementing that path.
+The immediate connected gate is original checkpoint token IDs through selected
+embedding startup, attention/HC and the complete first block into model-produced
+hidden state. Then extend the same checkpoint path through logits and cached
+decode before connecting it to the existing local Responses backend boundary.
+Measure first-token latency, sustained decode, complete tool turns, resident
+memory and physical SSD traffic separately. Faster isolated operators and
+successful SSD streaming are insufficient evidence of interactive performance.
+
+Recent upstream evidence is relevant but does not close the single-Mac gate:
+[MLX-LM's V4.1 implementation](https://github.com/ml-explore/mlx-lm/pull/1895)
+was merged with reported parity and four-Mac measurements, while an
+[original-weight SSD streaming experiment](https://github.com/atbender/deepseek-v41-flash-mac-mini)
+reports roughly 23 seconds per token on a 16 GB M1. Evaluate these as reference
+implementations and optimization baselines; neither establishes fast execution
+within the local target's memory budget. Weight residency, repeated reads and
+on-device packed computation need connected measurements before selecting a
+prefetch or expert-cache policy.
+
 Do not start full checkpoint acquisition or a pager/prefetch policy until the
 resource envelope and reference gate are satisfied. Recheck the existing
 [upstream-runtime pivot](architecture.md#pivot-conditions) against that same

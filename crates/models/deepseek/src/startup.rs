@@ -78,6 +78,15 @@ pub enum StartupError {
     /// A token ID cannot select a row in the supplied table.
     #[error("startup token ID {id} is outside table rows {rows}")]
     TokenOutOfRange { id: u64, rows: usize },
+    /// The original-token-ID map does not match the supplied row count.
+    #[error("startup selected token ID count {actual}, expected {expected}")]
+    SelectedTokenCount { actual: usize, expected: usize },
+    /// The selected original token IDs are not strictly increasing.
+    #[error("startup selected token IDs must be strictly increasing at index {index}")]
+    SelectedTokenOrder { index: usize },
+    /// An original token ID has no row in the selected embedding storage.
+    #[error("startup token ID {id} has no selected embedding row")]
+    MissingSelectedToken { id: u64 },
     /// A selected BF16 table element is nonfinite.
     #[error("startup embedding row {row}, feature {feature} is nonfinite")]
     NonFiniteEmbedding { row: usize, feature: usize },
@@ -170,9 +179,77 @@ pub fn startup_bf16_reference(
     })
 }
 
+/// Looks up original token IDs in selected BF16 rows and performs the dense startup equation.
+///
+/// `selected_token_ids` must contain exactly `layout.rows` strictly increasing
+/// original IDs, corresponding to the rows of `embedding_rows_bf16`. Requested
+/// IDs may repeat; a missing original ID is never treated as a storage offset.
+/// Shape limits, requested IDs and requested BF16 rows are validated before
+/// allocating the bounded slot map. Unrequested nonfinite rows are allowed,
+/// matching [`startup_bf16_reference`].
+pub fn startup_selected_bf16_reference(
+    ids: &[u64],
+    selected_token_ids: &[u64],
+    embedding_rows_bf16: &[u16],
+    layout: StartupLayout,
+) -> Result<StartupOutput, StartupError> {
+    if selected_token_ids.len() != layout.rows {
+        return Err(StartupError::SelectedTokenCount {
+            actual: selected_token_ids.len(),
+            expected: layout.rows,
+        });
+    }
+    for (index, pair) in selected_token_ids.windows(2).enumerate() {
+        if pair[0] >= pair[1] {
+            return Err(StartupError::SelectedTokenOrder { index: index + 1 });
+        }
+    }
+    if embedding_rows_bf16.len() != layout.table_elements {
+        return Err(StartupError::TableLength {
+            actual: embedding_rows_bf16.len(),
+            expected: layout.table_elements,
+        });
+    }
+    let token_width = bounded_product(ids.len(), layout.width)?;
+    bounded_product(token_width, layout.copies)?;
+    bounded_product(ids.len(), layout.copies)?;
+    let selected_row = |id| {
+        selected_token_ids
+            .binary_search(&id)
+            .map_err(|_| StartupError::MissingSelectedToken { id })
+    };
+    for &id in ids {
+        let row = selected_row(id)?;
+        for (feature, &bits) in embedding_rows_bf16[row * layout.width..(row + 1) * layout.width]
+            .iter()
+            .enumerate()
+        {
+            if !finite_bf16(bits) {
+                return Err(StartupError::NonFiniteEmbedding { row, feature });
+            }
+        }
+    }
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(ids.len())
+        .map_err(|_| StartupError::AllocationFailed {
+            field: "selected token slots",
+            elements: ids.len(),
+        })?;
+    for &id in ids {
+        let slot = u64::try_from(selected_row(id)?).map_err(|_| StartupError::ElementLimit {
+            field: "selected token slots",
+        })?;
+        slots.push(slot);
+    }
+    startup_bf16_reference(&slots, embedding_rows_bf16, layout)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StartupError, StartupLayout, startup_bf16_reference};
+    use super::{
+        StartupError, StartupLayout, startup_bf16_reference, startup_selected_bf16_reference,
+    };
 
     #[test]
     fn startup_repeats_selected_rows_and_builds_identity_pre_mix() {
@@ -208,6 +285,96 @@ mod tests {
         assert_eq!(
             startup_bf16_reference(&[1], &[0x3f80, 0x3f80, 0x7f80, 0x3f80], layout),
             Err(StartupError::NonFiniteEmbedding { row: 1, feature: 0 })
+        );
+    }
+
+    #[test]
+    fn selected_startup_matches_dense_for_repeated_original_ids() {
+        let mut dense_rows = vec![0; 24];
+        dense_rows[10..12].copy_from_slice(&[0x3f80, 0x4000]);
+        dense_rows[22..24].copy_from_slice(&[0xbf80, 0x4080]);
+        let ids = [11, 5, 11];
+        let dense =
+            startup_bf16_reference(&ids, &dense_rows, StartupLayout::new(12, 2, 3).unwrap())
+                .unwrap();
+        let selected = startup_selected_bf16_reference(
+            &ids,
+            &[5, 11],
+            &[0x3f80, 0x4000, 0xbf80, 0x4080],
+            StartupLayout::new(2, 2, 3).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected, dense);
+        assert_eq!(
+            selected.identity_pre(),
+            &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn selected_startup_keeps_original_ids_distinct_from_storage_slots() {
+        let layout = StartupLayout::new(2, 1, 2).unwrap();
+        for id in [0, 1, 6] {
+            assert_eq!(
+                startup_selected_bf16_reference(&[id], &[5, u64::MAX], &[0x3f80, 0x4000], layout,),
+                Err(StartupError::MissingSelectedToken { id })
+            );
+        }
+        assert_eq!(
+            startup_selected_bf16_reference(&[u64::MAX], &[5, u64::MAX], &[0x3f80, 0x4000], layout,),
+            startup_bf16_reference(&[1], &[0x3f80, 0x4000], layout)
+        );
+    }
+
+    #[test]
+    fn selected_startup_rejects_invalid_map_storage_and_output_geometry() {
+        let layout = StartupLayout::new(2, 1, 2).unwrap();
+        assert_eq!(
+            startup_selected_bf16_reference(&[5], &[5], &[0x3f80, 0x4000], layout),
+            Err(StartupError::SelectedTokenCount {
+                actual: 1,
+                expected: 2,
+            })
+        );
+        for selected_ids in [[11, 5], [5, 5]] {
+            assert_eq!(
+                startup_selected_bf16_reference(&[5], &selected_ids, &[0x3f80, 0x4000], layout),
+                Err(StartupError::SelectedTokenOrder { index: 1 })
+            );
+        }
+        assert_eq!(
+            startup_selected_bf16_reference(&[5], &[5, 11], &[0x3f80], layout),
+            Err(StartupError::TableLength {
+                actual: 1,
+                expected: 2,
+            })
+        );
+        assert_eq!(
+            startup_selected_bf16_reference(
+                &[5; 65],
+                &[5],
+                &[0x3f80; 1024],
+                StartupLayout::new(1, 1024, 16).unwrap(),
+            ),
+            Err(StartupError::ElementLimit { field: "shape" })
+        );
+    }
+
+    #[test]
+    fn selected_startup_matches_dense_nonfinite_and_empty_request_policy() {
+        let layout = StartupLayout::new(2, 1, 2).unwrap();
+        let rows = [0x3f80, 0x7f80];
+        assert_eq!(
+            startup_selected_bf16_reference(&[5], &[5, 99], &rows, layout),
+            startup_bf16_reference(&[0], &rows, layout)
+        );
+        assert_eq!(
+            startup_selected_bf16_reference(&[99], &[5, 99], &rows, layout),
+            Err(StartupError::NonFiniteEmbedding { row: 1, feature: 0 })
+        );
+        assert_eq!(
+            startup_selected_bf16_reference(&[], &[5, 99], &rows, layout),
+            startup_bf16_reference(&[], &rows, layout)
         );
     }
 }

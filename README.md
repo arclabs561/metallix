@@ -51,6 +51,10 @@ when only selected routed experts are loaded. It rejects missing selected
 payloads before expert arithmetic. Shared-FP8 readers validate the six weight
 and scale ranges with an aggregate raw-byte budget; callers still authenticate
 checkpoint identity. These are building blocks for checkpoint execution.
+`startup_selected_bf16_reference` likewise preserves original token IDs when
+only selected embedding rows are present, including repeated requests. It
+performs the bounded CPU embedding/HC startup equation; it does not execute
+the transformer blocks or establish generation throughput.
 
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.

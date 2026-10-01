@@ -44,7 +44,10 @@ pub use routing::{
     ExpertRoute, FlashRoutingError, MAX_FLASH_ROUTING_WIDTH, flash_sqrt_softplus_routes,
 };
 pub use selection::{SelectionError, select_indices};
-pub use startup::{StartupError, StartupLayout, StartupOutput, startup_bf16_reference};
+pub use startup::{
+    StartupError, StartupLayout, StartupOutput, startup_bf16_reference,
+    startup_selected_bf16_reference,
+};
 
 // MLX's native test operations share process-global device initialization.
 #[cfg(all(test, feature = "metal"))]
