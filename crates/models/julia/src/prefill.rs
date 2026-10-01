@@ -297,74 +297,93 @@ fn write_full_encoder_error_distribution() {
     std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
 }
 
+/// Native encoder and head accuracy against an explicit float64 reference.
+///
+/// A single FP32 source run is not an accuracy oracle: two FP32 attention
+/// implementations of the same pinned model differ by more than `1e-5` on
+/// `unmasked_control`. Each case instead accepts native hidden error up to
+/// `gate_ratio` times the FP32 SDPA source's own error against float64. The
+/// ratio was fixed on calibration cases before held-out cases were evaluated.
 #[test]
-fn full_encoder_then_head_matches_frozen_sdpa_source() {
+fn full_encoder_then_head_matches_float64_reference() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../../fixtures/julia-1/full-prefill-reference.json"
+        "../../../../fixtures/julia-1/f64-gate-reference.json"
     ))
     .unwrap();
+    let ratio = fixture["gate_ratio"].as_f64().unwrap();
+    let score_limit = fixture["score_max_abs"].as_f64().unwrap();
     let encoder = full_encoder();
     let head = head();
-    for case in fixture["cases"].as_array().unwrap() {
-        let case_name = case["name"].as_str().unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 21, "legacy, calibration and held-out cases");
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let ids = |key: &str| -> Vec<u64> {
+            case[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect()
+        };
+        let flags = |key: &str| -> Vec<bool> {
+            case[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_bool().unwrap())
+                .collect()
+        };
         let input = EncoderInput {
-            input_ids: case["input_ids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item.as_u64().unwrap())
-                .collect(),
-            attention_mask: case["attention_mask"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item.as_bool().unwrap())
-                .collect(),
+            input_ids: ids("input_ids"),
+            attention_mask: flags("attention_mask"),
         };
         let hidden = encoder.forward(&input).unwrap();
-        let expected_hidden = case["expected_hidden"].as_array().unwrap();
-        assert_eq!(hidden.len(), expected_hidden.len() * WIDTH);
-        for (index, (actual, expected)) in hidden
+        let reference: Vec<f64> = case["f64_hidden"]
+            .as_array()
+            .unwrap()
             .iter()
-            .zip(
-                expected_hidden
-                    .iter()
-                    .flat_map(|row| row.as_array().unwrap()),
-            )
-            .enumerate()
-        {
-            let expected = serde_json::from_value::<f32>(expected.clone()).unwrap();
-            assert!(
-                (actual - expected).abs() <= 1e-5,
-                "{case_name} hidden[{index}]: {actual} != {expected}"
-            );
+            .flat_map(|row| row.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()))
+            .collect();
+        assert_eq!(hidden.len(), reference.len(), "{name} hidden shape");
+        let mut native_error = 0.0_f64;
+        for (row, valid) in input.attention_mask.iter().enumerate() {
+            if *valid {
+                for column in 0..WIDTH {
+                    let index = row * WIDTH + column;
+                    native_error =
+                        native_error.max((f64::from(hidden[index]) - reference[index]).abs());
+                }
+            }
         }
+        let source_error = case["source_f32_hidden_max_abs"].as_f64().unwrap();
+        assert!(
+            native_error <= ratio * source_error,
+            "{name}: native hidden error {native_error:e} exceeds {ratio} x source FP32 error {source_error:e}"
+        );
+        let marker_mask = flags("marker_mask");
         let scores = head
             .scores(&HeadInput {
                 hidden,
                 positions: input.input_ids.len(),
                 attention_mask: input.attention_mask,
-                marker_pos: case["marker_pos"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|item| usize::try_from(item.as_u64().unwrap()).unwrap())
+                marker_pos: ids("marker_pos")
+                    .into_iter()
+                    .map(|v| usize::try_from(v).unwrap())
                     .collect(),
-                marker_mask: case["marker_mask"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|item| item.as_bool().unwrap())
-                    .collect(),
+                marker_mask: marker_mask.clone(),
                 qtype: usize::try_from(case["qtype"].as_u64().unwrap()).unwrap(),
             })
             .unwrap();
-        for (actual, expected) in scores
+        for ((actual, expected), valid) in scores
             .iter()
-            .zip(case["expected_scores"].as_array().unwrap())
+            .zip(case["f64_scores"].as_array().unwrap())
+            .zip(&marker_mask)
         {
-            let expected = serde_json::from_value::<f32>(expected.clone()).unwrap();
-            assert!((actual - expected).abs() <= 1e-5, "{actual} != {expected}");
+            if *valid {
+                let error = (f64::from(*actual) - expected.as_f64().unwrap()).abs();
+                assert!(error <= score_limit, "{name}: score error {error:e}");
+            }
         }
     }
 }
@@ -551,7 +570,14 @@ fn write_accuracy_calibration_outputs() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|case| case["split"].as_str() == Some("calibration"))
+        .filter(|case| {
+            case["split"].as_str()
+                == Some(
+                    std::env::var("JULIA_ACCURACY_SPLIT")
+                        .as_deref()
+                        .unwrap_or("calibration"),
+                )
+        })
         .map(|case| {
             let input = EncoderInput {
                 input_ids: case["input_ids"]

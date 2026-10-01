@@ -44,7 +44,7 @@ defines the correctness, performance and resource gates.
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
 | [DeepSeek](docs/progress.md) | Reduced-model greedy token generation, five-block requests with persistent shared state, bounded routed-FP4/shared-FP8 checkpoint reads, sparse CPU expert tables, and opt-in mixed CPU/Metal replay | Reduced generation uses synthetic parameters; selected expert execution is not full-model loading. Tokenizer/template integration, text decoding and native checkpoint generation remain open |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
-| [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
+| [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head, 22-layer encoder qualified against a float64 reference on synthetic weights | No real-checkpoint qualification or serving integration |
 
 The DeepSeek library's `MoEReference::new_sparse` preserves original gate IDs
 when only selected routed experts are loaded. It rejects missing selected

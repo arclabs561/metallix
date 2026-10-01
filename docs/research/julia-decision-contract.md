@@ -1,11 +1,10 @@
 # Julia-1 native decision prerequisite
 
 Status: source contract, published-header validation, real-tokenizer sequence
-parity, and a native CPU decision head are implemented. A bounded native
-22-layer prefill is present for diagnosis, but it has not qualified against the
-strict source-output gate: the `unmasked_control` synthetic case exceeds the
-fixed `1e-5` hidden-state tolerance. Full Julia execution still requires a
-numerical contract decision and checkpoint qualification.
+parity, a native CPU decision head and a bounded native 22-layer prefill are
+implemented. The prefill is qualified against a float64 accuracy reference on
+synthetic weights (see [the full-encoder gate](#float64-accuracy-reference-for-the-full-encoder)).
+Checkpoint loading, real-weight qualification and serving integration remain open.
 
 ## Calibration-only source control
 
@@ -126,11 +125,32 @@ positions:
 | `no_padding` | 7.7e-6 | 3.5e-6 | 2.9e-6 |
 
 On the failing case, native is about twice as close to the float64 result as
-the fixture it is gated against. The `1e-5` gate is narrower than the spread
-between two FP32 source implementations of the same model on that case, and
-measures agreement with one rounding path rather than accuracy. Whether to
-gate against a float64 reference instead is a contract decision; the current
-gate and tolerance are unchanged.
+the fixture it was gated against. The `1e-5` gate was narrower than the spread
+between two FP32 source implementations of the same model, so it measured
+agreement with one rounding path rather than accuracy.
+
+The full-encoder test now gates against float64. For each case, native maximum
+hidden error on valid positions must be at most four times the FP32 SDPA
+source's own error against float64, and valid scores must be within `1e-5` of
+the float64 scores. The factor was recorded from the eight calibration cases
+(worst native-to-source ratio 2.3) before the eight held-out cases were run.
+Every held-out case passed on first evaluation, worst ratio 2.2:
+
+| Split | Cases | Worst native/source ratio | Worst score error |
+| --- | ---: | ---: | ---: |
+| Calibration | 8 | 2.3 | 1.2e-7 |
+| Held-out | 8 | 2.2 | 9.8e-8 |
+| Legacy synthetic | 5 | 2.2 | - |
+
+The test also rejects a planted `1e-4` hidden-state defect. It qualifies the
+native encoder on generated weights; real-checkpoint qualification is separate.
+Regenerate the fixture with:
+
+```sh
+uv run --offline scripts/julia_f64_gate_fixture.py
+```
+
+The earlier diagnostic commands remain available:
 
 ```sh
 JULIA_ERROR_OUTPUT=/tmp/julia-native.json \
