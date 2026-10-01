@@ -187,7 +187,10 @@ impl V41SafetensorsIndex {
     }
 
     /// Iterates tensor names and assigned shards in tensor-name order.
-    #[must_use]
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "the returned iterator is already must_use; toolchains disagree on the attribute"
+    )]
     pub fn tensor_shards(&self) -> impl ExactSizeIterator<Item = (&str, &str)> + '_ {
         self.weight_map
             .iter()

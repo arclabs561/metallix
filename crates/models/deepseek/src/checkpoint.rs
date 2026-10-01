@@ -300,7 +300,10 @@ impl V41SafetensorsHeader {
     }
 
     /// Iterates validated tensor names and intervals in deterministic order.
-    #[must_use]
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "the returned iterator is already must_use; toolchains disagree on the attribute"
+    )]
     pub fn tensors(&self) -> impl ExactSizeIterator<Item = (&str, &V41TensorRange)> + '_ {
         self.tensors
             .iter()

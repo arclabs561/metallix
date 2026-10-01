@@ -262,6 +262,17 @@ fn expected_generation_output(
     })
 }
 
+// In-process Metal work shares MLX's process-global device state; serialize it.
+#[cfg(feature = "metal")]
+static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "metal")]
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(feature = "metal")]
 fn expected_output_with_head_execution(
     artifact: &ReducedArtifact,
@@ -454,6 +465,7 @@ fn generation_arguments_reject_before_artifact_read() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_cli_matches_scalar_library_output_for_both_fixed_partitions() {
+    let _gpu = gpu_lock();
     let bytes = export_artifact();
     let artifact_file = TempArtifact::from_bytes(&bytes);
     let artifact = ReducedArtifact::parse(&bytes).expect("exported artifact parses");
@@ -484,6 +496,7 @@ fn metal_cli_matches_scalar_library_output_for_both_fixed_partitions() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_key_rotation_alone_and_with_scores_matches_scalar_cli() {
+    let _gpu = gpu_lock();
     let bytes = export_artifact();
     let file = TempArtifact::from_bytes(&bytes);
     let artifact = ReducedArtifact::parse(&bytes).unwrap();
@@ -515,6 +528,7 @@ fn metal_key_rotation_alone_and_with_scores_matches_scalar_cli() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_key_preparation_receipt_and_execution_match_selected_library() {
+    let _gpu = gpu_lock();
     let bytes = export_artifact();
     let file = TempArtifact::from_bytes(&bytes);
     let artifact = ReducedArtifact::parse(&bytes).unwrap();
@@ -571,6 +585,7 @@ fn metal_key_preparation_receipt_and_execution_match_selected_library() {
 #[cfg(feature = "metal")]
 #[test]
 fn metal_final_head_cli_matches_selected_library_execution_for_both_fixed_partitions() {
+    let _gpu = gpu_lock();
     let bytes = export_artifact();
     let file = TempArtifact::from_bytes(&bytes);
     let artifact = ReducedArtifact::parse(&bytes).unwrap();
