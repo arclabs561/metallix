@@ -42,9 +42,15 @@ defines the correctness, performance and resource gates.
 | Qwen text and tools | Schema-constrained generation, chat, local agent, experimental Responses API | Bounded local Qwen3 controls |
 | [Typed decisions](docs/typed-decisions.md) | `mx decide`: choice, score, Boolean probabilities; flattened leaf-path labels | Up to 16 options; probabilities are uncalibrated |
 | [Verified candidates](docs/candidate-control.md) | Isolated retries with schema, non-overlap, and optional exact task requirements | Requirements must be supplied explicitly |
-| [DeepSeek](docs/progress.md) | Reduced-model greedy token generation, five-block requests with persistent shared state, bounded selected-expert checkpoint reads, and opt-in mixed CPU/Metal replay | Reduced generation uses synthetic parameters; selected expert execution is not full-model loading. Tokenizer/template integration, text decoding and native checkpoint generation remain open |
+| [DeepSeek](docs/progress.md) | Reduced-model greedy token generation, five-block requests with persistent shared state, bounded routed-FP4/shared-FP8 checkpoint reads, sparse CPU expert tables, and opt-in mixed CPU/Metal replay | Reduced generation uses synthetic parameters; selected expert execution is not full-model loading. Tokenizer/template integration, text decoding and native checkpoint generation remain open |
 | [SMC](docs/research/sampling-next-gates.md) | Finite accounting, checkpoint-backed proposal correction, resampling and cache tests | Test-only composition, no particle-serving API |
 | [Julia-1](docs/research/julia-decision-contract.md) | Tokenizer/header checks, native CPU head and ModernBERT block parity, two-block-to-head composition | Full 22-layer numerical qualification is open; no checkpoint or serving integration |
+
+The DeepSeek library's `MoEReference::new_sparse` preserves original gate IDs
+when only selected routed experts are loaded. It rejects missing selected
+payloads before expert arithmetic. Shared-FP8 readers validate the six weight
+and scale ranges with an aggregate raw-byte budget; callers still authenticate
+checkpoint identity. These are building blocks for checkpoint execution.
 
 On the same 72 public decision tasks, local Qwen3-4B-Instruct-2507 scored
 65/72 (90.3%), versus 35/72 for Qwen3-0.6B; all tasks produced valid receipts.

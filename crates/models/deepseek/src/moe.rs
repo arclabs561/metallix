@@ -217,8 +217,47 @@ pub struct MoEReference<'a> {
     config: MoEConfig,
     gate_bf16: &'a [u16],
     bias: &'a [f32],
-    routed: &'a [Fp4ExpertWeights<'a>],
+    routed: RoutedExperts<'a>,
     shared: Fp8ExpertWeights<'a>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RoutedExperts<'a> {
+    Dense(&'a [Fp4ExpertWeights<'a>]),
+    Sparse(&'a [Option<Fp4ExpertWeights<'a>>]),
+}
+
+impl<'a> RoutedExperts<'a> {
+    const fn len(self) -> usize {
+        match self {
+            Self::Dense(experts) => experts.len(),
+            Self::Sparse(experts) => experts.len(),
+        }
+    }
+
+    fn geometry_matches(self, config: MoEConfig) -> bool {
+        match self {
+            Self::Dense(experts) => experts.iter().all(|expert| {
+                expert.hidden_width == config.hidden_width
+                    && expert.intermediate_width == config.intermediate_width
+            }),
+            Self::Sparse(experts) => experts.iter().flatten().all(|expert| {
+                expert.hidden_width == config.hidden_width
+                    && expert.intermediate_width == config.intermediate_width
+            }),
+        }
+    }
+
+    fn selected(self, index: usize) -> Result<Fp4ExpertWeights<'a>, MoEError> {
+        match self {
+            Self::Dense(experts) => experts.get(index).copied().ok_or(MoEError::RouteOutOfRange),
+            Self::Sparse(experts) => match experts.get(index) {
+                Some(Some(expert)) => Ok(*expert),
+                Some(None) => Err(MoEError::MissingRoutedExpert { index }),
+                None => Err(MoEError::RouteOutOfRange),
+            },
+        }
+    }
 }
 
 impl<'a> MoEReference<'a> {
@@ -237,16 +276,53 @@ impl<'a> MoEReference<'a> {
         routed: &'a [Fp4ExpertWeights<'a>],
         shared: Fp8ExpertWeights<'a>,
     ) -> Result<Self, MoEError> {
-        if routed.is_empty() {
+        Self::new_with_routed(
+            config,
+            gate_bf16,
+            bias,
+            RoutedExperts::Dense(routed),
+            shared,
+        )
+    }
+
+    /// Validates a sparse logical routed-expert table.
+    ///
+    /// Missing entries retain their original gate IDs and are rejected only
+    /// when routing selects them, before any expert arithmetic begins.
+    pub fn new_sparse(
+        config: MoEConfig,
+        gate_bf16: &'a [u16],
+        bias: &'a [f32],
+        routed: &'a [Option<Fp4ExpertWeights<'a>>],
+        shared: Fp8ExpertWeights<'a>,
+    ) -> Result<Self, MoEError> {
+        Self::new_with_routed(
+            config,
+            gate_bf16,
+            bias,
+            RoutedExperts::Sparse(routed),
+            shared,
+        )
+    }
+
+    fn new_with_routed(
+        config: MoEConfig,
+        gate_bf16: &'a [u16],
+        bias: &'a [f32],
+        routed: RoutedExperts<'a>,
+        shared: Fp8ExpertWeights<'a>,
+    ) -> Result<Self, MoEError> {
+        let expert_count = routed.len();
+        if expert_count == 0 {
             return Err(MoEError::NoRoutedExperts);
         }
-        if config.top_k > routed.len() {
+        if config.top_k > expert_count {
             return Err(MoEError::TopKExceedsExperts {
                 top_k: config.top_k,
-                experts: routed.len(),
+                experts: expert_count,
             });
         }
-        let expected_gate = checked_product("gate", routed.len(), config.hidden_width)?;
+        let expected_gate = checked_product("gate", expert_count, config.hidden_width)?;
         if gate_bf16.len() != expected_gate {
             return Err(MoEError::Length {
                 field: "gate_bf16",
@@ -254,17 +330,14 @@ impl<'a> MoEReference<'a> {
                 expected: expected_gate,
             });
         }
-        if bias.len() != routed.len() {
+        if bias.len() != expert_count {
             return Err(MoEError::Length {
                 field: "bias",
                 actual: bias.len(),
-                expected: routed.len(),
+                expected: expert_count,
             });
         }
-        if routed.iter().any(|expert| {
-            expert.hidden_width != config.hidden_width
-                || expert.intermediate_width != config.intermediate_width
-        }) {
+        if !routed.geometry_matches(config) {
             return Err(MoEError::ExpertGeometry);
         }
         if shared.hidden_width != config.hidden_width
@@ -317,6 +390,9 @@ impl<'a> MoEReference<'a> {
             self.config.normalize_top_k,
             self.config.route_scale,
         )?;
+        for route in &routes {
+            let _ = self.routed.selected(route.expert_index())?;
+        }
         let mut accumulator = allocate_f32("accumulator", self.config.hidden_width)?;
         let mut selected_outputs = Vec::new();
         selected_outputs
@@ -325,10 +401,7 @@ impl<'a> MoEReference<'a> {
                 field: "selected outputs",
             })?;
         for route in &routes {
-            let expert = self
-                .routed
-                .get(route.expert_index())
-                .ok_or(MoEError::RouteOutOfRange)?;
+            let expert = self.routed.selected(route.expert_index())?;
             let output =
                 expert.forward_token(input_bf16, self.config.swiglu_limit, Some(route.weight()))?;
             accumulate_bf16(&mut accumulator, &output, "routed accumulation")?;
@@ -468,6 +541,12 @@ pub enum MoEError {
     /// A selected route refers to an absent routed expert.
     #[error("selected route refers to an absent routed expert")]
     RouteOutOfRange,
+    /// The sparse logical routed-expert table has no payload for a selected ID.
+    #[error("selected routed expert {index} has no loaded FP4 payload")]
+    MissingRoutedExpert {
+        /// Logical gate/expert ID.
+        index: usize,
+    },
     /// A finite FP32 stage cannot be represented as finite BF16.
     #[error("{stage} cannot remain finite BF16 at element {element}")]
     Bf16Overflow {
@@ -932,6 +1011,160 @@ mod tests {
                 elements,
                 max: super::MAX_MOE_WORK,
             }) if elements == 3 * HIDDEN * INTERMEDIATE
+        ));
+    }
+
+    fn fp4_expert(buffers: &ExpertBuffers) -> Fp4ExpertWeights<'_> {
+        Fp4ExpertWeights::new(
+            WIDTH,
+            WIDTH,
+            &buffers.w1,
+            &buffers.w1_scales,
+            &buffers.w2,
+            &buffers.w2_scales,
+            &buffers.w3,
+            &buffers.w3_scales,
+        )
+        .expect("complete packed FP4 expert")
+    }
+
+    fn fp8_expert(buffers: &ExpertBuffers) -> Fp8ExpertWeights<'_> {
+        Fp8ExpertWeights::new(
+            WIDTH,
+            WIDTH,
+            &buffers.w1,
+            &buffers.w1_scales,
+            &buffers.w2,
+            &buffers.w2_scales,
+            &buffers.w3,
+            &buffers.w3_scales,
+        )
+        .expect("complete packed FP8 expert")
+    }
+
+    #[test]
+    fn sparse_experts_preserve_dense_ids_and_reject_only_selected_holes() {
+        let routed_buffers = fp4_buffers();
+        let expert = fp4_expert(&routed_buffers);
+        let shared_buffers = fp8_buffers();
+        let shared = fp8_expert(&shared_buffers);
+        let config =
+            MoEConfig::new(WIDTH, WIDTH, 4.0, 1, 1.0, true, 1.0).expect("one-route configuration");
+        let gate = vec![0; 2 * WIDTH];
+        let bias = [1.0, 0.0];
+        let dense = [expert, expert];
+        let sparse = [Some(expert), Some(expert)];
+        let input = [0x3f80; WIDTH];
+        assert_eq!(
+            MoEReference::new(config, &gate, &bias, &dense, shared)
+                .expect("dense reference")
+                .forward_token(&input)
+                .expect("dense token"),
+            MoEReference::new_sparse(config, &gate, &bias, &sparse, shared)
+                .expect("sparse reference")
+                .forward_token(&input)
+                .expect("sparse token"),
+            "sparse storage retains the full logical gate table",
+        );
+        let unselected_hole = [Some(expert), None];
+        assert!(
+            MoEReference::new_sparse(config, &gate, &bias, &unselected_hole, shared)
+                .expect("unselected sparse hole is valid")
+                .forward_token(&input)
+                .is_ok()
+        );
+        let selected_hole = [None, Some(expert)];
+        assert!(matches!(
+            MoEReference::new_sparse(config, &gate, &bias, &selected_hole, shared)
+                .expect("selected-hole table has valid geometry")
+                .forward_token(&input),
+            Err(MoEError::MissingRoutedExpert { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn sparse_missing_payload_follows_the_current_route_and_validates_present_geometry() {
+        let routed_buffers = fp4_buffers();
+        let expert = fp4_expert(&routed_buffers);
+        let shared_buffers = fp8_buffers();
+        let shared = fp8_expert(&shared_buffers);
+        let config =
+            MoEConfig::new(WIDTH, WIDTH, 4.0, 1, 1.0, true, 1.0).expect("one-route configuration");
+        let mut gate = vec![0; 2 * WIDTH];
+        gate[0] = 0x3f80;
+        gate[WIDTH] = 0xbf80;
+        let bias = [0.0, 0.0];
+        let sparse = [Some(expert), None];
+        let reference =
+            MoEReference::new_sparse(config, &gate, &bias, &sparse, shared).expect("sparse table");
+        let mut positive = [0; WIDTH];
+        positive[0] = 0x3f80;
+        assert!(reference.forward_token(&positive).is_ok());
+        let mut negative = positive;
+        negative[0] = 0xbf80;
+        assert!(matches!(
+            reference.forward_token(&negative),
+            Err(MoEError::MissingRoutedExpert { index: 1 })
+        ));
+        let malformed = Fp4ExpertWeights {
+            hidden_width: WIDTH * 2,
+            ..expert
+        };
+        assert!(matches!(
+            MoEReference::new_sparse(config, &gate, &bias, &[Some(malformed), None], shared),
+            Err(MoEError::ExpertGeometry)
+        ));
+    }
+
+    #[test]
+    fn sparse_selected_id_survives_preceding_holes() {
+        let first_buffers = fp4_buffers_with_codes(0x11, 0x11, 0x11);
+        let selected_buffers = fp4_buffers_with_codes(0x22, 0x22, 0x22);
+        let first = fp4_expert(&first_buffers);
+        let selected = fp4_expert(&selected_buffers);
+        let shared_buffers = fp8_buffers();
+        let shared = fp8_expert(&shared_buffers);
+        let config = MoEConfig::new(WIDTH, WIDTH, 4.0, 1, 1.0, true, 1.0).unwrap();
+        let gate = vec![0; 2 * WIDTH];
+        let bias = [0.0, 1.0];
+        let input = [0x3f80; WIDTH];
+        assert_ne!(
+            first.forward_token(&input, 4.0, Some(1.0)).unwrap(),
+            selected.forward_token(&input, 4.0, Some(1.0)).unwrap(),
+            "distinct expert payloads must produce distinguishable outputs",
+        );
+        let dense = [first, selected];
+        let sparse = [None, Some(selected)];
+        let expected = MoEReference::new(config, &gate, &bias, &dense, shared)
+            .unwrap()
+            .forward_token(&input)
+            .unwrap();
+        let actual = MoEReference::new_sparse(config, &gate, &bias, &sparse, shared)
+            .unwrap()
+            .forward_token(&input)
+            .unwrap();
+        assert_eq!(actual.routes()[0].expert_index(), 1);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sparse_missing_later_payload_preempts_earlier_expert_arithmetic() {
+        let mut invalid_buffers = fp4_buffers();
+        invalid_buffers.w1_scales[0] = 0xff;
+        let invalid = fp4_expert(&invalid_buffers);
+        let shared_buffers = fp8_buffers();
+        let shared = fp8_expert(&shared_buffers);
+        let config = MoEConfig::new(WIDTH, WIDTH, 4.0, 2, 1.0, true, 1.0).unwrap();
+        let gate = vec![0; 2 * WIDTH];
+        let bias = [1.0, 0.0];
+        let input = [0x3f80; WIDTH];
+        assert!(invalid.forward_token(&input, 4.0, Some(0.5)).is_err());
+        let sparse = [Some(invalid), None];
+        assert!(matches!(
+            MoEReference::new_sparse(config, &gate, &bias, &sparse, shared)
+                .unwrap()
+                .forward_token(&input),
+            Err(MoEError::MissingRoutedExpert { index: 1 })
         ));
     }
 

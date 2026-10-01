@@ -17,10 +17,17 @@ use crate::manifest::V41SafetensorsIndex;
 pub mod mlx;
 pub use mlx::{LayerZeroAttentionActivation, LayerZeroQkvResident};
 mod source_fp4;
+mod source_fp8;
 pub use source_fp4::{
     MAX_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,
     V41ExpertI8ScalePairs, V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
     V41ExpertProjectionPayload,
+};
+
+pub use source_fp8::{
+    MAX_SHARED_EXPERT_PAYLOAD_BYTES, V41SharedExpertFp8ScalePair, V41SharedExpertFp8ScalePairError,
+    V41SharedExpertFp8ScalePairs, V41SharedExpertFp8ScalePayload, V41SharedExpertPayloadError,
+    V41SharedExpertProjection, V41SharedExpertProjectionPayload,
 };
 
 const SAFETENSORS_PREFIX_BYTES: u64 = 8;
