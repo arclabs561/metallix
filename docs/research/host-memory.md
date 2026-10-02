@@ -261,8 +261,69 @@ Revised after that search. Each lists its falsifying test; none is implemented.
    which token is sampled to save reads is lossy, and is out of scope by
    default; 2607.26627 documents how such relaxations distort generation.
 
+### Batches and probabilistic decoding under the same cost model
+
+Because decode is bound by weight bytes, any work that shares one expert read
+across several tokens is nearly free compute. Each extra token in a batch or a
+verified draft only costs the experts its routes add to the union. That makes
+batch prediction and exact probabilistic methods unusually attractive here, and
+it changes how to evaluate them: the cost of a batch is the bytes of its
+expert union, not its token count.
+
+Relevant work (Firecrawl arXiv index):
+
+- [Cacheable by design? (2608.18261)](https://arxiv.org/abs/2608.18261)
+  measures Qwen3-235B decoding from SSD at 0.44 tok/s, matching a bytes-per-token
+  model, with adjacent-token expert reuse 2.0x chance, 95% of traffic on 52.5%
+  of experts, and a 13.4% LRU cache serving 66% of requests. It also reports a
+  batching scheme collapsing at batch 32 from paging thrash. This is the closest
+  published measurement to the DeepSeek setting and supports the cost model.
+- [XShare (2602.07265)](https://arxiv.org/abs/2602.07265),
+  [Opportunistic expert activation (2511.02237)](https://arxiv.org/abs/2511.02237)
+  and [BASE (2609.36222)](https://arxiv.org/abs/2609.36222) re-route tokens
+  toward experts the batch already loaded. They cut expert traffic but change
+  outputs.
+- Exact multi-draft speculative sampling ([SpecTr (2310.15141)](https://arxiv.org/abs/2310.15141),
+  [SpecHub (2411.05289)](https://arxiv.org/abs/2411.05289),
+  [Global Resolution (2511.15898)](https://arxiv.org/abs/2511.15898)) verifies
+  several drafts per step while preserving the target distribution.
+- Prefix-sharing parallel decoding ([Hydragen (2402.05099)](https://arxiv.org/abs/2402.05099),
+  [Bifurcated attention (2403.08845)](https://arxiv.org/abs/2403.08845)) and
+  [distinct-leaf enumeration (2604.20500)](https://arxiv.org/abs/2604.20500)
+  make many samples from one prompt cheap and non-redundant.
+- Sequential Monte Carlo steering ([2306.03081](https://arxiv.org/abs/2306.03081),
+  [twisted SMC (2507.02315)](https://arxiv.org/abs/2507.02315)) already informs
+  Metallix's [sampling gates](sampling-next-gates.md).
+
+Hypotheses specific to an expert-streaming Mac (untested):
+
+5. **Particles and parallel samples are cheap on an MoE.** SMC particles,
+   best-of-n samples and self-consistency votes from one prompt share early
+   routes, so their expert union grows sublinearly with particle count.
+   Falsifier: measured expert-union bytes per step versus particle count on
+   recorded routes; if the union grows nearly linearly, the advantage is small.
+6. **Route-aware particle scheduling with exact weights.** When resampling SMC
+   particles, advance first the particles whose next step reuses the resident
+   expert set, deferring the rest within the same step. Ordering does not change
+   particle weights or the target distribution; it only changes which reads
+   overlap. Falsifier: SSD bytes per completed step versus fixed order.
+7. **Exact multi-draft verification counted in bytes.** Score multi-draft
+   trees from V4.1's MTP/DSpark heads by expected accepted tokens per
+   non-resident byte, combining exact multi-draft verification (SpecTr-style)
+   with the residency ranking in hypothesis 2. Falsifier: tokens per SSD byte
+   against single-draft and acceptance-only multi-draft baselines.
+8. **Shared-prefix batching across requests.** Serve concurrent agent requests
+   as one batch per step so they share both the prompt prefix and each step's
+   expert reads, with an explicit memory budget to avoid the paging collapse
+   reported in 2608.18261. Falsifier: aggregate tokens per second and peak
+   resident memory against serial serving at batch sizes 1-16.
+
+Approximate methods that change routing (XShare, opportunistic activation,
+expert halving) are worth measuring as opt-in modes with a held-out quality gate,
+never as defaults.
+
 The first measurement for all of these is the same: record actual V4.1 expert
-routes per layer over real prompts, then replay cache, prefetch and speculation
+routes per layer over real prompts, including several samples per prompt, then replay cache, prefetch and speculation
 policies offline against those traces before building any of them.
 
 ## DeepSeek routed-expert traffic sensitivity
