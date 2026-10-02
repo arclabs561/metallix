@@ -27,6 +27,9 @@ rand_core = "=0.9.3"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+# Toolchains in use span Clippy 1.98 and 1.99; a lint configured for the newer
+# one is unknown to the older one.
+unknown_lints = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

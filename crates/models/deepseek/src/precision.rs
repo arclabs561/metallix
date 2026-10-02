@@ -23,6 +23,11 @@ pub(crate) use linear::fp4_linear_runtime_f32_owned;
 pub use linear::{ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32};
 mod fp8_linear;
 pub use fp8_linear::{Fp8LinearError, fp8_linear_runtime_f32};
+
+#[cfg(feature = "metal")]
+mod fp8_metal;
+#[cfg(feature = "metal")]
+pub use fp8_metal::{Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights};
 mod roundtrip;
 pub use roundtrip::{
     ActivationRoundtripError, MAX_ACTIVATION_ROUNDTRIP_ELEMENTS, requantize_bf16_activations_e4m3fn,

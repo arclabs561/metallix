@@ -447,6 +447,7 @@ version = "0.1.0"
 dependencies = [
  "divan",
  "mlx-rs",
+ "mlx-sys",
  "proptest",
  "serde",
  "serde_json",

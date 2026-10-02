@@ -122,10 +122,19 @@ versus 2.6 ms for resident FP32 weights and 6.9 ms for per-call MLX decoding,
 while holding a quarter of the FP32 memory. The kernel runs on MLX's stream
 and allocator, so no second queue or buffer owner is introduced.
 
-This makes the middle path concrete: a small safe Rust wrapper over these
-FFI calls, owning kernel and config lifetimes and checking input layouts,
-avoids both a binding upgrade and a separate Metal runtime. The wrapper is
-not yet written; the experiment uses raw `unsafe` calls outside the workspace.
+This made the middle path concrete. `deepseek::precision::Fp8MetalKernel`
+(Metal feature only) now wraps these calls: it is the workspace's only module
+permitted `unsafe`, owns every MLX-C handle through drop guards, validates
+geometry, lengths and NaN codes before crossing the FFI boundary, and rejects
+nonfinite device outputs. Resident weights are uploaded once as
+`Fp8MetalWeights`. A unit test compares it with the scalar FP8 reference on
+random finite codes; on the real layer-zero projections it reproduces the
+source BF16 outputs exactly. Its practices follow MLX's custom-kernel guide:
+build the kernel once and reuse it (MLX compiles and caches the library on
+first use, keyed by name and template values); pass sizes as template
+integers so each shape compiles to constant loops; keep inputs row contiguous;
+launch whole SIMD groups (32 threads) per output row, as MLX's own quantized
+matrix-vector kernels do.
 
 ### Direct Metal from Rust
 
