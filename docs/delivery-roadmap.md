@@ -69,6 +69,22 @@ within the local target's memory budget. Weight residency, repeated reads and
 on-device packed computation need connected measurements before selecting a
 prefetch or expert-cache policy.
 
+### Declared resource envelope for route recording
+
+Target machine: one Apple Silicon Mac with 128 GiB unified memory. Route
+recording may hold up to 64 GiB of acquired checkpoint ranges on disk and must
+leave at least 150 GiB free. Resident weights during recording stay under
+48 GiB. Recording uses short prompts (16 tokens, then 64) and several samples
+per prompt, so cache and batching policies can be replayed against real
+expert routes.
+
+Acquisition is staged and receipted per tensor range: all 40 layers'
+non-expert tensors first (about 5.4 GB at layer-zero shapes, plus compressed-
+attention and Engram tensors where present), then only the routed experts the
+recorded prompts actually select. Each stage is checked against the pinned
+source on real weights before the next is fetched. This envelope covers trace
+recording, not a serving residency or pager commitment.
+
 Do not start full checkpoint acquisition or a pager/prefetch policy until the
 resource envelope and reference gate are satisfied. Recheck the existing
 [upstream-runtime pivot](architecture.md#pivot-conditions) against that same
