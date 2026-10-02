@@ -109,6 +109,36 @@ There are three possible paths, in increasing integration cost:
 | Extend the Rust wrapper to an MLX custom operation | Can preserve MLX graph ownership while specializing a hot operation | Safe FFI, input/output layouts, stream behavior, lifetimes and numerical tests |
 | Add a direct-Metal operation boundary | Direct control of APIs not exposed by the current stack | Explicit resource sharing/copies, synchronization, errors, ownership and measurable benefit over MLX |
 
+### Qualified: the MLX-C custom kernel path works from the pinned binding
+
+The pinned `mlx-sys 0.2.0` exposes `mlx_fast_metal_kernel_new`, its config
+builder and `mlx_fast_metal_kernel_apply` as raw FFI, together with the
+vector and array helpers they need. A private experiment called them directly
+with a fused FP8 decode-and-multiply kernel (packed one-byte E4M3 codes and
+E8M0 block scales resident; one SIMD group per output row, block sums in
+ascending order). On the four real DeepSeek layer-zero attention projections it
+matched the source BF16 outputs exactly and took 2.8 ms for three tokens,
+versus 2.6 ms for resident FP32 weights and 6.9 ms for per-call MLX decoding,
+while holding a quarter of the FP32 memory. The kernel runs on MLX's stream
+and allocator, so no second queue or buffer owner is introduced.
+
+This makes the middle path concrete: a small safe Rust wrapper over these
+FFI calls, owning kernel and config lifetimes and checking input layouts,
+avoids both a binding upgrade and a separate Metal runtime. The wrapper is
+not yet written; the experiment uses raw `unsafe` calls outside the workspace.
+
+### Direct Metal from Rust
+
+If a needed operation cannot run under MLX, [`objc2`](https://github.com/madsmtm/objc2)
+with `objc2-metal` is the maintained route. Its framework crates are generated
+from Apple's SDK headers and are widely used (about 37M downloads for
+`objc2-metal`). The older `metal` crate (`metal-rs`) is now marked deprecated by
+its maintainers in favor of `objc2-metal`. A direct path would own its own
+command queue, buffers and synchronization; sharing tensors with MLX would
+require explicit copies or buffer interop that the pinned MLX binding does not
+expose. Given the working MLX-C path, direct Metal is a fallback for operations
+MLX cannot express, not the default for DeepSeek's quantized projections.
+
 Recommendation: retain MLX composition as the baseline. Choose a custom path
 only for a measured bottleneck with a stable numerical contract. A broad
 backend rewrite is not justified by an API announcement or by another
@@ -196,7 +226,7 @@ evidence that a newer MLX capability is safe in the checked-out binary.
 | Quantized matrix operations | Quantize/dequantize and `quantized_matmul` are exposed | Not used by the current Qwen path | Requires checkpoint-layout and numerical qualification, not an API toggle. |
 | Allocator observability and limits | No high-level memory module in the pinned binding | No allocator telemetry or limits | 0.32.0 adds active/cache/peak metrics, limits and cache clearing; an upgrade needs its own compatibility and enforcement gate. |
 | GGUF, contiguous arrays and functional index updates | Not exposed by the pinned release | Not used | 0.32.0 adds these facilities. They may help a future fixed-capacity cache design, but do not justify an upgrade alone. |
-| Custom Metal extensions and distributed execution | Not exposed as a high-level pinned Rust API | Not used | MLX documents [custom extensions](https://ml-explore.github.io/mlx/build/html/dev/extensions.html) and [distributed communication](https://ml-explore.github.io/mlx/build/html/usage/distributed.html), but neither is an available current Qwen call. Treat either as wrapper/upgrade work with a separate FFI and lifecycle design. |
+| Custom Metal extensions and distributed execution | Custom kernels: raw MLX-C FFI only, qualified by a private experiment; no safe wrapper. Distributed: not exposed | Not used | MLX documents [custom extensions](https://ml-explore.github.io/mlx/build/html/dev/extensions.html) and [distributed communication](https://ml-explore.github.io/mlx/build/html/usage/distributed.html), but neither is an available current Qwen call. Treat either as wrapper/upgrade work with a separate FFI and lifecycle design. |
 
 The smallest current-binding performance experiment is to cache each static
 linear weight's transposed view at resident-session load, then compare it with

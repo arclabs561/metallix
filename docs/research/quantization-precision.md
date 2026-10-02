@@ -548,6 +548,18 @@ fused decode-and-multiply kernel would remove that materialization; MLX's
 built-in quantized matmul uses affine integer groups rather than E4M3 codes
 with E8M0 scales, so it cannot run these weights unchanged.
 
+A fused kernel through MLX's custom Metal kernel API (see
+[MLX backend](mlx-backend.md#qualified-the-mlx-c-custom-kernel-path-works-from-the-pinned-binding))
+removes that materialization: the same packed weights now take 2.8 ms for all
+four projections, again matching the source exactly. That is about the speed of
+FP32 residency at a quarter of the memory.
+
+The 4-bit routed experts were also run on Metal with their packed codes
+resident and decoded per call. All six real experts from the source-routed
+synthetic-input case match the source BF16 outputs exactly (30,720 values), at
+about 7.8 ms per expert. That decoded-per-call path is not yet fused; a fused
+FP4 kernel follows the FP8 one.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
