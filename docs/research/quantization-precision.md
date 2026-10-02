@@ -539,6 +539,15 @@ also four times the FP8 storage (about 0.48 GB for these four tensors), which
 will not scale to all 40 layers within one Mac's memory. A packed-FP8 or FP4
 Metal path must keep this exact-match gate.
 
+Keeping the one-byte FP8 codes and FP32 block scales resident instead, and
+decoding through an E4M3 lookup table on Metal at each call, also matches the
+source exactly for all four projections. It holds 93 MB rather than 372 MB
+(4.0x smaller) at 6.9 ms rather than 2.6 ms total (2.7x slower) for three
+tokens, because MLX materializes the decoded matrix before the multiply. A
+fused decode-and-multiply kernel would remove that materialization; MLX's
+built-in quantized matmul uses affine integer groups rather than E4M3 codes
+with E8M0 scales, so it cannot run these weights unchanged.
+
 ## Serving-side choices
 
 Weight-only post-training quantization (PTQ) commonly stores low-bit weights
