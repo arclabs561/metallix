@@ -161,6 +161,110 @@ KV offload, predictor-driven loading, speculative prefetch, and adaptive cache
 replacement remain separate experiments. Compare each against a simple exact
 baseline and retain it only with measured benefit and unchanged output semantics.
 
+## What bounds DeepSeek decode speed on one Mac
+
+A byte-level cost model from the pinned configuration decides what matters.
+Per decoded token, V4.1-Flash reads about 12.5 GB of weights across 40 layers:
+about 160 MB per layer of attention projections (with `wo_a` as BF16 after
+conversion), the 35 MB shared FP8 expert, the 3.9 MB router, and 113 MB for six
+routed FP4 experts. The 8.0 GB of non-routed weights fit in memory; the 289 GB of
+routed experts do not.
+
+| Where expert bytes come from | Expert traffic per token | Decode floor |
+| --- | ---: | ---: |
+| All weights in unified memory (~400 GB/s) | 4.5 GB | ~31 ms, ~32 tok/s |
+| Experts from SSD, no cache (~3 GB/s measured) | 4.5 GB | ~1.5 s, ~0.7 tok/s |
+| 90% expert cache hit | 0.45 GB from SSD | ~180 ms, ~5.6 tok/s |
+| 95% expert cache hit | 0.23 GB from SSD | ~105 ms, ~9.7 tok/s |
+
+These are bandwidth floors, not predictions; they ignore compute, overlap and
+read amplification. Two conclusions follow. Kernel speed matters only after
+residency: the fused FP8 Metal kernel already runs a layer's attention
+projections in about the time their bytes take to read. Expert residency and
+read volume decide whether DeepSeek is usable: every percentage point of expert
+cache hit rate above 90% is worth more than any further kernel work.
+
+### Current work that addresses this bottleneck
+
+Read from abstracts on the Hugging Face papers index; results are the authors'
+claims until reproduced here.
+
+- [Edge0 (2609.18063)](https://huggingface.co/papers/2609.18063) serves a 35B
+  MoE from SSD at 20 tok/s in 3 GiB by training a per-layer prerouter that
+  predicts the next layer's routing and then uses that prediction as the
+  routing. That removes the dependency that keeps reads from starting early,
+  but it changes the model and needs a recovery adapter.
+- [Training-free halving of activated experts (2609.04575)](https://huggingface.co/papers/2609.04575)
+  activates the top `k1` experts while normalizing by the top `k2` mass, keeping
+  the expert branch's gain calibrated. It reports small quality loss from
+  halving experts on Qwen MoEs. For V4.1 this would cut expert traffic in half,
+  but it is an approximation and needs a held-out quality gate here.
+- [EcoSpec (2607.12696)](https://huggingface.co/papers/2607.12696) observes that
+  speculative drafts can route to disjoint experts and inflate the verified
+  expert union, and selects drafts by predicted expert cost as well as
+  acceptance.
+- [ExFold (2608.24938)](https://huggingface.co/papers/2608.24938) projects
+  excluded experts' contributions onto retained ones under a budget.
+- [Lossy verification analysis (2607.26627)](https://huggingface.co/papers/2607.26627)
+  shows relaxed speculative verification silently changes the sampling
+  distribution; exact verification should remain the default.
+
+V4.1 ships its own speculation path: three next-token-prediction layers
+(`num_nextn_predict_layers = 3`) and a "DSpark" block drafter over layers
+37-39 with 128 experts. Those are the natural drafters; no separate draft
+model is needed.
+
+### Closest prior art, from a wider arXiv search
+
+A semantic arXiv search through Firecrawl's research index found much closer
+work than the Hugging Face index, which changes what is worth proposing:
+
+- [Speculating Experts (2603.19289)](https://arxiv.org/abs/2603.19289) predicts
+  future experts from current internal representations to overlap transfers
+  with compute, and reports that executing the predicted experts usually
+  preserves accuracy.
+- [SpecMD (2602.03921)](https://arxiv.org/abs/2602.03921) benchmarks caching
+  policies and finds MoE expert access does not follow the temporal locality
+  that LRU and LFU assume.
+- [Reproducible MoE caching evaluation (2608.07911)](https://arxiv.org/abs/2608.07911)
+  shows replay semantics and templated prompts can inflate recency policies by
+  27-29% and invert policy rankings.
+- [AcceptMoE (2608.02989)](https://arxiv.org/abs/2608.02989) selects verifier
+  experts using commitment probabilities and, under offloading, cache
+  residency; [MoE-Spec (2602.16052)](https://arxiv.org/abs/2602.16052) and
+  [the limits of speculation (2609.22156)](https://arxiv.org/abs/2609.22156)
+  budget experts and bound the gain from speculation in MoE.
+
+### Proposed methods (hypotheses, not yet tested)
+
+Revised after that search. Each lists its falsifying test; none is implemented.
+
+1. **Exact lookahead prefetch.** Apply the layer-`N+1` router to the layer-`N`
+   residual only to choose SSD reads, then route exactly and read misses. The
+   prediction mechanism is the one in 2603.19289; what differs is the contract:
+   never execute a predicted expert, so outputs stay identical to the source.
+   Falsifier: on recorded V4.1 routes, the read time it hides must exceed the
+   extra bytes it wastes on mispredictions.
+2. **Exact speculation ranked by non-resident bytes.** Rank V4.1's own MTP and
+   DSpark drafts by the bytes their verification would read from SSD given the
+   exact resident set, and keep exact verification with full routing.
+   AcceptMoE instead shrinks the verifier's expert set, which alters outputs;
+   this proposal changes only which drafts are verified. Falsifier: accepted
+   tokens per SSD byte versus acceptance-only draft selection on the same prompts.
+3. **Frequency-first residency.** Given SpecMD's evidence against temporal
+   locality, start from a static per-layer allocation of the most frequently
+   routed experts measured on held-out prompts, with recency only as a
+   secondary tier. Falsifier: hit rate at a fixed budget against LRU, using an
+   event-atomic replay and varied prompt templates (2608.07911) so the
+   comparison is not an artifact.
+4. **No route-aware changes to sampled probabilities.** Any policy that alters
+   which token is sampled to save reads is lossy, and is out of scope by
+   default; 2607.26627 documents how such relaxations distort generation.
+
+The first measurement for all of these is the same: record actual V4.1 expert
+routes per layer over real prompts, then replay cache, prefetch and speculation
+policies offline against those traces before building any of them.
+
 ## DeepSeek routed-expert traffic sensitivity
 
 The pinned V4.1 configuration and inspected shard metadata make one capacity
