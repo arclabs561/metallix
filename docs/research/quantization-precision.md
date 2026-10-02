@@ -557,8 +557,20 @@ FP32 residency at a quarter of the memory.
 The 4-bit routed experts were also run on Metal with their packed codes
 resident and decoded per call. All six real experts from the source-routed
 synthetic-input case match the source BF16 outputs exactly (30,720 values), at
-about 7.8 ms per expert. That decoded-per-call path is not yet fused; a fused
-FP4 kernel follows the FP8 one.
+about 7.8 ms per expert in that decoded-per-call form.
+
+`Fp4MetalKernel` now fuses the decode into the multiply the same way the FP8
+kernel does: one SIMD group per output, each lane decoding one nibble of its
+32-element block through a 16-entry table, then the block dot scaled by the
+activation and weight E8M0 scales in ascending block order (the source
+`fp4_gemm` with a 32-element activation block). The same six real experts
+again match the source BF16 outputs exactly, now at about 1.5-2.3 ms per
+expert (three projections each, one decode token, 10.5 ms for all six), about
+4x faster than decoding per call. The packed weights stay at 18.8 MB per
+expert. These are single-token, synchronous timings that include host
+activation quantization and one device round trip per projection; batching an
+expert's projections and a layer's experts into one command stream is the next
+cost to remove.
 
 ## Serving-side choices
 

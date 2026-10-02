@@ -134,7 +134,9 @@ build the kernel once and reuse it (MLX compiles and caches the library on
 first use, keyed by name and template values); pass sizes as template
 integers so each shape compiles to constant loops; keep inputs row contiguous;
 launch whole SIMD groups (32 threads) per output row, as MLX's own quantized
-matrix-vector kernels do.
+matrix-vector kernels do. `Fp4MetalKernel` and `Fp4MetalWeights` apply the same
+design to the packed 4-bit routed experts and also reproduce the source
+outputs exactly on real weights.
 
 ### Direct Metal from Rust
 

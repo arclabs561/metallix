@@ -19,7 +19,7 @@ use mlx_rs::{Array, Dtype, Stream, StreamOrDevice};
 use mlx_sys as sys;
 use thiserror::Error;
 
-use super::{decode_e4m3fn, decode_e8m0};
+use super::{decode_e2m1x2, decode_e4m3fn, decode_e8m0};
 
 const GROUP: usize = 32;
 
@@ -44,7 +44,28 @@ const SOURCE: &str = r"
     }
 ";
 
-/// An invalid fused FP8 linear request or MLX failure.
+const FP4_SOURCE: &str = r"
+    uint column = threadgroup_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.y;
+    uint lane = thread_position_in_threadgroup.x;
+    float accumulated = 0.0f;
+    uint groups = K / 32;
+    uint weight_base = column * (K / 2);
+    uint activation_base = row * K;
+    for (uint group = 0; group < groups; ++group) {
+        uchar packed = weight_codes[weight_base + group * 16 + lane / 2];
+        uint nibble = (lane & 1) ? (packed >> 4) : (packed & 15);
+        float product = lut[activation_codes[activation_base + group * 32 + lane]] * fp4_lut[nibble];
+        float dot = simd_sum(product);
+        accumulated += dot * activation_scales[row * groups + group]
+            * weight_scales[column * groups + group];
+    }
+    if (lane == 0) {
+        out[row * N + column] = accumulated;
+    }
+";
+
+/// An invalid fused FP8 or FP4 linear request or MLX failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Fp8MetalError {
@@ -153,6 +174,137 @@ impl Fp8MetalWeights {
     }
 }
 
+/// Resident packed E2M1 weights `[outputs, reduction]` with one E8M0 scale per 32 elements.
+pub struct Fp4MetalWeights {
+    codes: Array,
+    scales: Array,
+    outputs: usize,
+    reduction: usize,
+}
+
+impl Fp4MetalWeights {
+    /// Validates and uploads checkpoint-layout packed FP4 codes and scales.
+    ///
+    /// `codes` is row-major `[outputs, reduction / 2]` low-nibble-first
+    /// `E2M1x2` bytes; `scales` is row-major `[outputs, reduction / 32]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Fp8MetalError`] for invalid geometry, lengths, sizes beyond
+    /// MLX's 32-bit limits, or NaN scales. Every E2M1 code is finite.
+    pub fn new(
+        codes: &[u8],
+        scales: &[u8],
+        outputs: usize,
+        reduction: usize,
+    ) -> Result<Self, Fp8MetalError> {
+        if outputs == 0 || reduction == 0 || !reduction.is_multiple_of(GROUP) {
+            return Err(Fp8MetalError::Geometry {
+                rows: 1,
+                reduction,
+                outputs,
+            });
+        }
+        let code_count = checked(outputs, reduction / 2, "weight codes")?;
+        let scale_count = checked(outputs, reduction / GROUP, "weight scales")?;
+        exact_length("weight codes", code_count, codes.len())?;
+        exact_length("weight scales", scale_count, scales.len())?;
+        let decoded_scales = decode_scales("weight scales", scales)?;
+        Ok(Self {
+            codes: Array::from_slice(codes, &[dimension("weight codes", code_count)?]),
+            scales: Array::from_slice(&decoded_scales, &[dimension("weight scales", scale_count)?]),
+            outputs,
+            reduction,
+        })
+    }
+
+    /// Returns the output width.
+    #[must_use]
+    pub const fn outputs(&self) -> usize {
+        self.outputs
+    }
+
+    /// Returns the reduction width.
+    #[must_use]
+    pub const fn reduction(&self) -> usize {
+        self.reduction
+    }
+}
+
+/// A compiled fused FP8-activation by FP4-weight linear kernel for routed experts.
+pub struct Fp4MetalKernel {
+    kernel: KernelHandle,
+    lut: Array,
+    fp4_lut: Array,
+}
+
+impl Fp4MetalKernel {
+    /// Constructs the kernel. MLX compiles and caches it on first application.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Fp8MetalError::Mlx`] if MLX cannot create the kernel object.
+    pub fn new() -> Result<Self, Fp8MetalError> {
+        let fp4: Vec<f32> = (0..16_u8).map(|code| decode_e2m1x2(code)[0]).collect();
+        Ok(Self {
+            kernel: KernelHandle::new(
+                "metallix_fp4_linear_g32",
+                &[
+                    "activation_codes",
+                    "activation_scales",
+                    "weight_codes",
+                    "weight_scales",
+                    "lut",
+                    "fp4_lut",
+                ],
+                "out",
+                FP4_SOURCE,
+            )?,
+            lut: e4m3_lut(),
+            fp4_lut: Array::from_slice(&fp4, &[16]),
+        })
+    }
+
+    /// Computes `activation x weightsᵀ` for E4M3FN activations with G32 E8M0 scales.
+    ///
+    /// Inputs are as for [`Fp8MetalKernel::forward`]; the weights are packed FP4.
+    /// This is the source `fp4_gemm` with `act_block_size = 32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Fp8MetalError`] for invalid lengths or codes, an MLX failure,
+    /// or a nonfinite output.
+    pub fn forward(
+        &self,
+        activation_codes: &[u8],
+        activation_scales: &[u8],
+        rows: usize,
+        weights: &Fp4MetalWeights,
+    ) -> Result<Vec<f32>, Fp8MetalError> {
+        let (codes, scales) = upload_activations(
+            activation_codes,
+            activation_scales,
+            rows,
+            weights.reduction,
+            weights.outputs,
+        )?;
+        run(
+            &self.kernel,
+            &[
+                &codes,
+                &scales,
+                &weights.codes,
+                &weights.scales,
+                &self.lut,
+                &self.fp4_lut,
+            ],
+            rows,
+            weights.reduction,
+            weights.outputs,
+        )
+    }
+}
+
 /// A compiled fused FP8 linear kernel. Build once and reuse across calls.
 pub struct Fp8MetalKernel {
     kernel: KernelHandle,
@@ -166,13 +318,6 @@ impl Fp8MetalKernel {
     ///
     /// Returns [`Fp8MetalError::Mlx`] if MLX cannot create the kernel object.
     pub fn new() -> Result<Self, Fp8MetalError> {
-        let lut: Vec<f32> = (0..=u8::MAX)
-            .map(|code| {
-                let value = decode_e4m3fn(code);
-                // NaN codes are rejected before upload; keep the table finite.
-                if value.is_finite() { value } else { 0.0 }
-            })
-            .collect();
         Ok(Self {
             kernel: KernelHandle::new(
                 "metallix_fp8_linear_g32",
@@ -186,7 +331,7 @@ impl Fp8MetalKernel {
                 "out",
                 SOURCE,
             )?,
-            lut: Array::from_slice(&lut, &[256]),
+            lut: e4m3_lut(),
         })
     }
 
@@ -207,50 +352,93 @@ impl Fp8MetalKernel {
         rows: usize,
         weights: &Fp8MetalWeights,
     ) -> Result<Vec<f32>, Fp8MetalError> {
-        let reduction = weights.reduction;
-        let outputs = weights.outputs;
-        if rows == 0 {
-            return Err(Fp8MetalError::Geometry {
-                rows,
-                reduction,
-                outputs,
-            });
-        }
-        let code_count = checked(rows, reduction, "activation codes")?;
-        let scale_count = checked(rows, reduction / GROUP, "activation scales")?;
-        let output_count = checked(rows, outputs, "output")?;
-        exact_length("activation codes", code_count, activation_codes.len())?;
-        exact_length("activation scales", scale_count, activation_scales.len())?;
-        finite_e4m3("activation codes", activation_codes)?;
-        let decoded_scales = decode_scales("activation scales", activation_scales)?;
-        let codes = Array::from_slice(
+        let (codes, scales) = upload_activations(
+            activation_codes,
+            activation_scales,
+            rows,
+            weights.reduction,
+            weights.outputs,
+        )?;
+        run(
+            &self.kernel,
+            &[&codes, &scales, &weights.codes, &weights.scales, &self.lut],
+            rows,
+            weights.reduction,
+            weights.outputs,
+        )
+    }
+}
+
+fn e4m3_lut() -> Array {
+    let lut: Vec<f32> = (0..=u8::MAX)
+        .map(|code| {
+            let value = decode_e4m3fn(code);
+            // NaN codes are rejected before upload; keep the table finite.
+            if value.is_finite() { value } else { 0.0 }
+        })
+        .collect();
+    Array::from_slice(&lut, &[256])
+}
+
+fn upload_activations(
+    activation_codes: &[u8],
+    activation_scales: &[u8],
+    rows: usize,
+    reduction: usize,
+    outputs: usize,
+) -> Result<(Array, Array), Fp8MetalError> {
+    if rows == 0 {
+        return Err(Fp8MetalError::Geometry {
+            rows,
+            reduction,
+            outputs,
+        });
+    }
+    let code_count = checked(rows, reduction, "activation codes")?;
+    let scale_count = checked(rows, reduction / GROUP, "activation scales")?;
+    exact_length("activation codes", code_count, activation_codes.len())?;
+    exact_length("activation scales", scale_count, activation_scales.len())?;
+    finite_e4m3("activation codes", activation_codes)?;
+    let decoded_scales = decode_scales("activation scales", activation_scales)?;
+    Ok((
+        Array::from_slice(
             activation_codes,
             &[dimension("activation codes", code_count)?],
-        );
-        let scales = Array::from_slice(
+        ),
+        Array::from_slice(
             &decoded_scales,
             &[dimension("activation scales", scale_count)?],
-        );
-        let grid_x = dimension("output columns", checked(outputs, GROUP, "grid")?)?;
-        let output = self.kernel.apply(
-            &[&codes, &scales, &weights.codes, &weights.scales, &self.lut],
-            &[dimension("output", output_count)?],
-            &[
-                ("N", dimension("outputs", outputs)?),
-                ("K", dimension("reduction", reduction)?),
-            ],
-            [grid_x, dimension("rows", rows)?, 1],
-            [dimension("simd width", GROUP)?, 1, 1],
-        )?;
-        output
-            .eval()
-            .map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
-        let values = output.as_slice::<f32>().to_vec();
-        if let Some(index) = values.iter().position(|value| !value.is_finite()) {
-            return Err(Fp8MetalError::NonFiniteOutput { index });
-        }
-        Ok(values)
+        ),
+    ))
+}
+
+fn run(
+    kernel: &KernelHandle,
+    inputs: &[&Array],
+    rows: usize,
+    reduction: usize,
+    outputs: usize,
+) -> Result<Vec<f32>, Fp8MetalError> {
+    let output_count = checked(rows, outputs, "output")?;
+    let grid_x = dimension("output columns", checked(outputs, GROUP, "grid")?)?;
+    let output = kernel.apply(
+        inputs,
+        &[dimension("output", output_count)?],
+        &[
+            ("N", dimension("outputs", outputs)?),
+            ("K", dimension("reduction", reduction)?),
+        ],
+        [grid_x, dimension("rows", rows)?, 1],
+        [dimension("simd width", GROUP)?, 1, 1],
+    )?;
+    output
+        .eval()
+        .map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
+    let values = output.as_slice::<f32>().to_vec();
+    if let Some(index) = values.iter().position(|value| !value.is_finite()) {
+        return Err(Fp8MetalError::NonFiniteOutput { index });
     }
+    Ok(values)
 }
 
 fn checked(left: usize, right: usize, field: &'static str) -> Result<usize, Fp8MetalError> {
@@ -471,9 +659,10 @@ impl Drop for KernelHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights};
+    use super::{Fp4MetalKernel, Fp4MetalWeights, Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights};
     use crate::precision::{
-        ActivationGroup, fp8_linear_runtime_f32, quantize_bf16_activations_e4m3fn,
+        ActivationGroup, fp4_linear_runtime_f32, fp8_linear_runtime_f32,
+        quantize_bf16_activations_e4m3fn,
     };
 
     fn lcg(seed: &mut u64) -> u32 {
@@ -547,7 +736,73 @@ mod tests {
     }
 
     #[test]
+    fn fp4_matches_scalar_fp4_linear_on_every_code() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let (rows, reduction, outputs): (usize, usize, usize) = (3, 256, 40);
+        let mut seed = 5_u64;
+        // Every byte value appears, so every nibble pair is exercised in both positions.
+        let weight_codes: Vec<u8> = (0..outputs * reduction / 2)
+            .map(|index| u8::try_from((index + lcg(&mut seed) as usize) % 256).expect("byte"))
+            .collect();
+        let weight_scales: Vec<u8> = (0..outputs * reduction / 32)
+            .map(|_| 118 + u8::try_from(lcg(&mut seed) % 18).expect("byte"))
+            .collect();
+        let activation: Vec<u16> = (0..rows * reduction)
+            .map(|index| {
+                let value = (f32::from(u16::try_from(index % 89).expect("small")) - 44.0) / 5.0;
+                u16::try_from(value.to_bits() >> 16).expect("bf16")
+            })
+            .collect();
+        let mut codes = vec![0; rows * reduction];
+        let mut scales = vec![0; rows * reduction / 32];
+        quantize_bf16_activations_e4m3fn(
+            &activation,
+            rows,
+            reduction,
+            ActivationGroup::Elements32,
+            &mut codes,
+            &mut scales,
+        )
+        .expect("activation quantization");
+        let mut expected = vec![0.0; rows * outputs];
+        fp4_linear_runtime_f32(
+            &codes,
+            &scales,
+            &weight_codes,
+            &weight_scales,
+            rows,
+            reduction,
+            outputs,
+            ActivationGroup::Elements32,
+            &mut expected,
+        )
+        .expect("scalar reference");
+        let weights = Fp4MetalWeights::new(&weight_codes, &weight_scales, outputs, reduction)
+            .expect("resident weights");
+        let actual = Fp4MetalKernel::new()
+            .expect("kernel")
+            .forward(&codes, &scales, rows, &weights)
+            .expect("metal forward");
+        // Block order and scale placement match the scalar reference; only the
+        // order of the 32 products inside a block may differ.
+        for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = want.abs().max(1.0) * 4.0 * f32::EPSILON * 32.0;
+            assert!(
+                (got - want).abs() <= tolerance,
+                "output {index}: {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_inputs_before_device_work() {
+        assert!(matches!(
+            Fp4MetalWeights::new(&[0; 32], &[127], 1, 32),
+            Err(Fp8MetalError::Length {
+                field: "weight codes",
+                ..
+            })
+        ));
         assert!(matches!(
             Fp8MetalWeights::new(&[0; 31], &[127], 1, 31),
             Err(Fp8MetalError::Geometry { .. })

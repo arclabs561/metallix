@@ -28,6 +28,13 @@ choices without expanding current support claims.
   [quantization and precision](research/quantization-precision.md#real-layer-zero-attention).
   Generation and later layers remain open.
 
+- Fused Metal kernels now cover both quantized weight formats. `Fp8MetalKernel`
+  and `Fp4MetalKernel` decode packed FP8 and FP4 weights inside the multiply,
+  so weights stay at their checkpoint size on the GPU. On real tensors both
+  reproduce the source BF16 outputs exactly; a routed FP4 expert takes about
+  1.5-2.3 ms per decode token, versus about 7.8 ms when decoded per call. See
+  [quantization and precision](research/quantization-precision.md#real-layer-zero-attention).
+
 - Index-key rotation now has an independent Metal choice, from
   `IndexKeyRotaryExecution::MetalFp32` through both owner paths, request and
   `ReducedArtifact::run_with_execution` to `--key-rotary-execution metal-fp32`.
