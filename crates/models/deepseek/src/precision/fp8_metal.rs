@@ -305,6 +305,64 @@ impl Fp4MetalKernel {
     }
 }
 
+impl Fp4MetalKernel {
+    /// Applies the same activations to several weight matrices in one device submission.
+    ///
+    /// Each output equals [`Self::forward`] on that weight bit for bit; only the
+    /// host round trips are shared. Use it for the gate and up projections of a
+    /// layer's routed experts, which all read the same normalized input.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::forward`]; every weight must share one reduction width.
+    pub fn forward_many(
+        &self,
+        activation_codes: &[u8],
+        activation_scales: &[u8],
+        rows: usize,
+        weights: &[&Fp4MetalWeights],
+    ) -> Result<Vec<Vec<f32>>, Fp8MetalError> {
+        let Some(first) = weights.first() else {
+            return Ok(Vec::new());
+        };
+        let reduction = first.reduction;
+        let (codes, scales) = upload_activations(
+            activation_codes,
+            activation_scales,
+            rows,
+            reduction,
+            first.outputs,
+        )?;
+        let mut pending = Vec::with_capacity(weights.len());
+        for weight in weights {
+            if weight.reduction != reduction {
+                return Err(Fp8MetalError::Geometry {
+                    rows,
+                    reduction: weight.reduction,
+                    outputs: weight.outputs,
+                });
+            }
+            pending.push(launch(
+                &self.kernel,
+                &[
+                    &codes,
+                    &scales,
+                    &weight.codes,
+                    &weight.scales,
+                    &self.lut,
+                    &self.fp4_lut,
+                ],
+                rows,
+                reduction,
+                weight.outputs,
+            )?);
+        }
+        mlx_rs::transforms::eval(pending.iter())
+            .map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
+        pending.iter().map(read_finite).collect()
+    }
+}
+
 /// A compiled fused FP8 linear kernel. Build once and reuse across calls.
 pub struct Fp8MetalKernel {
     kernel: KernelHandle,
@@ -412,16 +470,16 @@ fn upload_activations(
     ))
 }
 
-fn run(
+fn launch(
     kernel: &KernelHandle,
     inputs: &[&Array],
     rows: usize,
     reduction: usize,
     outputs: usize,
-) -> Result<Vec<f32>, Fp8MetalError> {
+) -> Result<Array, Fp8MetalError> {
     let output_count = checked(rows, outputs, "output")?;
     let grid_x = dimension("output columns", checked(outputs, GROUP, "grid")?)?;
-    let output = kernel.apply(
+    kernel.apply(
         inputs,
         &[dimension("output", output_count)?],
         &[
@@ -430,10 +488,24 @@ fn run(
         ],
         [grid_x, dimension("rows", rows)?, 1],
         [dimension("simd width", GROUP)?, 1, 1],
-    )?;
+    )
+}
+
+fn run(
+    kernel: &KernelHandle,
+    inputs: &[&Array],
+    rows: usize,
+    reduction: usize,
+    outputs: usize,
+) -> Result<Vec<f32>, Fp8MetalError> {
+    let output = launch(kernel, inputs, rows, reduction, outputs)?;
     output
         .eval()
         .map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
+    read_finite(&output)
+}
+
+fn read_finite(output: &Array) -> Result<Vec<f32>, Fp8MetalError> {
     let values = output.as_slice::<f32>().to_vec();
     if let Some(index) = values.iter().position(|value| !value.is_finite()) {
         return Err(Fp8MetalError::NonFiniteOutput { index });
@@ -783,6 +855,30 @@ mod tests {
             .expect("kernel")
             .forward(&codes, &scales, rows, &weights)
             .expect("metal forward");
+        let kernel = Fp4MetalKernel::new().expect("kernel");
+        let half = Fp4MetalWeights::new(
+            &weight_codes[..outputs / 2 * reduction / 2],
+            &weight_scales[..outputs / 2 * reduction / 32],
+            outputs / 2,
+            reduction,
+        )
+        .expect("half weights");
+        let batched = kernel
+            .forward_many(&codes, &scales, rows, &[&weights, &half])
+            .expect("batched forward");
+        assert_eq!(batched.len(), 2);
+        assert_eq!(
+            batched[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "one submission must equal separate calls bit for bit"
+        );
+        let separate = kernel
+            .forward(&codes, &scales, rows, &half)
+            .expect("separate forward");
+        assert_eq!(
+            batched[1].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            separate.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
         // Block order and scale placement match the scalar reference; only the
         // order of the 32 products inside a block may differ.
         for (index, (&got, &want)) in actual.iter().zip(&expected).enumerate() {

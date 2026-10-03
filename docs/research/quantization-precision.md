@@ -568,9 +568,16 @@ again match the source BF16 outputs exactly, now at about 1.5-2.3 ms per
 expert (three projections each, one decode token, 10.5 ms for all six), about
 4x faster than decoding per call. The packed weights stay at 18.8 MB per
 expert. These are single-token, synchronous timings that include host
-activation quantization and one device round trip per projection; batching an
-expert's projections and a layer's experts into one command stream is the next
-cost to remove.
+activation quantization and one device round trip per projection.
+
+Most of that time was the round trips. `Fp4MetalKernel::forward_many` submits
+several projections that share one input and waits once. For the twelve gate
+and up projections of six real experts it takes 1.2 ms instead of 6.2 ms
+(63 GB/s of packed weights instead of 12 GB/s), and its outputs equal the
+separate calls bit for bit. A single 2304x5120 projection alone runs in about
+0.27 ms (28 GB/s), so submission overhead, not memory bandwidth, still
+dominates small calls; the remaining step is keeping a whole layer's experts
+on device between the up and down projections.
 
 ## Serving-side choices
 
