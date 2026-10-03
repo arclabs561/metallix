@@ -461,6 +461,43 @@ acquiring full weights. The illustrative five-token/s target above requires
 at least about 86.5–87.1% of selected expert bytes to hit residency even before
 compute and read amplification; stored capacity fraction cannot establish that.
 
+### First real V4.1 route trace
+
+A recorder now runs the unmodified pinned V4.1 source on CPU over real
+checkpoint tensors, fetching only the routed experts and Engram rows each layer
+selects (exact HTTP byte ranges, checked against the shard index) and recording
+every router decision. Its layer-zero choices match the earlier source capture
+exactly for all three positions of the parity prompt. The first trace covers a
+single 23-token coding prompt and 7 decoded tokens (1,200 router rows, 2,585
+distinct layer/experts; 54.8 GB of expert payload fetched, within a 64 GiB
+disk envelope). It ran at about 40 minutes per prompt on CPU, so it is a
+locality probe, not a speed measurement.
+
+Replaying the decode tokens after an empty cache sees the prefill
+(18.8 MB per expert):
+
+| Expert cache | LRU decode hit rate | Belady (offline optimum) |
+| ---: | ---: | ---: |
+| 2 GiB | 0.0% | 34.3% |
+| 8 GiB | 33.0% | 68.9% |
+| 16 GiB | 48.6% | 73.3% |
+| 32 GiB | 66.4% | 73.3% |
+
+Three facts bound what any cache can do on this trace. 65.2% of decode
+selections reuse an expert the prompt's prefill already used; only 32.4%
+repeat an expert the previous token chose at the same layer; and 26.7% are
+first-ever uses of that layer/expert, which no cache can hit. Belady saturates
+at 73.3% for exactly that reason. LRU needs about four times Belady's memory
+for the same hit rate, which agrees with SpecMD's finding that recency is a
+poor fit for expert access. Exact prefetch (method 1 above) addresses the
+compulsory misses that caching cannot: they must be read, so the gain comes
+only from overlapping the read with the preceding layers' compute.
+
+With one prompt and seven decode tokens these rates are not yet held-out
+evidence and do not pick a policy. The next trace adds four varied prompts
+with 32 decoded tokens each, two used only to fit the frequency policy and two
+held out, as 2608.07911 recommends.
+
 ### Offline route replay contract
 
 `scripts/replay_v41_route_trace.py` now supplies the accounting step once a real
