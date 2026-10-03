@@ -65,6 +65,73 @@ const FP4_SOURCE: &str = r"
     }
 ";
 
+/// `SwiGLU`, route weighting and the source's FP8 activation quantization, on device.
+///
+/// Inputs are the gate and up projections in FP32. Each is rounded to BF16
+/// (the source's matrix output dtype), clamped, combined as `silu(gate) * up`
+/// in FP32, scaled by the row's route weight and rounded to BF16, then
+/// quantized per 32 elements with a power-of-two E8M0 scale and
+/// round-to-nearest-even E4M3FN, as `quantize_bf16_activations_e4m3fn` does.
+/// The output packs the decoded E4M3FN values `[rows, I]` followed by the
+/// scales `[rows, I / 32]`.
+const SWIGLU_QUANT_SOURCE: &str = r"
+    uint group = threadgroup_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.y;
+    uint lane = thread_position_in_threadgroup.x;
+    uint index = row * I + group * 32 + lane;
+    uint gate_bits = as_type<uint>(gate[index]);
+    uint up_bits = as_type<uint>(up[index]);
+    float g = as_type<float>((gate_bits + 0x7fffu + ((gate_bits >> 16) & 1u)) & 0xffff0000u);
+    float u = as_type<float>((up_bits + 0x7fffu + ((up_bits >> 16) & 1u)) & 0xffff0000u);
+    if (LIMIT > 0) {
+        u = clamp(u, -float(LIMIT), float(LIMIT));
+        g = min(g, float(LIMIT));
+    }
+    float v = (g / (1.0f + metal::precise::exp(-g))) * u;
+    v = route_weights[row] * v;
+    uint v_bits = as_type<uint>(v);
+    v = as_type<float>((v_bits + 0x7fffu + ((v_bits >> 16) & 1u)) & 0xffff0000u);
+    float amax = max(simd_max(fabs(v)), 1e-4f);
+    uint scaled = as_type<uint>(amax * (1.0f / 448.0f));
+    int exponent = int((scaled >> 23) & 0xffu) - 127 + ((scaled & 0x7fffffu) != 0u ? 1 : 0);
+    float scale = as_type<float>(uint(exponent + 127) << 23);
+    float normalized = clamp(v / scale, -448.0f, 448.0f);
+    float magnitude = fabs(normalized);
+    float quantized;
+    if (magnitude < 0.015625f) {
+        quantized = rint(magnitude * 512.0f) / 512.0f;
+    } else {
+        uint bits = as_type<uint>(magnitude);
+        quantized = as_type<float>((bits + 0x7ffffu + ((bits >> 20) & 1u)) & 0xfff00000u);
+    }
+    out[index] = copysign(quantized, normalized);
+    if (lane == 0) {
+        out[ROWS * I + row * (I / 32) + group] = scale;
+    }
+";
+
+/// The FP4 linear with activations already decoded to FP32 values plus scales.
+const FP4_DECODED_SOURCE: &str = r"
+    uint column = threadgroup_position_in_grid.x;
+    uint row = threadgroup_position_in_grid.y;
+    uint lane = thread_position_in_threadgroup.x;
+    float accumulated = 0.0f;
+    uint groups = K / 32;
+    uint weight_base = column * (K / 2);
+    uint activation_base = row * K;
+    for (uint group = 0; group < groups; ++group) {
+        uchar packed = weight_codes[weight_base + group * 16 + lane / 2];
+        uint nibble = (lane & 1) ? (packed >> 4) : (packed & 15);
+        float product = activations[activation_base + group * 32 + lane] * fp4_lut[nibble];
+        float dot = simd_sum(product);
+        accumulated += dot * activations[ROWS * K + row * groups + group]
+            * weight_scales[column * groups + group];
+    }
+    if (lane == 0) {
+        out[row * N + column] = accumulated;
+    }
+";
+
 /// An invalid fused FP8 or FP4 linear request or MLX failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
@@ -231,9 +298,21 @@ impl Fp4MetalWeights {
     }
 }
 
+/// One routed expert's resident packed FP4 projections.
+pub struct Fp4MetalExpert {
+    /// Gate projection `[inter, dim]`.
+    pub w1: Fp4MetalWeights,
+    /// Up projection `[inter, dim]`.
+    pub w3: Fp4MetalWeights,
+    /// Down projection `[dim, inter]`.
+    pub w2: Fp4MetalWeights,
+}
+
 /// A compiled fused FP8-activation by FP4-weight linear kernel for routed experts.
 pub struct Fp4MetalKernel {
     kernel: KernelHandle,
+    swiglu: KernelHandle,
+    decoded: KernelHandle,
     lut: Array,
     fp4_lut: Array,
 }
@@ -259,6 +338,18 @@ impl Fp4MetalKernel {
                 ],
                 "out",
                 FP4_SOURCE,
+            )?,
+            swiglu: KernelHandle::new(
+                "metallix_swiglu_quant_g32",
+                &["gate", "up", "route_weights"],
+                "out",
+                SWIGLU_QUANT_SOURCE,
+            )?,
+            decoded: KernelHandle::new(
+                "metallix_fp4_decoded_linear_g32",
+                &["activations", "weight_codes", "weight_scales", "fp4_lut"],
+                "out",
+                FP4_DECODED_SOURCE,
             )?,
             lut: e4m3_lut(),
             fp4_lut: Array::from_slice(&fp4, &[16]),
@@ -355,6 +446,128 @@ impl Fp4MetalKernel {
                 rows,
                 reduction,
                 weight.outputs,
+            )?);
+        }
+        mlx_rs::transforms::eval(pending.iter())
+            .map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
+        pending.iter().map(read_finite).collect()
+    }
+}
+
+impl Fp4MetalKernel {
+    /// Runs whole routed experts on device and waits once for all of them.
+    ///
+    /// For each expert this computes the source `Expert.forward`: gate and up
+    /// projections from the shared quantized input, `SwiGLU` with `swiglu_limit`
+    /// clamps, the row's route weight, BF16 rounding and FP8 requantization,
+    /// then the down projection. `route_weights[e]` holds one weight per row
+    /// for expert `e`. Returns each expert's FP32 down-projection output
+    /// `[rows, dim]`, before the source's final BF16 rounding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Fp8MetalError`] for mismatched geometry or lengths, an MLX
+    /// failure, or a nonfinite output.
+    pub fn experts_forward(
+        &self,
+        activation_codes: &[u8],
+        activation_scales: &[u8],
+        rows: usize,
+        experts: &[&Fp4MetalExpert],
+        route_weights: &[&[f32]],
+        swiglu_limit: u8,
+    ) -> Result<Vec<Vec<f32>>, Fp8MetalError> {
+        exact_length("route weight sets", experts.len(), route_weights.len())?;
+        let Some(first) = experts.first() else {
+            return Ok(Vec::new());
+        };
+        let dim = first.w1.reduction;
+        let (codes, scales) = upload_activations(
+            activation_codes,
+            activation_scales,
+            rows,
+            dim,
+            first.w1.outputs,
+        )?;
+        let mut pending = Vec::with_capacity(experts.len());
+        for (expert, weights) in experts.iter().zip(route_weights) {
+            let inter = expert.w1.outputs;
+            if expert.w1.reduction != dim
+                || expert.w3.reduction != dim
+                || expert.w3.outputs != inter
+                || expert.w2.reduction != inter
+                || expert.w2.outputs != dim
+            {
+                return Err(Fp8MetalError::Geometry {
+                    rows,
+                    reduction: expert.w2.reduction,
+                    outputs: expert.w2.outputs,
+                });
+            }
+            exact_length("route weights", rows, weights.len())?;
+            if let Some(index) = weights.iter().position(|value| !value.is_finite()) {
+                return Err(Fp8MetalError::NonFinite {
+                    field: "route weights",
+                    index,
+                });
+            }
+            let gate = launch(
+                &self.kernel,
+                &[
+                    &codes,
+                    &scales,
+                    &expert.w1.codes,
+                    &expert.w1.scales,
+                    &self.lut,
+                    &self.fp4_lut,
+                ],
+                rows,
+                dim,
+                inter,
+            )?;
+            let up = launch(
+                &self.kernel,
+                &[
+                    &codes,
+                    &scales,
+                    &expert.w3.codes,
+                    &expert.w3.scales,
+                    &self.lut,
+                    &self.fp4_lut,
+                ],
+                rows,
+                dim,
+                inter,
+            )?;
+            let weights = Array::from_slice(weights, &[dimension("rows", rows)?]);
+            let packed_len = checked(rows, inter + inter / GROUP, "packed activations")?;
+            let activations = self.swiglu.apply(
+                &[&gate, &up, &weights],
+                &[dimension("packed activations", packed_len)?],
+                &[
+                    ("I", dimension("inter", inter)?),
+                    ("ROWS", dimension("rows", rows)?),
+                    ("LIMIT", i32::from(swiglu_limit)),
+                ],
+                [dimension("inter", inter)?, dimension("rows", rows)?, 1],
+                [dimension("simd width", GROUP)?, 1, 1],
+            )?;
+            let grid_x = dimension("output columns", checked(dim, GROUP, "grid")?)?;
+            pending.push(self.decoded.apply(
+                &[
+                    &activations,
+                    &expert.w2.codes,
+                    &expert.w2.scales,
+                    &self.fp4_lut,
+                ],
+                &[dimension("output", checked(rows, dim, "output")?)?],
+                &[
+                    ("N", dimension("outputs", dim)?),
+                    ("K", dimension("inter", inter)?),
+                    ("ROWS", dimension("rows", rows)?),
+                ],
+                [grid_x, dimension("rows", rows)?, 1],
+                [dimension("simd width", GROUP)?, 1, 1],
             )?);
         }
         mlx_rs::transforms::eval(pending.iter())
@@ -731,7 +944,10 @@ impl Drop for KernelHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{Fp4MetalKernel, Fp4MetalWeights, Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights};
+    use super::{
+        Fp4MetalExpert, Fp4MetalKernel, Fp4MetalWeights, Fp8MetalError, Fp8MetalKernel,
+        Fp8MetalWeights,
+    };
     use crate::precision::{
         ActivationGroup, fp4_linear_runtime_f32, fp8_linear_runtime_f32,
         quantize_bf16_activations_e4m3fn,
@@ -887,6 +1103,96 @@ mod tests {
                 (got - want).abs() <= tolerance,
                 "output {index}: {got} vs {want}"
             );
+        }
+    }
+
+    #[test]
+    fn whole_experts_match_the_scalar_expert_on_bf16_outputs() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let (dim, inter) = (128_usize, 96_usize);
+        let mut seed = 23_u64;
+        let mut bytes = |count: usize| -> Vec<u8> {
+            (0..count)
+                .map(|_| u8::try_from(lcg(&mut seed) & 0xff).expect("byte"))
+                .collect()
+        };
+        let mut expert_codes = Vec::new();
+        for _ in 0..2 {
+            expert_codes.push((
+                bytes(inter * dim / 2),
+                bytes(dim * inter / 2),
+                bytes(inter * dim / 2),
+            ));
+        }
+        let mut seed = 31_u64;
+        let mut scales = |count: usize| -> Vec<u8> {
+            (0..count)
+                .map(|_| 120 + u8::try_from(lcg(&mut seed) % 10).expect("byte"))
+                .collect()
+        };
+        let expert_scales: Vec<_> = (0..2)
+            .map(|_| {
+                (
+                    scales(inter * dim / 32),
+                    scales(dim * inter / 32),
+                    scales(inter * dim / 32),
+                )
+            })
+            .collect();
+        let input: Vec<u16> = (0..dim)
+            .map(|index| {
+                let value = (f32::from(u16::try_from(index % 61).expect("small")) - 30.0) / 3.0;
+                u16::try_from(value.to_bits() >> 16).expect("bf16")
+            })
+            .collect();
+        let (limit, route_weights) = (2_u8, [0.75_f32, 1.25]);
+        let kernel = Fp4MetalKernel::new().expect("kernel");
+        let experts: Vec<Fp4MetalExpert> = expert_codes
+            .iter()
+            .zip(&expert_scales)
+            .map(|((w1, w2, w3), (s1, s2, s3))| Fp4MetalExpert {
+                w1: Fp4MetalWeights::new(w1, s1, inter, dim).expect("w1"),
+                w3: Fp4MetalWeights::new(w3, s3, inter, dim).expect("w3"),
+                w2: Fp4MetalWeights::new(w2, s2, dim, inter).expect("w2"),
+            })
+            .collect();
+        let mut codes = vec![0; dim];
+        let mut activation_scales = vec![0; dim / 32];
+        quantize_bf16_activations_e4m3fn(
+            &input,
+            1,
+            dim,
+            ActivationGroup::Elements32,
+            &mut codes,
+            &mut activation_scales,
+        )
+        .expect("activation quantization");
+        let weights: Vec<[f32; 1]> = route_weights.iter().map(|&w| [w]).collect();
+        let actual = kernel
+            .experts_forward(
+                &codes,
+                &activation_scales,
+                1,
+                &experts.iter().collect::<Vec<_>>(),
+                &weights.iter().map(<[f32; 1]>::as_slice).collect::<Vec<_>>(),
+                limit,
+            )
+            .expect("device experts");
+        for (index, (((w1, w2, w3), (s1, s2, s3)), route)) in expert_codes
+            .iter()
+            .zip(&expert_scales)
+            .zip(route_weights)
+            .enumerate()
+        {
+            let expected = crate::moe::Fp4ExpertWeights::new(dim, inter, w1, s1, w2, s2, w3, s3)
+                .expect("scalar expert")
+                .forward_token(&input, f32::from(limit), Some(route))
+                .expect("scalar forward");
+            let got: Vec<u16> = actual[index]
+                .iter()
+                .map(|&value| crate::precision::f32_to_bf16_rne(value))
+                .collect();
+            assert_eq!(got, expected, "expert {index} BF16 outputs");
         }
     }
 

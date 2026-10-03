@@ -28,7 +28,7 @@ pub use fp8_linear::{Fp8LinearError, fp8_linear_runtime_f32};
 mod fp8_metal;
 #[cfg(feature = "metal")]
 pub use fp8_metal::{
-    Fp4MetalKernel, Fp4MetalWeights, Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights,
+    Fp4MetalExpert, Fp4MetalKernel, Fp4MetalWeights, Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights,
 };
 mod roundtrip;
 pub use roundtrip::{

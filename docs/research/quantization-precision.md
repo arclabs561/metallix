@@ -576,8 +576,16 @@ and up projections of six real experts it takes 1.2 ms instead of 6.2 ms
 (63 GB/s of packed weights instead of 12 GB/s), and its outputs equal the
 separate calls bit for bit. A single 2304x5120 projection alone runs in about
 0.27 ms (28 GB/s), so submission overhead, not memory bandwidth, still
-dominates small calls; the remaining step is keeping a whole layer's experts
-on device between the up and down projections.
+dominates small calls.
+
+`Fp4MetalKernel::experts_forward` now keeps whole routed experts on the GPU:
+gate and up projections, the source's SwiGLU clamps and route weight, BF16
+rounding and FP8 requantization run in one device kernel, followed by the
+down projection, with one wait for all of a layer's selected experts. All six
+real experts again match the source BF16 outputs exactly (30,720 values), in
+about 1.9 ms for the six together (59 GB/s of packed expert weights), versus
+10.5 ms with a host round trip per projection. A unit test compares it with
+the scalar expert on BF16 outputs and fails if the SwiGLU limit is off by one.
 
 ## Serving-side choices
 
