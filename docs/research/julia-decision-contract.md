@@ -143,7 +143,41 @@ Every held-out case passed on first evaluation, worst ratio 2.2:
 | Legacy synthetic | 5 | 2.2 | - |
 
 The test also rejects a planted `1e-4` hidden-state defect. It qualifies the
-native encoder on generated weights; real-checkpoint qualification is separate.
+native encoder on generated weights.
+
+### Published checkpoint
+
+The same gate now holds on the published checkpoint at the pinned revision
+(SHA-256 matches the pin above). An opt-in test loads `model.safetensors`
+directly and runs real requests serialized by the source's own `sequence`
+function, 12 to 57 positions long. To admit real requests, the full prefill
+and head now accept up to 126 positions, the bound each encoder block already
+enforced. The factor stays four, fixed on synthetic calibration before any
+real case ran:
+
+| Case | Positions | Native hidden error | Source FP32 error | Ratio | Native score error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `calib-a` | 16 | 2.8e-4 | 1.4e-4 | 2.1 | 7.2e-6 |
+| `calib-b` | 15 | 1.9e-4 | 3.1e-4 | 0.6 | 1.8e-5 |
+| `held-a` | 14 | 2.7e-4 | 1.4e-4 | 1.9 | 1.1e-5 |
+| `held-b` | 15 | 2.1e-4 | 2.3e-4 | 0.9 | 2.5e-5 |
+| `held-c` | 12 | 1.9e-4 | 1.3e-4 | 1.5 | 2.9e-6 |
+| `held-long` | 57 | 6.5e-4 | 9.3e-4 | 0.7 | 7.4e-5 |
+
+Real weights raise every error about tenfold over the synthetic ones, for the
+source as much as for native code, and native scores stay as close to the
+float64 scores as the FP32 source's (worst source score error 1.0e-4). The
+fixed `1e-5` score limit used for synthetic weights is not applied here, since
+the FP32 source itself exceeds it; scores are instead held to the same factor
+of four times the source's own score error (worst native ratio 2.7, on
+`calib-b`). Reproduce with the pinned checkpoint
+directory (weights, `tokenizer/` and `julia/` from the revision):
+
+```sh
+uv run scripts/julia_real_f64_reference.py CHECKPOINT_DIR /tmp/julia-real.json
+JULIA_CHECKPOINT_DIR=CHECKPOINT_DIR JULIA_REAL_REFERENCE=/tmp/julia-real.json \
+  cargo test --release -p julia --lib real_checkpoint -- --ignored --nocapture
+```
 Regenerate the fixture with:
 
 ```sh

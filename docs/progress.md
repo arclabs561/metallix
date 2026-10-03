@@ -18,6 +18,12 @@ choices without expanding current support claims.
   are clean under Rust 1.99. Entries below that end at the Julia
   `unmasked_control` mismatch predate this change.
 
+- Julia-1's native encoder and decision head now run on the published
+  checkpoint and pass the float64 gate on real requests (12 to 57 positions):
+  native error stays within four times the FP32 source's own error for both
+  hidden states and scores. See
+  [Julia](research/julia-decision-contract.md#published-checkpoint).
+
 - Real DeepSeek-V4.1 block zero runs natively on actual checkpoint tensors for
   a three-token prefill: selected-embedding startup, Hyper-Connection mixing,
   window attention, expert routing and 16 routed FP4 experts plus the shared

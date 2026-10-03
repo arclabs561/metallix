@@ -11,9 +11,11 @@ pub const INVALID_MARKER_SCORE: f32 = -10_000.0;
 const EPSILON: f32 = 1e-5;
 const WIDTH_F32: f32 = 384.0;
 const HEAD_WIDTH_F32: f32 = 64.0;
-const MAX_POSITIONS: usize = 64;
+// Matches the encoder's sequence bound so every encoded prefill can be scored.
+const MAX_POSITIONS: usize = 126;
 const MAX_MARKERS: usize = 20;
-const MAX_WORK: usize = 32_000_000;
+// Two layers at 126 positions plus 20 scored markers: 476.2M MACs.
+const MAX_WORK: usize = 480_000_000;
 
 /// Unvalidated transfer container; [`DecisionHead::new`] validates every field.
 #[derive(Clone, Debug)]
@@ -662,13 +664,18 @@ mod tests {
     #[test]
     fn rejects_work_that_exceeds_cap_and_malformed_weights() {
         let h = head();
-        let mut too_wide = input();
-        too_wide.positions = 9;
-        too_wide.hidden.resize(9 * WIDTH, 0.0);
-        too_wide.attention_mask.resize(9, true);
-        too_wide.marker_pos = vec![1];
-        too_wide.marker_mask = vec![true];
-        assert_eq!(h.scores(&too_wide), Err(JuliaHeadError::Work));
+        let widened = |positions: usize| {
+            let mut wide = input();
+            wide.positions = positions;
+            wide.hidden.resize(positions * WIDTH, 0.0);
+            wide.attention_mask.resize(positions, true);
+            wide.marker_pos = vec![1];
+            wide.marker_mask = vec![true];
+            wide
+        };
+        // The work cap admits the largest admitted sequence; one more position is rejected.
+        assert!(h.scores(&widened(126)).is_ok());
+        assert_eq!(h.scores(&widened(127)), Err(JuliaHeadError::Positions(127)));
         let mut weights = HeadWeights {
             layers: [layer(0), layer(12)],
             type_embedding: values(3 * WIDTH, 24),

@@ -14,9 +14,11 @@ const HEAD_WIDTH_F32: f32 = 64.0;
 const MAX_POSITIONS: usize = 126;
 const MAX_WORK: usize = 256_000_000;
 const FULL_ENCODER_LAYERS: usize = 22;
-const MAX_PREFILL_POSITIONS: usize = 8;
+// Matches the per-block bound, so a full prefill admits every sequence a block does.
+const MAX_PREFILL_POSITIONS: usize = MAX_POSITIONS;
 const MAX_SELECTED_ROWS: usize = MAX_PREFILL_POSITIONS;
-const MAX_FULL_ENCODER_WORK: usize = 384_000_000;
+// 22 layers at MAX_PREFILL_POSITIONS: 126 * 384 * (4 * 384 + 3 * 1152) + 126^2 * 2 * 384 = 253.7M MACs each.
+const MAX_FULL_ENCODER_WORK: usize = 5_600_000_000;
 const PUBLISHED_VOCAB_SIZE: u64 = 256_000;
 
 /// Raw parameters in the same row-major layout as `PyTorch` `nn.Linear` weights.
