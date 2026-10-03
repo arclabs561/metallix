@@ -483,6 +483,13 @@ cover layers 0 through 39. Rows retain the supplied chronological router-event
 order, including layer-major prefill; they are never regrouped into token-major
 order. A regression demonstrates that regrouping changes cache hits.
 
+`--policy` selects `lru` (default), `belady` or `frequency`. Belady is the
+offline optimum: it evicts the resident expert reused furthest in the future,
+so it bounds every online cache policy at the same capacity. `frequency` keeps
+a static set of the most often routed layer/experts, counted only on requests
+named with `--calibration-request`; those requests are then excluded from the
+replayed rows, so the comparison stays held out.
+
 The report hashes the raw trace and labels its source identity
 declared/unverified. Matching declared hashes cannot authenticate the collector
 or its output. Synthetic reduced traces are rejected; a separately qualified

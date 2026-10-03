@@ -157,45 +157,118 @@ def _phase_report() -> dict[str, int]:
     return {"route_rows": 0, "selections": 0, "hits": 0, "misses": 0}
 
 
+POLICIES = ("lru", "belady", "frequency")
+POLICY_DESCRIPTIONS = {
+    "lru": "exact layer/expert LRU; initially empty; no prefetch",
+    "belady": (
+        "offline optimal eviction (evict the resident expert reused furthest in "
+        "the future); an upper bound no online policy can exceed; initially empty"
+    ),
+    "frequency": (
+        "static residency of the most frequently routed layer/experts counted on "
+        "calibration requests only; misses are read and not retained"
+    ),
+}
+
+
+def _keys(rows: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    return [(row["layer"], expert) for row in rows for expert in row["expert_ids"]]
+
+
+def _belady_hits(rows: list[dict[str, Any]], capacity: int) -> tuple[list[bool], int]:
+    """Exact Belady/MIN replay; returns the per-selection hit flags and evictions."""
+    keys = _keys(rows)
+    upcoming: dict[tuple[int, int], list[int]] = {}
+    for index in range(len(keys) - 1, -1, -1):
+        upcoming.setdefault(keys[index], []).append(index)
+    resident: set[tuple[int, int]] = set()
+    flags: list[bool] = []
+    evictions = 0
+    never = len(keys)
+    for index, key in enumerate(keys):
+        upcoming[key].pop()
+        if key in resident:
+            flags.append(True)
+            continue
+        flags.append(False)
+        if capacity == 0:
+            continue
+        if len(resident) == capacity:
+            victim = max(
+                resident,
+                key=lambda item: upcoming[item][-1] if upcoming[item] else never,
+            )
+            resident.remove(victim)
+            evictions += 1
+        resident.add(key)
+    return flags, evictions
+
+
 def replay(
-    rows: list[dict[str, Any]], *, expert_cache_bytes: int, expert_bytes: int
+    rows: list[dict[str, Any]],
+    *,
+    expert_cache_bytes: int,
+    expert_bytes: int,
+    policy: str = "lru",
+    calibration_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Replay exact layer/expert selections with an initially empty LRU cache."""
+    """Replay exact layer/expert selections under one residency policy."""
     if not isinstance(rows, list) or not rows:
         raise TraceError("replay requires nonempty validated route rows")
     if type(expert_cache_bytes) is not int or expert_cache_bytes < 0:
         raise TraceError("expert cache bytes must be a nonnegative integer")
     if type(expert_bytes) is not int or expert_bytes <= 0:
         raise TraceError("expert bytes must be a positive integer")
+    if policy not in POLICIES:
+        raise TraceError(f"policy must be one of {', '.join(POLICIES)}")
+    if (policy == "frequency") != (calibration_rows is not None):
+        raise TraceError("the frequency policy requires separate calibration rows")
     capacity_items = expert_cache_bytes // expert_bytes
-    cache: OrderedDict[tuple[int, int], None] = OrderedDict()
-    phases = {phase: _phase_report() for phase in sorted(VALID_PHASES)}
-    hits = 0
-    misses = 0
     evictions = 0
-    for row in rows:
-        phase = row["phase"]
-        phase_report = phases[phase]
-        phase_report["route_rows"] += 1
-        for expert in row["expert_ids"]:
-            phase_report["selections"] += 1
-            key = (row["layer"], expert)
+    resident_at_end: int
+    if policy == "lru":
+        cache: OrderedDict[tuple[int, int], None] = OrderedDict()
+        flags = []
+        for key in _keys(rows):
             if key in cache:
-                hits += 1
-                phase_report["hits"] += 1
+                flags.append(True)
                 cache.move_to_end(key)
                 continue
-            misses += 1
-            phase_report["misses"] += 1
+            flags.append(False)
             if capacity_items == 0:
                 continue
             if len(cache) == capacity_items:
                 cache.popitem(last=False)
                 evictions += 1
             cache[key] = None
+        resident_at_end = len(cache)
+    elif policy == "belady":
+        flags, evictions = _belady_hits(rows, capacity_items)
+        resident_at_end = min(capacity_items, len(set(_keys(rows))))
+    else:
+        assert calibration_rows is not None
+        counts: dict[tuple[int, int], int] = {}
+        for key in _keys(calibration_rows):
+            counts[key] = counts.get(key, 0) + 1
+        # Deterministic ties: higher count first, then layer, then expert id.
+        ranked = sorted(counts, key=lambda key: (-counts[key], key))
+        static = set(ranked[:capacity_items])
+        flags = [key in static for key in _keys(rows)]
+        resident_at_end = len(static)
+    phases = {phase: _phase_report() for phase in sorted(VALID_PHASES)}
+    position = 0
+    for row in rows:
+        phase_report = phases[row["phase"]]
+        phase_report["route_rows"] += 1
+        for _ in row["expert_ids"]:
+            phase_report["selections"] += 1
+            phase_report["hits" if flags[position] else "misses"] += 1
+            position += 1
+    hits = sum(flags)
+    misses = len(flags) - hits
     selections = hits + misses
     return {
-        "policy": "exact layer/expert LRU; initially empty; no prefetch",
+        "policy": POLICY_DESCRIPTIONS[policy],
         "supplied_parameters": {
             "expert_cache_bytes": expert_cache_bytes,
             "expert_bytes": expert_bytes,
@@ -214,7 +287,7 @@ def replay(
             "miss_fraction": misses / selections,
             "miss_useful_bytes": misses * expert_bytes,
             "evictions": evictions,
-            "resident_layer_experts_at_end": len(cache),
+            "resident_layer_experts_at_end": resident_at_end,
             "by_phase": phases,
         },
         "limitations": [
@@ -231,6 +304,13 @@ def main() -> int:
     parser.add_argument("--trace", type=Path, required=True)
     parser.add_argument("--expert-cache-bytes", type=_nonnegative_int, required=True)
     parser.add_argument("--expert-bytes", type=_positive_int, required=True)
+    parser.add_argument("--policy", choices=POLICIES, default="lru")
+    parser.add_argument(
+        "--calibration-request",
+        action="append",
+        default=[],
+        help="request id used only to fit the frequency policy; excluded from replay",
+    )
     parser.add_argument("--output", type=Path, required=True, help="new JSON report")
     args = parser.parse_args()
     try:
@@ -239,6 +319,15 @@ def main() -> int:
             raise TraceError("report output must not overwrite the route trace")
         document, trace_sha256 = _read_trace(args.trace)
         rows = validate_trace(document)
+        calibration = set(args.calibration_request)
+        calibration_rows = [row for row in rows if row["request_id"] in calibration]
+        if calibration and len({row["request_id"] for row in calibration_rows}) != len(
+            calibration
+        ):
+            raise TraceError("every calibration request must appear in the trace")
+        held_out = [row for row in rows if row["request_id"] not in calibration]
+        if not held_out:
+            raise TraceError("calibration requests leave no held-out rows to replay")
         report = {
             "schema_version": 1,
             "scope": "offline source-compatible V4.1 route-trace LRU accounting; not a checkpoint read or serving measurement",
@@ -251,10 +340,15 @@ def main() -> int:
             },
             "trace_source": document["source"],
             "trace_geometry": document["geometry"],
+            "calibration_requests": sorted(calibration),
             **replay(
-                rows,
+                held_out,
                 expert_cache_bytes=args.expert_cache_bytes,
                 expert_bytes=args.expert_bytes,
+                policy=args.policy,
+                calibration_rows=calibration_rows
+                if args.policy == "frequency"
+                else None,
             ),
         }
         encoded = json.dumps(report, sort_keys=True, indent=2, allow_nan=False) + "\n"

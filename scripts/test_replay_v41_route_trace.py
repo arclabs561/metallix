@@ -139,6 +139,56 @@ class ReplayV41RouteTraceTests(unittest.TestCase):
         self.assertEqual(token_major_report["observed"]["hits"], 0)
         self.assertEqual(layer_major_report["observed"]["hits"], 240)
 
+    def test_belady_bounds_lru_and_matches_a_hand_counted_case(self) -> None:
+        # Three tokens whose layer-0 routes alternate; capacity for one token.
+        document = trace(positions=3)
+        for position in range(3):
+            row = document["rows"][position * 40]
+            row["expert_ids"] = (
+                [0, 1, 2, 3, 4, 5] if position != 1 else [6, 7, 8, 9, 10, 11]
+            )
+        rows = self.module.validate_trace(document)
+        capacity = 40 * 6  # every layer's six experts, but not both layer-0 sets
+        lru = self.module.replay(rows, expert_cache_bytes=capacity, expert_bytes=1)
+        best = self.module.replay(
+            rows, expert_cache_bytes=capacity, expert_bytes=1, policy="belady"
+        )
+        self.assertGreaterEqual(best["observed"]["hits"], lru["observed"]["hits"])
+        # LRU: 240 + 6 + 6 misses (position 2 re-misses layer 0's 0..5).
+        # Belady: the first new insert finds only reused experts resident and
+        # must evict one (0..5's furthest); later inserts evict the never-reused
+        # 6..11, so position 2 misses just that one: 240 + 6 + 1 misses.
+        self.assertEqual(lru["observed"]["misses"], 252)
+        self.assertEqual(best["observed"]["misses"], 247)
+
+    def test_frequency_policy_uses_only_calibration_counts(self) -> None:
+        rows = self.module.validate_trace(trace(positions=1))
+        other = trace(positions=1)
+        for row in other["rows"]:
+            row["request_id"] = "calibration"
+            row["expert_ids"] = [(expert + 100) % 384 for expert in row["expert_ids"]]
+        calibration = self.module.validate_trace(other)
+        disjoint = self.module.replay(
+            rows,
+            expert_cache_bytes=240,
+            expert_bytes=1,
+            policy="frequency",
+            calibration_rows=calibration,
+        )
+        self.assertEqual(disjoint["observed"]["hits"], 0)
+        same = self.module.replay(
+            rows,
+            expert_cache_bytes=240,
+            expert_bytes=1,
+            policy="frequency",
+            calibration_rows=rows,
+        )
+        self.assertEqual(same["observed"]["hits"], 240)
+        with self.assertRaisesRegex(self.module.TraceError, "calibration"):
+            self.module.replay(
+                rows, expert_cache_bytes=240, expert_bytes=1, policy="frequency"
+            )
+
     def test_rejects_synthetic_trace(self) -> None:
         document = trace()
         document["synthetic_geometry"] = {"routed_experts": 4}
