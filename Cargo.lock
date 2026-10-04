@@ -822,6 +822,7 @@ name = "julia"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "serde",
  "serde_json",
  "thiserror",
 ]
@@ -1563,6 +1564,7 @@ dependencies = [
  "engine",
  "httparse",
  "jsonschema",
+ "julia",
  "minijinja",
  "minijinja-contrib",
  "proptest",

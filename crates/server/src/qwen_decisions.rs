@@ -427,7 +427,7 @@ fn argmax(items: &[f64]) -> Result<usize, String> {
         .ok_or_else(|| String::from("decision choice needs probabilities"))
 }
 
-fn read_request(path: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read_request(path: &Path) -> Result<Vec<u8>, String> {
     let file = File::open(path).map_err(|_| String::from("decision request must be readable"))?;
     let metadata = file
         .metadata()

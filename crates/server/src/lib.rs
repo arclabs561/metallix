@@ -27,6 +27,8 @@ mod decision_cli;
 mod deepseek_reduced_cli;
 #[cfg(feature = "metal")]
 mod http_transport;
+#[cfg(feature = "metal")]
+mod julia_decisions;
 mod model_registry;
 #[cfg(feature = "metal")]
 mod qwen_decisions;
@@ -180,6 +182,9 @@ enum Command {
     /// Score typed decision options directly with Qwen3, without generating text.
     #[cfg(feature = "metal")]
     Decide(decision_cli::DecisionArgs),
+    /// Score typed decision options with a local Julia-1 checkpoint on the CPU.
+    #[cfg(feature = "metal")]
+    DecideJulia(julia_decisions::JuliaDecisionArgs),
     /// Acquire supported model artifacts through the Hugging Face CLI.
     Fetch {
         #[command(subcommand)]
@@ -630,6 +635,8 @@ pub fn run() -> ExitCode {
         Command::RunDeepseekReduced(args) => args.run(),
         #[cfg(feature = "metal")]
         Command::Decide(args) => args.run(),
+        #[cfg(feature = "metal")]
+        Command::DecideJulia(args) => args.run(),
         Command::Fetch {
             command:
                 FetchCommand::Deepseek {

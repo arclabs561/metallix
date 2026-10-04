@@ -992,114 +992,6 @@ fn full_encoder_rejects_malformed_rows_layers_ids_and_masks() {
     ));
 }
 
-/// Reads named F32 tensors from a local safetensors file.
-fn read_f32_tensors(
-    path: &std::path::Path,
-) -> std::collections::HashMap<String, (Vec<usize>, Vec<f32>)> {
-    let bytes = std::fs::read(path).expect("read checkpoint");
-    let header_len = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap())).unwrap();
-    let header: Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
-    let data = &bytes[8 + header_len..];
-    header
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(name, _)| name.as_str() != "__metadata__")
-        .map(|(name, info)| {
-            assert_eq!(info["dtype"], "F32", "{name} dtype");
-            let shape: Vec<usize> = info["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| usize::try_from(v.as_u64().unwrap()).unwrap())
-                .collect();
-            let offsets = info["data_offsets"].as_array().unwrap();
-            let start = usize::try_from(offsets[0].as_u64().unwrap()).unwrap();
-            let end = usize::try_from(offsets[1].as_u64().unwrap()).unwrap();
-            let values = data[start..end]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect();
-            (name.clone(), (shape, values))
-        })
-        .collect()
-}
-
-/// Loads the native encoder (selected rows for `token_ids`) and head from a checkpoint.
-fn real_checkpoint_model(
-    dir: &std::path::Path,
-    token_ids: Vec<u64>,
-) -> (JuliaEncoder, DecisionHead) {
-    let mut tensors = read_f32_tensors(&dir.join("model.safetensors"));
-    let mut take = |name: &str| tensors.remove(name).unwrap_or_else(|| panic!("{name}")).1;
-    let table = take("encoder.embeddings.tok_embeddings.weight");
-    let token_rows = token_ids
-        .iter()
-        .flat_map(|&id| {
-            let row = usize::try_from(id).unwrap() * WIDTH;
-            table[row..row + WIDTH].to_vec()
-        })
-        .collect();
-    let layers = (0..22)
-        .map(|layer| {
-            let p = format!("encoder.layers.{layer}.");
-            EncoderBlockWeights {
-                wqkv_weight: take(&format!("{p}attn.Wqkv.weight")),
-                wo_weight: take(&format!("{p}attn.Wo.weight")),
-                wi_weight: take(&format!("{p}mlp.Wi.weight")),
-                wo_mlp_weight: take(&format!("{p}mlp.Wo.weight")),
-                // Layer 0 has no attention norm in the source (identity); the native block skips it.
-                attn_norm_weight: if layer == 0 {
-                    vec![1.0; WIDTH]
-                } else {
-                    take(&format!("{p}attn_norm.weight"))
-                },
-                mlp_norm_weight: take(&format!("{p}mlp_norm.weight")),
-            }
-        })
-        .collect();
-    let encoder = JuliaEncoder::new(FullEncoderWeights {
-        token_ids,
-        token_rows,
-        embedding_norm_weight: take("encoder.embeddings.norm.weight"),
-        layers,
-        final_norm_weight: take("encoder.final_norm.weight"),
-    })
-    .unwrap();
-    let mut head_layer = |index: usize| {
-        let p = format!("head.layers.{index}.");
-        HeadLayerWeights {
-            in_proj_weight: take(&format!("{p}self_attn.in_proj_weight")),
-            in_proj_bias: take(&format!("{p}self_attn.in_proj_bias")),
-            out_proj_weight: take(&format!("{p}self_attn.out_proj.weight")),
-            out_proj_bias: take(&format!("{p}self_attn.out_proj.bias")),
-            linear1_weight: take(&format!("{p}linear1.weight")),
-            linear1_bias: take(&format!("{p}linear1.bias")),
-            linear2_weight: take(&format!("{p}linear2.weight")),
-            linear2_bias: take(&format!("{p}linear2.bias")),
-            norm1_weight: take(&format!("{p}norm1.weight")),
-            norm1_bias: take(&format!("{p}norm1.bias")),
-            norm2_weight: take(&format!("{p}norm2.weight")),
-            norm2_bias: take(&format!("{p}norm2.bias")),
-        }
-    };
-    let layers = [head_layer(0), head_layer(1)];
-    let head = DecisionHead::new(HeadWeights {
-        layers,
-        type_embedding: take("type_emb.weight"),
-        scorer: ScorerWeights {
-            norm_weight: take("scorer.0.weight"),
-            norm_bias: take("scorer.0.bias"),
-            linear1_weight: take("scorer.1.weight"),
-            linear1_bias: take("scorer.1.bias"),
-            linear2_weight: take("scorer.3.weight"),
-            linear2_bias: take("scorer.3.bias"),
-        },
-    })
-    .unwrap();
-    (encoder, head)
-}
-
 /// The native encoder and head on the published Julia-1 checkpoint, gated on float64.
 ///
 /// Opt-in: `JULIA_CHECKPOINT_DIR` names the pinned revision's directory holding
@@ -1120,19 +1012,8 @@ fn real_checkpoint_encoder_then_head_matches_float64_reference() {
     .unwrap();
     let ratio = gate["gate_ratio"].as_f64().unwrap();
     let cases = reference["cases"].as_array().unwrap();
-    let mut token_ids: Vec<u64> = cases
-        .iter()
-        .flat_map(|c| {
-            c["input_ids"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap())
-        })
-        .collect();
-    token_ids.sort_unstable();
-    token_ids.dedup();
-    let (encoder, head) = real_checkpoint_model(&dir, token_ids);
+    let checkpoint = crate::JuliaCheckpoint::load(&dir).unwrap();
+    let head = checkpoint.head();
     let mut report = Vec::new();
     for case in cases {
         let name = case["name"].as_str().unwrap();
@@ -1143,6 +1024,7 @@ fn real_checkpoint_encoder_then_head_matches_float64_reference() {
             .map(|v| v.as_u64().unwrap())
             .collect();
         let positions = input_ids.len();
+        let encoder = checkpoint.encoder(&input_ids).unwrap();
         let input = EncoderInput {
             input_ids,
             attention_mask: vec![true; positions],

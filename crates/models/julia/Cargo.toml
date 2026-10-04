@@ -8,10 +8,9 @@ publish.workspace = true
 
 [dependencies]
 libm = "0.2"
-thiserror.workspace = true
-
-[dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
