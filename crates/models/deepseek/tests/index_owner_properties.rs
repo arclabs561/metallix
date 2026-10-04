@@ -75,24 +75,25 @@ fn capacity_failure_preserves_live_stream_for_same_id_retry() {
 
 #[test]
 fn projection_work_guard_precedes_linear_execution() {
-    let layout = IndexKeyLayout::new(nz(1), nz(257), nz(32), nz(1), 1e-5).expect("layout");
-    let mut owner = RatioOneIndexKeyOwner::new(layout, nz(256), nz(257), 3, &[0x3f80; 257], 1e-5)
-        .expect("bounded persistent state");
-    let input = vec![0x3f80; 257 * 256];
-    // Buffers fit the element cap, but projection exceeds 2^24 scalar terms.
+    let layout = IndexKeyLayout::new(nz(1), nz(1024), nz(32), nz(1), 1e-5).expect("layout");
+    let mut owner =
+        RatioOneIndexKeyOwner::new(layout, nz(1024), nz(1024), 3, &[0x3f80; 1024], 1e-5)
+            .expect("bounded persistent state");
+    let input = vec![0x3f80; 1024 * 1024];
+    // Buffers fit the element cap, but projection exceeds 2^29 scalar terms.
     // Empty weights would produce a different error if linear execution began.
     assert!(matches!(
         owner.forward(RatioOneOwnerCall::new(
             IndexKeyPublicationId::new(3, 0, 0),
             0,
-            nz(257),
+            nz(1024),
             &input,
             &[],
             RatioOneOwnerWeights::new(&[], IndexKeyWeights::new(&[], &[])),
         )),
         Err(RatioOneIndexKeyOwnerError::ProjectionWorkloadTooLarge {
-            terms: 16_908_544,
-            maximum: 16_777_216,
+            terms: 1_073_741_824,
+            maximum: 536_870_912,
         })
     ));
     assert_eq!(owner.next_position(), 0);
