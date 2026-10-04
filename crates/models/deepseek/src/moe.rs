@@ -221,6 +221,24 @@ pub struct MoEReference<'a> {
     shared: Fp8ExpertWeights<'a>,
 }
 
+/// Supplies routed experts after routing selects them.
+///
+/// Implementations own (or borrow) the packed bytes and lend them to `run`
+/// for the duration of one expert call, so a caller can hold only a bounded
+/// working set of a checkpoint's experts.
+pub trait RoutedExpertSource {
+    /// Runs `run` with routed expert `index`'s weights, or fails if it is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the source's error or the error `run` returns.
+    fn with_expert(
+        &self,
+        index: usize,
+        run: &mut dyn FnMut(Fp4ExpertWeights<'_>) -> Result<Vec<u16>, MoEError>,
+    ) -> Result<Vec<u16>, MoEError>;
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RoutedExperts<'a> {
     Dense(&'a [Fp4ExpertWeights<'a>]),
@@ -372,6 +390,45 @@ impl<'a> MoEReference<'a> {
 
     /// Executes one V4.1 text `MoE` token in the source's expert-ID order.
     pub fn forward_token(&self, input_bf16: &[u16]) -> Result<MoEDiagnostic, MoEError> {
+        let routes = self.route_token(input_bf16)?;
+        for route in &routes {
+            let _ = self.routed.selected(route.expert_index())?;
+        }
+        self.run_routes(input_bf16, routes, |index, weight| {
+            self.routed.selected(index)?.forward_token(
+                input_bf16,
+                self.config.swiglu_limit,
+                Some(weight),
+            )
+        })
+    }
+
+    /// Executes one token with routed experts supplied after routing selects them.
+    ///
+    /// The construction-time routed table is not consulted; a model too large
+    /// to hold every expert can build this reference over an empty sparse table
+    /// and fetch only the selected experts. Supplied experts must match the
+    /// configured geometry. No state changes, so a source failure leaves
+    /// nothing partially applied.
+    pub fn forward_token_with(
+        &self,
+        input_bf16: &[u16],
+        source: &dyn RoutedExpertSource,
+    ) -> Result<MoEDiagnostic, MoEError> {
+        let routes = self.route_token(input_bf16)?;
+        self.run_routes(input_bf16, routes, |index, weight| {
+            source.with_expert(index, &mut |expert| {
+                if expert.hidden_width != self.config.hidden_width
+                    || expert.intermediate_width != self.config.intermediate_width
+                {
+                    return Err(MoEError::ExpertGeometry);
+                }
+                expert.forward_token(input_bf16, self.config.swiglu_limit, Some(weight))
+            })
+        })
+    }
+
+    fn route_token(&self, input_bf16: &[u16]) -> Result<Vec<ExpertRoute>, MoEError> {
         if input_bf16.len() != self.config.hidden_width {
             return Err(MoEError::Length {
                 field: "input_bf16",
@@ -379,7 +436,7 @@ impl<'a> MoEReference<'a> {
                 expected: self.config.hidden_width,
             });
         }
-        let routes = flash_bf16_gate_routes(
+        Ok(flash_bf16_gate_routes(
             input_bf16,
             self.gate_bf16,
             self.routed.len(),
@@ -389,10 +446,15 @@ impl<'a> MoEReference<'a> {
             self.config.gate_temperature,
             self.config.normalize_top_k,
             self.config.route_scale,
-        )?;
-        for route in &routes {
-            let _ = self.routed.selected(route.expert_index())?;
-        }
+        )?)
+    }
+
+    fn run_routes(
+        &self,
+        input_bf16: &[u16],
+        routes: Vec<ExpertRoute>,
+        mut run_expert: impl FnMut(usize, f32) -> Result<Vec<u16>, MoEError>,
+    ) -> Result<MoEDiagnostic, MoEError> {
         let mut accumulator = allocate_f32("accumulator", self.config.hidden_width)?;
         let mut selected_outputs = Vec::new();
         selected_outputs
@@ -401,9 +463,7 @@ impl<'a> MoEReference<'a> {
                 field: "selected outputs",
             })?;
         for route in &routes {
-            let expert = self.routed.selected(route.expert_index())?;
-            let output =
-                expert.forward_token(input_bf16, self.config.swiglu_limit, Some(route.weight()))?;
+            let output = run_expert(route.expert_index(), route.weight())?;
             accumulate_bf16(&mut accumulator, &output, "routed accumulation")?;
             selected_outputs.push(output);
         }
@@ -466,6 +526,14 @@ impl MoEDiagnostic {
 #[derive(Clone, Debug, Error, PartialEq)]
 #[non_exhaustive]
 pub enum MoEError {
+    /// A routed-expert source could not supply the selected expert.
+    #[error("routed expert {index} is unavailable: {reason}")]
+    ExpertUnavailable {
+        /// Original gate expert ID.
+        index: usize,
+        /// Source-specific reason, such as a missing or corrupt payload.
+        reason: String,
+    },
     /// A vector width was zero, not group-aligned, or beyond the bounded reference limit.
     #[error("{field} width {width} must be nonzero, group-aligned, and at most {max}")]
     InvalidWidth {
@@ -878,8 +946,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEError, MoEReference, project_fp4_expert,
-        swiglu_hidden,
+        Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEError, MoEReference, RoutedExpertSource,
+        project_fp4_expert, swiglu_hidden,
     };
 
     const WIDTH: usize = 32;
@@ -1112,6 +1180,87 @@ mod tests {
         };
         assert!(matches!(
             MoEReference::new_sparse(config, &gate, &bias, &[Some(malformed), None], shared),
+            Err(MoEError::ExpertGeometry)
+        ));
+    }
+
+    /// Lends experts from a borrowed table, like a cache would from fetched bytes.
+    struct TableSource<'a>(&'a [Option<Fp4ExpertWeights<'a>>]);
+
+    impl RoutedExpertSource for TableSource<'_> {
+        fn with_expert(
+            &self,
+            index: usize,
+            run: &mut dyn FnMut(Fp4ExpertWeights<'_>) -> Result<Vec<u16>, MoEError>,
+        ) -> Result<Vec<u16>, MoEError> {
+            match self.0.get(index) {
+                Some(Some(expert)) => run(*expert),
+                _ => Err(MoEError::ExpertUnavailable {
+                    index,
+                    reason: String::from("not in table"),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn supplied_experts_reproduce_the_table_path_without_consulting_the_table() {
+        let a = fp4_buffers_with_codes(0x11, 0x22, 0x13);
+        let b = fp4_buffers_with_codes(0x23, 0x11, 0x21);
+        let table = [Some(fp4_expert(&a)), Some(fp4_expert(&b))];
+        let shared_buffers = fp8_buffers();
+        let shared = fp8_expert(&shared_buffers);
+        let config = MoEConfig::new(WIDTH, WIDTH, 4.0, 2, 1.0, true, 1.5).expect("two routes");
+        let mut gate = vec![0; 2 * WIDTH];
+        gate[0] = 0x3f80;
+        gate[WIDTH + 1] = 0x3f00;
+        let bias = [0.0, 0.0];
+        let with_table =
+            MoEReference::new_sparse(config, &gate, &bias, &table, shared).expect("table");
+        let empty = [None, None];
+        let without_table =
+            MoEReference::new_sparse(config, &gate, &bias, &empty, shared).expect("empty table");
+        for first in [0x3f80_u16, 0xbf80, 0x4040] {
+            let mut input = [0x3e00_u16; WIDTH];
+            input[0] = first;
+            let expected = with_table.forward_token(&input).expect("table path");
+            let supplied = without_table
+                .forward_token_with(&input, &TableSource(&table))
+                .expect("supplied path");
+            assert_eq!(supplied, expected);
+        }
+        // The empty table alone cannot run the same token.
+        assert!(matches!(
+            without_table.forward_token(&[0x3e00; WIDTH]),
+            Err(MoEError::MissingRoutedExpert { .. })
+        ));
+    }
+
+    #[test]
+    fn supplied_experts_fail_closed_on_absence_and_geometry() {
+        let buffers = fp4_buffers();
+        let expert = fp4_expert(&buffers);
+        let shared_buffers = fp8_buffers();
+        let shared = fp8_expert(&shared_buffers);
+        let config = MoEConfig::new(WIDTH, WIDTH, 4.0, 1, 1.0, true, 1.0).expect("one route");
+        let mut gate = vec![0; 2 * WIDTH];
+        gate[0] = 0x3f80;
+        let bias = [0.0, 0.0];
+        let empty = [None, None];
+        let reference =
+            MoEReference::new_sparse(config, &gate, &bias, &empty, shared).expect("empty table");
+        let mut input = [0; WIDTH];
+        input[0] = 0x3f80;
+        assert!(matches!(
+            reference.forward_token_with(&input, &TableSource(&[None, None])),
+            Err(MoEError::ExpertUnavailable { index: 0, .. })
+        ));
+        let wide = Fp4ExpertWeights {
+            hidden_width: WIDTH * 2,
+            ..expert
+        };
+        assert!(matches!(
+            reference.forward_token_with(&input, &TableSource(&[Some(wide), None])),
             Err(MoEError::ExpertGeometry)
         ));
     }

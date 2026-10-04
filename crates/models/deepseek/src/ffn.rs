@@ -14,7 +14,7 @@ use crate::{
         mixing::{HcMixError, hc_post_bf16_reference, hc_pre_bf16_reference},
         projection::{HcProjectionError, project_hc_coefficients},
     },
-    moe::{MoEDiagnostic, MoEError, MoEReference},
+    moe::{MoEDiagnostic, MoEError, MoEReference, RoutedExpertSource},
     norm::{RmsNormError, rms_norm_bf16_reference},
 };
 
@@ -140,6 +140,35 @@ impl<'a> FfnSublayerReference<'a> {
         residual: &[u16],
         incoming_pre: &[f32],
     ) -> Result<FfnDiagnostic, FfnError> {
+        self.forward_token_inner(residual, incoming_pre, |input| {
+            self.moe.forward_token(input)
+        })
+    }
+
+    /// Same as [`Self::forward_token`], with routed experts fetched from `source`
+    /// after routing instead of from the construction-time table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FfnError`] as [`Self::forward_token`] does, including a
+    /// source that cannot supply a selected expert.
+    pub fn forward_token_with(
+        &self,
+        residual: &[u16],
+        incoming_pre: &[f32],
+        source: &dyn RoutedExpertSource,
+    ) -> Result<FfnDiagnostic, FfnError> {
+        self.forward_token_inner(residual, incoming_pre, |input| {
+            self.moe.forward_token_with(input, source)
+        })
+    }
+
+    fn forward_token_inner(
+        &self,
+        residual: &[u16],
+        incoming_pre: &[f32],
+        run_moe: impl FnOnce(&[u16]) -> Result<MoEDiagnostic, MoEError>,
+    ) -> Result<FfnDiagnostic, FfnError> {
         // The source derives the FFN coefficients before it consumes the
         // previous attention pre-mix. Keep this first: it bounds the residual
         // geometry before any FFN temporary allocation.
@@ -164,7 +193,7 @@ impl<'a> FfnSublayerReference<'a> {
             self.norm_epsilon,
             &mut normalized_bf16,
         )?;
-        let moe = self.moe.forward_token(&normalized_bf16)?;
+        let moe = run_moe(&normalized_bf16)?;
         let mut output_bf16 = allocate_u16("output", residual_elements)?;
         hc_post_bf16_reference(
             moe.output_bf16(),

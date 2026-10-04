@@ -15,6 +15,7 @@ use crate::{
         mixing::{HcMixError, MAX_HC_COPIES, MAX_HC_MIX_WIDTH, hc_post_bf16_reference},
         projection::{HcProjectionError, project_hc_coefficients},
     },
+    moe::RoutedExpertSource,
 };
 
 const MAX_BLOCK_TAIL_PROJECTION_ELEMENTS: usize = 1 << 20;
@@ -159,6 +160,26 @@ impl<'a> BlockTailReference<'a> {
         residual: &[u16],
         attention: &[u16],
     ) -> Result<BlockTailDiagnostic, BlockTailError> {
+        self.forward_token_inner(residual, attention, None)
+    }
+
+    /// Same as [`Self::forward_token`], with routed experts fetched from `source`
+    /// after routing instead of from the FFN's construction-time table.
+    pub fn forward_token_with(
+        &self,
+        residual: &[u16],
+        attention: &[u16],
+        source: &dyn RoutedExpertSource,
+    ) -> Result<BlockTailDiagnostic, BlockTailError> {
+        self.forward_token_inner(residual, attention, Some(source))
+    }
+
+    fn forward_token_inner(
+        &self,
+        residual: &[u16],
+        attention: &[u16],
+        source: Option<&dyn RoutedExpertSource>,
+    ) -> Result<BlockTailDiagnostic, BlockTailError> {
         let residual_elements = checked_product(self.copies, self.width, "residual")?;
         if residual.len() != residual_elements {
             return Err(BlockTailError::Length {
@@ -193,9 +214,16 @@ impl<'a> BlockTailReference<'a> {
             attention_coefficients.comb(),
             &mut after_attention_bf16,
         )?;
-        let ffn = self
-            .ffn
-            .forward_token(&after_attention_bf16, attention_coefficients.pre())?;
+        let ffn = match source {
+            Some(source) => self.ffn.forward_token_with(
+                &after_attention_bf16,
+                attention_coefficients.pre(),
+                source,
+            )?,
+            None => self
+                .ffn
+                .forward_token(&after_attention_bf16, attention_coefficients.pre())?,
+        };
         Ok(BlockTailDiagnostic {
             attention_coefficients,
             after_attention_bf16,
