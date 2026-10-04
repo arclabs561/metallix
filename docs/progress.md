@@ -24,6 +24,16 @@ choices without expanding current support claims.
   hidden states and scores. See
   [Julia](research/julia-decision-contract.md#published-checkpoint).
 
+- Julia-1 typed decisions now run end to end from the CLI:
+  `mx decide-julia --model DIR --request REQUEST.json` loads the published
+  checkpoint through a strict loader (exactly the 170 published F32 tensors and
+  shapes, fail closed) and encodes requests with the source `sequence` under the
+  published strict policy. On the six reference requests the CLI's token IDs
+  and markers equal the source's exactly, and its scores stay within four times
+  the FP32 source's error against float64. Requests are capped at 126 positions,
+  weights are not hashed, and HTTP serving remains open. See
+  [typed decisions](research/julia-decision-contract.md#typed-decisions-from-the-cli).
+
 - Real DeepSeek-V4.1 block zero runs natively on actual checkpoint tensors for
   a three-token prefill: selected-embedding startup, Hyper-Connection mixing,
   window attention, expert routing and 16 routed FP4 experts plus the shared

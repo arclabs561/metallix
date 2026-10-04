@@ -3,8 +3,11 @@
 Status: source contract, published-header validation, real-tokenizer sequence
 parity, a native CPU decision head and a bounded native 22-layer prefill are
 implemented. The prefill is qualified against a float64 accuracy reference on
-synthetic weights (see [the full-encoder gate](#float64-accuracy-reference-for-the-full-encoder)).
-Checkpoint loading, real-weight qualification and serving integration remain open.
+synthetic weights (see [the full-encoder gate](#float64-accuracy-reference-for-the-full-encoder))
+and on the published checkpoint (see [published checkpoint](#published-checkpoint)).
+A strict checkpoint loader and the `mx decide-julia` typed-decision command are
+delivered (see [typed decisions](#typed-decisions-from-the-cli)). HTTP serving,
+sequences longer than 126 positions and Metal execution remain open.
 
 ## Calibration-only source control
 
@@ -192,6 +195,54 @@ JULIA_ERROR_OUTPUT=/tmp/julia-native.json \
 NATIVE=/tmp/julia-native.json OUT=/tmp/julia-f64.json \
   uv run --offline scripts/julia_full_prefill_f64_oracle.py
 ```
+
+### Typed decisions from the CLI
+
+`mx decide-julia --model CHECKPOINT_DIR --request REQUEST.json` scores typed
+decisions on the CPU from a local checkpoint directory. It is built with the
+server's `metal` feature, which is where the tokenizer dependency lives; the
+model itself runs on the CPU. The request is the same JSON shape as `mx decide`:
+`state` plus named `questions`, each with `type` (`choice`, `score` or `noul`),
+`instructions` and `criteria`. That shape matches the pinned source's
+`typed.predict_typed`, and the command follows the source where the Qwen
+command differs: questions and choice criteria keep caller order, because order
+moves the marker positions; a `noul` question without criteria scores the
+literal labels `false` and `true`; probabilities are a plain option softmax with
+no temperature.
+
+- Loading: `JuliaCheckpoint::load` requires `config.json` and
+  `julia_config.json` (format 1, `JuliaDecisionModel`, two head layers),
+  `encoder/config.json`, `tokenizer/tokenizer.json` and `model.safetensors`.
+  The weights header must name exactly the 170 published F32 tensors with their
+  published shapes, and their offsets must tile the data section with no gaps,
+  overlaps or trailing bytes. Any difference fails before a weight is read. The
+  unused `temperature` and `act_head` tensors are checked but not loaded.
+- Encoding: requests follow the published inference policy, `sequence` with
+  `max_length` 8192, `head_length` 512 and strict mode. Strict mode rejects any
+  input the source would sanitize or truncate: a literal mask token, an option
+  over 48 tokens, a head over budget, or a state that does not fit. A dict or
+  list `state` is serialized as Python `json.dumps(..., ensure_ascii=False)`
+  would, keeping member order. Integers outside the 64-bit range are the one
+  known difference: they are parsed as floats and serialize differently.
+- Bounds: the native encoder admits at most 126 positions. Longer requests fail
+  closed with the encoder's position error rather than being truncated.
+- Output: per question, the raw marker scores, probabilities, `choice`, `score`
+  or `noul`, the serialized `input_ids` and `markers`, and timing. The receipt
+  records the encoding settings and the SHA-256 of the request and
+  `tokenizer.json`. Checkpoint weights are not hashed; identity rests on the
+  directory layout and the tensor names, types and shapes.
+
+An opt-in integration test runs the built `mx` binary on the six reference
+requests above, rewritten as typed requests. Its token IDs and marker positions
+equal the source `sequence` output exactly, and every score stays within four
+times the FP32 source's own score error, the same gate as the library test:
+
+```sh
+JULIA_CHECKPOINT_DIR=/abs/CHECKPOINT_DIR JULIA_REAL_REFERENCE=/abs/julia-real.json \
+  cargo test --release -p server --features metal --test julia_decide -- --ignored --nocapture
+```
+
+Both paths must be absolute because cargo runs tests from the crate directory.
 
 ## Reproduction identity
 
@@ -466,8 +517,10 @@ gate remains enabled and currently fails for `unmasked_control`; native scalar
 F32 reductions diverge from both source eager and source CPU-flash paths from
 layer zero and accumulate across the 22 layers. The implementation must remain
 unqualified until a separately reviewed numerical contract or a source-kernel
-compatible execution strategy resolves that mismatch. Checkpoint loading,
-Metal execution, server, or registry integration remain later boundaries.
+compatible execution strategy resolves that mismatch. Checkpoint loading and a
+CLI typed-decision path are now delivered (see
+[typed decisions](#typed-decisions-from-the-cli)); Metal execution, HTTP
+serving and registry integration remain later boundaries.
 
 
 ## Native head placement
@@ -480,4 +533,5 @@ CPU head with local affine, normalization, attention and activation operations
 keeps this step model-specific without introducing a shared tensor framework.
 The first head gate is the synthetic pinned-source fixture. The separate
 encoder-block gate provides a reusable bounded CPU operator; full encoder
-composition and checkpoint loading remain separately qualified boundaries.
+composition and checkpoint loading are now qualified separately on the
+published checkpoint.
