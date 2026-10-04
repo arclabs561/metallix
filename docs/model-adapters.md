@@ -166,3 +166,125 @@ stability should be declared only after the consumer checks above. Distributed
 deployment and automatic execution of arbitrary Hub code are separate future
 decisions. Training and adaptation stay in scope, with explicit correctness
 and memory gates rather than support implied by an inference adapter.
+
+## Serving
+
+Proposal, extending step 3. Metallix should serve generation, decision and
+embedding models from one `mx serve` process, so a client sees one model list
+and one set of routes. Today `mx serve` loads one Qwen `ChatSession` and
+answers `/healthz`, `/v1/models` and `/v1/responses`; typed decisions exist only
+as the `mx decide` (Qwen) and `mx decide-julia` commands. The principles above
+still hold: adapters own graphs and state, the server only routes typed
+requests, and every advertised capability names a qualification receipt.
+
+### Registry
+
+- Declaration: a local serving manifest lists entries, each pointing at a
+  model manifest from the configuration contract plus serving fields:
+  `id`, `path`, `capabilities`, `residency` (`resident` or `on_demand`) and an
+  optional memory estimate. `mx serve --model PATH` stays as the one-entry
+  shorthand for today's behavior. Machine paths stay in the local manifest,
+  never in published model manifests.
+- Identity: `id` is the client-facing name; the receipt behind each
+  capability binds it to the immutable revision and artifact hashes.
+- Validation: at startup every entry is inspected (manifest, header, tokenizer)
+  without loading weights. An unknown architecture, unqualified capability or a
+  resident set over budget fails startup, not the first request.
+- Residency on one 128 GB Mac: resident entries load at startup; on-demand
+  entries load on first use and are evicted least recently used when the
+  declared resident budget would be exceeded. Eviction only unloads an idle
+  worker. Larger-than-RAM models such as DeepSeek keep their own streamed
+  residency inside the adapter; the registry budgets only their resident part.
+- Selection: the request's `model` field picks the entry, as `/v1/responses`
+  already checks `model_id`. Unknown models return 404 `model_not_found`.
+
+### Capability-typed routes
+
+| Route | Capability | Body and response |
+| --- | --- | --- |
+| `POST /v1/responses` | `generate` | Unchanged Responses shape. |
+| `POST /v1/decisions` | `decide` | The existing `mx decide` request plus `model`; responds with the same receipt the CLI prints. |
+| `POST /v1/embeddings` | `embed` | OpenAI-compatible `{model, input}` with `data[].embedding`, plus the adapter's pooling, normalization and dimension in metadata. |
+| `GET /v1/models` | none | Every entry with `capabilities` and `loaded` state. |
+
+A route sent to a model without that capability returns 400
+`unsupported_capability` naming the model's capabilities. The decision body is
+already the de facto typed-decision shape: Julia's source `predict_typed` and
+the third-party Decision 2.0 models use the same `state` plus typed `questions`.
+Each decision adapter keeps its own option order and normalization (Qwen sorts
+choice IDs and applies a temperature; Julia keeps caller order and a plain
+softmax) and reports both in its receipt. Ollama's `/v1/systemone` stays a
+separate compatibility decision after its semantics are compared.
+
+### Workers and admission
+
+- One worker per loaded model, each owning its adapter state on its own thread,
+  fed by today's zero-capacity channel. The `Admission` flag becomes one flag
+  per model, so a busy Qwen request does not block a Julia decision. Admission
+  must move after the request is read, because the model is named in the body;
+  transport limits already bound that read.
+- Device sharing: CPU models (the native Julia encoder) run concurrently with
+  GPU models. GPU workers share one Metal lock, as the tests already do, until
+  measured overlap shows concurrent GPU work is safe and faster.
+- Workers expose capabilities, not a common trait over all of them:
+  `ChatBackend` stays generation-only, and decision and embedding workers get
+  their own narrow traits. A worker panic marks only that model unavailable.
+
+### Embedding candidates
+
+From live Hub API metadata, 2026-10-04 (pinned revisions in sources):
+
+| Model | Arch / dims / pooling | License, access | MLX and reuse |
+| --- | --- | --- | --- |
+| Qwen3-Embedding-0.6B | Qwen3, 28 layers, 1024 dims, last-token pooling | Apache-2.0, open; 9.4M downloads | Reuses the Qwen3 decoder adapter; `mlx-community` 8-bit and 4-bit ports exist |
+| gte-modernbert-base | ModernBERT, 22 layers, 768 dims, CLS pooling | Apache-2.0, open | Same encoder family as the native Julia encoder (width differs) |
+| EmbeddingGemma-300m | Gemma 3 text, 24 layers, 768 dims | Gemma terms, gated (manual approval) | `mlx-community` ports exist; gated, so not first |
+
+Proposed first: Qwen3-Embedding-0.6B, because it reuses the qualified Qwen3
+path and is open. gte-modernbert-base is the second, encoder-side check.
+Neither is qualified; each needs a source-oracle receipt before `embed` is
+advertised.
+
+### Decision candidates
+
+| Model | Shape | License | Fit |
+| --- | --- | --- | --- |
+| Decision-2.0-Kai-0.6B (vLLM Semantic Router) | Qwen3-0.6B-Base backbone plus `decision_head.safetensors`; choice, yes/no and score in one pass | Apache-2.0, open; custom code | Same request shape; reuses the Qwen3 adapter plus a new head. Sizes up to 27B exist. |
+| Qwen3-Reranker-0.6B | Qwen3 causal model scored as a yes/no reranker | Apache-2.0, open | A `rerank` capability or a two-option decision; needs its own semantics |
+| gte-reranker-modernbert-base | ModernBERT sequence classifier | Apache-2.0, open | Encoder-side reranker close to the Julia encoder |
+
+The 26B MATILDA-jev decision model is also Apache-2.0 but needs about 49 GiB
+and custom multimodal code; it is not a first candidate. Custom Hub code is a
+reference to port, never code the server executes.
+
+### Sequence and gates
+
+1. Registry plus `/v1/models` plus `/v1/decisions` for Qwen decide and Julia.
+   Gate: decision receipts over HTTP equal the CLI receipts for the same
+   request (Julia: the six reference requests); existing `/v1/responses` tests
+   pass unchanged; a Julia request completes while a Qwen request is busy.
+2. On-demand loading and eviction. Gate: measured resident memory stays under
+   the declared budget across a load/evict cycle; an evicted model reloads
+   with an identical receipt.
+3. `/v1/embeddings` with Qwen3-Embedding-0.6B. Gate: embeddings match the
+   source within a recorded tolerance on fixed inputs, with pooling and
+   normalization recorded.
+4. Decision-2.0-Kai as the second Qwen-backbone decision model, then further
+   generation adapters from the October priorities as they qualify.
+
+Non-goals for this proposal: a universal model trait, request batching across
+models, multi-host serving, binding beyond loopback, authentication, running
+Hub-supplied code, and matching Ollama's `/v1/systemone` before the comparison
+above.
+
+Sources: Hub model API (`/api/models/{id}`, pipeline-tag listings for
+`sentence-similarity`, `feature-extraction` and `text-ranking`) and each
+repository's `config.json` and `1_Pooling/config.json`:
+[Qwen3-Embedding-0.6B@97b0c61](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/tree/97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3),
+[gte-modernbert-base@e7f32e3](https://huggingface.co/Alibaba-NLP/gte-modernbert-base/tree/e7f32e3c00f91d699e8c43b53106206bcc72bb22),
+[embeddinggemma-300m](https://huggingface.co/google/embeddinggemma-300m) (gated;
+dims from [the MLX port@2f420ef](https://huggingface.co/mlx-community/embeddinggemma-300m-bf16/tree/2f420efb007317a1ef2aa1608f87ef24226e6807)),
+[Decision-2.0-Kai-0.6B@cd49ea3](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B/tree/cd49ea3813fd8ba0928a9a23ef6c9a0f2f0cd764),
+[Qwen3-Reranker-0.6B@e61197e](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B/tree/e61197ed45024b0ed8a2d74b80b4d909f1255473),
+[gte-reranker-modernbert-base](https://huggingface.co/Alibaba-NLP/gte-reranker-modernbert-base),
+[MATILDA-jev](https://huggingface.co/Maincode/matilda-jev-v1).
