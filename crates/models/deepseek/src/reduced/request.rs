@@ -32,7 +32,6 @@ use super::{
     StartupSession, StartupSessionError, StartupStepOutput,
 };
 
-const SOURCE_L1: u16 = 1;
 const MAX_REQUEST_ELEMENTS: usize = 1 << 20;
 
 /// Immutable runtime operands for the startup block.
@@ -424,7 +423,12 @@ impl<'a> RequestModel<'a> {
                 .layout
                 .compression()
                 .map(|(source, ratio)| (source, ratio.get()))
-                != Some((SOURCE_L1, 2))
+                != self
+                    .layer_one
+                    .config
+                    .attention_layout()
+                    .compression()
+                    .map(|(source, ratio)| (source, ratio.get()))
         {
             return Err(RequestError::LayerTwoGeometry);
         }

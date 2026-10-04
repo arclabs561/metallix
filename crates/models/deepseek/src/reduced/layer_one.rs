@@ -32,7 +32,6 @@ use super::{
     RatioTwoOwnerLayout, RatioTwoOwnerWeights,
 };
 
-const SOURCE_LAYER: u16 = 1;
 const SOURCE_RATIO: usize = 2;
 const NEGATIVE_INFINITY_BF16: u16 = 0xff80;
 
@@ -42,6 +41,7 @@ pub struct LayerOneConfig {
     owner_layout: RatioTwoOwnerLayout,
     attention_layout: LayerAttentionLayout,
     index_topk: NonZeroUsize,
+    source_layer: u16,
 }
 
 impl LayerOneConfig {
@@ -67,10 +67,11 @@ impl LayerOneConfig {
                 actual: attention_layout.batches().get(),
             });
         }
-        if attention_layout.compression().map(|(source, _)| source) != Some(SOURCE_LAYER) {
+        // The owner publishes under the source layer its attention layout expects to consume.
+        let Some((source_layer, ratio)) = attention_layout.compression() else {
             return Err(LayerOneSessionError::AttentionSourceLayer);
-        }
-        if attention_layout.compression().map(|(_, ratio)| ratio.get()) != Some(SOURCE_RATIO) {
+        };
+        if ratio.get() != SOURCE_RATIO {
             return Err(LayerOneSessionError::AttentionCompressionRatio);
         }
         if owner_layout.input_dimension() != attention_layout.hidden_dimension() {
@@ -101,6 +102,7 @@ impl LayerOneConfig {
             owner_layout,
             attention_layout,
             index_topk,
+            source_layer,
         })
     }
 }
@@ -267,8 +269,11 @@ impl LayerOneSession {
         config: LayerOneConfig,
         compressor_norm: &[u16],
     ) -> Result<Self, LayerOneSessionError> {
-        let owner =
-            RatioTwoCompressedOwner::new(config.owner_layout, SOURCE_LAYER, compressor_norm)?;
+        let owner = RatioTwoCompressedOwner::new(
+            config.owner_layout,
+            config.source_layer,
+            compressor_norm,
+        )?;
         Ok(Self {
             config,
             score_execution: IndexScoreExecution::Scalar,
@@ -461,7 +466,7 @@ impl LayerOneSession {
             completed_frequencies,
             old_key_count,
             publication: IndexKeyPublicationId::new(
-                SOURCE_LAYER,
+                self.config.source_layer,
                 self.expected_epoch,
                 self.owner.next_call_id(),
             ),
@@ -560,7 +565,7 @@ pub enum LayerOneSessionError {
     OwnerBatchCount { actual: usize },
     #[error("layer-one attention requires batch one, got {actual}")]
     AttentionBatchCount { actual: usize },
-    #[error("layer-one attention layout does not accept source layer 1")]
+    #[error("layer-one attention layout has no compressed source layer")]
     AttentionSourceLayer,
     #[error("layer-one attention layout does not use compression ratio two")]
     AttentionCompressionRatio,

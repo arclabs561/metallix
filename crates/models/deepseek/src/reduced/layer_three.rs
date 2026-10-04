@@ -71,7 +71,7 @@ impl LayerThreeConfig {
                 actual: attention_layout.batches().get(),
             });
         }
-        if attention_layout.compression().map(|(source, _)| source) != Some(3) {
+        if attention_layout.compression().is_none() {
             return Err(LayerThreeSessionError::AttentionSourceLayer);
         }
         if attention_layout.compression().map(|(_, ratio)| ratio.get()) != Some(1) {
@@ -237,7 +237,12 @@ impl LayerThreeSession {
         compressor_norm: &[u16],
         compressor_epsilon: f32,
     ) -> Result<Self, LayerThreeSessionError> {
-        if source_layer != 3 {
+        // The owner and its own attention must agree on the publishing layer.
+        let expected = config
+            .attention_layout
+            .compression()
+            .map(|(source, _)| source);
+        if expected != Some(source_layer) {
             return Err(LayerThreeSessionError::SourceLayer {
                 actual: source_layer,
             });
@@ -411,7 +416,7 @@ pub enum LayerThreeSessionError {
     OwnerBatchCount { actual: usize },
     #[error("layer-three attention requires batch one, got {actual}")]
     AttentionBatchCount { actual: usize },
-    #[error("layer-three attention layout does not accept source layer 3")]
+    #[error("layer-three attention layout has no compressed source layer")]
     AttentionSourceLayer,
     #[error("layer-three attention layout does not use compression ratio one")]
     AttentionCompressionRatio,
@@ -431,7 +436,7 @@ pub enum LayerThreeSessionError {
     KeyDimensionMismatch { owner: usize, attention: usize },
     #[error("layer-three owner rope pairs {owner} differs from attention rope pairs {attention}")]
     RopePairMismatch { owner: usize, attention: usize },
-    #[error("layer-three session requires source layer 3, got {actual}")]
+    #[error("layer-three session source layer {actual} differs from its attention layout")]
     SourceLayer { actual: u16 },
     #[error("layer-three session is poisoned; reset is required")]
     Poisoned,

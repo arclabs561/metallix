@@ -56,7 +56,7 @@ impl LayerFourConfig {
                 attention: attention_layout.hidden_dimension().get(),
             });
         }
-        if attention_layout.compression().map(|(source, _)| source) != Some(3) {
+        if attention_layout.compression().is_none() {
             return Err(LayerFourSessionError::AttentionSourceLayer);
         }
         if attention_layout.compression().map(|(_, ratio)| ratio.get()) != Some(1) {
@@ -202,16 +202,26 @@ impl LayerFourSession {
         result
     }
 
+    /// Accepts only publications from the layer this session's attention consumes.
+    fn check_publication_source(&self, actual: u16) -> Result<(), LayerFourSessionError> {
+        let expected = self
+            .config
+            .attention_layout
+            .compression()
+            .map(|(source, _)| source);
+        if expected == Some(actual) {
+            Ok(())
+        } else {
+            Err(LayerFourSessionError::PublicationSource { actual })
+        }
+    }
+
     fn step_admitted(
         &mut self,
         call: &LayerFourCall<'_>,
     ) -> Result<LayerFourStepOutput, LayerFourSessionError> {
         let selection_call = call.publication.candidates.call();
-        if call.publication.publication.source_layer() != 3 {
-            return Err(LayerFourSessionError::PublicationSource {
-                actual: call.publication.publication.source_layer(),
-            });
-        }
+        self.check_publication_source(call.publication.publication.source_layer())?;
         if selection_call.publication() != call.publication.publication {
             return Err(LayerFourSessionError::CandidatePublicationMismatch);
         }
@@ -332,13 +342,13 @@ pub enum LayerFourSessionError {
     BatchCount { query: usize, attention: usize },
     #[error("layer-four query width {query} differs from attention width {attention}")]
     InputDimension { query: usize, attention: usize },
-    #[error("layer-four attention does not consume source layer three")]
+    #[error("layer-four attention layout has no compressed source layer")]
     AttentionSourceLayer,
     #[error("layer-four attention compression ratio is not one")]
     AttentionCompressionRatio,
     #[error("layer-four session is poisoned; reset is required")]
     Poisoned,
-    #[error("layer-four publication source {actual} is not layer three")]
+    #[error("layer-four publication source {actual} differs from its attention layout")]
     PublicationSource { actual: u16 },
     #[error("layer-four candidate mask identity differs from its L3 publication")]
     CandidatePublicationMismatch,
