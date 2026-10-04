@@ -15,8 +15,8 @@ use std::{
     fs,
     io::Read,
     ops::Range,
-    path::PathBuf,
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use serde::Deserialize;
@@ -24,7 +24,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{V41SafetensorsHeader, V41SafetensorsHeaderError, V41StorageDtype, V41TensorRange};
-use crate::manifest::V41SafetensorsIndex;
+use crate::{
+    manifest::{CheckpointManifestError, V41SafetensorsIndex},
+    moe::{Fp4ExpertWeights, MoEError, RoutedExpertSource},
+};
 
 /// One exact byte-range request against a checkpoint shard.
 #[derive(Clone, Debug)]
@@ -210,6 +213,63 @@ impl<S: V41RangeSource> V41RangeCache<S> {
         })
     }
 
+    /// Builds a cache from the route-trace metadata layout: `index_path` is
+    /// the checkpoint index, `trace_dir/headers.json` lists each shard's
+    /// `header_bytes`, `header_sha256` and `file_bytes` for `revision`, and
+    /// `trace_dir/headers/<shard>.header.bin` holds its prefixed header. The
+    /// index and every listed header must match their recorded digests.
+    pub fn load(
+        source: S,
+        index_path: &Path,
+        trace_dir: &Path,
+        revision: &str,
+        budget_bytes: u64,
+    ) -> Result<Self, V41RangeCacheError> {
+        #[derive(Deserialize)]
+        struct Manifest {
+            revision: String,
+            index_sha256: String,
+            shards: BTreeMap<String, ShardHeader>,
+        }
+        #[derive(Deserialize)]
+        struct ShardHeader {
+            header_bytes: u64,
+            header_sha256: String,
+            file_bytes: u64,
+        }
+        let mismatch = |what: &str| V41RangeCacheError::HeadersManifest(what.to_owned());
+        let manifest: Manifest = serde_json::from_slice(
+            &fs::read(trace_dir.join("headers.json")).map_err(V41RangeCacheError::Io)?,
+        )
+        .map_err(V41RangeCacheError::ReceiptJson)?;
+        if manifest.revision != revision {
+            return Err(mismatch("revision"));
+        }
+        let index_json = fs::read(index_path).map_err(V41RangeCacheError::Io)?;
+        if format!("{:x}", Sha256::digest(&index_json)) != manifest.index_sha256 {
+            return Err(mismatch("index sha256"));
+        }
+        let index = V41SafetensorsIndex::parse(
+            std::str::from_utf8(&index_json).map_err(|_| mismatch("index utf-8"))?,
+        )?;
+        let mut headers = Vec::with_capacity(manifest.shards.len());
+        for (shard, expected) in manifest.shards {
+            if shard.starts_with('.') || shard.contains(['/', '\\']) {
+                return Err(mismatch(&shard));
+            }
+            let bytes = fs::read(trace_dir.join(format!("headers/{shard}.header.bin")))
+                .map_err(V41RangeCacheError::Io)?;
+            if bytes.len() as u64 != expected.header_bytes
+                || format!("{:x}", Sha256::digest(&bytes)) != expected.header_sha256
+            {
+                return Err(mismatch(&shard));
+            }
+            let header = V41SafetensorsHeader::parse_prefixed_header(&bytes, expected.file_bytes)?;
+            headers.push((shard, header));
+        }
+        Self::new(source, index, headers, budget_bytes)
+    }
+
     /// Bytes currently held by the cache.
     #[must_use]
     pub const fn used_bytes(&self) -> u64 {
@@ -377,17 +437,194 @@ pub enum V41RangeCacheError {
     /// Local I/O failed.
     #[error("range source I/O failed: {0}")]
     Io(std::io::Error),
+    /// The checkpoint index was invalid.
+    #[error(transparent)]
+    Index(#[from] CheckpointManifestError),
+    /// `headers.json` disagrees with the index, a header file, or the revision.
+    #[error("headers manifest mismatch: {0}")]
+    HeadersManifest(String),
+}
+
+/// Lends one layer's routed experts from a shared [`V41RangeCache`].
+///
+/// Each call loads `layers.{layer}.ffn.experts.{index}.{w1,w2,w3}.{weight,scale}`
+/// under the lock, releases it, then runs the expert over the `Arc` payloads,
+/// so one cache can serve every layer and the lock is never held during
+/// expert arithmetic.
+#[derive(Debug)]
+pub struct V41CachedRoutedExperts<'a, S> {
+    cache: &'a Mutex<V41RangeCache<S>>,
+    layer: usize,
+    hidden_width: usize,
+    intermediate_width: usize,
+}
+
+impl<'a, S> V41CachedRoutedExperts<'a, S> {
+    /// Serves `layer`'s routed experts with the given geometry (5120 x 2304
+    /// for V4.1 Flash).
+    pub const fn new(
+        cache: &'a Mutex<V41RangeCache<S>>,
+        layer: usize,
+        hidden_width: usize,
+        intermediate_width: usize,
+    ) -> Self {
+        Self {
+            cache,
+            layer,
+            hidden_width,
+            intermediate_width,
+        }
+    }
+}
+
+impl<S: V41RangeSource> RoutedExpertSource for V41CachedRoutedExperts<'_, S> {
+    fn with_expert(
+        &self,
+        index: usize,
+        run: &mut dyn FnMut(Fp4ExpertWeights<'_>) -> Result<Vec<u16>, MoEError>,
+    ) -> Result<Vec<u16>, MoEError> {
+        let unavailable = |reason: String| MoEError::ExpertUnavailable { index, reason };
+        let payloads = {
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|_| unavailable("range cache lock poisoned".to_owned()))?;
+            let mut payloads = Vec::with_capacity(6);
+            for projection in ["w1", "w2", "w3"] {
+                for kind in ["weight", "scale"] {
+                    let name = format!(
+                        "layers.{}.ffn.experts.{index}.{projection}.{kind}",
+                        self.layer
+                    );
+                    payloads.push(
+                        cache
+                            .get_tensor(&name)
+                            .map_err(|error| unavailable(error.to_string()))?,
+                    );
+                }
+            }
+            payloads
+        };
+        let [w1, w1_scale, w2, w2_scale, w3, w3_scale] = &payloads[..] else {
+            unreachable!("six projection payloads");
+        };
+        run(Fp4ExpertWeights::new(
+            self.hidden_width,
+            self.intermediate_width,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            w3,
+            w3_scale,
+        )?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        cell::RefCell,
+        path::{Path, PathBuf},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::{
-        Digest, Sha256, V41LocalWeightsSource, V41RangeCache, V41RangeCacheError, V41RangeRequest,
-        V41RangeSource,
+        Digest, Sha256, V41CachedRoutedExperts, V41LocalWeightsSource, V41RangeCache,
+        V41RangeCacheError, V41RangeRequest, V41RangeSource,
     };
-    use crate::{checkpoint::V41SafetensorsHeader, manifest::V41SafetensorsIndex};
+    use crate::{
+        checkpoint::V41SafetensorsHeader,
+        manifest::V41SafetensorsIndex,
+        moe::{Fp8ExpertWeights, MoEConfig, MoEError, MoEReference, RoutedExpertSource},
+    };
+
+    /// Zero payloads; records every requested tensor name in order.
+    #[derive(Default)]
+    struct Zeros(RefCell<Vec<String>>);
+
+    impl V41RangeSource for &Zeros {
+        fn read_range(&self, request: &V41RangeRequest<'_>) -> Result<Vec<u8>, V41RangeCacheError> {
+            self.0.borrow_mut().push(request.tensor.to_owned());
+            Ok(vec![
+                0;
+                usize::try_from(request.range.end - request.range.start)
+                    .expect("small")
+            ])
+        }
+    }
+
+    #[test]
+    fn cached_experts_request_exactly_six_tensors_and_report_absent_experts() {
+        // Layer 3 holds only expert 0, with 32 x 32 FP4 projections.
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        for projection in ["w1", "w2", "w3"] {
+            for (kind, dtype, columns) in [("weight", "I8", 16), ("scale", "F8_E8M0", 1)] {
+                let name = format!("layers.3.ffn.experts.0.{projection}.{kind}");
+                let end = offset + 32 * columns;
+                entries.push((
+                    name.clone(),
+                    format!(
+                        r#""{name}":{{"dtype":"{dtype}","shape":[32,{columns}],"data_offsets":[{offset},{end}]}}"#
+                    ),
+                ));
+                offset = end;
+            }
+        }
+        let header_json = format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(_, json)| json.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let header = V41SafetensorsHeader::parse(
+            header_json.as_bytes(),
+            8 + header_json.len() as u64 + offset,
+        )
+        .expect("synthetic expert header");
+        let index = V41SafetensorsIndex::parse(&format!(
+            r#"{{"metadata":{{"total_size":1}},"weight_map":{{{}}}}}"#,
+            entries
+                .iter()
+                .map(|(name, _)| format!(r#""{name}":"{SHARD}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+        .expect("synthetic index");
+        let source = Zeros::default();
+        let cache = Mutex::new(
+            V41RangeCache::new(&source, index, [(SHARD.to_owned(), header)], 1 << 20)
+                .expect("cache"),
+        );
+        let experts = V41CachedRoutedExperts::new(&cache, 3, 32, 32);
+        let mut runs = 0;
+        let output = experts
+            .with_expert(0, &mut |_| {
+                runs += 1;
+                Ok(vec![7])
+            })
+            .expect("present expert");
+        assert_eq!((output, runs), (vec![7], 1));
+        let requested: Vec<_> = entries.into_iter().map(|(name, _)| name).collect();
+        assert_eq!(*source.0.borrow(), requested);
+
+        let absent = experts.with_expert(1, &mut |_| {
+            runs += 1;
+            Ok(Vec::new())
+        });
+        assert!(matches!(
+            absent,
+            Err(MoEError::ExpertUnavailable { index: 1, ref reason })
+                if reason.contains("layers.3.ffn.experts.1.w1.weight")
+        ));
+        assert_eq!(runs, 1);
+    }
 
     const SHARD: &str = "model-00001-of-00001.safetensors";
     const REV: &str = "rev";
@@ -564,36 +801,8 @@ mod tests {
     #[test]
     #[ignore = "requires .agents/receipts/route-trace weights, headers and index"]
     fn real_expert_tensor_matches_its_receipt() {
-        let root =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts");
-        let trace = root.join("route-trace");
-        let index = V41SafetensorsIndex::parse(
-            &std::fs::read_to_string(root.join(
-                "control/receipts/candidate-control/real-expert/model.safetensors.index.json",
-            ))
-            .expect("index"),
-        )
-        .expect("pinned index");
-        let shards: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(trace.join("headers.json")).expect("headers.json"),
-        )
-        .expect("headers.json");
-        let shard = "model-00003-of-00048.safetensors";
-        let file_bytes = shards["shards"][shard]["file_bytes"]
-            .as_u64()
-            .expect("file_bytes");
-        let header = V41SafetensorsHeader::parse_prefixed_header(
-            &std::fs::read(trace.join(format!("headers/{shard}.header.bin"))).expect("header"),
-            file_bytes,
-        )
-        .expect("pinned header");
+        let (trace, mut cache) = real_cache(64 << 20);
         let tensor = "layers.0.ffn.experts.2.w1.weight";
-        let source = V41LocalWeightsSource::new(
-            trace.join("weights"),
-            "dba1be0a40aa45a94ad051997016db3960a90277",
-        );
-        let mut cache = V41RangeCache::new(source, index, [(shard.to_owned(), header)], 64 << 20)
-            .expect("cache");
         let bytes = cache.get_tensor(tensor).expect("verified real expert");
         assert_eq!(bytes.len(), 2_304 * 2_560);
         let receipt: serde_json::Value = serde_json::from_slice(
@@ -604,5 +813,115 @@ mod tests {
             format!("{:x}", Sha256::digest(&*bytes)),
             receipt["sha256"].as_str().expect("sha256")
         );
+    }
+
+    const PINNED: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
+
+    fn real_cache(budget: u64) -> (PathBuf, V41RangeCache<V41LocalWeightsSource>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts");
+        let trace = root.join("route-trace");
+        let cache = V41RangeCache::load(
+            V41LocalWeightsSource::new(trace.join("weights"), PINNED),
+            &root.join(
+                "control/receipts/candidate-control/real-expert/model.safetensors.index.json",
+            ),
+            &trace,
+            PINNED,
+            budget,
+        )
+        .expect("pinned index and headers");
+        (trace, cache)
+    }
+
+    fn le_u16(bytes: &[u8]) -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "requires .agents/receipts/route-trace weights, headers, index and capture-parity3"]
+    fn real_layer_zero_moe_matches_the_captured_source_output_bit_for_bit() {
+        const HIDDEN: usize = 5_120;
+        const INTERMEDIATE: usize = 2_304;
+        const EXPERTS: usize = 384;
+        let (trace, mut cache) = real_cache(1 << 30);
+        let mut get = |name: &str| cache.get_tensor(name).expect(name);
+        let gate = le_u16(&get("layers.0.ffn.gate.weight"));
+        let bias: Vec<f32> = get("layers.0.ffn.gate.bias")
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
+            .collect();
+        let shared: Vec<_> = ["w1", "w2", "w3"]
+            .into_iter()
+            .flat_map(|projection| {
+                ["weight", "scale"]
+                    .map(|kind| format!("layers.0.ffn.shared_experts.{projection}.{kind}"))
+            })
+            .map(|name| get(&name))
+            .collect();
+        let shared = Fp8ExpertWeights::new(
+            HIDDEN,
+            INTERMEDIATE,
+            &shared[0],
+            &shared[1],
+            &shared[2],
+            &shared[3],
+            &shared[4],
+            &shared[5],
+        )
+        .expect("shared expert");
+        let table = vec![None; EXPERTS];
+        let moe = MoEReference::new_sparse(
+            MoEConfig::new(HIDDEN, INTERMEDIATE, 10.0, 6, 1.0, true, 1.5).expect("V4.1 config"),
+            &gate,
+            &bias,
+            &table,
+            shared,
+        )
+        .expect("empty sparse layer-0 MoE");
+        let cache = Mutex::new(cache);
+        let experts = V41CachedRoutedExperts::new(&cache, 0, HIDDEN, INTERMEDIATE);
+        let capture = trace.join("capture-parity3");
+        let input = le_u16(
+            &std::fs::read(capture.join("layer00.ffn_in.torch.bfloat16.bin")).expect("ffn_in"),
+        );
+        let expected = le_u16(
+            &std::fs::read(capture.join("layer00.ffn_out.torch.bfloat16.bin")).expect("ffn_out"),
+        );
+        assert_eq!(input.len(), 3 * HIDDEN);
+        assert_eq!(expected.len(), input.len());
+        // The recorder's layer-0 gate selections for the same three tokens.
+        let recorded: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(trace.join("parity-greedy3.json")).expect("parity-greedy3.json"),
+        )
+        .expect("recorded routes");
+        let recorded = recorded["runs"][0]["routes"]
+            .as_array()
+            .expect("routes")
+            .iter()
+            .find(|route| route["layer"] == 0)
+            .expect("layer-0 routes")["ids"]
+            .clone();
+        for (token, (input, expected)) in input
+            .chunks_exact(HIDDEN)
+            .zip(expected.chunks_exact(HIDDEN))
+            .enumerate()
+        {
+            let output = moe
+                .forward_token_with(input, &experts)
+                .unwrap_or_else(|error| panic!("token {token}: {error}"));
+            let mut ids: Vec<_> = recorded[token]
+                .as_array()
+                .expect("token routes")
+                .iter()
+                .map(|id| usize::try_from(id.as_u64().expect("id")).expect("small id"))
+                .collect();
+            ids.sort_unstable();
+            let routed: Vec<_> = output.routes().iter().map(|r| r.expert_index()).collect();
+            assert_eq!(routed, ids, "token {token} routes");
+            assert_eq!(output.output_bf16(), expected, "token {token}");
+        }
     }
 }
