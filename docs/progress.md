@@ -44,6 +44,17 @@ choices without expanding current support claims.
   [quantization and precision](research/quantization-precision.md#real-layer-zero-attention).
   Generation and later layers remain open.
 
+- All 40 real DeepSeek-V4.1 layers and the final head now run natively on
+  checkpoint tensors in a private teacher-forced harness, on a 3-token and a
+  real 17-token prompt. Every layer selects the source's experts, attention
+  inputs are bit-exact, and the final logits keep the source's top 5 in order
+  (max difference 0.0051 on the 17-token prompt). Remaining differences trace
+  to BLAS-ordered source reductions, including a batch-dependent FP32 gate
+  projection. The scalar caps now admit a 128-token prefill. Prompts beyond
+  `index_topk` compressed positions, decode steps, native Engram hashing and
+  a library entry point remain open. See
+  [all forty real layers](research/quantization-precision.md#all-forty-real-layers).
+
 - Fused Metal kernels now cover both quantized weight formats. `Fp8MetalKernel`
   and `Fp4MetalKernel` decode packed FP8 and FP4 weights inside the multiply,
   so weights stay at their checkpoint size on the GPU. On real tensors both

@@ -515,6 +515,60 @@ tokens (2.2 s attention, 1.8 s experts) in release mode. That is a correctness
 baseline. Forty such layers would take roughly a minute per token, which is
 why the hot paths need Metal implementations before serving.
 
+### All forty real layers
+
+A private harness now composes the existing native components over all 40
+real layers and the final head: window attention (layers 0 and 1), ratio-two
+compressed owners at layers 2, 8 and 14, the ratio-one owner at layer 20,
+compressed-KV consumers on every other layer, Engram on layers 1 and 14,
+Hyper-Connections, routed FP4 and shared FP8 experts. Each layer is fed the
+pinned source's captured input (teacher forcing), and the source's prefill
+outputs, attention and MoE boundaries, sparse-attention outputs and final
+logits are captured by hooks on the unmodified graph.
+
+Compressed index selection is not computed. For a prefill whose compressed
+length is at most `index_topk` (512), the source's top-k keeps every reachable
+compressed position and candidate blocks keep all of them, so the indices
+follow from causality alone. The harness rejects longer prompts rather than
+approximate them; real indexer scoring is the next requirement for long
+prompts.
+
+| Prompt | Tokens | Routed experts | Final logits |
+| --- | --- | --- | --- |
+| `[42, 7, 42]` | 3 | identical on all 40 layers | same top 5 in the same order, max difference 0.109 |
+| `held-shell` | 17 | identical on all 40 layers | same top 5 in the same order, max difference 0.0051 |
+
+On both prompts the attention input is bit-exact on every layer, and native
+`wo_b` applied to the source's own `wo_a` product reproduces the source
+attention output exactly on every layer. Per-layer outputs agree to cosine
+within 1.3e-5 of 1. The remaining differences come from three source
+operations that reduce through Accelerate BLAS in a shape-dependent order:
+
+- The grouped BF16 `wo_a` einsum, as on layer zero.
+- The FP32 Hyper-Connection coefficient projection, as on layer zero.
+- The FP32 gate projection. With 17 tokens, 95% of the source's gate scores
+  change (by at most 2.8e-5) when the same rows go through `F.linear`
+  together instead of one at a time, so route weights depend on which other
+  tokens share the batch. The source's FP4 expert GEMM and SiLU are batch
+  invariant on the same rows. On the 3-token prompt the native MoE matches the
+  source exactly on all 40 layers given the source's FFN input; on the
+  17-token prompt it differs on 12 layers through these route weights.
+
+Sparse attention also differs at 2 to 173 of 557,056 values per layer on the
+17-token prompt, by one BF16 step. Its cause has not been isolated.
+
+Free-running native chains diverge from the source quickly, and so does the
+source itself. Starting the unmodified source from the native layer-zero
+output (one-BF16-step differences on 4% of values) moves layer one by cosine
+1.0e-4, the same as the native chain, and reaches 0.2 to 0.3 by layers 30 to
+39, changing the 3-token prompt's greedy token. FP8 and FP4 activation
+quantization turns single-step input differences into multi-percent element
+changes. Bitwise comparison of free-running chains is therefore not an
+acceptance test; per-layer teacher forcing and logit agreement are.
+
+The scalar harness takes about 230 seconds for 3 tokens and 1,600 seconds for
+17 tokens across 40 layers. It is a correctness reference, not a runtime.
+
 ### First Metal measurement on real projections
 
 The four real layer-zero FP8 attention projections (`wq_a`, `wq_b`, `wkv`,
