@@ -26,7 +26,7 @@ use super::{
     window::{WindowError, WindowStep, window_topk_indices, write_window_kv_bf16},
 };
 
-const MAX_LAYER_ATTENTION_ELEMENTS: usize = 1 << 20;
+const MAX_LAYER_ATTENTION_ELEMENTS: usize = 1 << 23;
 
 /// The model-local dimensions and provenance contract for one layer attention.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1686,10 +1686,10 @@ mod tests {
     #[test]
     fn stateless_qr_rejects_an_oversized_one_position_input_before_allocation() {
         assert!(matches!(
-            AttentionQrLayout::new(nonzero(32_769), nonzero(32), nonzero(32), 1e-5),
+            AttentionQrLayout::new(nonzero(262_145), nonzero(32), nonzero(32), 1e-5),
             Err(LayerAttentionLayoutError::ElementLimit {
                 field: "one-position input",
-                elements: 1_048_608
+                elements: 8_388_640
             })
         ));
     }

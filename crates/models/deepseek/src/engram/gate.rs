@@ -8,7 +8,7 @@
 use crate::precision::{bf16_to_f32, f32_to_bf16_rne};
 use thiserror::Error;
 
-const MAX_ENGRAM_GATE_ELEMENTS: usize = 1 << 20;
+const MAX_ENGRAM_GATE_ELEMENTS: usize = 1 << 22;
 
 /// Explicit shape of one bounded Engram residual-gate call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,10 +473,10 @@ mod tests {
             Err(EngramGateError::ShapeOverflow { field: "rows" })
         );
         assert_eq!(
-            EngramGateLayout::new(1, 1, 1, (1 << 20) + 1),
+            EngramGateLayout::new(1, 1, 1, (1 << 22) + 1),
             Err(EngramGateError::ElementLimit {
                 field: "stream",
-                elements: (1 << 20) + 1,
+                elements: (1 << 22) + 1,
             })
         );
     }

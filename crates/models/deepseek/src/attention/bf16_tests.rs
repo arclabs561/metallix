@@ -111,7 +111,7 @@ fn sink_is_added_after_key_blocks_without_changing_the_running_maximum() {
 #[test]
 fn rejects_expensive_geometry_and_finite_input_arithmetic_overflow() {
     assert!(matches!(
-        sparse_attention_bf16_reference(&[], &[], &[], &[], 1.0, layout(1024, 1, 8193)),
+        sparse_attention_bf16_reference(&[], &[], &[], &[], 1.0, layout(1024, 1, 1_048_577)),
         Err(SparseAttentionBf16Error::WorkloadTooLarge { .. })
     ));
     assert!(matches!(

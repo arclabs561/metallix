@@ -19,7 +19,7 @@ use crate::{
 // Real V4.1 output weights hold 33.5M (`wo_a`) and 41.9M (`wo_b`) elements;
 // a three-token prefill needs about 2.3e8 multiply-adds.
 const MAX_ATTENTION_OUTPUT_ELEMENTS: usize = 1 << 26;
-const MAX_ATTENTION_OUTPUT_WORK: usize = 1 << 28;
+const MAX_ATTENTION_OUTPUT_WORK: usize = 1 << 34;
 
 /// Explicit layout for attention's inverse-RoPE and output projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn rejects_total_projection_work_before_staging() {
         assert!(matches!(
-            AttentionOutputLayout::new(8_192, 1, 1, 32, 1, 1, 1_024, 32),
+            AttentionOutputLayout::new(8_192, 1, 1, 32, 1, 1, 1_024, 2_048),
             Err(AttentionOutputLayoutError::WorkLimit { .. })
         ));
     }

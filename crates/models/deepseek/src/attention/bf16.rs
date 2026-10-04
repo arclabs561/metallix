@@ -10,9 +10,9 @@ use thiserror::Error;
 use super::{SparseAttentionError, SparseAttentionLayout, validate_inputs};
 
 /// Largest one-buffer BF16 sparse-attention input or output accepted here.
-pub const MAX_BF16_ATTENTION_ELEMENTS: usize = 1 << 20;
+pub const MAX_BF16_ATTENTION_ELEMENTS: usize = 1 << 23;
 
-const MAX_BF16_ATTENTION_WORK: usize = 1 << 24;
+const MAX_BF16_ATTENTION_WORK: usize = 1 << 31;
 const BLOCK: usize = 64;
 const EMPTY_ROW_MAX: f32 = -1.0e30;
 

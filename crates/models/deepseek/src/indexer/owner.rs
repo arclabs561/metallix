@@ -28,7 +28,7 @@ use super::{
     },
 };
 
-const MAX_RATIO_ONE_OWNER_WORK: usize = 1 << 24;
+const MAX_RATIO_ONE_OWNER_WORK: usize = 1 << 29;
 
 /// Borrowed BF16 parameters for one ratio-one owner call.
 ///

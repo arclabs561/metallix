@@ -10,7 +10,7 @@ use thiserror::Error;
 /// Largest one-buffer BF16 linear input, weight, or output accepted here.
 /// Admits one real V4.1 `wo_a` group (1024 x 4096 BF16 weights).
 pub const MAX_BF16_LINEAR_ELEMENTS: usize = 1 << 23;
-const MAX_BF16_LINEAR_WORK: usize = 1 << 24;
+const MAX_BF16_LINEAR_WORK: usize = 1 << 30;
 
 /// An invalid bounded scalar BF16 linear request.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -253,7 +253,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            bf16_linear_reference(&[], &[], 512, 32, 1_025, &mut output),
+            bf16_linear_reference(&[], &[], 2_048, 4_096, 129, &mut output),
             Err(Bf16LinearError::WorkLimit { .. })
         ));
         assert!(matches!(

@@ -8,8 +8,10 @@
 use thiserror::Error;
 
 /// Largest one-buffer FP32 linear input, weight, or output accepted here.
-pub const MAX_FP32_LINEAR_ELEMENTS: usize = 1 << 20;
-const MAX_FP32_LINEAR_WORK: usize = 1 << 24;
+///
+/// Sized for the real V4.1 ratio-two compressor `wkv`/`wgate` (`512 x 5120`).
+pub const MAX_FP32_LINEAR_ELEMENTS: usize = 1 << 22;
+const MAX_FP32_LINEAR_WORK: usize = 1 << 29;
 
 /// An invalid bounded scalar FP32 linear request.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -297,7 +299,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            fp32_linear_reference(&[], &[], 512, 32, 1_025, &mut output),
+            fp32_linear_reference(&[], &[], 2_048, 2_048, 129, &mut output),
             Err(Fp32LinearError::WorkLimit { .. })
         ));
         assert!(matches!(
