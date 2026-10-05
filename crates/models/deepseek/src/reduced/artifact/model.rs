@@ -1072,6 +1072,108 @@ mod tests {
         .unwrap();
     }
 
+    /// Lends one layer's routed experts from the artifact table, counting calls.
+    struct TableSource<'a> {
+        experts: Vec<Fp4ExpertWeights<'a>>,
+        calls: std::cell::Cell<usize>,
+        available: bool,
+    }
+
+    impl<'a> TableSource<'a> {
+        fn new(experts: Vec<Fp4ExpertWeights<'a>>, available: bool) -> Self {
+            Self {
+                experts,
+                calls: std::cell::Cell::new(0),
+                available,
+            }
+        }
+    }
+
+    impl crate::moe::RoutedExpertSource for TableSource<'_> {
+        fn with_expert(
+            &self,
+            index: usize,
+            run: &mut dyn FnMut(Fp4ExpertWeights<'_>) -> Result<Vec<u16>, crate::moe::MoEError>,
+        ) -> Result<Vec<u16>, crate::moe::MoEError> {
+            self.calls.set(self.calls.get() + 1);
+            match self.experts.get(index) {
+                Some(expert) if self.available => run(*expert),
+                _ => Err(crate::moe::MoEError::ExpertUnavailable {
+                    index,
+                    reason: String::from("withheld by test source"),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn per_layer_expert_sources_reproduce_the_owned_expert_tables() {
+        let artifact = artifact();
+        let (config, tensors) = (&artifact.config, &artifact.tensors);
+        let ids = ids(config);
+        let sources = [STARTUP_LAYER, LAYER_ONE, LAYER_TWO, LAYER_THREE, LAYER_FOUR]
+            .map(|layer| TableSource::new(routed(config, tensors, layer).unwrap(), true));
+        with_parts(config, tensors, |parts| {
+            let model = from_schedule(&parts, reduced_schedule(&parts)).unwrap();
+            // Every model layer, startup included, fetches through a source.
+            let experts: Vec<Option<&dyn crate::moe::RoutedExpertSource>> = sources
+                .iter()
+                .map(|source| Some(source as &dyn crate::moe::RoutedExpertSource))
+                .collect();
+            let mut owned = RequestSession::new(&model).unwrap();
+            let mut fetched = RequestSession::new(&model).unwrap();
+
+            // A malformed slice is rejected before admission.
+            assert!(matches!(
+                fetched.step_with_experts(&ids[..3], &experts[1..]),
+                Err(RequestError::ExpertSourceCount {
+                    expected: 5,
+                    actual: 4
+                })
+            ));
+            assert!(!fetched.is_poisoned());
+
+            let mut chunks = vec![&ids[..3]];
+            chunks.extend(ids[3..].chunks(1));
+            for chunk in chunks {
+                let calls: Vec<usize> = sources.iter().map(|source| source.calls.get()).collect();
+                let left = owned.step(chunk).unwrap();
+                let right = fetched.step_with_experts(chunk, &experts).unwrap();
+                assert_eq!(format!("{left:?}"), format!("{right:?}"));
+                for (source, before) in sources.iter().zip(calls) {
+                    assert!(
+                        source.calls.get() > before,
+                        "every layer fetched its experts"
+                    );
+                }
+            }
+
+            let withheld = TableSource::new(routed(config, tensors, LAYER_TWO)?, false);
+            let mut failing = experts.clone();
+            failing[2] = Some(&withheld);
+            let mut request = RequestSession::new(&model).unwrap();
+            assert!(matches!(
+                request.step_with_experts(&ids[..3], &failing),
+                Err(RequestError::Tail(_))
+            ));
+            assert!(withheld.calls.get() > 0);
+            assert!(request.is_poisoned());
+
+            let withheld = TableSource::new(routed(config, tensors, STARTUP_LAYER)?, false);
+            let mut failing = experts.clone();
+            failing[0] = Some(&withheld);
+            let mut request = RequestSession::new(&model).unwrap();
+            assert!(matches!(
+                request.step_with_experts(&ids[..3], &failing),
+                Err(RequestError::Startup(_))
+            ));
+            assert!(withheld.calls.get() > 0);
+            assert!(request.is_poisoned());
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,

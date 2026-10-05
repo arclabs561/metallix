@@ -10,6 +10,7 @@ use crate::{
         LayerAttentionDiagnostic, LayerAttentionError, LayerAttentionLayout, LayerAttentionState,
         LayerAttentionWeights,
     },
+    moe::RoutedExpertSource,
     startup_bf16_reference,
 };
 
@@ -96,6 +97,18 @@ impl<'a> StartupSession<'a> {
         ids: &[u64],
         frequencies: &[RotaryFrequency],
     ) -> Result<StartupStepOutput, StartupSessionError> {
+        self.step_with(start, ids, frequencies, None)
+    }
+
+    /// Same as [`Self::step`], with the block tail's routed experts fetched
+    /// from `experts` when supplied instead of its construction-time table.
+    pub fn step_with(
+        &mut self,
+        start: usize,
+        ids: &[u64],
+        frequencies: &[RotaryFrequency],
+        experts: Option<&dyn RoutedExpertSource>,
+    ) -> Result<StartupStepOutput, StartupSessionError> {
         if self.poisoned {
             return Err(StartupSessionError::Poisoned);
         }
@@ -132,7 +145,10 @@ impl<'a> StartupSession<'a> {
             .chunks_exact(self.width * self.copies)
             .zip(attention.final_output.chunks_exact(self.width))
         {
-            let diagnostic = self.tail.forward_token(initial, attended)?;
+            let diagnostic = match experts {
+                Some(experts) => self.tail.forward_token_with(initial, attended, experts)?,
+                None => self.tail.forward_token(initial, attended)?,
+            };
             residual.extend_from_slice(diagnostic.ffn().output_bf16());
             next_pre.extend_from_slice(diagnostic.ffn().coefficients().pre());
             tails.push(diagnostic);

@@ -25,6 +25,7 @@ use crate::{
         key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
         query::{CandidateQueryLayout, CandidateQueryWeights, IndexScoreExecution},
     },
+    moe::RoutedExpertSource,
 };
 
 use super::{
@@ -778,6 +779,34 @@ impl<'a> RequestSession<'a> {
 
     /// Executes a prefill at start zero or one-token decode at the request cursor.
     pub fn step(&mut self, ids: &[i64]) -> Result<RequestStepOutput, RequestError> {
+        self.step_admitting(ids, None)
+    }
+
+    /// Same as [`Self::step`], with each layer's routed experts fetched from a source.
+    ///
+    /// `experts[n]` serves model layer `n` (0 is startup, `n` is scheduled
+    /// layer `n`); `None` keeps that layer's construction-time expert table.
+    /// The slice must have one entry per model layer.
+    pub fn step_with_experts(
+        &mut self,
+        ids: &[i64],
+        experts: &[Option<&dyn RoutedExpertSource>],
+    ) -> Result<RequestStepOutput, RequestError> {
+        let expected = self.model.layers.len() + 1;
+        if experts.len() != expected {
+            return Err(RequestError::ExpertSourceCount {
+                expected,
+                actual: experts.len(),
+            });
+        }
+        self.step_admitting(ids, Some(experts))
+    }
+
+    fn step_admitting(
+        &mut self,
+        ids: &[i64],
+        experts: Option<&[Option<&dyn RoutedExpertSource>]>,
+    ) -> Result<RequestStepOutput, RequestError> {
         if self.poisoned {
             return Err(RequestError::Poisoned);
         }
@@ -798,7 +827,7 @@ impl<'a> RequestSession<'a> {
             });
         }
         self.poisoned = true;
-        let result = self.step_admitted(ids, end);
+        let result = self.step_admitted(ids, end, experts);
         if result.is_ok() {
             self.poisoned = false;
         }
@@ -813,6 +842,7 @@ impl<'a> RequestSession<'a> {
         &mut self,
         ids: &[i64],
         end: usize,
+        experts: Option<&[Option<&dyn RoutedExpertSource>]>,
     ) -> Result<RequestStepOutput, RequestError> {
         let start = self.next_start;
         let positions = NonZeroUsize::new(ids.len()).expect("nonempty ids");
@@ -821,9 +851,12 @@ impl<'a> RequestSession<'a> {
         let startup_frequencies =
             frequency_span(self.model.startup.frequencies, start, ids.len(), rope_pairs)?;
         let startup_ids = ids_to_u64(ids)?;
-        let startup = self
-            .startup
-            .step(start, &startup_ids, startup_frequencies)?;
+        let startup = self.startup.step_with(
+            start,
+            &startup_ids,
+            startup_frequencies,
+            experts.and_then(|experts| experts[0]),
+        )?;
         let mut residual = startup.residual().to_vec();
         let mut pre = startup.next_pre().to_vec();
         let partial_group = !completes_ratio_two_group(start, ids.len());
@@ -831,12 +864,13 @@ impl<'a> RequestSession<'a> {
         // Indices into `outputs` of the latest owner and latest index publisher.
         let mut latest_owner = None;
         let mut latest_indices = None;
-        for ((definition, state), engram) in self
+        for (index, ((definition, state), engram)) in self
             .model
             .layers
             .iter()
             .zip(&mut self.layers)
             .zip(&mut self.engrams)
+            .enumerate()
         {
             let engram = engram
                 .as_mut()
@@ -958,6 +992,7 @@ impl<'a> RequestSession<'a> {
                 block_residual,
                 attention.final_output(),
                 ids.len(),
+                experts.and_then(|experts| experts[index + 1]),
             )?;
             match attention {
                 ScheduledAttentionOutput::RatioTwoOwner(_)
@@ -1317,6 +1352,9 @@ pub enum RequestError {
     /// The layer schedule is not a valid sequence of producers and consumers.
     #[error("schedule layer {layer}: {reason}")]
     Schedule { layer: usize, reason: ScheduleError },
+    /// A per-layer expert-source slice did not have one entry per model layer.
+    #[error("request needs {expected} per-layer expert sources, got {actual}")]
+    ExpertSourceCount { expected: usize, actual: usize },
     /// A requested static or dynamic request surface exceeds its bound.
     #[error("request has {elements} tokens beyond the bounded maximum")]
     ElementLimit { elements: usize },
@@ -1476,6 +1514,7 @@ fn tails(
     residual: &[u16],
     attention: &[u16],
     positions: usize,
+    experts: Option<&dyn RoutedExpertSource>,
 ) -> Result<TailOutputs, RequestError> {
     let (copies, width) = block.geometry();
     let residual_stride = copies
@@ -1513,7 +1552,12 @@ fn tails(
         .chunks_exact(residual_stride)
         .zip(attention.chunks_exact(width))
     {
-        let tail = block.tail.forward_token(residual_row, attention_row)?;
+        let tail = match experts {
+            Some(experts) => block
+                .tail
+                .forward_token_with(residual_row, attention_row, experts)?,
+            None => block.tail.forward_token(residual_row, attention_row)?,
+        };
         next_residual.extend_from_slice(tail.ffn().output_bf16());
         next_pre.extend_from_slice(tail.ffn().coefficients().pre());
         diagnostics.push(tail);
