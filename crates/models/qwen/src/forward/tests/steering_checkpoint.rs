@@ -36,11 +36,15 @@ fn cache_snapshot(
             let keys = layer
                 .keys
                 .as_type_device::<f32>(StreamOrDevice::gpu())
-                .expect("lossless key widening");
+                .expect("lossless key widening")
+                .contiguous()
+                .expect("row-major key cache");
             let values = layer
                 .values
                 .as_type_device::<f32>(StreamOrDevice::gpu())
-                .expect("lossless value widening");
+                .expect("lossless value widening")
+                .contiguous()
+                .expect("row-major value cache");
             keys.eval().expect("materialized key cache");
             values.eval().expect("materialized value cache");
             (

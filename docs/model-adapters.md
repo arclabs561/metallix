@@ -15,7 +15,7 @@ interface cannot describe a vision encoder, audio codec, forecast model, or
 iterative denoiser accurately. Fast execution depends on preserving those
 model-specific shapes, state lifetimes, precision choices, and device graphs.
 
-Today the workspace pins `mlx-rs 0.25.3`. MLX arrays and graph execution live in
+Today the workspace pins `mlx-rs 0.32.0`. MLX arrays and graph execution live in
 the Qwen and DeepSeek crates. Qwen has the working decoder; DeepSeek has
 source-grounded scalar and bounded Metal operators plus a connected reduced
 five-block request and head. The artifact CLI exposes mixed scoring/key rotation;

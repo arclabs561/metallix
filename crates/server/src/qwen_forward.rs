@@ -755,7 +755,7 @@ fn generate_inner(
     let mut report = json!({
     "schema_version": 1,
     "operation": if sampled { "qwen3_sampled_cached_generation" } else { "qwen3_greedy_cached_generation" },
-    "backend": "mlx-rs 0.25.3 Metal float32",
+    "backend": "mlx-rs 0.32.0 Metal float32",
     "input_format": input_format.report(),
     "input_ids": input_ids,
     "generated_ids": generated,
@@ -1120,7 +1120,7 @@ fn generate_schedule_candidates(
         "model_identity_scope": "local model directory and config bytes; checkpoint weights are not fingerprinted",
         "sampling": sampling.report(),
         "constraint_identity": constraint_identity,
-        "backend": "mlx-rs 0.25.3 Metal float32",
+        "backend": "mlx-rs 0.32.0 Metal float32",
         "input_format": input_format.report(),
         "input_ids": input_ids,
         "generated_ids": generated,
@@ -1396,7 +1396,7 @@ fn measure(
         serde_json::to_string_pretty(&json!({
             "schema_version": 1,
             "operation": "uncached_qwen3_last_token_logits",
-            "backend": "mlx-rs 0.25.3 Metal float32",
+            "backend": "mlx-rs 0.32.0 Metal float32",
             "input_ids": input_ids,
             "vocabulary_logits": logits.len(),
         "checkpoint_payload_bytes": weights.inspection().tensor_bytes(),

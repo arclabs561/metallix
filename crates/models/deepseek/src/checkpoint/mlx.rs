@@ -3,6 +3,11 @@
 //! This is the first native bridge for the MLX checkpoint layout. It decodes
 //! bounded rows only; it does not load a model or allocate a full tensor.
 
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},

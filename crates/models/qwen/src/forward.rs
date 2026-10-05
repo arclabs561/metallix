@@ -6,6 +6,11 @@
 //! normalization and GQA tensors; any kernel fusion belongs behind an
 //! equivalent numerical test.
 
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+
 use std::{collections::HashMap, hash::BuildHasher};
 
 #[cfg(test)]
@@ -485,16 +490,6 @@ fn last_normalized_hidden<S: BuildHasher>(
     )
 }
 
-/// Smallest padded length for a batch of more than one sequence; see
-/// [`forward_last_hidden_batch`].
-///
-/// Workaround for MLX 0.25 (mlx-sys 0.2.0): its attention returns wrong rows
-/// for causal batches of two or more sequences with 2 to 8 positions.
-/// `tests/mlx_short_batch_attention.rs` asserts that bug and fails once an MLX
-/// upgrade (the planned mlx-rs 0.32) fixes it; then remove this padding and
-/// confirm with the opt-in `tests/embedding_batch.rs`.
-const MIN_BATCHED_POSITIONS: usize = 9;
-
 /// Last-position final-norm hidden states for several sequences in one
 /// forward pass, one `hidden_size` row per sequence, in input order.
 ///
@@ -516,15 +511,6 @@ pub fn forward_last_hidden_batch<S: BuildHasher>(
         .map(|ids| ids.len())
         .max()
         .ok_or(Qwen3ForwardError::EmptyInput)?;
-    // MLX 0.25's short-query attention path returns wrong rows for causal
-    // batches of more than one sequence padded to 8 or fewer positions (seen on
-    // Qwen3-Embedding-0.6B: cosine near 0 against single passes; 9 positions
-    // match). Extra trailing padding is harmless under causal attention.
-    let longest = if sequences.len() > 1 {
-        longest.max(MIN_BATCHED_POSITIONS)
-    } else {
-        longest
-    };
     let mut padded = Vec::with_capacity(sequences.len() * longest);
     let mut last_rows = Vec::with_capacity(sequences.len());
     for (index, ids) in sequences.iter().enumerate() {
@@ -1185,6 +1171,7 @@ fn cached_attention<S: BuildHasher>(
         attention_values,
         attention_scale(config)?,
         mask,
+        Option::<&Array>::None,
         &stream,
     )?;
     *cache = Some(Qwen3LayerKv { keys, values });
@@ -1482,6 +1469,7 @@ fn attention<S: BuildHasher>(
             // One unpadded sequence: every position attends to every position.
             Qwen3Attention::Bidirectional => None,
         },
+        Option::<&Array>::None,
         &stream,
     )?
     .transpose_axes_device(&[0, 2, 1, 3], &stream)?

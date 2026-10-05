@@ -6,6 +6,11 @@
 //! Metal. It is not device-resident index selection, BF16/TileLang parity,
 //! throughput evidence, or a decoder implementation.
 
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+
 use mlx_rs::{
     Array, StreamOrDevice,
     ops::{self, indexing::TryIndexOp},

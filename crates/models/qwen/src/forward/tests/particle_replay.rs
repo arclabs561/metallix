@@ -190,6 +190,24 @@ proptest! {
     }
 }
 
+/// Full prefill and cached decode reduce in different orders. On Qwen3-0.6B
+/// they differ by up to 6.2e-5 here under MLX 0.32, against 2.3e-5 under
+/// MLX 0.25. Measured against a float64 HF forward over all 151,936 logits of
+/// 11 prompts (3 to 460 tokens), MLX 0.32's worst error is 6.1e-5 against
+/// 4.3e-5 for MLX 0.25. The increase is in full prefill of short prompts like
+/// these: 1.5x to 3.7x MLX 0.25's error for 3 to 7 tokens (logits up to 24).
+/// From 17 tokens up MLX 0.32 is closer to the reference. The synthetic tests
+/// keep 5e-5.
+fn assert_checkpoint_logits_match(full: Vec<f32>, cached: Vec<f32>) {
+    assert_eq!(full.len(), cached.len());
+    for (full, cached) in full.into_iter().zip(cached) {
+        assert!(
+            (full - cached).abs() <= 1e-4,
+            "cached logit {cached} differs from full logit {full}"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
 fn checkpoint_particle_ancestry_fork_replays_next_logits() {
@@ -224,7 +242,7 @@ fn checkpoint_particle_ancestry_fork_replays_next_logits() {
         assert_eq!(child.cached_tokens(), 3);
         assert_eq!(child.kv_bytes(), parents[parent].0.kv_bytes());
         assert_eq!(cache_snapshot(child), parents[parent].2);
-        assert_logits_match(
+        assert_checkpoint_logits_match(
             weights
                 .executor()
                 .prefill_last_logits(&[9_707, 11, parent_tails[parent]])
@@ -238,7 +256,7 @@ fn checkpoint_particle_ancestry_fork_replays_next_logits() {
         (151_645, &[9_707, 11, 13, 151_645][..]),
     ]) {
         let logits = child.decode_last_logits(token).expect("live child decode");
-        assert_logits_match(
+        assert_checkpoint_logits_match(
             weights
                 .executor()
                 .prefill_last_logits(prefix)
@@ -252,7 +270,7 @@ fn checkpoint_particle_ancestry_fork_replays_next_logits() {
         eos_cache,
         "EOS cache is unchanged"
     );
-    assert_logits_match(
+    assert_checkpoint_logits_match(
         weights
             .executor()
             .prefill_last_logits(&[9_707, 11, 151_645])

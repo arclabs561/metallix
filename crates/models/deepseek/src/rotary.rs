@@ -7,6 +7,11 @@
 //! general tensor implementation, `RoPE`-frequency generator, Metal kernel, or
 //! full V4.1 attention claim.
 
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+
 use std::num::NonZeroUsize;
 
 #[cfg(feature = "metal")]

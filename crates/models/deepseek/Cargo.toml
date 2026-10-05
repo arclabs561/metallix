@@ -9,7 +9,7 @@ publish.workspace = true
 [dependencies]
 blockfloat = { path = "../../blockfloat" }
 mlx-rs = { workspace = true, optional = true }
-mlx-sys = { version = "=0.2.0", optional = true }
+mlx-sys = { version = "=0.6.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

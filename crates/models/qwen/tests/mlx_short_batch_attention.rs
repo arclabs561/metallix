@@ -1,13 +1,15 @@
-//! Tripwire for the MLX 0.25 attention bug behind `MIN_BATCHED_POSITIONS` in
-//! `src/forward.rs`.
+//! Regression test for the MLX 0.25 short causal batch attention bug.
 //!
 //! With MLX 0.25 (mlx-sys 0.2.0), causal scaled-dot-product attention over a
-//! batch of two or more sequences returns wrong rows when the query length is
-//! 2 through 8 and the head width is 64 or 128. One sequence, a query length
-//! of 1 or 9, and a head width of 4 all match. This test asserts that state.
-//! When an MLX upgrade fixes it, this test fails: then drop the workaround and
-//! run the opt-in `tests/embedding_batch.rs` to confirm.
+//! batch of two or more sequences returned wrong rows when the query length
+//! was 2 through 8 and the head width was 64 or 128, so `src/forward.rs`
+//! padded batches to 9 positions. MLX 0.32 (mlx-sys 0.6.0) computes those rows
+//! exactly; this test keeps it that way so the padding can stay deleted.
 #![cfg(feature = "metal")]
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
 
 use mlx_rs::{Array, StreamOrDevice, fast, random};
 
@@ -24,9 +26,16 @@ fn batched_minus_alone(batch: i32, length: i32, heads: i32, kv_heads: i32, width
     #[allow(clippy::cast_precision_loss, reason = "small head widths")]
     let scale = (width as f32).powf(-0.5);
     let causal = || Some(fast::ScaledDotProductAttentionMask::Causal);
-    let batched =
-        fast::scaled_dot_product_attention_device(&query, &key, &value, scale, causal(), &stream)
-            .unwrap();
+    let batched = fast::scaled_dot_product_attention_device(
+        &query,
+        &key,
+        &value,
+        scale,
+        causal(),
+        Option::<&Array>::None,
+        &stream,
+    )
+    .unwrap();
     (0..batch)
         .map(|row| {
             let pick = |array: &Array| {
@@ -40,6 +49,7 @@ fn batched_minus_alone(batch: i32, length: i32, heads: i32, kv_heads: i32, width
                 pick(&value),
                 scale,
                 causal(),
+                Option::<&Array>::None,
                 &stream,
             )
             .unwrap();
@@ -51,22 +61,20 @@ fn batched_minus_alone(batch: i32, length: i32, heads: i32, kv_heads: i32, width
                 .max(None)
                 .unwrap();
             difference.eval().unwrap();
-            difference.item::<f32>()
+            difference.item_exact::<f32>()
         })
         .fold(0.0, f32::max)
 }
 
 #[test]
-fn mlx_short_causal_batches_still_need_padding() {
-    // Qwen3-Embedding-0.6B attention: 16 query heads, 8 key/value heads, width 128.
-    for length in [2, 5, 8] {
-        let difference = batched_minus_alone(2, length, 16, 8, 128);
-        assert!(
-            difference > 1.0,
-            "length {length}: batched rows now match ({difference:e}); MLX may have fixed short causal batches"
-        );
-    }
+fn mlx_short_causal_batches_match_single_sequences() {
+    // Qwen3-Embedding-0.6B attention: 16 query heads, 8 key/value heads, width
+    // 128. Lengths 2 through 8 are the ones MLX 0.25 got wrong.
     for (batch, length, heads, kv_heads, width) in [
+        (2, 2, 16, 8, 128),
+        (2, 5, 16, 8, 128),
+        (2, 8, 16, 8, 128),
+        (3, 4, 16, 8, 64),
         (1, 8, 16, 8, 128),
         (2, 9, 16, 8, 128),
         (2, 1, 16, 8, 128),

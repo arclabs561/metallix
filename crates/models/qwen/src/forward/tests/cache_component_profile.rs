@@ -192,6 +192,7 @@ fn build_attention_outputs(
             &values,
             scale,
             None::<fast::ScaledDotProductAttentionMask<'_>>,
+            Option::<&Array>::None,
             &stream,
         )
         .expect("attention component graph");

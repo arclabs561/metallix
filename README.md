@@ -51,6 +51,12 @@ export PATH="$PWD/target/release:$PATH"
 This builds `mx` (and the identical `metallix`). Without the `metal` feature
 only `inspect`, `fetch` and the reduced DeepSeek runner are available.
 
+A `metal` build also writes MLX's compiled kernels, `mlx.metallib`, to
+`~/.mlx/lib/<key>/`, or to `$MLX_RS_METAL_PATH` if that is set at build time.
+`mx` loads `mlx.metallib` from its own directory if one is there, and
+otherwise from that build-time path. To run `mx` on another machine or
+account, copy `mlx.metallib` next to the binary.
+
 ## Quick start
 
 Write a registry, `models.json`:

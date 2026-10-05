@@ -39,7 +39,7 @@ httparse = { version = "=1.10.1", optional = true }
 jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 rustix = { version = "=1.1.4", features = ["fs"], optional = true }
 mlx-rs = { workspace = true, optional = true }
-mlx-sys = { version = "=0.2.0", optional = true }
+mlx-sys = { version = "=0.6.0", optional = true }
 tracing.workspace = true
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "env-filter", "tracing-log", "ansi"] }
 tracing-chrome = { version = "=0.7.2", optional = true }

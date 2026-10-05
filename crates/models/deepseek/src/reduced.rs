@@ -16,6 +16,11 @@
 //! # Ok::<(), deepseek::reduced::FinalHeadError>(())
 //! ```
 
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+
 mod ratio_two;
 pub use ratio_two::{
     RatioTwoCompressedOwner, RatioTwoOwnerCall, RatioTwoOwnerDiagnostic, RatioTwoOwnerError,

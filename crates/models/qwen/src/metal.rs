@@ -2,6 +2,11 @@
 //! The loaded checkpoint retains its decoder configuration and lends tensors
 //! to independent sequence executors.
 
+#![allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+
 use std::{collections::HashMap, fs, path::Path};
 
 use mlx_rs::{Array, StreamOrDevice};
@@ -162,7 +167,7 @@ pub fn run_metal_smoke() -> Result<Qwen3MetalSmoke, Qwen3MetalSmokeError> {
     let right = Array::from_slice(&[3.0_f32], &[1, 1]);
     let product = left.matmul_device(&right, StreamOrDevice::gpu())?;
     product.eval()?;
-    let product = product.item::<f32>();
+    let product = product.item_exact::<f32>();
     if !product.is_finite() || (product - 6.0).abs() > f32::EPSILON {
         return Err(Qwen3MetalSmokeError::UnexpectedProduct(product));
     }

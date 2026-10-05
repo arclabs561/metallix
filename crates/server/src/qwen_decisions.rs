@@ -120,7 +120,7 @@ fn decision_receipt(
         "schema_version": 1,
         "operation": "qwen_typed_decision_prefill",
         "model": model,
-        "backend": "mlx-rs 0.25.3 Metal float32",
+        "backend": "mlx-rs 0.32.0 Metal float32",
         "session_load_ms": session.load_ms(),
         "calibration": {
             "status": "uncalibrated",

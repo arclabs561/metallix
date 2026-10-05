@@ -487,6 +487,7 @@ fn capacity_attention(
             &value_prefix,
             attention_scale(config)?,
             Some(fast::ScaledDotProductAttentionMask::Causal),
+            Option::<&Array>::None,
             &stream,
         )?
     } else {
@@ -496,6 +497,7 @@ fn capacity_attention(
             &value_prefix,
             attention_scale(config)?,
             None::<fast::ScaledDotProductAttentionMask<'_>>,
+            Option::<&Array>::None,
             &stream,
         )?
     };
