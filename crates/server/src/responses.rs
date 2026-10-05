@@ -715,6 +715,8 @@ fn response_value(
         output.push(json!({"type":"function_call","id":format!("fc_{id}_{index}"),"call_id":format!("call_{id}_{index}"),"name":call.name,"arguments":call.arguments.to_string(),"status":"completed"}));
     }
     let mut response = json!({"id":id,"object":"response","model":request.model,"status":if complete {"completed"} else {"incomplete"},"output":output,"incomplete_details":if complete {Value::Null} else {json!({"reason":"max_output_tokens"})},"usage":{"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()},"metrics":generated.metrics});
+    response["usage"]["input_tokens_details"]["cached_tokens"] =
+        generated.metrics.cached_prompt_tokens.into();
     if let Some(sampling) = &generated.sampling {
         response["metallix"] = json!({ "sampling": sampling });
     }
@@ -1075,6 +1077,7 @@ mod tests {
 
         let request = request_with(&json!({"top_logprobs":1,"temperature":1.0})).unwrap();
         let mut generated = generation("hi");
+        generated.metrics.cached_prompt_tokens = 1;
         generated.sampling = Some(
             SamplingRequest {
                 temperature: Some(1.0),
@@ -1096,6 +1099,10 @@ mod tests {
         assert_eq!(logprobs[0]["bytes"], json!([104, 105]));
         assert_eq!(logprobs[0]["logprob"], -0.25);
         assert_eq!(response["metallix"]["sampling"]["seed"], 9);
+        assert_eq!(
+            response["usage"]["input_tokens_details"]["cached_tokens"],
+            1
+        );
         assert_eq!(response["metallix"]["sampling"]["temperature"], 1.0);
         assert_eq!(
             response["metallix"]["sampling"]["defaults_applied"],
