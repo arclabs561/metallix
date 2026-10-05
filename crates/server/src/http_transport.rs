@@ -318,9 +318,15 @@ fn validate_header_wire(input: &[u8]) -> Result<(), HttpError> {
 }
 
 fn remaining(deadline: Instant) -> Result<Duration, HttpError> {
+    time_left(deadline, Instant::now()).ok_or(HttpError::timeout())
+}
+
+/// Positive time before `deadline`. A deadline reached exactly counts as
+/// expired: sockets reject a zero timeout as invalid input, not a timeout.
+fn time_left(deadline: Instant, now: Instant) -> Option<Duration> {
     deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(HttpError::timeout())
+        .checked_duration_since(now)
+        .filter(|left| !left.is_zero())
 }
 
 fn deadline_after(duration: Duration) -> Instant {
@@ -330,8 +336,7 @@ fn deadline_after(duration: Duration) -> Instant {
 }
 
 fn remaining_io(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
+    time_left(deadline, Instant::now())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "response write deadline exceeded"))
 }
 
@@ -347,14 +352,14 @@ fn map_read_error(kind: io::ErrorKind) -> HttpError {
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::{Shutdown, TcpListener, TcpStream},
+        net::{Shutdown, TcpListener, TcpStream, UdpSocket},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use proptest::prelude::*;
 
-    use super::{Connection, HttpError, Request, TransportLimits};
+    use super::{Connection, HttpError, Request, TransportLimits, time_left};
 
     fn limits() -> TransportLimits {
         TransportLimits {
@@ -603,6 +608,25 @@ mod tests {
         connection.flush().unwrap();
         drop(connection);
         assert_eq!(client.join().unwrap(), response);
+    }
+
+    #[test]
+    fn a_deadline_reached_exactly_is_expired_not_a_zero_timeout() {
+        let now = Instant::now();
+        let later = now + Duration::from_millis(1);
+        // The socket layer rejects a zero timeout as invalid, so a deadline
+        // equal to now must not reach it as `Some(Duration::ZERO)`.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            socket
+                .set_write_timeout(Some(Duration::ZERO))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(time_left(now, now), None);
+        assert_eq!(time_left(now, later), None);
+        assert_eq!(time_left(later, now), Some(Duration::from_millis(1)));
     }
 
     #[test]
