@@ -63,6 +63,30 @@ pub enum EngramEmbeddingError {
     /// A selected value or its scale is nonfinite, or BF16 narrowing overflows.
     #[error("Engram embedding selected element {element} is nonfinite or overflows BF16")]
     NonFinite { element: usize },
+    /// A row source could not supply a selected row.
+    #[error("Engram embedding rows unavailable: {reason}")]
+    RowsUnavailable { reason: String },
+}
+
+/// Supplies selected rows of one layer's FP8 Engram table on demand.
+///
+/// Real V4.1 tables are far too large to hold, so a lookup asks only for the
+/// rows its hash IDs select. An implementation must fill every requested row
+/// or return an error; it must never substitute zeros for a missing row.
+pub trait EngramRowSource {
+    /// Writes `rows` (ascending, distinct, in-table) as FP8 codes
+    /// `[rows.len(), width]` and E8M0 scales `[rows.len(), width / 32]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngramEmbeddingError::RowsUnavailable`] or a length error when
+    /// any requested row cannot be supplied exactly.
+    fn read_rows(
+        &self,
+        rows: &[usize],
+        codes: &mut [u8],
+        scales: &mut [u8],
+    ) -> Result<(), EngramEmbeddingError>;
 }
 
 fn bounded_product(left: usize, right: usize) -> Result<usize, EngramEmbeddingError> {
@@ -138,6 +162,64 @@ pub fn engram_embedding_bf16_reference(
         }
     }
     Ok(())
+}
+
+/// Looks up flattened hash IDs in a `table_rows`-row table read from `source`.
+///
+/// Only distinct in-table rows the IDs select are requested. They are gathered
+/// into a compact table and looked up with [`engram_embedding_bf16_reference`],
+/// so decoding, masking, and narrowing are those of the owned-table path.
+/// Errors leave `output` unchanged.
+///
+/// # Errors
+/// Returns [`EngramEmbeddingError`] for invalid shapes, an oversized selection,
+/// a source failure, or a nonfinite selected value.
+pub fn engram_embedding_bf16_from_source(
+    ids: &[i64],
+    table_rows: usize,
+    width: usize,
+    source: &dyn EngramRowSource,
+    output: &mut [u16],
+) -> Result<(), EngramEmbeddingError> {
+    if table_rows == 0 || width == 0 {
+        return Err(EngramEmbeddingError::EmptyDimension);
+    }
+    let group = 32;
+    if !width.is_multiple_of(group) {
+        return Err(EngramEmbeddingError::InvalidGroup { width, group });
+    }
+    let output_elements = bounded_product(ids.len(), width)?;
+    if output.len() != output_elements {
+        return Err(EngramEmbeddingError::Length {
+            field: "output",
+            actual: output.len(),
+            expected: output_elements,
+        });
+    }
+    let mut rows: Vec<usize> = ids
+        .iter()
+        .filter_map(|&id| selected_row(id, table_rows))
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() {
+        output.fill(0);
+        return Ok(());
+    }
+    let layout = EngramEmbeddingLayout::new(rows.len(), width, group)?;
+    let mut codes = vec![0; layout.elements];
+    let mut scales = vec![0; layout.elements / group];
+    source.read_rows(&rows, &mut codes, &mut scales)?;
+    // Masked IDs stay negative, so the compact lookup masks them as well.
+    let compact: Vec<i64> = ids
+        .iter()
+        .map(|&id| {
+            selected_row(id, table_rows)
+                .and_then(|row| rows.binary_search(&row).ok())
+                .map_or(-1, |index| i64::try_from(index).unwrap_or(-1))
+        })
+        .collect();
+    engram_embedding_bf16_reference(&compact, &codes, &scales, layout, output)
 }
 
 #[cfg(test)]
