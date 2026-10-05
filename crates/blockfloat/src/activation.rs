@@ -250,7 +250,7 @@ mod tests {
         ActivationGroup, ActivationQuantError, FP8_MAX, decode_bf16, decode_e4m3fn,
         encode_e4m3fn_rne, encode_e4m3fn_rne_bruteforce, quantize_bf16_activations_e4m3fn,
     };
-    use crate::precision::fp4_linear_runtime_f32;
+    use crate::fp4_linear_runtime_f32;
 
     const BF16_ZERO: u16 = 0x0000;
 

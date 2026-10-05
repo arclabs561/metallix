@@ -178,7 +178,7 @@ pub fn fp4_linear_runtime_f32(
     clippy::too_many_arguments,
     reason = "the direct runtime-buffer contract keeps each shape and scale role explicit"
 )]
-pub(crate) fn fp4_linear_runtime_f32_owned(
+pub fn fp4_linear_runtime_f32_owned(
     activation_codes: &[u8],
     activation_scales: &[u8],
     weight_codes: &[u8],

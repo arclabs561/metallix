@@ -87,7 +87,7 @@ pub fn expand_e2m1x2_blocks32(
 #[cfg(test)]
 mod tests {
     use super::{BlockDecodeError, expand_e2m1x2_blocks32};
-    use crate::precision::decode_e2m1x2;
+    use crate::decode_e2m1x2;
 
     #[test]
     fn all_packed_pairs_preserve_lane_order_and_signed_zero() {

@@ -92,14 +92,14 @@ pub enum Fp32LinearError {
 /// caller's output untouched.
 ///
 /// ```
-/// use deepseek::precision::fp32_linear_reference;
+/// use blockfloat::fp32_linear_reference;
 /// let mut output = [0.0; 4];
 /// fp32_linear_reference(
 ///     &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0],
 ///     2, 2, 2, &mut output,
 /// )?;
 /// assert_eq!(output, [17.0, 23.0, 39.0, 53.0]);
-/// # Ok::<(), deepseek::precision::Fp32LinearError>(())
+/// # Ok::<(), blockfloat::Fp32LinearError>(())
 /// ```
 pub fn fp32_linear_reference(
     activations: &[f32],

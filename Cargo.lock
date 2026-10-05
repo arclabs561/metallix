@@ -150,6 +150,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockfloat"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "borrow-or-share"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,6 +453,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 name = "deepseek"
 version = "0.1.0"
 dependencies = [
+ "blockfloat",
  "divan",
  "mlx-rs",
  "mlx-sys",

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/blockfloat",
     "crates/engine",
     "crates/models/deepseek",
     "crates/models/julia",

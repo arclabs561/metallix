@@ -108,14 +108,14 @@ pub enum Fp4ActivationError {
 /// # Example
 ///
 /// ```
-/// use deepseek::precision::{Fp4ActivationMode, requantize_bf16_activations_e2m1};
+/// use blockfloat::{Fp4ActivationMode, requantize_bf16_activations_e2m1};
 /// let input = [0x4110_u16; 32]; // BF16 value 9
 /// let mut output = [0_u16; 32];
 /// requantize_bf16_activations_e2m1(
 ///     &input, 1, 32, Fp4ActivationMode::Index32E8m0, &mut output,
 /// )?;
 /// assert_eq!(output, [0x4100_u16; 32]); // BF16 value 8
-/// # Ok::<(), deepseek::precision::Fp4ActivationError>(())
+/// # Ok::<(), blockfloat::Fp4ActivationError>(())
 /// ```
 pub fn requantize_bf16_activations_e2m1(
     input: &[u16],
@@ -261,7 +261,7 @@ fn check_length(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precision::decode_e2m1;
+    use crate::decode_e2m1;
     #[test]
     fn e2m1_software_rne_covers_ties_and_adjacent_fp32_inputs() {
         for code in 0_u8..=15 {
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn source_fixture_scale_values_and_known_codes_are_preserved() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../../fixtures/deepseek-v41/fp4-activation-reference.json"
+            "../../../fixtures/deepseek-v41/fp4-activation-reference.json"
         ))
         .expect("independent CPU oracle");
         for case in fixture["cases"].as_array().expect("cases") {
