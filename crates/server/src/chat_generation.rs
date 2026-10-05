@@ -1193,6 +1193,7 @@ fn load_template(model: &Path) -> Result<String, String> {
 fn parse_template(template_source: String) -> Result<Environment<'static>, String> {
     let mut template = Environment::new();
     template.set_unknown_method_callback(unknown_method_callback);
+    template.add_filter("tojson", crate::template_json::tojson);
     template.set_fuel(Some(TEMPLATE_FUEL));
     template
         .add_template_owned("qwen_chat".to_owned(), template_source)
@@ -1792,11 +1793,12 @@ mod tests {
                 "# Tools\n\n",
                 "You may call one or more functions to assist with the user query.\n\n",
                 "You are provided with function signatures within <tools></tools> XML tags:\n",
-                "<tools>\n{\"name\":\"ping\"}\n</tools>\n\n",
+                // transformers' `tojson` (Python `json.dumps` separators).
+                "<tools>\n{\"name\": \"ping\"}\n</tools>\n\n",
                 "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
                 "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
                 "<|im_start|>user\nread README<|im_end|>\n",
-                "<|im_start|>assistant\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\":\"README.md\"}}\n</tool_call><|im_end|>\n",
+                "<|im_start|>assistant\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"README.md\"}}\n</tool_call><|im_end|>\n",
                 "<|im_start|>user\n<tool_response>\ntitle\n</tool_response><|im_end|>\n",
                 "<|im_start|>user\nthanks<|im_end|>\n",
                 "<|im_start|>assistant\n<think>\n\n</think>\n\n",

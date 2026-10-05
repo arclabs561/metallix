@@ -52,6 +52,8 @@ mod serve_registry;
 mod serving;
 #[cfg(feature = "metal")]
 mod sse;
+#[cfg(feature = "metal")]
+mod template_json;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
