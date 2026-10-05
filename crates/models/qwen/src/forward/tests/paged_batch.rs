@@ -20,7 +20,7 @@ use engine::blocks::{BlockTokens, PoolConfig, SequenceId};
 
 use super::paged_kv::{MIB, fixed_tokens, millis, paged_config, paged_weights, pool, prompt};
 use super::*;
-use crate::forward::{BatchDecoded, BatchReadback, PagedQwen3Session};
+use crate::forward::{BatchDecoded, BatchReadback, PagedQwen3Session, Qwen3WeightPrecision};
 
 /// Largest batched-vs-single logit difference accepted on the fixture.
 /// Declared after the first measurement, whose largest difference over
@@ -436,4 +436,85 @@ fn throughput(
         millis(elapsed) / f64::from(u32::try_from(STEPS).expect("small")),
         tokens / elapsed.as_secs_f64(),
     );
+}
+
+/// Qwen3-0.6B decode-step profile, BF16 then F32: wall step
+/// time, host graph-build time and evaluate-plus-readback time at B = 1..16
+/// and contexts 128 and 1024. Measurement only; nothing is asserted.
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
+fn paged_batch_qwen3_06b_profile() {
+    use crate::{forward::paged::profile, metal::Qwen3MlxWeights};
+
+    let model = std::env::var_os("METALLIX_QWEN_MODEL")
+        .map(std::path::PathBuf::from)
+        .expect("METALLIX_QWEN_MODEL is required for this ignored test");
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let mut checkpoint = Qwen3MlxWeights::load(model).expect("checkpoint load");
+    for (dtype, precision) in [
+        ("bf16", Qwen3WeightPrecision::BFloat16),
+        ("f32", Qwen3WeightPrecision::Float32),
+    ] {
+        checkpoint
+            .prepare_precision(precision)
+            .expect("weights at the profiled precision");
+        let layout = checkpoint
+            .resident_chat_executor(4096, u64::MAX)
+            .expect("resident plan");
+        let (config, weights) = (layout.config, layout.weights);
+        for context in [128_usize, 1024] {
+            for batch in [1_usize, 2, 4, 8, 16] {
+                let pool = PagedQwen3Session::pool_for_budget(
+                    config,
+                    weights,
+                    4096 * MIB,
+                    BlockTokens::DEFAULT,
+                )
+                .expect("pool")
+                .with_prefix_caching(false);
+                let mut paged = PagedQwen3Session::new(config, weights, pool).expect("paged");
+                let mut rows = Vec::new();
+                for row in 0..batch {
+                    let seq = SequenceId(row as u64 + 1);
+                    let last = paged
+                        .prefill_last_logits(seq, &fixed_tokens(context, 7 + row as u64))
+                        .expect("prefill");
+                    rows.push((seq, first_argmax(&last)));
+                }
+                let mut step = |rows: &mut Vec<(SequenceId, i32)>| {
+                    let BatchDecoded::Greedy(tokens) = paged
+                        .decode_batch(rows, BatchReadback::Greedy)
+                        .expect("decode")
+                    else {
+                        panic!("asked for greedy tokens");
+                    };
+                    for (row, token) in rows.iter_mut().zip(tokens) {
+                        row.1 = token;
+                    }
+                };
+                for _ in 0..4 {
+                    step(&mut rows);
+                }
+                profile::take();
+                let started = Instant::now();
+                for _ in 0..32 {
+                    step(&mut rows);
+                }
+                let wall = millis(started.elapsed()) / 32.0;
+                let steps = profile::take();
+                let median = |pick: fn(&(std::time::Duration, std::time::Duration)) -> f64| {
+                    let mut values = steps.iter().map(pick).collect::<Vec<_>>();
+                    values.sort_by(f64::total_cmp);
+                    values[values.len() / 2]
+                };
+                println!(
+                    "paged_profile dtype={dtype} context={context} B={batch} step_ms={wall:.3} \
+                     build_ms={:.3} eval_ms={:.3} aggregate_tok_s={:.1}",
+                    median(|step| millis(step.0)),
+                    median(|step| millis(step.1)),
+                    1e3 * f64::from(u32::try_from(batch).expect("small")) / wall,
+                );
+            }
+        }
+    }
 }

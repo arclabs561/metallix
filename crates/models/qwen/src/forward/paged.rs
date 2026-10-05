@@ -480,6 +480,8 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         rows: &[(SequenceId, i32)],
         readback: BatchReadback,
     ) -> Result<BatchDecoded, Qwen3ForwardError> {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let stream = StreamOrDevice::gpu();
         let batch = as_i32(rows.len())?;
         let RowSlots {
@@ -552,7 +554,12 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
             weight(self.weights, self.config.output_weight_name())?,
         )?
         .reshape_device(&[batch, vocab], &stream)?;
-        read_rows(&logits, self.config.vocab_size, readback)
+        #[cfg(test)]
+        let built = std::time::Instant::now();
+        let decoded = read_rows(&logits, self.config.vocab_size, readback);
+        #[cfg(test)]
+        profile::record(built - started, built.elapsed());
+        decoded
     }
 
     /// Runs the forward for tokens already given slots, then commits them.
@@ -738,6 +745,26 @@ fn rope_offset(position: TokenPosition) -> Result<i32, Qwen3ForwardError> {
 /// against the vocabulary first, so none is negative.
 fn token_ids(input_ids: &[i32]) -> Vec<u32> {
     input_ids.iter().map(|&id| id.cast_unsigned()).collect()
+}
+
+/// Test-only host timings of [`PagedQwen3Session::decode_batch`] steps:
+/// building the lazy graph, and evaluating plus reading it back.
+#[cfg(test)]
+pub(super) mod profile {
+    use std::{cell::RefCell, time::Duration};
+
+    thread_local! {
+        static STEPS: RefCell<Vec<(Duration, Duration)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(in super::super) fn record(build: Duration, evaluate: Duration) {
+        STEPS.with(|steps| steps.borrow_mut().push((build, evaluate)));
+    }
+
+    /// Returns and clears the recorded `(build, evaluate)` pairs.
+    pub(in super::super) fn take() -> Vec<(Duration, Duration)> {
+        STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
 }
 
 #[cfg(test)]
