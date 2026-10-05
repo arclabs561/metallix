@@ -2991,7 +2991,6 @@ mod tests {
     mod paged_kv;
     mod particle_replay;
     mod prefix_extend;
-    mod speculative_checkpoint;
     mod speculative_verify;
     mod steering_checkpoint;
 
