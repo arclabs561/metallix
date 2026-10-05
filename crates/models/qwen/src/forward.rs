@@ -1242,7 +1242,7 @@ pub struct Qwen3GreedyPicks {
 impl Qwen3GreedyPicks {
     /// Queues the per-row argmax of `[rows, vocab]` logits and a check that
     /// every logit is finite.
-    fn start(rows: &Array, binding: usize) -> Result<Self, Qwen3ForwardError> {
+    pub(crate) fn start(rows: &Array, binding: usize) -> Result<Self, Qwen3ForwardError> {
         let stream = StreamOrDevice::gpu();
         let tokens = ops::indexing::argmax_axis_device(rows, -1, false, &stream)?;
         let finite = rows.is_finite_device(&stream)?.all_device(false, &stream)?;

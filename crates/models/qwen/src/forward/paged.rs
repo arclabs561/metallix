@@ -805,12 +805,12 @@ fn read_rows(
                     .collect(),
             ))
         }
-        BatchReadback::Greedy => {
-            let tokens = ops::indexing::argmax_axis_device(logits, 1, false, &stream)?
-                .as_type_device::<i32>(&stream)?;
-            tokens.eval()?;
-            Ok(BatchDecoded::Greedy(tokens.as_slice::<i32>().to_vec()))
-        }
+        // The same pick as single-sequence greedy decode, including its
+        // refusal of non-finite rows. Binding 0 matches no executor, so these
+        // picks cannot be fed to `decode_greedy_after`.
+        BatchReadback::Greedy => Ok(BatchDecoded::Greedy(
+            super::Qwen3GreedyPicks::start(logits, 0)?.wait()?,
+        )),
     }
 }
 
