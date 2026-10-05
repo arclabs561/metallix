@@ -5,6 +5,7 @@ members = [
     "crates/models/deepseek",
     "crates/models/julia",
     "crates/models/qwen",
+    "crates/models/qwen35",
     "crates/server",
 ]
 resolver = "2"

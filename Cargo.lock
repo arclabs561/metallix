@@ -1368,6 +1368,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen35"
+version = "0.1.0"
+dependencies = [
+ "mlx-rs",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
