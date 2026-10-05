@@ -10,7 +10,16 @@
 //! layer, so differences compound; the result is reported per layer and the
 //! final next-token argmax must match the source.
 
-use std::{io, num::NonZeroUsize, ops::Range, path::Path, sync::Mutex};
+use std::{
+    io,
+    num::NonZeroUsize,
+    ops::Range,
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use deepseek::{
     checkpoint::{
@@ -90,25 +99,52 @@ fn backend() -> V41Backend {
 }
 
 /// Largest fetch [`Host`] allows with `METALLIX_V41_NO_EXPERT_FETCH=1`.
-/// Engram and embedding rows, which are fetched on every run and never
-/// stored, are at most a few KB; a routed expert tensor is megabytes.
+/// Engram and embedding row runs are at most a few KB; a routed expert
+/// tensor is megabytes.
 const ROW_FETCH_LIMIT: u64 = 1 << 20;
 
-/// [`CurlHost`], except that with `METALLIX_V41_NO_EXPERT_FETCH=1` it refuses
-/// any fetch larger than a row, so a run that routes to an expert not stored
-/// yet (as a different backend's numerics might) fails instead of
-/// downloading it.
+/// [`CurlHost`] with an optional fetch-size limit, counting what it fetches.
+/// `METALLIX_V41_NO_EXPERT_FETCH=1` refuses any fetch larger than a row run,
+/// so a run that routes to an expert not stored yet (as a different
+/// backend's numerics might) fails instead of downloading it.
+/// `METALLIX_V41_OFFLINE=1` refuses every fetch: once a prompt's rows and
+/// experts are stored, a repeat run needs no network.
 struct Host {
-    rows_only: bool,
+    limit: Option<(u64, &'static str)>,
+    fetches: AtomicU64,
+    bytes: AtomicU64,
 }
 
-impl RangeHost for Host {
+impl Host {
+    fn from_env() -> Self {
+        let set = |name| std::env::var(name).as_deref() == Ok("1");
+        let limit = if set("METALLIX_V41_OFFLINE") {
+            Some((0, "METALLIX_V41_OFFLINE"))
+        } else if set("METALLIX_V41_NO_EXPERT_FETCH") {
+            Some((ROW_FETCH_LIMIT, "METALLIX_V41_NO_EXPERT_FETCH"))
+        } else {
+            None
+        };
+        Self {
+            limit,
+            fetches: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RangeHost for &Host {
     fn get_range(&self, url: &str, range: Range<u64>) -> io::Result<(Vec<u8>, String)> {
-        if self.rows_only && range.end.saturating_sub(range.start) > ROW_FETCH_LIMIT {
+        let length = range.end.saturating_sub(range.start);
+        if let Some((limit, flag)) = self.limit
+            && length > limit
+        {
             return Err(io::Error::other(format!(
-                "METALLIX_V41_NO_EXPERT_FETCH: refusing {url} bytes {range:?}"
+                "{flag}: refusing {url} bytes {range:?}"
             )));
         }
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(length, Ordering::Relaxed);
         CurlHost.get_range(url, range)
     }
 
@@ -140,14 +176,13 @@ fn run_capture(run_file: &str, capture: &str) {
         &std::fs::read_to_string(trace.join("inference-config.json")).expect("config"),
     )
     .expect("pinned inference config");
+    let host = Host::from_env();
     let source = FetchingSource::new(
         trace.join("weights"),
         &trace,
         repo,
         revision.clone(),
-        Host {
-            rows_only: std::env::var("METALLIX_V41_NO_EXPERT_FETCH").as_deref() == Ok("1"),
-        },
+        &host,
         Envelope::default(),
     )
     .expect("fetching source");
@@ -229,6 +264,11 @@ fn run_capture(run_file: &str, capture: &str) {
         started.elapsed().as_secs_f64()
     );
     assert_eq!(session.next_start(), ids.len());
+    eprintln!(
+        "network: {} fetches, {} bytes",
+        host.fetches.load(Ordering::Relaxed),
+        host.bytes.load(Ordering::Relaxed)
+    );
     #[cfg(feature = "metal")]
     if let Some(counts) = weights.device_counts() {
         eprintln!("device {counts:?}");
