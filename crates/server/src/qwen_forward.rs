@@ -130,17 +130,25 @@ impl SamplingPolicy {
         logits: &[f32],
         logprobs: bool,
     ) -> Result<(i32, Option<serde_json::Value>), String> {
+        let legal_mask = std::mem::take(&mut self.legal_mask);
+        let sampled = self.sample_masked(logits, &legal_mask, logprobs);
+        self.legal_mask = legal_mask;
+        sampled
+    }
+
+    fn sample_masked(
+        &mut self,
+        logits: &[f32],
+        legal_mask: &[bool],
+        logprobs: bool,
+    ) -> Result<(i32, Option<serde_json::Value>), String> {
         // Advance a cloned stream first, committing it only after the sampler
         // accepts the logits. Invalid model output must not make a replay drift.
         let mut candidate_rng = self.rng.clone();
         let uniform = unit_uniform(candidate_rng.next_u64());
-        let sample = sample_categorical(
-            logits,
-            &self.legal_mask,
-            self.configuration.temperature,
-            uniform,
-        )
-        .map_err(|error| error.to_string())?;
+        let sample =
+            sample_categorical(logits, legal_mask, self.configuration.temperature, uniform)
+                .map_err(|error| error.to_string())?;
         let token = i32::try_from(sample.token_id).map_err(|error| error.to_string())?;
         let scores = if logprobs {
             Some(json!({
@@ -173,6 +181,51 @@ impl SamplingPolicy {
             &mut self.legal_mask,
         )?;
         self.sample(logits, false).map(|(token, _)| token)
+    }
+
+    /// The variate the draw `ahead` draws after the next one will use; zero
+    /// is the next draw's. Every committed draw consumes exactly one.
+    pub(crate) fn uniform_ahead(&self, ahead: usize) -> f64 {
+        let mut rng = self.rng.clone();
+        for _ in 0..ahead {
+            rng.next_u64();
+        }
+        unit_uniform(rng.next_u64())
+    }
+
+    /// [`Self::sample_nucleus`] from a row's top candidates instead of the
+    /// whole row, with the same result bit for bit.
+    ///
+    /// With `top_k` set, the nucleus, its normalizer and the draw read only
+    /// the `top_k` most likely rows, walked in token-ID order; so the same
+    /// f64 steps over the candidates, ordered by ID, give the same token. It
+    /// returns `None`, drawing nothing, when the candidates cannot settle
+    /// which tokens are the `top_k` most likely (`top_k` reaches the
+    /// candidate count, or its last entry ties the smallest candidate); the
+    /// caller then samples the whole row.
+    pub(crate) fn sample_top_k_candidates(
+        &mut self,
+        candidates: &qwen::forward::Qwen3RowCandidates,
+        top_p: f64,
+        top_k: usize,
+    ) -> Result<Option<i32>, String> {
+        if !candidates.settles_head(top_k) {
+            return Ok(None);
+        }
+        let mut by_id = candidates.top.clone();
+        by_id.sort_unstable_by_key(|&(id, _)| id);
+        let logits: Vec<f32> = by_id.iter().map(|&(_, logit)| logit).collect();
+        let mut legal_mask = vec![false; logits.len()];
+        nucleus_mask(
+            &logits,
+            self.configuration.temperature,
+            top_p,
+            Some(top_k),
+            &mut legal_mask,
+        )?;
+        let (row, _) = self.sample_masked(&logits, &legal_mask, false)?;
+        let row = usize::try_from(row).map_err(|error| error.to_string())?;
+        Ok(Some(by_id[row].0))
     }
 
     #[cfg(feature = "structured-output")]
@@ -2016,5 +2069,89 @@ mod tests {
                 .all(|&token| nucleus[usize::try_from(token).unwrap()])
         );
         assert!(nucleus.iter().filter(|&&kept| kept).count() > 1);
+    }
+
+    fn host_candidates(logits: &[f32], count: usize) -> qwen::forward::Qwen3RowCandidates {
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_by(|&left, &right| {
+            logits[right]
+                .total_cmp(&logits[left])
+                .then(left.cmp(&right))
+        });
+        qwen::forward::Qwen3RowCandidates {
+            top: order
+                .into_iter()
+                .take(count)
+                .map(|index| (i32::try_from(index).unwrap(), logits[index]))
+                .collect(),
+            max_logit: 0.0,
+            shifted_exp_sum: 1.0,
+        }
+    }
+
+    #[test]
+    fn top_k_candidates_sample_exactly_what_the_whole_row_samples() {
+        // Uneven values with many ties, so ID order matters.
+        let logits: Vec<f32> = (0_u32..3_000)
+            .map(|index| f32::from(u16::try_from(index * 7_919 % 997).unwrap()) / 90.0)
+            .collect();
+        for (temperature, top_p, top_k) in [(0.6, 0.95, 20), (1.0, 0.3, 5), (1.7, 1.0, 64)] {
+            let configuration = super::SamplingConfiguration {
+                seed: 5,
+                temperature,
+            };
+            let mut whole = super::SamplingPolicy::new(configuration, logits.len());
+            let mut compact = super::SamplingPolicy::new(configuration, logits.len());
+            // The narrowest candidate window that settles the top `top_k`
+            // despite ties, as a caller widening on refusal would reach.
+            let candidates = (top_k + 1..logits.len())
+                .map(|count| host_candidates(&logits, count))
+                .find(|candidates| candidates.settles_head(top_k))
+                .unwrap();
+            for _ in 0..300 {
+                let expected = whole.sample_nucleus(&logits, top_p, Some(top_k)).unwrap();
+                let actual = compact
+                    .sample_top_k_candidates(&candidates, top_p, top_k)
+                    .unwrap()
+                    .expect("distinct boundary values settle the head");
+                assert_eq!(actual, expected);
+            }
+            // Both consumed one draw per token.
+            assert_eq!(
+                whole.uniform_ahead(0).to_bits(),
+                compact.uniform_ahead(0).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn unsettled_top_k_candidates_draw_nothing() {
+        let logits = [4.0_f32, 3.0, 2.0, 2.0, 2.0, 1.0];
+        let mut policy = super::SamplingPolicy::new(
+            super::SamplingConfiguration {
+                seed: 3,
+                temperature: 1.0,
+            },
+            logits.len(),
+        );
+        let before = policy.uniform_ahead(0);
+        // The 3rd most likely value ties the smallest of four candidates.
+        let candidates = host_candidates(&logits, 4);
+        assert_eq!(
+            policy.sample_top_k_candidates(&candidates, 1.0, 3).unwrap(),
+            None
+        );
+        assert_eq!(policy.uniform_ahead(0).to_bits(), before.to_bits());
+        assert_eq!(policy.uniform_ahead(1).to_bits(), {
+            let mut probe = super::SamplingPolicy::new(
+                super::SamplingConfiguration {
+                    seed: 3,
+                    temperature: 1.0,
+                },
+                logits.len(),
+            );
+            probe.sample(&logits, false).unwrap();
+            probe.uniform_ahead(0).to_bits()
+        });
     }
 }

@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use qwen::metal::{Qwen3MlxWeights, Qwen3WeightPrecision};
+use qwen::{
+    forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks},
+    metal::{Qwen3MlxWeights, Qwen3WeightPrecision},
+};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -27,6 +30,10 @@ use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
 
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
+
+#[cfg(test)]
+#[path = "chat_decode_checkpoint_tests.rs"]
+mod decode_checkpoint;
 
 const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
@@ -761,15 +768,17 @@ impl ChatSession {
         let mut decode_ms = Vec::new();
         let mut ttft = None;
         let mut finish_reason = ChatFinishReason::Length;
-        // A plain greedy turn without logprobs picks each token on the GPU
-        // and queues step t + 1 before reading step t back. Every other turn
-        // reads the full logit row, which the host picker and logprobs need.
-        // The GPU pick has no suppression mask, so a checkpoint that
-        // suppresses tokens reads every row back.
-        let pipelined = request.top_logprobs.is_none()
-            && picker.is_plain_greedy()
-            && !self.format.suppresses_tokens();
-        let mut pending = None;
+        // Greedy turns, and sampled turns with top_k, pick each token on the
+        // GPU and queue step t + 1 before reading step t back; the host then
+        // settles the token and any logprobs exactly from a few top
+        // candidates. Grammar turns, sampling without top_k, and checkpoints
+        // that suppress tokens (the GPU pick has no suppression mask) read
+        // the full logit row each step.
+        let pipelined = !self.format.suppresses_tokens()
+            && picker
+                .gpu_rule(0, request.top_logprobs, self.vocabulary_size)
+                .is_some();
+        let mut pending: Option<Qwen3TokenPicks> = None;
         let mut last_token_at = Instant::now();
 
         for step in 0..max_tokens {
@@ -777,22 +786,41 @@ impl ChatSession {
             if pending.is_none() {
                 self.format.suppress(&mut logits);
             }
+            let mut receipt = None;
             let (token, grammar_complete) = match pending.take() {
                 Some(current) => {
                     let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
-                    let token = span
-                        .in_scope(|| {
-                            if step + 1 < max_tokens {
-                                pending = Some(executor.decode_greedy_after(&current)?);
-                            }
-                            current.wait_one()
-                        })
-                        .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+                    let (token, gpu_token, settled_receipt) = span.in_scope(|| {
+                        if step + 1 < max_tokens {
+                            // This step's draw is not committed yet, so the
+                            // next step's variate is one draw ahead.
+                            let rule = picker
+                                .gpu_rule(1, request.top_logprobs, self.vocabulary_size)
+                                .ok_or_else(|| {
+                                    String::from("GPU pick rule changed within a turn")
+                                })?;
+                            pending = Some(
+                                executor
+                                    .decode_picks_after(&current, &rule)
+                                    .map_err(|error| error.to_string())?,
+                            );
+                        }
+                        self.settle_gpu_step(&mut picker, &current, request.top_logprobs)
+                    })?;
                     // Time between token readbacks: with a step always queued,
                     // that is the per-token cost, not one step's latency.
                     let step_ms = elapsed_ms(last_token_at.elapsed());
                     span.record("decode_ms", step_ms);
                     decode_ms.push(step_ms);
+                    if token != gpu_token && pending.take().is_some() {
+                        // The f32 GPU draw landed across a cumulative-mass
+                        // boundary from the exact draw; the queued step was
+                        // built on the wrong token.
+                        executor
+                            .truncate_cached_tokens(executor.cached_tokens() - 1)
+                            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+                    }
+                    receipt = settled_receipt;
                     (token, false)
                 }
                 None => picker.pick(&logits)?,
@@ -800,7 +828,10 @@ impl ChatSession {
             last_token_at = Instant::now();
             let class = self.format.stops().classify(TokenId::from_model(token)?);
             if let Some(top) = request.top_logprobs.filter(|_| class == TokenClass::Normal) {
-                logprobs.push(self.token_logprob(&logits, token, top)?);
+                logprobs.push(match receipt {
+                    Some(receipt) => receipt,
+                    None => self.token_logprob(&logits, token, top)?,
+                });
             }
             generated.push(token);
             match class {
@@ -832,11 +863,17 @@ impl ChatSession {
             }
 
             if pipelined && step + 1 < max_tokens && pending.is_none() {
-                // Only after the prefill token; later steps were queued above.
+                // After the prefill token or a rejected GPU draw; later steps
+                // were queued above. Every draw so far is committed.
                 deadline.check()?;
+                let rule = picker
+                    .gpu_rule(0, request.top_logprobs, self.vocabulary_size)
+                    .ok_or_else(|| {
+                        ChatGenerationError::message("GPU pick rule changed within a turn")
+                    })?;
                 pending = Some(
                     executor
-                        .decode_greedy(token)
+                        .decode_picks(token, &rule)
                         .map_err(|error| ChatGenerationError::message(error.to_string()))?,
                 );
             } else if !pipelined && step + 1 < max_tokens {
@@ -958,6 +995,87 @@ impl ChatSession {
             )));
         }
         Ok(max_tokens)
+    }
+
+    /// Reads back a GPU-picked step and settles its token, and its logprob
+    /// receipt when asked, as the full-row host path would: from the step's
+    /// top candidates when they decide it, else from the whole row. Returns
+    /// the settled token, the GPU's own pick, and the receipt.
+    fn settle_gpu_step(
+        &self,
+        picker: &mut TokenPicker,
+        picks: &Qwen3TokenPicks,
+        top_logprobs: Option<u8>,
+    ) -> Result<(i32, i32, Option<TokenLogprob>), String> {
+        let (tokens, candidates) = picks
+            .wait_with_candidates()
+            .map_err(|error| error.to_string())?;
+        let [gpu_token] = tokens[..] else {
+            return Err("a decode step picks one token".into());
+        };
+        let candidates = candidates.as_ref().and_then(|rows| rows.first());
+        let mut row = None;
+        let token = if let Some(token) = picker.pick_from_candidates(gpu_token, candidates)? {
+            token
+        } else {
+            let full = full_row(picks)?;
+            let (token, _) = picker.pick(&full)?;
+            row = Some(full);
+            token
+        };
+        let Some(top) = top_logprobs else {
+            return Ok((token, gpu_token, None));
+        };
+        let settled = match candidates {
+            Some(candidates) => self.candidate_logprob(candidates, token, top)?,
+            None => None,
+        };
+        let receipt = if let Some(receipt) = settled {
+            receipt
+        } else {
+            let full = match row {
+                Some(full) => full,
+                None => full_row(picks)?,
+            };
+            self.token_logprob(&full, token, top)?
+        };
+        Ok((token, gpu_token, Some(receipt)))
+    }
+
+    /// [`Self::token_logprob`] from a row's top candidates, or `None` when
+    /// they cannot settle it: `token` is not among them, or the `top + 8`
+    /// most likely tokens the host would rank are not certain to be. Only the
+    /// softmax normalizer differs from the host's, by its f32 summation.
+    fn candidate_logprob(
+        &self,
+        candidates: &Qwen3RowCandidates,
+        token: i32,
+        top: u8,
+    ) -> Result<Option<TokenLogprob>, String> {
+        let head = usize::from(top) + 8;
+        let selected = candidates.top.iter().find(|&&(id, _)| id == token);
+        let Some(&(_, selected_logit)) = selected.filter(|_| candidates.settles_head(head)) else {
+            return Ok(None);
+        };
+        let top_logprobs = candidates.top[..head]
+            .iter()
+            .filter_map(|&(id, logit)| {
+                let bytes = self.format.tokenizer().token_bytes(id).ok()?;
+                Some(TopLogprob {
+                    token: String::from_utf8_lossy(&bytes).into_owned(),
+                    bytes,
+                    logprob: candidates.logprob(logit),
+                })
+            })
+            .take(usize::from(top))
+            .collect();
+        let bytes = self.format.tokenizer().token_bytes(token)?;
+        Ok(Some(TokenLogprob {
+            token: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
+            logprob: candidates.logprob(selected_logit),
+            top_logprobs,
+        }))
     }
 
     /// Scores `token` and the `top` most likely tokens under the raw logits.
@@ -1182,14 +1300,59 @@ impl TokenPicker {
         })
     }
 
-    /// Whether every token is the unmasked argmax of the raw logits, which the
-    /// GPU can select without the host reading the row.
-    fn is_plain_greedy(&self) -> bool {
+    /// How the GPU picks this turn's tokens, with the variate `ahead` draws
+    /// past the next uncommitted one, or `None` when every step must read
+    /// the whole logit row: under a grammar mask, or sampling without
+    /// `top_k`, whose nucleus normalizer spans the whole row. Candidates
+    /// cover the receipts `top_logprobs` asks for and the `top_k` draw.
+    fn gpu_rule(
+        &self,
+        ahead: usize,
+        top_logprobs: Option<u8>,
+        vocabulary_size: usize,
+    ) -> Option<Qwen3PickRule> {
         #[cfg(feature = "structured-output")]
         if self.constraint.is_some() {
-            return false;
+            return None;
         }
-        self.policy.is_none()
+        let receipts = top_logprobs.map_or(0, |top| usize::from(top) + 9);
+        let rule = match &self.policy {
+            None => Qwen3PickRule {
+                selection: Qwen3Selection::Greedy,
+                candidates: receipts,
+            },
+            Some((policy, top_p, top_k)) => {
+                let top_k = (*top_k)?;
+                Qwen3PickRule {
+                    selection: Qwen3Selection::TopKNucleus {
+                        temperature: self.applied.temperature,
+                        top_p: *top_p,
+                        top_k,
+                        uniforms: vec![policy.uniform_ahead(ahead)],
+                    },
+                    candidates: receipts.max(top_k + 1),
+                }
+            }
+        };
+        (rule.candidates < vocabulary_size).then_some(rule)
+    }
+
+    /// The exact token for a GPU-picked step, from its candidates, or `None`
+    /// when the caller must pick from the whole row. Greedy keeps the GPU
+    /// argmax; a `top_k` draw is re-derived on the host and consumes the
+    /// step's variate.
+    fn pick_from_candidates(
+        &mut self,
+        gpu_token: i32,
+        candidates: Option<&Qwen3RowCandidates>,
+    ) -> Result<Option<i32>, String> {
+        match (self.policy.as_mut(), candidates) {
+            (None, _) => Ok(Some(gpu_token)),
+            (Some((policy, top_p, Some(top_k))), Some(candidates)) => {
+                policy.sample_top_k_candidates(candidates, *top_p, *top_k)
+            }
+            (Some(_), _) => Ok(None),
+        }
     }
 
     /// Returns the next token and whether it completed the schema grammar.
@@ -1256,6 +1419,16 @@ fn greedy_token(logits: &[f32]) -> Result<i32, String> {
     }
     i32::try_from(best)
         .map_err(|_| String::from("model vocabulary token ID does not fit server token IDs"))
+}
+
+/// The whole logit row of a single-row GPU pick, for steps its candidates
+/// cannot settle.
+fn full_row(picks: &Qwen3TokenPicks) -> Result<Vec<f32>, String> {
+    picks
+        .full_rows()
+        .map_err(|error| error.to_string())?
+        .pop()
+        .ok_or_else(|| String::from("a decode step has one logit row"))
 }
 
 fn emit_delta(
