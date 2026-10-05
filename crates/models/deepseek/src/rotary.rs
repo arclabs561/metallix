@@ -352,8 +352,10 @@ pub enum RotaryMetalError {
 /// `(position, pair)` is reused across every batch and head. Validation happens
 /// before any write, so a rejected buffer remains unchanged.
 ///
-/// This preserves the pinned FP32 operation's ordinary IEEE-754 arithmetic.
-/// Finite inputs and frequencies can therefore produce a non-finite output by
+/// This preserves the pinned FP32 operation's IEEE-754 arithmetic, including
+/// the fused first product of the source's CPU complex64 multiply. The
+/// `rotate_tail_metal` and MLX key-preparation paths still round both products
+/// separately and are covered only at `1e-6` tolerance. Finite inputs and frequencies can therefore produce a non-finite output by
 /// overflow; this helper does not add a second output scan that the source does
 /// not perform.
 ///
@@ -385,8 +387,13 @@ pub fn rotate_tail(
                     };
                     let real = values[value_index];
                     let input_imaginary = values[value_index + 1];
-                    values[value_index] = real * frequency.real - input_imaginary * imaginary;
-                    values[value_index + 1] = real * imaginary + input_imaginary * frequency.real;
+                    // Torch's CPU complex64 multiply fuses the first product: a
+                    // separately rounded `a * c - b * d` can land on a BF16 tie
+                    // that the source rounds the other way.
+                    values[value_index] =
+                        real.mul_add(frequency.real, -(input_imaginary * imaginary));
+                    values[value_index + 1] =
+                        real.mul_add(imaginary, input_imaginary * frequency.real);
                 }
             }
         }
@@ -1015,6 +1022,29 @@ mod tests {
         .expect("finite inputs are accepted");
         assert!(values[0].is_infinite() && values[0].is_sign_positive());
         assert_eq!(values[1].to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn fuses_like_torch_where_separate_rounding_hits_a_bf16_tie() {
+        // Real V4.1 layer-1 query pair (position 14, head 57, pair 5). Separately
+        // rounded products give exactly the BF16 midpoint 3.3671875, which rounds
+        // to even (3.375). Torch 2.13's CPU complex64 multiply gives 0x40577fff;
+        // the float64 value 3.36718727 also narrows to BF16 3.359375.
+        let mut values = [-2.078_125_f32, -3.046_875];
+        let frequency =
+            RotaryFrequency::new(f32::from_bits(0xbf7b_f0ae), f32::from_bits(0xbe35_a4e3))
+                .expect("finite");
+        rotate_tail(
+            &mut values,
+            layout(1, 1, 1, 1),
+            &[frequency],
+            RotaryDirection::Forward,
+        )
+        .expect("finite rotation");
+        assert_eq!(values.map(f32::to_bits), [0x3fc0_99c8, 0x4057_7fff]);
+        let bits = values[1].to_bits();
+        let bf16 = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16;
+        assert_eq!(bf16, 0x4057);
     }
 
     #[test]

@@ -63,12 +63,13 @@ def fp4_reconstruct(x: torch.Tensor) -> torch.Tensor:
 
 
 def rotate(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    # Complex multiply as in the pinned apply_rotary_emb: Torch's CPU complex64
+    # product fuses the first real multiply, so separately written real ops can
+    # round a cancelling pair differently.
     y = x.float().clone()
-    tail = y[:, -4:].reshape(-1, 2, 2)
-    real, imag = freqs[:, :, 0], freqs[:, :, 1]
-    a, b = tail[..., 0].clone(), tail[..., 1].clone()
-    tail[..., 0] = a * real - b * imag
-    tail[..., 1] = a * imag + b * real
+    tail = torch.view_as_complex(y[:, -4:].reshape(-1, 2, 2).contiguous())
+    rotated = tail * torch.view_as_complex(freqs.contiguous())
+    y[:, -4:] = torch.view_as_real(rotated).reshape(-1, 4)
     return y.to(torch.bfloat16)
 
 
