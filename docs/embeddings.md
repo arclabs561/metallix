@@ -1,7 +1,8 @@
 # Embeddings
 
 `mx serve` answers `POST /v1/embeddings` for registry entries of kind
-`qwen_embedding`, and for `pplx_context` (see [Contextual chunks](#contextual-chunks)).
+`qwen_embedding`, for `pplx_context` (see [Contextual chunks](#contextual-chunks)),
+and for `pplx_late` (see [Multi-vector](#multi-vector)).
 The qualified `qwen_embedding` checkpoint is
 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) at
 revision `97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3`.
@@ -143,12 +144,87 @@ A 4-chunk, 53-token document takes 23 to 25 ms over HTTP (warm median over two
 runs, of which 21 to 23 ms is the forward pass and pooling); the first request
 after load takes 23 to 26 ms.
 
+## Multi-vector
+
+Registry entries of kind `pplx_late` return one vector per token for
+late-interaction (ColBERT-style) retrieval. The qualified checkpoint is
+[pplx-embed-v1-late-0.6b](https://huggingface.co/perplexity-ai/pplx-embed-v1-late-0.6b)
+at revision `4d28cf627d225552cfc29fb7df6cb0705ea0f1b3` (MIT), the same
+bidirectional Qwen3-0.6B backbone with a 1024-to-128 projection head. A causal
+checkpoint fails at load.
+
+```json
+{"models": [{"id": "late", "kind": "pplx_late", "path": "/path/to/pplx-embed-v1-late-0.6b"}]}
+```
+
+```sh
+curl -s localhost:8321/v1/embeddings -d '{"model": "late",
+  "input": "What motivates scientific discovery?", "input_type": "query"}'
+```
+
+| Field | Meaning |
+| --- | --- |
+| `model` | Registered ID. |
+| `input` | One text or a list of 1 to 64 nonempty texts. |
+| `input_type` | `document` (default) or `query`. |
+| `encoding_format` | Only `float`. |
+| `user` | Accepted and ignored. |
+
+Following the checkpoint's sentence-transformers pipeline, a query is `[Q] `
+followed by its text, truncated or padded with the tokenizer's mask token to
+exactly 32 tokens; every position, padding included, is attended and returned.
+A document is `[D] ` followed by its text, truncated to 512 tokens, and its
+ASCII punctuation tokens are left out. Each returned token's final-norm hidden
+state is projected to 128 values and L2-normalized. There are no
+`instruction` or `dimensions` fields; sending one returns 400.
+
+```json
+{"object": "list", "model": "late",
+ "data": [{"object": "embedding", "index": 0,
+           "embedding": [[0.031, -0.112, ...], ...],
+           "positions": [0, 1, 2, ...],
+           "offsets": [null, [0, 4], [4, 14], ..., null],
+           "truncated": false}],
+ "usage": {"prompt_tokens": 32, "total_tokens": 32},
+ "metallix": {"pooling": "none", "vectors": "per_token", "similarity": "maxsim",
+              "normalized": true, "dimensions": 128, "input_type": "query",
+              "query_length": 32, "document_length": 512, "precision": "float32",
+              "embed_ms": 23, "tokenizer_json_sha256": "..."}}
+```
+
+`embedding` holds one 128-value vector per returned token. `positions` gives
+each vector's index in the model's input sequence, and `offsets` its
+`[start, end)` character span in the input text, or `null` for the prefix
+token and for query padding, which have no text. `truncated` says whether the
+text was longer than the query or document length. Score a query against a
+document with MaxSim: for each query vector, take the largest dot product with
+any document vector, and sum those. The server does not score; clients do.
+
+Served weights are float32, as the checkpoint stores them. An opt-in test sends
+the 11 inputs of `fixtures/pplx-embed-v1-late-0.6b/late-reference.json` (four
+queries, including one over 32 tokens, and seven documents, including one over
+512 tokens, punctuation, code and Japanese) through `mx serve`. Against the
+source's `MultiVectorEncoder`, positions match exactly, the worst token vector
+is at 1 - 1.6e-11 cosine, MaxSim scores over eight query and document pairs are
+within 3.2e-6, and the card's three published scores (31.4841, 31.2462,
+31.4041) are reproduced to their printed precision. The fixture's declared
+policy is cosine at least 1 - 1e-5 per token and MaxSim within 1e-3.
+
+```sh
+METALLIX_PPLX_LATE_MODEL=/path/to/pplx-embed-v1-late-0.6b \
+  cargo test --release -p server --features metal --test serve_pplx_late -- --ignored --nocapture
+```
+
+Over HTTP (warm median over two runs), a query takes about 25 ms, a 9-token
+document about 10 ms and a 512-token document about 116 ms. For that document
+about 6 ms falls outside the forward pass, mostly writing and sending its 456
+vectors as JSON.
+
 ## Not supported yet
 
-Multi-vector output (per-token vectors for late-interaction scoring, or pooling
-over caller-chosen spans) is kept out deliberately. Neither served model is
-trained for it: Qwen3-Embedding pools the last token and pplx-embed-context
-pools fixed chunk spans, so other token states are not qualified retrieval
-vectors. It will be offered per model, only for a model trained for that output
-and qualified against its source. Both request shapes reject unknown fields so
-new modes can be added as fields without changing existing responses.
+Pooling over caller-chosen spans is kept out: no served model is trained for
+it, so arbitrary spans of token states are not qualified retrieval vectors.
+Qwen3-Embedding's and pplx-embed-context's own token states are not returned
+for the same reason; per-token vectors come only from `pplx_late`. Every
+request shape rejects unknown fields so new modes can be added as fields
+without changing existing responses.

@@ -10,6 +10,7 @@ use crate::{
     chat_generation::{ChatBackend, ChatSession, ResidentChatLimits},
     julia_decisions::JuliaDecider,
     pplx_context_embeddings::PplxContextEmbedder,
+    pplx_late_embeddings::PplxLateEmbedder,
     qwen_decisions,
     qwen_embeddings::QwenEmbedder,
 };
@@ -28,6 +29,9 @@ pub(crate) enum ModelKind {
     /// pplx-embed-context checkpoint: `/v1/embeddings` with one vector per
     /// chunk of each document.
     PplxContext,
+    /// pplx-embed-v1-late checkpoint: `/v1/embeddings` with one vector per
+    /// scored token, for late-interaction scoring.
+    PplxLate,
 }
 
 impl ModelKind {
@@ -39,7 +43,7 @@ impl ModelKind {
         match self {
             Self::Qwen => &["generate", "decide"],
             Self::Julia => &["decide"],
-            Self::QwenEmbedding | Self::PplxContext => &["embed"],
+            Self::QwenEmbedding | Self::PplxContext | Self::PplxLate => &["embed"],
         }
     }
 }
@@ -209,6 +213,20 @@ impl ModelWorker for PplxContextEmbedder {
     }
 }
 
+impl ModelWorker for PplxLateEmbedder {
+    fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+        None
+    }
+
+    fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
+
+    fn embed(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+        Some(PplxLateEmbedder::embed(self, body, model))
+    }
+}
+
 pub(crate) fn load(
     entry: &ServedEntry,
     limits: ResidentChatLimits,
@@ -218,6 +236,7 @@ pub(crate) fn load(
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
         ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
         ModelKind::PplxContext => Box::new(PplxContextEmbedder::load(&entry.path)?),
+        ModelKind::PplxLate => Box::new(PplxLateEmbedder::load(&entry.path)?),
     })
 }
 
@@ -247,6 +266,11 @@ mod tests {
         assert_eq!(context[0].kind, ModelKind::PplxContext);
         assert_eq!(context[0].kind.capabilities(), ["embed"]);
         assert!(!context[0].kind.generates());
+        let late =
+            parse_manifest(br#"{"models": [{"id": "l", "kind": "pplx_late", "path": "/l"}]}"#)
+                .unwrap();
+        assert_eq!(late[0].kind, ModelKind::PplxLate);
+        assert_eq!(late[0].kind.capabilities(), ["embed"]);
 
         let shorthand = entries(None, Some(Path::new("/q")), "qwen").unwrap();
         assert_eq!(shorthand[0].kind, ModelKind::Qwen);
