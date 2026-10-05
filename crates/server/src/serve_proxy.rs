@@ -19,7 +19,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{Sender, channel},
+        mpsc::{RecvTimeoutError, Sender, channel},
     },
     thread,
     time::{Duration, Instant},
@@ -411,18 +411,24 @@ fn forward_child_log(id: &str, stderr: impl io::Read, address: &Sender<SocketAdd
 
 fn wait_for_child(started: Started) -> Result<(Child, SocketAddr), String> {
     let (mut child, receiver) = started?;
-    // The log reader drops its sender when the child exits, so this returns early.
-    if let Ok(address) = receiver.recv_timeout(START_TIMEOUT) {
-        return Ok((child, address));
+    match receiver.recv_timeout(START_TIMEOUT) {
+        Ok(address) => Ok((child, address)),
+        // The log reader drops its sender at the end of the child's stderr. An
+        // exiting child's stderr closes a moment before its exit status can be
+        // collected, so wait for the status instead of checking for it once.
+        Err(RecvTimeoutError::Disconnected) => Err(match child.wait() {
+            Ok(status) => format!("child exited during startup with {status}"),
+            Err(error) => format!("child closed its log during startup: {error}"),
+        }),
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(format!(
+                "child did not listen within {} s",
+                START_TIMEOUT.as_secs()
+            ))
+        }
     }
-    let reason = if let Ok(Some(status)) = child.try_wait() {
-        format!("child exited during startup with {status}")
-    } else {
-        let _ = child.kill();
-        format!("child did not listen within {} s", START_TIMEOUT.as_secs())
-    };
-    let _ = child.wait();
-    Err(reason)
 }
 
 fn start_and_wait(launcher: &Launcher, entry: &ServedEntry) -> Result<(Child, SocketAddr), String> {
@@ -1193,6 +1199,25 @@ mod tests {
         assert!(victims(&slots, 4, 3999).is_err());
         // A target that already fits stops nothing.
         assert_eq!(victims(&slots, 4, 6500), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_child_whose_log_ended_before_it_can_be_reaped_exited_during_startup() {
+        // The log reader has already seen end of stderr and dropped its sender,
+        // but the child's exit status is not yet available: the window between
+        // the kernel closing an exiting child's descriptors and its reaping.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (_, receiver) = channel();
+        let started = Instant::now();
+        let reason = wait_for_child(Ok((child, receiver))).unwrap_err();
+        assert_eq!(reason, "child exited during startup with exit status: 3");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
