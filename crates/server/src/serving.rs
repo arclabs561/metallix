@@ -803,7 +803,7 @@ mod tests {
                     generated_tokens: 1,
                 },
                 logprobs: Vec::new(),
-                seed: None,
+                sampling: None,
             })
         }
     }
@@ -915,7 +915,7 @@ stream.close()
                     generated_tokens: 1,
                 },
                 logprobs: Vec::new(),
-                seed: None,
+                sampling: None,
             })
         }
     }

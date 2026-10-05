@@ -154,14 +154,22 @@ impl SamplingPolicy {
         Ok((token, scores))
     }
 
-    /// Samples from the smallest most-likely token set whose
-    /// temperature-transformed mass reaches `top_p` (nucleus sampling). A
-    /// `top_p` of one keeps every token, matching [`Self::sample`].
-    pub(crate) fn sample_nucleus(&mut self, logits: &[f32], top_p: f64) -> Result<i32, String> {
+    /// Samples from the `top_k` most likely tokens, then from the smallest
+    /// most-likely set whose temperature-transformed mass, renormalized over
+    /// those `top_k`, reaches `top_p` (the vLLM and Hugging Face order). A
+    /// `top_p` of one and no `top_k` keep every token, matching
+    /// [`Self::sample`].
+    pub(crate) fn sample_nucleus(
+        &mut self,
+        logits: &[f32],
+        top_p: f64,
+        top_k: Option<usize>,
+    ) -> Result<i32, String> {
         nucleus_mask(
             logits,
             self.configuration.temperature,
             top_p,
+            top_k,
             &mut self.legal_mask,
         )?;
         self.sample(logits, false).map(|(token, _)| token)
@@ -201,11 +209,13 @@ impl SamplingPolicy {
 }
 
 /// Marks the nucleus in `mask`: tokens in descending logit order (index order
-/// on ties) until their temperature-transformed mass reaches `top_p`.
+/// on ties), limited to the first `top_k`, until their temperature-transformed
+/// mass reaches `top_p` of the kept mass.
 fn nucleus_mask(
     logits: &[f32],
     temperature: f64,
     top_p: f64,
+    top_k: Option<usize>,
     mask: &mut [bool],
 ) -> Result<(), String> {
     if logits.len() != mask.len() || logits.is_empty() {
@@ -215,8 +225,10 @@ fn nucleus_mask(
     if !valid {
         return Err("nucleus sampling requires top_p in (0, 1] and a positive temperature".into());
     }
-    mask.fill(top_p >= 1.0);
-    if top_p >= 1.0 {
+    let top_k = top_k.filter(|&top_k| top_k > 0 && top_k < logits.len());
+    let keep_all = top_p >= 1.0 && top_k.is_none();
+    mask.fill(keep_all);
+    if keep_all {
         return Ok(());
     }
     if logits.iter().any(|logit| !logit.is_finite()) {
@@ -226,13 +238,28 @@ fn nucleus_mask(
     let weight = |logit: f32| ((f64::from(logit) - maximum) / temperature).exp();
     let total: f64 = logits.iter().map(|&logit| weight(logit)).sum();
     let target = top_p * total;
-    let order = |candidates: &mut Vec<usize>| {
-        candidates.sort_unstable_by(|&left, &right| {
-            logits[right]
-                .total_cmp(&logits[left])
-                .then(left.cmp(&right))
-        });
+    let descending = |left: &usize, right: &usize| {
+        logits[*right]
+            .total_cmp(&logits[*left])
+            .then(left.cmp(right))
     };
+    let order = |candidates: &mut Vec<usize>| candidates.sort_unstable_by(descending);
+    if let Some(top_k) = top_k {
+        let mut head: Vec<usize> = (0..logits.len()).collect();
+        head.select_nth_unstable_by(top_k - 1, descending);
+        head.truncate(top_k);
+        order(&mut head);
+        let kept: f64 = head.iter().map(|&index| weight(logits[index])).sum();
+        let mut covered = 0.0;
+        for index in head {
+            mask[index] = true;
+            covered += weight(logits[index]);
+            if covered >= top_p * kept {
+                break;
+            }
+        }
+        return Ok(());
+    }
     // Sorting the whole vocabulary every step is the slow path; the head
     // above a tiny relative weight almost always holds the nucleus.
     let mut candidates: Vec<usize> = (0..logits.len())
@@ -1932,19 +1959,29 @@ mod tests {
     fn nucleus_keeps_the_smallest_head_reaching_top_p() {
         // Softmax of [3, 2, 1, 0] is about [0.644, 0.237, 0.087, 0.032].
         let logits = [1.0_f32, 3.0, 0.0, 2.0];
-        let kept = |top_p: f64, temperature: f64| {
+        let kept_k = |top_p: f64, temperature: f64, top_k: Option<usize>| {
             let mut mask = [false; 4];
-            super::nucleus_mask(&logits, temperature, top_p, &mut mask).unwrap();
+            super::nucleus_mask(&logits, temperature, top_p, top_k, &mut mask).unwrap();
             mask
         };
+        let kept = |top_p: f64, temperature: f64| kept_k(top_p, temperature, None);
         assert_eq!(kept(0.5, 1.0), [false, true, false, false]);
         assert_eq!(kept(0.8, 1.0), [false, true, false, true]);
         assert_eq!(kept(0.95, 1.0), [true, true, false, true]);
         assert_eq!(kept(1.0, 1.0), [true; 4]);
         // A hotter distribution needs more tokens for the same mass.
         assert_eq!(kept(0.7, 10.0), [true, true, false, true]);
+        // top_k cuts first; top_p then applies to the mass the cut kept:
+        // the top three hold about 0.968, and 0.7 of that needs two tokens.
+        assert_eq!(kept_k(1.0, 1.0, Some(2)), [false, true, false, true]);
+        assert_eq!(kept_k(0.7, 1.0, Some(3)), [false, true, false, true]);
+        assert_eq!(kept_k(0.5, 1.0, Some(3)), [false, true, false, false]);
+        assert_eq!(kept_k(1.0, 1.0, Some(1)), [false, true, false, false]);
+        // A top_k of zero or of the whole vocabulary keeps everything.
+        assert_eq!(kept_k(1.0, 1.0, Some(0)), [true; 4]);
+        assert_eq!(kept_k(1.0, 1.0, Some(4)), [true; 4]);
         let mut mask = [false; 4];
-        assert!(super::nucleus_mask(&logits, 1.0, 0.0, &mut mask).is_err());
+        assert!(super::nucleus_mask(&logits, 1.0, 0.0, None, &mut mask).is_err());
     }
 
     #[test]
@@ -1965,14 +2002,14 @@ mod tests {
                 logits.len(),
             );
             (0..200)
-                .map(|_| policy.sample_nucleus(&logits, 0.6).unwrap())
+                .map(|_| policy.sample_nucleus(&logits, 0.6, None).unwrap())
                 .collect::<Vec<_>>()
         };
         let first = draw(11);
         assert_eq!(first, draw(11));
         assert_ne!(first, draw(12));
         let mut nucleus = vec![false; logits.len()];
-        super::nucleus_mask(&logits, 0.8, 0.6, &mut nucleus).unwrap();
+        super::nucleus_mask(&logits, 0.8, 0.6, None, &mut nucleus).unwrap();
         assert!(
             first
                 .iter()

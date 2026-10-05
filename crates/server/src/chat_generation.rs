@@ -25,6 +25,7 @@ use crate::{
 };
 
 const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
+const MAX_GENERATION_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
@@ -188,7 +189,7 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) enable_thinking: bool,
     /// Optional model-specific reasoning effort passed through to templates.
     pub(crate) reasoning_effort: Option<&'a str>,
-    pub(crate) sampling: Sampling,
+    pub(crate) sampling: SamplingRequest,
     /// `Some(k)` records each output token's log probability and its `k`
     /// most likely alternatives.
     pub(crate) top_logprobs: Option<u8>,
@@ -206,28 +207,123 @@ impl<'a> ChatRequest<'a> {
             max_tokens: Some(max_tokens),
             enable_thinking: false,
             reasoning_effort: None,
-            sampling: Sampling::Greedy,
+            sampling: SamplingRequest::GREEDY,
             top_logprobs: None,
             json_schema: None,
         }
     }
 }
 
-/// How each output token is chosen.
+/// The caller's sampling fields. Omitted values take the checkpoint's
+/// `generation_config.json` defaults, as vLLM does; a temperature of zero,
+/// requested or defaulted, is greedy.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) enum Sampling {
-    /// The highest-logit token.
-    #[default]
-    Greedy,
-    /// Seeded categorical sampling through `engine::sampling` after a
-    /// temperature transform. `top_p` below one restricts each draw to the
-    /// nucleus. An absent seed is drawn per turn and reported in
-    /// [`ChatGeneration::seed`] so the turn can be replayed.
-    Categorical {
-        temperature: f64,
-        top_p: f64,
-        seed: Option<u64>,
-    },
+pub(crate) struct SamplingRequest {
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) seed: Option<u64>,
+}
+
+/// Sampling defaults a checkpoint ships in `generation_config.json`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct SamplingDefaults {
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) top_k: Option<u32>,
+}
+
+impl SamplingDefaults {
+    /// Reads the optional file, keeping only values generation can honor:
+    /// a finite nonnegative temperature, `top_p` in (0, 1], a positive
+    /// `top_k`. Other fields (`do_sample`, penalties) are not applied.
+    fn load(model: &Path) -> Result<Self, String> {
+        let path = model.join("generation_config.json");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = crate::qwen_tokenizer::read_regular_file(
+            &path,
+            MAX_GENERATION_CONFIG_BYTES,
+            "generation_config.json",
+        )?;
+        let config: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| String::from("local generation_config.json could not be parsed"))?;
+        Ok(Self {
+            temperature: config["temperature"]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            top_p: config["top_p"]
+                .as_f64()
+                .filter(|value| *value > 0.0 && *value <= 1.0),
+            top_k: config["top_k"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0),
+        })
+    }
+}
+
+/// The sampling policy one turn actually used.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct AppliedSampling {
+    /// Zero means greedy; `top_p`, `top_k` and `seed` then do not apply.
+    pub(crate) temperature: f64,
+    pub(crate) top_p: f64,
+    pub(crate) top_k: Option<u32>,
+    /// The seed drawn or requested, so an unseeded turn can be replayed.
+    pub(crate) seed: Option<u64>,
+    /// Fields taken from the checkpoint's `generation_config.json`.
+    pub(crate) defaults_applied: Vec<&'static str>,
+}
+
+impl SamplingRequest {
+    /// Explicitly greedy, for callers that predate model defaults.
+    pub(crate) const GREEDY: Self = Self {
+        temperature: Some(0.0),
+        top_p: None,
+        seed: None,
+    };
+
+    /// Fills omitted fields from `defaults`. Under a grammar mask the default
+    /// `top_p` and `top_k` are not applied: the grammar owns the legal-token
+    /// mask, so only temperature carries over.
+    pub(crate) fn resolve(self, defaults: SamplingDefaults, constrained: bool) -> AppliedSampling {
+        let mut defaults_applied = Vec::new();
+        let temperature = self.temperature.unwrap_or_else(|| {
+            defaults.temperature.map_or(0.0, |value| {
+                defaults_applied.push("temperature");
+                value
+            })
+        });
+        if temperature <= 0.0 {
+            return AppliedSampling {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                defaults_applied,
+            };
+        }
+        let top_p = match (self.top_p, defaults.top_p) {
+            (Some(value), _) => value,
+            (None, Some(value)) if !constrained => {
+                defaults_applied.push("top_p");
+                value
+            }
+            (None, _) => 1.0,
+        };
+        let top_k = defaults.top_k.filter(|_| !constrained);
+        if top_k.is_some() {
+            defaults_applied.push("top_k");
+        }
+        AppliedSampling {
+            temperature,
+            top_p,
+            top_k,
+            seed: Some(self.seed.unwrap_or_else(fresh_seed)),
+            defaults_applied,
+        }
+    }
 }
 
 pub(crate) const MAX_TOP_LOGPROBS: u8 = 20;
@@ -238,7 +334,7 @@ pub(crate) const MAX_TOP_LOGPROBS: u8 = 20;
 pub(crate) struct GenerationControls {
     /// `None` allows output up to the remaining context after the prompt.
     pub(crate) max_tokens: Option<u32>,
-    pub(crate) sampling: Sampling,
+    pub(crate) sampling: SamplingRequest,
     pub(crate) top_logprobs: Option<u8>,
     pub(crate) enable_thinking: bool,
     pub(crate) reasoning_effort: Option<String>,
@@ -256,13 +352,12 @@ impl GenerationControls {
         if self.max_tokens == Some(0) {
             return Err("the output token limit must be positive".into());
         }
-        if let Sampling::Categorical {
-            temperature, top_p, ..
-        } = self.sampling
-        {
-            if !(temperature > 0.0 && temperature <= 2.0) {
+        if let Some(temperature) = self.sampling.temperature {
+            if !(0.0..=2.0).contains(&temperature) {
                 return Err("temperature must be in [0, 2]".into());
             }
+        }
+        if let Some(top_p) = self.sampling.top_p {
             if !(top_p > 0.0 && top_p <= 1.0) {
                 return Err("top_p must be in (0, 1]".into());
             }
@@ -285,7 +380,8 @@ impl GenerationControls {
             if has_tools || self.enable_thinking {
                 return Err("JSON schema output cannot be combined with tools or reasoning".into());
             }
-            if matches!(self.sampling, Sampling::Categorical { top_p, .. } if top_p < 1.0) {
+            let greedy = self.sampling.temperature == Some(0.0);
+            if !greedy && self.sampling.top_p.is_some_and(|top_p| top_p < 1.0) {
                 return Err("JSON schema output cannot be combined with top_p below 1".into());
             }
         }
@@ -371,9 +467,10 @@ pub(crate) struct ChatGeneration {
     /// One entry per generated token except a final EOS, when requested.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) logprobs: Vec<TokenLogprob>,
-    /// The seed a sampled turn actually used; `None` for greedy turns.
+    /// The sampling policy the turn used; `None` from backends that do not
+    /// report one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) seed: Option<u64>,
+    pub(crate) sampling: Option<AppliedSampling>,
 }
 
 /// A cooperative wall-clock budget for one complete chat turn.
@@ -463,6 +560,7 @@ pub(crate) struct ChatSession {
     template_sha256: String,
     /// Checkpoint directory, read again only to compile a JSON-schema grammar.
     model: PathBuf,
+    sampling_defaults: SamplingDefaults,
 }
 
 /// The non-generative result of a single independently-prefilled chat prompt.
@@ -531,6 +629,7 @@ impl ChatSession {
             tokenizer_sha256,
             template_sha256,
             model: model.to_path_buf(),
+            sampling_defaults: SamplingDefaults::load(model)?,
         })
     }
 
@@ -651,7 +750,7 @@ impl ChatSession {
         let max_tokens = self.output_budget(request.max_tokens, input_ids.len())?;
         // Compiles a schema grammar before any model work, so a bad schema
         // fails fast.
-        let mut picker = TokenPicker::new(request, &self.model, self.vocabulary_size)?;
+        let mut picker = self.token_picker(request)?;
 
         deadline.check()?;
         let mut executor = self
@@ -737,7 +836,7 @@ impl ChatSession {
             generated_token_ids: generated,
             finish_reason,
             logprobs,
-            seed: picker.seed,
+            sampling: Some(picker.applied),
             metrics: ChatGenerationMetrics {
                 context_tokens: self.context_limit,
                 planned_kv_bytes: self.planned_kv_bytes,
@@ -755,6 +854,15 @@ impl ChatSession {
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
         render_template(&self.template, request)
+    }
+
+    fn token_picker(&self, request: ChatRequest<'_>) -> Result<TokenPicker, String> {
+        TokenPicker::new(
+            request,
+            self.sampling_defaults,
+            &self.model,
+            self.vocabulary_size,
+        )
     }
 
     /// Resolves the output limit (`None` fills the remaining context) and
@@ -1037,29 +1145,34 @@ fn validate_ids(ids: &[i32], eos_token_id: i32, vocabulary_size: usize) -> Resul
 /// Chooses each output token: greedy, seeded nucleus sampling, or either
 /// under a JSON-schema grammar mask.
 struct TokenPicker {
-    policy: Option<(SamplingPolicy, f64)>,
+    /// The sampler with its `top_p` and `top_k`; `None` is greedy.
+    policy: Option<(SamplingPolicy, f64, Option<usize>)>,
     #[cfg(feature = "structured-output")]
     constraint: Option<crate::qwen_constraints::ConstraintRun>,
-    seed: Option<u64>,
+    applied: AppliedSampling,
 }
 
 impl TokenPicker {
-    fn new(request: ChatRequest<'_>, model: &Path, vocabulary_size: usize) -> Result<Self, String> {
-        let (policy, seed) = match request.sampling {
-            Sampling::Greedy => (None, None),
-            Sampling::Categorical {
-                temperature,
-                top_p,
+    fn new(
+        request: ChatRequest<'_>,
+        defaults: SamplingDefaults,
+        model: &Path,
+        vocabulary_size: usize,
+    ) -> Result<Self, String> {
+        let applied = request
+            .sampling
+            .resolve(defaults, request.json_schema.is_some());
+        let policy = applied.seed.map(|seed| {
+            let configuration = SamplingConfiguration {
                 seed,
-            } => {
-                let seed = seed.unwrap_or_else(fresh_seed);
-                let configuration = SamplingConfiguration { seed, temperature };
-                (
-                    Some((SamplingPolicy::new(configuration, vocabulary_size), top_p)),
-                    Some(seed),
-                )
-            }
-        };
+                temperature: applied.temperature,
+            };
+            (
+                SamplingPolicy::new(configuration, vocabulary_size),
+                applied.top_p,
+                applied.top_k.and_then(|top_k| usize::try_from(top_k).ok()),
+            )
+        });
         #[cfg(feature = "structured-output")]
         let constraint = request
             .json_schema
@@ -1083,7 +1196,7 @@ impl TokenPicker {
             policy,
             #[cfg(feature = "structured-output")]
             constraint,
-            seed,
+            applied,
         })
     }
 
@@ -1094,14 +1207,14 @@ impl TokenPicker {
             let (token, _) = match self.policy.as_mut() {
                 None => constraint.sample(logits, false),
                 // Validation rejects a constrained top_p below one.
-                Some((policy, _)) => policy.sample_constrained(constraint, logits, false),
+                Some((policy, ..)) => policy.sample_constrained(constraint, logits, false),
             }
             .map_err(|error| error.to_string())?;
             return Ok((token, constraint.is_complete()));
         }
         let token = match self.policy.as_mut() {
             None => greedy_token(logits)?,
-            Some((policy, top_p)) => policy.sample_nucleus(logits, *top_p)?,
+            Some((policy, top_p, top_k)) => policy.sample_nucleus(logits, *top_p, *top_k)?,
         };
         Ok((token, false))
     }

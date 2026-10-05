@@ -317,7 +317,7 @@ mod tests {
                     generated_tokens: 0,
                 },
                 logprobs: Vec::new(),
-                seed: None,
+                sampling: None,
             },
         )
     }

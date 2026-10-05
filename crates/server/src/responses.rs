@@ -14,7 +14,7 @@ use crate::{
     chat_cli::message,
     chat_generation::{
         ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRole, ChatToolCall,
-        GenerationControls, Sampling, TokenLogprob,
+        GenerationControls, SamplingRequest, TokenLogprob,
     },
     chat_tools,
     http_transport::Connection,
@@ -151,8 +151,11 @@ const KNOWN_INCLUDES: [&str; 8] = [
 /// `reasoning.effort` maps onto Qwen's binary `enable_thinking`: absent,
 /// `none` and `minimal` keep thinking off; `low`, `medium`, `high` and `xhigh`
 /// turn it on and are passed to the template as `reasoning_effort`, which the
-/// stock Qwen3 template ignores. An omitted or zero temperature is greedy;
-/// `top_p` and `seed` apply only when temperature is positive.
+/// stock Qwen3 template ignores. As in vLLM, an omitted `temperature` or
+/// `top_p` takes the checkpoint's `generation_config.json` default (and its
+/// `top_k`, which has no request field), greedy if it has none; an explicit
+/// temperature of zero is greedy. The response's `metallix.sampling` records
+/// the policy used and which defaults applied.
 pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> {
     if request.background == Some(true) {
         return Err("background responses are unsupported".into());
@@ -193,17 +196,13 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
             Some(schema.clone())
         }
     };
-    let sampling = match request.temperature {
-        None | Some(0.0) => Sampling::Greedy,
-        Some(temperature) => Sampling::Categorical {
-            temperature,
-            top_p: request.top_p.unwrap_or(1.0),
-            seed: request.seed,
-        },
-    };
     let controls = GenerationControls {
         max_tokens: request.max_output_tokens,
-        sampling,
+        sampling: SamplingRequest {
+            temperature: request.temperature,
+            top_p: request.top_p,
+            seed: request.seed,
+        },
         top_logprobs: (logprobs || request.top_logprobs.is_some())
             .then(|| request.top_logprobs.unwrap_or(0)),
         enable_thinking,
@@ -211,12 +210,6 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         json_schema,
     };
     controls.validate(!request.tools.is_empty())?;
-    if let Some(top_p) = request.top_p {
-        // Validate an ignored greedy top_p too, so a typo is never accepted.
-        if !(top_p > 0.0 && top_p <= 1.0) {
-            return Err("top_p must be in (0, 1]".into());
-        }
-    }
     Ok(controls)
 }
 
@@ -715,9 +708,8 @@ fn response_value(
         output.push(json!({"type":"function_call","id":format!("fc_{id}_{index}"),"call_id":format!("call_{id}_{index}"),"name":call.name,"arguments":call.arguments.to_string(),"status":"completed"}));
     }
     let mut response = json!({"id":id,"object":"response","model":request.model,"status":if complete {"completed"} else {"incomplete"},"output":output,"incomplete_details":if complete {Value::Null} else {json!({"reason":"max_output_tokens"})},"usage":{"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()},"metrics":generated.metrics});
-    if let Some(seed) = generated.seed {
-        // The seed actually drawn, so an unseeded sampled turn can be replayed.
-        response["metallix"] = json!({"seed": seed});
+    if let Some(sampling) = &generated.sampling {
+        response["metallix"] = json!({ "sampling": sampling });
     }
     Ok(response)
 }
@@ -893,18 +885,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             sampled.sampling,
-            Sampling::Categorical {
-                temperature: 0.7,
-                top_p: 0.9,
+            SamplingRequest {
+                temperature: Some(0.7),
+                top_p: Some(0.9),
                 seed: Some(7)
             }
         );
         assert_eq!(sampled.max_tokens, Some(4096));
-        // A zero temperature is greedy, whatever else is sent.
-        let greedy =
-            controls(&request_with(&json!({"temperature":0.0,"top_p":0.5,"seed":1})).unwrap())
-                .unwrap();
-        assert_eq!(greedy.sampling, Sampling::Greedy);
+        // Omitted fields stay omitted, for the model's defaults to fill.
+        assert_eq!(
+            controls(&request_with(&json!({})).unwrap())
+                .unwrap()
+                .sampling,
+            SamplingRequest::default()
+        );
 
         let logprobs = |extra: Value| {
             controls(&request_with(&extra).unwrap())
@@ -991,12 +985,68 @@ mod tests {
                 generated_tokens: 2,
             },
             logprobs: Vec::new(),
-            seed: None,
+            sampling: None,
         }
     }
 
     #[test]
-    fn response_carries_reasoning_logprobs_and_seed() {
+    fn omitted_sampling_fields_take_the_model_defaults() {
+        use crate::chat_generation::SamplingDefaults;
+        // Qwen3-0.6B's generation_config.json.
+        let qwen = SamplingDefaults {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            top_k: Some(20),
+        };
+        let resolve = |extra: Value, defaults, constrained| {
+            controls(&request_with(&extra).unwrap())
+                .unwrap()
+                .sampling
+                .resolve(defaults, constrained)
+        };
+        let all = resolve(json!({"seed":4}), qwen, false);
+        assert_eq!(
+            (all.temperature, all.top_p, all.top_k, all.seed),
+            (0.6, 0.95, Some(20), Some(4))
+        );
+        assert_eq!(all.defaults_applied, ["temperature", "top_p", "top_k"]);
+        // Explicit fields win; top_k has no request field, so it still applies.
+        let some = resolve(json!({"temperature":1.0,"top_p":0.5}), qwen, false);
+        assert_eq!(
+            (some.temperature, some.top_p, some.top_k),
+            (1.0, 0.5, Some(20))
+        );
+        assert_eq!(some.defaults_applied, ["top_k"]);
+        assert!(
+            some.seed.is_some(),
+            "an unseeded turn reports its drawn seed"
+        );
+        // An explicit zero temperature is greedy and takes no defaults.
+        let greedy = resolve(json!({"temperature":0.0,"top_p":0.5,"seed":1}), qwen, false);
+        assert_eq!(
+            (greedy.temperature, greedy.top_k, greedy.seed),
+            (0.0, None, None)
+        );
+        assert!(greedy.defaults_applied.is_empty());
+        // A model without defaults stays greedy.
+        let bare = resolve(json!({}), SamplingDefaults::default(), false);
+        assert_eq!((bare.temperature, bare.seed), (0.0, None));
+        assert!(bare.defaults_applied.is_empty());
+        // Under a grammar only the default temperature carries over.
+        let constrained = resolve(json!({}), qwen, true);
+        assert_eq!(
+            (
+                constrained.temperature,
+                constrained.top_p,
+                constrained.top_k
+            ),
+            (0.6, 1.0, None)
+        );
+        assert_eq!(constrained.defaults_applied, ["temperature"]);
+    }
+
+    #[test]
+    fn response_carries_reasoning_logprobs_and_sampling() {
         let request = request_with(&json!({"reasoning":{"effort":"low"}})).unwrap();
         let thinking = controls(&request).unwrap();
         let response = response_value(
@@ -1017,7 +1067,14 @@ mod tests {
 
         let request = request_with(&json!({"top_logprobs":1,"temperature":1.0})).unwrap();
         let mut generated = generation("hi");
-        generated.seed = Some(9);
+        generated.sampling = Some(
+            SamplingRequest {
+                temperature: Some(1.0),
+                seed: Some(9),
+                ..SamplingRequest::default()
+            }
+            .resolve(crate::chat_generation::SamplingDefaults::default(), false),
+        );
         generated.logprobs = vec![TokenLogprob {
             token: "hi".into(),
             bytes: b"hi".to_vec(),
@@ -1030,7 +1087,12 @@ mod tests {
         assert_eq!(logprobs[0]["token"], "hi");
         assert_eq!(logprobs[0]["bytes"], json!([104, 105]));
         assert_eq!(logprobs[0]["logprob"], -0.25);
-        assert_eq!(response["metallix"]["seed"], 9);
+        assert_eq!(response["metallix"]["sampling"]["seed"], 9);
+        assert_eq!(response["metallix"]["sampling"]["temperature"], 1.0);
+        assert_eq!(
+            response["metallix"]["sampling"]["defaults_applied"],
+            json!([])
+        );
     }
 
     #[test]
@@ -1146,7 +1208,7 @@ mod tests {
         }
 
         /// Max tokens, sampling, top logprobs, thinking, and schema presence.
-        type Seen = (Option<u32>, Sampling, Option<u8>, bool, bool);
+        type Seen = (Option<u32>, SamplingRequest, Option<u8>, bool, bool);
 
         /// Records what reached the backend; optionally fails before any token.
         #[derive(Default)]
@@ -1193,9 +1255,9 @@ mod tests {
                 backend.seen,
                 Some((
                     Some(9000),
-                    Sampling::Categorical {
-                        temperature: 0.5,
-                        top_p: 0.8,
+                    SamplingRequest {
+                        temperature: Some(0.5),
+                        top_p: Some(0.8),
                         seed: Some(3)
                     },
                     Some(2),
@@ -1211,7 +1273,7 @@ mod tests {
             let events = events(&exchange(&body, &mut backend));
             assert_eq!(
                 backend.seen,
-                Some((None, Sampling::Greedy, None, false, schema))
+                Some((None, SamplingRequest::default(), None, false, schema))
             );
             assert_eq!(events.last().unwrap()["type"], "response.completed");
             let done = events
@@ -1284,14 +1346,33 @@ mod tests {
                 );
                 let (status, response) = json_body(&exchange(&body, session));
                 assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
-                assert_eq!(response["metallix"]["seed"], seed);
+                assert_eq!(response["metallix"]["sampling"]["seed"], seed);
                 text(&response).to_owned()
             };
             let first = sampled(1234, &mut session);
             assert_eq!(first, sampled(1234, &mut session));
             assert_ne!(first, sampled(99, &mut session));
 
-            let body = r#"{"model":"q","input":"Say hello.","include":["message.output_text.logprobs"],"top_logprobs":3,"max_output_tokens":8}"#;
+            // Omitted sampling fields take the checkpoint's generation_config.json.
+            let body = r#"{"model":"q","input":"Say hello.","max_output_tokens":4}"#;
+            let (_, response) = json_body(&exchange(body, &mut session));
+            let sampling = &response["metallix"]["sampling"];
+            // Qwen3 checkpoints ship temperature, top_p and top_k.
+            assert_eq!(
+                sampling["defaults_applied"],
+                json!(["temperature", "top_p", "top_k"]),
+                "{response}"
+            );
+            let model = std::env::var_os("METALLIX_QWEN_MODEL").unwrap();
+            let config: Value = serde_json::from_slice(
+                &std::fs::read(Path::new(&model).join("generation_config.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sampling["temperature"], config["temperature"]);
+            assert_eq!(sampling["top_p"], config["top_p"]);
+            assert_eq!(sampling["top_k"], config["top_k"]);
+
+            let body = r#"{"model":"q","input":"Say hello.","temperature":0,"include":["message.output_text.logprobs"],"top_logprobs":3,"max_output_tokens":8}"#;
             let (_, response) = json_body(&exchange(body, &mut session));
             let logprobs = response["output"][0]["content"][0]["logprobs"]
                 .as_array()
