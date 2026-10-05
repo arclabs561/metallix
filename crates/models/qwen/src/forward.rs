@@ -1233,9 +1233,11 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
                 cached: self.cached_tokens,
             });
         }
-        // Resident storage keeps the tier `stepped_cached_kv` chooses for the
-        // shorter sequence, which forks check; unbounded caches hold exactly
-        // the cached positions.
+        // Resident storage shrinks to the tier `stepped_cached_kv` chooses for
+        // the shorter sequence, which forks check; unbounded caches hold
+        // exactly the cached positions. Storage is never widened: compact
+        // storage restored from a snapshot stays compact, and the next append
+        // re-tiers it, as after `from_snapshot`.
         let stored = match self.resident_cache_capacity {
             Some(maximum_capacity) => stepped_capacity(tokens, maximum_capacity)?,
             None => tokens,
@@ -1243,7 +1245,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         let stored = as_i32(stored)?;
         let stream = StreamOrDevice::gpu();
         for layer in self.cache.iter_mut().flatten() {
-            if layer.keys.shape().get(2) != Some(&stored) {
+            if layer.keys.shape().get(2).is_some_and(|&length| length > stored) {
                 layer.keys = layer.keys.index_device((.., .., 0..stored, ..), &stream);
                 layer.values = layer.values.index_device((.., .., 0..stored, ..), &stream);
             }
@@ -2701,6 +2703,32 @@ mod tests {
                 Err(Qwen3ForwardError::NonFiniteLogits)
             ));
         }
+    }
+
+    #[test]
+    fn truncating_restored_snapshot_storage_keeps_it_compact() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = long_small_config();
+        let weights = deterministic_weights();
+        let plan = config
+            .resident_chat_plan(256, u64::MAX, F32)
+            .expect("plan");
+        let prompt: Vec<i32> = (0..100).map(|index| index % 7 + 1).collect();
+        let mut source = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        let _ = source.prefill_last_logits(&prompt).expect("prefill");
+        let snapshot = source.snapshot_prefix(prompt.len(), 7).expect("snapshot");
+        // Restored storage holds exactly 100 positions, below the 128 tier
+        // that 90 tokens would occupy; truncation must not widen it.
+        let mut restored = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &snapshot);
+        restored.truncate_cached_tokens(90).expect("truncate");
+        assert_eq!(restored.cached_tokens(), 90);
+        let continued = restored.decode_last_logits(5).expect("append re-tiers");
+
+        let mut expected_prompt = prompt[..90].to_vec();
+        expected_prompt.push(5);
+        let mut fresh = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        let expected = fresh.prefill_last_logits(&expected_prompt).expect("fresh prefill");
+        assert_logits_match(expected, continued);
     }
 
     #[test]
