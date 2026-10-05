@@ -50,6 +50,10 @@ pub struct V41RangeRequest<'a> {
 pub trait V41RangeSource {
     /// Reads the requested range.
     fn read_range(&self, request: &V41RangeRequest<'_>) -> Result<Vec<u8>, V41RangeCacheError>;
+
+    /// Called when [`V41RangeCache`] serves `request` from memory without
+    /// reading the source, so a source that tracks recency sees every use.
+    fn note_memory_hit(&self, _request: &V41RangeRequest<'_>) {}
 }
 
 /// Serves ranges from route-trace `weights/<tensor>.bin` files, each checked
@@ -467,6 +471,12 @@ impl<S: V41RangeSource> V41RangeCache<S> {
             self.order.remove(last);
             *last = self.tick;
             self.order.insert(self.tick, key);
+            self.source.note_memory_hit(&V41RangeRequest {
+                tensor,
+                shard,
+                tensor_range,
+                range,
+            });
             return Ok(Arc::clone(bytes));
         }
         let length = range.end - range.start;

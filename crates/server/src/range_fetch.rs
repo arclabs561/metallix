@@ -10,11 +10,19 @@
 //! it is checked only by exact length and `Content-Range`.
 //!
 //! Stored bytes stay inside an acquisition envelope (total stored bytes and a
-//! free-disk floor). A fetch that would cross it is refused; nothing is evicted.
+//! free-disk floor). A whole-tensor fetch that would cross it first evicts
+//! least-recently-used routed experts, one whole expert at a time; experts in
+//! the trace directory's `pinned-experts.json` and all non-expert tensors are
+//! never evicted, and the fetch is refused only when evicting everything else
+//! would still not make room. Replaying 5 recorded runs (58,080 expert
+//! accesses) through LRU, a 64 GiB cap missed 23% of accesses and re-downloaded
+//! 79 GiB; 128 GiB, the default, missed 16% and re-downloaded 7.6 GiB, against a
+//! 15.3% compulsory floor.
 
 use std::{
-    collections::BTreeMap,
-    fs, io,
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
+    io::{self, Write as _},
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
@@ -41,10 +49,10 @@ pub struct Envelope {
 }
 
 impl Default for Envelope {
-    /// The route-trace acquisition envelope: 64 GiB stored, 150 GiB free.
+    /// The route-trace acquisition envelope: 128 GiB stored, 150 GiB free.
     fn default() -> Self {
         Self {
-            max_acquired_bytes: 64 << 30,
+            max_acquired_bytes: 128 << 30,
             min_free_bytes: 150 << 30,
         }
     }
@@ -145,6 +153,264 @@ struct ReceiptMetadata {
     data_offsets: [u64; 2],
 }
 
+/// `trace_dir/pinned-experts.json`, written by `scripts/v41_expert_pins.py`.
+#[derive(Deserialize)]
+struct PinFile {
+    experts: Vec<Expert>,
+}
+
+/// A routed expert: (layer, expert index).
+type Expert = (u32, u32);
+
+/// The tensors of one routed expert, after `layers.L.ffn.experts.E.`.
+const EXPERT_PARTS: [&str; 6] = [
+    "w1.weight",
+    "w1.scale",
+    "w2.weight",
+    "w2.scale",
+    "w3.weight",
+    "w3.scale",
+];
+
+/// Store-owned recency log, one `layer expert` line per use, in the weights
+/// directory. A leading dot keeps it out of the tensor namespace.
+const JOURNAL: &str = ".expert-recency.log";
+
+/// Journal lines beyond the live expert count before it is rewritten.
+const JOURNAL_SLACK: usize = 1 << 16;
+
+/// The routed expert `tensor` belongs to, if it is one of an expert's parts.
+fn routed_expert(tensor: &str) -> Option<Expert> {
+    let (layer, rest) = tensor.strip_prefix("layers.")?.split_once('.')?;
+    let (expert, part) = rest.strip_prefix("ffn.experts.")?.split_once('.')?;
+    if !EXPERT_PARTS.contains(&part) {
+        return None;
+    }
+    Some((layer.parse().ok()?, expert.parse().ok()?))
+}
+
+/// What the weights directory holds, and when each routed expert was last used.
+///
+/// Recency is a store-owned journal rather than file atime, which macOS does
+/// not maintain reliably. It is an append-only log: one short `write` per use,
+/// no timer, and a torn final line after a crash is skipped on replay, so a
+/// crash loses at most the last use. It is compacted to one line per stored
+/// expert, oldest first, on startup and whenever it grows past
+/// [`JOURNAL_SLACK`] extra lines. The journal only orders eviction; losing it
+/// costs re-downloads, never correctness.
+#[derive(Debug)]
+struct Store {
+    /// Total `*.bin` bytes in the weights directory.
+    acquired: u64,
+    /// Stored `*.bin` bytes and last-use tick of each routed expert with any
+    /// part on disk.
+    experts: HashMap<Expert, (u64, u64)>,
+    /// Routed experts by last-use tick, oldest first.
+    by_age: BTreeMap<u64, Expert>,
+    tick: u64,
+    journal_path: PathBuf,
+    journal: Option<fs::File>,
+    journal_lines: usize,
+    /// The expert of the last journal line; repeat uses of one expert's parts
+    /// write one line.
+    last: Option<Expert>,
+}
+
+impl Store {
+    fn open(weights_dir: &Path) -> io::Result<Self> {
+        let mut acquired = 0;
+        let mut experts = HashMap::<Expert, (u64, u64)>::new();
+        for entry in fs::read_dir(weights_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(tensor) = name
+                .to_string_lossy()
+                .strip_suffix(".bin")
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let len = entry.metadata()?.len();
+            acquired += len;
+            if let Some(expert) = routed_expert(&tensor) {
+                experts.entry(expert).or_default().0 += len;
+            }
+        }
+        let mut store = Self {
+            acquired,
+            experts,
+            by_age: BTreeMap::new(),
+            tick: 0,
+            journal_path: weights_dir.join(JOURNAL),
+            journal: None,
+            journal_lines: 0,
+            last: None,
+        };
+        // Experts the journal never saw are the oldest, in name order.
+        let mut unseen: Vec<Expert> = store.experts.keys().copied().collect();
+        unseen.sort_unstable();
+        for expert in unseen {
+            store.mark_used(expert);
+        }
+        let log = match fs::read_to_string(&store.journal_path) {
+            Ok(log) => log,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(store),
+            Err(error) => return Err(error),
+        };
+        for line in log.lines() {
+            let mut fields = line.split(' ').map(str::parse::<u32>);
+            if let (Some(Ok(layer)), Some(Ok(index)), None) =
+                (fields.next(), fields.next(), fields.next())
+            {
+                store.mark_used((layer, index));
+            }
+        }
+        store.compact_journal()?;
+        Ok(store)
+    }
+
+    /// Moves a stored `expert` to the most-recent end; false if not stored.
+    fn mark_used(&mut self, expert: Expert) -> bool {
+        let Some((_, used)) = self.experts.get_mut(&expert) else {
+            return false;
+        };
+        self.by_age.remove(used);
+        self.tick += 1;
+        *used = self.tick;
+        self.by_age.insert(self.tick, expert);
+        true
+    }
+
+    /// Records a use of `expert` in memory and in the journal.
+    fn touch(&mut self, expert: Expert) {
+        if self.last == Some(expert) || !self.mark_used(expert) {
+            return;
+        }
+        self.last = Some(expert);
+        // A failed journal write only loses recency, so it does not fail the read.
+        if self.journal_lines > self.experts.len().saturating_mul(4) + JOURNAL_SLACK {
+            let _ = self.compact_journal();
+        } else {
+            let _ = self.append(expert);
+        }
+    }
+
+    fn append(&mut self, (layer, index): Expert) -> io::Result<()> {
+        if self.journal.is_none() {
+            self.journal = Some(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.journal_path)?,
+            );
+        }
+        if let Some(journal) = &mut self.journal {
+            journal.write_all(format!("{layer} {index}\n").as_bytes())?;
+        }
+        self.journal_lines += 1;
+        Ok(())
+    }
+
+    /// Rewrites the journal as one line per stored expert, oldest first.
+    fn compact_journal(&mut self) -> io::Result<()> {
+        let mut log = Vec::new();
+        for (layer, index) in self.by_age.values() {
+            writeln!(log, "{layer} {index}")?;
+        }
+        // The open handle would keep appending to the replaced file.
+        self.journal = None;
+        write_atomically(&self.journal_path, &log).map_err(|error| match error {
+            V41RangeCacheError::Io(error) => error,
+            other => io::Error::other(other.to_string()),
+        })?;
+        self.journal_lines = self.by_age.len();
+        Ok(())
+    }
+
+    /// Least-recently-used experts whose eviction lets `length` more bytes fit
+    /// both limits, never `pinned` ones or `keep` (the expert being fetched).
+    fn victims(
+        &self,
+        envelope: Envelope,
+        free: u64,
+        length: u64,
+        pinned: &HashSet<Expert>,
+        keep: Option<Expert>,
+    ) -> Result<Vec<Expert>, String> {
+        let over_cap = (self.acquired + length).saturating_sub(envelope.max_acquired_bytes);
+        let over_floor = (envelope.min_free_bytes + length).saturating_sub(free);
+        let shortfall = over_cap.max(over_floor);
+        let mut need = shortfall;
+        let mut chosen = Vec::new();
+        for expert in self.by_age.values() {
+            if need == 0 {
+                break;
+            }
+            if Some(*expert) == keep || pinned.contains(expert) {
+                continue;
+            }
+            need = need.saturating_sub(self.experts[expert].0);
+            chosen.push(*expert);
+        }
+        if need > 0 {
+            return Err(format!(
+                "{shortfall} bytes over the envelope ({} stored of {} allowed, {free} free above a {}-byte floor), and only {} of them belong to unpinned routed experts",
+                self.acquired,
+                envelope.max_acquired_bytes,
+                envelope.min_free_bytes,
+                shortfall - need
+            ));
+        }
+        Ok(chosen)
+    }
+
+    /// Deletes every stored part of `expert`.
+    ///
+    /// Only `*.bin` payloads are removed; receipts stay, so a refetch must
+    /// reproduce the recorded digest, and a part whose payload is gone reads
+    /// as absent ([`V41RangeCacheError::NotLocal`]). Each unlink is atomic, so
+    /// a crash part-way leaves each part either whole and verified or absent:
+    /// the next read of an absent part refetches and re-verifies it, the next
+    /// startup counts exactly the payloads that remain, and a later eviction
+    /// removes the rest.
+    fn evict(&mut self, weights_dir: &Path, expert: Expert) -> io::Result<()> {
+        let (layer, index) = expert;
+        for part in EXPERT_PARTS {
+            let path = weights_dir.join(format!("layers.{layer}.ffn.experts.{index}.{part}.bin"));
+            let len = match fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            fs::remove_file(&path)?;
+            self.acquired = self.acquired.saturating_sub(len);
+            if let Some((bytes, _)) = self.experts.get_mut(&expert) {
+                *bytes = bytes.saturating_sub(len);
+            }
+        }
+        if let Some((_, used)) = self.experts.remove(&expert) {
+            self.by_age.remove(&used);
+        }
+        if self.last == Some(expert) {
+            self.last = None;
+        }
+        Ok(())
+    }
+
+    /// Counts a `length`-byte payload that replaced `replaced` bytes.
+    fn stored(&mut self, expert: Option<Expert>, length: u64, replaced: u64) {
+        self.acquired = self.acquired.saturating_sub(replaced) + length;
+        if let Some(expert) = expert {
+            let fresh = !self.experts.contains_key(&expert);
+            let (bytes, _) = self.experts.entry(expert).or_default();
+            *bytes = bytes.saturating_sub(replaced) + length;
+            if fresh {
+                self.mark_used(expert);
+            }
+        }
+    }
+}
+
 /// Local weights first; exact-range fetch from the pinned revision on a miss.
 #[derive(Debug)]
 pub struct FetchingSource<H> {
@@ -155,13 +421,18 @@ pub struct FetchingSource<H> {
     shards: BTreeMap<String, (u64, u64)>,
     host: H,
     envelope: Envelope,
-    acquired: Mutex<u64>,
+    pinned: HashSet<Expert>,
+    /// Held across a whole fetch so concurrent misses cannot jointly overrun.
+    acquiring: Mutex<()>,
+    /// Held briefly, so local reads are not stalled behind a network fetch.
+    store: Mutex<Store>,
 }
 
 impl<H: RangeHost> FetchingSource<H> {
     /// Serves `weights_dir` for `repo` at `revision`. Shard lengths come from
-    /// `trace_dir/headers.json`, whose revision must match. The current
-    /// `*.bin` total in `weights_dir` counts against `envelope`.
+    /// `trace_dir/headers.json`, whose revision must match, and pinned experts
+    /// from `trace_dir/pinned-experts.json` when present. The current `*.bin`
+    /// total in `weights_dir` counts against `envelope`.
     pub fn new(
         weights_dir: impl Into<PathBuf>,
         trace_dir: &Path,
@@ -181,13 +452,16 @@ impl<H: RangeHost> FetchingSource<H> {
                 manifest.revision
             )));
         }
-        let mut acquired = 0;
-        for entry in fs::read_dir(&weights_dir)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().ends_with(".bin") {
-                acquired += entry.metadata()?.len();
-            }
-        }
+        let pinned = match fs::read(trace_dir.join("pinned-experts.json")) {
+            Ok(json) => serde_json::from_slice::<PinFile>(&json)
+                .map_err(io::Error::other)?
+                .experts
+                .into_iter()
+                .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => HashSet::new(),
+            Err(error) => return Err(error),
+        };
+        let store = Store::open(&weights_dir)?;
         Ok(Self {
             local: V41LocalWeightsSource::new(&weights_dir, revision.clone()),
             weights_dir,
@@ -200,16 +474,27 @@ impl<H: RangeHost> FetchingSource<H> {
                 .collect(),
             host,
             envelope,
-            acquired: Mutex::new(acquired),
+            pinned,
+            acquiring: Mutex::new(()),
+            store: Mutex::new(store),
         })
     }
 
     /// Total `*.bin` bytes counted against the envelope.
     pub fn acquired_bytes(&self) -> u64 {
-        *self
-            .acquired
+        self.lock_store().acquired
+    }
+
+    fn lock_store(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn free_bytes(&self) -> Result<u64, V41RangeCacheError> {
+        self.host
+            .free_bytes(&self.weights_dir)
+            .ok_or_else(|| fail("cannot determine free space for the weights volume".to_owned()))
     }
 
     fn fetch(&self, shard: &str, range: Range<u64>) -> Result<Vec<u8>, V41RangeCacheError> {
@@ -245,27 +530,17 @@ impl<H: RangeHost> FetchingSource<H> {
         let tensor = request.tensor;
         let file_range = request.tensor_range.file_range();
         let length = file_range.end - file_range.start;
-        // Held across the write so concurrent misses cannot jointly overrun.
-        let mut acquired = self
-            .acquired
+        let owner = routed_expert(tensor);
+        let refuse = |why: String| fail(format!("fetching {tensor} ({length} bytes): {why}"));
+        let _acquiring = self
+            .acquiring
             .lock()
             .map_err(|_| fail("acquisition lock poisoned".to_owned()))?;
-        if *acquired + length > self.envelope.max_acquired_bytes {
-            return Err(fail(format!(
-                "fetching {tensor} ({length} bytes) would exceed the {}-byte acquisition envelope ({} stored)",
-                self.envelope.max_acquired_bytes, *acquired
-            )));
-        }
-        let free = self
-            .host
-            .free_bytes(&self.weights_dir)
-            .ok_or_else(|| fail("cannot determine free space for the weights volume".to_owned()))?;
-        if free.saturating_sub(length) < self.envelope.min_free_bytes {
-            return Err(fail(format!(
-                "fetching {tensor} ({length} bytes) would leave less than {} bytes free",
-                self.envelope.min_free_bytes
-            )));
-        }
+        // Refuse before downloading anything that could never be stored.
+        let free = self.free_bytes()?;
+        self.lock_store()
+            .victims(self.envelope, free, length, &self.pinned, owner)
+            .map_err(refuse)?;
 
         let bytes = self.fetch(request.shard, file_range.clone())?;
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -282,8 +557,23 @@ impl<H: RangeHost> FetchingSource<H> {
         if prior.as_ref().is_some_and(|prior| prior.sha256 != sha256) {
             return Err(V41RangeCacheError::HashMismatch(tensor.to_owned()));
         }
-        write_atomically(&self.weights_dir.join(format!("{tensor}.bin")), &bytes)?;
-        *acquired += length;
+        // Evict only once the bytes are in hand, so a failed download costs nothing.
+        let free = self.free_bytes()?;
+        let mut store = self.lock_store();
+        let victims = store
+            .victims(self.envelope, free, length, &self.pinned, owner)
+            .map_err(refuse)?;
+        for victim in victims {
+            store
+                .evict(&self.weights_dir, victim)
+                .map_err(V41RangeCacheError::Io)?;
+        }
+        let bin_path = self.weights_dir.join(format!("{tensor}.bin"));
+        // A payload left without a receipt is replaced, not added to.
+        let replaced = fs::metadata(&bin_path).map_or(0, |metadata| metadata.len());
+        write_atomically(&bin_path, &bytes)?;
+        store.stored(owner, length, replaced);
+        drop(store);
         if prior.is_none() {
             let &(payload_start, _) = &self.shards[request.shard];
             let receipt = Receipt {
@@ -311,15 +601,29 @@ impl<H: RangeHost> FetchingSource<H> {
 
 impl<H: RangeHost> V41RangeSource for FetchingSource<H> {
     fn read_range(&self, request: &V41RangeRequest<'_>) -> Result<Vec<u8>, V41RangeCacheError> {
-        match self.local.read_range(request) {
-            Err(V41RangeCacheError::NotLocal(_)) => {}
-            result => return result,
+        let result = match self.local.read_range(request) {
+            Err(V41RangeCacheError::NotLocal(_)) => {
+                if request.range != request.tensor_range.file_range() {
+                    return self.fetch(request.shard, request.range.clone());
+                }
+                self.acquire_tensor(request)?;
+                self.local.read_range(request)
+            }
+            result => result,
+        };
+        if result.is_ok()
+            && let Some(expert) = routed_expert(request.tensor)
+        {
+            self.lock_store().touch(expert);
         }
-        if request.range != request.tensor_range.file_range() {
-            return self.fetch(request.shard, request.range.clone());
+        result
+    }
+
+    /// A RAM-hot expert stays recent on disk, so it is not evicted as cold.
+    fn note_memory_hit(&self, request: &V41RangeRequest<'_>) {
+        if let Some(expert) = routed_expert(request.tensor) {
+            self.lock_store().touch(expert);
         }
-        self.acquire_tensor(request)?;
-        self.local.read_range(request)
     }
 }
 
@@ -373,6 +677,7 @@ fn safetensors_dtype(dtype: V41StorageDtype) -> Result<&'static str, V41RangeCac
 mod tests {
     use std::{
         cell::RefCell,
+        collections::BTreeSet,
         fs,
         ops::Range,
         path::{Path, PathBuf},
@@ -382,20 +687,50 @@ mod tests {
     use deepseek::checkpoint::range_cache::{V41RangeCache, V41RangeCacheError};
     use sha2::{Digest, Sha256};
 
-    use super::{CurlHost, Envelope, FetchingSource, RangeHost};
+    use super::{CurlHost, EXPERT_PARTS, Envelope, FetchingSource, RangeHost};
 
     const SHARD: &str = "model-00001-of-00001.safetensors";
     const REV: &str = "rev";
-    // `a` is a 4x4 U8 table at payload bytes 0..16; `b` is 8 E8M0 scales at 16..24.
-    const HEADER: &str = r#"{"a":{"dtype":"U8","shape":[4,4],"data_offsets":[0,16]},"b":{"dtype":"F8_E8M0","shape":[8],"data_offsets":[16,24]}}"#;
+    /// Routed experts `layers.0.ffn.experts.0..EXPERTS`, each six 2-byte parts.
+    const EXPERTS: u32 = 4;
+    const EXPERT_BYTES: u64 = 12;
+    const PAYLOAD_BYTES: u64 = 24 + EXPERTS as u64 * EXPERT_BYTES;
+
+    fn part(expert: u32, part: &str) -> String {
+        format!("layers.0.ffn.experts.{expert}.{part}")
+    }
+
+    /// `a` is a 4x4 U8 table at payload bytes 0..16; `b` is 8 E8M0 scales at
+    /// 16..24; the expert parts follow as 2-byte U8 tensors.
+    fn header() -> String {
+        let mut tensors = vec![
+            r#""a":{"dtype":"U8","shape":[4,4],"data_offsets":[0,16]}"#.to_owned(),
+            r#""b":{"dtype":"F8_E8M0","shape":[8],"data_offsets":[16,24]}"#.to_owned(),
+        ];
+        let mut offset = 24;
+        for expert in 0..EXPERTS {
+            for name in EXPERT_PARTS {
+                tensors.push(format!(
+                    r#""{}":{{"dtype":"U8","shape":[2],"data_offsets":[{offset},{}]}}"#,
+                    part(expert, name),
+                    offset + 2
+                ));
+                offset += 2;
+            }
+        }
+        format!("{{{}}}", tensors.join(","))
+    }
 
     fn payload_start() -> u64 {
-        8 + HEADER.len() as u64
+        8 + header().len() as u64
     }
 
     /// Serves one synthetic shard whose payload byte `i` is `i`.
     struct FakeHost {
         free: u64,
+        /// When set, free space is this volume size minus the `*.bin` bytes
+        /// in the queried directory, so evictions free space.
+        volume: Option<u64>,
         content_range: Option<String>,
         calls: RefCell<Vec<Range<u64>>>,
     }
@@ -404,6 +739,7 @@ mod tests {
         fn new(free: u64) -> Self {
             Self {
                 free,
+                volume: None,
                 content_range: None,
                 calls: RefCell::default(),
             }
@@ -417,7 +753,7 @@ mod tests {
                 format!("https://huggingface.co/org/model/resolve/{REV}/{SHARD}")
             );
             self.calls.borrow_mut().push(range.clone());
-            let total = payload_start() + 24;
+            let total = payload_start() + PAYLOAD_BYTES;
             let body = range
                 .clone()
                 .map(|offset| u8::try_from(offset - payload_start()).expect("small"))
@@ -429,8 +765,17 @@ mod tests {
             Ok((body, content_range))
         }
 
-        fn free_bytes(&self, _: &Path) -> Option<u64> {
-            Some(self.free)
+        fn free_bytes(&self, path: &Path) -> Option<u64> {
+            let Some(volume) = self.volume else {
+                return Some(self.free);
+            };
+            let stored: u64 = fs::read_dir(path)
+                .expect("weights")
+                .map(|entry| entry.expect("entry"))
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".bin"))
+                .map(|entry| entry.metadata().expect("metadata").len())
+                .sum();
+            Some(volume - stored)
         }
     }
 
@@ -444,12 +789,21 @@ mod tests {
         ));
         fs::create_dir_all(dir.join("headers")).expect("headers dir");
         fs::create_dir_all(dir.join("weights")).expect("weights dir");
-        let index = format!(
-            r#"{{"metadata":{{"total_size":24}},"weight_map":{{"a":"{SHARD}","b":"{SHARD}"}}}}"#
-        );
+        let mut weight_map = serde_json::json!({"a": SHARD, "b": SHARD});
+        for expert in 0..EXPERTS {
+            for name in EXPERT_PARTS {
+                weight_map[part(expert, name)] = SHARD.into();
+            }
+        }
+        let index = serde_json::json!({
+            "metadata": {"total_size": PAYLOAD_BYTES},
+            "weight_map": weight_map,
+        })
+        .to_string();
         fs::write(dir.join("index.json"), &index).expect("index");
-        let mut header = (HEADER.len() as u64).to_le_bytes().to_vec();
-        header.extend_from_slice(HEADER.as_bytes());
+        let header_json = header();
+        let mut header = (header_json.len() as u64).to_le_bytes().to_vec();
+        header.extend_from_slice(header_json.as_bytes());
         fs::write(dir.join(format!("headers/{SHARD}.header.bin")), &header).expect("header");
         fs::write(
             dir.join("headers.json"),
@@ -459,7 +813,7 @@ mod tests {
                 "shards": {SHARD: {
                     "header_bytes": header.len(),
                     "header_sha256": format!("{:x}", Sha256::digest(&header)),
-                    "file_bytes": payload_start() + 24,
+                    "file_bytes": payload_start() + PAYLOAD_BYTES,
                 }},
             })
             .to_string(),
@@ -558,6 +912,10 @@ mod tests {
             assert!(host.calls.borrow().is_empty());
         }
         assert!(!dir.join("weights/b.bin").exists());
+        assert!(
+            dir.join("weights/old.bin").exists(),
+            "non-expert data is never evicted"
+        );
         fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 
@@ -565,7 +923,7 @@ mod tests {
     fn rejects_a_wrong_content_range_and_writes_nothing() {
         let dir = trace_dir();
         let mut host = FakeHost::new(1 << 30);
-        host.content_range = Some(format!("bytes 0-7/{}", payload_start() + 24));
+        host.content_range = Some(format!("bytes 0-7/{}", payload_start() + PAYLOAD_BYTES));
         let mut cache = cache(&dir, &host, ROOMY);
         let error = cache.get_tensor("b").expect_err("wrong range");
         assert!(error.to_string().contains("Content-Range"), "{error}");
@@ -611,6 +969,226 @@ mod tests {
         assert_eq!(
             fs::read_dir(dir.join("weights")).expect("weights").count(),
             0
+        );
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    /// Room for exactly two experts and nothing else.
+    const TWO_EXPERTS: Envelope = Envelope {
+        max_acquired_bytes: 2 * EXPERT_BYTES,
+        min_free_bytes: 0,
+    };
+
+    /// A cache that keeps one part in memory, so every expert read reaches
+    /// the source.
+    fn expert_cache<'a>(
+        dir: &Path,
+        host: &'a FakeHost,
+        envelope: Envelope,
+    ) -> V41RangeCache<FetchingSource<&'a FakeHost>> {
+        let source =
+            FetchingSource::new(dir.join("weights"), dir, "org/model", REV, host, envelope)
+                .expect("source");
+        V41RangeCache::load(source, &dir.join("index.json"), dir, REV, 2).expect("cache")
+    }
+
+    fn read_expert(
+        cache: &mut V41RangeCache<FetchingSource<&FakeHost>>,
+        expert: u32,
+    ) -> Result<(), V41RangeCacheError> {
+        for name in EXPERT_PARTS {
+            cache.get_tensor(&part(expert, name))?;
+        }
+        Ok(())
+    }
+
+    /// Payloads on disk for each part of `expert`, in [`EXPERT_PARTS`] order.
+    fn stored_parts(dir: &Path, expert: u32) -> Vec<bool> {
+        EXPERT_PARTS
+            .iter()
+            .map(|name| {
+                dir.join(format!("weights/{}.bin", part(expert, name)))
+                    .exists()
+            })
+            .collect()
+    }
+
+    /// Experts with every part on disk; panics on a partially stored expert.
+    fn stored_experts(dir: &Path) -> BTreeSet<u32> {
+        (0..EXPERTS)
+            .filter(|&expert| {
+                let parts = stored_parts(dir, expert);
+                assert!(
+                    parts.iter().all(|&p| p) || parts.iter().all(|&p| !p),
+                    "expert {expert} is partially stored: {parts:?}"
+                );
+                parts[0]
+            })
+            .collect()
+    }
+
+    fn pin(dir: &Path, experts: &[u32]) {
+        let experts: Vec<_> = experts.iter().map(|&expert| [0, expert]).collect();
+        fs::write(
+            dir.join("pinned-experts.json"),
+            serde_json::json!({"experts": experts}).to_string(),
+        )
+        .expect("pin file");
+    }
+
+    #[test]
+    fn lru_eviction_honors_read_hits() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        let mut cache = expert_cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        // A local hit on expert 0 makes expert 1 the least recently used.
+        read_expert(&mut cache, 0).expect("expert 0 again");
+        assert_eq!(host.calls.borrow().len(), 12, "the hit fetched nothing");
+        read_expert(&mut cache, 2).expect("expert 2 evicts rather than refuses");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([0, 2]));
+        // The evicted expert keeps its receipts, so a refetch is verified.
+        for name in EXPERT_PARTS {
+            assert!(
+                dir.join(format!("weights/{}.receipt.json", part(1, name)))
+                    .exists()
+            );
+        }
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn memory_hits_keep_an_expert_recent_on_disk() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        // Room for every part in memory, so the second read of expert 0
+        // never reaches the source.
+        let mut cache = cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        read_expert(&mut cache, 0).expect("expert 0 from memory");
+        read_expert(&mut cache, 2).expect("expert 2");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([0, 2]));
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn recency_survives_a_restart_through_the_journal() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        let mut cache = expert_cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        read_expert(&mut cache, 0).expect("expert 0 again");
+        drop(cache);
+        // Without the journal, name order would make expert 0 the oldest.
+        let host = FakeHost::new(1 << 30);
+        let mut cache = expert_cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 2).expect("expert 2");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([0, 2]));
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn eviction_removes_a_whole_expert_even_when_one_part_would_do() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        let mut cache = expert_cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        // The first 2-byte part of expert 2 needs 2 bytes; all 12 of expert 0 go.
+        cache
+            .get_tensor(&part(2, EXPERT_PARTS[0]))
+            .expect("first part of expert 2");
+        assert_eq!(stored_parts(&dir, 0), [false; 6]);
+        assert_eq!(stored_parts(&dir, 1), [true; 6]);
+        // The rest of expert 2 then fits without touching expert 1.
+        read_expert(&mut cache, 2).expect("rest of expert 2");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([1, 2]));
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn pinned_experts_survive_pressure() {
+        let dir = trace_dir();
+        pin(&dir, &[0]);
+        let host = FakeHost::new(1 << 30);
+        let mut cache = expert_cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        // Expert 0 is least recently used but pinned.
+        read_expert(&mut cache, 2).expect("expert 2");
+        read_expert(&mut cache, 3).expect("expert 3");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([0, 3]));
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn free_floor_pressure_evicts_instead_of_refusing() {
+        let dir = trace_dir();
+        let mut host = FakeHost::new(0);
+        // The volume holds the floor plus two experts; the cap is no constraint.
+        host.volume = Some(100 + 2 * EXPERT_BYTES);
+        let envelope = Envelope {
+            max_acquired_bytes: 1 << 20,
+            min_free_bytes: 100,
+        };
+        let mut cache = expert_cache(&dir, &host, envelope);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        read_expert(&mut cache, 2).expect("expert 2 evicts rather than refuses");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([1, 2]));
+        let free = (&host).free_bytes(&dir.join("weights")).expect("free");
+        assert!(free >= 100, "{free}");
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn refuses_only_when_pinned_experts_alone_fill_the_cap() {
+        let dir = trace_dir();
+        pin(&dir, &[0, 1]);
+        let host = FakeHost::new(1 << 30);
+        let mut cache = expert_cache(&dir, &host, TWO_EXPERTS);
+        read_expert(&mut cache, 0).expect("expert 0");
+        read_expert(&mut cache, 1).expect("expert 1");
+        let error = read_expert(&mut cache, 2).expect_err("no unpinned expert to evict");
+        assert!(error.to_string().contains("unpinned"), "{error}");
+        assert_eq!(host.calls.borrow().len(), 12, "refused before downloading");
+        assert_eq!(stored_experts(&dir), BTreeSet::from([0, 1]));
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn a_crash_mid_eviction_leaves_a_state_the_next_read_repairs() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        read_expert(&mut expert_cache(&dir, &host, ROOMY), 0).expect("expert 0");
+        // Eviction unlinks payloads only, in part order; crash after three.
+        for name in &EXPERT_PARTS[..3] {
+            fs::remove_file(dir.join(format!("weights/{}.bin", part(0, name)))).expect("unlink");
+        }
+        let host = FakeHost::new(1 << 30);
+        let source = FetchingSource::new(dir.join("weights"), &dir, "org/model", REV, &host, ROOMY)
+            .expect("source");
+        assert_eq!(
+            source.acquired_bytes(),
+            6,
+            "only the surviving payloads count"
+        );
+        let mut cache =
+            V41RangeCache::load(source, &dir.join("index.json"), &dir, REV, 2).expect("cache");
+        read_expert(&mut cache, 0).expect("repaired");
+        // Exactly the three missing parts were refetched, against kept receipts.
+        let start = payload_start() + 24;
+        assert_eq!(
+            host.calls.borrow().as_slice(),
+            [start..start + 2, start + 2..start + 4, start + 4..start + 6]
+        );
+        assert_eq!(stored_parts(&dir, 0), [true; 6]);
+        assert_eq!(
+            &*cache.get_tensor(&part(0, EXPERT_PARTS[0])).expect("part"),
+            [24, 25]
         );
         fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
