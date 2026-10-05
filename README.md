@@ -3,7 +3,7 @@
 </p>
 <h1 align="center">metallix</h1>
 
-A local inference engine for Apple Silicon, built around Rust and Metal.
+An inference engine for Apple Silicon, built around Rust and Metal.
 
 ## What works today
 
