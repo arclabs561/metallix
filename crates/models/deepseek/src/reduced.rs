@@ -57,7 +57,7 @@ pub use layer_four::{
 mod input;
 pub use input::{AttentionInput, AttentionInputError, AttentionInputOutput};
 mod startup;
-pub use startup::{StartupSession, StartupSessionError, StartupStepOutput};
+pub use startup::{EmbeddingRowSource, StartupSession, StartupSessionError, StartupStepOutput};
 
 mod engram;
 pub use engram::{

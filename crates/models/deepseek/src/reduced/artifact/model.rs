@@ -851,7 +851,7 @@ mod tests {
     use super::*;
     use crate::reduced::{
         HeadPositions, LayerKind, RequestError, ScheduleError, ScheduledAttentionOutput,
-        ScheduledLayer, artifact::ReducedArtifact,
+        ScheduledLayer, StepSources, artifact::ReducedArtifact,
     };
 
     fn artifact() -> ReducedArtifact {
@@ -957,6 +957,127 @@ mod tests {
                     );
                 }
             }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Serves rows of the artifact's dense embedding table and records requests.
+    struct TableRows<'a> {
+        table: &'a [u16],
+        width: usize,
+        requests: std::cell::RefCell<Vec<Vec<usize>>>,
+    }
+
+    impl crate::reduced::EmbeddingRowSource for TableRows<'_> {
+        fn read_rows(
+            &self,
+            rows: &[usize],
+            output: &mut [u16],
+        ) -> Result<(), crate::reduced::StartupSessionError> {
+            self.requests.borrow_mut().push(rows.to_vec());
+            for (row, out) in rows.iter().zip(output.chunks_exact_mut(self.width)) {
+                out.copy_from_slice(&self.table[row * self.width..(row + 1) * self.width]);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn row_source_startup_reproduces_the_dense_table_startup() {
+        let artifact = artifact();
+        let config = &artifact.config;
+        let ids = ids(config);
+        with_parts(config, &artifact.tensors, |parts| {
+            let dense = from_schedule(&parts, reduced_schedule(&parts)).unwrap();
+            let rows = RequestModel::from_schedule(
+                parts.startup.reading_rows(config.vocabulary),
+                reduced_schedule(&parts),
+                parts.engrams.to_vec(),
+                parts.head,
+                parts.frequencies,
+                parts.max_tokens,
+            )
+            .unwrap();
+            let source = TableRows {
+                table: artifact
+                    .tensors
+                    .u16("embed.weight", &[config.vocabulary, config.width])
+                    .unwrap(),
+                width: config.width,
+                requests: std::cell::RefCell::default(),
+            };
+            let sources = StepSources {
+                embedding_rows: Some(&source),
+                ..StepSources::default()
+            };
+            let mut dense_session = RequestSession::new(&dense).unwrap();
+            let mut rows_session = RequestSession::new(&rows).unwrap();
+            let chunks: Vec<&[i64]> = std::iter::once(&ids[..3])
+                .chain(ids[3..].chunks(1))
+                .collect();
+            for &chunk in &chunks {
+                let expected = dense_session.step(chunk).unwrap();
+                let actual = rows_session.step_with_sources(chunk, sources).unwrap();
+                assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+            }
+            // Each step reads exactly its distinct token rows, ascending.
+            let expected: Vec<Vec<usize>> = chunks
+                .iter()
+                .map(|chunk| {
+                    let mut rows: Vec<usize> = chunk
+                        .iter()
+                        .map(|&id| usize::try_from(id).unwrap())
+                        .collect();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    rows
+                })
+                .collect();
+            assert_eq!(*source.requests.borrow(), expected);
+
+            // Startup alone (no scheduled layers) with unsorted, repeated IDs.
+            let vocabulary = i64::try_from(config.vocabulary).unwrap();
+            let repeated: Vec<i64> = [7, 2, 7, 2].iter().map(|id| id % vocabulary).collect();
+            let startup_only = |startup| {
+                RequestModel::from_schedule(
+                    startup,
+                    Vec::new(),
+                    Vec::new(),
+                    parts.head,
+                    parts.frequencies,
+                    parts.max_tokens,
+                )
+                .unwrap()
+            };
+            let (dense_only, rows_only) = (
+                startup_only(parts.startup),
+                startup_only(parts.startup.reading_rows(config.vocabulary)),
+            );
+            let (mut dense_only, mut rows_only) = (
+                RequestSession::new(&dense_only).unwrap(),
+                RequestSession::new(&rows_only).unwrap(),
+            );
+            source.requests.borrow_mut().clear();
+            for chunk in [&repeated[..3], &repeated[3..]] {
+                assert_eq!(
+                    format!("{:?}", dense_only.step(chunk).unwrap()),
+                    format!("{:?}", rows_only.step_with_sources(chunk, sources).unwrap())
+                );
+            }
+            let row = |id: i64| usize::try_from(id).unwrap();
+            let mut prefill = vec![row(repeated[0]), row(repeated[1])];
+            prefill.sort_unstable();
+            prefill.dedup();
+            assert_eq!(*source.requests.borrow(), [prefill, vec![row(repeated[3])]]);
+
+            let mut missing = RequestSession::new(&rows).unwrap();
+            assert!(matches!(
+                missing.step(&ids[..3]),
+                Err(RequestError::Startup(
+                    crate::reduced::StartupSessionError::MissingEmbeddingRows
+                ))
+            ));
             Ok(())
         })
         .unwrap();
@@ -1222,6 +1343,7 @@ mod tests {
             let sources = StepSources {
                 experts: &expert_refs,
                 engram_rows: &row_refs,
+                embedding_rows: None,
             };
             let mut owned = RequestSession::new(&model).unwrap();
             let mut fetched = RequestSession::new(&model).unwrap();

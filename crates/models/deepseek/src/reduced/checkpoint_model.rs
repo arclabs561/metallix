@@ -13,12 +13,11 @@
 //! cannot prove without `unsafe`. `wo_a` is dequantized to BF16 as the pinned
 //! `convert.py` does, and the FP8 source of it is dropped.
 //!
-//! Three inputs are not supplied here yet, each marked `HOOK`:
-//! routed experts (tails run over an empty sparse table until request steps
-//! take a per-layer [`crate::moe::RoutedExpertSource`]), Engram embedding rows
-//! (the full tables are hundreds of GB; the caller supplies definitions or
-//! explicitly omits them), and the token embedding and output head, which the
-//! startup and final-head element caps currently reject at real vocabulary size.
+//! Three tables are read per request step from caller sources rather than
+//! held here: routed experts (tails are built over an empty sparse table),
+//! Engram embedding rows (hundreds of GB), and token-embedding rows (startup
+//! is built [`super::StartupDefinition::with_row_source`]). The output head
+//! is held as BF16 and computes the last position's logits only.
 
 use std::{collections::BTreeMap, num::NonZeroUsize, ops::Range, sync::Arc};
 
@@ -63,11 +62,10 @@ const MAX_ROUTED_EXPERTS: usize = 384;
 /// as in the pinned source and the private native harness.
 const ENGRAM_GATE_CLAMP: f32 = 1e-6;
 
-// HOOK(routed-experts): every tail is built over this empty sparse table, so a
-// request step that runs a tail without a `RoutedExpertSource` fails with
-// `MoEError::MissingRoutedExpert` instead of reading weights. Once steps take a
-// per-layer source (e.g. `checkpoint::range_cache::V41CachedRoutedExperts`),
-// tails reach real experts without changing this builder.
+// Every tail is built over this empty sparse table: a request step reads routed
+// experts from its `StepSources::experts` (for example
+// `checkpoint::range_cache::V41CachedRoutedExperts`), and a tail run without
+// one fails with `MoEError::MissingRoutedExpert` instead of reading weights.
 static NO_ROUTED_EXPERTS: [Option<Fp4ExpertWeights<'static>>; MAX_ROUTED_EXPERTS] =
     [None; MAX_ROUTED_EXPERTS];
 
@@ -483,21 +481,19 @@ impl V41CheckpointWeights {
         Ok((config, weights))
     }
 
-    /// HOOK(startup): reads the token embedding and the BF16 output head,
-    /// both `[vocab_size, dim]` (1.3 GB each). The head fits
-    /// [`super::MAX_BF16_HEAD_ELEMENTS`]; the embedding still exceeds the
-    /// startup-table cap until a row-source startup lands.
-    pub fn load_embedding_and_head<S: V41RangeSource>(
+    /// Reads the BF16 output head `[vocab_size, dim]` (1.3 GB). The token
+    /// embedding is not loaded: startup reads its rows per step.
+    pub fn load_head<S: V41RangeSource>(
         &mut self,
         cache: &mut V41RangeCache<S>,
     ) -> Result<(), V41CheckpointModelError> {
         let shape = [self.config.vocab_size, self.config.dim];
-        self.read(cache, "embed.weight", Read::Bf16, &shape)?;
         self.read(cache, "head.weight", Read::Bf16, &shape)
     }
 
-    /// Assembles the request model. Requires every layer and the embedding
-    /// and head; see the module's `HOOK` notes for what still blocks it.
+    /// Assembles the request model. Requires every layer and the head. Steps
+    /// supply routed experts, Engram rows and embedding rows through
+    /// [`super::StepSources`].
     pub fn request_model(
         &self,
         engrams: V41Engrams,
@@ -521,8 +517,8 @@ impl V41CheckpointWeights {
             }
             V41Engrams::Omitted => None,
         };
-        let startup = StartupDefinition::new(
-            self.bf16("embed.weight")?,
+        let startup = StartupDefinition::with_row_source(
+            config.vocab_size,
             self.bf16("layers.0.attn_norm.weight")?,
             config.norm_eps,
             config.attention_layout(0)?,
@@ -1337,7 +1333,6 @@ mod tests {
 
     use super::{V41CheckpointWeights, V41InferenceConfig, V41LayerRole, V41TeacherState, le_u16};
     use crate::{
-        StartupLayout,
         checkpoint::range_cache::{V41CachedRoutedExperts, V41LocalWeightsSource, V41RangeCache},
         indexer::key::IndexKeyLayout,
         reduced::{
@@ -1441,12 +1436,10 @@ mod tests {
             .expect("ratio-one indexer");
     }
 
-    /// HOOK(startup): pins the remaining startup-table blocker so lifting it
-    /// fails here. The real head passes every BF16 cap and reaches the
-    /// length check; the FP32 head stays bounded.
+    /// The real head passes every BF16 cap and reaches the length check; the
+    /// FP32 head stays bounded.
     #[test]
-    fn real_vocabulary_fits_the_bf16_head_but_not_the_startup_table() {
-        assert!(StartupLayout::new(129_280, 5120, 4).is_err());
+    fn real_vocabulary_fits_the_bf16_head_only() {
         assert!(matches!(
             FinalHead::with_weights(&[0x3f80; 5120], HeadWeights::Bf16(&[]), 129_280, 4, 1e-20),
             Err(FinalHeadError::Length {

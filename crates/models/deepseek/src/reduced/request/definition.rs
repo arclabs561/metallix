@@ -19,7 +19,9 @@ use super::RequestError;
 /// Immutable runtime operands for the startup block.
 #[derive(Clone, Copy, Debug)]
 pub struct StartupDefinition<'a> {
-    table: &'a [u16],
+    /// The dense table, or `None` for rows read per step from a source.
+    table: Option<&'a [u16]>,
+    vocabulary: usize,
     pub(super) norm: &'a [u16],
     epsilon: f32,
     pub(super) attention_layout: LayerAttentionLayout,
@@ -41,7 +43,8 @@ impl<'a> StartupDefinition<'a> {
         frequencies: &'a [RotaryFrequency],
     ) -> Self {
         Self {
-            table,
+            table: Some(table),
+            vocabulary: 0,
             norm,
             epsilon,
             attention_layout,
@@ -51,15 +54,57 @@ impl<'a> StartupDefinition<'a> {
         }
     }
 
+    /// Like [`Self::new`] over a `vocabulary`-row embedding table whose rows
+    /// each step reads from [`super::StepSources::embedding_rows`].
+    #[must_use]
+    pub const fn with_row_source(
+        vocabulary: usize,
+        norm: &'a [u16],
+        epsilon: f32,
+        attention_layout: LayerAttentionLayout,
+        attention_weights: LayerAttentionWeights<'a>,
+        tail: BlockTailReference<'a>,
+        frequencies: &'a [RotaryFrequency],
+    ) -> Self {
+        Self {
+            table: None,
+            vocabulary,
+            norm,
+            epsilon,
+            attention_layout,
+            attention_weights,
+            tail,
+            frequencies,
+        }
+    }
+
+    /// This startup with its table replaced by per-step rows from a source.
+    #[cfg(test)]
+    pub(crate) const fn reading_rows(mut self, vocabulary: usize) -> Self {
+        self.table = None;
+        self.vocabulary = vocabulary;
+        self
+    }
+
     pub(super) fn session(self) -> Result<StartupSession<'a>, RequestError> {
-        Ok(StartupSession::new(
-            self.table,
-            self.norm,
-            self.epsilon,
-            self.attention_layout,
-            self.attention_weights,
-            self.tail,
-        )?)
+        Ok(match self.table {
+            Some(table) => StartupSession::new(
+                table,
+                self.norm,
+                self.epsilon,
+                self.attention_layout,
+                self.attention_weights,
+                self.tail,
+            )?,
+            None => StartupSession::with_row_source(
+                self.vocabulary,
+                self.norm,
+                self.epsilon,
+                self.attention_layout,
+                self.attention_weights,
+                self.tail,
+            )?,
+        })
     }
 }
 

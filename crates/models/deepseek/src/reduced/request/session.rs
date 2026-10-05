@@ -13,10 +13,10 @@ use crate::{
     },
     moe::RoutedExpertSource,
     reduced::{
-        AttentionInputOutput, BlockTailDiagnostic, EngramSession, FinalHead, FinalHeadExecution,
-        FinalHeadOutput, LayerFourCall, LayerFourSession, LayerOneCall, LayerOneSession,
-        LayerThreeCall, LayerThreePublication, LayerThreeSession, LayerThreeStepOutput,
-        PreviousLayerThreeKeys, StartupSession,
+        AttentionInputOutput, BlockTailDiagnostic, EmbeddingRowSource, EngramSession, FinalHead,
+        FinalHeadExecution, FinalHeadOutput, LayerFourCall, LayerFourSession, LayerOneCall,
+        LayerOneSession, LayerThreeCall, LayerThreePublication, LayerThreeSession,
+        LayerThreeStepOutput, PreviousLayerThreeKeys, StartupSession,
     },
 };
 
@@ -40,10 +40,13 @@ pub(super) enum LayerState {
 /// `experts[n]` serves model layer `n` (0 is startup, `n` is scheduled layer
 /// `n`); `engram_rows[i]` serves the model's `i`-th Engram definition. An
 /// empty slice or a `None` entry keeps the construction-time table.
+/// `embedding_rows` serves a startup built
+/// [`super::StartupDefinition::with_row_source`]; a dense-table startup ignores it.
 #[derive(Clone, Copy, Default)]
 pub struct StepSources<'a> {
     pub experts: &'a [Option<&'a dyn RoutedExpertSource>],
     pub engram_rows: &'a [Option<&'a dyn EngramRowSource>],
+    pub embedding_rows: Option<&'a dyn EmbeddingRowSource>,
 }
 
 impl<'a> StepSources<'a> {
@@ -219,9 +222,13 @@ impl<'a> RequestSession<'a> {
         let startup_frequencies =
             frequency_span(self.model.startup.frequencies, start, ids.len(), rope_pairs)?;
         let startup_ids = ids_to_u64(ids)?;
-        let startup =
-            self.startup
-                .step_with(start, &startup_ids, startup_frequencies, sources.expert(0))?;
+        let startup = self.startup.step_with_sources(
+            start,
+            &startup_ids,
+            startup_frequencies,
+            sources.expert(0),
+            sources.embedding_rows,
+        )?;
         let mut residual = startup.residual().to_vec();
         let mut pre = startup.next_pre().to_vec();
         let partial_group = !completes_ratio_two_group(start, ids.len());

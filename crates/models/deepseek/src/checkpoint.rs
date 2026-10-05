@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::manifest::V41SafetensorsIndex;
 
+pub mod embedding_rows;
 pub mod engram_rows;
 pub mod mlx;
 pub use mlx::{LayerZeroAttentionActivation, LayerZeroQkvResident};
