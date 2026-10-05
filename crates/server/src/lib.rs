@@ -17,8 +17,6 @@ mod chat_cli;
 #[cfg(feature = "metal")]
 mod chat_completions;
 #[cfg(feature = "metal")]
-mod chat_format;
-#[cfg(feature = "metal")]
 mod chat_generation;
 #[cfg(feature = "metal")]
 mod chat_tools;
@@ -54,8 +52,6 @@ mod serve_registry;
 mod serving;
 #[cfg(feature = "metal")]
 mod sse;
-#[cfg(feature = "metal")]
-mod template_json;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
@@ -69,8 +65,6 @@ mod qwen_constraints;
 mod qwen_forward;
 #[cfg(all(test, feature = "metal"))]
 mod qwen_particle_tests;
-#[cfg(feature = "metal")]
-mod qwen_tokenizer;
 #[cfg(all(feature = "metal", feature = "structured-output"))]
 mod schedule_requirements;
 mod telemetry;
@@ -381,7 +375,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                     } else {
                         None
                     };
-                    let tokenizer = match qwen_tokenizer::QwenTokenizer::load(&model) {
+                    let tokenizer = match chat_format::QwenTokenizer::load(&model) {
                         Ok(tokenizer) => tokenizer,
                         Err(error) => {
                             eprintln!("Qwen prompt failed: {error}");

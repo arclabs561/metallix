@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/blockfloat",
+    "crates/chat-format",
     "crates/engine",
     "crates/models/deepseek",
     "crates/models/gemma",

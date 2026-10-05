@@ -23,7 +23,7 @@ use qwen::{
 use sha2::{Digest, Sha256};
 
 use super::ChatRequest;
-use crate::chat_format::ChatFormat;
+use chat_format::ChatFormat;
 
 type PrefixKey = [u8; 32];
 type Executor<'w> = Qwen3ForwardExecutor<'w, std::collections::hash_map::RandomState>;
@@ -89,7 +89,7 @@ pub(super) fn remember(
             messages,
             ..request
         };
-        let Ok(rendered) = format.template().render(prefix, false) else {
+        let Ok(rendered) = format.template().render(prefix.conversation(), false) else {
             continue;
         };
         let Ok(ids) = format.tokenizer().encode_prompt(&rendered) else {

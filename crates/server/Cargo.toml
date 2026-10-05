@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys"]
+metal = ["qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys"]
 structured-output = ["dep:engine", "engine/structured-output"]
 # Chrome/Perfetto JSON timeline behind `--trace-out`.
 timeline = ["dep:tracing-chrome"]
@@ -29,12 +29,11 @@ sha2.workspace = true
 deepseek = { path = "../models/deepseek" }
 julia = { path = "../models/julia" }
 qwen = { path = "../models/qwen" }
+chat-format = { path = "../chat-format", optional = true }
 engine = { path = "../engine", optional = true }
 rand_chacha = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
-minijinja = { version = "=2.24.0", features = ["json", "fuel"], optional = true }
-minijinja-contrib = { version = "=2.24.0", features = ["pycompat"], optional = true }
 httparse = { version = "=1.10.1", optional = true }
 jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 rustix = { version = "=1.1.4", features = ["fs"], optional = true }
@@ -45,6 +44,7 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 tracing-chrome = { version = "=0.7.2", optional = true }
 
 [dev-dependencies]
+chat-format = { path = "../chat-format", features = ["test-model"] }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 [lints]

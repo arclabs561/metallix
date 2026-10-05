@@ -59,7 +59,7 @@ pub(crate) struct GenerationDiagnostics<'a> {
     pub(crate) preview: bool,
     pub(crate) sampling: Option<SamplingConfiguration>,
     /// Optional decoder for text in the output receipt; execution still uses IDs.
-    pub(crate) tokenizer: Option<&'a crate::qwen_tokenizer::QwenTokenizer>,
+    pub(crate) tokenizer: Option<&'a chat_format::QwenTokenizer>,
     /// Input preparation recorded in every ordinary and candidate receipt.
     pub(crate) input_format: GenerationInputFormat,
 }

@@ -12,16 +12,17 @@ use std::{
 };
 
 use qwen::metal::{Qwen3MlxWeights, Qwen3WeightPrecision};
-use serde::{Deserialize, Serialize, ser::SerializeStruct};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
-use crate::{
-    chat_format::{ChatFormat, MAX_GENERATION_CONFIG_BYTES, TokenClass, TokenId},
-    qwen_forward::{SamplingConfiguration, SamplingPolicy},
-    qwen_tokenizer::QwenTokenizer,
+use chat_format::{
+    ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, QwenTokenizer, TokenClass, TokenId,
 };
+pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
+
+use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
 
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
@@ -84,93 +85,6 @@ impl ResidentChatLimits {
     }
 }
 
-/// A checkpoint-template role with the spellings expected by Qwen's Jinja.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ChatRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-/// One completed assistant tool call retained in conversation history.
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct ChatToolCall {
-    pub name: String,
-    pub arguments: Value,
-}
-
-impl Serialize for ChatToolCall {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = serializer.serialize_struct("ChatToolCall", 3)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("arguments", &self.arguments)?;
-        state.serialize_field(
-            "function",
-            &serde_json::json!({"name": self.name, "arguments": self.arguments}),
-        )?;
-        state.end()
-    }
-}
-
-/// One tool result which can be converted into a template-ready tool message.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChatToolResult {
-    pub tool_call_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub content: String,
-}
-
-impl ChatToolResult {
-    /// Returns the tool-role message consumed by the checkpoint chat template.
-    #[must_use]
-    pub(crate) fn into_message(self) -> ChatMessage {
-        ChatMessage {
-            role: ChatRole::Tool,
-            content: self.content,
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: Some(self.tool_call_id),
-            name: self.name,
-        }
-    }
-}
-
-/// One concrete message supplied to the checkpoint's chat template.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChatMessage {
-    pub role: ChatRole,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ChatToolCall>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-}
-
-impl ChatMessage {
-    /// Makes a text-only system, user, or assistant message.
-    #[must_use]
-    pub(crate) fn text(role: ChatRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            name: None,
-        }
-    }
-}
-
 /// A bounded one-user-message prompt rendered from the checkpoint's own template.
 ///
 /// This only prepares generation input. It neither loads checkpoint weights
@@ -195,7 +109,7 @@ pub(crate) fn render_generation_prompt(
     let (config, ..) = read_config(model)?;
     let format = ChatFormat::load(model, config.vocab_size)?;
     Ok(GenerationTemplatePrompt {
-        rendered: format.template().render(request, true)?,
+        rendered: format.template().render(request.conversation(), true)?,
         template_sha256: format.template().sha256().to_owned(),
     })
 }
@@ -240,6 +154,17 @@ impl<'a> ChatRequest<'a> {
             cache_salt: None,
         }
     }
+
+    /// The parts of this turn the chat template renders.
+    #[must_use]
+    pub(crate) const fn conversation(&self) -> Conversation<'a> {
+        Conversation {
+            messages: self.messages,
+            tools: self.tools,
+            enable_thinking: self.enable_thinking,
+            reasoning_effort: self.reasoning_effort,
+        }
+    }
 }
 
 /// The caller's sampling fields. Omitted values take the checkpoint's
@@ -271,7 +196,7 @@ impl SamplingDefaults {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let bytes = crate::qwen_tokenizer::read_regular_file(
+        let bytes = chat_format::read_regular_file(
             &path,
             MAX_GENERATION_CONFIG_BYTES,
             "generation_config.json",
@@ -971,7 +896,7 @@ impl ChatSession {
     }
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
-        self.format.template().render(request, true)
+        self.format.template().render(request.conversation(), true)
     }
 
     fn token_picker(&self, request: ChatRequest<'_>) -> Result<TokenPicker, String> {
@@ -1367,7 +1292,7 @@ mod tests {
         ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, ResidentChatLimits,
         render_generation_prompt,
     };
-    use crate::chat_format::{
+    use chat_format::{
         ChatTemplate, SpecialTokens,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
@@ -1384,7 +1309,7 @@ mod tests {
         request.tools = tools;
         request.enable_thinking = enable_thinking;
         template
-            .render(request, true)
+            .render(request.conversation(), true)
             .expect("fixture template renders")
     }
 
@@ -1680,7 +1605,7 @@ mod tests {
             name: None,
         }];
         let rendered = template
-            .render(ChatRequest::new(&messages, 1), false)
+            .render(ChatRequest::new(&messages, 1).conversation(), false)
             .expect("DeepSeek-shaped context renders");
         assert_eq!(rendered, "assistant:;read_file=README.md;");
     }
