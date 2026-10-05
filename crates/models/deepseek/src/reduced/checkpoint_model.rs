@@ -32,6 +32,7 @@ use crate::{
         V41StorageDtype,
         range_cache::{V41RangeCache, V41RangeCacheError, V41RangeSource},
     },
+    engram::inputs::EngramHashInputs,
     ffn::FfnSublayerReference,
     indexer::{
         key::{IndexKeyLayout, IndexKeyWeights},
@@ -44,13 +45,18 @@ use crate::{
 
 use super::{
     AttentionInput, BlockDefinition, BlockTailReference, CandidateProjector, EngramDefinition,
-    FinalHead, LayerFourConfig, LayerFourDefinition, LayerKind, LayerOneConfig, LayerOneDefinition,
-    LayerThreeConfig, LayerThreeDefinition, RatioTwoOwnerLayout, RatioTwoOwnerWeights,
-    RequestError, RequestModel, ReusedAttentionDefinition, ScheduledLayer, StartupDefinition,
+    EngramSessionConfig, EngramSessionWeights, FinalHead, LayerFourConfig, LayerFourDefinition,
+    LayerKind, LayerOneConfig, LayerOneDefinition, LayerThreeConfig, LayerThreeDefinition,
+    RatioTwoOwnerLayout, RatioTwoOwnerWeights, RequestError, RequestModel,
+    ReusedAttentionDefinition, ScheduledLayer, StartupDefinition,
 };
 
 /// Largest routed-expert count the static empty table covers.
 const MAX_ROUTED_EXPERTS: usize = 384;
+
+/// Lower bound on the Engram gate's |score| before its signed square root,
+/// as in the pinned source and the private native harness.
+const ENGRAM_GATE_CLAMP: f32 = 1e-6;
 
 // HOOK(routed-experts): every tail is built over this empty sparse table, so a
 // request step that runs a tail without a `RoutedExpertSource` fails with
@@ -98,6 +104,9 @@ pub struct V41InferenceConfig {
     hc_sinkhorn_iters: usize,
     hc_eps: f32,
     engram_layer_ids: Vec<usize>,
+    engram_max_ngram_size: usize,
+    engram_n_heads: usize,
+    engram_head_dim: usize,
     compress_rope_theta: f32,
     compress_ratios: Vec<usize>,
 }
@@ -383,6 +392,60 @@ impl V41CheckpointWeights {
         Ok(weights)
     }
 
+    /// Builds one Engram definition per `engram_layer_ids` entry. Embedding
+    /// rows are not loaded: request steps read them from an
+    /// [`crate::engram::embedding::EngramRowSource`] (e.g.
+    /// `checkpoint::engram_rows::V41CachedEngramRows`).
+    pub fn engram_definitions(
+        &self,
+        inputs: &EngramHashInputs,
+    ) -> Result<Vec<EngramDefinition>, V41CheckpointModelError> {
+        (0..self.config.engram_layer_ids.len())
+            .map(|index| {
+                let (config, weights) = self.engram_parts(index, inputs)?;
+                Ok(EngramDefinition::new(config, weights))
+            })
+            .collect()
+    }
+
+    fn engram_parts(
+        &self,
+        index: usize,
+        inputs: &EngramHashInputs,
+    ) -> Result<(EngramSessionConfig, EngramSessionWeights), V41CheckpointModelError> {
+        let c = &self.config;
+        if inputs.layer_ids() != c.engram_layer_ids {
+            return Err(V41CheckpointModelError::Config(format!(
+                "Engram inputs cover layers {:?}, the config {:?}",
+                inputs.layer_ids(),
+                c.engram_layer_ids
+            )));
+        }
+        let layer = c.engram_layer_ids[index];
+        let rows = usize::try_from(inputs.num_embeddings()[index]).map_err(component)?;
+        let config = EngramSessionConfig::new(
+            inputs.hash_layout().map_err(component)?,
+            inputs.token_map().iter().map(|&id| i64::from(id)).collect(),
+            index,
+            self.max_tokens.get(),
+            c.hc_mult,
+            c.dim,
+            rows,
+            c.engram_head_dim,
+            c.norm_eps,
+            ENGRAM_GATE_CLAMP,
+        )
+        .map_err(component)?;
+        let p = |name: &str| format!("layers.{layer}.engram.{name}");
+        let weights = EngramSessionWeights::without_embedding_table(
+            self.bytes(&p("wkv.weight"))?.to_vec(),
+            self.bytes(&p("wkv.scale"))?.to_vec(),
+            self.bf16(&p("q_weight"))?.to_vec(),
+            self.bf16(&p("k_weight"))?.to_vec(),
+        );
+        Ok((config, weights))
+    }
+
     /// HOOK(startup-head): reads the token embedding and output head. Both
     /// are `[vocab_size, dim]` (1.3 GB BF16 each; the head is widened to the
     /// 2.6 GB FP32 [`FinalHead`] takes), and both currently exceed the
@@ -550,6 +613,14 @@ impl V41CheckpointWeights {
                 ));
             }
             _ => {}
+        }
+        if c.engram_layer_ids.contains(&layer) {
+            let reduction = (c.engram_max_ngram_size - 1) * c.engram_n_heads * c.engram_head_dim;
+            fp8.push(("engram.wkv", (c.hc_mult + 1) * width, reduction));
+            other.extend([
+                ("engram.q_weight", Read::Bf16, vec![c.hc_mult, width]),
+                ("engram.k_weight", Read::Bf16, vec![c.hc_mult, width]),
+            ]);
         }
         if indexed {
             fp8.push((
@@ -1024,7 +1095,8 @@ mod tests {
             "original_seq_len": 65536, "rope_theta": 10000, "rope_factor": 16, "beta_fast": 32,
             "beta_slow": 1, "index_n_heads": 32, "index_head_dim": 128, "index_topk": 512,
             "candidate_source_layer": 20, "candidate_topk_blocks": 2048, "candidate_block_size": 8,
-            "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6, "engram_layer_ids": [1, 14],
+            "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6, "engram_layer_ids": [1, 14], "engram_max_ngram_size": 4, "engram_n_heads": 8,
+            "engram_head_dim": 256,
             "compress_rope_theta": 160_000, "compress_ratios": ratios,
         })
         .to_string()
@@ -1254,6 +1326,15 @@ mod tests {
                 ),
             }
         }
+        // HOOK(engram-cap): `EngramSessionConfig::new` caps the WKV weight at
+        // 2^20 elements; the real one is 25600 x 6144.
+        let inputs = crate::engram::inputs::EngramHashInputs::parse(
+            &std::fs::read(root.join("engram-hash/v41-engram-inputs.bin")).expect("Engram inputs"),
+            &crate::engram::inputs::V41_ENGRAM_INPUTS_IDENTITY,
+        )
+        .expect("pinned Engram inputs");
+        let blocker = weights.engram_parts(0, &inputs).expect_err("still blocked");
+        assert!(blocker.to_string().contains("WKV weight"), "{blocker}");
         // HOOK(key-dimension): `LayerOneConfig::new` requires the index key width
         // (128) to equal the attention head width (512); V4.1 has them differ.
         // When this is lifted, extend `DRIVEN` past the ratio-two owner.
