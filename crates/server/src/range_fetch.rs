@@ -7,20 +7,21 @@
 //! then re-read through the local source so it passes the same receipt and
 //! SHA-256 checks as any other local tensor.
 //!
-//! A sub-tensor read of whole rows (Engram and embedding table rows) is
-//! stored per row under `.rows/<tensor>/`, each row with its own receipt, so a
-//! repeat request reads rows locally whatever runs they were grouped into.
-//! The source publishes no digest for part of a tensor, so a row is trusted
-//! on first use: that fetch is checked by exact length and `Content-Range`,
-//! and its receipt records the digest every later read and any refetch must
+//! A sub-tensor read of whole rows (Engram table rows; the token embedding is
+//! a stored whole tensor) is kept in an append-only pack per tensor under
+//! `.row-packs/` with an index line per row (see `row_pack`), so a repeat
+//! request reads rows locally whatever runs they were grouped into. The
+//! source publishes no digest for part of a tensor, so a row is trusted on
+//! first use: that fetch is checked by exact length and `Content-Range`, and
+//! its index line records the digest every later read and any refetch must
 //! reproduce. A read that is not whole rows is fetched and not stored.
 //!
 //! Stored bytes stay inside an acquisition envelope (total stored bytes and a
 //! free-disk floor). A fetch that would cross it first evicts
 //! least-recently-used routed experts, one whole expert at a time; experts in
 //! the trace directory's `pinned-experts.json`, all non-expert tensors and all
-//! stored rows are never evicted, and the fetch is refused only when evicting everything else
-//! would still not make room. Replaying 5 recorded runs (58,080 expert
+//! stored rows are never evicted, and the fetch is refused only when evicting
+//! everything else would still not make room. Replaying 5 recorded runs (58,080 expert
 //! accesses) through LRU, a 64 GiB cap missed 23% of accesses and re-downloaded
 //! 79 GiB; 128 GiB, the default, missed 16% and re-downloaded 7.6 GiB, against a
 //! 15.3% compulsory floor.
@@ -44,6 +45,10 @@ use deepseek::checkpoint::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod row_pack;
+
+use row_pack::{NewRow, RowPacks, StoredRow};
 
 /// Bounds on bytes a [`FetchingSource`] may store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,18 +157,6 @@ struct Receipt {
     revision: String,
 }
 
-/// The receipt of one stored table row, `.rows/<tensor>/<row>.receipt.json`.
-#[derive(Deserialize, Serialize)]
-struct RowReceipt {
-    tensor: String,
-    shard: String,
-    row: u64,
-    /// Absolute shard byte range of the row.
-    range: [u64; 2],
-    sha256: String,
-    revision: String,
-}
-
 #[derive(Deserialize, Serialize)]
 struct ReceiptMetadata {
     dtype: String,
@@ -194,9 +187,12 @@ const EXPERT_PARTS: [&str; 6] = [
 /// directory. A leading dot keeps it out of the tensor namespace.
 const JOURNAL: &str = ".expert-recency.log";
 
-/// Directory of stored table rows in the weights directory, one subdirectory
-/// per tensor; hidden like the journal.
-const ROWS: &str = ".rows";
+/// Directory of the table-row packs in the weights directory; hidden like
+/// the journal.
+const ROW_PACKS: &str = ".row-packs";
+
+/// The earlier one-file-per-row store, migrated into packs on open.
+const LEGACY_ROWS: &str = ".rows";
 
 /// Journal lines beyond the live expert count before it is rewritten.
 const JOURNAL_SLACK: usize = 1 << 16;
@@ -222,8 +218,10 @@ fn routed_expert(tensor: &str) -> Option<Expert> {
 /// costs re-downloads, never correctness.
 #[derive(Debug)]
 struct Store {
-    /// Total `*.bin` bytes in the weights directory, stored rows included.
+    /// Total `*.bin` bytes in the weights directory plus row-pack bytes.
     acquired: u64,
+    /// Row-pack bytes, included in `acquired`.
+    row_pack_bytes: u64,
     /// Stored `*.bin` bytes and last-use tick of each routed expert with any
     /// part on disk.
     experts: HashMap<Expert, (u64, u64)>,
@@ -258,9 +256,9 @@ impl Store {
                 experts.entry(expert).or_default().0 += len;
             }
         }
-        acquired += stored_row_bytes(&weights_dir.join(ROWS))?;
         let mut store = Self {
             acquired,
+            row_pack_bytes: 0,
             experts,
             by_age: BTreeMap::new(),
             tick: 0,
@@ -449,6 +447,8 @@ pub struct FetchingSource<H> {
     acquiring: Mutex<()>,
     /// Held briefly, so local reads are not stalled behind a network fetch.
     store: Mutex<Store>,
+    /// Stored table rows of sub-tensor reads.
+    rows: RowPacks,
 }
 
 impl<H: RangeHost> FetchingSource<H> {
@@ -484,7 +484,24 @@ impl<H: RangeHost> FetchingSource<H> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => HashSet::new(),
             Err(error) => return Err(error),
         };
-        let store = Store::open(&weights_dir)?;
+        let (rows, opened_bytes) = RowPacks::open(weights_dir.join(ROW_PACKS))?;
+        let migrated_bytes = rows
+            .migrate_legacy(&weights_dir.join(LEGACY_ROWS))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let row_pack_bytes = opened_bytes + migrated_bytes;
+        let mut store = Store::open(&weights_dir)?;
+        store.acquired += row_pack_bytes;
+        store.row_pack_bytes = row_pack_bytes;
+        let expert_bytes: u64 = store.experts.values().map(|(bytes, _)| bytes).sum();
+        tracing::info!(
+            weights = %weights_dir.display(),
+            stored_bytes = store.acquired,
+            routed_expert_bytes = expert_bytes,
+            row_pack_bytes,
+            migrated_bytes,
+            max_bytes = envelope.max_acquired_bytes,
+            "opened the V4.1 weights store"
+        );
         Ok(Self {
             local: V41LocalWeightsSource::new(&weights_dir, revision.clone()),
             weights_dir,
@@ -500,12 +517,18 @@ impl<H: RangeHost> FetchingSource<H> {
             pinned,
             acquiring: Mutex::new(()),
             store: Mutex::new(store),
+            rows,
         })
     }
 
-    /// Total `*.bin` bytes counted against the envelope.
+    /// Total `*.bin` and row-pack bytes counted against the envelope.
     pub fn acquired_bytes(&self) -> u64 {
         self.lock_store().acquired
+    }
+
+    /// Row-pack bytes, included in [`Self::acquired_bytes`]; never evicted.
+    pub fn row_pack_bytes(&self) -> u64 {
+        self.lock_store().row_pack_bytes
     }
 
     fn lock_store(&self) -> std::sync::MutexGuard<'_, Store> {
@@ -629,89 +652,52 @@ impl<H: RangeHost> FetchingSource<H> {
         let Some((row_bytes, rows)) = whole_rows(request) else {
             return self.fetch(request.shard, request.range.clone());
         };
-        let mut found = rows
-            .clone()
-            .map(|row| self.stored_row(request, row, row_bytes))
-            .collect::<Result<Vec<_>, _>>()?;
+        let start = request.tensor_range.file_range().start;
+        let mut found = Vec::new();
+        for row in rows.clone() {
+            let range = [start + row * row_bytes, start + (row + 1) * row_bytes];
+            found.push(self.rows.get(
+                request.tensor,
+                row,
+                (request.shard, range, &self.revision),
+            )?);
+        }
+        let mut output = Vec::new();
         let mut index = 0;
         while index < found.len() {
-            if found[index].is_some() {
+            if let StoredRow::Present(bytes) = &found[index] {
+                output.extend_from_slice(bytes);
                 index += 1;
                 continue;
             }
             let mut end = index + 1;
-            while end < found.len() && found[end].is_none() {
+            while end < found.len() && !matches!(found[end], StoredRow::Present(_)) {
                 end += 1;
             }
+            let lost: Vec<Option<&str>> = found[index..end]
+                .iter()
+                .map(|stored| match stored {
+                    StoredRow::Lost(sha256) => Some(sha256.as_str()),
+                    _ => None,
+                })
+                .collect();
             let missing = rows.start + index as u64..rows.start + end as u64;
-            let fetched = self.acquire_rows(request, row_bytes, missing)?;
-            for (slot, row) in found[index..end].iter_mut().zip(fetched) {
-                *slot = Some(row);
-            }
+            output.extend(self.acquire_rows(request, row_bytes, missing, &lost)?);
             index = end;
         }
-        Ok(found.into_iter().flatten().flatten().collect())
+        Ok(output)
     }
 
-    fn row_paths(&self, tensor: &str, row: u64) -> (PathBuf, PathBuf) {
-        let dir = self.weights_dir.join(ROWS).join(tensor);
-        (
-            dir.join(format!("{row}.bin")),
-            dir.join(format!("{row}.receipt.json")),
-        )
-    }
-
-    /// One stored row, checked against its receipt; `None` when it has no
-    /// receipt or no payload (a payload without a receipt is replaced).
-    fn stored_row(
-        &self,
-        request: &V41RangeRequest<'_>,
-        row: u64,
-        row_bytes: u64,
-    ) -> Result<Option<Vec<u8>>, V41RangeCacheError> {
-        let (bin_path, receipt_path) = self.row_paths(request.tensor, row);
-        let Some(receipt) = row_receipt(&receipt_path)? else {
-            return Ok(None);
-        };
-        let bytes = match fs::read(&bin_path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(V41RangeCacheError::Io(error)),
-        };
-        let start = request.tensor_range.file_range().start + row * row_bytes;
-        if receipt.tensor != request.tensor
-            || receipt.shard != request.shard
-            || receipt.row != row
-            || receipt.range != [start, start + row_bytes]
-            || receipt.revision != self.revision
-        {
-            return Err(fail(format!(
-                "{} does not describe {} row {row} at revision {}",
-                receipt_path.display(),
-                request.tensor,
-                self.revision
-            )));
-        }
-        if bytes.len() as u64 != row_bytes
-            || format!("{:x}", Sha256::digest(&bytes)) != receipt.sha256
-        {
-            return Err(V41RangeCacheError::HashMismatch(format!(
-                "{} row {row}",
-                request.tensor
-            )));
-        }
-        Ok(Some(bytes))
-    }
-
-    /// Fetches `rows` of `request.tensor` in one range read and stores each
-    /// row with a receipt, inside the envelope. A row whose receipt survives
-    /// its payload must refetch to the recorded digest.
+    /// Fetches `rows` of `request.tensor` in one range read and appends them
+    /// to its pack, inside the envelope. `lost[i]` is the recorded digest
+    /// that row `rows.start + i` must reproduce, if any.
     fn acquire_rows(
         &self,
         request: &V41RangeRequest<'_>,
         row_bytes: u64,
         rows: Range<u64>,
-    ) -> Result<Vec<Vec<u8>>, V41RangeCacheError> {
+        lost: &[Option<&str>],
+    ) -> Result<Vec<u8>, V41RangeCacheError> {
         let tensor = request.tensor;
         let length = (rows.end - rows.start) * row_bytes;
         let refuse = |why: String| {
@@ -728,23 +714,25 @@ impl<H: RangeHost> FetchingSource<H> {
             .victims(self.envelope, free, length, &self.pinned, None)
             .map_err(refuse)?;
 
-        let start = request.tensor_range.file_range().start + rows.start * row_bytes;
+        let tensor_start = request.tensor_range.file_range().start;
+        let start = tensor_start + rows.start * row_bytes;
         let bytes = self.fetch(request.shard, start..start + length)?;
-        let fetched: Vec<Vec<u8>> = bytes
-            .chunks_exact(usize::try_from(row_bytes).map_err(|_| fail("row too large".to_owned()))?)
-            .map(<[u8]>::to_vec)
-            .collect();
-        let mut receipts = Vec::with_capacity(fetched.len());
-        for (row, payload) in rows.clone().zip(&fetched) {
-            let (_, receipt_path) = self.row_paths(tensor, row);
-            let sha256 = format!("{:x}", Sha256::digest(payload));
-            let prior = row_receipt(&receipt_path)?;
-            if prior.as_ref().is_some_and(|prior| prior.sha256 != sha256) {
+        let row_len = usize::try_from(row_bytes).map_err(|_| fail("row too large".to_owned()))?;
+        let mut new_rows = Vec::with_capacity(lost.len());
+        for ((row, chunk), lost) in rows.clone().zip(bytes.chunks_exact(row_len)).zip(lost) {
+            if lost.is_some_and(|sha256| format!("{:x}", Sha256::digest(chunk)) != sha256) {
                 return Err(V41RangeCacheError::HashMismatch(format!(
                     "{tensor} row {row}"
                 )));
             }
-            receipts.push((prior.is_none(), sha256));
+            let row_start = tensor_start + row * row_bytes;
+            new_rows.push(NewRow {
+                row,
+                shard: request.shard.to_owned(),
+                range: [row_start, row_start + row_bytes],
+                revision: self.revision.clone(),
+                bytes: chunk.to_vec(),
+            });
         }
 
         let free = self.free_bytes()?;
@@ -757,38 +745,10 @@ impl<H: RangeHost> FetchingSource<H> {
                 .evict(&self.weights_dir, victim)
                 .map_err(V41RangeCacheError::Io)?;
         }
-        fs::create_dir_all(self.weights_dir.join(ROWS).join(tensor))
-            .map_err(V41RangeCacheError::Io)?;
-        for ((row, payload), (fresh, sha256)) in rows.zip(&fetched).zip(receipts) {
-            let (bin_path, receipt_path) = self.row_paths(tensor, row);
-            let replaced = fs::metadata(&bin_path).map_or(0, |metadata| metadata.len());
-            write_atomically(&bin_path, payload)?;
-            store.stored(None, row_bytes, replaced);
-            if fresh {
-                let row_start = request.tensor_range.file_range().start + row * row_bytes;
-                let receipt = RowReceipt {
-                    tensor: tensor.to_owned(),
-                    shard: request.shard.to_owned(),
-                    row,
-                    range: [row_start, row_start + row_bytes],
-                    sha256,
-                    revision: self.revision.clone(),
-                };
-                let json = serde_json::to_vec(&receipt).map_err(V41RangeCacheError::ReceiptJson)?;
-                write_atomically(&receipt_path, &json)?;
-            }
-        }
-        Ok(fetched)
-    }
-}
-
-fn row_receipt(path: &Path) -> Result<Option<RowReceipt>, V41RangeCacheError> {
-    match fs::read(path) {
-        Ok(json) => Ok(Some(
-            serde_json::from_slice(&json).map_err(V41RangeCacheError::ReceiptJson)?,
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(V41RangeCacheError::Io(error)),
+        let added = self.rows.append(tensor, new_rows)?;
+        store.stored(None, added, 0);
+        store.row_pack_bytes += added;
+        Ok(bytes)
     }
 }
 
@@ -813,25 +773,6 @@ fn whole_rows(request: &V41RangeRequest<'_>) -> Option<(u64, Range<u64>)> {
         return None;
     }
     Some((row_bytes, offset / row_bytes..(offset + length) / row_bytes))
-}
-
-/// Total `*.bin` bytes of stored rows under `rows_dir`, zero if it is absent.
-fn stored_row_bytes(rows_dir: &Path) -> io::Result<u64> {
-    let tensors = match fs::read_dir(rows_dir) {
-        Ok(tensors) => tensors,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let mut total = 0;
-    for tensor in tensors {
-        for row in fs::read_dir(tensor?.path())? {
-            let row = row?;
-            if row.file_name().to_string_lossy().ends_with(".bin") {
-                total += row.metadata()?.len();
-            }
-        }
-    }
-    Ok(total)
 }
 
 impl<H: RangeHost> V41RangeSource for FetchingSource<H> {
@@ -1190,24 +1131,20 @@ mod tests {
         fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 
-    fn row_names(dir: &Path) -> BTreeSet<String> {
-        fs::read_dir(dir.join("weights/.rows/a"))
-            .map(|entries| {
-                entries
-                    .map(|entry| {
-                        entry
-                            .expect("entry")
-                            .file_name()
-                            .into_string()
-                            .expect("utf-8")
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn pack_dir(dir: &Path) -> PathBuf {
+        dir.join("weights/.row-packs")
+    }
+
+    fn index_lines(dir: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(pack_dir(dir).join("a.index"))
+            .expect("index")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("index line"))
+            .collect()
     }
 
     #[test]
-    fn row_reads_store_each_row_so_a_regrouped_repeat_fetches_only_new_rows() {
+    fn row_reads_pack_each_row_so_a_regrouped_repeat_fetches_only_new_rows() {
         let dir = trace_dir();
         let host = FakeHost::new(1 << 30);
         assert_eq!(
@@ -1220,20 +1157,15 @@ mod tests {
             std::slice::from_ref(&(start + 4..start + 12))
         );
         assert_eq!(
-            row_names(&dir),
-            BTreeSet::from(
-                ["1.bin", "1.receipt.json", "2.bin", "2.receipt.json"].map(str::to_owned)
-            )
+            fs::read(pack_dir(&dir).join("a.pack")).expect("pack"),
+            [4, 5, 6, 7, 8, 9, 10, 11]
         );
-        let receipt: serde_json::Value = serde_json::from_slice(
-            &fs::read(dir.join("weights/.rows/a/2.receipt.json")).expect("receipt"),
-        )
-        .expect("receipt json");
         assert_eq!(
-            receipt,
+            index_lines(&dir)[1],
             serde_json::json!({
-                "tensor": "a", "shard": SHARD, "row": 2, "range": [start + 8, start + 12],
-                "sha256": format!("{:x}", Sha256::digest([8, 9, 10, 11])), "revision": REV,
+                "row": 2, "offset": 4, "length": 4,
+                "sha256": format!("{:x}", Sha256::digest([8, 9, 10, 11])),
+                "shard": SHARD, "range": [start + 8, start + 12], "revision": REV,
             })
         );
         // A fresh cache, rows grouped differently: only row 3 goes to the network.
@@ -1241,9 +1173,9 @@ mod tests {
         let source = FetchingSource::new(dir.join("weights"), &dir, "org/model", REV, &host, ROOMY)
             .expect("source");
         assert_eq!(
-            source.acquired_bytes(),
-            8,
-            "stored rows count against the envelope"
+            (source.acquired_bytes(), source.row_pack_bytes()),
+            (8, 8),
+            "pack bytes count against the envelope"
         );
         let mut regrouped =
             V41RangeCache::load(source, &dir.join("index.json"), &dir, REV, 1 << 20)
@@ -1259,6 +1191,58 @@ mod tests {
         // And a third read of stored rows needs no network at all.
         let host = FakeHost::new(1 << 30);
         assert_eq!(
+            &*cache(&dir, &host, ROOMY).get_rows("a", 1..4).expect("rows"),
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert!(host.calls.borrow().is_empty());
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn a_torn_write_is_dropped_on_open_and_later_appends_stay_readable() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        cache(&dir, &host, ROOMY)
+            .get_rows("a", 1..3)
+            .expect("first fetch");
+        // A crash after writing row 3's data but mid-way through its index line.
+        let mut pack = fs::read(pack_dir(&dir).join("a.pack")).expect("pack");
+        pack.extend([12, 13, 14, 15]);
+        fs::write(pack_dir(&dir).join("a.pack"), &pack).expect("orphan data");
+        let index = fs::read_to_string(pack_dir(&dir).join("a.index")).expect("index");
+        fs::write(
+            pack_dir(&dir).join("a.index"),
+            format!("{index}{{\"row\":3,\"offs"),
+        )
+        .expect("torn line");
+        let host = FakeHost::new(1 << 30);
+        let source = FetchingSource::new(dir.join("weights"), &dir, "org/model", REV, &host, ROOMY)
+            .expect("recovering open");
+        assert_eq!(
+            source.row_pack_bytes(),
+            8,
+            "the orphaned tail is not counted"
+        );
+        assert_eq!(
+            fs::read_to_string(pack_dir(&dir).join("a.index")).expect("index"),
+            index,
+            "the torn line is gone"
+        );
+        let mut recovered =
+            V41RangeCache::load(source, &dir.join("index.json"), &dir, REV, 1 << 20)
+                .expect("cache");
+        assert_eq!(
+            &*recovered.get_rows("a", 1..4).expect("rows"),
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        let start = payload_start();
+        assert_eq!(
+            host.calls.borrow().as_slice(),
+            std::slice::from_ref(&(start + 12..start + 16)),
+            "only the row whose index line tore is refetched"
+        );
+        let host = FakeHost::new(1 << 30);
+        assert_eq!(
             cache(&dir, &host, ROOMY)
                 .get_rows("a", 1..4)
                 .expect("rows")
@@ -1266,39 +1250,128 @@ mod tests {
             12
         );
         assert!(host.calls.borrow().is_empty());
+        assert_eq!(index_lines(&dir).len(), 3);
         fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 
     #[test]
-    fn a_stored_row_is_checked_on_every_read_and_refetched_to_its_digest() {
+    fn a_corrupt_row_fails_its_read_without_a_refetch() {
         let dir = trace_dir();
         let host = FakeHost::new(1 << 30);
         cache(&dir, &host, ROOMY)
-            .get_rows("a", 2..3)
+            .get_rows("a", 1..3)
             .expect("first fetch");
-        let row = dir.join("weights/.rows/a/2.bin");
-        fs::write(&row, [8, 9, 10, 0]).expect("corrupt");
+        let path = pack_dir(&dir).join("a.pack");
+        let mut pack = fs::read(&path).expect("pack");
+        pack[7] ^= 1;
+        fs::write(&path, &pack).expect("corrupt row 2");
         let host = FakeHost::new(1 << 30);
-        assert!(matches!(
-            cache(&dir, &host, ROOMY).get_rows("a", 2..3),
-            Err(V41RangeCacheError::HashMismatch(_))
-        ));
-        assert!(
-            host.calls.borrow().is_empty(),
-            "a corrupt row is not silently refetched"
+        let mut cache = cache(&dir, &host, ROOMY);
+        assert_eq!(
+            &*cache.get_rows("a", 1..2).expect("row 1 is intact"),
+            [4, 5, 6, 7]
         );
-        // A lost payload refetches, and the bytes must match the kept receipt.
-        fs::remove_file(&row).expect("lose payload");
-        let receipt_path = dir.join("weights/.rows/a/2.receipt.json");
-        let receipt = fs::read_to_string(&receipt_path).expect("receipt");
+        assert!(matches!(
+            cache.get_rows("a", 2..3),
+            Err(V41RangeCacheError::HashMismatch(_))
+        ));
+        assert!(host.calls.borrow().is_empty());
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn legacy_per_row_files_migrate_into_the_pack() {
+        let dir = trace_dir();
+        let legacy = dir.join("weights/.rows/a");
+        fs::create_dir_all(&legacy).expect("legacy dir");
+        let start = payload_start();
+        let receipt = |row: u64, bytes: [u8; 4]| {
+            serde_json::json!({
+                "tensor": "a", "shard": SHARD, "row": row,
+                "range": [start + 4 * row, start + 4 * row + 4],
+                "sha256": format!("{:x}", Sha256::digest(bytes)), "revision": REV,
+            })
+            .to_string()
+        };
+        // Row 1 intact, row 2 lost (receipt only), row 3 corrupt.
+        fs::write(legacy.join("1.bin"), [4, 5, 6, 7]).expect("row 1");
+        fs::write(legacy.join("1.receipt.json"), receipt(1, [4, 5, 6, 7])).expect("receipt 1");
+        fs::write(legacy.join("2.receipt.json"), receipt(2, [8, 9, 10, 11])).expect("receipt 2");
+        fs::write(legacy.join("3.bin"), [0; 4]).expect("row 3");
+        fs::write(legacy.join("3.receipt.json"), receipt(3, [12, 13, 14, 15])).expect("receipt 3");
+        let host = FakeHost::new(1 << 30);
+        let source = FetchingSource::new(dir.join("weights"), &dir, "org/model", REV, &host, ROOMY)
+            .expect("migrating open");
+        assert_eq!(source.row_pack_bytes(), 4, "only row 1's bytes moved");
+        let names: BTreeSet<_> = fs::read_dir(&legacy)
+            .expect("legacy left")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["3.bin", "3.receipt.json"].map(str::to_owned)),
+            "migrated files are removed, the corrupt row stays visible"
+        );
+        let mut cache = V41RangeCache::load(source, &dir.join("index.json"), &dir, REV, 1 << 20)
+            .expect("cache");
+        assert_eq!(
+            &*cache.get_rows("a", 1..4).expect("rows"),
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(
+            host.calls.borrow().as_slice(),
+            std::slice::from_ref(&(start + 8..start + 16)),
+            "row 1 came from the pack; rows 2 and 3 were fetched"
+        );
+        assert!(index_lines(&dir).iter().any(|line| line["row"] == 2));
+        fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn a_lost_row_refetches_only_to_its_recorded_digest() {
+        let dir = trace_dir();
+        let host = FakeHost::new(1 << 30);
+        cache(&dir, &host, ROOMY)
+            .get_rows("a", 1..3)
+            .expect("first fetch");
+        let pack = pack_dir(&dir).join("a.pack");
+        let lose_row_2 = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&pack)
+                .and_then(|file| file.set_len(4))
+                .expect("truncate the pack after row 1");
+        };
+        lose_row_2();
+        let host = FakeHost::new(1 << 30);
+        assert_eq!(
+            &*cache(&dir, &host, ROOMY)
+                .get_rows("a", 1..3)
+                .expect("refetch"),
+            [4, 5, 6, 7, 8, 9, 10, 11]
+        );
+        let start = payload_start();
+        assert_eq!(
+            host.calls.borrow().as_slice(),
+            std::slice::from_ref(&(start + 8..start + 12))
+        );
+        // Lost again, with a different recorded digest: the refetch must fail.
+        lose_row_2();
+        let index_path = pack_dir(&dir).join("a.index");
         let digest = format!("{:x}", Sha256::digest([8, 9, 10, 11]));
-        fs::write(&receipt_path, receipt.replace(&digest, &"0".repeat(64))).expect("tamper");
+        let index = fs::read_to_string(&index_path).expect("index");
+        fs::write(&index_path, index.replace(&digest, &"0".repeat(64))).expect("tamper");
         let host = FakeHost::new(1 << 30);
         assert!(matches!(
             cache(&dir, &host, ROOMY).get_rows("a", 2..3),
             Err(V41RangeCacheError::HashMismatch(_))
         ));
-        assert!(!row.exists());
         fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 
@@ -1315,7 +1388,7 @@ mod tests {
             Err(V41RangeCacheError::Io(_))
         ));
         assert!(host.calls.borrow().is_empty());
-        assert!(row_names(&dir).is_empty());
+        assert!(!pack_dir(&dir).exists());
         fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 

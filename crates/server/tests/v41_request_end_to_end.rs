@@ -103,14 +103,15 @@ fn backend() -> V41Backend {
 /// tensor is megabytes.
 const ROW_FETCH_LIMIT: u64 = 1 << 20;
 
-/// [`CurlHost`] with an optional fetch-size limit, counting what it fetches.
+/// [`CurlHost`] that can refuse fetches by size, counting what it fetches.
 /// `METALLIX_V41_NO_EXPERT_FETCH=1` refuses any fetch larger than a row run,
 /// so a run that routes to an expert not stored yet (as a different
 /// backend's numerics might) fails instead of downloading it.
-/// `METALLIX_V41_OFFLINE=1` refuses every fetch: once a prompt's rows and
-/// experts are stored, a repeat run needs no network.
+/// `METALLIX_V41_NO_ROW_FETCH=1` refuses row runs, which a repeat run reads
+/// from the row packs. With both set, the run makes no network request.
 struct Host {
-    limit: Option<(u64, &'static str)>,
+    no_experts: bool,
+    no_rows: bool,
     fetches: AtomicU64,
     bytes: AtomicU64,
 }
@@ -118,15 +119,9 @@ struct Host {
 impl Host {
     fn from_env() -> Self {
         let set = |name| std::env::var(name).as_deref() == Ok("1");
-        let limit = if set("METALLIX_V41_OFFLINE") {
-            Some((0, "METALLIX_V41_OFFLINE"))
-        } else if set("METALLIX_V41_NO_EXPERT_FETCH") {
-            Some((ROW_FETCH_LIMIT, "METALLIX_V41_NO_EXPERT_FETCH"))
-        } else {
-            None
-        };
         Self {
-            limit,
+            no_experts: set("METALLIX_V41_NO_EXPERT_FETCH"),
+            no_rows: set("METALLIX_V41_NO_ROW_FETCH"),
             fetches: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
         }
@@ -136,9 +131,12 @@ impl Host {
 impl RangeHost for &Host {
     fn get_range(&self, url: &str, range: Range<u64>) -> io::Result<(Vec<u8>, String)> {
         let length = range.end.saturating_sub(range.start);
-        if let Some((limit, flag)) = self.limit
-            && length > limit
-        {
+        let refused = if length > ROW_FETCH_LIMIT {
+            self.no_experts.then_some("METALLIX_V41_NO_EXPERT_FETCH")
+        } else {
+            self.no_rows.then_some("METALLIX_V41_NO_ROW_FETCH")
+        };
+        if let Some(flag) = refused {
             return Err(io::Error::other(format!(
                 "{flag}: refusing {url} bytes {range:?}"
             )));
