@@ -42,6 +42,7 @@ pub struct LayerOneConfig {
     attention_layout: LayerAttentionLayout,
     index_topk: NonZeroUsize,
     source_layer: u16,
+    previous_owner_layer: u16,
 }
 
 impl LayerOneConfig {
@@ -103,7 +104,17 @@ impl LayerOneConfig {
             attention_layout,
             index_topk,
             source_layer,
+            previous_owner_layer: 3,
         })
+    }
+
+    /// Names the ratio-one owner whose previous-call keys score an incomplete group.
+    ///
+    /// [`Self::new`] accepts layer 3, the reduced schedule's owner.
+    #[must_use]
+    pub const fn with_previous_owner_layer(mut self, layer: u16) -> Self {
+        self.previous_owner_layer = layer;
+        self
     }
 }
 
@@ -493,7 +504,7 @@ impl LayerOneSession {
             .next_call_id()
             .checked_sub(2)
             .ok_or(LayerOneSessionError::NoPreviousLayerThreeCall)?;
-        if previous.publication.source_layer() != 3
+        if previous.publication.source_layer() != self.config.previous_owner_layer
             || previous.publication.epoch() != self.expected_epoch
             || previous.publication.call_id() != expected_call_id
         {
@@ -501,6 +512,7 @@ impl LayerOneSession {
                 source_layer: previous.publication.source_layer(),
                 epoch: previous.publication.epoch(),
                 call_id: previous.publication.call_id(),
+                expected_source_layer: self.config.previous_owner_layer,
                 expected_epoch: self.expected_epoch,
                 expected_call_id,
             });
@@ -622,12 +634,13 @@ pub enum LayerOneSessionError {
     #[error("layer-one incomplete owner group has no preceding layer-three call")]
     NoPreviousLayerThreeCall,
     #[error(
-        "previous layer-three publication ({source_layer}, {epoch}, {call_id}) does not match source 3 epoch {expected_epoch} call {expected_call_id}"
+        "previous layer-three publication ({source_layer}, {epoch}, {call_id}) does not match source {expected_source_layer} epoch {expected_epoch} call {expected_call_id}"
     )]
     PreviousLayerThreeIdentity {
         source_layer: u16,
         epoch: u64,
         call_id: u64,
+        expected_source_layer: u16,
         expected_epoch: u64,
         expected_call_id: u64,
     },

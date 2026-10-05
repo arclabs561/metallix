@@ -41,6 +41,13 @@ impl Operands {
     }
 
     fn session(&self) -> LayerOneSession {
+        self.session_with(|config| config)
+    }
+
+    fn session_with(
+        &self,
+        configure: impl FnOnce(LayerOneConfig) -> LayerOneConfig,
+    ) -> LayerOneSession {
         let owner =
             RatioTwoOwnerLayout::new(nz(1), nz(32), nz(32), nz(32), nz(1), nz(4), 1.0e-6).unwrap();
         let attention = LayerAttentionLayout::new(
@@ -60,7 +67,7 @@ impl Operands {
         )
         .unwrap();
         LayerOneSession::new(
-            LayerOneConfig::new(owner, attention, nz(2)).unwrap(),
+            configure(LayerOneConfig::new(owner, attention, nz(2)).unwrap()),
             &self.norm,
         )
         .unwrap()
@@ -178,4 +185,41 @@ fn late_attention_failure_requires_reset_and_rejects_old_epoch_keys() {
         .unwrap();
     assert_eq!(partial.publication(), IndexKeyPublicationId::new(1, 2, 1));
     assert_eq!(partial.score_key_prefix(), &prior_keys[..2 * 32]);
+}
+
+#[test]
+fn incomplete_group_accepts_only_the_configured_previous_owner_layer() {
+    let operands = Operands::new();
+    let prior_keys = vec![0x3f80; 4 * 32];
+    let from =
+        |layer| PreviousLayerThreeKeys::new(IndexKeyPublicationId::new(layer, 0, 0), &prior_keys);
+
+    let mut default = operands.session();
+    operands.step(&mut default, 4, None, false).unwrap();
+    assert!(matches!(
+        operands.step(&mut default, 1, Some(from(20)), false),
+        Err(LayerOneSessionError::PreviousLayerThreeIdentity {
+            source_layer: 20,
+            expected_source_layer: 3,
+            ..
+        })
+    ));
+
+    let mut configured = operands.session_with(|config| config.with_previous_owner_layer(20));
+    operands.step(&mut configured, 4, None, false).unwrap();
+    let partial = operands
+        .step(&mut configured, 1, Some(from(20)), false)
+        .unwrap();
+    assert_eq!(partial.score_key_prefix(), &prior_keys[..2 * 32]);
+
+    let mut configured = operands.session_with(|config| config.with_previous_owner_layer(20));
+    operands.step(&mut configured, 4, None, false).unwrap();
+    assert!(matches!(
+        operands.step(&mut configured, 1, Some(from(3)), false),
+        Err(LayerOneSessionError::PreviousLayerThreeIdentity {
+            source_layer: 3,
+            expected_source_layer: 20,
+            ..
+        })
+    ));
 }
