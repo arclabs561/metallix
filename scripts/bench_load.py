@@ -24,11 +24,14 @@ Usage:
       --sets shared-prefix,long --concurrency 1,2,4,8 --rates 0.5,1,2
   uv run scripts/bench_load.py --url http://127.0.0.1:8000 --api chat \\
       --model-id qwen3 --model-path DIR --concurrency 1
+  uv run scripts/bench_load.py --server metallix --model-path DIR \\
+      --sets file --prompts-file agent_benchmark_prompts.json --concurrency 1,8
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import itertools
 import json
@@ -81,11 +84,18 @@ TOOL_NAMES = (  # noqa: SIM905 (one string reads better than a long list)
 
 @dataclass(frozen=True)
 class Prompt:
-    """One request's text: an optional system part and the user turn."""
+    """One request's text: an optional system part and the user turn.
+
+    A prompt loaded from a file may instead carry a recorded conversation in
+    OpenAI chat form (tool calls and results included), sent as is, and its own
+    output cap; `system` and `user` are then unused.
+    """
 
     label: str
     system: str | None
     user: str
+    messages: tuple[dict, ...] | None = None
+    max_tokens: int | None = None
 
 
 def sentence(rng: random.Random, length: int) -> str:
@@ -194,7 +204,76 @@ def build_prompts(name: str, count: int, count_tokens, seed: int) -> list[Prompt
     raise ValueError(f"unknown prompt set {name!r}")
 
 
-PROMPT_SETS = ("short", "long", "shared-prefix", "mixed")
+# The set name for prompts read with --prompts-file.
+FILE_SET = "file"
+PROMPT_SETS = ("short", "long", "shared-prefix", "mixed", FILE_SET)
+
+
+def load_prompts_file(path: Path) -> list[Prompt]:
+    """Prompts from a JSON array or JSON Lines file, in file order.
+
+    Each entry has either `messages` (OpenAI chat messages, as in SiliconBench's
+    prompts/agent_benchmark_prompts.json) or `user` with an optional `system`,
+    plus optional `name` and `max_tokens`.
+    """
+    text = path.read_text()
+    stripped = text.lstrip()
+    entries = (
+        json.loads(text)
+        if stripped.startswith("[")
+        else [json.loads(line) for line in text.splitlines() if line.strip()]
+    )
+    prompts = []
+    for index, entry in enumerate(entries):
+        label = str(entry.get("name") or entry.get("label") or f"file-{index}")
+        max_tokens = entry.get("max_tokens")
+        if max_tokens is not None and (
+            not isinstance(max_tokens, int) or max_tokens < 1
+        ):
+            raise ValueError(f"{path}: entry {index} has a bad max_tokens")
+        if isinstance(entry.get("messages"), list) and entry["messages"]:
+            prompts.append(
+                Prompt(label, None, "", tuple(entry["messages"]), max_tokens)
+            )
+        elif isinstance(entry.get("user"), str):
+            prompts.append(
+                Prompt(label, entry.get("system"), entry["user"], None, max_tokens)
+            )
+        else:
+            raise ValueError(f"{path}: entry {index} has neither messages nor user")
+    if not prompts:
+        raise ValueError(f"{path}: no prompts")
+    return prompts
+
+
+def file_identity(path: Path | None) -> dict | None:
+    """Name and SHA-256 of a prompts file, so a report pins the exact prompts."""
+    if path is None:
+        return None
+    return {"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def cycle(prompts: list[Prompt], count: int) -> list[Prompt]:
+    """The first `count` prompts, wrapping around when the file is shorter."""
+    return [prompts[i % len(prompts)] for i in range(count)]
+
+
+def set_prompts(
+    name: str, count: int, count_tokens, seed: int, file_prompts: list[Prompt]
+) -> list[Prompt]:
+    if name == FILE_SET:
+        return cycle(file_prompts, count)
+    return build_prompts(name, count, count_tokens, seed)
+
+
+def warmup_prompts(
+    name: str, count: int, count_tokens, seed: int, file_prompts: list[Prompt]
+) -> list[Prompt]:
+    """Discarded requests before a measurement, distinct from the measured ones
+    where the set allows: a fresh seed, or the tail of a prompts file."""
+    if name == FILE_SET:
+        return cycle(file_prompts[::-1], count)
+    return build_prompts(name, count, count_tokens, seed + 999)
 
 
 def tokenizer_counter(model_path: Path):
@@ -213,11 +292,15 @@ def request_body(
     api: str, model: str, prompt: Prompt, max_tokens: int, extra: dict
 ) -> tuple[str, dict]:
     """`(path, body)` for one streaming request."""
+    max_tokens = prompt.max_tokens or max_tokens
     if api == "chat":
-        messages = (
-            [{"role": "system", "content": prompt.system}] if prompt.system else []
-        )
-        messages.append({"role": "user", "content": prompt.user})
+        if prompt.messages is not None:
+            messages = list(prompt.messages)
+        else:
+            messages = (
+                [{"role": "system", "content": prompt.system}] if prompt.system else []
+            )
+            messages.append({"role": "user", "content": prompt.user})
         body = {
             "model": model,
             "messages": messages,
@@ -230,7 +313,11 @@ def request_body(
     if api == "responses":
         body = {
             "model": model,
-            "input": prompt.user,
+            "input": (
+                prompt.user
+                if prompt.messages is None
+                else responses_input(prompt.messages)
+            ),
             "max_output_tokens": max_tokens,
             "temperature": 0,
             "stream": True,
@@ -239,6 +326,37 @@ def request_body(
             body["instructions"] = prompt.system
         return "/v1/responses", body | extra
     raise ValueError(f"unknown api {api!r}")
+
+
+def responses_input(messages: tuple[dict, ...]) -> list[dict]:
+    """Chat messages as Responses input items: an assistant turn's tool calls
+    become `function_call` items and tool results `function_call_output` items."""
+    items: list[dict] = []
+    for message in messages:
+        role, content = message["role"], message.get("content") or ""
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message["tool_call_id"],
+                    "output": content,
+                }
+            )
+            continue
+        if content or not message.get("tool_calls"):
+            items.append({"type": "message", "role": role, "content": content})
+        for call in message.get("tool_calls") or []:
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "arguments": arguments
+                    if isinstance(arguments := call["function"]["arguments"], str)
+                    else json.dumps(arguments),
+                }
+            )
+    return items
 
 
 @dataclass
@@ -776,7 +894,9 @@ def measure_set(
     address: str, spec: ServerSpec, model_id: str, set_name: str, args, count_tokens
 ) -> dict:
     out: dict = {"set": set_name, "concurrency": [], "rates": []}
-    warm = build_prompts(set_name, args.warmup, count_tokens, seed=args.seed + 999)
+    warm = warmup_prompts(
+        set_name, args.warmup, count_tokens, args.seed, args.file_prompts
+    )
     if warm:
         run_load(
             address,
@@ -814,10 +934,14 @@ def measure_set(
 
     for concurrency in args.concurrency:
         count = max(args.min_requests, args.requests_per_slot * concurrency)
-        prompts = build_prompts(set_name, count, count_tokens, args.seed)
+        prompts = set_prompts(
+            set_name, count, count_tokens, args.seed, args.file_prompts
+        )
         out["concurrency"].append(one_run("concurrency", concurrency, prompts))
     for rate in args.rates:
-        prompts = build_prompts(set_name, args.rate_requests, count_tokens, args.seed)
+        prompts = set_prompts(
+            set_name, args.rate_requests, count_tokens, args.seed, args.file_prompts
+        )
         out["rates"].append(one_run("rate", rate, prompts))
     if out["rates"]:
         out["goodput_rps"] = goodput(
@@ -891,6 +1015,12 @@ def main() -> int:
     parser.add_argument("--model-id", default="qwen3-0.6b")
     parser.add_argument("--sets", default="shared-prefix,long")
     parser.add_argument(
+        "--prompts-file",
+        type=Path,
+        help=f"JSON or JSON Lines prompts for the {FILE_SET!r} set "
+        "(for example SiliconBench's agent split)",
+    )
+    parser.add_argument(
         "--concurrency",
         type=lambda t: [int(x) for x in floats(t)],
         default=[1, 2, 4, 8],
@@ -922,6 +1052,11 @@ def main() -> int:
     for name in sets:
         if name not in PROMPT_SETS:
             parser.error(f"unknown set {name!r}; choose from {', '.join(PROMPT_SETS)}")
+    if (FILE_SET in sets) != (args.prompts_file is not None):
+        parser.error(f"--prompts-file and the {FILE_SET!r} set go together")
+    args.file_prompts = (
+        load_prompts_file(args.prompts_file) if args.prompts_file else []
+    )
 
     count_tokens = tokenizer_counter(args.model_path)
     report = {
@@ -936,6 +1071,7 @@ def main() -> int:
         "model_path": str(args.model_path),
         "model_id": args.model_id,
         "max_tokens": args.max_tokens,
+        "prompts_file": file_identity(args.prompts_file),
         "slo": {
             "ttft_ms": args.slo_ttft_ms,
             "tpot_ms": args.slo_tpot_ms,

@@ -12,6 +12,7 @@ import json
 import pathlib
 import random
 import sys
+import tempfile
 import unittest
 
 SCRIPTS = pathlib.Path(__file__).parent
@@ -235,6 +236,95 @@ class Prompts(unittest.TestCase):
         self.assertEqual(path, "/v1/responses")
         self.assertEqual((body["instructions"], body["input"]), ("sys", "hi"))
         self.assertEqual(body["max_output_tokens"], 64)
+
+
+# Shaped like an entry of SiliconBench's prompts/agent_benchmark_prompts.json
+# (github.com/WindChimeRan/SiliconBench at 616aa51c): pre-baked tool turns with
+# empty assistant content, string arguments and a per-prompt output cap.
+AGENT_ENTRY = {
+    "name": "a000_vlong_bfcl_v3",
+    "description": "BFCL multi-turn",
+    "max_tokens": 256,
+    "messages": [
+        {"role": "system", "content": "You have tools."},
+        {"role": "user", "content": "Touch notes.txt."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_0_0",
+                    "type": "function",
+                    "function": {"name": "touch", "arguments": '{"file_name": "a"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_0_0", "content": '{"ok": true}'},
+        {"role": "user", "content": "Now list the directory."},
+    ],
+}
+
+
+class PromptsFile(unittest.TestCase):
+    def write(self, text: str) -> pathlib.Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "prompts.json"
+        path.write_text(text)
+        return path
+
+    def test_json_array_and_json_lines_load_in_file_order(self) -> None:
+        plain = {"name": "p1", "system": "s", "user": "u"}
+        for text in (
+            json.dumps([AGENT_ENTRY, plain]),
+            json.dumps(AGENT_ENTRY) + "\n\n" + json.dumps(plain) + "\n",
+        ):
+            prompts = bench_load.load_prompts_file(self.write(text))
+            self.assertEqual([p.label for p in prompts], ["a000_vlong_bfcl_v3", "p1"])
+            self.assertEqual(prompts[0].max_tokens, 256)
+            self.assertEqual(len(prompts[0].messages), 5)
+            self.assertEqual((prompts[1].system, prompts[1].user), ("s", "u"))
+            self.assertIsNone(prompts[1].messages)
+
+    def test_bad_entries_are_rejected(self) -> None:
+        for entry in ({"name": "x"}, {"user": "u", "max_tokens": 0}):
+            with self.assertRaises(ValueError):
+                bench_load.load_prompts_file(self.write(json.dumps([entry])))
+        with self.assertRaises(ValueError):
+            bench_load.load_prompts_file(self.write("[]"))
+
+    def test_chat_sends_recorded_messages_with_the_prompt_cap(self) -> None:
+        prompt = bench_load.load_prompts_file(self.write(json.dumps([AGENT_ENTRY])))[0]
+        path, body = bench_load.request_body("chat", "m", prompt, 128, {})
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual(body["messages"], AGENT_ENTRY["messages"])
+        self.assertEqual(body["max_tokens"], 256)
+
+    def test_responses_turns_tool_calls_into_items(self) -> None:
+        prompt = bench_load.load_prompts_file(self.write(json.dumps([AGENT_ENTRY])))[0]
+        path, body = bench_load.request_body("responses", "m", prompt, 128, {})
+        self.assertEqual(path, "/v1/responses")
+        self.assertNotIn("instructions", body)
+        self.assertEqual(body["max_output_tokens"], 256)
+        self.assertEqual(
+            [item["type"] for item in body["input"]],
+            ["message", "message", "function_call", "function_call_output", "message"],
+        )
+        call, output = body["input"][2], body["input"][3]
+        self.assertEqual(
+            (call["call_id"], call["name"], call["arguments"]),
+            ("call_0_0", "touch", '{"file_name": "a"}'),
+        )
+        self.assertEqual(
+            (output["call_id"], output["output"]), ("call_0_0", '{"ok": true}')
+        )
+
+    def test_cells_wrap_and_warmup_comes_from_the_tail(self) -> None:
+        prompts = [bench_load.Prompt(f"p{i}", None, str(i)) for i in range(4)]
+        cell = bench_load.set_prompts("file", 6, None, 0, prompts)
+        self.assertEqual([p.label for p in cell], ["p0", "p1", "p2", "p3", "p0", "p1"])
+        warm = bench_load.warmup_prompts("file", 2, None, 0, prompts)
+        self.assertEqual([p.label for p in warm], ["p3", "p2"])
 
 
 if __name__ == "__main__":
