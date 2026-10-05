@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "source": {
+    "model_id": "google/gemma-4-12B-it",
+    "revision": "707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+    "field": "chat_template.jinja",
+    "template_sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+    "bos_token": "<bos>",
+    "eos_token": "<eos>"
+  }
+}

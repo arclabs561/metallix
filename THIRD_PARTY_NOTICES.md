@@ -18,6 +18,18 @@ in `crates/models/qwen/src/forward.rs` is a parser-test layout, not a tracked
 upstream config file. These Qwen-derived compatibility records are covered by
 the Apache-2.0 notice and license copy above.
 
+`fixtures/gemma-4-12b/chat-template.jinja` reproduces `chat_template.jinja`
+from google/gemma-4-12B-it revision `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7`
+for local compatibility tests. It is provided under the Apache License 2.0;
+a copy is in `third_party/LICENSE-APACHE-2.0.txt`, and the
+[model card](https://huggingface.co/google/gemma-4-12B-it/blob/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7/README.md)
+identifies the license and Google DeepMind as the author.
+`fixtures/gemma-4-12b/reference.json` holds small numerical observations
+generated locally from that checkpoint by `scripts/gemma4-reference.py`:
+input IDs, rendered prompts, top-8 logits and hashes of the local config,
+tokenizer and weights. It contains no copied config, tokenizer payload,
+checkpoint or full-logit sidecar.
+
 `crates/models/julia/src/encoder.rs`,
 `scripts/julia_encoder_reference.py`, and
 `fixtures/julia-1/encoder-reference.json`, plus the test-private prefix
