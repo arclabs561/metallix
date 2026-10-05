@@ -3,6 +3,8 @@
 //! This implements the pinned per-group FP8 equation in FP32. It is not a
 //! checkpoint decoder or a `TileLang`, CUDA, Tensor Core, or BF16-output oracle.
 
+use std::sync::LazyLock;
+
 use thiserror::Error;
 
 use super::{ActivationGroup, decode_e4m3fn, decode_e8m0};
@@ -119,15 +121,22 @@ pub fn fp8_linear_runtime_f32(
 
     // Compute once into scratch and copy on success, so an overflow partway
     // through still leaves `output` unchanged.
+    let table = &*E4M3FN;
     let mut scratch = vec![0.0_f32; output.len()];
-    for row in 0..shape.rows {
+    let mut activations = vec![0.0_f32; shape.reduction];
+    for (row, codes) in activation_codes.chunks_exact(shape.reduction).enumerate() {
+        // Decode the row once; every output column reuses it.
+        for (value, &code) in activations.iter_mut().zip(codes) {
+            *value = table[usize::from(code)];
+        }
         let destination = &mut scratch[row * shape.outputs..(row + 1) * shape.outputs];
         for (column, slot) in destination.iter_mut().enumerate() {
             *slot = shape.compute(
-                activation_codes,
+                &activations,
                 activation_scales,
                 weight_codes,
                 weight_scales,
+                table,
                 row,
                 column,
             )?;
@@ -136,6 +145,16 @@ pub fn fp8_linear_runtime_f32(
     output.copy_from_slice(&scratch);
     Ok(())
 }
+
+/// [`decode_e4m3fn`] for every code, so the inner product loads a value
+/// instead of branching on the code.
+static E4M3FN: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    let mut table = [0.0; 256];
+    for (value, code) in table.iter_mut().zip(0_u8..=255) {
+        *value = decode_e4m3fn(code);
+    }
+    table
+});
 
 #[derive(Clone, Copy)]
 struct LinearShape {
@@ -208,22 +227,32 @@ impl LinearShape {
         check_length("output", self.rows.checked_mul(self.outputs), output.len())
     }
 
+    /// One output from row `row`'s decoded `activations`, summing each group's
+    /// products in reduction order and the scaled groups in group order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each buffer role stays explicit, as in fp8_linear_runtime_f32"
+    )]
     fn compute(
         self,
-        activation_codes: &[u8],
+        activations: &[f32],
         activation_scales: &[u8],
         weight_codes: &[u8],
         weight_scales: &[u8],
+        table: &[f32; 256],
         row: usize,
         column: usize,
     ) -> Result<f32, Fp8LinearError> {
+        let weights = &weight_codes[column * self.reduction..(column + 1) * self.reduction];
         let mut accumulated = 0.0_f32;
-        for group in 0..self.activation_scales_per_row {
-            let start = group * self.activation_group;
+        for (group, (activations, weights)) in activations
+            .chunks_exact(self.activation_group)
+            .zip(weights.chunks_exact(self.activation_group))
+            .enumerate()
+        {
             let mut dot = 0.0_f32;
-            for offset in 0..self.activation_group {
-                dot += decode_e4m3fn(activation_codes[row * self.reduction + start + offset])
-                    * decode_e4m3fn(weight_codes[column * self.reduction + start + offset]);
+            for (&activation, &weight) in activations.iter().zip(weights) {
+                dot += activation * table[usize::from(weight)];
             }
             let activation_scale =
                 decode_e8m0(activation_scales[row * self.activation_scales_per_row + group]);
@@ -272,13 +301,14 @@ fn validate_codes(
     weight_codes: &[u8],
     weight_scales: &[u8],
 ) -> Result<(), Fp8LinearError> {
+    let table = &*E4M3FN;
     for (element, &code) in activation_codes.iter().enumerate() {
-        if !decode_e4m3fn(code).is_finite() {
+        if !table[usize::from(code)].is_finite() {
             return Err(Fp8LinearError::NonFiniteActivation { element });
         }
     }
     for (element, &code) in weight_codes.iter().enumerate() {
-        if !decode_e4m3fn(code).is_finite() {
+        if !table[usize::from(code)].is_finite() {
             return Err(Fp8LinearError::NonFiniteWeight { element });
         }
     }
@@ -297,10 +327,103 @@ fn validate_codes(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivationGroup, Fp8LinearError, fp8_linear_runtime_f32};
+    use super::{
+        ActivationGroup, E4M3FN, Fp8LinearError, decode_e4m3fn, decode_e8m0, fp8_linear_runtime_f32,
+    };
 
     const ONE: u8 = 0x38;
     const NEG_ONE: u8 = 0xb8;
+
+    #[test]
+    fn e4m3fn_table_matches_the_decoder_for_every_code() {
+        for code in 0_u8..=255 {
+            assert_eq!(
+                E4M3FN[usize::from(code)].to_bits(),
+                decode_e4m3fn(code).to_bits(),
+                "code {code:#04x}"
+            );
+        }
+    }
+
+    /// The equation as written: decode both codes per product, sum each group
+    /// in reduction order, then the scaled groups in group order.
+    fn per_product_decode(
+        activations: &[u8],
+        activation_scales: &[u8],
+        weights: &[u8],
+        weight_scales: &[u8],
+        (rows, reduction, outputs, group): (usize, usize, usize, usize),
+    ) -> Vec<f32> {
+        let groups = reduction / group;
+        let mut output = Vec::with_capacity(rows * outputs);
+        for row in 0..rows {
+            for column in 0..outputs {
+                let mut accumulated = 0.0_f32;
+                for g in 0..groups {
+                    let mut dot = 0.0_f32;
+                    for k in g * group..(g + 1) * group {
+                        dot += decode_e4m3fn(activations[row * reduction + k])
+                            * decode_e4m3fn(weights[column * reduction + k]);
+                    }
+                    accumulated += dot
+                        * decode_e8m0(activation_scales[row * groups + g])
+                        * decode_e8m0(weight_scales[(column / group) * groups + g]);
+                }
+                output.push(accumulated);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn matches_per_product_decoding_bit_for_bit() {
+        // Every finite code, signs and subnormals included, in a fixed
+        // shuffled stream; sums of mixed signs make the order observable.
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let code = state.to_le_bytes()[0];
+            if code & 0x7f == 0x7f { code ^ 1 } else { code }
+        };
+        for (group, rows, reduction, outputs) in [
+            (ActivationGroup::Elements32, 3, 256, 70),
+            (ActivationGroup::Elements128, 2, 384, 130),
+        ] {
+            let g = group.elements();
+            let groups = reduction / g;
+            let activations: Vec<u8> = (0..rows * reduction).map(|_| next()).collect();
+            let weights: Vec<u8> = (0..outputs * reduction).map(|_| next()).collect();
+            let activation_scales: Vec<u8> = (0..rows * groups).map(|_| 120 + next() % 8).collect();
+            let weight_scales: Vec<u8> = (0..outputs.div_ceil(g) * groups)
+                .map(|_| 120 + next() % 8)
+                .collect();
+            let mut output = vec![0.0_f32; rows * outputs];
+            fp8_linear_runtime_f32(
+                &activations,
+                &activation_scales,
+                &weights,
+                &weight_scales,
+                rows,
+                reduction,
+                outputs,
+                group,
+                &mut output,
+            )
+            .expect("finite");
+            assert_bits_eq(
+                &output,
+                &per_product_decode(
+                    &activations,
+                    &activation_scales,
+                    &weights,
+                    &weight_scales,
+                    (rows, reduction, outputs, g),
+                ),
+            );
+        }
+    }
 
     fn assert_bits_eq(actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len());

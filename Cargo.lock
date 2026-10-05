@@ -153,6 +153,7 @@ dependencies = [
 name = "blockfloat"
 version = "0.1.0"
 dependencies = [
+ "divan",
  "serde_json",
  "thiserror",
 ]

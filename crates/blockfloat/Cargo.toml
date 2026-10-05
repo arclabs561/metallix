@@ -10,7 +10,12 @@ publish = false
 thiserror.workspace = true
 
 [dev-dependencies]
+divan = "0.1"
 serde_json.workspace = true
+
+[[bench]]
+name = "fp8_linear"
+harness = false
 
 [lints]
 workspace = true
