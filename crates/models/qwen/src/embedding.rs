@@ -18,6 +18,46 @@ pub const QWEN3_EMBEDDING_MIN_DIMENSIONS: usize = 32;
 pub const QWEN3_EMBEDDING_WEB_SEARCH_TASK: &str =
     "Given a web search query, retrieve relevant passages that answer the query";
 
+/// Most tokens a right-padded batch may run per real token before its
+/// sequences are split into separate length groups.
+///
+/// Measured on Qwen3-Embedding-0.6B (Apple M3 Max, float32): 16 equal short
+/// inputs ran about 7 times faster as one batch than one at a time, while a
+/// 16-input mix padded to 9.4 times its real tokens ran about 2 times slower.
+pub const EMBEDDING_BATCH_PADDING_RATIO: f64 = 1.25;
+
+/// Groups sequence indices by length, shortest first, so that each group
+/// padded to its longest member runs at most `max_ratio` times its real tokens.
+///
+/// Every index appears in exactly one group. A single sequence always forms a
+/// group, so the bound never splits below one sequence.
+#[must_use]
+pub fn padding_groups(lengths: &[usize], max_ratio: f64) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&index| lengths[index]);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut real = 0_usize;
+    for index in order {
+        let length = lengths[index];
+        if let Some(group) = groups.last_mut() {
+            // Sorted ascending, so `length` is the group's new longest member.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "token counts are far below 2^52"
+            )]
+            let fits = ((group.len() + 1) * length) as f64 <= max_ratio * (real + length) as f64;
+            if fits {
+                group.push(index);
+                real += length;
+                continue;
+            }
+        }
+        groups.push(vec![index]);
+        real = length;
+    }
+    groups
+}
+
 /// Formats a query with its task instruction, exactly as the model card does.
 ///
 /// There is no space after `Query:`. Documents take no instruction.
@@ -251,8 +291,34 @@ mod tests {
     use super::{
         PPLX_CONTEXT_SEPARATOR_ID, QWEN3_EMBEDDING_EOS_ID, QWEN3_EMBEDDING_WEB_SEARCH_TASK,
         Qwen3EmbeddingError, check_embedding_input, join_context_chunks, mean_pool_context_chunks,
-        normalize_embedding, quantize_binary, quantize_int8_tanh, qwen3_embedding_query,
+        normalize_embedding, padding_groups, quantize_binary, quantize_int8_tanh,
+        qwen3_embedding_query,
     };
+
+    #[test]
+    fn padding_groups_bound_padded_tokens_and_cover_every_index() {
+        // Equal lengths pad nothing, so they share one group.
+        assert_eq!(padding_groups(&[8, 8, 8], 1.25), [vec![0, 1, 2]]);
+        // A long outlier gets its own group instead of padding the short ones.
+        assert_eq!(
+            padding_groups(&[400, 10, 12, 11], 1.25),
+            [vec![1, 3, 2], vec![0]]
+        );
+        assert_eq!(padding_groups(&[5], 1.0), [vec![0]]);
+        assert!(padding_groups(&[], 1.25).is_empty());
+        let lengths = [27, 393, 5, 40, 41, 300, 7, 7, 120, 3];
+        let groups = padding_groups(&lengths, 1.25);
+        let mut covered: Vec<usize> = groups.iter().flatten().copied().collect();
+        covered.sort_unstable();
+        assert_eq!(covered, (0..lengths.len()).collect::<Vec<_>>());
+        for group in &groups {
+            let longest = group.iter().map(|&i| lengths[i]).max().unwrap();
+            let real: usize = group.iter().map(|&i| lengths[i]).sum();
+            #[allow(clippy::cast_precision_loss, reason = "small test counts")]
+            let ratio = (longest * group.len()) as f64 / real as f64;
+            assert!(ratio <= 1.25, "{group:?} pads {ratio}");
+        }
+    }
 
     #[test]
     fn joins_chunks_with_the_separator_and_refuses_one_inside_a_chunk() {

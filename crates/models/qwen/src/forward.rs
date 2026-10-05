@@ -481,6 +481,85 @@ fn last_normalized_hidden<S: BuildHasher>(
     )
 }
 
+/// Smallest padded length for a batch of more than one sequence; see
+/// [`forward_last_hidden_batch`].
+///
+/// Workaround for MLX 0.25 (mlx-sys 0.2.0): its attention returns wrong rows
+/// for causal batches of two or more sequences with 2 to 8 positions.
+/// `tests/mlx_short_batch_attention.rs` asserts that bug and fails once an MLX
+/// upgrade (the planned mlx-rs 0.32) fixes it; then remove this padding and
+/// confirm with the opt-in `tests/embedding_batch.rs`.
+const MIN_BATCHED_POSITIONS: usize = 9;
+
+/// Last-position final-norm hidden states for several sequences in one
+/// forward pass, one `hidden_size` row per sequence, in input order.
+///
+/// Sequences are right-padded to the longest. Under causal attention a
+/// position never attends to later positions, so padding after a sequence
+/// cannot change its real positions, and each row is read at that sequence's
+/// own last token. Bidirectional attention would need a padding mask, so it is
+/// refused.
+pub fn forward_last_hidden_batch<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    sequences: &[&[i32]],
+) -> Result<Vec<Vec<f32>>, Qwen3ForwardError> {
+    if config.attention != Qwen3Attention::Causal {
+        return Err(Qwen3ForwardError::BatchedBidirectional);
+    }
+    let longest = sequences
+        .iter()
+        .map(|ids| ids.len())
+        .max()
+        .ok_or(Qwen3ForwardError::EmptyInput)?;
+    // MLX 0.25's short-query attention path returns wrong rows for causal
+    // batches of more than one sequence padded to 8 or fewer positions (seen on
+    // Qwen3-Embedding-0.6B: cosine near 0 against single passes; 9 positions
+    // match). Extra trailing padding is harmless under causal attention.
+    let longest = if sequences.len() > 1 {
+        longest.max(MIN_BATCHED_POSITIONS)
+    } else {
+        longest
+    };
+    let mut padded = Vec::with_capacity(sequences.len() * longest);
+    let mut last_rows = Vec::with_capacity(sequences.len());
+    for (index, ids) in sequences.iter().enumerate() {
+        validate_input_ids(config, ids, 0, config.maximum_cached_tokens())?;
+        padded.extend_from_slice(ids);
+        // Any valid ID works as padding; repeating the last one keeps it in range.
+        padded.extend(std::iter::repeat_n(ids[ids.len() - 1], longest - ids.len()));
+        last_rows.push(as_i32(index * longest + ids.len() - 1)?);
+    }
+    let stream = StreamOrDevice::gpu();
+    let batch = as_i32(sequences.len())?;
+    let seq_len = as_i32(longest)?;
+    let hidden = as_i32(config.hidden_size)?;
+    let rows = batch
+        .checked_mul(seq_len)
+        .ok_or(Qwen3ForwardError::ShapeOverflow)?;
+    let mut hidden_states = weight(weights, "model.embed_tokens.weight")?
+        .take_axis_device(Array::from_slice(&padded, &[rows]), 0, &stream)?
+        .reshape_device(&[batch, seq_len, hidden], &stream)?;
+    for layer in 0..config.hidden_layers {
+        hidden_states = forward_layer(config, weights, layer, &hidden_states)?;
+    }
+    let last = hidden_states
+        .reshape_device(&[rows, hidden], &stream)?
+        .take_axis_device(Array::from_slice(&last_rows, &[batch]), 0, &stream)?;
+    let normalized = rms_norm(
+        &last,
+        weight(weights, "model.norm.weight")?,
+        config.rms_norm_eps,
+    )?
+    .as_type_device::<f32>(&stream)?;
+    normalized.eval()?;
+    Ok(normalized
+        .as_slice::<f32>()
+        .chunks_exact(config.hidden_size)
+        .map(<[f32]>::to_vec)
+        .collect())
+}
+
 /// The residual stream after every decoder layer, `[1, positions, hidden]`.
 fn decoder_states<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
@@ -515,8 +594,9 @@ fn decoder_states<S: BuildHasher>(
 ///
 /// This is intentionally crate-private: selected-layer diagnostics borrow it
 /// while retaining the same bounded, uncached attention contract as
-/// [`forward_last_logits`]. Callers must provide a residual stream with shape
-/// `[1, sequence, hidden_size]`; it is not a general batched-layer API.
+/// [`forward_last_logits`]. Callers provide a residual stream with shape
+/// `[batch, sequence, hidden_size]`; a batch shares one sequence length and one
+/// attention mode, so only right-padded causal batches are exact.
 pub(crate) fn forward_layer<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
@@ -524,6 +604,7 @@ pub(crate) fn forward_layer<S: BuildHasher>(
     hidden_states: &Array,
 ) -> Result<Array, Qwen3ForwardError> {
     let seq_len = validate_layer_input(config, layer, hidden_states)?;
+    let batch = hidden_states.shape()[0];
     let stream = StreamOrDevice::gpu();
     let hidden = as_i32(config.hidden_size)?;
     let intermediate = as_i32(config.intermediate_size)?;
@@ -533,7 +614,7 @@ pub(crate) fn forward_layer<S: BuildHasher>(
         weight(weights, &format!("{base}.input_layernorm.weight"))?,
         config.rms_norm_eps,
     )?;
-    let attention = attention(config, weights, &base, &attention_input, seq_len)?;
+    let attention = attention(config, weights, &base, &attention_input, batch, seq_len)?;
     let residual = hidden_states.add_device(&attention, &stream)?;
 
     let mlp_input = rms_norm(
@@ -545,18 +626,18 @@ pub(crate) fn forward_layer<S: BuildHasher>(
         &mlp_input,
         weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
     )?
-    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    .reshape_device(&[batch, seq_len, intermediate], &stream)?;
     let up = linear(
         &mlp_input,
         weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
     )?
-    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    .reshape_device(&[batch, seq_len, intermediate], &stream)?;
     let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
     let mlp = linear(
         &activated.multiply_device(&up, &stream)?,
         weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
     )?
-    .reshape_device(&[1, seq_len, hidden], &stream)?;
+    .reshape_device(&[batch, seq_len, hidden], &stream)?;
     residual.add_device(&mlp, &stream).map_err(Into::into)
 }
 
@@ -1244,7 +1325,7 @@ fn validate_layer_input(
             hidden_size: config.hidden_size,
         });
     };
-    if shape.len() != 3 || shape[0] != 1 || shape[2] != expected_hidden || seq_len <= 0 {
+    if shape.len() != 3 || shape[0] <= 0 || shape[2] != expected_hidden || seq_len <= 0 {
         return Err(Qwen3ForwardError::InvalidLayerInputShape {
             actual: shape.to_vec(),
             hidden_size: config.hidden_size,
@@ -1297,6 +1378,7 @@ fn attention<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     base: &str,
     input: &Array,
+    batch: i32,
     seq_len: i32,
 ) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
@@ -1305,11 +1387,11 @@ fn attention<S: BuildHasher>(
     let head_dim = as_i32(config.head_dim)?;
     let attn = format!("{base}.self_attn");
     let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, heads, head_dim], &stream)?;
+        .reshape_device(&[batch, seq_len, heads, head_dim], &stream)?;
     let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
+        .reshape_device(&[batch, seq_len, kv_heads, head_dim], &stream)?;
     let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
+        .reshape_device(&[batch, seq_len, kv_heads, head_dim], &stream)?;
 
     // Qwen3 normalizes Q and K per head, then applies nontraditional RoPE.
     let query = rms_norm(
@@ -1360,7 +1442,7 @@ fn attention<S: BuildHasher>(
     .transpose_axes_device(&[0, 2, 1, 3], &stream)?
     .reshape_device(
         &[
-            1,
+            batch,
             seq_len,
             heads
                 .checked_mul(head_dim)
@@ -1631,6 +1713,9 @@ pub enum Qwen3ForwardError {
     /// The KV-cache executor only supports causal attention.
     #[error("the Qwen3 KV-cache executor requires causal attention")]
     CachedBidirectional,
+    /// Right-padded batches are exact only under causal attention.
+    #[error("batched Qwen3 forward requires causal attention")]
+    BatchedBidirectional,
     /// The configuration selected a non-Qwen3 architecture, or its attention
     /// flag disagrees with its model type.
     #[error(
@@ -1696,7 +1781,7 @@ pub enum Qwen3ForwardError {
     },
     /// A selected-layer diagnostic did not receive one residual stream.
     #[error(
-        "Qwen3 layer input shape {actual:?} must be [1, sequence, {hidden_size}] with positive sequence"
+        "Qwen3 layer input shape {actual:?} must be [batch, sequence, {hidden_size}] with positive batch and sequence"
     )]
     InvalidLayerInputShape {
         /// Actual MLX array shape.
@@ -1760,7 +1845,7 @@ mod tests {
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
         Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
-        forward_hidden_states, forward_last_hidden, forward_last_logits,
+        forward_hidden_states, forward_last_hidden, forward_last_hidden_batch, forward_last_logits,
         forward_last_logits_with_residual_steering, forward_layer, linear, read_last_logits,
         rms_norm, stepped_capacity, weight,
     };
@@ -2550,6 +2635,42 @@ mod tests {
         for (left, right) in all[8..].iter().zip(&last) {
             assert!((left - right).abs() <= 1e-6, "{left} vs {right}");
         }
+    }
+
+    #[test]
+    fn batched_last_hidden_matches_each_sequence_run_alone() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = small_dense_config();
+        let weights = deterministic_weights();
+        // Different lengths, so the shorter rows are padded and must be read
+        // at their own last token, not the batch's last position.
+        let sequences: [&[i32]; 3] = [&[1, 2, 3], &[4], &[5, 6, 7, 1, 2]];
+        let batched =
+            forward_last_hidden_batch(&weights, &config, &sequences).expect("batched rows");
+        assert_eq!(batched.len(), sequences.len());
+        for (ids, row) in sequences.iter().zip(&batched) {
+            let alone = forward_last_hidden(&weights, &config, ids).expect("single row");
+            assert_eq!(row.len(), alone.len());
+            for (left, right) in row.iter().zip(&alone) {
+                assert!((left - right).abs() <= 1e-6, "{ids:?}: {left} vs {right}");
+            }
+        }
+        assert!(matches!(
+            forward_last_hidden_batch(&weights, &bidirectional_config(), &sequences),
+            Err(Qwen3ForwardError::BatchedBidirectional)
+        ));
+        assert!(matches!(
+            forward_last_hidden_batch(&weights, &config, &[]),
+            Err(Qwen3ForwardError::EmptyInput)
+        ));
+        assert!(matches!(
+            forward_last_hidden_batch(&weights, &config, &[&[1], &[]]),
+            Err(Qwen3ForwardError::EmptyInput)
+        ));
+        assert!(matches!(
+            forward_last_hidden_batch(&weights, &config, &[&[1], &[8]]),
+            Err(Qwen3ForwardError::InvalidTokenId { token_id: 8, .. })
+        ));
     }
 
     #[test]

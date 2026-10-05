@@ -251,6 +251,43 @@ impl Qwen3MlxWeights {
         crate::embedding::normalize_embedding(&hidden, dimensions)
     }
 
+    /// [`Self::embed`] for several sequences, returning one vector per
+    /// sequence in input order. Sequences of similar length share one
+    /// right-padded forward pass; see
+    /// [`crate::embedding::EMBEDDING_BATCH_PADDING_RATIO`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::embedding::Qwen3EmbeddingError`] as [`Self::embed`]
+    /// does, for the first sequence that fails.
+    pub fn embed_batch(
+        &self,
+        sequences: &[&[i32]],
+        dimensions: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, crate::embedding::Qwen3EmbeddingError> {
+        self.require_attention(crate::Qwen3Attention::Causal)?;
+        for input_ids in sequences {
+            crate::embedding::check_embedding_input(input_ids)?;
+        }
+        let lengths: Vec<usize> = sequences.iter().map(|ids| ids.len()).collect();
+        let mut vectors = vec![Vec::new(); sequences.len()];
+        for group in crate::embedding::padding_groups(
+            &lengths,
+            crate::embedding::EMBEDDING_BATCH_PADDING_RATIO,
+        ) {
+            let members: Vec<&[i32]> = group.iter().map(|&index| sequences[index]).collect();
+            let hidden = crate::forward::forward_last_hidden_batch(
+                &self.tensors,
+                &self.forward_config,
+                &members,
+            )?;
+            for (index, row) in group.into_iter().zip(hidden) {
+                vectors[index] = crate::embedding::normalize_embedding(&row, dimensions)?;
+            }
+        }
+        Ok(vectors)
+    }
+
     /// Embeds each chunk of one pplx-embed-context document, encoded from
     /// [`crate::embedding::join_context_chunks`]: the mean of its final-norm
     /// hidden states under bidirectional attention, one float vector per chunk.
