@@ -26,6 +26,7 @@ mod read;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3CheckpointInspection {
     contract: Qwen3TextContract,
+    naming: Qwen3TensorNaming,
     tensor_count: usize,
     tensor_bytes: u64,
     shards: Vec<PathBuf>,
@@ -73,15 +74,25 @@ impl Qwen3CheckpointInspection {
 
         let shards = discover_shards(model_dir)?;
 
+        let headers = shards
+            .iter()
+            .map(|shard| read_validated_shard(shard))
+            .collect::<Result<Vec<_>, _>>()?;
+        let naming = Qwen3TensorNaming::detect(
+            headers
+                .iter()
+                .flat_map(|header| header.tensors.iter().map(|(name, _)| name.as_str())),
+        )?;
+
         let mut tensors = BTreeMap::new();
         let mut tensor_count = 0_usize;
         let mut tensor_bytes = 0_u64;
-        for shard in &shards {
-            let header = read_validated_shard(shard)?;
+        for (shard, header) in shards.iter().zip(headers) {
             for (name, tensor) in header.tensors {
                 if name.trim().is_empty() {
                     return Err(Qwen3CheckpointError::BlankTensorName(shard.clone()));
                 }
+                let name = naming.canonical_name(&name);
                 let byte_length = tensor.byte_length;
                 if tensors
                     .insert(
@@ -122,11 +133,21 @@ impl Qwen3CheckpointInspection {
 
         Ok(Self {
             contract,
+            naming,
             tensor_count,
             tensor_bytes,
             shards,
             tensors,
         })
+    }
+
+    /// Returns how the checkpoint names its tensors on disk.
+    ///
+    /// Inspection and loading key every tensor by its canonical
+    /// `model.`-prefixed name regardless of this naming.
+    #[must_use]
+    pub const fn tensor_naming(&self) -> Qwen3TensorNaming {
+        self.naming
     }
 
     /// Returns the configuration contract validated for this checkpoint.
@@ -172,6 +193,50 @@ impl Qwen3CheckpointInspection {
             });
         }
         Ok(location.range.byte_length)
+    }
+}
+
+/// How a checkpoint names its decoder tensors on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen3TensorNaming {
+    /// `model.`-prefixed names, as saved from `Qwen3ForCausalLM`.
+    Prefixed,
+    /// Bare names, as saved from `Qwen3Model` (for example Qwen3-Embedding).
+    Bare,
+}
+
+impl Qwen3TensorNaming {
+    /// Detects the naming from a checkpoint's token-embedding tensor name.
+    ///
+    /// A checkpoint with neither embedding name is treated as prefixed, so
+    /// required-tensor validation reports the missing canonical name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen3CheckpointError::AmbiguousTensorNaming`] when both
+    /// `embed_tokens.weight` and `model.embed_tokens.weight` are present.
+    pub fn detect<'a>(
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, Qwen3CheckpointError> {
+        let (mut bare, mut prefixed) = (false, false);
+        for name in names {
+            bare |= name == "embed_tokens.weight";
+            prefixed |= name == "model.embed_tokens.weight";
+        }
+        match (bare, prefixed) {
+            (true, true) => Err(Qwen3CheckpointError::AmbiguousTensorNaming),
+            (true, false) => Ok(Self::Bare),
+            (false, _) => Ok(Self::Prefixed),
+        }
+    }
+
+    /// Returns the canonical `model.`-prefixed name for an on-disk name.
+    #[must_use]
+    pub fn canonical_name(self, name: &str) -> String {
+        match self {
+            Self::Prefixed => name.to_owned(),
+            Self::Bare => format!("model.{name}"),
+        }
     }
 }
 
@@ -762,6 +827,9 @@ pub enum Qwen3CheckpointError {
     /// A safetensors-named entry did not resolve to a regular file.
     #[error("safetensors shard target is not a regular file: {0}")]
     NonRegularShard(PathBuf),
+    /// Both bare and `model.`-prefixed token-embedding names are present.
+    #[error("checkpoint mixes bare and model.-prefixed tensor names")]
+    AmbiguousTensorNaming,
     /// The model root contained no regular safetensors shard.
     #[error("Qwen3 model directory has no safetensors shards: {0}")]
     NoSafetensors(PathBuf),

@@ -1,6 +1,7 @@
 //! Qwen3 text-model execution-contract parsing and validation.
 
 pub mod checkpoint;
+pub mod embedding;
 #[cfg(feature = "metal")]
 pub mod forward;
 #[cfg(feature = "metal")]

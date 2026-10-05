@@ -230,6 +230,26 @@ impl Qwen3MlxWeights {
         crate::forward::forward_last_logits(&self.tensors, &self.forward_config, input_ids)
     }
 
+    /// Embeds one sequence encoded with the tokenizer's special-token template:
+    /// the final-norm hidden state at its last position (the appended
+    /// `<|endoftext|>`), truncated to `dimensions` if given, then L2-normalized.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::embedding::Qwen3EmbeddingError`] when the IDs lack the
+    /// appended `<|endoftext|>`, the dimension is unsupported, or the forward
+    /// pass fails.
+    pub fn embed(
+        &self,
+        input_ids: &[i32],
+        dimensions: Option<usize>,
+    ) -> Result<Vec<f32>, crate::embedding::Qwen3EmbeddingError> {
+        crate::embedding::check_embedding_input(input_ids)?;
+        let hidden =
+            crate::forward::forward_last_hidden(&self.tensors, &self.forward_config, input_ids)?;
+        crate::embedding::normalize_embedding(&hidden, dimensions)
+    }
+
     /// Loads all validated safetensors shards as MLX arrays for Metal execution.
     ///
     /// The checkpoint headers are validated before payload loading. The token
@@ -256,7 +276,14 @@ impl Qwen3MlxWeights {
             // MLX safetensors I/O is defined on the CPU stream. Subsequent
             // graph operations choose the GPU stream explicitly.
             let shard_tensors = Array::load_safetensors_device(shard, StreamOrDevice::cpu())?;
-            tensors.extend(shard_tensors);
+            // Inspection keyed tensors by canonical name; the loaded map must
+            // agree so forward code sees one naming for every checkpoint.
+            let naming = inspection.tensor_naming();
+            tensors.extend(
+                shard_tensors
+                    .into_iter()
+                    .map(|(name, tensor)| (naming.canonical_name(&name), tensor)),
+            );
         }
 
         if tensors.len() != inspection.tensor_count() {
@@ -583,6 +610,84 @@ mod tests {
         assert!(matches!(
             validate_token_ids(&[], 151_936),
             Err(Qwen3MetalLoadError::EmptyInputIds)
+        ));
+    }
+
+    /// Writes a one-layer BF16 checkpoint whose names carry `prefix`.
+    fn write_tiny_checkpoint(dir: &std::path::Path, prefix: &str) {
+        std::fs::create_dir_all(dir).expect("checkpoint dir");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":4,"intermediate_size":8,"vocab_size":8,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":4,"max_position_embeddings":16,"rms_norm_eps":0.000001,"rope_theta":1000000,"hidden_act":"silu","tie_word_embeddings":true,"attention_bias":false,"mlp_bias":false}"#,
+        )
+        .expect("config");
+        let layer = "layers.0";
+        let tensors: Vec<(String, Vec<i64>)> = [
+            ("embed_tokens.weight".to_owned(), vec![8, 4]),
+            ("norm.weight".to_owned(), vec![4]),
+            (format!("{layer}.input_layernorm.weight"), vec![4]),
+            (format!("{layer}.post_attention_layernorm.weight"), vec![4]),
+            (format!("{layer}.self_attn.q_norm.weight"), vec![4]),
+            (format!("{layer}.self_attn.k_norm.weight"), vec![4]),
+            (format!("{layer}.self_attn.q_proj.weight"), vec![8, 4]),
+            (format!("{layer}.self_attn.k_proj.weight"), vec![4, 4]),
+            (format!("{layer}.self_attn.v_proj.weight"), vec![4, 4]),
+            (format!("{layer}.self_attn.o_proj.weight"), vec![4, 8]),
+            (format!("{layer}.mlp.gate_proj.weight"), vec![8, 4]),
+            (format!("{layer}.mlp.up_proj.weight"), vec![8, 4]),
+            (format!("{layer}.mlp.down_proj.weight"), vec![4, 8]),
+        ]
+        .into();
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (name, shape) in tensors {
+            let count = usize::try_from(shape.iter().product::<i64>()).expect("small");
+            let start = payload.len();
+            for index in 0..count {
+                // Multiples of 1/16 are exact in BF16.
+                let value = f32::from(u8::try_from(index % 11).expect("small") + 1) / 16.0;
+                payload.extend_from_slice(
+                    &u16::try_from(value.to_bits() >> 16)
+                        .expect("bf16")
+                        .to_le_bytes(),
+                );
+            }
+            header.insert(
+                format!("{prefix}{name}"),
+                serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[start, payload.len()]}),
+            );
+        }
+        let header = serde_json::to_vec(&header).expect("header");
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.extend(payload);
+        std::fs::write(dir.join("model.safetensors"), bytes).expect("shard");
+    }
+
+    #[test]
+    fn bare_and_prefixed_checkpoints_load_to_the_same_decoder() {
+        let _guard = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let root =
+            std::env::temp_dir().join(format!("metallix-qwen-naming-{}", std::process::id()));
+        write_tiny_checkpoint(&root.join("prefixed"), "model.");
+        write_tiny_checkpoint(&root.join("bare"), "");
+        let prefixed = super::Qwen3MlxWeights::load(root.join("prefixed")).expect("prefixed load");
+        let bare = super::Qwen3MlxWeights::load(root.join("bare")).expect("bare load");
+        std::fs::remove_dir_all(&root).expect("remove fixture");
+
+        let ids = [1_i32, 5, 3];
+        let expected = prefixed
+            .forward_last_logits(&ids)
+            .expect("prefixed forward");
+        let actual = bare.forward_last_logits(&ids).expect("bare forward");
+        assert_eq!(
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // Embedding input without the appended end-of-text is refused up front.
+        assert!(matches!(
+            bare.embed(&ids, None),
+            Err(crate::embedding::Qwen3EmbeddingError::MissingEndOfText { last: Some(3) })
         ));
     }
 

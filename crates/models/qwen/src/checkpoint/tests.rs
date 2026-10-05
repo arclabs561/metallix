@@ -9,8 +9,8 @@ use std::{
 use serde_json::json;
 
 use super::{
-    Qwen3CheckpointError, Qwen3CheckpointInspection, RawCheckpointLayout, read_header,
-    required_dense_tensors,
+    Qwen3CheckpointError, Qwen3CheckpointInspection, Qwen3TensorNaming, RawCheckpointLayout,
+    read_header, required_dense_tensors,
 };
 use crate::Qwen3TextContract;
 
@@ -555,4 +555,83 @@ fn rejects_non_object_metadata_without_treating_it_as_a_tensor() {
 
     let error = read_header(&path).expect_err("metadata must be an object");
     assert!(matches!(error, Qwen3CheckpointError::InvalidMetadata(_)));
+}
+
+/// The same dense layout under `Qwen3Model`'s bare names.
+fn bare_tensors() -> Vec<super::ExpectedTensor> {
+    expected_tensors()
+        .into_iter()
+        .map(|tensor| super::ExpectedTensor {
+            name: tensor
+                .name
+                .strip_prefix("model.")
+                .expect("canonical names are prefixed")
+                .to_owned(),
+            shape: tensor.shape,
+        })
+        .collect()
+}
+
+#[test]
+fn bare_tensor_names_inspect_and_read_under_canonical_names() {
+    let fixture = Fixture::new();
+    fixture.write_config();
+    let tensors = bare_tensors();
+    let total = tensors
+        .iter()
+        .map(|tensor| tensor.shape.iter().product::<u64>() * 2)
+        .sum::<u64>();
+    let payload = (0..usize::try_from(total).expect("small payload"))
+        .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+        .collect::<Vec<_>>();
+    write_safetensors_with_payload(&fixture.path.join("model.safetensors"), &tensors, &payload);
+
+    let inspection = Qwen3CheckpointInspection::inspect(&fixture.path).expect("bare checkpoint");
+    assert_eq!(inspection.tensor_naming(), Qwen3TensorNaming::Bare);
+    assert_eq!(inspection.tensor_count(), tensors.len());
+    let tensor = inspection
+        .read_tensor("model.layers.0.input_layernorm.weight", 8)
+        .expect("canonical read of a bare tensor");
+    assert_eq!(
+        tensor.bytes(),
+        &payload[payload_range(&tensors, "layers.0.input_layernorm.weight")]
+    );
+    assert!(
+        inspection
+            .read_tensor("layers.0.input_layernorm.weight", 8)
+            .is_err()
+    );
+}
+
+#[test]
+fn prefixed_names_keep_their_naming_and_mixed_embeddings_are_rejected() {
+    let fixture = Fixture::new();
+    fixture.write_config();
+    write_safetensors(&fixture.path.join("model.safetensors"), &expected_tensors());
+    assert_eq!(
+        Qwen3CheckpointInspection::inspect(&fixture.path)
+            .expect("prefixed checkpoint")
+            .tensor_naming(),
+        Qwen3TensorNaming::Prefixed
+    );
+
+    let mut mixed = bare_tensors();
+    mixed.push(super::ExpectedTensor {
+        name: "model.embed_tokens.weight".to_owned(),
+        shape: vec![8, 4],
+    });
+    write_safetensors(&fixture.path.join("model.safetensors"), &mixed);
+    assert!(matches!(
+        Qwen3CheckpointInspection::inspect(&fixture.path),
+        Err(Qwen3CheckpointError::AmbiguousTensorNaming)
+    ));
+
+    // A bare checkpoint missing a decoder tensor reports its canonical name.
+    let mut incomplete = bare_tensors();
+    incomplete.retain(|tensor| tensor.name != "norm.weight");
+    write_safetensors(&fixture.path.join("model.safetensors"), &incomplete);
+    assert!(matches!(
+        Qwen3CheckpointInspection::inspect(&fixture.path),
+        Err(Qwen3CheckpointError::MissingRequiredTensor(name)) if name == "model.norm.weight"
+    ));
 }

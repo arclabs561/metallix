@@ -404,6 +404,33 @@ pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
     input_ids: &[i32],
     steering: Option<&Qwen3ResidualSteering>,
 ) -> Result<Vec<f32>, Qwen3ForwardError> {
+    let normalized = last_normalized_hidden(weights, config, input_ids, steering)?;
+    let logits = linear(&normalized, weight(weights, "model.embed_tokens.weight")?)?;
+    read_last_logits(&logits, 1, config.vocab_size)
+}
+
+/// Runs a complete uncached Qwen3 forward pass and reads back the last
+/// position's final-norm hidden state as `hidden_size` f32 values.
+///
+/// This is the input of the tied output projection: the result of
+/// [`forward_last_logits`] is this vector times the token-embedding matrix.
+/// It equals the last row of a source `Qwen3Model`'s `last_hidden_state`.
+pub fn forward_last_hidden<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    input_ids: &[i32],
+) -> Result<Vec<f32>, Qwen3ForwardError> {
+    let normalized = last_normalized_hidden(weights, config, input_ids, None)?;
+    // The readback helper reads any `[1, 1, width]` row, not only logits.
+    read_last_logits(&normalized, 1, config.hidden_size)
+}
+
+fn last_normalized_hidden<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    input_ids: &[i32],
+    steering: Option<&Qwen3ResidualSteering>,
+) -> Result<Array, Qwen3ForwardError> {
     if steering.is_some_and(|steering| !steering.is_bound_to(config)) {
         return Err(Qwen3SteeringError::BoundConfigurationMismatch.into());
     }
@@ -429,13 +456,11 @@ pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
     // projection are position-independent after the decoder layers.
     let last_hidden =
         hidden_states.take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?;
-    let normalized = rms_norm(
+    rms_norm(
         &last_hidden,
         weight(weights, "model.norm.weight")?,
         config.rms_norm_eps,
-    )?;
-    let logits = linear(&normalized, embedding)?;
-    read_last_logits(&logits, 1, config.vocab_size)
+    )
 }
 
 /// Executes one uncached dense Qwen3 decoder layer.
@@ -1670,8 +1695,8 @@ mod tests {
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
         Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
-        forward_last_logits, forward_last_logits_with_residual_steering, forward_layer, linear,
-        read_last_logits, rms_norm, stepped_capacity, weight,
+        forward_last_hidden, forward_last_logits, forward_last_logits_with_residual_steering,
+        forward_layer, linear, read_last_logits, rms_norm, stepped_capacity, weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -2367,6 +2392,30 @@ mod tests {
         )
         .expect("test steering artifact");
         Qwen3ResidualSteering::bind(artifact, config).expect("bind test steering")
+    }
+
+    #[test]
+    fn last_hidden_is_the_input_of_the_tied_output_projection() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = small_dense_config();
+        let weights = deterministic_weights();
+        let prompt = [1_i32, 2, 3];
+        let hidden = forward_last_hidden(&weights, &config, &prompt).expect("last hidden");
+        let logits = forward_last_logits(&weights, &config, &prompt).expect("last logits");
+        assert_eq!(hidden.len(), 4);
+        // The test embedding is `nonzero_values(32)` as an 8 x 4 matrix.
+        let embedding = nonzero_values(32);
+        for (row, &logit) in logits.iter().enumerate() {
+            let projected: f32 = hidden
+                .iter()
+                .zip(&embedding[row * 4..row * 4 + 4])
+                .map(|(h, e)| h * e)
+                .sum();
+            assert!(
+                (projected - logit).abs() <= 1e-5 * (1.0 + logit.abs()),
+                "row {row}: {projected} vs {logit}"
+            );
+        }
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {
