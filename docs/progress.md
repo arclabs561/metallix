@@ -11,6 +11,52 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- One real DeepSeek-V4.1 request step now runs end to end through the
+  library: `RequestSession::step_with_sources` over all 40 layers, built from
+  checkpoint tensors by `reduced::checkpoint_model`, with routed experts,
+  Engram rows and embedding rows read on demand through `V41RangeCache` and
+  missing ranges fetched from the pinned Hub revision inside a 64 GiB / 150
+  GiB-free envelope (`server::range_fetch`). On the captured 3-token prompt it
+  predicts the source's greedy token. Teacher-forced, every layer's attention
+  input is exact and layer outputs agree at cosine at least 0.99999 (two layers
+  at about 0.999989); chained, BF16-level differences compound to cosine about
+  0.70 by layer 38 and the top logit reads 25.1 against the source's 20.0, as
+  the unmodified source also drifts when started from native layer-0 output.
+  One prompt only. Remaining gaps: prefill is one call and one Engram step
+  admits at most 40 positions (chunked prefill next), and the path is a scalar
+  CPU reference (about 9 minutes per step) pending profile-driven Metal work.
+  See [all forty real layers](research/quantization-precision.md#all-forty-real-layers).
+
+- Pieces that made it possible: a checkpoint-defined layer schedule in
+  `RequestSession` (window, ratio-two owner/consumer, ratio-one owner,
+  candidate indexer, ratio-one consumer); per-call `RoutedExpertSource`,
+  `EngramRowSource` and `EmbeddingRowSource` so no full expert, Engram (about
+  384M rows per layer) or embedding table is held; a BF16 output head with
+  bit-identical logits and opt-in last-position heads; Engram hash inputs from
+  a checked artifact reproducing the source ids bit for bit; and fixes found
+  against real data: fused RoPE matching torch (layer 1 sparse-attention
+  mismatches 173 to 4), index keys narrower than attention heads, and
+  incremental Engram decode hashing (75 ns per token at any history capacity).
+
+- `mx serve` serves several models from a registry: generation
+  (`/v1/responses`), typed decisions (`/v1/decisions`, Qwen and Julia, same
+  receipts as the CLIs) and embeddings (`/v1/embeddings`, Qwen3-Embedding-0.6B
+  matching a pinned float32 oracle on 68 inputs). Each model runs in its own
+  child process behind a byte proxy, because dropped models measured as not
+  returning memory in-process; on-demand models start on first use and the
+  least recently used idle one stops to fit `--memory-budget-mib`. See
+  [serving](model-adapters.md#serving) and [typed decisions](typed-decisions.md).
+
+- Workspace structure: the narrow-float codecs moved to the `blockfloat`
+  crate; `reduced/request`, `server/responses` and `attention/layer` split
+  into focused files as pure moves; 25 crate-internal items narrowed. Benches
+  cover the range cache, MoE expert sources and Engram hashing.
+
+- Known precision issue: the pinned MLX (0.25, via mlx-rs 0.25.3) computes
+  BF16 sigmoid imprecisely (fixed upstream in MLX 0.29.3), so Qwen BF16
+  embeddings and logits carry about 2.5 times the error of a current MLX. The
+  mlx-rs 0.32 upgrade is in progress.
+
 - Both canonical checks now pass end to end: `uv run scripts/check.py` and
   `uv run scripts/check.py --metal`. The Julia full encoder is gated against a
   float64 reference ([details](research/julia-decision-contract.md#float64-accuracy-reference-for-the-full-encoder));
