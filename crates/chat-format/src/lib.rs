@@ -115,7 +115,12 @@ enum TokenIds {
 impl StopTokens {
     /// The union, in order, of `eos_token_id` from `config.json` and from
     /// `generation_config.json` (which `generate` in transformers uses).
-    fn from_configs(config: &Value, generation_config: Option<&Value>) -> Result<Self, String> {
+    /// Listed IDs in `tool_end` end a tool-calling turn; the rest end a turn.
+    fn from_configs(
+        config: &Value,
+        generation_config: Option<&Value>,
+        tool_end: &[TokenId],
+    ) -> Result<Self, String> {
         let mut ids = Vec::new();
         // Multimodal checkpoints (Qwen3.5) keep the text model's IDs in
         // `text_config`.
@@ -140,13 +145,14 @@ impl StopTokens {
                 }
             }
         }
-        let end_turn = NonEmpty::from_vec(ids).ok_or_else(|| {
-            String::from("local config.json and generation_config.json list no eos_token_id")
+        let (tool_end, end_turn): (Vec<_>, Vec<_>) =
+            ids.into_iter().partition(|id| tool_end.contains(id));
+        let end_turn = NonEmpty::from_vec(end_turn).ok_or_else(|| {
+            String::from(
+                "local config.json and generation_config.json list no end-of-turn eos_token_id",
+            )
         })?;
-        Ok(Self {
-            end_turn,
-            tool_end: Vec::new(),
-        })
+        Ok(Self { end_turn, tool_end })
     }
 
     #[must_use]
@@ -335,17 +341,24 @@ impl ChatFormat {
         } else {
             None
         };
-        let stops = StopTokens::from_configs(&config, generation_config.as_ref())?;
         let tokenizer = QwenTokenizer::load(model)?;
+        let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
+        let source = load_template(model, &tokenizer_config)?;
+        let turn = TurnFormat::from_template(&source);
+        let tool_end: Vec<TokenId> = turn
+            .tools
+            .tool_end_marker()
+            .and_then(|marker| tokenizer.token_id(marker))
+            .map(TokenId::new)
+            .into_iter()
+            .collect();
+        let stops = StopTokens::from_configs(&config, generation_config.as_ref(), &tool_end)?;
         for id in stops.iter() {
             let id = i32::try_from(id.get())
                 .map_err(|_| String::from("model EOS token ID does not fit server token IDs"))?;
             tokenizer.check_model_vocabulary(vocabulary_size, id)?;
         }
-        let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
         let specials = SpecialTokens::from_config(&tokenizer_config, &tokenizer)?;
-        let source = load_template(model, &tokenizer_config)?;
-        let turn = TurnFormat::from_template(&source);
         let template = ChatTemplate::parse(source, specials)?;
         let format = Self {
             tokenizer,
@@ -559,8 +572,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ChatFormat, ChatTemplate, MAX_CHAT_TEMPLATE_BYTES, NonEmpty, SpecialTokens, StopTokens,
-        TokenClass, TokenId, load_template, read_json,
+        ChatFormat, ChatTemplate, MAX_CHAT_TEMPLATE_BYTES, SpecialTokens, StopTokens, TokenClass,
+        TokenId, load_template, read_json,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
     use crate::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation};
@@ -750,7 +763,7 @@ mod tests {
     #[test]
     fn stop_tokens_are_every_listed_eos_from_both_configs() {
         let stops = |config: Value, generation: Option<Value>| {
-            StopTokens::from_configs(&config, generation.as_ref())
+            StopTokens::from_configs(&config, generation.as_ref(), &[])
         };
         let minicpm = stops(json!({"eos_token_id": [1, 130_073]}), None).expect("list");
         for id in [1, 130_073] {
@@ -779,12 +792,19 @@ mod tests {
         assert!(stops(json!({"eos_token_id": -1}), None).is_err());
         assert!(stops(json!({"eos_token_id": "2"}), None).is_err());
 
-        let tool_turns = StopTokens {
-            end_turn: NonEmpty::from_vec(vec![TokenId::new(1)]).expect("nonempty"),
-            tool_end: vec![TokenId::new(50)],
-        };
-        assert_eq!(tool_turns.classify(TokenId::new(50)), TokenClass::ToolEnd);
-        assert_eq!(tool_turns.classify(TokenId::new(1)), TokenClass::EndTurn);
+        // Gemma 4: `<|tool_response>` (50) ends a turn that issued calls.
+        let gemma = StopTokens::from_configs(
+            &json!({"eos_token_id": [1, 106]}),
+            Some(&json!({"eos_token_id": [1, 106, 50]})),
+            &[TokenId::new(50)],
+        )
+        .expect("gemma stops");
+        assert_eq!(gemma.classify(TokenId::new(50)), TokenClass::ToolEnd);
+        assert_eq!(gemma.classify(TokenId::new(106)), TokenClass::EndTurn);
+        assert!(
+            StopTokens::from_configs(&json!({"eos_token_id": 50}), None, &[TokenId::new(50)])
+                .is_err()
+        );
     }
 
     #[test]

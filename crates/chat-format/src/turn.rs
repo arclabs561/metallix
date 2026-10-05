@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     messages::ChatToolCall,
-    tools::{self, ParsedTurn, json_in_tags, minicpm_xml, xml_function_params},
+    tools::{self, ParsedTurn, gemma_call, json_in_tags, minicpm_xml, xml_function_params},
 };
 
 /// How a template tells the model to write tool calls.
@@ -24,6 +24,8 @@ pub enum ToolDialect {
     XmlFunctionParams,
     /// `<function name="NAME"><param name="K">V</param></function>` (`MiniCPM5`).
     MiniCpmXml,
+    /// `<|tool_call>call:NAME{k:<|"|>v<|"|>}<tool_call|>` (Gemma 4).
+    GemmaCall,
     /// No calls are parsed; the whole answer is text.
     PlainText,
 }
@@ -34,6 +36,8 @@ pub enum ToolDialect {
 pub enum ReasoningDialect {
     /// `<think>...</think>` (Qwen3, `MiniCPM5`).
     ThinkTags,
+    /// `<|channel>thought...<channel|>` (Gemma 4).
+    GemmaChannel,
     /// No reasoning is split from the answer.
     None,
 }
@@ -69,6 +73,7 @@ impl TurnFormat {
                 ToolDialect::MiniCpmXml,
                 &["<function name=", "<param name="],
             ),
+            (ToolDialect::GemmaCall, &["<|tool_call>", "<tool_call|>"]),
         ]
         .into_iter()
         .filter(|(_, markers)| spells(markers))
@@ -77,10 +82,13 @@ impl TurnFormat {
         if tools.contains(&ToolDialect::XmlFunctionParams) {
             tools.retain(|&dialect| dialect != ToolDialect::JsonInTags);
         }
-        let reasoning = if spells(&["<think>", "</think>"]) {
-            ReasoningDialect::ThinkTags
-        } else {
-            ReasoningDialect::None
+        let reasoning = match (
+            spells(&["<think>", "</think>"]),
+            spells(&["<|channel>", "<channel|>"]),
+        ) {
+            (true, false) => ReasoningDialect::ThinkTags,
+            (false, true) => ReasoningDialect::GemmaChannel,
+            _ => ReasoningDialect::None,
         };
         Self {
             tools: match tools.as_slice() {
@@ -93,6 +101,16 @@ impl TurnFormat {
 }
 
 impl ToolDialect {
+    /// The token that ends a turn which issued calls and now awaits their
+    /// results, when the dialect has one; it is a stop token, not text.
+    #[must_use]
+    pub const fn tool_end_marker(self) -> Option<&'static str> {
+        match self {
+            Self::GemmaCall => Some("<|tool_response>"),
+            Self::JsonInTags | Self::XmlFunctionParams | Self::MiniCpmXml | Self::PlainText => None,
+        }
+    }
+
     /// `tools` give parameter types to dialects that write every value as
     /// text.
     fn parse(self, answer: &str, tools: &[Value]) -> Result<ParsedTurn, String> {
@@ -100,6 +118,7 @@ impl ToolDialect {
             Self::JsonInTags => json_in_tags::parse(answer),
             Self::XmlFunctionParams => xml_function_params::parse(answer, tools),
             Self::MiniCpmXml => minicpm_xml::parse(answer, tools),
+            Self::GemmaCall => gemma_call::parse(answer),
             Self::PlainText => Ok(ParsedTurn {
                 text: answer.to_owned(),
                 calls: Vec::new(),
@@ -109,13 +128,20 @@ impl ToolDialect {
 }
 
 impl ReasoningDialect {
+    const fn markers(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::ThinkTags => Some(("<think>", "</think>")),
+            Self::GemmaChannel => Some(("<|channel>thought", "<channel|>")),
+            Self::None => None,
+        }
+    }
+
     /// Splits a thinking turn into its reasoning and its answer. The model
     /// may open the block itself, or the template may pre-fill the opening
     /// marker and leave only the close.
     fn split(self, text: &str) -> (&str, &str) {
-        let (open, close) = match self {
-            Self::ThinkTags => ("<think>", "</think>"),
-            Self::None => return ("", text),
+        let Some((open, close)) = self.markers() else {
+            return ("", text);
         };
         let (opened, body) = match text.trim_start().strip_prefix(open) {
             Some(body) => (true, body),
@@ -126,6 +152,16 @@ impl ReasoningDialect {
             None if opened => (body.trim(), ""),
             None => ("", text),
         }
+    }
+
+    /// Drops an empty block the model opens and closes on its own while
+    /// thinking is off: Gemma 4 writes `<|channel>thought\n<channel|>` after
+    /// each tool result. A block with reasoning in it stays text.
+    fn strip_empty(self, text: &str) -> &str {
+        self.markers()
+            .and_then(|(open, close)| text.trim_start().strip_prefix(open)?.split_once(close))
+            .filter(|(reasoning, _)| reasoning.trim().is_empty())
+            .map_or(text, |(_, answer)| answer.trim_start())
     }
 }
 
@@ -153,7 +189,7 @@ pub fn parse_turn(
     let (reasoning, answer) = if enable_thinking {
         format.reasoning.split(text)
     } else {
-        ("", text)
+        ("", format.reasoning.strip_empty(text))
     };
     let turn = format.tools.parse(answer, tools)?;
     if !turn.calls.is_empty() && !complete {
@@ -233,6 +269,19 @@ mod tests {
                 reasoning: ReasoningDialect::ThinkTags,
             }
         );
+        // gemma-4-12B-it's chat_template.jinja (sha256 ae53464b...).
+        let gemma4 = concat!(
+            r"{{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}",
+            r"{{- '<|tool_call>call:' + function['name'] + '{' -}}",
+            r"{{- '}<tool_call|>' -}}",
+        );
+        assert_eq!(
+            TurnFormat::from_template(gemma4),
+            TurnFormat {
+                tools: ToolDialect::GemmaCall,
+                reasoning: ReasoningDialect::GemmaChannel,
+            }
+        );
         // A template spelling two dialects' markers selects neither.
         assert_eq!(
             TurnFormat::from_template(&format!("{QWEN3_TEMPLATE}{MINICPM5_TEMPLATE}")).tools,
@@ -252,6 +301,90 @@ mod tests {
         assert!(qwen3.calls.is_empty());
     }
 
+    /// The turns that failed on the Qwen-only parser: each family's call
+    /// syntax under its own dialects.
+    #[test]
+    fn every_family_call_parses_in_its_own_dialect() {
+        let format = |tools, reasoning| TurnFormat { tools, reasoning };
+        let cases = [
+            (
+                format(ToolDialect::MiniCpmXml, ReasoningDialect::ThinkTags),
+                r#"<function name="read_file"><param name="path">README.md</param></function>"#,
+            ),
+            (
+                format(ToolDialect::XmlFunctionParams, ReasoningDialect::ThinkTags),
+                "<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n</function>\n</tool_call>",
+            ),
+            (
+                format(ToolDialect::GemmaCall, ReasoningDialect::GemmaChannel),
+                r#"<|tool_call>call:read_file{path:<|"|>README.md<|"|>}<tool_call|>"#,
+            ),
+        ];
+        for (format, text) in cases {
+            let turn = parse_turn(format, text, &read_file(), false, true).unwrap();
+            assert_eq!(turn.calls.len(), 1, "{text}");
+            assert_eq!(turn.calls[0].arguments, json!({"path":"README.md"}));
+        }
+        let gemma = format(ToolDialect::GemmaCall, ReasoningDialect::GemmaChannel);
+        let turn = parse_turn(
+            gemma,
+            "<|channel>thought\nadd them<channel|>4",
+            &[],
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            (turn.reasoning.as_str(), turn.text.as_str()),
+            ("add them", "4")
+        );
+    }
+
+    /// Greedy outputs of gemma-4-12B-it@707f0a3 under transformers, each
+    /// without the stop token that ended it.
+    #[test]
+    fn gemma4_measured_turns_parse() {
+        let gemma = TurnFormat {
+            tools: ToolDialect::GemmaCall,
+            reasoning: ReasoningDialect::GemmaChannel,
+        };
+        let weather = [
+            json!({"type":"function","function":{"name":"get_weather","parameters":{
+            "type":"object","required":["city"],"properties":{"city":{"type":"string"},
+            "unit":{"type":"string","enum":["celsius","fahrenheit"]}}}}}),
+        ];
+        // "Weather in Paris?", stopped on <|tool_response> (50).
+        let call = r#"<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
+        let turn = parse_turn(gemma, call, &weather, false, true).unwrap();
+        assert_eq!(turn.text, "");
+        assert_eq!(
+            turn.calls,
+            [ChatToolCall {
+                name: "get_weather".into(),
+                arguments: json!({"city":"Paris"}),
+            }]
+        );
+        // After the tool result with thinking off, stopped on <turn|> (106):
+        // the model opens and closes an empty channel before answering.
+        let answer =
+            "<|channel>thought\n<channel|>The current weather in Paris is 18°C with clear skies.";
+        let turn = parse_turn(gemma, answer, &weather, false, true).unwrap();
+        assert_eq!(
+            (turn.reasoning.as_str(), turn.text.as_str()),
+            ("", "The current weather in Paris is 18°C with clear skies.")
+        );
+        // Thinking on ("Is 91 prime?", trace shortened).
+        let thought = "<|channel>thought\n91 = 7 x 13.<channel|>No, **91 is not a prime number.**";
+        let turn = parse_turn(gemma, thought, &[], true, true).unwrap();
+        assert_eq!(
+            (turn.reasoning.as_str(), turn.text.as_str()),
+            ("91 = 7 x 13.", "No, **91 is not a prime number.**")
+        );
+        // With thinking off, a channel that holds reasoning stays text.
+        let turn = parse_turn(gemma, thought, &[], false, true).unwrap();
+        assert_eq!(turn.text, thought);
+    }
+
     #[test]
     fn think_tags_split_reasoning_from_the_answer() {
         let split = |text| ReasoningDialect::ThinkTags.split(text);
@@ -259,6 +392,14 @@ mod tests {
         assert_eq!(split("pre-filled\n</think>\n\n4"), ("pre-filled", "4"));
         assert_eq!(split("<think>\nunfinished"), ("unfinished", ""));
         assert_eq!(split("plain answer"), ("", "plain answer"));
+        let channel = |text| ReasoningDialect::GemmaChannel.split(text);
+        assert_eq!(
+            channel("<|channel>thought\nadd them<channel|>4"),
+            ("add them", "4")
+        );
+        // The Gemma 4 template pre-fills the opening marker when thinking.
+        assert_eq!(channel("add them\n<channel|>4"), ("add them", "4"));
+        assert_eq!(channel("4"), ("", "4"));
         assert_eq!(
             ReasoningDialect::None.split("<think>x</think>y"),
             ("", "<think>x</think>y")

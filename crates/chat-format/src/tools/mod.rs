@@ -1,6 +1,7 @@
 //! Complete-call parsers, one module per tool dialect, and tool schema
 //! validation. Reached only through [`crate::parse_turn`].
 
+pub(crate) mod gemma_call;
 pub(crate) mod json_in_tags;
 pub(crate) mod minicpm_xml;
 pub(crate) mod xml_function_params;
