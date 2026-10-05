@@ -1,12 +1,16 @@
 //! Models declared to `mx serve`, from a local manifest and the `--model`
 //! shorthand. Every entry loads at startup; on-demand loading is a later step.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    admission_queue::QueueSettings,
     chat_generation::{ChatBackend, ChatSession, ResidentChatLimits},
     julia_decisions::JuliaDecider,
     pplx_context_embeddings::PplxContextEmbedder,
@@ -16,6 +20,9 @@ use crate::{
 };
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Upper bounds shared with the `--queue-depth` and `--queue-wait-ms` flags.
+pub(crate) const MAX_QUEUE_DEPTH: usize = 1024;
+pub(crate) const MAX_QUEUE_WAIT_MS: u64 = 600_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +77,24 @@ pub(crate) struct ServedEntry {
     /// Measured process footprint while serving; required with a memory budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) memory_mib: Option<u64>,
+    /// Requests that may wait while this model is busy; overrides `--queue-depth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queue_depth: Option<usize>,
+    /// Longest wait for this model, in milliseconds; overrides `--queue-wait-ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) queue_wait_ms: Option<u64>,
+}
+
+impl ServedEntry {
+    /// This model's queue limits: its own fields over the server defaults.
+    pub(crate) fn queue(&self, defaults: QueueSettings) -> QueueSettings {
+        QueueSettings {
+            depth: self.queue_depth.unwrap_or(defaults.depth),
+            wait: self
+                .queue_wait_ms
+                .map_or(defaults.wait, Duration::from_millis),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -95,6 +120,8 @@ pub(crate) fn entries(
             path: model.to_owned(),
             residency: Residency::Resident,
             memory_mib: None,
+            queue_depth: None,
+            queue_wait_ms: None,
         });
     }
     if entries.is_empty() {
@@ -104,6 +131,18 @@ pub(crate) fn entries(
         if entry.id.is_empty() || entries[..index].iter().any(|other| other.id == entry.id) {
             return Err(format!(
                 "served model IDs must be nonempty and unique: {:?}",
+                entry.id
+            ));
+        }
+        if entry
+            .queue_depth
+            .is_some_and(|depth| depth > MAX_QUEUE_DEPTH)
+            || entry
+                .queue_wait_ms
+                .is_some_and(|wait| !(1..=MAX_QUEUE_WAIT_MS).contains(&wait))
+        {
+            return Err(format!(
+                "{:?}: queue_depth must be at most {MAX_QUEUE_DEPTH} and queue_wait_ms 1 to {MAX_QUEUE_WAIT_MS}",
                 entry.id
             ));
         }
@@ -265,6 +304,8 @@ mod tests {
                 path: "/j".into(),
                 residency: Residency::Resident,
                 memory_mib: None,
+                queue_depth: None,
+                queue_wait_ms: None,
             }]
         );
         assert!(!parsed[0].kind.generates());
@@ -318,6 +359,8 @@ mod tests {
             path: "/j".into(),
             residency,
             memory_mib,
+            queue_depth: None,
+            queue_wait_ms: None,
         };
         let parsed = parse_manifest(
             br#"{"models": [{"id": "x", "kind": "julia", "path": "/j", "residency": "on_demand", "memory_mib": 1300}]}"#,
@@ -359,6 +402,46 @@ mod tests {
             ),
         ] {
             assert!(check_budget(&entries, Some(budget)).is_err(), "{entries:?}");
+        }
+    }
+
+    #[test]
+    fn queue_fields_override_server_defaults_within_bounds() {
+        let defaults = QueueSettings::default();
+        let parsed = parse_manifest(
+            br#"{"models": [{"id": "x", "kind": "julia", "path": "/j", "queue_depth": 0, "queue_wait_ms": 2500}, {"id": "y", "kind": "julia", "path": "/j"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed[0].queue(defaults),
+            QueueSettings {
+                depth: 0,
+                wait: Duration::from_millis(2500)
+            }
+        );
+        assert_eq!(parsed[1].queue(defaults), defaults);
+        // Children receive their entry as JSON; unset fields stay out of it.
+        assert!(!serde_json::to_string(&parsed[1]).unwrap().contains("queue"));
+
+        let path = std::env::temp_dir().join(format!("serve-queue-{}.json", std::process::id()));
+        let mut outcomes = Vec::new();
+        for fields in [
+            r#""queue_depth": 1025"#,
+            r#""queue_wait_ms": 0"#,
+            r#""queue_wait_ms": 600001"#,
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"models": [{{"id": "x", "kind": "julia", "path": "/j", {fields}}}]}}"#
+                ),
+            )
+            .unwrap();
+            outcomes.push(entries(Some(&path), None, "qwen"));
+        }
+        std::fs::remove_file(&path).unwrap();
+        for outcome in outcomes {
+            assert!(outcome.unwrap_err().contains("queue_depth"));
         }
     }
 }

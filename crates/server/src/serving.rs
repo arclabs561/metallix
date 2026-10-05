@@ -136,6 +136,10 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
                 id,
                 generation_timeout,
             } => {
+                // Dropped in reverse order: the model is free before the socket
+                // closes, so a front process that admits its next request when
+                // this response ends never finds the model still busy.
+                let _socket = connection.hold_open();
                 let _admission = admission;
                 // Routing admits only models that declare generation.
                 let Some(session) = worker.chat() else {

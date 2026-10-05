@@ -76,6 +76,10 @@ pub(crate) struct Connection {
     limits: TransportLimits,
     read_deadline: Instant,
     response_deadline: Option<Instant>,
+    /// HTTP minor version of the request read, once one is read.
+    minor_version: Option<u8>,
+    /// Whether [`Connection::client_gone`] has sent its one probe.
+    probed: bool,
 }
 
 impl Connection {
@@ -87,6 +91,8 @@ impl Connection {
             limits,
             read_deadline: deadline_after(limits.read_deadline),
             response_deadline: None,
+            minor_version: None,
+            probed: false,
         }
     }
 
@@ -117,6 +123,37 @@ impl Connection {
             path,
             body: received,
         })
+    }
+
+    /// Whether the client has closed its connection while its request waits,
+    /// without consuming input. Read EOF alone also means a client that
+    /// half-closed and is still waiting, so on the first EOF an HTTP/1.1 client
+    /// is sent one `100 Continue`, which clients must accept before the final
+    /// response; a closed peer answers it with a reset that a later call sees.
+    pub(crate) fn client_gone(&mut self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let peeked = self.stream.peek(&mut [0_u8; 1]);
+        if self.stream.set_nonblocking(false).is_err() {
+            return true;
+        }
+        match peeked {
+            Ok(0) if !self.probed && self.minor_version == Some(1) => {
+                self.probed = true;
+                self.stream
+                    .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                    .is_err()
+            }
+            Ok(_) => false,
+            Err(error) => error.kind() != io::ErrorKind::WouldBlock,
+        }
+    }
+
+    /// A second handle on the socket, which keeps it open after this
+    /// connection is dropped until the handle is dropped too.
+    pub(crate) fn hold_open(&self) -> Option<TcpStream> {
+        self.stream.try_clone().ok()
     }
 
     /// Starts a new bounded response-write interval.
@@ -153,6 +190,7 @@ impl Connection {
                         });
                     }
                     let body_length = validate_headers(&request, &method, version, self.limits)?;
+                    self.minor_version = Some(version);
                     return Ok((input, header_end, method, path, body_length));
                 }
                 Ok(httparse::Status::Partial) => {
@@ -717,5 +755,67 @@ mod tests {
             prop_assert_eq!(actual.body, expected_body);
             client.join().expect("fragment client joins");
         }
+    }
+    #[test]
+    fn client_gone_tells_a_closed_client_from_a_waiting_one() {
+        let listener = listener();
+        let address = listener.local_addr().expect("listener address");
+        let request =
+            b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        let probe_until = |connection: &mut Connection, gone: bool| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while connection.client_gone() != gone {
+                assert!(Instant::now() < deadline, "client_gone never became {gone}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // Still sending nothing more, still connected: present.
+        let mut open = TcpStream::connect(address).expect("connect");
+        open.write_all(request).expect("request");
+        let mut waiting = request_at(&listener);
+        waiting.read_request().expect("request reads");
+        for _ in 0..3 {
+            assert!(!waiting.client_gone());
+        }
+
+        // Half-closed but reading: present, and sent exactly one 100 Continue.
+        let mut half = TcpStream::connect(address).expect("connect");
+        half.write_all(request).expect("request");
+        half.shutdown(Shutdown::Write).expect("half-close");
+        let mut half_closed = request_at(&listener);
+        half_closed.read_request().expect("request reads");
+        for _ in 0..5 {
+            assert!(!half_closed.client_gone());
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(half_closed);
+        let mut received = Vec::new();
+        half.read_to_end(&mut received).expect("probe arrives");
+        assert_eq!(received, b"HTTP/1.1 100 Continue\r\n\r\n");
+
+        // Fully closed: gone once its reset to the probe arrives.
+        let mut closed = TcpStream::connect(address).expect("connect");
+        closed.write_all(request).expect("request");
+        let mut departed = request_at(&listener);
+        departed.read_request().expect("request reads");
+        drop(closed);
+        probe_until(&mut departed, true);
+
+        // An HTTP/1.0 client is never sent a 1xx response.
+        let mut old = TcpStream::connect(address).expect("connect");
+        old.write_all(b"POST / HTTP/1.0\r\nContent-Length: 0\r\n\r\n")
+            .expect("request");
+        old.shutdown(Shutdown::Write).expect("half-close");
+        let mut legacy = request_at(&listener);
+        legacy.read_request().expect("request reads");
+        for _ in 0..3 {
+            assert!(!legacy.client_gone());
+        }
+        drop(legacy);
+        let mut received = Vec::new();
+        old.read_to_end(&mut received).expect("close arrives");
+        assert!(received.is_empty());
+        drop(open);
     }
 }

@@ -146,6 +146,14 @@ pub(crate) enum Command {
         /// Cooperative generation budget per request, in milliseconds.
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=120_000))]
         generation_timeout_ms: u32,
+        /// Requests that may wait, in arrival order, while a model is busy; 0
+        /// refuses any overlap. A registry entry's `queue_depth` overrides it.
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(0..=1024))]
+        queue_depth: u32,
+        /// Longest a queued request waits for its model, in milliseconds. A
+        /// registry entry's `queue_wait_ms` overrides it.
+        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=600_000))]
+        queue_wait_ms: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]

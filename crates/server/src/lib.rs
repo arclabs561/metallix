@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::chat_generation::{ResidentChatLimits, render_generation_prompt};
 
 #[cfg(feature = "metal")]
+mod admission_queue;
+#[cfg(feature = "metal")]
 mod agent_receipt;
 #[cfg(feature = "metal")]
 mod chat_cli;
@@ -212,6 +214,8 @@ pub fn run() -> ExitCode {
             context_tokens,
             kv_budget_mib,
             generation_timeout_ms,
+            queue_depth,
+            queue_wait_ms,
         } => {
             if let Some(entry) = worker_entry {
                 return match serde_json::from_str(&entry) {
@@ -237,6 +241,10 @@ pub fn run() -> ExitCode {
                         generation_timeout_ms,
                     },
                     memory_budget_mib,
+                    admission_queue::QueueSettings {
+                        depth: queue_depth as usize,
+                        wait: Duration::from_millis(u64::from(queue_wait_ms)),
+                    },
                 ),
                 Err(error) => {
                     eprintln!("mx serve: {error}");

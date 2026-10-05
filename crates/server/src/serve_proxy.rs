@@ -7,9 +7,12 @@
 //! recently used first, to keep declared `memory_mib` within the budget. A
 //! child that fails to start or dies makes only its model unavailable until
 //! a later request starts it again; the front process keeps serving.
+//!
+//! A model serves one request at a time; overlapping requests wait for it in
+//! that model's FIFO queue (see [`crate::admission_queue`]).
 
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, ExitCode, Stdio},
@@ -26,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
+    admission_queue::{ModelQueue, QueueSettings, Refusal, Refused},
     http_transport::{Connection, Request, TransportLimits},
     responses::json_response,
     serve_registry::{Residency, ServedEntry},
@@ -65,11 +69,14 @@ struct ChildModel {
     /// child is never stopped to make room.
     in_flight: AtomicUsize,
     last_used: Mutex<Instant>,
+    /// Requests waiting for this model; counted in `in_flight` while queued.
+    queue: ModelQueue,
 }
 
 impl ChildModel {
-    fn new(entry: ServedEntry, state: ChildState) -> Self {
+    fn new(entry: ServedEntry, state: ChildState, queue: QueueSettings) -> Self {
         Self {
+            queue: ModelQueue::new(entry.queue(queue)),
             entry,
             state: Mutex::new(state),
             last_error: Mutex::new(None),
@@ -258,8 +265,9 @@ pub(crate) fn serve(
     address: SocketAddr,
     settings: ChildSettings,
     budget_mib: Option<u64>,
+    queue: QueueSettings,
 ) -> ExitCode {
-    match serve_inner(entries, address, settings, budget_mib) {
+    match serve_inner(entries, address, settings, budget_mib, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mx serve: {error}");
@@ -273,6 +281,7 @@ fn serve_inner(
     address: SocketAddr,
     settings: ChildSettings,
     budget_mib: Option<u64>,
+    queue: QueueSettings,
 ) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
@@ -293,7 +302,7 @@ fn serve_inner(
         .iter()
         .zip(started)
         .map(|(entry, started)| {
-            let model = ChildModel::new(entry.clone(), ChildState::Stopped);
+            let model = ChildModel::new(entry.clone(), ChildState::Stopped, queue);
             if let Some(started) = started {
                 match wait_for_child(started) {
                     Ok((child, address)) => {
@@ -435,7 +444,7 @@ fn proxy_models(
                     .models
                     .iter()
                     .map(|model| {
-                        json!({"id":model.entry.id,"object":"model","owned_by":"local","capabilities":model.entry.kind.capabilities(),"residency":model.entry.residency,"loaded":model.address().is_some()})
+                        json!({"id":model.entry.id,"object":"model","owned_by":"local","capabilities":model.entry.kind.capabilities(),"residency":model.entry.residency,"loaded":model.address().is_some(),"queued":model.queue.waiting()})
                     })
                     .collect();
                 json_response(connection, 200, &json!({"object":"list","data":data}));
@@ -504,6 +513,16 @@ fn forward(
     request: &Request,
     limits: TransportLimits,
 ) {
+    let admitted = match model.queue.admit(|| connection.client_gone()) {
+        Ok(admitted) => admitted,
+        Err(refused) => return refuse(connection, model, refused),
+    };
+    // Every forwarded response says how long it queued.
+    let queue_headers = format!(
+        "X-Metallix-Queue-Depth: {}\r\nX-Metallix-Queue-Wait-Ms: {}\r\n",
+        admitted.depth,
+        admitted.waited.as_millis()
+    );
     let unavailable = |connection, reason: String| {
         json_response(
             connection,
@@ -541,7 +560,11 @@ fn forward(
     }
     // The child writes one complete HTTP response and closes; pass it through.
     connection.begin_response();
-    if let Err(error) = io::copy(&mut child, &mut connection).and_then(|_| connection.flush()) {
+    let passed =
+        pass_response(&mut child, &mut connection, &queue_headers).and_then(|_| connection.flush());
+    // The model is free once its child has finished this response.
+    drop(admitted);
+    if let Err(error) = passed {
         eprintln!(
             "mx serve: forwarding a {} response failed: {error}",
             model.entry.id
@@ -549,10 +572,68 @@ fn forward(
     }
 }
 
+/// Copies the child's response to the client, adding `headers` (complete
+/// header lines) to its head. A head that does not end within 16 KiB passes
+/// through unchanged.
+fn pass_response(child: &mut impl Read, client: &mut impl Write, headers: &str) -> io::Result<u64> {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let end = loop {
+        if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            break Some(end + 2);
+        }
+        let read = child.read(&mut chunk)?;
+        if read == 0 || head.len() > 16 * 1024 {
+            head.extend_from_slice(&chunk[..read]);
+            break None;
+        }
+        head.extend_from_slice(&chunk[..read]);
+    };
+    let mut written = head.len() as u64;
+    if let Some(end) = end {
+        client.write_all(&head[..end])?;
+        client.write_all(headers.as_bytes())?;
+        client.write_all(&head[end..])?;
+        written += headers.len() as u64;
+    } else {
+        client.write_all(&head)?;
+    }
+    Ok(written + io::copy(child, client)?)
+}
+
+/// Answers a request the model's queue did not admit. 503 rather than 429:
+/// the limit is this server's capacity, not a per-client rate, and the `openai`
+/// SDKs retry both alike, honoring `Retry-After`.
+fn refuse(mut connection: Connection, model: &ChildModel, refused: Refused) {
+    let id = &model.entry.id;
+    let (code, message) = match refused.refusal {
+        Refusal::Full => (
+            "server_busy",
+            format!("model {id} is busy and its request queue is full"),
+        ),
+        Refusal::Expired => (
+            "queue_timeout",
+            format!(
+                "model {id} stayed busy for the {} ms queue wait",
+                refused.waited.as_millis()
+            ),
+        ),
+        // Nobody is left to answer.
+        Refusal::Gone => return,
+    };
+    let body = json!({"error":{"code":code,"message":message}}).to_string();
+    connection.begin_response();
+    let _ = write!(
+        connection,
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+        refused.retry_after_secs,
+    )
+    .and_then(|()| connection.flush());
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::Read as _;
-
     use super::*;
     use crate::serve_registry::ModelKind;
 
@@ -608,18 +689,281 @@ mod tests {
     }
 
     fn model(id: &str, kind: ModelKind, address: Option<SocketAddr>) -> Arc<ChildModel> {
+        queued_model(id, kind, address, QueueSettings::default())
+    }
+
+    fn queued_model(
+        id: &str,
+        kind: ModelKind,
+        address: Option<SocketAddr>,
+        queue: QueueSettings,
+    ) -> Arc<ChildModel> {
         let entry = ServedEntry {
             id: id.into(),
             kind,
             path: "/unused".into(),
             residency: Residency::Resident,
             memory_mib: None,
+            queue_depth: None,
+            queue_wait_ms: None,
         };
         let state = address.map_or(ChildState::Stopped, |address| ChildState::Running {
             child: None,
             address,
         });
-        Arc::new(ChildModel::new(entry, state))
+        Arc::new(ChildModel::new(entry, state, queue))
+    }
+
+    /// A stand-in child that serves one request at a time and answers each
+    /// only when the test releases it. It reports each request's `input` as it
+    /// arrives, and whether the front process opened another connection to it
+    /// while one was in progress.
+    struct GatedChild {
+        address: SocketAddr,
+        seen: std::sync::mpsc::Receiver<String>,
+        release: Sender<()>,
+        overlapped: thread::JoinHandle<bool>,
+    }
+
+    fn gated_child(requests: usize) -> GatedChild {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("child listener");
+        let address = listener.local_addr().expect("child address");
+        let (seen_sender, seen) = channel();
+        let (release, released) = channel::<()>();
+        let overlapped = thread::spawn(move || {
+            let mut overlapped = false;
+            for _ in 0..requests {
+                listener.set_nonblocking(false).unwrap();
+                let (socket, _) = listener.accept().unwrap();
+                socket.set_nonblocking(false).unwrap();
+                let mut connection = Connection::accept(socket, TransportLimits::default());
+                let request = connection.read_request().expect("forwarded request");
+                let input = json(&request.body)["input"].as_str().unwrap().to_owned();
+                seen_sender.send(input.clone()).unwrap();
+                released.recv().unwrap();
+                listener.set_nonblocking(true).unwrap();
+                overlapped |= listener.accept().is_ok();
+                connection.begin_response();
+                let body = json!({"input": input}).to_string();
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+            overlapped
+        });
+        GatedChild {
+            address,
+            seen,
+            release,
+            overlapped,
+        }
+    }
+
+    /// Sends a request and leaves the connection open, as most clients do.
+    fn send(address: SocketAddr, input: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(address).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("bound reads");
+        let body = json!({"model": "m", "input": input}).to_string();
+        write!(
+            stream,
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("request");
+        stream
+    }
+
+    /// The final response's status, head and body, after any 1xx responses.
+    fn finish(mut stream: TcpStream) -> (u16, String, Value) {
+        let mut wire = Vec::new();
+        stream.read_to_end(&mut wire).expect("response");
+        let mut wire = String::from_utf8(wire).unwrap();
+        while wire.starts_with("HTTP/1.1 1") {
+            let end = wire.find("\r\n\r\n").unwrap() + 4;
+            wire.drain(..end);
+        }
+        let split = wire.find("\r\n\r\n").unwrap();
+        (
+            wire[9..12].parse().unwrap(),
+            wire[..split].to_owned(),
+            json(&wire.as_bytes()[split + 4..]),
+        )
+    }
+
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            key.eq_ignore_ascii_case(name).then_some(value)
+        })
+    }
+
+    fn until_waiting(model: &ChildModel, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while model.queue.waiting() != count {
+            assert!(Instant::now() < deadline, "queue never reached {count}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn queued_pool(child: SocketAddr, queue: QueueSettings) -> Arc<Pool> {
+        Arc::new(Pool {
+            models: vec![queued_model("m", ModelKind::Qwen, Some(child), queue)],
+            launcher: None,
+            budget_mib: None,
+            residency: Mutex::new(()),
+        })
+    }
+
+    fn proxy(pool: &Arc<Pool>, requests: usize) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let pool = Arc::clone(pool);
+        let server = thread::spawn(move || {
+            proxy_models(&listener, &pool, TransportLimits::default(), Some(requests)).unwrap();
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn overlapping_requests_wait_and_reach_the_model_one_at_a_time_in_order() {
+        let child = gated_child(3);
+        let pool = queued_pool(child.address, QueueSettings::default());
+        let (address, server) = proxy(&pool, 3);
+        let model = &pool.models[0];
+
+        let first = send(address, "a");
+        assert_eq!(child.seen.recv().unwrap(), "a");
+        let second = send(address, "b");
+        until_waiting(model, 1);
+        // A client that half-closes after sending still waits its turn.
+        let third = send(address, "c");
+        third.shutdown(Shutdown::Write).expect("half-close");
+        until_waiting(model, 2);
+        // Waiters count as activity, so the idle stopper leaves the model running.
+        assert!(!model.stop_if_idle());
+        assert!(model.address().is_some());
+
+        child.release.send(()).unwrap();
+        assert_eq!(child.seen.recv().unwrap(), "b");
+        child.release.send(()).unwrap();
+        assert_eq!(child.seen.recv().unwrap(), "c");
+        child.release.send(()).unwrap();
+
+        for (stream, input, depth) in [(first, "a", "0"), (second, "b", "1"), (third, "c", "2")] {
+            let (status, head, body) = finish(stream);
+            assert_eq!((status, &body["input"]), (200, &json!(input)));
+            assert_eq!(
+                header(&head, "X-Metallix-Queue-Depth"),
+                Some(depth),
+                "{input}"
+            );
+            let waited: u64 = header(&head, "X-Metallix-Queue-Wait-Ms")
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(waited == 0, depth == "0", "{input} waited {waited} ms");
+        }
+        server.join().unwrap();
+        assert!(
+            !child.overlapped.join().unwrap(),
+            "the child saw overlapping requests"
+        );
+        assert_eq!(model.in_flight.load(Ordering::Acquire), 0);
+        assert!(model.stop_if_idle(), "an idle model can be stopped again");
+    }
+
+    #[test]
+    fn a_full_queue_and_an_expired_wait_answer_503_with_retry_after() {
+        let child = gated_child(1);
+        let pool = queued_pool(
+            child.address,
+            QueueSettings {
+                depth: 1,
+                wait: Duration::from_millis(400),
+            },
+        );
+        let (address, server) = proxy(&pool, 3);
+        let model = &pool.models[0];
+
+        let first = send(address, "a");
+        assert_eq!(child.seen.recv().unwrap(), "a");
+        let queued = send(address, "b");
+        until_waiting(model, 1);
+        let started = Instant::now();
+        let (status, head, body) = finish(send(address, "c"));
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "full refuses at once"
+        );
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (503, &json!("server_busy"))
+        );
+        assert_eq!(header(&head, "Retry-After"), Some("1"));
+
+        let (status, head, body) = finish(queued);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (503, &json!("queue_timeout"))
+        );
+        assert_eq!(header(&head, "Retry-After"), Some("1"));
+        assert_eq!(model.queue.waiting(), 0);
+
+        child.release.send(()).unwrap();
+        assert_eq!(finish(first).0, 200);
+        server.join().unwrap();
+        assert!(!child.overlapped.join().unwrap());
+    }
+
+    #[test]
+    fn a_client_that_leaves_while_queued_is_never_forwarded() {
+        let child = gated_child(2);
+        let pool = queued_pool(child.address, QueueSettings::default());
+        let (address, server) = proxy(&pool, 3);
+        let model = &pool.models[0];
+
+        let first = send(address, "a");
+        assert_eq!(child.seen.recv().unwrap(), "a");
+        let leaving = send(address, "b");
+        until_waiting(model, 1);
+        let staying = send(address, "c");
+        until_waiting(model, 2);
+        drop(leaving);
+        until_waiting(model, 1);
+
+        child.release.send(()).unwrap();
+        assert_eq!(
+            child.seen.recv().unwrap(),
+            "c",
+            "the departed request was skipped"
+        );
+        child.release.send(()).unwrap();
+        assert_eq!(finish(first).0, 200);
+        assert_eq!(finish(staying).0, 200);
+        server.join().unwrap();
+        assert!(!child.overlapped.join().unwrap());
+    }
+
+    #[test]
+    fn queue_headers_join_the_response_head_and_the_body_is_unchanged() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let mut client = Vec::new();
+        let bytes = pass_response(&mut &response[..], &mut client, "X-A: 1\r\n").unwrap();
+        assert_eq!(
+            client,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: 1\r\n\r\nhi"
+        );
+        assert_eq!(bytes, client.len() as u64);
+        // Without a complete head the bytes pass through untouched.
+        let mut client = Vec::new();
+        pass_response(&mut &b"garbage"[..], &mut client, "X-A: 1\r\n").unwrap();
+        assert_eq!(client, b"garbage");
     }
 
     #[test]
