@@ -10,7 +10,7 @@
 //! layer, so differences compound; the result is reported per layer and the
 //! final next-token argmax must match the source.
 
-use std::{num::NonZeroUsize, path::Path, sync::Mutex};
+use std::{io, num::NonZeroUsize, ops::Range, path::Path, sync::Mutex};
 
 use deepseek::{
     checkpoint::{
@@ -25,10 +25,10 @@ use deepseek::{
     moe::RoutedExpertSource,
     reduced::{
         RequestSession, StepSources,
-        checkpoint_model::{V41CheckpointWeights, V41Engrams, V41InferenceConfig},
+        checkpoint_model::{V41Backend, V41CheckpointWeights, V41Engrams, V41InferenceConfig},
     },
 };
-use server::range_fetch::{CurlHost, Envelope, FetchingSource};
+use server::range_fetch::{CurlHost, Envelope, FetchingSource, RangeHost};
 
 const ENGRAM_WIDTH: usize = 256;
 
@@ -78,6 +78,45 @@ fn real_shell_prompt_matches_the_source_greedy_token() {
     run_capture("parity-shell.json", "capture-shell2");
 }
 
+/// `METALLIX_V41_BACKEND=metal` selects the Metal Engram WKV and final head
+/// (with the `metal` feature); anything else, or unset, is the scalar path.
+fn backend() -> V41Backend {
+    match std::env::var("METALLIX_V41_BACKEND").as_deref() {
+        #[cfg(feature = "metal")]
+        Ok("metal") => V41Backend::Metal,
+        Ok("scalar") | Err(_) => V41Backend::Scalar,
+        Ok(other) => panic!("METALLIX_V41_BACKEND={other} is not available in this build"),
+    }
+}
+
+/// Largest fetch [`Host`] allows with `METALLIX_V41_NO_EXPERT_FETCH=1`.
+/// Engram and embedding rows, which are fetched on every run and never
+/// stored, are at most a few KB; a routed expert tensor is megabytes.
+const ROW_FETCH_LIMIT: u64 = 1 << 20;
+
+/// [`CurlHost`], except that with `METALLIX_V41_NO_EXPERT_FETCH=1` it refuses
+/// any fetch larger than a row, so a run that routes to an expert not stored
+/// yet (as a different backend's numerics might) fails instead of
+/// downloading it.
+struct Host {
+    rows_only: bool,
+}
+
+impl RangeHost for Host {
+    fn get_range(&self, url: &str, range: Range<u64>) -> io::Result<(Vec<u8>, String)> {
+        if self.rows_only && range.end.saturating_sub(range.start) > ROW_FETCH_LIMIT {
+            return Err(io::Error::other(format!(
+                "METALLIX_V41_NO_EXPERT_FETCH: refusing {url} bytes {range:?}"
+            )));
+        }
+        CurlHost.get_range(url, range)
+    }
+
+    fn free_bytes(&self, path: &Path) -> Option<u64> {
+        CurlHost.free_bytes(path)
+    }
+}
+
 /// Prefills the recorded run's prompt through `prefill_with_sources`, reports
 /// per-layer agreement with `capture`, and requires the source's greedy token.
 #[allow(
@@ -106,7 +145,9 @@ fn run_capture(run_file: &str, capture: &str) {
         &trace,
         repo,
         revision.clone(),
-        CurlHost,
+        Host {
+            rows_only: std::env::var("METALLIX_V41_NO_EXPERT_FETCH").as_deref() == Ok("1"),
+        },
         Envelope::default(),
     )
     .expect("fetching source");
@@ -126,6 +167,8 @@ fn run_capture(run_file: &str, capture: &str) {
     )
     .expect("non-expert layers");
     weights.load_head(&mut cache).expect("BF16 head");
+    let backend = backend();
+    weights.set_backend(backend).expect("backend");
     let inputs = EngramHashInputs::parse(
         &std::fs::read(root.join("engram-hash/v41-engram-inputs.bin")).expect("Engram inputs"),
         &V41_ENGRAM_INPUTS_IDENTITY,
@@ -169,6 +212,7 @@ fn run_capture(run_file: &str, capture: &str) {
         .collect();
     let embedding = V41CachedEmbeddingRows::new(&cache, config.width());
     let mut session = RequestSession::new(&model).expect("request session");
+    let started = std::time::Instant::now();
     let output = session
         .prefill_with_sources(
             &ids,
@@ -179,7 +223,20 @@ fn run_capture(run_file: &str, capture: &str) {
             },
         )
         .expect("real request prefill");
+    eprintln!(
+        "{backend:?} prefill of {} tokens: {:.1} s",
+        ids.len(),
+        started.elapsed().as_secs_f64()
+    );
     assert_eq!(session.next_start(), ids.len());
+    #[cfg(feature = "metal")]
+    if let Some(counts) = weights.device_counts() {
+        eprintln!("device {counts:?}");
+        assert!(
+            counts.resident_fp8 > 0 && counts.fp4_experts > 0 && counts.scalar_fallbacks == 0,
+            "the Metal backend ran its linears on the device: {counts:?}"
+        );
+    }
 
     let capture = trace.join(capture);
     let read = |name: String| std::fs::read(capture.join(name)).expect("captured tensor");
