@@ -14,6 +14,7 @@
 #![allow(unsafe_code)]
 
 use std::ffi::CString;
+use std::sync::OnceLock;
 
 use mlx_rs::{Array, Dtype, Stream, StreamOrDevice};
 use mlx_sys as sys;
@@ -822,6 +823,24 @@ impl Drop for ConfigHandle {
     }
 }
 
+/// Installs mlx-rs's MLX error handler before any raw MLX-C call.
+///
+/// MLX-C's default handler prints the message and calls `exit(-1)`, so a
+/// rejected kernel launch would end the process instead of returning a status.
+/// mlx-rs replaces that handler the first time it runs a guarded op, which
+/// this module's raw calls never do; one tiny guarded op forces the install.
+fn ensure_mlx_error_handler() -> Result<(), Fp8MetalError> {
+    static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
+    INSTALLED
+        .get_or_init(|| {
+            Array::zeros::<f32>(&[1])
+                .map(drop)
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(Fp8MetalError::Mlx)
+}
+
 fn check(status: std::os::raw::c_int) -> Result<(), Fp8MetalError> {
     if status == 0 {
         Ok(())
@@ -834,6 +853,7 @@ fn check(status: std::os::raw::c_int) -> Result<(), Fp8MetalError> {
 
 impl KernelHandle {
     fn new(name: &str, inputs: &[&str], output: &str, source: &str) -> Result<Self, Fp8MetalError> {
+        ensure_mlx_error_handler()?;
         let name = CString::new(name).map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
         let source = CString::new(source).map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
         let header = CString::default();
@@ -868,6 +888,7 @@ impl KernelHandle {
         grid: [i32; 3],
         threadgroup: [i32; 3],
     ) -> Result<Array, Fp8MetalError> {
+        ensure_mlx_error_handler()?;
         // SAFETY: `mlx_fast_metal_kernel_config_new` has no preconditions.
         let config = ConfigHandle(unsafe { sys::mlx_fast_metal_kernel_config_new() });
         // SAFETY: `config.0` is live; the shape slice outlives the call and MLX copies it.
@@ -944,9 +965,11 @@ impl Drop for KernelHandle {
 
 #[cfg(test)]
 mod tests {
+    use mlx_rs::Array;
+
     use super::{
         Fp4MetalExpert, Fp4MetalKernel, Fp4MetalWeights, Fp8MetalError, Fp8MetalKernel,
-        Fp8MetalWeights,
+        Fp8MetalWeights, KernelHandle,
     };
     use crate::precision::{
         ActivationGroup, fp4_linear_runtime_f32, fp8_linear_runtime_f32,
@@ -1230,5 +1253,25 @@ mod tests {
                 index: 0
             })
         ));
+    }
+
+    // Run alone with `--exact` to exercise a process where nothing else has
+    // installed the handler yet; without the install this exits with status 255.
+    #[test]
+    fn rejected_kernel_launch_returns_an_error_instead_of_exiting() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let kernel = KernelHandle::new(
+            "metallix_two_input_probe",
+            &["left", "right"],
+            "out",
+            "out[0] = left[0] + right[0];",
+        )
+        .expect("kernel object");
+        let left = Array::from_slice(&[1.0_f32], &[1]);
+        let launched = kernel.apply(&[&left], &[1], &[], [1, 1, 1], [1, 1, 1]);
+        assert!(
+            matches!(launched, Err(Fp8MetalError::Mlx(_))),
+            "{launched:?}"
+        );
     }
 }
