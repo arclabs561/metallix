@@ -148,7 +148,7 @@ pub fn fp8_linear_runtime_f32(
 
 /// [`decode_e4m3fn`] for every code, so the inner product loads a value
 /// instead of branching on the code.
-static E4M3FN: LazyLock<[f32; 256]> = LazyLock::new(|| {
+pub(crate) static E4M3FN: LazyLock<[f32; 256]> = LazyLock::new(|| {
     let mut table = [0.0; 256];
     for (value, code) in table.iter_mut().zip(0_u8..=255) {
         *value = decode_e4m3fn(code);

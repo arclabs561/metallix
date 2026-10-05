@@ -5,9 +5,11 @@
 //! It is neither a checkpoint decoder nor a CUDA, Tensor Core, or BF16-output
 //! parity oracle.
 
+use std::sync::LazyLock;
+
 use thiserror::Error;
 
-use super::{decode_e2m1x2, decode_e4m3fn, decode_e8m0};
+use super::{decode_e2m1x2, decode_e8m0, fp8_linear::E4M3FN};
 
 const WEIGHT_GROUP: usize = 32;
 
@@ -138,33 +140,17 @@ pub fn fp4_linear_runtime_f32(
     )?;
     validate_codes(activation_codes, activation_scales, weight_scales)?;
 
-    // Validate all numerical results before the write pass. The write pass has
-    // identical, infallible scalar arithmetic over inputs established above.
-    for row in 0..shape.rows {
-        for column in 0..shape.outputs {
-            let _ = shape.compute(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                row,
-                column,
-            )?;
-        }
-    }
-    for row in 0..shape.rows {
-        let destination = &mut output[row * shape.outputs..(row + 1) * shape.outputs];
-        for (column, slot) in destination.iter_mut().enumerate() {
-            *slot = shape.compute(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                row,
-                column,
-            )?;
-        }
-    }
+    // Compute once into scratch and copy on success, so an overflow partway
+    // through still leaves `output` unchanged.
+    let mut scratch = vec![0.0_f32; output.len()];
+    shape.compute_all(
+        activation_codes,
+        activation_scales,
+        weight_codes,
+        weight_scales,
+        &mut scratch,
+    )?;
+    output.copy_from_slice(&scratch);
     Ok(())
 }
 
@@ -203,20 +189,26 @@ pub fn fp4_linear_runtime_f32_owned(
         .map_err(|_| Fp4LinearError::AllocationFailed {
             elements: output_elements,
         })?;
-    for row in 0..shape.rows {
-        for column in 0..shape.outputs {
-            output.push(shape.compute(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                row,
-                column,
-            )?);
-        }
-    }
+    output.resize(output_elements, 0.0);
+    shape.compute_all(
+        activation_codes,
+        activation_scales,
+        weight_codes,
+        weight_scales,
+        &mut output,
+    )?;
     Ok(output)
 }
+
+/// [`decode_e2m1x2`] for every byte, so the inner product loads both weights
+/// instead of decoding two nibbles.
+static E2M1X2: LazyLock<[[f32; 2]; 256]> = LazyLock::new(|| {
+    let mut table = [[0.0; 2]; 256];
+    for (values, byte) in table.iter_mut().zip(0_u8..=255) {
+        *values = decode_e2m1x2(byte);
+    }
+    table
+});
 
 #[derive(Clone, Copy)]
 struct LinearShape {
@@ -308,24 +300,68 @@ impl LinearShape {
             .ok_or(Fp4LinearError::ShapeOverflow { field: "output" })
     }
 
-    fn compute(
+    /// Every output into `output` (`[rows, outputs]`), decoding each
+    /// activation row once for all of its output columns.
+    fn compute_all(
         self,
         activation_codes: &[u8],
         activation_scales: &[u8],
         weight_codes: &[u8],
         weight_scales: &[u8],
+        output: &mut [f32],
+    ) -> Result<(), Fp4LinearError> {
+        let activation_table = &*E4M3FN;
+        let weight_table = &*E2M1X2;
+        let mut activations = vec![0.0_f32; self.reduction];
+        for (row, codes) in activation_codes.chunks_exact(self.reduction).enumerate() {
+            for (value, &code) in activations.iter_mut().zip(codes) {
+                *value = activation_table[usize::from(code)];
+            }
+            let destination = &mut output[row * self.outputs..(row + 1) * self.outputs];
+            for (column, slot) in destination.iter_mut().enumerate() {
+                *slot = self.compute(
+                    &activations,
+                    activation_scales,
+                    weight_codes,
+                    weight_scales,
+                    weight_table,
+                    row,
+                    column,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One output from row `row`'s decoded `activations`, summing each block's
+    /// products in reduction order and the scaled blocks in block order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each buffer role stays explicit, as in fp4_linear_runtime_f32"
+    )]
+    fn compute(
+        self,
+        activations: &[f32],
+        activation_scales: &[u8],
+        weight_codes: &[u8],
+        weight_scales: &[u8],
+        weight_table: &[[f32; 2]; 256],
         row: usize,
         column: usize,
     ) -> Result<f32, Fp4LinearError> {
+        let packed = self.reduction / 2;
+        let weights = &weight_codes[column * packed..(column + 1) * packed];
         let mut accumulated = 0.0_f32;
-        for block in 0..self.weight_blocks_per_row {
-            let activation_base = row * self.reduction + block * WEIGHT_GROUP;
-            let weight_base = column * (self.reduction / 2) + block * (WEIGHT_GROUP / 2);
+        for (block, (activations, weights)) in activations
+            .chunks_exact(WEIGHT_GROUP)
+            .zip(weights.chunks_exact(WEIGHT_GROUP / 2))
+            .enumerate()
+        {
             let mut dot = 0.0_f32;
-            for pair in 0..(WEIGHT_GROUP / 2) {
-                let [low, high] = decode_e2m1x2(weight_codes[weight_base + pair]);
-                dot += decode_e4m3fn(activation_codes[activation_base + pair * 2]) * low;
-                dot += decode_e4m3fn(activation_codes[activation_base + pair * 2 + 1]) * high;
+            for (pair, &byte) in activations.chunks_exact(2).zip(weights) {
+                let [low, high] = weight_table[usize::from(byte)];
+                dot += pair[0] * low;
+                dot += pair[1] * high;
             }
             let activation_scale_index = row * self.activation_scales_per_row
                 + (block * WEIGHT_GROUP) / self.activation_group;
@@ -372,8 +408,9 @@ fn validate_codes(
     activation_scales: &[u8],
     weight_scales: &[u8],
 ) -> Result<(), Fp4LinearError> {
+    let table = &*E4M3FN;
     for (element, &code) in activation_codes.iter().enumerate() {
-        if !decode_e4m3fn(code).is_finite() {
+        if !table[usize::from(code)].is_finite() {
             return Err(Fp4LinearError::NonFiniteActivation { element });
         }
     }
@@ -393,8 +430,10 @@ fn validate_codes(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivationGroup, Fp4LinearError, fp4_linear_runtime_f32, fp4_linear_runtime_f32_owned,
+        ActivationGroup, E2M1X2, Fp4LinearError, decode_e2m1x2, decode_e8m0,
+        fp4_linear_runtime_f32, fp4_linear_runtime_f32_owned,
     };
+    use crate::decode_e4m3fn;
 
     const ONE: u8 = 0x38;
     const NEG_ONE: u8 = 0xb8;
@@ -408,6 +447,147 @@ mod tests {
                 .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
             "actual {actual:?} differs from expected {expected:?}"
         );
+    }
+
+    #[test]
+    fn e2m1x2_table_matches_the_decoder_for_every_byte() {
+        for byte in 0_u8..=255 {
+            let [low, high] = decode_e2m1x2(byte);
+            let [table_low, table_high] = E2M1X2[usize::from(byte)];
+            assert_eq!(
+                [table_low.to_bits(), table_high.to_bits()],
+                [low.to_bits(), high.to_bits()],
+                "byte {byte:#04x}"
+            );
+        }
+    }
+
+    /// The equation as written: decode every code per product, sum each
+    /// 32-element block in reduction order, then the scaled blocks in order.
+    fn per_product_decode(
+        activations: &[u8],
+        activation_scales: &[u8],
+        weights: &[u8],
+        weight_scales: &[u8],
+        (rows, reduction, outputs, group): (usize, usize, usize, usize),
+    ) -> Vec<f32> {
+        let blocks = reduction / 32;
+        let mut output = Vec::with_capacity(rows * outputs);
+        for row in 0..rows {
+            for column in 0..outputs {
+                let mut accumulated = 0.0_f32;
+                for block in 0..blocks {
+                    let mut dot = 0.0_f32;
+                    for k in block * 32..(block + 1) * 32 {
+                        let weight =
+                            decode_e2m1x2(weights[column * (reduction / 2) + k / 2])[k % 2];
+                        dot += decode_e4m3fn(activations[row * reduction + k]) * weight;
+                    }
+                    accumulated +=
+                        dot * decode_e8m0(
+                            activation_scales[row * (reduction / group) + block * 32 / group],
+                        ) * decode_e8m0(weight_scales[column * blocks + block]);
+                }
+                output.push(accumulated);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn sums_each_block_in_reduction_order() {
+        // FP4 x E4M3FN products carry few significant bits, so most sums are
+        // exact in FP32 and their order is invisible. Here 24 products of
+        // 448 x 6 reach D = 64512 (an even multiple of its ulp, 2^-8), then
+        // element 30 adds 2^-9 x 1 and element 31 adds (3 x 2^-9) x 0.5.
+        // In order: D + ulp/2 ties to even D, then + 3ulp/4 gives D + ulp.
+        // Swapped: D + 3ulp/4 gives D + ulp, then + ulp/2 ties up to D + 2ulp.
+        let mut activations = [ONE; 32];
+        activations[..24].fill(0x7e); // 448
+        activations[30] = 0x01; // 2^-9
+        activations[31] = 0x03; // 3 x 2^-9
+        let mut weights = [0_u8; 16];
+        weights[..12].fill(0x77); // 6, 6
+        weights[15] = 0x12; // low 1.0, high 0.5
+        let mut output = [0.0_f32; 1];
+        fp4_linear_runtime_f32(
+            &activations,
+            &[127],
+            &weights,
+            &[127],
+            1,
+            32,
+            1,
+            ActivationGroup::Elements32,
+            &mut output,
+        )
+        .expect("finite");
+        assert_bits_eq(&output, &[64512.0 + 2.0_f32.powi(-8)]);
+    }
+
+    #[test]
+    fn matches_per_product_decoding_bit_for_bit() {
+        // Every finite activation code and every weight byte, signs and
+        // subnormals included, in a fixed shuffled stream; sums of mixed signs
+        // make the order observable.
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        };
+        for (group, rows, reduction, outputs) in [
+            (ActivationGroup::Elements32, 3, 256, 37),
+            (ActivationGroup::Elements128, 2, 384, 29),
+        ] {
+            let g = group.elements();
+            let blocks = reduction / 32;
+            let activations: Vec<u8> = (0..rows * reduction)
+                .map(|_| {
+                    let code = next();
+                    if code & 0x7f == 0x7f { code ^ 1 } else { code }
+                })
+                .collect();
+            let weights: Vec<u8> = (0..outputs * reduction / 2).map(|_| next()).collect();
+            let activation_scales: Vec<u8> = (0..rows * (reduction / g))
+                .map(|_| 120 + next() % 8)
+                .collect();
+            let weight_scales: Vec<u8> = (0..outputs * blocks).map(|_| 120 + next() % 8).collect();
+            let expected = per_product_decode(
+                &activations,
+                &activation_scales,
+                &weights,
+                &weight_scales,
+                (rows, reduction, outputs, g),
+            );
+            let mut output = vec![0.0_f32; rows * outputs];
+            fp4_linear_runtime_f32(
+                &activations,
+                &activation_scales,
+                &weights,
+                &weight_scales,
+                rows,
+                reduction,
+                outputs,
+                group,
+                &mut output,
+            )
+            .expect("finite");
+            assert_bits_eq(&output, &expected);
+            let owned = fp4_linear_runtime_f32_owned(
+                &activations,
+                &activation_scales,
+                &weights,
+                &weight_scales,
+                rows,
+                reduction,
+                outputs,
+                group,
+            )
+            .expect("finite");
+            assert_bits_eq(&owned, &expected);
+        }
     }
 
     #[test]

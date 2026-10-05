@@ -17,5 +17,9 @@ serde_json.workspace = true
 name = "fp8_linear"
 harness = false
 
+[[bench]]
+name = "linear"
+harness = false
+
 [lints]
 workspace = true
