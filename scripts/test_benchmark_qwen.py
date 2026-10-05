@@ -109,7 +109,9 @@ def run_benchmark(
         [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
-        timeout=5,
+        # Only a hang guard: the fake binary returns at once, yet a 5 s bound
+        # expired under a load average of 15-25 from parallel builds.
+        timeout=60,
         env=env,
         check=False,
     )
