@@ -37,6 +37,8 @@ pub mod range_fetch;
 mod responses;
 #[cfg(feature = "metal")]
 mod serve_registry;
+#[cfg(feature = "metal")]
+mod serving;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
@@ -697,7 +699,7 @@ pub fn run() -> ExitCode {
             kv_budget_mib,
             generation_timeout_ms,
         } => match serve_registry::entries(registry.as_deref(), model.as_deref(), &model_id) {
-            Ok(models) => responses::serve(
+            Ok(models) => serving::serve(
                 &models,
                 listen,
                 resident_chat_limits(context_tokens, kv_budget_mib),
