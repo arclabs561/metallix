@@ -26,10 +26,6 @@ use crate::{
 };
 
 const MAX_SESSION_ELEMENTS: usize = 1 << 20;
-/// Largest owned FP8 WKV weight: the real V4.1 Flash projection,
-/// `[(hc_mult + 1) * dim, columns * embedding_width]` = 25600 x 6144.
-/// An allocation guard for the static weight, not a per-step work limit.
-const MAX_WKV_ELEMENTS: usize = 25_600 * 6_144;
 
 /// Immutable layout and token-compression operands for one batch-one Engram request.
 ///
@@ -708,16 +704,17 @@ fn checked_product(
     }
 }
 
+/// The static WKV weight is caller-owned and only length-checked, so its size
+/// is not capped; every per-step buffer and the work a step does are bounded
+/// through [`checked_product`] (the projection output is `positions x outputs`).
 fn wkv_weight_elements(
     outputs: usize,
     reduction: usize,
     field: &'static str,
 ) -> Result<usize, EngramSessionError> {
-    match outputs.checked_mul(reduction) {
-        Some(elements) if elements <= MAX_WKV_ELEMENTS => Ok(elements),
-        Some(elements) => Err(EngramSessionError::ElementLimit { field, elements }),
-        None => Err(EngramSessionError::ShapeOverflow { field }),
-    }
+    outputs
+        .checked_mul(reduction)
+        .ok_or(EngramSessionError::ShapeOverflow { field })
 }
 
 fn reserved_vec<T>(elements: usize, field: &'static str) -> Result<Vec<T>, EngramSessionError> {
@@ -828,7 +825,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{EngramSession, EngramSessionConfig, EngramSessionError, EngramSessionWeights};
-    use crate::engram::EngramHashLayout;
+    use crate::engram::{
+        EngramHashLayout,
+        embedding::{EngramEmbeddingError, EngramRowSource},
+    };
 
     /// A config with V4.1 Flash Engram geometry (4-grams, 8 heads, 256-wide
     /// rows, 4 HC copies) at hidden width `width`.
@@ -849,17 +849,45 @@ mod tests {
         )
     }
 
+    /// Every row is zero codes with unit scales.
+    struct ZeroRows;
+
+    impl EngramRowSource for ZeroRows {
+        fn read_rows(
+            &self,
+            _: &[usize],
+            codes: &mut [u8],
+            scales: &mut [u8],
+        ) -> Result<(), EngramEmbeddingError> {
+            codes.fill(0);
+            scales.fill(127);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn wkv_cap_admits_the_real_v41_projection_and_nothing_larger() {
+    fn real_v41_wkv_is_admitted_and_each_step_is_bounded_by_its_buffers() {
         // (4 + 1) * 5120 = 25600 outputs over 24 * 256 = 6144 reductions.
-        v41_config(5120).expect("real V4.1 WKV weight");
+        let config = v41_config(5120).expect("real V4.1 WKV weight");
+        let weights = EngramSessionWeights::without_embedding_table(
+            vec![0; 25_600 * 6_144],
+            vec![127; 800 * 192],
+            vec![0x3f80; 4 * 5120],
+            vec![0x3f80; 4 * 5120],
+        );
+        let mut session = EngramSession::new(config, weights).expect("real-size session");
+        // One step's WKV output is positions x 25600; 41 positions exceed the
+        // per-step buffer bound before any projection work starts.
+        let ids = vec![1; 41];
+        let residual = vec![0x3f80; 41 * 4 * 5120];
         assert!(matches!(
-            v41_config(5152),
+            session.step_with(0, &ids, &residual, &ZeroRows),
             Err(EngramSessionError::ElementLimit {
-                field: "WKV weight",
-                elements: 158_269_440,
+                field: "WKV output",
+                elements: 1_049_600,
             })
         ));
+        assert_eq!(session.next_start(), 0, "a rejected step commits nothing");
     }
 
     #[test]
