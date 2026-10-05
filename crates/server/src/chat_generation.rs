@@ -13,7 +13,7 @@ use std::{
 
 use minijinja::{Environment, context};
 use minijinja_contrib::pycompat::unknown_method_callback;
-use qwen::metal::Qwen3MlxWeights;
+use qwen::metal::{Qwen3MlxWeights, Qwen3WeightPrecision};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -36,8 +36,13 @@ const MAX_CHAT_TOOLS: usize = 64;
 const TEMPLATE_FUEL: u64 = 100_000;
 const MIB_BYTES: u64 = 1024 * 1024;
 
-/// Default prompt-prefix cache budget: room for a few multi-thousand-token
-/// agent preambles of a small Qwen3 at float32 K/V.
+/// Resident weight and K/V precision. Decode reads every weight once per
+/// token, so BF16 halves those bytes against float32, which stays the qwen
+/// crate's reference precision. Admission plans K/V at this same precision.
+const SERVING_PRECISION: Qwen3WeightPrecision = Qwen3WeightPrecision::BFloat16;
+
+/// Default prompt-prefix cache budget: room for several multi-thousand-token
+/// agent preambles of a small Qwen3 at BF16 K/V.
 pub(crate) const DEFAULT_PREFIX_CACHE_MIB: u32 = 2048;
 
 /// One resident-chat admission contract shared by session loading and turns.
@@ -661,7 +666,7 @@ impl ChatSession {
 
         let mut weights = Qwen3MlxWeights::load(model).map_err(|error| error.to_string())?;
         weights
-            .prepare_float32()
+            .prepare_precision(SERVING_PRECISION)
             .map_err(|error| error.to_string())?;
         // The template, tokenizer and config (which carries the RoPE
         // settings) fix how tokens become K/V; the chat path loads no adapter.
@@ -837,15 +842,47 @@ impl ChatSession {
         let mut decode_ms = Vec::new();
         let mut ttft = None;
         let mut finish_reason = ChatFinishReason::Length;
+        // A plain greedy turn without logprobs picks each token on the GPU
+        // and queues step t + 1 before reading step t back. Every other turn
+        // reads the full logit row, which the host picker and logprobs need.
+        let pipelined = request.top_logprobs.is_none() && picker.is_plain_greedy();
+        let mut pending = None;
+        let mut last_token_at = Instant::now();
 
         for step in 0..max_tokens {
             deadline.check()?;
-            let (token, grammar_complete) = picker.pick(&logits)?;
+            let (token, grammar_complete) = match pending.take() {
+                Some(current) => {
+                    let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
+                    let token = span
+                        .in_scope(|| {
+                            if step + 1 < max_tokens {
+                                pending = Some(executor.decode_greedy_after(&current)?);
+                            }
+                            current.wait_one()
+                        })
+                        .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+                    // Time between token readbacks: with a step always queued,
+                    // that is the per-token cost, not one step's latency.
+                    let step_ms = elapsed_ms(last_token_at.elapsed());
+                    span.record("decode_ms", step_ms);
+                    decode_ms.push(step_ms);
+                    (token, false)
+                }
+                None => picker.pick(&logits)?,
+            };
+            last_token_at = Instant::now();
             if let Some(top) = request.top_logprobs.filter(|_| token != self.eos_token_id) {
                 logprobs.push(self.token_logprob(&logits, token, top)?);
             }
             generated.push(token);
             if token == self.eos_token_id {
+                if pending.is_some() {
+                    // The queued step appended this end-of-sequence token.
+                    executor
+                        .truncate_cached_tokens(executor.cached_tokens() - 1)
+                        .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+                }
                 finish_reason = ChatFinishReason::Eos;
                 break;
             }
@@ -861,7 +898,15 @@ impl ChatSession {
                 break;
             }
 
-            if step + 1 < max_tokens {
+            if pipelined && step + 1 < max_tokens && pending.is_none() {
+                // Only after the prefill token; later steps were queued above.
+                deadline.check()?;
+                pending = Some(
+                    executor
+                        .decode_greedy(token)
+                        .map_err(|error| ChatGenerationError::message(error.to_string()))?,
+                );
+            } else if !pipelined && step + 1 < max_tokens {
                 deadline.check()?;
                 // One span per generated token, ending with its logit readback.
                 let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
@@ -1098,7 +1143,7 @@ fn load_config(
             config.resident_chat_plan(
                 limits.context_tokens(),
                 limits.kv_budget_bytes(),
-                qwen::forward::Qwen3WeightPrecision::Float32,
+                SERVING_PRECISION,
             )
         })
         .map_err(|error| error.to_string())?;
@@ -1287,6 +1332,16 @@ impl TokenPicker {
             constraint,
             applied,
         })
+    }
+
+    /// Whether every token is the unmasked argmax of the raw logits, which the
+    /// GPU can select without the host reading the row.
+    fn is_plain_greedy(&self) -> bool {
+        #[cfg(feature = "structured-output")]
+        if self.constraint.is_some() {
+            return false;
+        }
+        self.policy.is_none()
     }
 
     /// Returns the next token and whether it completed the schema grammar.
