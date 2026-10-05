@@ -77,7 +77,7 @@ use crate::{
 };
 
 #[cfg(feature = "metal")]
-use mlx_rs::{Array, StreamOrDevice};
+use mlx_rs::{Array, StreamOrDevice, ops::concatenate_device};
 
 /// Output-projection implementation selected by a model-local final head.
 ///
@@ -266,6 +266,74 @@ impl<'a> FinalHead<'a> {
         residual_bf16: &[u16],
         incoming_pre: &[f32],
     ) -> Result<FinalHeadOutput, FinalHeadError> {
+        let (mut output, normalized_f32) = self.normalize(residual_bf16, incoming_pre)?;
+        output.logits = match (self.execution, self.head_weight) {
+            (FinalHeadExecution::Scalar, HeadWeights::F32(weights)) => {
+                let mut logits = allocate_f32("logits", self.vocabulary)?;
+                logits.resize(self.vocabulary, 0.0);
+                fp32_linear_reference(
+                    &normalized_f32,
+                    weights,
+                    1,
+                    self.width,
+                    self.vocabulary,
+                    &mut logits,
+                )?;
+                logits
+            }
+            (FinalHeadExecution::Scalar, HeadWeights::Bf16(weights)) => {
+                project_logits_bf16(&normalized_f32, weights, self.vocabulary)?
+            }
+            #[cfg(feature = "metal")]
+            (FinalHeadExecution::MetalFp32, HeadWeights::F32(weights)) => {
+                project_logits_metal(&normalized_f32, weights, self.vocabulary, self.width)?
+            }
+            #[cfg(feature = "metal")]
+            (FinalHeadExecution::MetalFp32, HeadWeights::Bf16(_)) => {
+                return Err(FinalHeadError::UnsupportedExecution);
+            }
+        };
+        Ok(output)
+    }
+
+    /// Like [`Self::forward`], but projects through `head`, a device-resident
+    /// copy of this head's BF16 weights, regardless of the selected execution.
+    ///
+    /// `head` must have been built from the same `[vocabulary, hidden_width]`
+    /// BF16 weights this head borrows; only its shape can be checked here.
+    /// HC collapse and `RMSNorm` keep their scalar BF16 staging, and the
+    /// projection is FP32 over the exactly widened weights, so logits differ
+    /// from the scalar BF16 path only by FP32 summation order.
+    #[cfg(feature = "metal")]
+    pub fn forward_metal(
+        &self,
+        residual_bf16: &[u16],
+        incoming_pre: &[f32],
+        head: &MetalBf16Head,
+    ) -> Result<FinalHeadOutput, FinalHeadError> {
+        if !matches!(self.head_weight, HeadWeights::Bf16(_)) {
+            return Err(FinalHeadError::UnsupportedExecution);
+        }
+        if head.vocabulary != self.vocabulary || head.width != self.width {
+            return Err(FinalHeadError::Length {
+                field: "metal_head",
+                actual: checked_product(head.vocabulary, head.width, "metal_head")?,
+                expected: checked_product(self.vocabulary, self.width, "head_weight")?,
+            });
+        }
+        let (mut output, normalized_f32) = self.normalize(residual_bf16, incoming_pre)?;
+        output.logits = head.project(&normalized_f32)?;
+        Ok(output)
+    }
+
+    /// Validates one token's operands, then runs HC collapse and `RMSNorm`.
+    /// Returns the BF16 rows in an output with no logits yet, and the
+    /// normalized row widened to FP32 for the projection.
+    fn normalize(
+        &self,
+        residual_bf16: &[u16],
+        incoming_pre: &[f32],
+    ) -> Result<(FinalHeadOutput, Vec<f32>), FinalHeadError> {
         let expected_residual = checked_product(self.copies, self.width, "residual")?;
         if residual_bf16.len() != expected_residual {
             return Err(FinalHeadError::Length {
@@ -295,39 +363,164 @@ impl<'a> FinalHead<'a> {
 
         let mut normalized_f32 = allocate_f32("normalized_f32", self.width)?;
         normalized_f32.extend(normalized_bf16.iter().copied().map(bf16_to_f32));
-        let logits = match (self.execution, self.head_weight) {
-            (FinalHeadExecution::Scalar, HeadWeights::F32(weights)) => {
-                let mut logits = allocate_f32("logits", self.vocabulary)?;
-                logits.resize(self.vocabulary, 0.0);
-                fp32_linear_reference(
-                    &normalized_f32,
-                    weights,
-                    1,
-                    self.width,
-                    self.vocabulary,
-                    &mut logits,
-                )?;
-                logits
-            }
-            (FinalHeadExecution::Scalar, HeadWeights::Bf16(weights)) => {
-                project_logits_bf16(&normalized_f32, weights, self.vocabulary)?
-            }
-            #[cfg(feature = "metal")]
-            (FinalHeadExecution::MetalFp32, HeadWeights::F32(weights)) => {
-                project_logits_metal(&normalized_f32, weights, self.vocabulary, self.width)?
-            }
-            #[cfg(feature = "metal")]
-            (FinalHeadExecution::MetalFp32, HeadWeights::Bf16(_)) => {
-                return Err(FinalHeadError::UnsupportedExecution);
-            }
-        };
-
-        Ok(FinalHeadOutput {
+        let output = FinalHeadOutput {
             collapsed_bf16,
             normalized_bf16,
-            logits,
+            logits: Vec::new(),
+        };
+        Ok((output, normalized_f32))
+    }
+}
+
+/// Head rows widened and uploaded together: 8192 rows of a 5120-wide head
+/// are 168 MB of FP32, the largest host buffer an upload needs.
+#[cfg(feature = "metal")]
+const METAL_HEAD_CHUNK_ROWS: usize = 8192;
+
+/// A BF16 output head `[vocabulary, hidden_width]` widened exactly to FP32
+/// and uploaded once to MLX.
+///
+/// Build it once per model and pass it to [`FinalHead::forward_metal`] for
+/// every step; each call then uploads only the normalized row. The device
+/// copy adds `4 * vocabulary * hidden_width` bytes of unified memory beside
+/// the caller's host weights. Keeping FP32 rather than BF16 on the device
+/// gives FP32 logits without a per-call widened copy, and a BF16 matmul
+/// would round every logit to BF16.
+///
+/// The rows are held as separate row-block arrays: concatenating them on the
+/// device would hold the blocks and the joined copy at once, doubling the
+/// upload peak. Each projection concatenates only the per-block logits.
+#[cfg(feature = "metal")]
+pub struct MetalBf16Head {
+    blocks: Vec<Array>,
+    vocabulary: usize,
+    width: usize,
+}
+
+#[cfg(feature = "metal")]
+impl std::fmt::Debug for MetalBf16Head {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetalBf16Head")
+            .field("vocabulary", &self.vocabulary)
+            .field("width", &self.width)
+            .field("blocks", &self.blocks.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "metal")]
+impl MetalBf16Head {
+    /// Validates `weights` like [`FinalHead::with_weights`] does for
+    /// [`HeadWeights::Bf16`], then widens and uploads them to the GPU in
+    /// blocks of rows.
+    pub fn new(weights: &[u16], vocabulary: usize, width: usize) -> Result<Self, FinalHeadError> {
+        if width == 0 {
+            return Err(FinalHeadError::EmptyWidth);
+        }
+        if vocabulary == 0 {
+            return Err(FinalHeadError::EmptyVocabulary);
+        }
+        let expected = checked_product(vocabulary, width, "head_weight")?;
+        if expected > MAX_BF16_HEAD_ELEMENTS {
+            return Err(FinalHeadError::ElementLimit {
+                field: "head_weight",
+                elements: expected,
+                maximum: MAX_BF16_HEAD_ELEMENTS,
+            });
+        }
+        if weights.len() != expected {
+            return Err(FinalHeadError::Length {
+                field: "head_weight",
+                actual: weights.len(),
+                expected,
+            });
+        }
+        if let Some(element) = weights
+            .iter()
+            .position(|&bits| !bf16_to_f32(bits).is_finite())
+        {
+            return Err(FinalHeadError::NonFiniteHeadWeight { element });
+        }
+        i32::try_from(vocabulary).map_err(|_| FinalHeadError::MetalDimension {
+            field: "vocabulary",
+        })?;
+        let columns =
+            i32::try_from(width).map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
+        let block_rows = METAL_HEAD_CHUNK_ROWS.min(vocabulary);
+        let mut widened = allocate_f32("metal_head_block", block_rows * width)?;
+        let mut blocks = Vec::new();
+        for block in weights.chunks(block_rows * width) {
+            widened.clear();
+            widened.extend(block.iter().copied().map(bf16_to_f32));
+            let rows =
+                i32::try_from(block.len() / width).map_err(|_| FinalHeadError::MetalDimension {
+                    field: "vocabulary",
+                })?;
+            // `from_slice` copies into MLX-owned memory, so `widened` is reused.
+            blocks.push(Array::from_slice(&widened, &[rows, columns]));
+        }
+        Ok(Self {
+            blocks,
+            vocabulary,
+            width,
         })
     }
+
+    /// FP32 logits for one normalized FP32 row over the resident weights.
+    fn project(&self, input: &[f32]) -> Result<Vec<f32>, FinalHeadError> {
+        if input.len() != self.width {
+            return Err(FinalHeadError::Length {
+                field: "normalized_f32",
+                actual: input.len(),
+                expected: self.width,
+            });
+        }
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err(FinalHeadError::NonFiniteProjectionInput);
+        }
+        let columns = i32::try_from(self.width)
+            .map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
+        let stream = StreamOrDevice::gpu();
+        let input = Array::from_slice(input, &[columns, 1]);
+        let parts = self
+            .blocks
+            .iter()
+            .map(|block| block.matmul_device(&input, &stream))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(metal_error)?;
+        let logits = concatenate_device(&parts, &stream).map_err(metal_error)?;
+        host_logits(&logits, self.vocabulary)
+    }
+}
+
+#[cfg(feature = "metal")]
+#[allow(clippy::needless_pass_by_value)]
+fn metal_error(error: mlx_rs::error::Exception) -> FinalHeadError {
+    FinalHeadError::Metal {
+        message: error.to_string(),
+    }
+}
+
+/// Evaluates device `logits` and returns them as finite host logits.
+#[cfg(feature = "metal")]
+fn host_logits(logits: &Array, vocabulary: usize) -> Result<Vec<f32>, FinalHeadError> {
+    logits.eval().map_err(metal_error)?;
+    let values = logits.as_slice::<f32>();
+    if values.len() != vocabulary {
+        return Err(FinalHeadError::MetalOutputLength {
+            actual: values.len(),
+            expected: vocabulary,
+        });
+    }
+    if let Some((element, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(FinalHeadError::NonFiniteMetalOutput { element });
+    }
+    Ok(values.to_vec())
 }
 
 /// Runs one validated FP32 vocabulary projection through MLX Metal.
@@ -372,27 +565,8 @@ fn project_logits_metal(
     let input = Array::from_slice(input, &[columns, 1]);
     let logits = weights
         .matmul_device(&input, &stream)
-        .map_err(|error| FinalHeadError::Metal {
-            message: error.to_string(),
-        })?;
-    logits.eval().map_err(|error| FinalHeadError::Metal {
-        message: error.to_string(),
-    })?;
-    let values = logits.as_slice::<f32>();
-    if values.len() != vocabulary {
-        return Err(FinalHeadError::MetalOutputLength {
-            actual: values.len(),
-            expected: vocabulary,
-        });
-    }
-    if let Some((element, _)) = values
-        .iter()
-        .enumerate()
-        .find(|(_, value)| !value.is_finite())
-    {
-        return Err(FinalHeadError::NonFiniteMetalOutput { element });
-    }
-    Ok(values.to_vec())
+        .map_err(metal_error)?;
+    host_logits(&logits, vocabulary)
 }
 
 /// Owned observations from one final normalization and output-head call.
@@ -531,7 +705,7 @@ pub enum FinalHeadError {
         element: usize,
     },
     /// The selected execution does not support this head storage.
-    #[error("final head execution does not support BF16 head weights")]
+    #[error("final head execution does not support this head weight storage")]
     UnsupportedExecution,
     /// A temporary output row could not be reserved.
     #[error("could not allocate {elements} final-head elements for {field}")]
@@ -613,4 +787,113 @@ fn allocate_f32(field: &'static str, elements: usize) -> Result<Vec<f32>, FinalH
         .try_reserve_exact(elements)
         .map_err(|_| FinalHeadError::AllocationFailed { field, elements })?;
     Ok(values)
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod metal_tests {
+    use super::{FinalHead, FinalHeadError, HeadWeights, MetalBf16Head, bf16_to_f32};
+
+    /// Deterministic finite BF16 bits with exponents `low..low + span`.
+    fn bf16_values(count: usize, seed: u32, low: u32, span: u32) -> Vec<u16> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let sign = u16::from(state >> 31 == 1) << 15;
+                let exponent = u16::try_from(low + (state >> 16) % span).unwrap() << 7;
+                sign | exponent | u16::try_from(state & 0x7f).unwrap()
+            })
+            .collect()
+    }
+
+    fn argmax(values: &[f32]) -> usize {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn resident_bf16_head_matches_the_scalar_projection() {
+        // One full and one partial resident row block.
+        let (vocabulary, width, copies) = (super::METAL_HEAD_CHUNK_ROWS + 4099, 1024, 4);
+        let norm = bf16_values(width, 3, 126, 3);
+        // Weights about 2^-15..2^-6, the scale of a trained output head.
+        let weights = bf16_values(vocabulary * width, 11, 112, 10);
+        let head =
+            FinalHead::with_weights(&norm, HeadWeights::Bf16(&weights), vocabulary, copies, 1e-6)
+                .unwrap();
+        let resident = MetalBf16Head::new(&weights, vocabulary, width).unwrap();
+        assert_eq!(resident.blocks.len(), 2);
+        // Two steps through one upload: the resident copy is reused, not stale.
+        for seed in [13, 17] {
+            let residual = bf16_values(copies * width, seed, 120, 12);
+            let pre = [0.4, 0.3, 0.2, 0.1];
+            let scalar = head.forward(&residual, &pre).unwrap();
+            let metal = head.forward_metal(&residual, &pre, &resident).unwrap();
+            assert_eq!(metal.collapsed_bf16(), scalar.collapsed_bf16());
+            assert_eq!(metal.normalized_bf16(), scalar.normalized_bf16());
+            // Order-independent FP32 bound: width * eps * sum |x w| is about
+            // 6.1e-5 of the largest absolute row sum at width 1024.
+            let scale = weights
+                .chunks_exact(width)
+                .map(|row| {
+                    row.iter()
+                        .zip(scalar.normalized_bf16())
+                        .map(|(&w, &x)| (bf16_to_f32(w) * bf16_to_f32(x)).abs())
+                        .sum::<f32>()
+                })
+                .fold(0.0_f32, f32::max);
+            let error = metal
+                .logits()
+                .iter()
+                .zip(scalar.logits())
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0_f32, f32::max);
+            eprintln!(
+                "seed {seed}: max abs {error:e}, {:e} of scale {scale}",
+                error / scale
+            );
+            assert!(error <= 1e-4 * scale, "{error} exceeds 1e-4 * {scale}");
+            assert_eq!(argmax(metal.logits()), argmax(scalar.logits()));
+        }
+    }
+
+    #[test]
+    fn resident_head_rejects_mismatched_operands() {
+        let norm = [0x3f80; 4];
+        let weights = [0x3f80; 8];
+        let head = FinalHead::with_weights(&norm, HeadWeights::Bf16(&weights), 2, 1, 1.0).unwrap();
+        let residual = [0x3f80; 4];
+        let other = MetalBf16Head::new(&weights, 4, 2).unwrap();
+        assert!(matches!(
+            head.forward_metal(&residual, &[1.0], &other),
+            Err(FinalHeadError::Length {
+                field: "metal_head",
+                ..
+            })
+        ));
+        let resident = MetalBf16Head::new(&weights, 2, 4).unwrap();
+        assert!(
+            head.forward_metal(&residual[..3], &[1.0], &resident)
+                .is_err()
+        );
+        let f32_weights = [1.0; 8];
+        let f32_head = FinalHead::new(&norm, &f32_weights, 2, 1, 1.0).unwrap();
+        assert_eq!(
+            f32_head.forward_metal(&residual, &[1.0], &resident),
+            Err(FinalHeadError::UnsupportedExecution)
+        );
+        assert!(matches!(
+            MetalBf16Head::new(&[0x7f80; 8], 2, 4),
+            Err(FinalHeadError::NonFiniteHeadWeight { element: 0 })
+        ));
+        assert!(MetalBf16Head::new(&weights, 3, 4).is_err());
+        assert_eq!(
+            head.forward_metal(&residual, &[1.0], &resident).unwrap(),
+            head.forward(&residual, &[1.0]).unwrap()
+        );
+    }
 }
