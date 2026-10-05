@@ -394,8 +394,11 @@ Serve the same resident session locally:
 target/release/mx serve --model /path/to/Qwen3-0.6B --model-id metallix-qwen3
 ```
 
-It binds only to `127.0.0.1` by default and handles one request at a time. It
-offers `GET /healthz`, `GET /v1/models`, and `POST /v1/responses`; request
+It binds only to loopback (default `127.0.0.1:8321`). Each model runs in its own
+child process and admits one request at a time; a request to a busy model gets
+503 `server_busy`, while other models keep serving. It offers `GET /healthz`,
+`GET /v1/models`, and `POST /v1/responses`, plus `/v1/decisions`,
+`/v1/embeddings` and `/v1/rerank` for models with those capabilities; request
 bodies are limited to 1 MiB. The endpoint accepts text-only input, complete
 history, validated function definitions and function-call outputs, greedy
 sampling, and optional SSE. It rejects response storage, response-ID chaining,

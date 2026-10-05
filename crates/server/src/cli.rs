@@ -112,7 +112,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serve registered models: Qwen generation and decisions, Julia decisions.
+    /// Serve registered models for generation, decisions, embeddings and reranking.
     #[cfg(feature = "metal")]
     Serve {
         /// Qwen checkpoint served as `--model-id`; shorthand for a one-entry registry.
@@ -120,7 +120,12 @@ pub(crate) enum Command {
         model: Option<PathBuf>,
         #[arg(long, default_value = "metallix-qwen3")]
         model_id: String,
-        /// JSON manifest `{"models": [{"id", "kind": "qwen"|"julia", "path"}]}`; all load at startup.
+        /// JSON manifest `{"models": [{"id", "kind", "path", "residency", "memory_mib"}]}`.
+        ///
+        /// `kind` is `qwen`, `julia`, `qwen_embedding`, `pplx_context` or `pplx_late`.
+        /// `residency` is `resident` (default; started with the server) or `on_demand`
+        /// (started on first request). `memory_mib` is the measured process footprint,
+        /// required for every entry under `--memory-budget-mib`.
         #[arg(long)]
         registry: Option<PathBuf>,
         /// Total `memory_mib` that running models may declare; on-demand models
