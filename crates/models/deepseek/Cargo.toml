@@ -33,5 +33,19 @@ harness = false
 name = "owner_transaction"
 harness = false
 
+[[bench]]
+name = "range_cache"
+harness = false
+
+[[bench]]
+name = "moe_provider"
+harness = false
+# Loads real expert weights when present; keep it out of .
+test = false
+
+[[bench]]
+name = "engram_hash"
+harness = false
+
 [lints]
 workspace = true
