@@ -5,9 +5,13 @@
 
 An LLM serving engine for Apple Silicon, built around Rust and Metal.
 
+`mx serve` exposes models over an HTTP API. Apple Silicon machines in the cloud
+are a target deployment, as well as local Macs. Authentication and TLS are out
+of scope by design: put a router or reverse proxy in front of the server.
+
 ## What works today
 
-- `mx serve`: a loopback HTTP server for the models in a registry file. Each
+- `mx serve`: an HTTP server for the models in a registry file. Each
   model runs in its own child process, so stopping it returns its memory.
   Models start with the server or on first request, and idle on-demand models
   are stopped, least recently used first, to stay within `--memory-budget-mib`.
@@ -120,8 +124,8 @@ tests). They do not download model weights.
 
 ## Limitations
 
-- The server binds only to loopback. Each model handles one request at a time;
-  there is no batching across requests and no request queue.
+- The server currently binds only to loopback. Each model handles one request
+  at a time; there is no batching across requests and no request queue.
 - The Responses endpoint is a subset: text input, function calls and SSE are
   supported; stored responses, `previous_response_id`, images, nonzero
   temperature, `top_p` other than 1 and seeds are rejected. Output is greedy.
