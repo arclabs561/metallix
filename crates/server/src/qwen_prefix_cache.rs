@@ -16,15 +16,14 @@
 
 use std::collections::HashMap;
 
-use minijinja::Environment;
 use qwen::{
     forward::{Qwen3ForwardExecutor, Qwen3KvSnapshot},
     metal::Qwen3MlxWeights,
 };
 use sha2::{Digest, Sha256};
 
-use super::{ChatRequest, render_template_with};
-use crate::qwen_tokenizer::QwenTokenizer;
+use super::ChatRequest;
+use crate::chat_format::ChatFormat;
 
 type PrefixKey = [u8; 32];
 type Executor<'w> = Qwen3ForwardExecutor<'w, std::collections::hash_map::RandomState>;
@@ -70,8 +69,7 @@ pub(super) fn prefill<'w>(
 pub(super) fn remember(
     weights: &Qwen3MlxWeights,
     cache: &mut PrefixCache<Qwen3KvSnapshot>,
-    template: &Environment<'static>,
-    tokenizer: &QwenTokenizer,
+    format: &ChatFormat,
     executor: &Executor<'_>,
     request: ChatRequest<'_>,
     input_ids: &[i32],
@@ -91,10 +89,10 @@ pub(super) fn remember(
             messages,
             ..request
         };
-        let Ok(rendered) = render_template_with(template, prefix, false) else {
+        let Ok(rendered) = format.template().render(prefix, false) else {
             continue;
         };
-        let Ok(ids) = tokenizer.encode_prompt(&rendered) else {
+        let Ok(ids) = format.tokenizer().encode_prompt(&rendered) else {
             continue;
         };
         if ids.is_empty()

@@ -17,6 +17,8 @@ mod chat_cli;
 #[cfg(feature = "metal")]
 mod chat_completions;
 #[cfg(feature = "metal")]
+mod chat_format;
+#[cfg(feature = "metal")]
 mod chat_generation;
 #[cfg(feature = "metal")]
 mod chat_tools;

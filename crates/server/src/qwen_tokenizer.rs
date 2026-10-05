@@ -75,6 +75,12 @@ impl QwenTokenizer {
         Ok(())
     }
 
+    /// The ID of a token spelled exactly `text`, such as a special token.
+    #[must_use]
+    pub(crate) fn token_id(&self, text: &str) -> Option<u32> {
+        self.tokenizer.token_to_id(text)
+    }
+
     /// Encodes prompt bytes exactly as supplied: no chat template or special
     /// tokens are added by this CLI layer.
     pub(crate) fn encode_prompt(&self, prompt: &str) -> Result<Vec<i32>, String> {

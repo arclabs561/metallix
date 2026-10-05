@@ -11,8 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use minijinja::{Environment, context};
-use minijinja_contrib::pycompat::unknown_method_callback;
 use qwen::metal::{Qwen3MlxWeights, Qwen3WeightPrecision};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
@@ -20,6 +18,7 @@ use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
 use crate::{
+    chat_format::{ChatFormat, MAX_GENERATION_CONFIG_BYTES, TokenClass, TokenId},
     qwen_forward::{SamplingConfiguration, SamplingPolicy},
     qwen_tokenizer::QwenTokenizer,
 };
@@ -27,13 +26,9 @@ use crate::{
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
 
-const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
-const MAX_GENERATION_CONFIG_BYTES: usize = 64 * 1024;
-const MAX_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
 const MAX_CHAT_TOOLS: usize = 64;
-const TEMPLATE_FUEL: u64 = 100_000;
 const MIB_BYTES: u64 = 1024 * 1024;
 
 /// Resident weight and K/V precision. Decode reads every weight once per
@@ -197,13 +192,11 @@ pub(crate) fn render_generation_prompt(
     let messages = [ChatMessage::text(ChatRole::User, prompt)];
     let request = ChatRequest::new(&messages, 1);
     validate_request(request)?;
-    let template_source = load_template(model)?;
-    let template_sha256 = format!("{:x}", Sha256::digest(template_source.as_bytes()));
-    let template = parse_template(template_source)?;
-    let rendered = render_template(&template, request)?;
+    let (config, ..) = read_config(model)?;
+    let format = ChatFormat::load(model, config.vocab_size)?;
     Ok(GenerationTemplatePrompt {
-        rendered,
-        template_sha256,
+        rendered: format.template().render(request, true)?,
+        template_sha256: format.template().sha256().to_owned(),
     })
 }
 
@@ -598,9 +591,7 @@ impl fmt::Display for ChatGenerationError {
 /// A resident model and tokenizer for serial Qwen chat turns.
 pub(crate) struct ChatSession {
     weights: Qwen3MlxWeights,
-    tokenizer: QwenTokenizer,
-    template: Environment<'static>,
-    eos_token_id: i32,
+    format: ChatFormat,
     vocabulary_size: usize,
     context_limit: usize,
     kv_budget_bytes: u64,
@@ -608,7 +599,6 @@ pub(crate) struct ChatSession {
     load_ms: f64,
     config_sha256: String,
     tokenizer_sha256: String,
-    template_sha256: String,
     /// Checkpoint directory, read again only to compile a JSON-schema grammar.
     model: PathBuf,
     sampling_defaults: SamplingDefaults,
@@ -646,9 +636,10 @@ pub(crate) trait ChatBackend {
     ) -> Result<ChatGeneration, ChatGenerationError>;
 }
 
+/// The model config fields the chat path reads; stop tokens come from
+/// [`ChatFormat`].
 #[derive(serde::Deserialize)]
 struct ChatConfig {
-    eos_token_id: i32,
     vocab_size: usize,
 }
 
@@ -657,12 +648,9 @@ impl ChatSession {
     pub(crate) fn load(model: &Path, limits: ResidentChatLimits) -> Result<Self, String> {
         let started = Instant::now();
         let (config, plan, config_sha256) = load_config(model, limits)?;
-        let tokenizer = QwenTokenizer::load(model)?;
-        let tokenizer_sha256 = tokenizer.source_sha256().to_owned();
-        tokenizer.check_model_vocabulary(config.vocab_size, config.eos_token_id)?;
-        let template_source = load_template(model)?;
-        let template_sha256 = format!("{:x}", Sha256::digest(template_source.as_bytes()));
-        let template = parse_template(template_source)?;
+        let format = ChatFormat::load(model, config.vocab_size)?;
+        let tokenizer_sha256 = format.tokenizer().source_sha256().to_owned();
+        let template_sha256 = format.template().sha256();
 
         let mut weights = Qwen3MlxWeights::load(model).map_err(|error| error.to_string())?;
         weights
@@ -677,9 +665,7 @@ impl ChatSession {
         let prefix_budget = usize::try_from(limits.prefix_cache_bytes()).unwrap_or(usize::MAX);
         Ok(Self {
             weights,
-            tokenizer,
-            template,
-            eos_token_id: config.eos_token_id,
+            format,
             vocabulary_size: config.vocab_size,
             context_limit: limits.context_tokens(),
             kv_budget_bytes: limits.kv_budget_bytes(),
@@ -687,7 +673,6 @@ impl ChatSession {
             load_ms: elapsed_ms(started.elapsed()),
             config_sha256,
             tokenizer_sha256,
-            template_sha256,
             model: model.to_path_buf(),
             sampling_defaults: SamplingDefaults::load(model)?,
             prefix_cache: prefix_cache::PrefixCache::new(prefix_identity, prefix_budget),
@@ -703,7 +688,7 @@ impl ChatSession {
     /// Hash of the exact checkpoint template source selected at session load.
     #[must_use]
     pub(crate) fn template_sha256(&self) -> &str {
-        &self.template_sha256
+        self.format.template().sha256()
     }
 
     /// Hashes of the exact local metadata parsed during session loading.
@@ -719,7 +704,7 @@ impl ChatSession {
 
     /// Encodes a decision answer label as exactly one ordinary tokenizer token.
     pub(crate) fn answer_label_token(&self, label: &str) -> Result<i32, String> {
-        let ids = self.tokenizer.encode_prompt(label)?;
+        let ids = self.format.tokenizer().encode_prompt(label)?;
         match ids.as_slice() {
             [token] => Ok(*token),
             _ => Err(format!(
@@ -736,8 +721,7 @@ impl ChatSession {
         validate_request(request)?;
         let render = tracing::info_span!("chat.render", render_ms = Empty);
         let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
-        let input_ids = self.tokenizer.encode_prompt(&prompt)?;
-        validate_ids(&input_ids, self.eos_token_id, self.vocabulary_size)?;
+        let input_ids = self.format.encode(&prompt)?;
         if input_ids.len() > self.context_limit {
             return Err(format!(
                 "decision requires prompt_tokens <= {}; received {}",
@@ -805,9 +789,8 @@ impl ChatSession {
         let render = tracing::info_span!("chat.render", render_ms = Empty);
         let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
         deadline.check()?;
-        let input_ids = self.tokenizer.encode_prompt(&prompt)?;
+        let input_ids = self.format.encode(&prompt)?;
         deadline.check()?;
-        validate_ids(&input_ids, self.eos_token_id, self.vocabulary_size)?;
         let max_tokens = self.output_budget(request.max_tokens, input_ids.len())?;
         // Compiles a schema grammar before any model work, so a bad schema
         // fails fast.
@@ -872,22 +855,29 @@ impl ChatSession {
                 None => picker.pick(&logits)?,
             };
             last_token_at = Instant::now();
-            if let Some(top) = request.top_logprobs.filter(|_| token != self.eos_token_id) {
+            let class = self.format.stops().classify(TokenId::from_model(token)?);
+            if let Some(top) = request.top_logprobs.filter(|_| class == TokenClass::Normal) {
                 logprobs.push(self.token_logprob(&logits, token, top)?);
             }
             generated.push(token);
-            if token == self.eos_token_id {
-                if pending.is_some() {
-                    // The queued step appended this end-of-sequence token.
-                    executor
-                        .truncate_cached_tokens(executor.cached_tokens() - 1)
-                        .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+            match class {
+                TokenClass::Normal => {}
+                // Stop tokens are never visible text; a tool turn's end is
+                // complete like any other.
+                TokenClass::EndTurn | TokenClass::ToolEnd => {
+                    if pending.is_some() {
+                        // The queued step appended this stop token.
+                        executor
+                            .truncate_cached_tokens(executor.cached_tokens() - 1)
+                            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+                    }
+                    finish_reason = ChatFinishReason::Eos;
+                    break;
                 }
-                finish_reason = ChatFinishReason::Eos;
-                break;
             }
             if let Some(delta) = self
-                .tokenizer
+                .format
+                .tokenizer()
                 .decode_generated_token(&mut text_decoder, token)?
             {
                 emit_delta(&delta, &mut emitted, on_token, &mut ttft, turn_started)?;
@@ -927,19 +917,27 @@ impl ChatSession {
             prefix_cache::remember(
                 &self.weights,
                 &mut self.prefix_cache,
-                &self.template,
-                &self.tokenizer,
+                &self.format,
                 &executor,
                 request,
                 &input_ids,
             )
         })?;
 
-        let visible_generated = generated
-            .strip_suffix(&[self.eos_token_id])
-            .unwrap_or(&generated);
+        let visible_generated = match generated.split_last() {
+            Some((&last, visible))
+                if self.format.stops().classify(TokenId::from_model(last)?)
+                    != TokenClass::Normal =>
+            {
+                visible
+            }
+            _ => &generated,
+        };
         deadline.check()?;
-        let text = self.tokenizer.decode_generated(visible_generated)?;
+        let text = self
+            .format
+            .tokenizer()
+            .decode_generated(visible_generated)?;
         let remaining = text.strip_prefix(&emitted).ok_or_else(|| {
             ChatGenerationError::message(
                 "incremental tokenizer decoder diverged from complete generated text",
@@ -973,7 +971,7 @@ impl ChatSession {
     }
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
-        render_template(&self.template, request)
+        self.format.template().render(request, true)
     }
 
     fn token_picker(&self, request: ChatRequest<'_>) -> Result<TokenPicker, String> {
@@ -1053,7 +1051,8 @@ impl ChatSession {
             .into_iter()
             .filter_map(|index| {
                 let bytes = self
-                    .tokenizer
+                    .format
+                    .tokenizer()
                     .token_bytes(i32::try_from(index).ok()?)
                     .ok()?;
                 Some(TopLogprob {
@@ -1064,7 +1063,7 @@ impl ChatSession {
             })
             .take(wanted)
             .collect();
-        let bytes = self.tokenizer.token_bytes(token)?;
+        let bytes = self.format.tokenizer().token_bytes(token)?;
         Ok(TokenLogprob {
             token: String::from_utf8_lossy(&bytes).into_owned(),
             bytes,
@@ -1072,45 +1071,6 @@ impl ChatSession {
             top_logprobs,
         })
     }
-}
-
-fn render_template(
-    template: &Environment<'static>,
-    request: ChatRequest<'_>,
-) -> Result<String, String> {
-    render_template_with(template, request, true)
-}
-
-/// Renders `request`, optionally without the trailing assistant generation
-/// prompt; the prefix cache renders conversation prefixes that way.
-fn render_template_with(
-    template: &Environment<'static>,
-    request: ChatRequest<'_>,
-    add_generation_prompt: bool,
-) -> Result<String, String> {
-    let messages = serde_json::to_value(request.messages)
-        .map_err(|_| String::from("chat messages could not be serialized"))?;
-    let tools = serde_json::to_value(request.tools)
-        .map_err(|_| String::from("chat tools could not be serialized"))?;
-    let rendered = template
-        .get_template("qwen_chat")
-        .map_err(|error| format!("local chat template is unavailable: {error}"))?
-        .render(context! {
-            messages => messages,
-            tools => tools,
-            add_generation_prompt => add_generation_prompt,
-            enable_thinking => request.enable_thinking,
-            thinking_mode => if request.enable_thinking { "thinking" } else { "non-thinking" },
-            reasoning_effort => request.reasoning_effort.unwrap_or("low"),
-            drop_thinking => !request.enable_thinking,
-        })
-        .map_err(|error| format!("local chat template could not be rendered: {error}"))?;
-    if rendered.len() > MAX_CHAT_RENDERED_BYTES {
-        return Err(format!(
-            "rendered chat prompt exceeds the {MAX_CHAT_RENDERED_BYTES}-byte limit"
-        ));
-    }
-    Ok(rendered)
 }
 
 impl ChatBackend for ChatSession {
@@ -1128,15 +1088,20 @@ impl ChatBackend for ChatSession {
     }
 }
 
-fn load_config(
-    model: &Path,
-    limits: ResidentChatLimits,
-) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan, String), String> {
+fn read_config(model: &Path) -> Result<(ChatConfig, String), String> {
     let path = model.join("config.json");
     let raw = fs::read_to_string(&path)
         .map_err(|_| String::from("local model config.json could not be read"))?;
     let config = serde_json::from_str(&raw)
         .map_err(|_| String::from("local model config.json could not be parsed"))?;
+    Ok((config, raw))
+}
+
+fn load_config(
+    model: &Path,
+    limits: ResidentChatLimits,
+) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan, String), String> {
+    let (config, raw) = read_config(model)?;
     // Reject context/KV admission before checkpoint payload loading.
     let plan = qwen::forward::Qwen3ForwardConfig::parse(&raw)
         .and_then(|config| {
@@ -1152,53 +1117,6 @@ fn load_config(
         plan,
         format!("{:x}", Sha256::digest(raw.as_bytes())),
     ))
-}
-
-fn load_template(model: &Path) -> Result<String, String> {
-    let path = model.join("tokenizer_config.json");
-    let raw = String::from_utf8(crate::qwen_tokenizer::read_regular_file(
-        &path,
-        MAX_CHAT_TEMPLATE_BYTES,
-        "tokenizer_config.json",
-    )?)
-    .map_err(|_| String::from("local tokenizer_config.json could not be read"))?;
-    let config: Value = serde_json::from_str(&raw)
-        .map_err(|_| String::from("local tokenizer_config.json could not be parsed"))?;
-    if let Some(template) = config
-        .get("chat_template")
-        .and_then(Value::as_str)
-        .filter(|template| !template.is_empty())
-    {
-        return Ok(template.to_owned());
-    }
-
-    let external = model.join("chat_template.jinja");
-    if !external.exists() {
-        return Err(String::from(
-            "local tokenizer_config.json has no chat_template and chat_template.jinja is absent",
-        ));
-    }
-    let template = String::from_utf8(crate::qwen_tokenizer::read_regular_file(
-        &external,
-        MAX_CHAT_TEMPLATE_BYTES,
-        "chat_template.jinja",
-    )?)
-    .map_err(|_| String::from("local chat_template.jinja could not be read"))?;
-    if template.trim().is_empty() {
-        return Err(String::from("local chat_template.jinja must not be empty"));
-    }
-    Ok(template)
-}
-
-fn parse_template(template_source: String) -> Result<Environment<'static>, String> {
-    let mut template = Environment::new();
-    template.set_unknown_method_callback(unknown_method_callback);
-    template.add_filter("tojson", crate::template_json::tojson);
-    template.set_fuel(Some(TEMPLATE_FUEL));
-    template
-        .add_template_owned("qwen_chat".to_owned(), template_source)
-        .map_err(|error| format!("local chat template could not be parsed: {error}"))?;
-    Ok(template)
 }
 
 fn validate_request(request: ChatRequest<'_>) -> Result<(), String> {
@@ -1257,21 +1175,6 @@ fn validate_request(request: ChatRequest<'_>) -> Result<(), String> {
     if input_bytes > MAX_CHAT_INPUT_BYTES {
         return Err(format!(
             "chat messages and tools exceed the {MAX_CHAT_INPUT_BYTES}-byte limit"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_ids(ids: &[i32], eos_token_id: i32, vocabulary_size: usize) -> Result<(), String> {
-    if ids.is_empty()
-        || ids.iter().chain(std::iter::once(&eos_token_id)).any(|&id| {
-            usize::try_from(id)
-                .ok()
-                .is_none_or(|id| id >= vocabulary_size)
-        })
-    {
-        return Err(String::from(
-            "chat template token IDs or EOS are outside model vocabulary",
         ));
     }
     Ok(())
@@ -1450,20 +1353,23 @@ fn elapsed_ms(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        env, fs,
+        env,
         path::{Path, PathBuf},
         time::{Duration, Instant},
     };
 
-    use minijinja::context;
     use proptest::prelude::*;
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
 
     use super::{
         ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
-        ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, MAX_CHAT_TEMPLATE_BYTES,
-        ResidentChatLimits, load_template, parse_template, render_generation_prompt,
+        ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, ResidentChatLimits,
+        render_generation_prompt,
+    };
+    use crate::chat_format::{
+        ChatTemplate, SpecialTokens,
+        test_model::{ModelDir, VOCABULARY_SIZE},
     };
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
@@ -1472,16 +1378,13 @@ mod tests {
         "e132ae041e1217b5e1114eb9dc292484a7f478df945d72fa49ba01b88d8ec01a";
 
     fn render(messages: &[ChatMessage], tools: &[Value], enable_thinking: bool) -> String {
-        let template = parse_template(TEMPLATE.to_owned()).expect("fixture template parses");
+        let template = ChatTemplate::parse(TEMPLATE.to_owned(), SpecialTokens::default())
+            .expect("fixture template parses");
+        let mut request = ChatRequest::new(messages, 1);
+        request.tools = tools;
+        request.enable_thinking = enable_thinking;
         template
-            .get_template("qwen_chat")
-            .expect("fixture template exists")
-            .render(context! {
-                messages => messages,
-                tools => tools,
-                add_generation_prompt => true,
-                enable_thinking => enable_thinking,
-            })
+            .render(request, true)
             .expect("fixture template renders")
     }
 
@@ -1516,96 +1419,31 @@ mod tests {
     }
 
     #[test]
-    fn external_chat_template_is_accepted_when_config_has_none() {
-        let root =
-            std::env::temp_dir().join(format!("metallix-chat-template-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("template test directory");
-        fs::write(root.join("tokenizer_config.json"), b"{}").expect("tokenizer config");
-        fs::write(root.join("chat_template.jinja"), b"{{ messages }}").expect("external template");
-
-        assert_eq!(
-            load_template(&root).expect("external template"),
-            "{{ messages }}"
-        );
-        fs::remove_dir_all(root).expect("remove template test directory");
-    }
-
-    #[test]
-    fn template_sources_reject_oversized_invalid_utf8_and_nonregular_files() {
-        let root = std::env::temp_dir().join(format!(
-            "metallix-template-source-limits-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).expect("template test directory");
-        let config = root.join("tokenizer_config.json");
-        let external = root.join("chat_template.jinja");
-        let oversized = vec![b'x'; MAX_CHAT_TEMPLATE_BYTES + 1];
-
-        fs::write(&config, &oversized).expect("oversized tokenizer config");
-        assert!(
-            load_template(&root)
-                .expect_err("oversized tokenizer config must fail")
-                .contains("byte limit")
-        );
-        fs::write(&config, [0xff]).expect("invalid UTF-8 tokenizer config");
-        assert!(
-            load_template(&root)
-                .expect_err("invalid UTF-8 tokenizer config must fail")
-                .contains("could not be read")
-        );
-        fs::remove_file(&config).expect("remove tokenizer config file");
-        fs::create_dir(&config).expect("nonregular tokenizer config");
-        assert!(
-            load_template(&root)
-                .expect_err("nonregular tokenizer config must fail")
-                .contains("readable regular file")
-        );
-        fs::remove_dir(&config).expect("remove tokenizer config directory");
-
-        fs::write(&config, b"{}").expect("fallback tokenizer config");
-        fs::write(&external, &oversized).expect("oversized external template");
-        assert!(
-            load_template(&root)
-                .expect_err("oversized external template must fail")
-                .contains("byte limit")
-        );
-        fs::write(&external, [0xff]).expect("invalid UTF-8 external template");
-        assert!(
-            load_template(&root)
-                .expect_err("invalid UTF-8 external template must fail")
-                .contains("could not be read")
-        );
-        fs::remove_file(&external).expect("remove external template file");
-        fs::create_dir(&external).expect("nonregular external template");
-        assert!(
-            load_template(&root)
-                .expect_err("nonregular external template must fail")
-                .contains("readable regular file")
-        );
-
-        fs::remove_dir_all(root).expect("remove template test directory");
-    }
-
-    #[test]
     fn generation_template_renders_one_nonthinking_user_message_before_weights() {
-        let root = std::env::temp_dir().join(format!(
-            "metallix-generation-template-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).expect("template test directory");
-        fs::write(
-            root.join("tokenizer_config.json"),
-            serde_json::json!({"chat_template": TEMPLATE}).to_string(),
-        )
-        .expect("tokenizer config");
-        let rendered =
-            render_generation_prompt(&root, "hello").expect("bounded generation template render");
+        let model = ModelDir::new(
+            &json!({"chat_template": TEMPLATE, "bos_token": null, "eos_token": "<|im_end|>"}),
+            &json!({"eos_token_id": 3, "vocab_size": VOCABULARY_SIZE}),
+            None,
+        );
+        let rendered = render_generation_prompt(model.path(), "hello")
+            .expect("bounded generation template render");
         assert_eq!(rendered.template_sha256, TEMPLATE_SHA256);
         assert_eq!(
             rendered.rendered,
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
-        fs::remove_dir_all(root).expect("remove template test directory");
+    }
+
+    /// The prompt `mx generate` renders carries the BOS a template prints.
+    #[test]
+    fn generation_template_renders_the_tokenizer_bos() {
+        let model = ModelDir::new(
+            &json!({"chat_template": "{{ bos_token }}{{ messages[0].content }}", "bos_token": "<s>"}),
+            &json!({"eos_token_id": [1, 2], "vocab_size": VOCABULARY_SIZE}),
+            None,
+        );
+        let rendered = render_generation_prompt(model.path(), "hi").map(|prompt| prompt.rendered);
+        assert_eq!(rendered, Ok(String::from("<s>hi")));
     }
 
     #[test]
@@ -1820,16 +1658,17 @@ mod tests {
 
     #[test]
     fn deepseek_template_shape_renders_mapping_and_nested_tool_calls() {
-        let template = parse_template(
+        let template = ChatTemplate::parse(
             concat!(
                 "{% for message in messages %}{{ message.get('role') }}:{{ message.get('content') }};",
                 "{% for call in message.get('tool_calls') or [] %}{{ call.function.name }}={{ call.function.arguments.path }};{% endfor %}",
                 "{% endfor %}"
             )
             .to_owned(),
+            SpecialTokens::default(),
         )
         .expect("DeepSeek-shaped template parses");
-        let messages = serde_json::to_value([ChatMessage {
+        let messages = [ChatMessage {
             role: ChatRole::Assistant,
             content: String::new(),
             reasoning_content: None,
@@ -1839,12 +1678,9 @@ mod tests {
             }],
             tool_call_id: None,
             name: None,
-        }])
-        .expect("DeepSeek-shaped messages");
+        }];
         let rendered = template
-            .get_template("qwen_chat")
-            .expect("template name")
-            .render(context! { messages => messages, tools => Vec::<Value>::new() })
+            .render(ChatRequest::new(&messages, 1), false)
             .expect("DeepSeek-shaped context renders");
         assert_eq!(rendered, "assistant:;read_file=README.md;");
     }
