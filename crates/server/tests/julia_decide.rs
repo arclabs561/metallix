@@ -250,5 +250,22 @@ fn serve_decisions_equal_cli_receipts() {
             "{model} {name}"
         );
     }
+    if qwen.is_some() {
+        // Generation streams through the front process unchanged.
+        let body = r#"{"model":"qwen","input":"Say hi.","stream":true,"max_output_tokens":64}"#;
+        let mut stream = TcpStream::connect(address).unwrap();
+        write!(
+            stream,
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut wire = String::new();
+        stream.read_to_string(&mut wire).unwrap();
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{wire}");
+        assert!(wire.contains("text/event-stream"), "{wire}");
+        assert!(wire.contains(r#""type":"response.completed""#), "{wire}");
+    }
     let _ = std::fs::remove_dir_all(&scratch);
 }

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ModelKind {
     /// Qwen3 checkpoint: `/v1/responses` generation and `/v1/decisions`.
@@ -36,7 +36,7 @@ impl ModelKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServedEntry {
     pub(crate) id: String,

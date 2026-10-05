@@ -36,6 +36,8 @@ pub mod range_fetch;
 #[cfg(feature = "metal")]
 mod responses;
 #[cfg(feature = "metal")]
+mod serve_proxy;
+#[cfg(feature = "metal")]
 mod serve_registry;
 #[cfg(feature = "metal")]
 mod serving;
@@ -246,13 +248,16 @@ enum Command {
     #[cfg(feature = "metal")]
     Serve {
         /// Qwen checkpoint served as `--model-id`; shorthand for a one-entry registry.
-        #[arg(long, required_unless_present = "registry")]
+        #[arg(long, required_unless_present_any = ["registry", "worker_entry"])]
         model: Option<PathBuf>,
         #[arg(long, default_value = "metallix-qwen3")]
         model_id: String,
         /// JSON manifest `{"models": [{"id", "kind": "qwen"|"julia", "path"}]}`; all load at startup.
         #[arg(long)]
         registry: Option<PathBuf>,
+        /// Internal: serve one registry entry (JSON) in this process as a child.
+        #[arg(long, hide = true, conflicts_with_all = ["model", "registry"])]
+        worker_entry: Option<String>,
         #[arg(long, default_value = "127.0.0.1:8321")]
         listen: std::net::SocketAddr,
         /// Total prompt plus output budget for each request.
@@ -694,22 +699,42 @@ pub fn run() -> ExitCode {
             model,
             model_id,
             registry,
+            worker_entry,
             listen,
             context_tokens,
             kv_budget_mib,
             generation_timeout_ms,
-        } => match serve_registry::entries(registry.as_deref(), model.as_deref(), &model_id) {
-            Ok(models) => serving::serve(
-                &models,
-                listen,
-                resident_chat_limits(context_tokens, kv_budget_mib),
-                Duration::from_millis(u64::from(generation_timeout_ms)),
-            ),
-            Err(error) => {
-                eprintln!("mx serve: {error}");
-                ExitCode::FAILURE
+        } => {
+            if let Some(entry) = worker_entry {
+                return match serde_json::from_str(&entry) {
+                    Ok(entry) => serving::serve_child(
+                        entry,
+                        listen,
+                        resident_chat_limits(context_tokens, kv_budget_mib),
+                        Duration::from_millis(u64::from(generation_timeout_ms)),
+                    ),
+                    Err(error) => {
+                        eprintln!("mx serve: invalid worker entry: {error}");
+                        ExitCode::FAILURE
+                    }
+                };
             }
-        },
+            match serve_registry::entries(registry.as_deref(), model.as_deref(), &model_id) {
+                Ok(models) => serve_proxy::serve(
+                    &models,
+                    listen,
+                    serve_proxy::ChildSettings {
+                        context_tokens,
+                        kv_budget_mib,
+                        generation_timeout_ms,
+                    },
+                ),
+                Err(error) => {
+                    eprintln!("mx serve: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         #[cfg(feature = "metal")]
         Command::CheckV41RotaryMetal { fixture, repeats } => v41_rotary::run(&fixture, repeats),
         #[cfg(feature = "metal")]

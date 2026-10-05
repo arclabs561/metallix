@@ -164,6 +164,21 @@ fn unsupported_response(connection: Connection, capability: &str) {
     );
 }
 
+/// Serves `entry` in this process as a child of the `mx serve` front process,
+/// exiting when the front process closes this process's stdin.
+pub(crate) fn serve_child(
+    entry: ServedEntry,
+    address: SocketAddr,
+    limits: ResidentChatLimits,
+    generation_timeout: Duration,
+) -> ExitCode {
+    thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        std::process::exit(0);
+    });
+    serve(&[entry], address, limits, generation_timeout)
+}
+
 pub(crate) fn serve(
     models: &[ServedEntry],
     address: SocketAddr,
@@ -258,6 +273,8 @@ fn serve_inner(
     }
     let outcome = match TcpListener::bind(address) {
         Ok(server) => {
+            // The front process reads this line to find a child's ephemeral port.
+            let address = server.local_addr().unwrap_or(address);
             eprintln!(
                 "mx listening on http://{address}; models={}; one request per model; {} total tokens; kv_budget_bytes={}",
                 entries.len(),
