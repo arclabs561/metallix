@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::{
+    chat_completions,
     chat_generation::{ChatBackend, ChatMessage},
     http_transport::Connection,
     responses,
@@ -18,18 +19,23 @@ pub(crate) enum Generation {
         messages: Vec<ChatMessage>,
         tools: Vec<Value>,
     },
+    ChatCompletions(Box<chat_completions::Prepared>),
 }
 
 impl Generation {
     /// Whether a `POST` path generates.
     pub(crate) fn serves(path: &str) -> bool {
-        path == "/v1/responses"
+        matches!(path, "/v1/responses" | "/v1/chat/completions")
     }
 
     /// Parses and validates one body for `path`, returning the requested
     /// model; the error is a ready `400` body in the protocol's shape.
     pub(crate) fn parse(path: &str, body: &[u8]) -> Result<(String, Self), Value> {
         debug_assert!(Self::serves(path), "{path} does not generate");
+        if path == "/v1/chat/completions" {
+            return chat_completions::prepare(body)
+                .map(|(model, prepared)| (model, Self::ChatCompletions(Box::new(prepared))));
+        }
         let request: responses::Request = serde_json::from_slice(body)
             .map_err(|error| json!({"error":{"message":error.to_string()}}))?;
         let (messages, tools) = responses::messages(&request)
@@ -68,6 +74,9 @@ impl Generation {
                 &format!("resp_{id}"),
                 generation_timeout,
             ),
+            Self::ChatCompletions(prepared) => {
+                chat_completions::respond(connection, prepared, session, id, generation_timeout)
+            }
         }
     }
 }

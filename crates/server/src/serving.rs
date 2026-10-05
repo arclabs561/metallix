@@ -1874,6 +1874,76 @@ stream.close()
         decide_worker.join().expect("join decision worker");
     }
 
+    #[test]
+    fn generation_routes_answer_in_their_own_protocol() {
+        use crate::sse::test_support::Scripted;
+        fn post(address: std::net::SocketAddr, path: &str, body: &str) -> (u16, Value) {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound reads");
+            write!(
+                stream,
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("request");
+            stream.shutdown(Shutdown::Write).expect("half-close");
+            let (status, body) = fixed_http_response(&mut stream);
+            (
+                status,
+                serde_json::from_slice(&body).expect("response JSON"),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (sender, receiver) = sync_channel(0);
+        let worker = thread::spawn(move || {
+            let mut backend = Scripted::new("hi");
+            worker_loop(&mut backend, receiver);
+        });
+        let occupied = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let server = thread::spawn(move || {
+            serve_listener(
+                &listener,
+                "control",
+                &sender,
+                &occupied,
+                &alive,
+                Duration::from_secs(2),
+                Some(3),
+            )
+        });
+        let (status, completion) = post(
+            address,
+            "/v1/chat/completions",
+            r#"{"model":"control","messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        assert_eq!(status, 200, "{completion}");
+        assert_eq!(completion["object"], "chat.completion");
+        assert_eq!(completion["choices"][0]["message"]["content"], "hi");
+        let (status, rejected) = post(
+            address,
+            "/v1/chat/completions",
+            r#"{"model":"control","messages":[],"frobnicate":1}"#,
+        );
+        assert_eq!(status, 400);
+        assert_eq!(rejected["error"]["type"], "invalid_request_error");
+        let (status, response) = post(
+            address,
+            "/v1/responses",
+            r#"{"model":"control","input":"hello"}"#,
+        );
+        assert_eq!((status, &response["object"]), (200, &json!("response")));
+        server
+            .join()
+            .expect("join acceptor")
+            .expect("acceptor result");
+        worker.join().expect("join worker");
+    }
+
     mod checkpoint_reset {
         use super::*;
         struct ObservedSession<'a> {

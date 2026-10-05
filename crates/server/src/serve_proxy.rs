@@ -502,7 +502,14 @@ fn proxy_models(
                 json_response(connection, 200, &json!({"object":"list","data":data}));
                 continue;
             }
-            ("POST", "/v1/responses" | "/v1/decisions" | "/v1/embeddings" | "/v1/rerank") => {}
+            (
+                "POST",
+                "/v1/responses"
+                | "/v1/chat/completions"
+                | "/v1/decisions"
+                | "/v1/embeddings"
+                | "/v1/rerank",
+            ) => {}
             _ => {
                 json_response(
                     connection,
