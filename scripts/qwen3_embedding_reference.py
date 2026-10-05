@@ -60,16 +60,17 @@ TOLERANCE_POLICY = {
         "card anchor uses a looser bound and checks recipe, not arithmetic."
     ),
     "bf16": {
-        "embedding_cosine_min": 1 - 1e-3,
-        "score_abs_vs_reference": 1e-2,
+        "embedding_cosine_min": 1 - 4e-4,
+        "score_abs_vs_reference": 5e-3,
         "native_precision": "checkpoint BF16 weights and activations",
         "rationale": (
-            "Proposed from the four card inputs and three others (worst 1 - cosine "
-            "5.1e-4, worst score delta 5.1e-3; BF16 runs bit-identical run to run), "
-            "then held on the full stress set: worst 1 - cosine 8.0e-4 (hi), worst "
-            "score delta 5.2e-3. The excess over the HF BF16 source (worst 4.7e-4) "
-            "is MLX's imprecise BF16 sigmoid in SiLU before MLX 0.29.3; mlx-sys 0.2.0 "
-            "vendors MLX 0.25.1. MLX >= 0.29.3 or a float32 sigmoid gives about 3e-4."
+            "Measured on the full stress set with mlx-rs 0.32.0 (MLX 0.32.2): worst "
+            "1 - cosine 2.9e-4 (ko), worst score delta 3.3e-3, BF16 runs "
+            "bit-identical run to run. The bounds leave about 1.4x and 1.5x headroom "
+            "for kernel or hardware changes. The earlier bounds (1e-3 and 1e-2) "
+            "covered MLX 0.25.1, whose imprecise BF16 sigmoid in SiLU gave worst "
+            "1 - cosine 8.0e-4 (hi) and score delta 5.2e-3; MLX 0.29.3 fixed it. "
+            "The HF BF16 source's worst is 4.7e-4."
         ),
     },
 }

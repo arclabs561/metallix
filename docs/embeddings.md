@@ -64,9 +64,9 @@ Every vector matches the CPU float32 source oracle at cosine at least
 (worst 0.99999999999).
 
 BF16 weights would halve weight memory (about 1.2 GB instead of 2.4 GB). They
-are measured against a looser tolerance (cosine at least 1 - 1e-3; worst
-1 - 5.1e-4 on the first seven inputs) because the pinned MLX computes BF16 sigmoid imprecisely.
-Serving stays float32 until the MLX upgrade lands and BF16 is requalified.
+are measured against a looser tolerance: cosine at least 1 - 4e-4, worst
+1 - 2.9e-4 over the 68 inputs on MLX 0.32 (8.0e-4 on MLX 0.25, whose BF16
+sigmoid was imprecise). Serving stays float32.
 
 ```sh
 METALLIX_QWEN_EMBEDDING_MODEL=/path/to/Qwen3-Embedding-0.6B \

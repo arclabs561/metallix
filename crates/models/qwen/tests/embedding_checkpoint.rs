@@ -12,17 +12,17 @@
 //! - pair scores and the card's 2 x 2 scores within 1e-4 of the oracle's, and
 //!   the 2 x 2 within 1e-3 of the card's published scores.
 //!
-//! BF16 serving tolerances (checkpoint weights as stored), proposed from the
-//! first seven inputs (worst 1 - cosine 5.1e-4, worst score delta 5.1e-3; BF16
-//! runs were bit-identical run to run) and then checked against the stress set
-//! (worst 1 - cosine 8.0e-4 on `hi`, worst score delta 5.2e-3):
-//! - per input, cosine(native, oracle) >= 1 - 1e-3;
-//! - pair scores and the card's 2 x 2 scores within 1e-2 of the oracle's.
+//! BF16 tolerances (checkpoint weights as stored), set from the stress set
+//! measured with mlx-rs 0.32.0 (MLX 0.32.2): worst 1 - cosine 2.9e-4 on `ko`,
+//! worst score delta 3.3e-3, BF16 runs bit-identical run to run. The bounds
+//! leave about 1.4x and 1.5x headroom:
+//! - per input, cosine(native, oracle) >= 1 - 4e-4;
+//! - pair scores and the card's 2 x 2 scores within 5e-3 of the oracle's.
 //!
-//! The BF16 error is about twice the HF BF16 source's (worst 4.7e-4) because
-//! MLX before 0.29.3 computes BF16 sigmoid imprecisely, which `SiLU` uses in
-//! every MLP; mlx-sys 0.2.0 vendors MLX 0.25.1. An MLX >= 0.29.3 implementation,
-//! or a float32 sigmoid on 0.29.2, reaches about 3e-4 on the same inputs.
+//! The HF BF16 source's worst 1 - cosine is 4.7e-4. Under MLX 0.25.1 the
+//! native BF16 worst was 8.0e-4 (on `hi`, score delta 5.2e-3) because MLX
+//! before 0.29.3 computes BF16 sigmoid imprecisely, which `SiLU` uses in every
+//! MLP; the bounds were then 1e-3 and 1e-2.
 #![cfg(feature = "metal")]
 
 use std::{collections::HashMap, env, path::PathBuf};
@@ -34,8 +34,8 @@ use tokenizers::Tokenizer;
 const F32_COSINE_MIN: f64 = 1.0 - 1e-5;
 const F32_SCORE_VS_ORACLE: f64 = 1e-4;
 const F32_SCORE_VS_CARD: f64 = 1e-3;
-const BF16_COSINE_MIN: f64 = 1.0 - 1e-3;
-const BF16_SCORE_VS_ORACLE: f64 = 1e-2;
+const BF16_COSINE_MIN: f64 = 1.0 - 4e-4;
+const BF16_SCORE_VS_ORACLE: f64 = 5e-3;
 
 fn dot(left: &[f32], right: &[f32]) -> f64 {
     left.iter()
