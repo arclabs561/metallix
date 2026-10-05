@@ -8,10 +8,10 @@
 use thiserror::Error;
 
 /// Maximum number of routed experts accepted for one bounded score row.
-pub const MAX_FLASH_ROUTING_WIDTH: usize = 4_096;
+pub(crate) const MAX_FLASH_ROUTING_WIDTH: usize = 4_096;
 
 /// Maximum BF16 gate-matrix elements accepted by one scalar projection call.
-pub const MAX_FLASH_GATE_PROJECTION_ELEMENTS: usize = 1 << 22;
+pub(crate) const MAX_FLASH_GATE_PROJECTION_ELEMENTS: usize = 1 << 22;
 
 /// One selected routed expert with its final multiplicative route weight.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,7 +266,7 @@ pub fn flash_bf16_gate_routes(
 ///
 /// Returns [`FlashRoutingError`] for malformed, over-bounded, non-finite, or
 /// numerically overflowing inputs, and for a tie crossing the Top-K cutoff.
-pub fn flash_sqrt_softplus_routes(
+pub(crate) fn flash_sqrt_softplus_routes(
     logits: &[f32],
     bias: &[f32],
     top_k: usize,

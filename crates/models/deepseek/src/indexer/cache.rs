@@ -16,14 +16,7 @@ mod storage;
 use storage::{PrefixStore, StorePendingAppend, StorePendingReset};
 
 /// Largest bounded index-key cache allocation, in BF16 elements.
-pub const MAX_INDEX_KEY_CACHE_ELEMENTS: usize = 1 << 20;
-
-/// Largest bounded compressed-KV cache allocation, in BF16 elements.
-///
-/// This has the same model-local storage ceiling as index keys. It is a
-/// separate constant so a caller need not infer a compressed-KV limit from an
-/// index-key type.
-pub const MAX_COMPRESSED_KV_CACHE_ELEMENTS: usize = MAX_INDEX_KEY_CACHE_ELEMENTS;
+pub(crate) const MAX_INDEX_KEY_CACHE_ELEMENTS: usize = 1 << 20;
 
 /// Identifies one source publication in a request-local owner-prefix stream.
 ///

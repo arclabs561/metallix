@@ -18,12 +18,12 @@ use crate::{
 
 const GROUP_WIDTH: usize = 32;
 /// Largest accepted per-token vector in this bounded reference.
-pub const MAX_MOE_ELEMENTS: usize = 1 << 22;
+pub(crate) const MAX_MOE_ELEMENTS: usize = 1 << 22;
 /// Largest logical projection-term count across selected and shared experts.
 ///
 /// Scalar linear leaves perform validation and write passes, so this is not an
 /// exact instruction count. Gate projection and activation preparation add work.
-pub const MAX_MOE_WORK: usize = 1 << 28;
+pub(crate) const MAX_MOE_WORK: usize = 1 << 28;
 
 /// Static V4.1 `MoE` geometry and routing parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -375,7 +375,7 @@ pub fn prepare_index_keys_with_rotary_execution(
 /// reconstruction. `MetalPreFp4` is qualified
 /// only for the captured V4.1 operands in this module's fixture, rather than
 /// for arbitrary BF16 matrix reductions.
-pub fn prepare_index_keys_with_execution(
+pub(crate) fn prepare_index_keys_with_execution(
     latent: &[u16],
     frequencies: &[RotaryFrequency],
     weights: IndexKeyWeights<'_>,

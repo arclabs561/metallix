@@ -20,7 +20,7 @@ use crate::{
 use super::cache::IndexKeyPublicationId;
 
 /// Largest `[position, key]` score matrix accepted by this adapter.
-pub const MAX_SELECTION_SCORE_ELEMENTS: usize = 1 << 20;
+pub(crate) const MAX_SELECTION_SCORE_ELEMENTS: usize = 1 << 20;
 
 /// The validated, source-specific geometry shared by one candidate/selection call.
 ///

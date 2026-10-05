@@ -14,15 +14,12 @@ pub mod layer;
 pub mod window;
 
 mod output;
-pub use output::{
-    AttentionOutputError, AttentionOutputLayout, AttentionOutputLayoutError,
-    attention_output_reference,
-};
+pub use output::{AttentionOutputError, AttentionOutputLayoutError};
+pub(crate) use output::{AttentionOutputLayout, attention_output_reference};
 
 mod bf16;
-pub use bf16::{
-    MAX_BF16_ATTENTION_ELEMENTS, SparseAttentionBf16Error, sparse_attention_bf16_reference,
-};
+pub use bf16::SparseAttentionBf16Error;
+pub(crate) use bf16::sparse_attention_bf16_reference;
 
 #[cfg(test)]
 mod bf16_tests;

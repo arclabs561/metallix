@@ -23,7 +23,7 @@ const MAX_ATTENTION_OUTPUT_WORK: usize = 1 << 34;
 
 /// Explicit layout for attention's inverse-RoPE and output projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AttentionOutputLayout {
+pub(crate) struct AttentionOutputLayout {
     batches: usize,
     positions: usize,
     heads: usize,
@@ -297,7 +297,7 @@ pub enum AttentionOutputError {
 /// block-diagonal `einsum("bsgd,grd->bsgr")`, then FP8 `wo_b` order. Its
 /// BF16 `wo_a` and final `wo_b` narrows are scalar precision contracts; this
 /// does not claim `PyTorch`, CUDA, `TileLang`, or Metal GEMM reduction parity.
-pub fn attention_output_reference(
+pub(crate) fn attention_output_reference(
     attention: &[u16],
     frequencies: &[RotaryFrequency],
     wo_a: &[u16],

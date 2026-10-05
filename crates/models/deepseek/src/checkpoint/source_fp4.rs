@@ -30,7 +30,7 @@ const WEIGHT_GROUP: u64 = 32;
 ///
 /// Callers supply their own stricter limit. This ceiling prevents a malformed
 /// microartifact request from becoming a whole-checkpoint allocation.
-pub const MAX_EXPERT_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_EXPERT_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The canonical routed-expert projection named by a source checkpoint tensor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

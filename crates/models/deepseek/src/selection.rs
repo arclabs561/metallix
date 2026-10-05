@@ -8,7 +8,7 @@
 use thiserror::Error;
 
 /// Maximum score-row width accepted by this bounded CPU qualification helper.
-pub const MAX_SELECTION_WIDTH: usize = 1 << 20;
+pub(crate) const MAX_SELECTION_WIDTH: usize = 1 << 20;
 
 /// Errors from final V4.1 index selection qualification.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

@@ -9,11 +9,11 @@ use std::num::NonZeroUsize;
 use thiserror::Error;
 
 /// The largest raw BF16 ring or schedule allocation accepted by this reference.
-pub const MAX_WINDOW_ELEMENTS: usize = 1 << 20;
+pub(crate) const MAX_WINDOW_ELEMENTS: usize = 1 << 20;
 
 /// One source-shaped sliding-window update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowStep {
+pub(crate) enum WindowStep {
     /// A zero-origin chunk containing one or more consecutive tokens.
     Prefill {
         /// Number of tokens in the supplied chunk.
@@ -94,7 +94,7 @@ pub enum WindowError {
 ///
 /// Returns [`WindowError`] when the derived schedule is over the fixed bound,
 /// cannot be represented, or cannot be allocated.
-pub fn window_topk_indices(
+pub(crate) fn window_topk_indices(
     step: WindowStep,
     window: NonZeroUsize,
     batches: NonZeroUsize,
@@ -170,7 +170,7 @@ pub fn window_topk_indices(
 ///
 /// Returns [`WindowError`] before writing when either exact buffer length or a
 /// bounded shape is invalid. A rejection leaves `ring` unchanged.
-pub fn write_window_kv_bf16(
+pub(crate) fn write_window_kv_bf16(
     step: WindowStep,
     prepared_kv: &[u16],
     batches: NonZeroUsize,

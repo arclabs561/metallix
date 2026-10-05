@@ -22,12 +22,12 @@ pub mod startup;
 pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
 pub use checkpoint::{
-    MAX_EXPERT_PAYLOAD_BYTES, MAX_SHARED_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair,
-    V41ExpertI8ScalePairError, V41ExpertI8ScalePairs, V41ExpertI8ScalePayload,
-    V41ExpertPayloadError, V41ExpertProjection, V41ExpertProjectionPayload, V41SafetensorsHeader,
-    V41SafetensorsHeaderError, V41SharedExpertFp8ScalePair, V41SharedExpertFp8ScalePairError,
-    V41SharedExpertFp8ScalePairs, V41SharedExpertFp8ScalePayload, V41SharedExpertPayloadError,
-    V41SharedExpertProjection, V41SharedExpertProjectionPayload, V41StorageDtype, V41TensorRange,
+    MAX_SHARED_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,
+    V41ExpertI8ScalePairs, V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
+    V41ExpertProjectionPayload, V41SafetensorsHeader, V41SafetensorsHeaderError,
+    V41SharedExpertFp8ScalePair, V41SharedExpertFp8ScalePairError, V41SharedExpertFp8ScalePairs,
+    V41SharedExpertFp8ScalePayload, V41SharedExpertPayloadError, V41SharedExpertProjection,
+    V41SharedExpertProjectionPayload, V41StorageDtype, V41TensorRange,
 };
 pub use csa2::{CandidateError, candidate_mask};
 #[cfg(feature = "metal")]
@@ -40,9 +40,7 @@ pub use rotary::{
 };
 #[cfg(feature = "metal")]
 pub use rotary::{RotaryMetalError, rotate_tail_metal};
-pub use routing::{
-    ExpertRoute, FlashRoutingError, MAX_FLASH_ROUTING_WIDTH, flash_sqrt_softplus_routes,
-};
+pub use routing::{ExpertRoute, FlashRoutingError};
 pub use selection::{SelectionError, select_indices};
 pub use startup::{
     StartupError, StartupLayout, StartupOutput, startup_bf16_reference,

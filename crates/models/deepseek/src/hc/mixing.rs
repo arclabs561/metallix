@@ -7,10 +7,10 @@
 use thiserror::Error;
 
 /// Maximum Hyper-Connections copies accepted by one scalar mixing call.
-pub const MAX_HC_COPIES: usize = 16;
+pub(crate) const MAX_HC_COPIES: usize = 16;
 
 /// Maximum feature width accepted by one scalar mixing call.
-pub const MAX_HC_MIX_WIDTH: usize = 16_384;
+pub(crate) const MAX_HC_MIX_WIDTH: usize = 16_384;
 
 /// An invalid bounded Hyper-Connections scalar mixing request.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]

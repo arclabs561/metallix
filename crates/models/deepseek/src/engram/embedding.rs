@@ -174,7 +174,7 @@ pub fn engram_embedding_bf16_reference(
 /// # Errors
 /// Returns [`EngramEmbeddingError`] for invalid shapes, an oversized selection,
 /// a source failure, or a nonfinite selected value.
-pub fn engram_embedding_bf16_from_source(
+pub(crate) fn engram_embedding_bf16_from_source(
     ids: &[i64],
     table_rows: usize,
     width: usize,

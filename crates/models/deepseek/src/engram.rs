@@ -12,7 +12,7 @@ pub mod inputs;
 use thiserror::Error;
 
 /// Largest number of cached compressed-token slots accepted by this reference.
-pub const MAX_ENGRAM_HISTORY: usize = 1 << 20;
+pub(crate) const MAX_ENGRAM_HISTORY: usize = 1 << 20;
 const MAX_ENGRAM_LAYOUT_ELEMENTS: usize = 1 << 20;
 const MAX_ENGRAM_OUTPUTS: usize = 1 << 20;
 const MAX_ENGRAM_WORK: usize = 1 << 24;

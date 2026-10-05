@@ -496,7 +496,7 @@ pub fn prepare_scored_query(
 /// This keeps the scalar default available through [`prepare_scored_query`].
 /// Metal remains an explicit model-local diagnostic choice; this function does
 /// not create a generic backend abstraction or cache/selection policy.
-pub fn prepare_scored_query_with_execution(
+pub(crate) fn prepare_scored_query_with_execution(
     x: &[u16],
     frequencies: &[RotaryFrequency],
     weights: CandidateQueryWeights<'_>,

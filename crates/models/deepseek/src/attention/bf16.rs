@@ -10,7 +10,7 @@ use thiserror::Error;
 use super::{SparseAttentionError, SparseAttentionLayout, validate_inputs};
 
 /// Largest one-buffer BF16 sparse-attention input or output accepted here.
-pub const MAX_BF16_ATTENTION_ELEMENTS: usize = 1 << 23;
+pub(crate) const MAX_BF16_ATTENTION_ELEMENTS: usize = 1 << 23;
 
 const MAX_BF16_ATTENTION_WORK: usize = 1 << 31;
 const BLOCK: usize = 64;
@@ -98,7 +98,7 @@ pub enum SparseAttentionBf16Error {
 /// Returns [`SparseAttentionBf16Error`] before widening or output allocation
 /// for an over-bound geometry, and before publishing a result for invalid data
 /// or nonfinite scalar arithmetic.
-pub fn sparse_attention_bf16_reference(
+pub(crate) fn sparse_attention_bf16_reference(
     query: &[u16],
     shared_kv: &[u16],
     sink: &[f32],

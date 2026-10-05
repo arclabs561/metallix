@@ -11,7 +11,7 @@ use crate::precision::{bf16_to_f32, f32_to_bf16_rne};
 use thiserror::Error;
 
 /// Maximum elements in one compressor input, state, or result buffer.
-pub const MAX_COMPRESSOR_ELEMENTS: usize = 1 << 20;
+pub(crate) const MAX_COMPRESSOR_ELEMENTS: usize = 1 << 20;
 
 /// Preprojected inputs accepted by [`CompressorState::forward`].
 ///

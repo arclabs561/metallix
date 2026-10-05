@@ -21,8 +21,8 @@ pub mod range_cache;
 mod source_fp4;
 mod source_fp8;
 pub use source_fp4::{
-    MAX_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,
-    V41ExpertI8ScalePairs, V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
+    V41ExpertI8ScalePair, V41ExpertI8ScalePairError, V41ExpertI8ScalePairs,
+    V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
     V41ExpertProjectionPayload,
 };
 

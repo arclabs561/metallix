@@ -30,7 +30,7 @@ pub mod selection;
 /// Shared logical geometry cap. On Metal this bounds the 64 MiB FP32 matrix
 /// itself, not MLX temporary allocations or peak GPU memory. CPU scoring does
 /// not allocate that matrix and additionally bounds scalar work.
-pub const MAX_INDEX_SCORE_ELEMENTS: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_INDEX_SCORE_ELEMENTS: usize = 16 * 1024 * 1024;
 
 /// Maximum scalar multiply-accumulate terms in one CPU diagnostic call.
 pub const MAX_INDEX_REFERENCE_TERMS: usize = 16 * 1024 * 1024;
