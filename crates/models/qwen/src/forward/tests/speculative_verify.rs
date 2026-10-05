@@ -7,7 +7,8 @@
 //! compares with plain greedy decoding.
 
 use engine::speculative::{
-    Pick, PositionLogits, PromptLookup, SpeculativeTarget, speculative_step,
+    GreedySpeculativeTarget, Pick, PositionLogits, PromptLookup, SpeculativeTarget,
+    greedy_speculative_step, speculative_step,
 };
 
 use super::prefix_extend::{sensitive_weights, two_layer_long_config};
@@ -161,6 +162,76 @@ impl SpeculativeTarget for Target<'_, '_> {
     fn truncate(&mut self, tokens: usize) -> Result<(), Qwen3ForwardError> {
         self.0.truncate_cached_tokens(tokens)
     }
+}
+
+impl GreedySpeculativeTarget for Target<'_, '_> {
+    fn verify_greedy(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Qwen3ForwardError> {
+        self.0.extend_greedy(tokens)?.wait()
+    }
+}
+
+#[test]
+fn gpu_greedy_verify_matches_host_argmax_of_every_row() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = two_layer_long_config();
+    let weights = sensitive_weights();
+    let chunk = [4, 2, 7, 0, 5];
+    let mut host = resident(&config, &weights);
+    host.prefill_last_logits(&PROMPT).expect("prefill");
+    let rows = host.extend_all_logits(&chunk).expect("rows");
+    let mut device = resident(&config, &weights);
+    device.prefill_last_logits(&PROMPT).expect("prefill");
+    let picks = device
+        .extend_greedy(&chunk)
+        .expect("picks")
+        .wait()
+        .expect("wait");
+    let expected: Vec<i32> = (0..chunk.len())
+        .map(|index| argmax(rows.row(index).expect("row")))
+        .collect();
+    assert_eq!(picks, expected);
+    assert_eq!(device.cached_tokens(), PROMPT.len() + chunk.len());
+    assert!(matches!(
+        resident(&config, &weights).extend_greedy(&[1]),
+        Err(Qwen3ForwardError::DecodeWithoutPrefill)
+    ));
+}
+
+#[test]
+fn gpu_greedy_speculation_reproduces_plain_greedy_decoding() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = two_layer_long_config();
+    let weights = sensitive_weights();
+    let length = 40;
+    let expected = decode_plain(&config, &weights, length, |row, _| argmax(row));
+    let mut executor = resident(&config, &weights);
+    let first = executor.prefill_last_logits(&PROMPT).expect("prefill");
+    let mut output = vec![argmax(&first)];
+    let (mut drafted, mut accepted) = (0, 0);
+    while output.len() < length {
+        let limit = (length - output.len() - 1).min(4);
+        // Alternate a likely draft (the last token repeated, which this
+        // fixture mostly emits) with guesses that miss.
+        let draft: Vec<i32> = (0..limit)
+            .map(|offset| {
+                if output.len() % 3 == 0 {
+                    i32::try_from((output.len() + offset * 5) % 8).expect("small")
+                } else {
+                    *output.last().expect("first token")
+                }
+            })
+            .collect();
+        let last = *output.last().expect("first token");
+        let outcome =
+            greedy_speculative_step(&mut Target(&mut executor), last, &draft, &mut |_| false)
+                .expect("speculative step");
+        drafted += outcome.drafted;
+        accepted += outcome.accepted;
+        output.extend(outcome.emitted);
+        assert_eq!(executor.cached_tokens(), PROMPT.len() + output.len() - 1);
+    }
+    assert_eq!(output, expected);
+    assert!(accepted > 0 && drafted > accepted, "{accepted}/{drafted}");
 }
 
 fn argmax(logits: &[f32]) -> i32 {

@@ -8,7 +8,9 @@ use std::hash::BuildHasher;
 
 use mlx_rs::{Array, StreamOrDevice};
 
-use super::{LogitRows, Qwen3ForwardError, Qwen3ForwardExecutor, as_i32};
+use super::{
+    LogitRows, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3TokenPicks, as_i32, validate_input_ids,
+};
 
 /// Row-major `[positions, vocab_size]` f32 logits from one append.
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +70,47 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
         self.append_rows(input_ids)
+    }
+
+    /// Appends a chunk to a prefilled sequence and starts the greedy pick
+    /// after every chunk position on the GPU: pick `i` is the argmax of the
+    /// row [`Self::extend_all_logits`] would return at `i`, with the same
+    /// lowest-ID tie rule as decode. Only the `input_ids.len()` token IDs
+    /// are read back, not the vocabulary rows, which is what a greedy
+    /// speculative verify needs.
+    pub fn extend_greedy(
+        &mut self,
+        input_ids: &[i32],
+    ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
+        if self.cached_tokens == 0 {
+            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+        }
+        validate_input_ids(
+            self.config,
+            input_ids,
+            self.cached_tokens,
+            self.maximum_context_tokens,
+        )?;
+        let seq_len =
+            i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        let pending = self
+            .append_ids(
+                &Array::from_slice(input_ids, &[seq_len]),
+                seq_len,
+                LogitRows::All,
+            )
+            .and_then(|logits| {
+                let rows = logits.reshape_device(
+                    &[seq_len, as_i32(self.config.vocab_size)?],
+                    StreamOrDevice::gpu(),
+                )?;
+                Qwen3TokenPicks::start(&rows, self.weights_address())
+            });
+        if pending.is_err() {
+            // A partly built append must not leave some layers ahead.
+            self.reset();
+        }
+        pending
     }
 
     fn append_rows(&mut self, input_ids: &[i32]) -> Result<Qwen3PositionLogits, Qwen3ForwardError> {
