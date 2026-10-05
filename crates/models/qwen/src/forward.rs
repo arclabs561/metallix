@@ -1065,26 +1065,34 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     fn append_inner(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
-        // A cache of earlier positions cannot serve a layer whose earlier
-        // positions also attend to later ones.
-        if self.config.attention != Qwen3Attention::Causal {
-            return Err(Qwen3ForwardError::CachedBidirectional);
-        }
         validate_input_ids(
             self.config,
             input_ids,
             self.cached_tokens,
             self.maximum_context_tokens,
         )?;
-
-        let stream = StreamOrDevice::gpu();
         let seq_len =
             i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        let logits = self.append_ids(&Array::from_slice(input_ids, &[seq_len]), seq_len)?;
+        read_last_logits(&logits, 1, self.config.vocab_size)
+    }
+
+    /// Builds, without evaluating, the graph that appends `ids` (shape
+    /// `[seq_len]`, already validated against the vocabulary and context) to
+    /// every layer's cache, and returns the last position's `[1, 1, vocab]`
+    /// logits.
+    fn append_ids(&mut self, ids: &Array, seq_len: i32) -> Result<Array, Qwen3ForwardError> {
+        // A cache of earlier positions cannot serve a layer whose earlier
+        // positions also attend to later ones.
+        if self.config.attention != Qwen3Attention::Causal {
+            return Err(Qwen3ForwardError::CachedBidirectional);
+        }
+        let appended = usize::try_from(seq_len).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        let stream = StreamOrDevice::gpu();
         let hidden = as_i32(self.config.hidden_size)?;
-        let ids = Array::from_slice(input_ids, &[seq_len]);
         let embedding = weight(self.weights, "model.embed_tokens.weight")?;
         let mut hidden_states = embedding
-            .take_axis_device(&ids, 0, &stream)?
+            .take_axis_device(ids, 0, &stream)?
             .reshape_device(&[1, seq_len, hidden], &stream)?;
 
         let rope_offset =
@@ -1106,12 +1114,12 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
                 self.residual_steering.as_deref(),
                 layer,
                 self.cached_tokens,
-                input_ids.len(),
+                appended,
                 &hidden_states,
             )?;
         }
 
-        self.cached_tokens += input_ids.len();
+        self.cached_tokens += appended;
         let last_hidden =
             hidden_states.take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?;
         let normalized = rms_norm(
@@ -1119,11 +1127,159 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
-        let logits = linear(
+        linear(
             &normalized,
             weight(self.weights, self.config.output_weight_name())?,
+        )
+    }
+
+    /// Appends one host-known token and starts computing the greedy next
+    /// token on the GPU without waiting for it.
+    ///
+    /// Only the selected ID and a finiteness flag are read back, not the
+    /// vocabulary row. Ties go to the lowest token ID, as in a host argmax
+    /// that keeps the first maximum.
+    pub fn decode_greedy(&mut self, input_id: i32) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
+        if self.cached_tokens == 0 {
+            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+        }
+        validate_input_ids(
+            self.config,
+            &[input_id],
+            self.cached_tokens,
+            self.maximum_context_tokens,
         )?;
-        read_last_logits(&logits, 1, self.config.vocab_size)
+        self.append_greedy(&Array::from_slice(&[input_id], &[1]))
+    }
+
+    /// Appends `previous` while it may still be computing and starts the
+    /// greedy token after it, so the host builds step `t + 1` while the GPU
+    /// runs step `t`.
+    ///
+    /// The cache then holds `previous` even if the caller stops on it (an
+    /// end-of-sequence token); [`Self::truncate_cached_tokens`] removes it.
+    pub fn decode_greedy_after(
+        &mut self,
+        previous: &Qwen3GreedyPicks,
+    ) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
+        if self.cached_tokens == 0 {
+            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+        }
+        if previous.binding != self.weights_address() || previous.tokens.shape() != [1] {
+            return Err(Qwen3ForwardError::CacheInconsistent);
+        }
+        let total = self
+            .cached_tokens
+            .checked_add(1)
+            .ok_or(Qwen3ForwardError::ShapeOverflow)?;
+        if total > self.maximum_context_tokens {
+            return Err(Qwen3ForwardError::PromptTooLong {
+                actual: total,
+                maximum: self.maximum_context_tokens,
+            });
+        }
+        // An argmax over this checkpoint's logit rows is a valid token ID,
+        // so the vocabulary check host IDs get is not needed here.
+        self.append_greedy(&previous.tokens)
+    }
+
+    fn append_greedy(&mut self, ids: &Array) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
+        let pending = self.append_ids(ids, 1).and_then(|logits| {
+            let rows = logits
+                .reshape_device(&[1, as_i32(self.config.vocab_size)?], StreamOrDevice::gpu())?;
+            Qwen3GreedyPicks::start(&rows, self.weights_address())
+        });
+        if pending.is_err() {
+            // As in `append`: a partly built step must not leave some layers
+            // one position ahead of the others.
+            self.reset();
+        }
+        pending
+    }
+
+    /// Shortens the sequence to its first `tokens` cached positions, such as
+    /// dropping a token appended by [`Self::decode_greedy_after`] that the
+    /// caller then stopped on, or rejected draft positions.
+    pub fn truncate_cached_tokens(&mut self, tokens: usize) -> Result<(), Qwen3ForwardError> {
+        if tokens == 0 || tokens > self.cached_tokens {
+            return Err(Qwen3ForwardError::CacheInconsistent);
+        }
+        // Resident storage keeps the tier `stepped_cached_kv` chooses for the
+        // shorter sequence, which forks check; unbounded caches hold exactly
+        // the cached positions.
+        let stored = match self.resident_cache_capacity {
+            Some(maximum_capacity) => stepped_capacity(tokens, maximum_capacity)?,
+            None => tokens,
+        };
+        let stored = as_i32(stored)?;
+        let stream = StreamOrDevice::gpu();
+        for layer in self.cache.iter_mut().flatten() {
+            if layer.keys.shape().get(2) != Some(&stored) {
+                layer.keys = layer.keys.index_device((.., .., 0..stored, ..), &stream);
+                layer.values = layer.values.index_device((.., .., 0..stored, ..), &stream);
+            }
+        }
+        self.cached_tokens = tokens;
+        Ok(())
+    }
+
+    /// Identifies the borrowed weights map, so a pending token is never fed
+    /// to an executor of another checkpoint load.
+    fn weights_address(&self) -> usize {
+        std::ptr::from_ref(self.weights).addr()
+    }
+}
+
+/// Greedy picks for one or more logit rows that may still be computing on
+/// the GPU. Decode makes one row; a speculative verify can make several.
+pub struct Qwen3GreedyPicks {
+    /// `[rows]` uint32 token IDs.
+    tokens: Array,
+    finite: Array,
+    binding: usize,
+}
+
+impl Qwen3GreedyPicks {
+    /// Queues the per-row argmax of `[rows, vocab]` logits and a check that
+    /// every logit is finite.
+    fn start(rows: &Array, binding: usize) -> Result<Self, Qwen3ForwardError> {
+        let stream = StreamOrDevice::gpu();
+        let tokens = ops::indexing::argmax_axis_device(rows, -1, false, &stream)?;
+        let finite = rows.is_finite_device(&stream)?.all_device(false, &stream)?;
+        mlx_rs::transforms::async_eval([&tokens, &finite])?;
+        Ok(Self {
+            tokens,
+            finite,
+            binding,
+        })
+    }
+
+    /// Waits for the picks and reads back one token ID per row. Ties go to
+    /// the lowest ID, as in a host argmax that keeps the first maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen3ForwardError::NonFiniteLogits`] when any logit was NaN
+    /// or infinite, which the host argmax also refuses.
+    pub fn wait(&self) -> Result<Vec<i32>, Qwen3ForwardError> {
+        mlx_rs::transforms::eval([&self.tokens, &self.finite])?;
+        if !self.finite.item::<bool>() {
+            return Err(Qwen3ForwardError::NonFiniteLogits);
+        }
+        // MLX returns argmax indices as uint32.
+        self.tokens
+            .as_slice::<u32>()
+            .iter()
+            .map(|&token| i32::try_from(token).map_err(|_| Qwen3ForwardError::ShapeOverflow))
+            .collect()
+    }
+
+    /// [`Self::wait`] for a single-row pick, such as one decode step.
+    pub fn wait_one(&self) -> Result<i32, Qwen3ForwardError> {
+        match self.wait()?.as_slice() {
+            [token] => Ok(*token),
+            _ => Err(Qwen3ForwardError::CacheInconsistent),
+        }
     }
 }
 
@@ -2121,6 +2277,9 @@ pub enum Qwen3ForwardError {
     /// A weight dtype is not one of [`Qwen3WeightPrecision`]'s.
     #[error("Qwen3 weight dtype {0} is not a supported floating-point precision")]
     UnsupportedWeightDtype(String),
+    /// The model produced a NaN or infinite logit, so no greedy token exists.
+    #[error("Qwen3 produced non-finite vocabulary logits")]
+    NonFiniteLogits,
     /// MLX could not construct, evaluate, or copy the Metal graph.
     #[error("MLX Qwen3 forward failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
@@ -2138,11 +2297,11 @@ mod tests {
     const F32: super::Qwen3WeightPrecision = super::Qwen3WeightPrecision::Float32;
 
     use super::{
-        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
-        Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
-        forward_hidden_states, forward_last_hidden, forward_last_hidden_batch, forward_last_logits,
-        forward_last_logits_with_residual_steering, forward_layer, linear, read_last_logits,
-        rms_norm, stepped_capacity, weight,
+        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3GreedyPicks,
+        Qwen3ResidualSteering, Qwen3ResidualSteeringArtifact, Qwen3SteeringError,
+        Qwen3SteeringPositionRange, forward_hidden_states, forward_last_hidden,
+        forward_last_hidden_batch, forward_last_logits, forward_last_logits_with_residual_steering,
+        forward_layer, linear, read_last_logits, rms_norm, stepped_capacity, weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -2518,6 +2677,90 @@ mod tests {
         assert_eq!(executor.kv_bytes(), 0);
     }
 
+    fn host_argmax(logits: &[f32]) -> i32 {
+        let mut best = 0;
+        for (index, &value) in logits.iter().enumerate() {
+            if value > logits[best] {
+                best = index;
+            }
+        }
+        i32::try_from(best).expect("small vocabulary")
+    }
+
+    #[test]
+    fn gpu_greedy_breaks_ties_low_and_refuses_non_finite_rows() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let tied = Array::from_slice(
+            &[1.0_f32, 3.0, -2.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[2, 5],
+        );
+        let picks = Qwen3GreedyPicks::start(&tied, 0).expect("queued argmax");
+        assert_eq!(picks.wait().expect("finite rows"), [1, 0]);
+        assert!(matches!(
+            picks.wait_one(),
+            Err(Qwen3ForwardError::CacheInconsistent)
+        ));
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let row = Array::from_slice(&[0.0_f32, 1.0, poison], &[1, 3]);
+            let token = Qwen3GreedyPicks::start(&row, 0).expect("queued argmax");
+            assert!(matches!(
+                token.wait(),
+                Err(Qwen3ForwardError::NonFiniteLogits)
+            ));
+        }
+    }
+
+    #[test]
+    fn pipelined_gpu_greedy_matches_host_greedy_and_discards_the_stop_token() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = long_small_config();
+        let weights = deterministic_weights();
+        let prompt = [1, 2, 3];
+        // Crosses the 128-token storage tier, so the rollback also has to
+        // shrink storage back to the tier forks check.
+        let steps = 140;
+
+        let mut host = Qwen3ForwardExecutor::new_for_resident_chat(
+            &config,
+            &weights,
+            config.resident_chat_plan(256, u64::MAX, F32).expect("plan"),
+        );
+        let mut logits = host.prefill_last_logits(&prompt).expect("host prefill");
+        let mut expected = Vec::new();
+        for _ in 0..steps {
+            let token = host_argmax(&logits);
+            expected.push(token);
+            logits = host.decode_last_logits(token).expect("host decode");
+        }
+
+        let mut gpu = Qwen3ForwardExecutor::new_for_resident_chat(
+            &config,
+            &weights,
+            config.resident_chat_plan(256, u64::MAX, F32).expect("plan"),
+        );
+        let first = host_argmax(&gpu.prefill_last_logits(&prompt).expect("gpu prefill"));
+        let mut actual = vec![first];
+        let mut pending = gpu.decode_greedy(first).expect("first greedy step");
+        while actual.len() < steps {
+            // Queue the next step before reading this one back.
+            let next = gpu.decode_greedy_after(&pending).expect("pipelined step");
+            actual.push(pending.wait_one().expect("finite logits"));
+            pending = next;
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(gpu.cached_tokens(), prompt.len() + steps);
+        // The last queued step appended a token the caller never kept.
+        gpu.truncate_cached_tokens(gpu.cached_tokens() - 1)
+            .expect("rollback");
+        assert_eq!(gpu.cached_tokens(), host.cached_tokens() - 1);
+        gpu.fork_prefilled()
+            .expect("rolled-back storage stays consistent");
+        let continued = gpu
+            .decode_last_logits(*expected.last().expect("steps"))
+            .expect("decode after rollback");
+        assert_logits_match(logits, continued);
+    }
+
     #[test]
     fn residual_steering_rejects_corrupt_or_mismatched_artifacts() {
         let config = small_dense_config();
@@ -2699,6 +2942,7 @@ mod tests {
     mod cache_component_profile;
     mod capacity_cache_profile;
     mod decode_profile;
+    mod hot_path_profile;
     mod paged_batch;
     mod paged_kv;
     mod particle_replay;
