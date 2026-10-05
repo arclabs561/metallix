@@ -732,7 +732,7 @@ fn read_rows(
         // refusal of non-finite rows. Binding 0 matches no executor, so these
         // picks cannot be fed to `decode_greedy_after`.
         BatchReadback::Greedy => Ok(BatchDecoded::Greedy(
-            super::Qwen3GreedyPicks::start(logits, 0)?.wait()?,
+            super::Qwen3TokenPicks::start(logits, 0)?.wait()?,
         )),
     }
 }

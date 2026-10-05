@@ -29,10 +29,12 @@ use thiserror::Error;
 use crate::{DecoderFamily, Qwen3Attention};
 
 mod paged;
+mod picks;
 mod snapshot;
 mod verify;
 
 pub use paged::{BatchDecoded, BatchReadback, PagedQwen3Session};
+pub use picks::Qwen3TokenPicks;
 pub use snapshot::Qwen3KvSnapshot;
 pub use verify::Qwen3PositionLogits;
 
@@ -1163,7 +1165,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// Only the selected ID and a finiteness flag are read back, not the
     /// vocabulary row. Ties go to the lowest token ID, as in a host argmax
     /// that keeps the first maximum.
-    pub fn decode_greedy(&mut self, input_id: i32) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
+    pub fn decode_greedy(&mut self, input_id: i32) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
@@ -1184,8 +1186,8 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// end-of-sequence token); [`Self::truncate_cached_tokens`] removes it.
     pub fn decode_greedy_after(
         &mut self,
-        previous: &Qwen3GreedyPicks,
-    ) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
+        previous: &Qwen3TokenPicks,
+    ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
@@ -1207,11 +1209,11 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         self.append_greedy(&previous.tokens)
     }
 
-    fn append_greedy(&mut self, ids: &Array) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
+    fn append_greedy(&mut self, ids: &Array) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         let pending = self.append_ids(ids, 1, LogitRows::Last).and_then(|logits| {
             let rows = logits
                 .reshape_device(&[1, as_i32(self.config.vocab_size)?], StreamOrDevice::gpu())?;
-            Qwen3GreedyPicks::start(&rows, self.weights_address())
+            Qwen3TokenPicks::start(&rows, self.weights_address())
         });
         if pending.is_err() {
             // As in `append`: a partly built step must not leave some layers
@@ -1254,59 +1256,6 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// to an executor of another checkpoint load.
     fn weights_address(&self) -> usize {
         std::ptr::from_ref(self.weights).addr()
-    }
-}
-
-/// Greedy picks for one or more logit rows that may still be computing on
-/// the GPU. Decode makes one row; a speculative verify can make several.
-pub struct Qwen3GreedyPicks {
-    /// `[rows]` uint32 token IDs.
-    tokens: Array,
-    finite: Array,
-    binding: usize,
-}
-
-impl Qwen3GreedyPicks {
-    /// Queues the per-row argmax of `[rows, vocab]` logits and a check that
-    /// every logit is finite.
-    pub(crate) fn start(rows: &Array, binding: usize) -> Result<Self, Qwen3ForwardError> {
-        let stream = StreamOrDevice::gpu();
-        let tokens = ops::indexing::argmax_axis_device(rows, -1, false, &stream)?;
-        let finite = rows.is_finite_device(&stream)?.all_device(false, &stream)?;
-        mlx_rs::transforms::async_eval([&tokens, &finite])?;
-        Ok(Self {
-            tokens,
-            finite,
-            binding,
-        })
-    }
-
-    /// Waits for the picks and reads back one token ID per row. Ties go to
-    /// the lowest ID, as in a host argmax that keeps the first maximum.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Qwen3ForwardError::NonFiniteLogits`] when any logit was NaN
-    /// or infinite, which the host argmax also refuses.
-    pub fn wait(&self) -> Result<Vec<i32>, Qwen3ForwardError> {
-        mlx_rs::transforms::eval([&self.tokens, &self.finite])?;
-        if !self.finite.item::<bool>() {
-            return Err(Qwen3ForwardError::NonFiniteLogits);
-        }
-        // MLX returns argmax indices as uint32.
-        self.tokens
-            .as_slice::<u32>()
-            .iter()
-            .map(|&token| i32::try_from(token).map_err(|_| Qwen3ForwardError::ShapeOverflow))
-            .collect()
-    }
-
-    /// [`Self::wait`] for a single-row pick, such as one decode step.
-    pub fn wait_one(&self) -> Result<i32, Qwen3ForwardError> {
-        match self.wait()?.as_slice() {
-            [token] => Ok(*token),
-            _ => Err(Qwen3ForwardError::CacheInconsistent),
-        }
     }
 }
 
@@ -2341,7 +2290,7 @@ mod tests {
     const F32: super::Qwen3WeightPrecision = super::Qwen3WeightPrecision::Float32;
 
     use super::{
-        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3GreedyPicks,
+        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3TokenPicks,
         Qwen3ResidualSteering, Qwen3ResidualSteeringArtifact, Qwen3SteeringError,
         Qwen3SteeringPositionRange, forward_hidden_states, forward_last_hidden,
         forward_last_hidden_batch, forward_last_logits, forward_last_logits_with_residual_steering,
@@ -2738,7 +2687,7 @@ mod tests {
             &[1.0_f32, 3.0, -2.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             &[2, 5],
         );
-        let picks = Qwen3GreedyPicks::start(&tied, 0).expect("queued argmax");
+        let picks = Qwen3TokenPicks::start(&tied, 0).expect("queued argmax");
         assert_eq!(picks.wait().expect("finite rows"), [1, 0]);
         assert!(matches!(
             picks.wait_one(),
@@ -2746,7 +2695,7 @@ mod tests {
         ));
         for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let row = Array::from_slice(&[0.0_f32, 1.0, poison], &[1, 3]);
-            let token = Qwen3GreedyPicks::start(&row, 0).expect("queued argmax");
+            let token = Qwen3TokenPicks::start(&row, 0).expect("queued argmax");
             assert!(matches!(
                 token.wait(),
                 Err(Qwen3ForwardError::NonFiniteLogits)
