@@ -1,8 +1,9 @@
-//! One real DeepSeek-V4.1 request step, end to end, against the source capture.
+//! Real DeepSeek-V4.1 prompts, end to end, against the source captures.
 //!
 //! Opt-in: `cargo test -p server --release --test v41_request_end_to_end -- --ignored --nocapture`.
-//! Builds the 40-layer `RequestModel` from checkpoint tensors and runs
-//! `RequestSession::step_with_sources` on the captured 3-token prompt. Routed
+//! Builds the 40-layer `RequestModel` from checkpoint tensors and prefills a
+//! captured prompt (3 tokens, and the 17-token shell prompt) through
+//! `RequestSession::prefill_with_sources`. Routed
 //! experts, Engram rows and token-embedding rows come from caller sources over
 //! a `FetchingSource` (missing ranges fetched from the pinned Hub revision,
 //! inside the default envelope). Each layer chains from the native previous
@@ -29,7 +30,6 @@ use deepseek::{
 };
 use server::range_fetch::{CurlHost, Envelope, FetchingSource};
 
-const TOKENS: usize = 3;
 const ENGRAM_WIDTH: usize = 256;
 
 fn le_u16(bytes: &[u8]) -> Vec<u16> {
@@ -66,11 +66,25 @@ fn argmax(values: &[f32]) -> usize {
 
 #[test]
 #[ignore = "fetches missing experts and Engram rows from huggingface.co; needs .agents/receipts data and ~10 GB RAM"]
+fn one_real_request_step_matches_the_source_capture() {
+    run_capture("parity-greedy3.json", "capture-parity3");
+}
+
+/// The 17-token capture-shell2 prompt, prefilled in steps of at most the
+/// model's per-step token bound (one step here, since 17 fits).
+#[test]
+#[ignore = "fetches missing experts and Engram rows from huggingface.co; needs .agents/receipts data and ~10 GB RAM"]
+fn real_shell_prompt_matches_the_source_greedy_token() {
+    run_capture("parity-shell.json", "capture-shell2");
+}
+
+/// Prefills the recorded run's prompt through `prefill_with_sources`, reports
+/// per-layer agreement with `capture`, and requires the source's greedy token.
 #[allow(
     clippy::too_many_lines,
     reason = "one end-to-end request keeps every compared stage visible"
 )]
-fn one_real_request_step_matches_the_source_capture() {
+fn run_capture(run_file: &str, capture: &str) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.agents/receipts");
     let trace = root.join("route-trace");
     let registry: serde_json::Value =
@@ -125,17 +139,18 @@ fn one_real_request_step_matches_the_source_capture() {
         ))
         .expect("40-layer request model");
 
-    let run: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(trace.join("parity-greedy3.json")).expect("recorded run"),
-    )
-    .expect("recorded run JSON");
+    let run: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(trace.join(run_file)).expect("recorded run"))
+            .expect("recorded run JSON");
     let ids: Vec<i64> = run["runs"][0]["prompt_ids"]
         .as_array()
         .expect("prompt ids")
         .iter()
         .map(|id| id.as_i64().expect("id"))
         .collect();
-    assert_eq!(ids.len(), TOKENS);
+    let greedy = run["runs"][0]["generated_ids"][0]
+        .as_u64()
+        .expect("recorded greedy token");
 
     let cache = Mutex::new(cache);
     let experts: Vec<_> = (0..config.layers())
@@ -155,7 +170,7 @@ fn one_real_request_step_matches_the_source_capture() {
     let embedding = V41CachedEmbeddingRows::new(&cache, config.width());
     let mut session = RequestSession::new(&model).expect("request session");
     let output = session
-        .step_with_sources(
+        .prefill_with_sources(
             &ids,
             StepSources {
                 experts: &expert_refs,
@@ -163,9 +178,10 @@ fn one_real_request_step_matches_the_source_capture() {
                 embedding_rows: Some(&embedding),
             },
         )
-        .expect("real request step");
+        .expect("real request prefill");
+    assert_eq!(session.next_start(), ids.len());
 
-    let capture = trace.join("capture-parity3");
+    let capture = trace.join(capture);
     let read = |name: String| std::fs::read(capture.join(name)).expect("captured tensor");
     let layer_out = |layer: usize| le_u16(&read(format!("layer{layer:02}.out.torch.bfloat16.bin")));
     eprintln!(
@@ -215,6 +231,10 @@ fn one_real_request_step_matches_the_source_capture() {
     eprintln!(
         "logits max_abs {max_abs} native argmax {native_top} ({}) source argmax {source_top} ({})",
         logits[native_top], source[source_top]
+    );
+    assert_eq!(
+        source_top as u64, greedy,
+        "the capture's argmax is the recorded token"
     );
     assert_eq!(native_top, source_top, "next-token argmax");
 }

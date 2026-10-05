@@ -9,6 +9,11 @@ use thiserror::Error;
 
 const MAX_STARTUP_ELEMENTS: usize = 1 << 20;
 const MAX_STARTUP_COPIES: usize = 16;
+/// Most tokens one startup call expands; longer prompts are prefilled in steps.
+const MAX_STARTUP_STEP_TOKENS: usize = 128;
+/// Per-call residual bound: [`MAX_STARTUP_STEP_TOKENS`] rows of the widest
+/// per-token residual at V4.1 Flash, 4 HC copies x 5120.
+const MAX_STARTUP_STEP_ELEMENTS: usize = MAX_STARTUP_STEP_TOKENS * 4 * 5120;
 
 /// Validated dimensions for a bounded unsharded token embedding startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +109,22 @@ fn bounded_product(left: usize, right: usize) -> Result<usize, StartupError> {
         .ok_or(StartupError::ElementLimit { field: "shape" })
 }
 
+/// Bounds one call's token count and the residual and pre-mix it allocates.
+fn step_shape(tokens: usize, layout: StartupLayout) -> Result<(usize, usize), StartupError> {
+    if tokens > MAX_STARTUP_STEP_TOKENS {
+        return Err(StartupError::ElementLimit {
+            field: "step tokens",
+        });
+    }
+    let step = |left: usize, right: usize| {
+        left.checked_mul(right)
+            .filter(|&elements| elements <= MAX_STARTUP_STEP_ELEMENTS)
+            .ok_or(StartupError::ElementLimit { field: "shape" })
+    };
+    let residual = step(step(tokens, layout.width)?, layout.copies)?;
+    Ok((residual, step(tokens, layout.copies)?))
+}
+
 fn finite_bf16(bits: u16) -> bool {
     bits & 0x7f80 != 0x7f80
 }
@@ -124,9 +145,7 @@ pub fn startup_bf16_reference(
             expected: layout.table_elements,
         });
     }
-    let token_width = bounded_product(ids.len(), layout.width)?;
-    let residual_elements = bounded_product(token_width, layout.copies)?;
-    let pre_elements = bounded_product(ids.len(), layout.copies)?;
+    let (residual_elements, pre_elements) = step_shape(ids.len(), layout)?;
     for &id in ids {
         let row = usize::try_from(id).map_err(|_| StartupError::TokenOutOfRange {
             id,
@@ -210,9 +229,7 @@ pub fn startup_selected_bf16_reference(
             expected: layout.table_elements,
         });
     }
-    let token_width = bounded_product(ids.len(), layout.width)?;
-    bounded_product(token_width, layout.copies)?;
-    bounded_product(ids.len(), layout.copies)?;
+    step_shape(ids.len(), layout)?;
     let selected_row = |id| {
         selected_token_ids
             .binary_search(&id)
@@ -349,14 +366,35 @@ mod tests {
                 expected: 2,
             })
         );
+        // A call admits 128 tokens; its residual must also fit 128 x 4 x 5120.
         assert_eq!(
             startup_selected_bf16_reference(
-                &[5; 65],
+                &[5; 129],
                 &[5],
                 &[0x3f80; 1024],
                 StartupLayout::new(1, 1024, 16).unwrap(),
             ),
+            Err(StartupError::ElementLimit {
+                field: "step tokens"
+            })
+        );
+        assert_eq!(
+            startup_selected_bf16_reference(
+                &[5; 3],
+                &[5],
+                &vec![0x3f80; 65_536],
+                StartupLayout::new(1, 65_536, 16).unwrap(),
+            ),
             Err(StartupError::ElementLimit { field: "shape" })
+        );
+        assert!(
+            startup_selected_bf16_reference(
+                &[5; 128],
+                &[5],
+                &[0x3f80; 5120],
+                StartupLayout::new(1, 5120, 4).unwrap(),
+            )
+            .is_ok()
         );
     }
 

@@ -1084,6 +1084,37 @@ mod tests {
     }
 
     #[test]
+    fn chunked_prefill_equals_a_single_prefill_bit_for_bit() {
+        let artifact = artifact();
+        let ids = ids(&artifact.config);
+        with_parts(&artifact.config, &artifact.tensors, |parts| {
+            let single = from_schedule(&parts, reduced_schedule(&parts)).unwrap();
+            let expected = RequestSession::new(&single).unwrap().step(&ids).unwrap();
+            let rows = expected.residual().len() / ids.len();
+            let last_row = &expected.residual()[expected.residual().len() - rows..];
+            let bits = |output: &RequestStepOutput| -> Vec<u32> {
+                let head = output.heads().last().unwrap();
+                head.logits().iter().map(|value| value.to_bits()).collect()
+            };
+            for step in [1, 2, 3, ids.len() - 1, ids.len()] {
+                let chunked = from_schedule(&parts, reduced_schedule(&parts))
+                    .unwrap()
+                    .with_max_step_tokens(NonZeroUsize::new(step).unwrap());
+                let mut session = RequestSession::new(&chunked).unwrap();
+                let last = session
+                    .prefill_with_sources(&ids, StepSources::default())
+                    .unwrap();
+                assert_eq!(session.next_start(), ids.len());
+                let tail = &last.residual()[last.residual().len() - rows..];
+                assert_eq!(tail, last_row, "max step {step}");
+                assert_eq!(bits(&last), bits(&expected), "max step {step}");
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn last_position_heads_equal_the_last_of_all_position_heads() {
         let artifact = artifact();
         let ids = ids(&artifact.config);

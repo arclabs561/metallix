@@ -153,6 +153,33 @@ impl<'a> RequestSession<'a> {
         self.step_with_sources(ids, StepSources::default())
     }
 
+    /// Runs `ids` from the request cursor in steps no larger than the model's
+    /// [`RequestModel::max_step_tokens`] (at least two): at start zero the
+    /// first step takes up to that many tokens, and every later token is a
+    /// one-token step,
+    /// the only shape a step after the first admits. Returns the last step's
+    /// output; call [`Self::step_with_sources`] directly to keep each step's.
+    /// Each position attends to the same causal history as in one prefill.
+    pub fn prefill_with_sources(
+        &mut self,
+        ids: &[i64],
+        sources: StepSources<'_>,
+    ) -> Result<RequestStepOutput, RequestError> {
+        // A one-token first step would leave an incomplete ratio-two group
+        // with no previous ratio-one keys to score it, so it takes at least two.
+        let first = if self.next_start == 0 {
+            ids.len().min(self.model.max_step_tokens().get().max(2))
+        } else {
+            1
+        };
+        let (head, tail) = ids.split_at(first.min(ids.len()));
+        let mut output = self.step_with_sources(head, sources)?;
+        for id in tail {
+            output = self.step_with_sources(std::slice::from_ref(id), sources)?;
+        }
+        Ok(output)
+    }
+
     /// Same as [`Self::step`], with routed experts and Engram embedding rows
     /// fetched from caller sources instead of construction-time tables.
     ///

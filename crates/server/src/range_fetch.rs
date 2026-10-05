@@ -83,7 +83,9 @@ impl RangeHost for CurlHost {
                 "--max-time",
                 "180",
             ])
-            .args(["--retry", "3", "--retry-delay", "2"])
+            // `--retry` alone skips connection resets (exit 35), which the Hub
+            // CDN produces under many small range reads.
+            .args(["--retry", "3", "--retry-delay", "2", "--retry-all-errors"])
             .args(["-H", "Accept-Encoding: identity", "-D", "/dev/stderr"])
             .arg("-r")
             .arg(format!("{}-{last}", range.start))

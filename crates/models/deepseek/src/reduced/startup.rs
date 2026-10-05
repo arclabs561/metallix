@@ -14,7 +14,9 @@ use crate::{
     startup_bf16_reference, startup_selected_bf16_reference,
 };
 
-const MAX_ELEMENTS: usize = 1 << 20;
+/// Per-step buffer bound: 128 tokens (the crate startup's per-call token
+/// bound) of the widest per-token buffer at V4.1 Flash, 4 HC copies x 5120.
+const MAX_ELEMENTS: usize = 128 * 4 * 5120;
 
 /// Supplies BF16 token-embedding rows on demand, so a startup block need not
 /// hold the whole `[vocabulary, width]` table.

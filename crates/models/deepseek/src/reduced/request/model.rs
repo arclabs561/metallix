@@ -37,6 +37,7 @@ pub struct RequestModel<'a> {
     pub(super) engrams: Vec<EngramDefinition>,
     pub(super) head: FinalHead<'a>,
     pub(super) head_positions: HeadPositions,
+    max_step_tokens: Option<NonZeroUsize>,
     pub(super) frequencies: &'a [RotaryFrequency],
     pub(super) max_tokens: NonZeroUsize,
     pub(super) score_execution: IndexScoreExecution,
@@ -129,6 +130,7 @@ impl<'a> RequestModel<'a> {
             engrams,
             head,
             head_positions: HeadPositions::All,
+            max_step_tokens: None,
             frequencies,
             max_tokens,
             score_execution: IndexScoreExecution::Scalar,
@@ -236,6 +238,23 @@ impl<'a> RequestModel<'a> {
     #[must_use]
     pub const fn head_positions(&self) -> HeadPositions {
         self.head_positions
+    }
+
+    /// Sets the most tokens [`super::RequestSession::prefill_with_sources`]
+    /// puts in one step; the default is the request's `max_tokens`.
+    #[must_use]
+    pub const fn with_max_step_tokens(mut self, tokens: NonZeroUsize) -> Self {
+        self.max_step_tokens = Some(tokens);
+        self
+    }
+
+    /// Returns the most tokens one prefill step admits.
+    #[must_use]
+    pub const fn max_step_tokens(&self) -> NonZeroUsize {
+        match self.max_step_tokens {
+            Some(tokens) => tokens,
+            None => self.max_tokens,
+        }
     }
 
     fn validate(&self) -> Result<(), RequestError> {

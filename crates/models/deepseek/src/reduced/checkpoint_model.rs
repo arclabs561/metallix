@@ -553,7 +553,9 @@ impl V41CheckpointWeights {
             &self.compressed_frequencies,
             self.max_tokens,
         )?
-        .with_head_positions(HeadPositions::Last))
+        .with_head_positions(HeadPositions::Last)
+        // The startup and Engram per-step token bounds.
+        .with_max_step_tokens(nonzero(128)?))
     }
 
     /// Runs one layer of a start-zero prefill on a caller-supplied input
