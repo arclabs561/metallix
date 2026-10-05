@@ -377,9 +377,6 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
         }
         _ => return Err("messages must end with a user message".into()),
     }
-    if !pending.is_empty() {
-        return Err("tool_use blocks require tool_result blocks before generation resumes".into());
-    }
     Ok(messages)
 }
 
@@ -639,6 +636,7 @@ mod tests {
             json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"x"}}]}]}),
             json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"Sure,"}]}),
             json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"nope","content":"x"}]}]}),
+            json!({"messages":[{"role":"user","content":"x"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}]}]}),
         ] {
             assert!(prepare_body(&with(&extra)).is_err(), "accepted {extra}");
         }
@@ -650,6 +648,30 @@ mod tests {
         let error = prepare_body(&with(&json!({"frobnicate":1}))).err().unwrap();
         assert_eq!(error["type"], "error");
         assert_eq!(error["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn unanswered_tool_use_in_history_renders_as_given() {
+        let prepared = prepare_body(&with(&json!({"messages":[
+            {"role":"user","content":"read"},
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a"}},
+                {"type":"tool_use","id":"toolu_2","name":"read_file","input":{"path":"b"}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"A"}]}
+        ]})))
+        .unwrap();
+        let roles: Vec<_> = prepared
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect();
+        assert_eq!(roles, [ChatRole::User, ChatRole::Assistant, ChatRole::Tool]);
+        assert_eq!(prepared.messages[1].tool_calls.len(), 2);
+        assert_eq!(
+            prepared.messages[2].tool_call_id.as_deref(),
+            Some("toolu_1")
+        );
     }
 
     #[test]

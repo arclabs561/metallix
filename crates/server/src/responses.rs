@@ -327,9 +327,6 @@ pub(crate) fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
     if messages.is_empty() {
         return Err("input must contain at least one message".into());
     }
-    if !pending_calls.is_empty() {
-        return Err("tool calls require results before generation resumes".into());
-    }
     Ok(messages)
 }
 
@@ -849,6 +846,15 @@ mod tests {
         assert_eq!(messages[1].tool_calls[0].name, "read_file");
         assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
         assert!(input_text(&json!([{"type":"input_image","image_url":"x"}])).is_err());
+    }
+
+    #[test]
+    fn unanswered_function_calls_in_history_render_as_given() {
+        let request: Request = serde_json::from_value(json!({"model":"control","input":[{"role":"user","content":"read"},{"type":"function_call","name":"read_file","call_id":"call_1","arguments":"{}"},{"role":"user","content":"never mind"}]})).unwrap();
+        let messages = messages(&request).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].tool_calls[0].name, "read_file");
+        assert_eq!(messages[2].role, ChatRole::User);
     }
 
     fn request_with(extra: &Value) -> Result<Request, serde_json::Error> {

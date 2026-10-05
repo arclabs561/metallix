@@ -372,9 +372,6 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
     {
         return Err("messages must contain at least one non-system message".into());
     }
-    if !pending.is_empty() {
-        return Err("tool calls require results before generation resumes".into());
-    }
     Ok(messages)
 }
 
@@ -682,7 +679,6 @@ mod tests {
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}),
             json!({"messages":[{"role":"function","name":"f","content":"x"}]}),
             json!({"messages":[{"role":"tool","tool_call_id":"nope","content":"x"}]}),
-            json!({"messages":[{"role":"user","content":"x"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}]}),
             json!({"messages":[{"role":"system","content":"only system"}]}),
         ] {
             assert!(prepare_body(&with(&extra)).is_err(), "accepted {extra}");
@@ -694,6 +690,65 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("frobnicate")
+        );
+    }
+
+    /// Recorded agent traces (`SiliconBench` a003) carry parallel calls whose
+    /// results were never logged. vLLM and mlx-lm render them as given.
+    #[test]
+    fn unanswered_tool_calls_in_history_render_as_given() {
+        let call = |id: &str, path: &str| json!({"id":id,"type":"function","function":{"name":"read_file","arguments":json!({"path":path}).to_string()}});
+        let prepared = prepare_body(&with(&json!({"messages":[
+            {"role":"user","content":"find the readme"},
+            {"role":"assistant","content":"","tool_calls":[call("c2","a.md"),call("c3","b.md")]},
+            {"role":"tool","tool_call_id":"c2","content":"A"},
+            {"role":"assistant","content":"","tool_calls":[call("c4","c.md")]},
+            {"role":"tool","tool_call_id":"c4","content":"C"}
+        ]})))
+        .unwrap();
+        let history: Vec<_> = prepared
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.role,
+                    message.tool_calls.len(),
+                    message.tool_call_id.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            history,
+            [
+                (ChatRole::User, 0, None),
+                (ChatRole::Assistant, 2, None),
+                (ChatRole::Tool, 0, Some("c2")),
+                (ChatRole::Assistant, 1, None),
+                (ChatRole::Tool, 0, Some("c4")),
+            ]
+        );
+        assert_eq!(
+            prepared.messages[1].tool_calls[1].arguments,
+            json!({"path":"b.md"})
+        );
+        let late_result = json!({"messages":[
+            {"role":"user","content":"x"},
+            {"role":"assistant","content":"","tool_calls":[call("c1","a.md")]},
+            {"role":"user","content":"never mind"},
+            {"role":"tool","tool_call_id":"c1","content":"A"}
+        ]});
+        assert!(
+            prepare_body(&with(&late_result)).is_ok(),
+            "a later result still matches its call"
+        );
+        let unknown = json!({"messages":[
+            {"role":"user","content":"x"},
+            {"role":"assistant","content":"","tool_calls":[call("c1","a.md")]},
+            {"role":"tool","tool_call_id":"c9","content":"A"}
+        ]});
+        assert!(
+            prepare_body(&with(&unknown)).is_err(),
+            "a result for an unknown call has no name to render"
         );
     }
 
