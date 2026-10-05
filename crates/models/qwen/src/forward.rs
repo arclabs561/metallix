@@ -30,9 +30,11 @@ use crate::{DecoderFamily, Qwen3Attention};
 
 mod paged;
 mod snapshot;
+mod verify;
 
 pub use paged::{BatchDecoded, BatchReadback, PagedQwen3Session};
 pub use snapshot::Qwen3KvSnapshot;
+pub use verify::Qwen3PositionLogits;
 
 /// The largest prompt accepted by the uncached qualification forward path.
 pub const MAX_DENSE_DEBUG_TOKENS: usize = 512;
@@ -973,7 +975,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         input_ids: &[i32],
     ) -> Result<Vec<f32>, Qwen3ForwardError> {
         self.reset();
-        self.append(input_ids)
+        self.append(input_ids, LogitRows::Last)
     }
 
     /// Appends exactly one token to the current sequence and returns its logits.
@@ -981,7 +983,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
-        self.append(&[input_id])
+        self.append(&[input_id], LogitRows::Last)
     }
 
     /// Appends a chunk of one or more prompt tokens to a prefilled sequence
@@ -996,7 +998,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
-        self.append(input_ids)
+        self.append(input_ids, LogitRows::Last)
     }
 
     /// Creates an independent decoder branch from this fully materialized KV
@@ -1054,8 +1056,12 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         })
     }
 
-    fn append(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
-        let result = self.append_inner(input_ids);
+    fn append(
+        &mut self,
+        input_ids: &[i32],
+        rows: LogitRows,
+    ) -> Result<Vec<f32>, Qwen3ForwardError> {
+        let result = self.append_inner(input_ids, rows);
         if result.is_err() {
             // A failed graph may have appended only some layers. Retaining
             // that partial state would make a later decode numerically wrong.
@@ -1064,7 +1070,11 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         result
     }
 
-    fn append_inner(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
+    fn append_inner(
+        &mut self,
+        input_ids: &[i32],
+        rows: LogitRows,
+    ) -> Result<Vec<f32>, Qwen3ForwardError> {
         validate_input_ids(
             self.config,
             input_ids,
@@ -1073,15 +1083,23 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         )?;
         let seq_len =
             i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
-        let logits = self.append_ids(&Array::from_slice(input_ids, &[seq_len]), seq_len)?;
-        read_last_logits(&logits, 1, self.config.vocab_size)
+        let logits = self.append_ids(&Array::from_slice(input_ids, &[seq_len]), seq_len, rows)?;
+        match rows {
+            LogitRows::Last => read_last_logits(&logits, 1, self.config.vocab_size),
+            LogitRows::All => verify::read_all_logits(&logits, seq_len, self.config.vocab_size),
+        }
     }
 
     /// Builds, without evaluating, the graph that appends `ids` (shape
     /// `[seq_len]`, already validated against the vocabulary and context) to
     /// every layer's cache, and returns the last position's `[1, 1, vocab]`
     /// logits.
-    fn append_ids(&mut self, ids: &Array, seq_len: i32) -> Result<Array, Qwen3ForwardError> {
+    fn append_ids(
+        &mut self,
+        ids: &Array,
+        seq_len: i32,
+        rows: LogitRows,
+    ) -> Result<Array, Qwen3ForwardError> {
         // A cache of earlier positions cannot serve a layer whose earlier
         // positions also attend to later ones.
         if self.config.attention != Qwen3Attention::Causal {
@@ -1120,10 +1138,16 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         }
 
         self.cached_tokens += appended;
-        let last_hidden =
-            hidden_states.take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?;
+        let selected = match rows {
+            LogitRows::Last => hidden_states.take_axis_device(
+                Array::from_slice(&[seq_len - 1], &[1]),
+                1,
+                &stream,
+            )?,
+            LogitRows::All => hidden_states,
+        };
         let normalized = rms_norm(
-            &last_hidden,
+            &selected,
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
@@ -1184,7 +1208,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     fn append_greedy(&mut self, ids: &Array) -> Result<Qwen3GreedyPicks, Qwen3ForwardError> {
-        let pending = self.append_ids(ids, 1).and_then(|logits| {
+        let pending = self.append_ids(ids, 1, LogitRows::Last).and_then(|logits| {
             let rows = logits
                 .reshape_device(&[1, as_i32(self.config.vocab_size)?], StreamOrDevice::gpu())?;
             Qwen3GreedyPicks::start(&rows, self.weights_address())
@@ -1202,7 +1226,10 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// caller then stopped on, or rejected draft positions.
     pub fn truncate_cached_tokens(&mut self, tokens: usize) -> Result<(), Qwen3ForwardError> {
         if tokens == 0 || tokens > self.cached_tokens {
-            return Err(Qwen3ForwardError::CacheInconsistent);
+            return Err(Qwen3ForwardError::TruncateOutOfRange {
+                requested: tokens,
+                cached: self.cached_tokens,
+            });
         }
         // Resident storage keeps the tier `stepped_cached_kv` chooses for the
         // shorter sequence, which forks check; unbounded caches hold exactly
@@ -1281,6 +1308,15 @@ impl Qwen3GreedyPicks {
             _ => Err(Qwen3ForwardError::CacheInconsistent),
         }
     }
+}
+
+/// Which appended positions an executor append projects to logits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogitRows {
+    /// Only the final position: prefill and ordinary decode.
+    Last,
+    /// Every appended position: speculative verification and scoring.
+    All,
 }
 
 /// Executes one cached Qwen3 decoder layer and updates its adapter-local KV.
@@ -2227,6 +2263,14 @@ pub enum Qwen3ForwardError {
     /// The snapshot came from another checkpoint load or resident plan.
     #[error("Qwen3 K/V snapshot does not belong to this checkpoint load and resident plan")]
     KvSnapshotMismatch,
+    /// A rollback must keep between one token and the whole cache.
+    #[error("cannot truncate a {cached}-token Qwen3 cache to {requested} tokens")]
+    TruncateOutOfRange {
+        /// Positions the caller asked to keep.
+        requested: usize,
+        /// Positions in the cache.
+        cached: usize,
+    },
     /// A token does not fit the checkpoint vocabulary.
     #[error("token ID {token_id} is outside vocabulary size {vocab_size}")]
     InvalidTokenId {
@@ -2947,6 +2991,7 @@ mod tests {
     mod paged_kv;
     mod particle_replay;
     mod prefix_extend;
+    mod speculative_verify;
     mod steering_checkpoint;
 
     #[test]

@@ -9,7 +9,7 @@
 
 use super::*;
 
-fn sensitive_weights() -> HashMap<String, Array> {
+pub(super) fn sensitive_weights() -> HashMap<String, Array> {
     let mut named = deterministic_weights_for_layers(2)
         .into_iter()
         .collect::<Vec<_>>();
@@ -33,7 +33,7 @@ fn sensitive_weights() -> HashMap<String, Array> {
         .collect()
 }
 
-fn two_layer_long_config() -> Qwen3ForwardConfig {
+pub(super) fn two_layer_long_config() -> Qwen3ForwardConfig {
     let mut config = long_small_config();
     config.hidden_layers = 2;
     config
