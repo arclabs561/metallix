@@ -171,8 +171,8 @@ For normal constrained sampling, `q` may be the model conditioned on the
 allowed set.  For a global constraint or a power target it usually is not `π`;
 the incremental ledger must retain `log π_increment - log q_increment`.
 Hard top-k/top-p or an EOS ban can remove target support, so they cannot be
-quietly used as an importance proposal.  This is the support condition in the
-LLaMPPL Feynman--Kac formulation and the Power-SMC target/proposal analysis
+quietly used as an importance proposal.  This is the support condition
+implicit in the LLaMPPL Feynman--Kac formulation and the Power-SMC target/proposal analysis
 ([LLaMPPL v2, §§2--3](https://arxiv.org/html/2306.03081v2),
 [Power-SMC](power-smc.md#correctness-boundary)).
 
@@ -283,8 +283,11 @@ over all three gates.
 
 The [infilling plan](infilling-distribution-match.md#stop-rule-made-concrete)
 proposes the predeclared gain: at matched forward tokens, SMC must beat
-reweighted best-of-N by more than a null band on an enumerated template where
-middle text is informative, and must not on one where only the final text is.
+independence MH over the same number of draws by more than a null band on an
+enumerated template where middle text is informative, and must not on one
+where only the final text is. That baseline is our inference from
+[2610.03480](https://arxiv.org/abs/2610.03480) Thm 1, under which MH over
+the same draws is never worse than reweighted best-of-N.
 It also moves the `N=2` latency check after batched decode, since two
 sequential single-row forwards would measure missing batching rather than
 particle cost.

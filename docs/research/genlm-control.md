@@ -20,8 +20,8 @@ Markdown rendering and cross-checked against all 12 pages of arXiv
 references.  This version was submitted on 2023-11-26 and contains no
 appendix.  Full reading establishes what the paper claims, not correctness,
 current implementation parity, or Apple-Silicon performance.  The newer AWRS
-paper was read only through its abstract and selected sections 1--3; its claims
-below are correspondingly narrower.
+paper was later read from the v2 PDF: sections 1--7 and appendices A, B.1--B.3
+and H--L, not its proofs or runtime analysis.
 
 ## Separate three probability contracts
 
@@ -59,7 +59,9 @@ Boolean local constraints: uncapped adaptive weighted rejection samples the
 local constrained token law exactly and supplies normalizer estimates useful
 to SMC.  Its runtime is stochastic, so a cap, fallback or proposal truncation
 must be labelled approximate unless a valid correction remains
-([AWRS, selected §§1--3](https://arxiv.org/html/2504.05410)).
+([AWRS v2, §§1--7 and App. A, B.1--B.3, H--L](https://arxiv.org/abs/2504.05410v2)).
+AWRS appendix H gives capped and truncation-aware variants that stay properly
+weighted for SMC but are not exact local samplers.
 
 ## Cache and Mac implications
 
