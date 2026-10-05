@@ -171,6 +171,9 @@ pub(crate) mod test_support {
         pub(crate) seen: Option<(bool, bool)>,
         /// The last request's tenant cache salt.
         pub(crate) salt: Option<String>,
+        /// Prompt tokens to report, and how many of them the cache served.
+        pub(crate) prompt_tokens: usize,
+        pub(crate) cached_prompt_tokens: usize,
     }
 
     impl Scripted {
@@ -181,6 +184,8 @@ pub(crate) mod test_support {
                 deltas: 0,
                 seen: None,
                 salt: None,
+                prompt_tokens: 1,
+                cached_prompt_tokens: 0,
             }
         }
 
@@ -227,8 +232,8 @@ pub(crate) mod test_support {
                     time_to_first_token_ms: None,
                     decode_ms: vec![],
                     decode_total_ms: 0.0,
-                    prompt_tokens: 1,
-                    cached_prompt_tokens: 0,
+                    prompt_tokens: self.prompt_tokens,
+                    cached_prompt_tokens: self.cached_prompt_tokens,
                     generated_tokens: 2,
                 },
                 logprobs: Vec::new(),

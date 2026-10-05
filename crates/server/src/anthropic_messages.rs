@@ -393,7 +393,10 @@ fn stop_reason(turn: &AssistantTurn) -> &'static str {
 /// Anthropic counts cached prompt tokens apart from `input_tokens`.
 fn usage(generated: &ChatGeneration) -> Value {
     let cached = generated.metrics.cached_prompt_tokens;
-    json!({"input_tokens":generated.metrics.prompt_tokens - cached,"output_tokens":generated.generated_token_ids.len(),"cache_read_input_tokens":cached,"cache_creation_input_tokens":0})
+    // The cache serves a prefix of the prompt, so cached never exceeds the
+    // prompt; saturate so a metrics bug cannot panic the response.
+    let input = generated.metrics.prompt_tokens.saturating_sub(cached);
+    json!({"input_tokens":input,"output_tokens":generated.generated_token_ids.len(),"cache_read_input_tokens":cached,"cache_creation_input_tokens":0})
 }
 
 /// The content blocks of a finished turn, in order.
@@ -853,6 +856,36 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         assert_eq!(partial, json!({"path":"README.md"}));
         assert_eq!(data[10]["delta"]["stop_reason"], "tool_use");
         assert_eq!(data[10]["usage"]["input_tokens"], 1);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_reported_apart_from_input_tokens() {
+        for stream in [false, true] {
+            let mut backend = Scripted::new("hi");
+            backend.prompt_tokens = 10;
+            backend.cached_prompt_tokens = 4;
+            let wire = run(&with(&json!({"stream":stream})), &mut backend);
+            let usage = if stream {
+                let (_, data) = events(&wire)
+                    .into_iter()
+                    .find(|(name, _)| name.as_deref() == Some("message_delta"))
+                    .unwrap();
+                serde_json::from_str::<Value>(&data).unwrap()["usage"].clone()
+            } else {
+                json_body(&wire).1["usage"].clone()
+            };
+            assert_eq!(usage["input_tokens"], 6, "stream={stream}");
+            assert_eq!(usage["cache_read_input_tokens"], 4, "stream={stream}");
+        }
+        let mut backend = Scripted::new("hi");
+        backend.prompt_tokens = 3;
+        backend.cached_prompt_tokens = 5;
+        let (status, body) = json_body(&run(&with(&json!({})), &mut backend));
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "inconsistent metrics do not panic"
+        );
+        assert_eq!(body["usage"]["input_tokens"], 0);
     }
 
     #[test]

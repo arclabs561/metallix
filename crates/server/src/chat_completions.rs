@@ -905,6 +905,37 @@ mod tests {
     }
 
     #[test]
+    fn cached_prompt_tokens_are_a_subset_of_prompt_tokens() {
+        for stream in [false, true] {
+            let mut backend = Scripted::new("hi");
+            backend.prompt_tokens = 10;
+            backend.cached_prompt_tokens = 4;
+            let body = if stream {
+                with(&json!({"stream":true,"stream_options":{"include_usage":true}}))
+            } else {
+                with(&json!({}))
+            };
+            let wire = run(&body, &mut backend);
+            let usage = if stream {
+                let (_, data) = events(&wire)
+                    .into_iter()
+                    .rev()
+                    .find(|(_, data)| data != "[DONE]")
+                    .unwrap();
+                serde_json::from_str::<Value>(&data).unwrap()["usage"].clone()
+            } else {
+                json_body(&wire).1["usage"].clone()
+            };
+            assert_eq!(usage["prompt_tokens"], 10, "stream={stream}");
+            assert_eq!(
+                usage["prompt_tokens_details"]["cached_tokens"], 4,
+                "stream={stream}"
+            );
+            assert_eq!(usage["total_tokens"], 12, "stream={stream}");
+        }
+    }
+
+    #[test]
     fn the_router_cache_salt_reaches_generation() {
         for stream in [false, true] {
             let mut backend = Scripted::new("hi");
