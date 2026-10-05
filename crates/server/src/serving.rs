@@ -1353,69 +1353,106 @@ stream.close()
         }
     }
 
-    /// Answers with a receipt larger than the socket buffers, so writing it
-    /// blocks until the client reads.
-    struct LargeDecider;
+    /// Answers every body route with a response larger than the socket
+    /// buffers, so writing it blocks until the client reads.
+    struct LargeResponder;
 
-    impl ModelWorker for LargeDecider {
+    impl LargeResponder {
+        fn large() -> Value {
+            json!({"padding": "x".repeat(16 * 1024 * 1024)})
+        }
+    }
+
+    impl ModelWorker for LargeResponder {
         fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
             None
         }
 
         fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
-            Some(Ok(json!({"padding": "x".repeat(16 * 1024 * 1024)})))
+            Some(Ok(Self::large()))
+        }
+
+        fn embed(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+            Some(Ok(Self::large()))
+        }
+
+        fn rerank(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+            Some(Ok(Self::large()))
         }
     }
 
+    /// Every worker route releases the model before writing its response.
+    /// A new route whose worker-loop arm forgets the early release fails here.
     #[test]
-    fn a_model_is_free_before_its_decision_response_begins() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
-        let address = listener.local_addr().expect("listener address");
-        let (jobs, receiver) = sync_channel(0);
-        let worker = thread::spawn(move || model_worker_loop(&mut LargeDecider, receiver));
-        let occupied = Arc::new(AtomicBool::new(false));
-        let models = [ServedModel {
-            id: "julia".into(),
-            generates: false,
-            capabilities: &["decide"],
-            jobs,
-            occupied: Arc::clone(&occupied),
-            alive: Arc::new(AtomicBool::new(true)),
-        }];
-        let server = thread::spawn(move || {
-            serve_models(
-                &listener,
-                &models,
-                Duration::from_secs(2),
-                TransportLimits::default(),
-                Some(1),
+    fn a_model_is_free_before_any_body_response_begins() {
+        for (path, capability, body) in [
+            (
+                "/v1/decisions",
+                "decide",
+                r#"{"model":"m","state":"s","questions":{}}"#,
+            ),
+            ("/v1/embeddings", "embed", r#"{"model":"m","input":"x"}"#),
+            (
+                "/v1/rerank",
+                "rerank",
+                r#"{"model":"m","query":"q","documents":["d"]}"#,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+            let address = listener.local_addr().expect("listener address");
+            let (jobs, receiver) = sync_channel(0);
+            let worker = thread::spawn(move || model_worker_loop(&mut LargeResponder, receiver));
+            let occupied = Arc::new(AtomicBool::new(false));
+            let models = [ServedModel {
+                id: "m".into(),
+                generates: false,
+                capabilities: &["decide", "embed", "rerank"],
+                jobs,
+                occupied: Arc::clone(&occupied),
+                alive: Arc::new(AtomicBool::new(true)),
+            }];
+            let server = thread::spawn(move || {
+                serve_models(
+                    &listener,
+                    &models,
+                    Duration::from_secs(2),
+                    TransportLimits::default(),
+                    Some(1),
+                )
+            });
+            let mut stream = TcpStream::connect(address).expect("connect");
+            write!(
+                stream,
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
             )
-        });
-        let body = r#"{"model":"julia","state":"s","questions":{}}"#;
-        let mut stream = TcpStream::connect(address).expect("connect");
-        write!(
-            stream,
-            "POST /v1/decisions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .expect("request");
-        stream.shutdown(Shutdown::Write).expect("half-close");
-        // The worker is now blocked writing the rest. The next request must
-        // already be admissible; otherwise a client that sends it as soon as
-        // this response completes races the release and is refused as busy.
-        let mut first = [0_u8; 1];
-        stream.read_exact(&mut first).expect("first response byte");
-        assert!(
-            !occupied.load(Ordering::Acquire),
-            "admission held while responding"
-        );
-        let mut rest = Vec::new();
-        stream.read_to_end(&mut rest).expect("response");
-        server
-            .join()
-            .expect("join acceptor")
-            .expect("acceptor result");
-        worker.join().expect("join worker");
+            .expect("request");
+            stream.shutdown(Shutdown::Write).expect("half-close");
+            // The worker is now blocked writing the rest. The next request must
+            // already be admissible; otherwise a client that sends it as soon as
+            // this response completes races the release and is refused as busy.
+            let mut first = [0_u8; 1];
+            stream.read_exact(&mut first).expect("first response byte");
+            assert!(
+                !occupied.load(Ordering::Acquire),
+                "{capability}: admission held while responding"
+            );
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).expect("response");
+            // The worker answered (a refusal before the worker would leave the
+            // model free trivially and prove nothing).
+            assert!(
+                [&first[..], &rest[..]]
+                    .concat()
+                    .starts_with(b"HTTP/1.1 200 "),
+                "{capability}: expected the worker's 200 response"
+            );
+            server
+                .join()
+                .expect("join acceptor")
+                .expect("acceptor result");
+            worker.join().expect("join worker");
+        }
     }
 
     #[test]
