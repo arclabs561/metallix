@@ -6,6 +6,7 @@ use std::{path::Path, time::Instant};
 
 use qwen::{
     embedding::{QWEN3_EMBEDDING_WEB_SEARCH_TASK, qwen3_embedding_query},
+    forward::MAX_DENSE_DEBUG_TOKENS,
     metal::Qwen3MlxWeights,
 };
 use serde::Deserialize;
@@ -145,9 +146,7 @@ impl QwenEmbedder {
     pub(crate) fn embed(&self, body: &[u8], model: &str) -> Result<Value, String> {
         let prepared = prepare(body)?;
         let started = Instant::now();
-        let mut data = Vec::with_capacity(prepared.texts.len());
-        let mut prompt_tokens = 0;
-        let mut width = 0;
+        let mut sequences = Vec::with_capacity(prepared.texts.len());
         for (index, text) in prepared.texts.iter().enumerate() {
             // With special tokens, so the tokenizer appends the pooled <|endoftext|>.
             let ids = self
@@ -160,14 +159,27 @@ impl QwenEmbedder {
                     i32::try_from(id).map_err(|_| format!("input {index}: token ID overflows"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            prompt_tokens += ids.len();
-            let embedding = self
-                .weights
-                .embed(&ids, prepared.dimensions)
-                .map_err(|error| format!("input {index}: {error}"))?;
-            width = embedding.len();
-            data.push(json!({"object": "embedding", "index": index, "embedding": embedding}));
+            // Checked here so the error names the input; the batch reports only the first failure.
+            if ids.len() > MAX_DENSE_DEBUG_TOKENS {
+                return Err(format!(
+                    "input {index}: {} tokens, maximum is {MAX_DENSE_DEBUG_TOKENS}",
+                    ids.len()
+                ));
+            }
+            sequences.push(ids);
         }
+        let prompt_tokens: usize = sequences.iter().map(Vec::len).sum();
+        let batch: Vec<&[i32]> = sequences.iter().map(Vec::as_slice).collect();
+        let embeddings = self
+            .weights
+            .embed_batch(&batch, prepared.dimensions)
+            .map_err(|error| error.to_string())?;
+        let width = embeddings.first().map_or(0, Vec::len);
+        let data: Vec<Value> = embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(index, embedding)| json!({"object": "embedding", "index": index, "embedding": embedding}))
+            .collect();
         Ok(json!({
             "object": "list",
             "data": data,

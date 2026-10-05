@@ -50,8 +50,8 @@ Each text is tokenized with the tokenizer's special-token template, which
 appends `<|endoftext|>`. The final-norm hidden state at that last position is
 the embedding, truncated to `dimensions` if requested and L2-normalized, so the
 dot product of two embeddings is their cosine similarity. `data` keeps input
-order. Inputs in one request run one after another; a list is a convenience,
-not a batched forward pass.
+order. Inputs in one request are grouped by length, each group padded to at
+most 1.25 times its real tokens, and each group runs as one forward pass.
 
 ## Precision and qualification
 
