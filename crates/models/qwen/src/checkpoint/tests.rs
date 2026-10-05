@@ -635,3 +635,37 @@ fn prefixed_names_keep_their_naming_and_mixed_embeddings_are_rejected() {
         Err(Qwen3CheckpointError::MissingRequiredTensor(name)) if name == "model.norm.weight"
     ));
 }
+
+#[test]
+fn llama_layout_has_no_qk_norms_and_requires_an_untied_lm_head() {
+    let contract = Qwen3TextContract::parse(
+        r#"{"model_type":"llama","num_hidden_layers":2,"hidden_size":4,"vocab_size":8,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"max_position_embeddings":16}"#,
+    )
+    .expect("valid contract");
+    let names = |tie_word_embeddings| {
+        required_dense_tensors(
+            &contract,
+            &RawCheckpointLayout {
+                vocab_size: 8,
+                intermediate_size: 6,
+                tie_word_embeddings,
+            },
+        )
+        .expect("valid layout")
+        .into_iter()
+        .map(|tensor| tensor.name)
+        .collect::<Vec<_>>()
+    };
+    let untied = names(false);
+    // Embedding, two layers of nine tensors, final norm and lm_head.
+    assert_eq!(untied.len(), 1 + 2 * 9 + 1 + 1);
+    assert!(
+        !untied
+            .iter()
+            .any(|name| name.contains("_norm.weight") && name.contains("self_attn"))
+    );
+    assert!(untied.contains(&"lm_head.weight".to_owned()));
+    assert!(!names(true).contains(&"lm_head.weight".to_owned()));
+    // The Qwen3 fixture keeps its two per-layer Q/K norms.
+    assert_eq!(expected_tensors().len(), 1 + 11 + 1);
+}

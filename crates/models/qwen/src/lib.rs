@@ -1,4 +1,7 @@
 //! Qwen3 text-model execution-contract parsing and validation.
+//!
+//! The same dense decoder also runs plain `llama` checkpoints (MiniCPM5-2B):
+//! see [`DecoderFamily`].
 
 pub mod checkpoint;
 pub mod embedding;
@@ -17,10 +20,42 @@ pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Dense decoder families this crate executes.
+///
+/// Both use pre-norm GQA blocks, a `SiLU`-gated MLP and rotate-half `RoPE`
+/// with no embedding, residual or logit scaling (transformers
+/// `modeling_llama.py` and `modeling_qwen3.py`). They differ only in Qwen3's
+/// per-head RMS normalization of queries and keys before `RoPE`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecoderFamily {
+    /// `qwen3` and `bidirectional_pplx_qwen3`: per-head Q/K RMS norms.
+    Qwen3,
+    /// `llama`: no Q/K norms.
+    Llama,
+}
+
+impl DecoderFamily {
+    /// Maps a configuration's `model_type`, or `None` for an unknown type.
+    #[must_use]
+    pub fn from_model_type(model_type: &str) -> Option<Self> {
+        match model_type {
+            "qwen3" | "bidirectional_pplx_qwen3" => Some(Self::Qwen3),
+            "llama" => Some(Self::Llama),
+            _ => None,
+        }
+    }
+
+    /// Whether each layer carries `self_attn.q_norm` and `self_attn.k_norm`.
+    #[must_use]
+    pub const fn has_qk_norm(self) -> bool {
+        matches!(self, Self::Qwen3)
+    }
+}
+
 /// Which positions a Qwen3 decoder layer attends to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Qwen3Attention {
-    /// Each position attends to itself and earlier positions (`qwen3`).
+    /// Each position attends to itself and earlier positions (`qwen3`, `llama`).
     Causal,
     /// Each position attends to every position: `bidirectional_pplx_qwen3`
     /// with `use_bidirectional_attention`, as in pplx-embed.
@@ -33,7 +68,7 @@ impl Qwen3Attention {
     #[must_use]
     pub fn from_config(model_type: &str, use_bidirectional_attention: bool) -> Option<Self> {
         match (model_type, use_bidirectional_attention) {
-            ("qwen3", false) => Some(Self::Causal),
+            ("qwen3" | "llama", false) => Some(Self::Causal),
             ("bidirectional_pplx_qwen3", true) => Some(Self::Bidirectional),
             _ => None,
         }
@@ -43,6 +78,7 @@ impl Qwen3Attention {
 /// The validated text-execution contract extracted from a Qwen3 configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3TextContract {
+    family: DecoderFamily,
     hidden_layers: u32,
     hidden_size: u32,
     vocab_size: u32,
@@ -60,11 +96,23 @@ impl Qwen3TextContract {
     /// Returns [`Qwen3ConfigError`] when the document is malformed, is not a
     /// Qwen3 configuration, or omits a positive execution dimension.
     pub fn parse(json: &str) -> Result<Self, Qwen3ConfigError> {
-        let config: RawConfig = serde_json::from_str(json).map_err(Qwen3ConfigError::Json)?;
-        if Qwen3Attention::from_config(&config.model_type, config.use_bidirectional_attention)
-            .is_none()
-        {
+        let mut config: RawConfig = serde_json::from_str(json).map_err(Qwen3ConfigError::Json)?;
+        let (Some(family), Some(_)) = (
+            DecoderFamily::from_model_type(&config.model_type),
+            Qwen3Attention::from_config(&config.model_type, config.use_bidirectional_attention),
+        ) else {
             return Err(Qwen3ConfigError::UnexpectedModelType(config.model_type));
+        };
+        // Llama configurations may omit `head_dim`; transformers then uses
+        // `hidden_size / num_attention_heads`. Qwen3 must state it.
+        if family == DecoderFamily::Llama
+            && config.head_dim == 0
+            && config.num_attention_heads != 0
+            && config
+                .hidden_size
+                .is_multiple_of(config.num_attention_heads)
+        {
+            config.head_dim = config.hidden_size / config.num_attention_heads;
         }
         if config.num_hidden_layers == 0 {
             return Err(Qwen3ConfigError::MissingHiddenLayers);
@@ -89,6 +137,7 @@ impl Qwen3TextContract {
         }
 
         Ok(Self {
+            family,
             hidden_layers: config.num_hidden_layers,
             hidden_size: config.hidden_size,
             vocab_size: config.vocab_size,
@@ -97,6 +146,12 @@ impl Qwen3TextContract {
             head_dim: config.head_dim,
             max_position_embeddings: config.max_position_embeddings,
         })
+    }
+
+    /// Returns the decoder family named by `model_type`.
+    #[must_use]
+    pub const fn family(&self) -> DecoderFamily {
+        self.family
     }
 
     /// Returns the total number of transformer layers.
@@ -174,7 +229,7 @@ pub enum Qwen3ConfigError {
     /// The configuration was not a Qwen3 text model, or its attention flag
     /// disagrees with its model type.
     #[error(
-        "expected model_type qwen3, or bidirectional_pplx_qwen3 with use_bidirectional_attention, got {0:?}"
+        "expected model_type qwen3 or llama, or bidirectional_pplx_qwen3 with use_bidirectional_attention, got {0:?}"
     )]
     UnexpectedModelType(String),
     /// The configuration does not expose transformer layers.
@@ -202,7 +257,7 @@ pub enum Qwen3ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen3ConfigError, Qwen3TextContract};
+    use super::{DecoderFamily, Qwen3ConfigError, Qwen3TextContract};
 
     const CONFIG: &str = r#"{
       "model_type":"qwen3",
@@ -225,6 +280,28 @@ mod tests {
         assert_eq!(contract.key_value_heads(), 8);
         assert_eq!(contract.head_dim(), 128);
         assert_eq!(contract.max_position_embeddings(), 40_960);
+        assert_eq!(contract.family(), DecoderFamily::Qwen3);
+        assert!(contract.family().has_qk_norm());
+    }
+
+    #[test]
+    fn parses_a_llama_contract_and_defaults_its_head_dimension() {
+        // MiniCPM5-2B's dimensions, with `head_dim` omitted as older Llama
+        // configurations do.
+        let llama = CONFIG
+            .replace(r#""model_type":"qwen3""#, r#""model_type":"llama""#)
+            .replace(r#""hidden_size":1024"#, r#""hidden_size":2048"#)
+            .replace(r#""head_dim":128,"#, "");
+        let contract = Qwen3TextContract::parse(&llama).expect("valid Llama config");
+        assert_eq!(contract.family(), DecoderFamily::Llama);
+        assert!(!contract.family().has_qk_norm());
+        assert_eq!(contract.head_dim(), 128);
+        // Qwen3 has no such default.
+        let qwen = CONFIG.replace(r#""head_dim":128,"#, "");
+        assert!(matches!(
+            Qwen3TextContract::parse(&qwen),
+            Err(Qwen3ConfigError::MissingHeadDimension)
+        ));
     }
 
     #[test]
@@ -235,13 +312,18 @@ mod tests {
             Some(Qwen3Attention::Causal)
         );
         assert_eq!(
+            Qwen3Attention::from_config("llama", false),
+            Some(Qwen3Attention::Causal)
+        );
+        assert_eq!(
             Qwen3Attention::from_config("bidirectional_pplx_qwen3", true),
             Some(Qwen3Attention::Bidirectional)
         );
         for (model_type, flag) in [
             ("qwen3", true),
             ("bidirectional_pplx_qwen3", false),
-            ("llama", false),
+            ("llama", true),
+            ("mistral", false),
         ] {
             assert_eq!(Qwen3Attention::from_config(model_type, flag), None);
         }
@@ -262,7 +344,8 @@ mod tests {
 
     #[test]
     fn rejects_another_architecture() {
-        let error = Qwen3TextContract::parse(r#"{"model_type":"llama"}"#).expect_err("not Qwen3");
+        let error =
+            Qwen3TextContract::parse(r#"{"model_type":"mistral"}"#).expect_err("unsupported");
         assert!(matches!(error, Qwen3ConfigError::UnexpectedModelType(_)));
     }
 

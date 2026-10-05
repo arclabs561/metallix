@@ -26,7 +26,7 @@ use mlx_rs::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Qwen3Attention;
+use crate::{DecoderFamily, Qwen3Attention};
 
 mod snapshot;
 
@@ -248,17 +248,22 @@ pub struct Qwen3ForwardConfig {
     rms_norm_eps: f32,
     rope_theta: f32,
     attention: Qwen3Attention,
+    family: DecoderFamily,
+    tied_output_embedding: bool,
 }
 
 impl Qwen3ForwardConfig {
-    /// Parses only the dense, bias-free Qwen3 layout this qualification path
-    /// implements. Sliding-window and scaled `RoPE` variants require their own
-    /// reference vectors, so they are refused rather than silently ignored.
+    /// Parses only the dense, bias-free Qwen3 or Llama layout this
+    /// qualification path implements. Sliding-window and scaled `RoPE`
+    /// variants require their own reference vectors, so they are refused
+    /// rather than silently ignored. An untied checkpoint projects logits
+    /// through `lm_head.weight` instead of the token embedding.
     pub fn parse(json: &str) -> Result<Self, Qwen3ForwardError> {
-        let raw: RawForwardConfig = serde_json::from_str(json)?;
-        let Some(attention) =
-            Qwen3Attention::from_config(&raw.model_type, raw.use_bidirectional_attention)
-        else {
+        let mut raw: RawForwardConfig = serde_json::from_str(json)?;
+        let (Some(family), Some(attention)) = (
+            DecoderFamily::from_model_type(&raw.model_type),
+            Qwen3Attention::from_config(&raw.model_type, raw.use_bidirectional_attention),
+        ) else {
             return Err(Qwen3ForwardError::UnsupportedModelType(raw.model_type));
         };
         if raw.attention_bias || raw.mlp_bias {
@@ -267,11 +272,26 @@ impl Qwen3ForwardConfig {
         if raw.hidden_act != "silu" {
             return Err(Qwen3ForwardError::UnsupportedActivation(raw.hidden_act));
         }
-        if !raw.tie_word_embeddings {
-            return Err(Qwen3ForwardError::UntiedOutputEmbedding);
-        }
-        if raw.rope_scaling.is_some() {
+        // transformers 5 may write `rope_parameters` in place of
+        // `rope_theta` and `rope_scaling`; neither form is read here.
+        if raw.rope_scaling.is_some() || raw.rope_parameters.is_some() {
             return Err(Qwen3ForwardError::UnsupportedRopeScaling);
+        }
+        // Llama's documented default theta has changed across transformers
+        // releases, so a Llama checkpoint must state it.
+        let rope_theta = match (family, raw.rope_theta) {
+            (_, Some(theta)) => theta,
+            (DecoderFamily::Qwen3, None) => default_rope_theta(),
+            (DecoderFamily::Llama, None) => return Err(Qwen3ForwardError::MissingRopeTheta),
+        };
+        // As in transformers' LlamaConfig, an omitted Llama `head_dim` is
+        // `hidden_size / num_attention_heads`.
+        if family == DecoderFamily::Llama
+            && raw.head_dim == 0
+            && raw.num_attention_heads != 0
+            && raw.hidden_size.is_multiple_of(raw.num_attention_heads)
+        {
+            raw.head_dim = raw.hidden_size / raw.num_attention_heads;
         }
         if raw.use_sliding_window || raw.sliding_window.is_some() {
             return Err(Qwen3ForwardError::UnsupportedSlidingWindow);
@@ -310,8 +330,8 @@ impl Qwen3ForwardConfig {
         if !raw.rms_norm_eps.is_finite() || raw.rms_norm_eps <= 0.0 {
             return Err(Qwen3ForwardError::InvalidRmsNormEpsilon(raw.rms_norm_eps));
         }
-        if !raw.rope_theta.is_finite() || raw.rope_theta <= 0.0 {
-            return Err(Qwen3ForwardError::InvalidRopeTheta(raw.rope_theta));
+        if !rope_theta.is_finite() || rope_theta <= 0.0 {
+            return Err(Qwen3ForwardError::InvalidRopeTheta(rope_theta));
         }
 
         Ok(Self {
@@ -324,9 +344,32 @@ impl Qwen3ForwardConfig {
             head_dim: raw.head_dim,
             max_position_embeddings: raw.max_position_embeddings,
             rms_norm_eps: raw.rms_norm_eps,
-            rope_theta: raw.rope_theta,
+            rope_theta,
             attention,
+            family,
+            tied_output_embedding: raw.tie_word_embeddings,
         })
+    }
+
+    /// Returns the decoder family named by `model_type`.
+    #[must_use]
+    pub const fn family(&self) -> DecoderFamily {
+        self.family
+    }
+
+    /// Whether logits reuse `model.embed_tokens.weight` rather than a
+    /// separate `lm_head.weight`.
+    #[must_use]
+    pub const fn tied_output_embedding(&self) -> bool {
+        self.tied_output_embedding
+    }
+
+    fn output_weight_name(&self) -> &'static str {
+        if self.tied_output_embedding {
+            "model.embed_tokens.weight"
+        } else {
+            "lm_head.weight"
+        }
     }
 
     /// Returns whether decoder layers attend causally or bidirectionally.
@@ -429,15 +472,16 @@ pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
     steering: Option<&Qwen3ResidualSteering>,
 ) -> Result<Vec<f32>, Qwen3ForwardError> {
     let normalized = last_normalized_hidden(weights, config, input_ids, steering)?;
-    let logits = linear(&normalized, weight(weights, "model.embed_tokens.weight")?)?;
+    let logits = linear(&normalized, weight(weights, config.output_weight_name())?)?;
     read_last_logits(&logits, 1, config.vocab_size)
 }
 
 /// Runs a complete uncached Qwen3 forward pass and reads back the last
 /// position's final-norm hidden state as `hidden_size` f32 values.
 ///
-/// This is the input of the tied output projection: the result of
-/// [`forward_last_logits`] is this vector times the token-embedding matrix.
+/// This is the input of the output projection: the result of
+/// [`forward_last_logits`] is this vector times the token-embedding matrix,
+/// or `lm_head.weight` for an untied checkpoint.
 /// It equals the last row of a source `Qwen3Model`'s `last_hidden_state`.
 pub fn forward_last_hidden<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
@@ -476,7 +520,7 @@ fn last_normalized_hidden<S: BuildHasher>(
 ) -> Result<Array, Qwen3ForwardError> {
     let hidden_states = decoder_states(weights, config, input_ids, steering)?;
     let seq_len = i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
-    // Only the final position is requested; normalization and the tied output
+    // Only the final position is requested; normalization and the output
     // projection are position-independent after the decoder layers.
     let last_hidden = hidden_states.take_axis_device(
         Array::from_slice(&[seq_len - 1], &[1]),
@@ -979,7 +1023,10 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
-        let logits = linear(&normalized, embedding)?;
+        let logits = linear(
+            &normalized,
+            weight(self.weights, self.config.output_weight_name())?,
+        )?;
         read_last_logits(&logits, 1, self.config.vocab_size)
     }
 }
@@ -1094,12 +1141,8 @@ fn cached_attention<S: BuildHasher>(
     let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
         .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
     let query = fast::rope_device(
-        &rms_norm(
-            &query,
-            weight(weights, &format!("{attn}.q_norm.weight"))?,
-            config.rms_norm_eps,
-        )?
-        .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
+        &qk_norm(config, weights, &attn, "q_norm", query)?
+            .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
         head_dim,
         false,
         Some(config.rope_theta),
@@ -1109,12 +1152,8 @@ fn cached_attention<S: BuildHasher>(
         &stream,
     )?;
     let key = fast::rope_device(
-        &rms_norm(
-            &key,
-            weight(weights, &format!("{attn}.k_norm.weight"))?,
-            config.rms_norm_eps,
-        )?
-        .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
+        &qk_norm(config, weights, &attn, "k_norm", key)?
+            .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
         head_dim,
         false,
         Some(config.rope_theta),
@@ -1425,19 +1464,12 @@ fn attention<S: BuildHasher>(
     let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
         .reshape_device(&[batch, seq_len, kv_heads, head_dim], &stream)?;
 
-    // Qwen3 normalizes Q and K per head, then applies nontraditional RoPE.
-    let query = rms_norm(
-        &query,
-        weight(weights, &format!("{attn}.q_norm.weight"))?,
-        config.rms_norm_eps,
-    )?
-    .transpose_axes_device(&[0, 2, 1, 3], &stream)?;
-    let key = rms_norm(
-        &key,
-        weight(weights, &format!("{attn}.k_norm.weight"))?,
-        config.rms_norm_eps,
-    )?
-    .transpose_axes_device(&[0, 2, 1, 3], &stream)?;
+    // Qwen3 normalizes Q and K per head; both families then apply
+    // nontraditional (rotate-half) RoPE.
+    let query = qk_norm(config, weights, &attn, "q_norm", query)?
+        .transpose_axes_device(&[0, 2, 1, 3], &stream)?;
+    let key = qk_norm(config, weights, &attn, "k_norm", key)?
+        .transpose_axes_device(&[0, 2, 1, 3], &stream)?;
     let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
     let query = fast::rope_device(
         &query,
@@ -1484,6 +1516,25 @@ fn attention<S: BuildHasher>(
         &stream,
     )?;
     linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
+}
+
+/// Qwen3's per-head RMS norm on a `[batch, positions, heads, head_dim]`
+/// query or key; Llama has none and passes the projection through.
+fn qk_norm<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    attn: &str,
+    norm: &str,
+    projected: Array,
+) -> Result<Array, Qwen3ForwardError> {
+    if !config.family.has_qk_norm() {
+        return Ok(projected);
+    }
+    rms_norm(
+        &projected,
+        weight(weights, &format!("{attn}.{norm}.weight"))?,
+        config.rms_norm_eps,
+    )
 }
 
 fn rms_norm(input: &Array, scale: &Array, eps: f32) -> Result<Array, Qwen3ForwardError> {
@@ -1637,8 +1688,7 @@ struct RawForwardConfig {
     max_position_embeddings: usize,
     #[serde(default = "default_eps")]
     rms_norm_eps: f32,
-    #[serde(default = "default_rope_theta")]
-    rope_theta: f32,
+    rope_theta: Option<f32>,
     #[serde(default)]
     attention_bias: bool,
     #[serde(default)]
@@ -1648,6 +1698,7 @@ struct RawForwardConfig {
     #[serde(default)]
     tie_word_embeddings: bool,
     rope_scaling: Option<serde_json::Value>,
+    rope_parameters: Option<serde_json::Value>,
     sliding_window: Option<usize>,
     #[serde(default)]
     use_sliding_window: bool,
@@ -1784,9 +1835,15 @@ pub enum Qwen3ForwardError {
     /// The forward path implements Qwen3's SiLU-gated MLP only.
     #[error("Qwen3 hidden_act {0:?} is unsupported; expected silu")]
     UnsupportedActivation(String),
-    /// The qualification path projects logits through the embedding table.
-    #[error("Qwen3 untied output embeddings require a dedicated lm_head path")]
+    /// A diagnostic that projects logits through the token embedding was
+    /// given an untied checkpoint.
+    #[error(
+        "this path projects logits through the token embedding; the checkpoint has a separate lm_head"
+    )]
     UntiedOutputEmbedding,
+    /// A Llama configuration omitted `rope_theta`.
+    #[error("Llama configuration must state rope_theta")]
+    MissingRopeTheta,
     /// The adapter has no reference vectors for a RoPE-scaling variant.
     #[error("Qwen3 rope_scaling requires a dedicated qualification path")]
     UnsupportedRopeScaling,
@@ -1881,7 +1938,7 @@ mod tests {
     use mlx_rs::Array;
     use proptest::prelude::*;
 
-    use crate::GPU_TEST_LOCK;
+    use crate::{DecoderFamily, GPU_TEST_LOCK};
 
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
@@ -2086,14 +2143,36 @@ mod tests {
     }
 
     #[test]
-    fn refuses_layouts_the_tied_dense_path_cannot_implement() {
+    fn refuses_layouts_the_dense_path_cannot_implement() {
         let untied = QWEN3_06B.replace(
             "\"tie_word_embeddings\":true",
             "\"tie_word_embeddings\":false",
         );
+        let untied = Qwen3ForwardConfig::parse(&untied).expect("untied projects through lm_head");
+        assert!(!untied.tied_output_embedding());
+        assert_eq!(untied.output_weight_name(), "lm_head.weight");
+        let parameters = QWEN3_06B.replace(
+            "\"rope_theta\":1000000,",
+            "\"rope_parameters\":{\"rope_type\":\"default\",\"rope_theta\":1000000},",
+        );
         assert!(matches!(
-            Qwen3ForwardConfig::parse(&untied),
-            Err(Qwen3ForwardError::UntiedOutputEmbedding)
+            Qwen3ForwardConfig::parse(&parameters),
+            Err(Qwen3ForwardError::UnsupportedRopeScaling)
+        ));
+        let llama = QWEN3_06B.replace("\"model_type\":\"qwen3\"", "\"model_type\":\"llama\"");
+        assert_eq!(
+            Qwen3ForwardConfig::parse(&llama).expect("llama").family(),
+            DecoderFamily::Llama
+        );
+        assert!(matches!(
+            Qwen3ForwardConfig::parse(&llama.replace("\"rope_theta\":1000000,", "")),
+            Err(Qwen3ForwardError::MissingRopeTheta)
+        ));
+        assert!(matches!(
+            Qwen3ForwardConfig::parse(
+                &llama.replace("\"model_type\":\"llama\"", "\"model_type\":\"mistral\"")
+            ),
+            Err(Qwen3ForwardError::UnsupportedModelType(_))
         ));
         let activation = QWEN3_06B.replace("\"hidden_act\":\"silu\"", "\"hidden_act\":\"gelu\"");
         assert!(matches!(
@@ -2509,6 +2588,88 @@ mod tests {
                 maximum: 16
             })
         ));
+    }
+
+    /// A Llama layer has no Q/K norms and projects through its own
+    /// `lm_head`; cached decode must still match the full forward.
+    #[test]
+    fn llama_layout_skips_qk_norms_and_projects_through_lm_head() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"llama",
+              "num_hidden_layers":2,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "head_dim":4,
+              "max_position_embeddings":16,
+              "rms_norm_eps":0.000001,
+              "rope_theta":5000000,
+              "hidden_act":"silu",
+              "tie_word_embeddings":false
+            }"#,
+        )
+        .expect("small Llama config");
+        let mut weights = deterministic_weights_for_layers(2);
+        weights
+            .retain(|name, _| !name.ends_with("q_norm.weight") && !name.ends_with("k_norm.weight"));
+        // An output table unlike the embedding, so a tied projection fails.
+        let lm_head: Vec<f32> = nonzero_values(32)
+            .iter()
+            .rev()
+            .map(|value| -value)
+            .collect();
+        weights.insert(
+            "lm_head.weight".to_owned(),
+            Array::from_slice(&lm_head, &[8, 4]),
+        );
+
+        let prompt = [1, 2, 3];
+        let hidden = forward_last_hidden(&weights, &config, &prompt).expect("hidden");
+        let expected: Vec<f32> = lm_head
+            .chunks_exact(4)
+            .map(|row| row.iter().zip(&hidden).map(|(w, h)| w * h).sum())
+            .collect();
+        assert_logits_match(
+            expected,
+            forward_last_logits(&weights, &config, &prompt).expect("full forward"),
+        );
+
+        let mut executor = Qwen3ForwardExecutor::new(&config, &weights);
+        let _ = executor.prefill_last_logits(&prompt[..2]).expect("prefill");
+        assert_logits_match(
+            forward_last_logits(&weights, &config, &prompt).expect("full forward"),
+            executor.decode_last_logits(3).expect("cached decode"),
+        );
+
+        // The same weights under a Qwen3 type still require the norms.
+        let qwen = config_for_family_check();
+        assert!(matches!(
+            forward_last_logits(&weights, &qwen, &prompt),
+            Err(Qwen3ForwardError::MissingWeight(name)) if name.ends_with("q_norm.weight")
+        ));
+    }
+
+    fn config_for_family_check() -> Qwen3ForwardConfig {
+        Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen3",
+              "num_hidden_layers":2,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "head_dim":4,
+              "max_position_embeddings":16,
+              "hidden_act":"silu",
+              "tie_word_embeddings":false
+            }"#,
+        )
+        .expect("small Qwen3 config")
     }
 
     fn assert_logits_match(full: Vec<f32>, cached: Vec<f32>) {

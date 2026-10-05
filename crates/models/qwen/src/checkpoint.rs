@@ -724,14 +724,6 @@ fn required_dense_tensors(
                 shape: vec![hidden],
             },
             ExpectedTensor {
-                name: format!("{prefix}.self_attn.q_norm.weight"),
-                shape: vec![head_dim],
-            },
-            ExpectedTensor {
-                name: format!("{prefix}.self_attn.k_norm.weight"),
-                shape: vec![head_dim],
-            },
-            ExpectedTensor {
                 name: format!("{prefix}.self_attn.q_proj.weight"),
                 shape: vec![query_width, hidden],
             },
@@ -764,6 +756,12 @@ fn required_dense_tensors(
                 shape: vec![hidden, layout.intermediate_size],
             },
         ]);
+        if contract.family().has_qk_norm() {
+            expected.extend(["q_norm", "k_norm"].map(|norm| ExpectedTensor {
+                name: format!("{prefix}.self_attn.{norm}.weight"),
+                shape: vec![head_dim],
+            }));
+        }
     }
     expected.push(ExpectedTensor {
         name: "model.norm.weight".to_owned(),

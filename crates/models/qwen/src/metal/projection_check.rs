@@ -62,6 +62,9 @@ pub fn qualify_projection(
         }
     })?;
     let config = Qwen3ForwardConfig::parse(&config_json)?;
+    if !config.tied_output_embedding() {
+        return Err(crate::forward::Qwen3ForwardError::UntiedOutputEmbedding.into());
+    }
     let inspection = Qwen3CheckpointInspection::inspect(model)?;
     let plan = ProjectionPlan::new(
         config.hidden_size(),
