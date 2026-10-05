@@ -95,6 +95,10 @@ enum Work {
         body: Vec<u8>,
         model: String,
     },
+    Rerank {
+        body: Vec<u8>,
+        model: String,
+    },
 }
 
 /// Adapts a generation-only test backend to the worker loop.
@@ -161,6 +165,11 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
                 let outcome = worker.embed(&body, &model);
                 drop(admission);
                 body_response(connection, outcome, "embed");
+            }
+            Work::Rerank { body, model } => {
+                let outcome = worker.rerank(&body, &model);
+                drop(admission);
+                body_response(connection, outcome, "rerank");
             }
         }
     }
@@ -434,6 +443,7 @@ fn serve_models(
             ("POST", "/v1/responses") => "generate",
             ("POST", "/v1/decisions") => "decide",
             ("POST", "/v1/embeddings") => "embed",
+            ("POST", "/v1/rerank") => "rerank",
             _ => {
                 json_response(
                     connection,
@@ -497,10 +507,10 @@ fn serve_models(
                 continue;
             }
             let (body, model) = (request.body, model_id);
-            if capability == "decide" {
-                Work::Decide { body, model }
-            } else {
-                Work::Embed { body, model }
+            match capability {
+                "decide" => Work::Decide { body, model },
+                "rerank" => Work::Rerank { body, model },
+                _ => Work::Embed { body, model },
             }
         };
         let Some(admission) = Admission::try_acquire(&model.occupied) else {
@@ -1336,6 +1346,11 @@ stream.close()
             let request: Value = serde_json::from_slice(body).expect("embedding JSON");
             Some(Ok(json!({"model": model, "input": request["input"]})))
         }
+
+        fn rerank(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+            let request: Value = serde_json::from_slice(body).expect("rerank JSON");
+            Some(Ok(json!({"model": model, "query": request["query"]})))
+        }
     }
 
     /// Answers with a receipt larger than the socket buffers, so writing it
@@ -1436,7 +1451,7 @@ stream.close()
             alive: Arc::new(AtomicBool::new(true)),
         };
         let models = [
-            model("embedder", &["embed"], embed_jobs),
+            model("embedder", &["embed", "rerank"], embed_jobs),
             model("julia", &["decide"], decide_jobs),
         ];
         let server = thread::spawn(move || {
@@ -1445,7 +1460,7 @@ stream.close()
                 &models,
                 Duration::from_secs(2),
                 TransportLimits::default(),
-                Some(3),
+                Some(5),
             )
         });
 
@@ -1471,6 +1486,24 @@ stream.close()
             address,
             "/v1/decisions",
             r#"{"model":"embedder","state":"s","questions":{}}"#,
+        );
+        assert_eq!(
+            (status, &error["error"]["code"]),
+            (400, &json!("unsupported_capability"))
+        );
+        let (status, response) = post(
+            address,
+            "/v1/rerank",
+            r#"{"model":"embedder","query":"q","documents":["d"]}"#,
+        );
+        assert_eq!(
+            (status, response),
+            (200, json!({"model":"embedder","query":"q"}))
+        );
+        let (status, error) = post(
+            address,
+            "/v1/rerank",
+            r#"{"model":"julia","query":"q","documents":["d"]}"#,
         );
         assert_eq!(
             (status, &error["error"]["code"]),

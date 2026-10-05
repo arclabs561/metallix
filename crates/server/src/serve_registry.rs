@@ -30,7 +30,7 @@ pub(crate) enum ModelKind {
     /// chunk of each document.
     PplxContext,
     /// pplx-embed-v1-late checkpoint: `/v1/embeddings` with one vector per
-    /// scored token, for late-interaction scoring.
+    /// scored token, and `/v1/rerank` scoring documents by `MaxSim`.
     PplxLate,
 }
 
@@ -43,7 +43,8 @@ impl ModelKind {
         match self {
             Self::Qwen => &["generate", "decide"],
             Self::Julia => &["decide"],
-            Self::QwenEmbedding | Self::PplxContext | Self::PplxLate => &["embed"],
+            Self::QwenEmbedding | Self::PplxContext => &["embed"],
+            Self::PplxLate => &["embed", "rerank"],
         }
     }
 }
@@ -163,6 +164,10 @@ pub(crate) trait ModelWorker {
     fn embed(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
         None
     }
+
+    fn rerank(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
 }
 
 impl ModelWorker for ChatSession {
@@ -225,6 +230,10 @@ impl ModelWorker for PplxLateEmbedder {
     fn embed(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
         Some(PplxLateEmbedder::embed(self, body, model))
     }
+
+    fn rerank(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+        Some(PplxLateEmbedder::rerank(self, body, model))
+    }
 }
 
 pub(crate) fn load(
@@ -270,7 +279,7 @@ mod tests {
             parse_manifest(br#"{"models": [{"id": "l", "kind": "pplx_late", "path": "/l"}]}"#)
                 .unwrap();
         assert_eq!(late[0].kind, ModelKind::PplxLate);
-        assert_eq!(late[0].kind.capabilities(), ["embed"]);
+        assert_eq!(late[0].kind.capabilities(), ["embed", "rerank"]);
 
         let shorthand = entries(None, Some(Path::new("/q")), "qwen").unwrap();
         assert_eq!(shorthand[0].kind, ModelKind::Qwen);

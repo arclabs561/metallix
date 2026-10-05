@@ -3,7 +3,10 @@
 
 use std::{path::Path, time::Instant};
 
-use qwen::late::{LateTask, PPLX_LATE_DOCUMENT_LENGTH, PPLX_LATE_QUERY_LENGTH, PplxLateEncoder};
+use qwen::late::{
+    LateEmbedding, LateTask, PPLX_LATE_DOCUMENT_LENGTH, PPLX_LATE_QUERY_LENGTH, PplxLateEncoder,
+    maxsim,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -96,6 +99,45 @@ fn prepare(body: &[u8]) -> Result<Prepared, String> {
     })
 }
 
+/// Unknown fields are rejected, as for the embedding requests.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RerankRequest {
+    // Routing reads `model`; it is accepted here so the body parses whole.
+    #[allow(dead_code, reason = "the front process routes on it")]
+    model: String,
+    query: String,
+    documents: Vec<String>,
+    #[serde(default)]
+    top_n: Option<usize>,
+    /// Accepted for client compatibility and ignored.
+    #[serde(default)]
+    #[allow(dead_code, reason = "accepted and ignored")]
+    user: Option<String>,
+}
+
+fn prepare_rerank(body: &[u8]) -> Result<RerankRequest, String> {
+    let request: RerankRequest = serde_json::from_slice(body).map_err(|error| {
+        format!("rerank needs a query string and a list of document strings: {error}")
+    })?;
+    if request.query.is_empty() {
+        return Err("query must be nonempty".into());
+    }
+    if request.documents.is_empty() || request.documents.len() > MAX_INPUTS {
+        return Err(format!("documents needs 1 through {MAX_INPUTS} texts"));
+    }
+    if request.documents.iter().any(String::is_empty) {
+        return Err("documents must be nonempty".into());
+    }
+    if request
+        .top_n
+        .is_some_and(|top_n| top_n == 0 || top_n > request.documents.len())
+    {
+        return Err("top_n must be between 1 and the number of documents".into());
+    }
+    Ok(request)
+}
+
 /// A loaded pplx-embed-v1-late checkpoint (float32 weights) and its tokenizer.
 pub(crate) struct PplxLateEmbedder {
     encoder: PplxLateEncoder,
@@ -123,6 +165,65 @@ impl PplxLateEmbedder {
         })
     }
 
+    /// Tokenizes `text` as `task` (character offsets) and encodes it; `label`
+    /// names the input in errors.
+    fn encode(
+        &self,
+        task: LateTask,
+        text: &str,
+        label: &str,
+    ) -> Result<(tokenizers::Encoding, LateEmbedding), String> {
+        let encoding = self
+            .tokenizer
+            .encode_char_offsets(task.prompt(text), true)
+            .map_err(|error| format!("{label} could not be tokenized: {error}"))?;
+        let ids = encoding
+            .get_ids()
+            .iter()
+            .map(|&id| i32::try_from(id).map_err(|_| format!("{label}: token ID overflows")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let embedded = self
+            .encoder
+            .encode(task, &ids)
+            .map_err(|error| format!("{label}: {error}"))?;
+        Ok((encoding, embedded))
+    }
+
+    /// The `/v1/rerank` response: `documents` scored against `query` by
+    /// `MaxSim`, sorted by descending score (ties by index), cut to `top_n`.
+    pub(crate) fn rerank(&self, body: &[u8], model: &str) -> Result<Value, String> {
+        let request = prepare_rerank(body)?;
+        let started = Instant::now();
+        let (_, query) = self.encode(LateTask::Query, &request.query, "query")?;
+        let mut prompt_tokens = query.input_ids.len();
+        let mut results = Vec::with_capacity(request.documents.len());
+        for (index, text) in request.documents.iter().enumerate() {
+            let (_, document) =
+                self.encode(LateTask::Document, text, &format!("document {index}"))?;
+            prompt_tokens += document.input_ids.len();
+            results.push((index, maxsim(&query.vectors, &document.vectors)));
+        }
+        results.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+        results.truncate(request.top_n.unwrap_or(results.len()));
+        Ok(json!({
+            "object": "list",
+            "model": model,
+            "results": results
+                .iter()
+                .map(|&(index, score)| json!({"index": index, "score": score}))
+                .collect::<Vec<_>>(),
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+            "metallix": {
+                "similarity": "maxsim",
+                "query_vectors": query.vectors.len(),
+                "documents": request.documents.len(),
+                "precision": "float32",
+                "rerank_ms": started.elapsed().as_millis(),
+                "tokenizer_json_sha256": self.tokenizer_sha256,
+            },
+        }))
+    }
+
     /// The `{object: "list", data: [...]}` response with one entry per input,
     /// each holding one vector per scored token; `model` labels it.
     pub(crate) fn embed(&self, body: &[u8], model: &str) -> Result<Value, String> {
@@ -132,23 +233,9 @@ impl PplxLateEmbedder {
         let mut data = Vec::with_capacity(prepared.texts.len());
         let mut prompt_tokens = 0;
         for (index, text) in prepared.texts.iter().enumerate() {
-            let prompt = task.prompt(text);
-            let prefix_chars = prompt.chars().count() - text.chars().count();
-            let encoding = self
-                .tokenizer
-                .encode_char_offsets(prompt.as_str(), true)
-                .map_err(|error| format!("input {index} could not be tokenized: {error}"))?;
-            let ids = encoding
-                .get_ids()
-                .iter()
-                .map(|&id| {
-                    i32::try_from(id).map_err(|_| format!("input {index}: token ID overflows"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let embedded = self
-                .encoder
-                .encode(task, &ids)
-                .map_err(|error| format!("input {index}: {error}"))?;
+            let prefix_chars = task.prompt(text).chars().count() - text.chars().count();
+            let (encoding, embedded) = self.encode(task, text, &format!("input {index}"))?;
+            let ids = encoding.get_ids();
             prompt_tokens += embedded.input_ids.len();
             // Character offsets into the input text; null for the prefix token
             // and for query-expansion tokens, which have no text.
@@ -196,6 +283,40 @@ impl PplxLateEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rerank_requests_are_bounded_and_unknown_fields_rejected() {
+        let request = prepare_rerank(
+            br#"{"model": "l", "query": "q", "documents": ["a", "b"], "top_n": 1, "user": "u"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                request.query.as_str(),
+                request.documents.len(),
+                request.top_n
+            ),
+            ("q", 2, Some(1))
+        );
+        assert!(prepare_rerank(br#"{"model": "l", "query": "q", "documents": ["a"]}"#).is_ok());
+        let many = format!(
+            r#"{{"model": "l", "query": "q", "documents": {}}}"#,
+            serde_json::to_string(&vec!["x"; MAX_INPUTS + 1]).unwrap()
+        );
+        for invalid in [
+            r#"{"model": "l", "query": "", "documents": ["a"]}"#,
+            r#"{"model": "l", "query": "q", "documents": []}"#,
+            r#"{"model": "l", "query": "q", "documents": [""]}"#,
+            r#"{"model": "l", "query": "q", "documents": ["a"], "top_n": 0}"#,
+            r#"{"model": "l", "query": "q", "documents": ["a"], "top_n": 2}"#,
+            r#"{"model": "l", "query": ["q"], "documents": ["a"]}"#,
+            r#"{"model": "l", "query": "q", "documents": ["a"], "return_documents": true}"#,
+            r#"{"model": "l", "input": "q"}"#,
+            many.as_str(),
+        ] {
+            assert!(prepare_rerank(invalid.as_bytes()).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn requests_choose_the_side_and_unsupported_shapes_are_rejected() {

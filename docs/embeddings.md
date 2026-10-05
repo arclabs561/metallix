@@ -198,7 +198,8 @@ each vector's index in the model's input sequence, and `offsets` its
 token and for query padding, which have no text. `truncated` says whether the
 text was longer than the query or document length. Score a query against a
 document with MaxSim: for each query vector, take the largest dot product with
-any document vector, and sum those. The server does not score; clients do.
+any document vector, and sum those. `/v1/rerank` (below) does this on the
+server.
 
 Served weights are float32, as the checkpoint stores them. An opt-in test sends
 the 11 inputs of `fixtures/pplx-embed-v1-late-0.6b/late-reference.json` (four
@@ -219,6 +220,60 @@ Over HTTP (warm median over two runs), a query takes about 25 ms, a 9-token
 document about 10 ms and a 512-token document about 116 ms. For that document
 about 6 ms falls outside the forward pass, mostly writing and sending its 456
 vectors as JSON.
+
+## Reranking
+
+`POST /v1/rerank` scores documents against one query and returns them by
+descending score. It routes only to models whose `/v1/models` entry lists the
+`rerank` capability; today that is `pplx_late`, which scores with MaxSim over
+the same vectors `/v1/embeddings` returns. Other models answer 400
+`unsupported_capability`.
+
+```sh
+curl -s localhost:8321/v1/rerank -d '{"model": "late",
+  "query": "What motivates scientific discovery?",
+  "documents": ["Scientists explore the universe driven by curiosity.",
+                "Children learn through curious exploration."],
+  "top_n": 1}'
+```
+
+| Field | Meaning |
+| --- | --- |
+| `model` | Registered ID with the `rerank` capability. |
+| `query` | Nonempty query text, encoded as for `input_type: "query"`. |
+| `documents` | 1 to 64 nonempty texts, each encoded as a document. |
+| `top_n` | Optional: return only the best 1 to `len(documents)` results. |
+| `user` | Accepted and ignored. |
+
+Any other field returns 400.
+
+```json
+{"object": "list", "model": "late",
+ "results": [{"index": 0, "score": 31.4841}],
+ "usage": {"prompt_tokens": 48, "total_tokens": 48},
+ "metallix": {"similarity": "maxsim", "query_vectors": 32, "documents": 2,
+              "precision": "float32", "rerank_ms": 45, "tokenizer_json_sha256": "..."}}
+```
+
+`index` is the document's position in the request. Equal scores keep request
+order. A MaxSim score is a sum of up to 32 cosines, so it lies between -32 and
+32 and is comparable only between documents scored against the same query.
+
+An opt-in test checks that `/v1/rerank` matches the source's MaxSim for all
+eight fixture pairs (worst 3.2e-6, policy 1e-3). For one query and 16 documents
+of mixed length (7 fixture documents and 9 prefixes of the long one, 2,002
+tokens in all), it checks that the scores and ranking equal MaxSim computed by
+a client over the same server's `/v1/embeddings` vectors, and that `top_n`
+truncates that ranking.
+
+```sh
+METALLIX_PPLX_LATE_MODEL=/path/to/pplx-embed-v1-late-0.6b \
+  cargo test --release -p server --features metal --test serve_pplx_rerank -- --ignored --nocapture
+```
+
+That request takes about 600 ms over HTTP (warm median), nearly all of it in 17
+forward passes run one sequence at a time. Documents are not batched yet: the
+pinned MLX returns wrong rows for short padded batches.
 
 ## Not supported yet
 
