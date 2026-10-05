@@ -189,6 +189,7 @@ class Summaries(unittest.TestCase):
             "metallix shared-prefix/on c=8: throughput passes deviate", warnings
         )
         self.assertEqual(warnings.count("output tokens differ"), 3)  # Once per pass.
+        self.assertNotIn("failed:", warnings)
         self.assertIn(
             "1 engine cells include passes without a passed idle gate", warnings
         )

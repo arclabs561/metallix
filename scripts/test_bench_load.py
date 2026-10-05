@@ -476,6 +476,24 @@ class TokenCounts(unittest.TestCase):
         }
         self.assertEqual(bench_load.token_count_warnings(cells), [])
 
+    def test_failures_list_prompt_labels_per_engine(self) -> None:
+        records = self.records([128, None, 128, None])
+        for r, label in zip(records, ["a000", "a003_vlong_hermes", "a004", "a007"]):
+            r["label"] = label
+        records[3]["outcome"] = "error"
+        cells = {
+            ("file", "c", 8): {"metallix": records, "vllm-metal": self.records([1])}
+        }
+        self.assertEqual(
+            bench_load.failure_warnings(cells),
+            [
+                (
+                    "metallix file c=8: 2/4 failed: "
+                    "a003_vlong_hermes (http_503), a007 (error)"
+                )
+            ],
+        )
+
     def test_cells_come_from_measured_levels_only(self) -> None:
         run = {"concurrency": 2, "summary": {}, "records": self.records([1])}
         servers = [

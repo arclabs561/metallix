@@ -1081,6 +1081,29 @@ def report_cells(servers: list[dict]) -> dict[tuple, dict[str, list[dict]]]:
     return cells
 
 
+def failure_warnings(cells: dict[tuple, dict[str, list[dict]]]) -> list[str]:
+    """Each engine's failed requests per cell, by prompt label and outcome.
+
+    A rejected prompt (for example a recorded tool conversation an engine
+    refuses) counts against that engine's throughput and SLO attainment; the
+    labels show which prompts did it, so the prompt set stays whole.
+    """
+    warnings = []
+    for (set_name, mode, value), by_engine in cells.items():
+        for engine, records in by_engine.items():
+            failed = [r for r in records if r["outcome"] != "ok"]
+            if failed:
+                listed = ", ".join(
+                    f"{r['label']} ({r['outcome']})"
+                    for r in sorted(failed, key=lambda r: r["index"])
+                )
+                warnings.append(
+                    f"{engine} {set_name} {mode}={value:g}: "
+                    f"{len(failed)}/{len(records)} failed: {listed}"
+                )
+    return warnings
+
+
 def token_count_warnings(cells: dict[tuple, dict[str, list[dict]]]) -> list[str]:
     """Cells where engines generated different output token counts for the same
     prompts. Throughput then compares unequal work: an engine that stops early
@@ -1345,7 +1368,8 @@ def main() -> int:
         ]
         entry["load_after"] = load_average()
     report["load_after"] = load_average()
-    report["warnings"] = token_count_warnings(report_cells(report["servers"]))
+    cells = report_cells(report["servers"])
+    report["warnings"] = failure_warnings(cells) + token_count_warnings(cells)
     print()
     print(render(report))
     if args.json:

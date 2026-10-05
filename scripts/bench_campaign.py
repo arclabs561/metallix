@@ -355,9 +355,9 @@ def summarize_rows(rows: list[dict], subject: str = SUBJECT) -> dict:
             for r in engine_rows:
                 passes.setdefault(r["pass"], {})[engine] = r["records"]
         for pass_name, records in sorted(passes.items()):
-            warnings += bench_load.token_count_warnings(
-                {(f"{set_name}/{cache} {pass_name}", "c", level): records}
-            )
+            cell = {(f"{set_name}/{cache} {pass_name}", "c", level): records}
+            warnings += bench_load.failure_warnings(cell)
+            warnings += bench_load.token_count_warnings(cell)
         table.append(
             {
                 "set": set_name,
