@@ -34,7 +34,7 @@ mod snapshot;
 mod verify;
 
 pub use paged::{BatchDecoded, BatchReadback, PagedQwen3Session};
-pub use picks::Qwen3TokenPicks;
+pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
 pub use snapshot::Qwen3KvSnapshot;
 pub use verify::Qwen3PositionLogits;
 
@@ -1166,16 +1166,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// vocabulary row. Ties go to the lowest token ID, as in a host argmax
     /// that keeps the first maximum.
     pub fn decode_greedy(&mut self, input_id: i32) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
-        if self.cached_tokens == 0 {
-            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
-        }
-        validate_input_ids(
-            self.config,
-            &[input_id],
-            self.cached_tokens,
-            self.maximum_context_tokens,
-        )?;
-        self.append_greedy(&Array::from_slice(&[input_id], &[1]))
+        self.decode_picks(input_id, &Qwen3PickRule::GREEDY)
     }
 
     /// Appends `previous` while it may still be computing and starts the
@@ -1187,6 +1178,33 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     pub fn decode_greedy_after(
         &mut self,
         previous: &Qwen3TokenPicks,
+    ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
+        self.decode_picks_after(previous, &Qwen3PickRule::GREEDY)
+    }
+
+    /// [`Self::decode_greedy`] under any [`Qwen3PickRule`].
+    pub fn decode_picks(
+        &mut self,
+        input_id: i32,
+        rule: &Qwen3PickRule,
+    ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
+        if self.cached_tokens == 0 {
+            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+        }
+        validate_input_ids(
+            self.config,
+            &[input_id],
+            self.cached_tokens,
+            self.maximum_context_tokens,
+        )?;
+        self.append_picks(&Array::from_slice(&[input_id], &[1]), rule)
+    }
+
+    /// [`Self::decode_greedy_after`] under any [`Qwen3PickRule`].
+    pub fn decode_picks_after(
+        &mut self,
+        previous: &Qwen3TokenPicks,
+        rule: &Qwen3PickRule,
     ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
@@ -1204,16 +1222,20 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
                 maximum: self.maximum_context_tokens,
             });
         }
-        // An argmax over this checkpoint's logit rows is a valid token ID,
-        // so the vocabulary check host IDs get is not needed here.
-        self.append_greedy(&previous.tokens)
+        // A pick over this checkpoint's logit rows is a valid token ID, so
+        // the vocabulary check host IDs get is not needed here.
+        self.append_picks(&previous.tokens, rule)
     }
 
-    fn append_greedy(&mut self, ids: &Array) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
+    fn append_picks(
+        &mut self,
+        ids: &Array,
+        rule: &Qwen3PickRule,
+    ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         let pending = self.append_ids(ids, 1, LogitRows::Last).and_then(|logits| {
             let rows = logits
                 .reshape_device(&[1, as_i32(self.config.vocab_size)?], StreamOrDevice::gpu())?;
-            Qwen3TokenPicks::start(&rows, self.weights_address())
+            Qwen3TokenPicks::start_with(&rows, self.weights_address(), rule)
         });
         if pending.is_err() {
             // As in `append`: a partly built step must not leave some layers
@@ -1245,7 +1267,12 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         let stored = as_i32(stored)?;
         let stream = StreamOrDevice::gpu();
         for layer in self.cache.iter_mut().flatten() {
-            if layer.keys.shape().get(2).is_some_and(|&length| length > stored) {
+            if layer
+                .keys
+                .shape()
+                .get(2)
+                .is_some_and(|&length| length > stored)
+            {
                 layer.keys = layer.keys.index_device((.., .., 0..stored, ..), &stream);
                 layer.values = layer.values.index_device((.., .., 0..stored, ..), &stream);
             }
@@ -2272,6 +2299,9 @@ pub enum Qwen3ForwardError {
     /// A weight dtype is not one of [`Qwen3WeightPrecision`]'s.
     #[error("Qwen3 weight dtype {0} is not a supported floating-point precision")]
     UnsupportedWeightDtype(String),
+    /// A GPU pick rule or its logits were malformed.
+    #[error("invalid Qwen3 GPU pick rule: {0}")]
+    InvalidPickRule(&'static str),
     /// The model produced a NaN or infinite logit, so no greedy token exists.
     #[error("Qwen3 produced non-finite vocabulary logits")]
     NonFiniteLogits,
@@ -2292,11 +2322,11 @@ mod tests {
     const F32: super::Qwen3WeightPrecision = super::Qwen3WeightPrecision::Float32;
 
     use super::{
-        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3TokenPicks,
-        Qwen3ResidualSteering, Qwen3ResidualSteeringArtifact, Qwen3SteeringError,
-        Qwen3SteeringPositionRange, forward_hidden_states, forward_last_hidden,
-        forward_last_hidden_batch, forward_last_logits, forward_last_logits_with_residual_steering,
-        forward_layer, linear, read_last_logits, rms_norm, stepped_capacity, weight,
+        Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
+        Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
+        Qwen3TokenPicks, forward_hidden_states, forward_last_hidden, forward_last_hidden_batch,
+        forward_last_logits, forward_last_logits_with_residual_steering, forward_layer, linear,
+        read_last_logits, rms_norm, stepped_capacity, weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -2710,9 +2740,7 @@ mod tests {
         let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
         let config = long_small_config();
         let weights = deterministic_weights();
-        let plan = config
-            .resident_chat_plan(256, u64::MAX, F32)
-            .expect("plan");
+        let plan = config.resident_chat_plan(256, u64::MAX, F32).expect("plan");
         let prompt: Vec<i32> = (0..100).map(|index| index % 7 + 1).collect();
         let mut source = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
         let _ = source.prefill_last_logits(&prompt).expect("prefill");
@@ -2727,7 +2755,9 @@ mod tests {
         let mut expected_prompt = prompt[..90].to_vec();
         expected_prompt.push(5);
         let mut fresh = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
-        let expected = fresh.prefill_last_logits(&expected_prompt).expect("fresh prefill");
+        let expected = fresh
+            .prefill_last_logits(&expected_prompt)
+            .expect("fresh prefill");
         assert_logits_match(expected, continued);
     }
 
