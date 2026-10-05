@@ -4,8 +4,13 @@
 //! It has no fixture, checkpoint, or expected-output dependency.
 
 use std::sync::{Arc, OnceLock};
+#[cfg(feature = "metal")]
+use std::sync::{Mutex, PoisonError};
 
 use thiserror::Error;
+
+#[cfg(feature = "metal")]
+use crate::precision::{Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights};
 
 use crate::{
     engram::{
@@ -146,6 +151,30 @@ struct WeightsInner {
     q_weight: Vec<u16>,
     k_weight: Vec<u16>,
     scan: OnceLock<Result<(), ScanFault>>,
+    #[cfg(feature = "metal")]
+    metal_wkv: ResidentWkv,
+}
+
+/// The WKV weight uploaded for Metal on the first Metal step, then shared by
+/// every session built from these operands. MLX arrays are `Send` but not
+/// `Sync`, so the shared copy sits behind a lock.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct ResidentWkv(Mutex<Option<Fp8MetalWeights>>);
+
+#[cfg(feature = "metal")]
+impl std::fmt::Debug for ResidentWkv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let resident = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        formatter
+            .debug_struct("ResidentWkv")
+            .field("resident", &resident)
+            .finish()
+    }
 }
 
 /// The first nonfinite value found by the shared operand scan.
@@ -212,6 +241,8 @@ impl EngramSessionWeights {
             q_weight,
             k_weight,
             scan: OnceLock::new(),
+            #[cfg(feature = "metal")]
+            metal_wkv: ResidentWkv::default(),
         }))
     }
 }
@@ -268,6 +299,8 @@ pub struct EngramSession {
     key_weights: Vec<f32>,
     hashes: EngramHashState,
     next_start: usize,
+    #[cfg(feature = "metal")]
+    metal_wkv: bool,
 }
 
 impl EngramSession {
@@ -287,7 +320,24 @@ impl EngramSession {
             key_weights,
             hashes,
             next_start: 0,
+            #[cfg(feature = "metal")]
+            metal_wkv: false,
         })
+    }
+
+    /// Selects the fused Metal FP8 kernel for the WKV projection.
+    ///
+    /// The scalar projection is the default and the reference. The Metal
+    /// kernel uses the same block order and scales and differs only in the
+    /// order of the 32 products inside a block, so FP32 outputs agree to a
+    /// few ulps and BF16 outputs can differ by one ulp at a rounding boundary.
+    /// The first Metal step uploads the WKV weight once for every session
+    /// sharing these operands.
+    #[cfg(feature = "metal")]
+    #[must_use]
+    pub const fn with_metal_wkv(mut self, enabled: bool) -> Self {
+        self.metal_wkv = enabled;
+        self
     }
 
     /// Returns the only admissible start position for the next call.
@@ -477,6 +527,19 @@ impl EngramSession {
         embedding: &[u16],
         positions: usize,
     ) -> Result<Vec<u16>, EngramSessionError> {
+        let projected = self.project_wkv_f32(embedding, positions)?;
+        let mut wkv = step_vec(projected.len(), "WKV BF16 output")?;
+        for value in projected {
+            wkv.push(f32_to_bf16_rne(value));
+        }
+        Ok(wkv)
+    }
+
+    fn project_wkv_f32(
+        &self,
+        embedding: &[u16],
+        positions: usize,
+    ) -> Result<Vec<f32>, EngramSessionError> {
         let columns = hash_columns(&self.config.hash_layout)?;
         let reduction = checked_product(columns, self.config.embedding_width, "WKV reduction")?;
         let outputs = wkv_width(self.config.copies, self.config.width)?;
@@ -502,6 +565,10 @@ impl EngramSession {
             &mut scales,
         )?;
         let output_elements = step_product(positions, outputs, "WKV output")?;
+        #[cfg(feature = "metal")]
+        if self.metal_wkv {
+            return self.project_wkv_metal(&codes, &scales, positions, reduction, outputs);
+        }
         let mut projected = step_vec(output_elements, "WKV FP32 output")?;
         projected.resize(output_elements, 0.0);
         fp8_linear_runtime_f32(
@@ -515,11 +582,36 @@ impl EngramSession {
             ActivationGroup::Elements32,
             &mut projected,
         )?;
-        let mut wkv = step_vec(output_elements, "WKV BF16 output")?;
-        for value in projected {
-            wkv.push(f32_to_bf16_rne(value));
-        }
-        Ok(wkv)
+        Ok(projected)
+    }
+
+    #[cfg(feature = "metal")]
+    fn project_wkv_metal(
+        &self,
+        codes: &[u8],
+        scales: &[u8],
+        positions: usize,
+        reduction: usize,
+        outputs: usize,
+    ) -> Result<Vec<f32>, EngramSessionError> {
+        // A panic while holding the lock leaves either no upload or a complete one.
+        let mut resident = self
+            .weights
+            .0
+            .metal_wkv
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let weights = match &mut *resident {
+            Some(weights) => weights,
+            empty => empty.insert(Fp8MetalWeights::new(
+                &self.weights.0.wkv_codes,
+                &self.weights.0.wkv_scales,
+                outputs,
+                reduction,
+            )?),
+        };
+        Ok(Fp8MetalKernel::new()?.forward(codes, scales, positions, weights)?)
     }
 
     fn split_wkv(
@@ -832,6 +924,9 @@ pub enum EngramSessionError {
     Activation(#[from] ActivationQuantError),
     #[error(transparent)]
     Wkv(#[from] Fp8LinearError),
+    #[cfg(feature = "metal")]
+    #[error(transparent)]
+    MetalWkv(#[from] Fp8MetalError),
     #[error(transparent)]
     Gate(#[from] EngramGateError),
 }
@@ -969,5 +1064,322 @@ mod tests {
             assert!(Arc::ptr_eq(&session.config.token_map, &config.token_map));
         }
         assert!(matches!(weights.0.scan.get(), Some(Ok(()))));
+    }
+
+    #[cfg(feature = "metal")]
+    use crate::precision::{bf16_to_f32, f32_to_bf16_rne};
+
+    #[cfg(feature = "metal")]
+    fn lcg(seed: &mut u64) -> u32 {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        u32::try_from(*seed >> 33).expect("31-bit value")
+    }
+
+    #[cfg(feature = "metal")]
+    fn finite_codes(seed: &mut u64, count: usize) -> Vec<u8> {
+        let mut codes = Vec::with_capacity(count);
+        while codes.len() < count {
+            let code = u8::try_from(lcg(seed) & 0xff).expect("byte");
+            if code & 0x7f != 0x7f {
+                codes.push(code);
+            }
+        }
+        codes
+    }
+
+    /// Rows of pseudo-random finite codes and scales, keyed by row index.
+    #[cfg(feature = "metal")]
+    struct RandomRows;
+
+    #[cfg(feature = "metal")]
+    impl EngramRowSource for RandomRows {
+        fn read_rows(
+            &self,
+            rows: &[usize],
+            codes: &mut [u8],
+            scales: &mut [u8],
+        ) -> Result<(), EngramEmbeddingError> {
+            let (code_width, scale_width) = (codes.len() / rows.len(), scales.len() / rows.len());
+            for (index, &row) in rows.iter().enumerate() {
+                let mut seed = u64::try_from(row).expect("row index") + 1;
+                codes[index * code_width..(index + 1) * code_width]
+                    .copy_from_slice(&finite_codes(&mut seed, code_width));
+                for scale in &mut scales[index * scale_width..(index + 1) * scale_width] {
+                    *scale = 122 + u8::try_from(lcg(&mut seed) % 8).expect("byte");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_wkv_matches_the_scalar_projection() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        // V4.1 hash geometry (24 columns) at embedding width 32: reduction
+        // 768. Two copies of width 40 give 120 outputs, so the last weight
+        // scale block covers a partial 32-row tile.
+        let (copies, width, positions) = (2_usize, 40_usize, 3_usize);
+        let (reduction, outputs) = (24 * 32, (copies + 1) * width);
+        let config = EngramSessionConfig::new(
+            EngramHashLayout::new(4, 8, 1, 2, vec![3; 24], vec![0; 24], vec![1; 4])
+                .expect("hash layout"),
+            (0..64).collect(),
+            0,
+            16,
+            copies,
+            width,
+            1 << 20,
+            32,
+            1e-6,
+            1e-6,
+        )
+        .expect("config");
+        let mut seed = 41_u64;
+        let wkv_codes = finite_codes(&mut seed, outputs * reduction);
+        let wkv_scales: Vec<u8> = (0..outputs.div_ceil(32) * (reduction / 32))
+            .map(|_| 120 + u8::try_from(lcg(&mut seed) % 14).expect("byte"))
+            .collect();
+        let weights = EngramSessionWeights::without_embedding_table(
+            wkv_codes.clone(),
+            wkv_scales.clone(),
+            vec![0x3f80; copies * width],
+            vec![0x3f80; copies * width],
+        );
+        let scalar = EngramSession::new(config.clone(), weights.clone()).expect("scalar");
+        let metal = EngramSession::new(config, weights.clone())
+            .expect("metal")
+            .with_metal_wkv(true);
+        let ids = [5, 17, 42];
+        let residual = vec![0x3f80; positions * copies * width];
+        let mut runs = Vec::new();
+        for mut session in [scalar, metal] {
+            let step = session
+                .step_with(0, &ids, &residual, &RandomRows)
+                .expect("step");
+            let projected = session
+                .project_wkv_f32(step.embedding(), positions)
+                .expect("FP32 projection");
+            runs.push((step, projected));
+        }
+        let resident = weights.0.metal_wkv.0.lock().expect("lock").is_some();
+        assert!(
+            resident,
+            "the Metal session uploaded and used the WKV weight"
+        );
+        let ((scalar_step, want), (metal_step, got)) = (&runs[0], &runs[1]);
+        assert_eq!(metal_step.hash_ids(), scalar_step.hash_ids());
+        assert_eq!(metal_step.embedding(), scalar_step.embedding());
+        assert!(
+            want.iter().any(|value| value.abs() > 1.0),
+            "nontrivial outputs"
+        );
+        let reference = f64_reference(
+            scalar_step.embedding(),
+            (&wkv_codes, &wkv_scales),
+            positions,
+            reduction,
+            outputs,
+        );
+        let report = check_parity(want, got, &reference);
+        assert_eq!(
+            metal_step.wkv(),
+            got.iter()
+                .map(|&value| f32_to_bf16_rne(value))
+                .collect::<Vec<_>>(),
+            "the step's BF16 WKV is the Metal FP32 projection rounded"
+        );
+        eprintln!("synthetic WKV parity: {report:?}");
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires .agents/receipts/route-trace layer-1 Engram WKV weights and capture-shell2 rows; run with --release"]
+    fn metal_wkv_matches_scalar_on_the_real_layer_one_projection() {
+        use crate::engram::embedding::{EngramEmbeddingLayout, engram_embedding_bf16_reference};
+
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let trace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../.agents/receipts/route-trace");
+        let read = |name: &str| {
+            std::fs::read(trace.join(name)).unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        let wkv_codes = read("weights/layers.1.engram.wkv.weight.bin");
+        let wkv_scales = read("weights/layers.1.engram.wkv.scale.bin");
+        let rows = read("capture-shell2/engram01.rows.fp8.bin");
+        let row_scales = read("capture-shell2/engram01.scales.e8m0.bin");
+        // The capture holds the hash IDs `[1, positions, 24]` and the FP8
+        // rows fetched for them in that flattened order, so captured row `i`
+        // is the embedding of lookup `i`.
+        let (columns, row_width, outputs) = (24_usize, 256_usize, 25_600_usize);
+        let lookups = rows.len() / row_width;
+        let positions = lookups / columns;
+        assert_eq!(lookups * row_width, rows.len());
+        assert_eq!(positions * columns, lookups);
+        assert_eq!(row_scales.len(), lookups * row_width / 32);
+        let mut embedding = vec![0; rows.len()];
+        engram_embedding_bf16_reference(
+            &(0..i64::try_from(lookups).expect("lookups")).collect::<Vec<_>>(),
+            &rows,
+            &row_scales,
+            EngramEmbeddingLayout::new(lookups, row_width, 32).expect("row layout"),
+            &mut embedding,
+        )
+        .expect("captured embedding");
+        let weights = EngramSessionWeights::without_embedding_table(
+            wkv_codes.clone(),
+            wkv_scales.clone(),
+            vec![0x3f80; 4 * 5120],
+            vec![0x3f80; 4 * 5120],
+        );
+        let config = v41_config(5120).expect("V4.1 config");
+        let scalar = EngramSession::new(config.clone(), weights.clone()).expect("scalar");
+        let metal = EngramSession::new(config, weights)
+            .expect("metal")
+            .with_metal_wkv(true);
+        let want = scalar
+            .project_wkv_f32(&embedding, positions)
+            .expect("scalar projection");
+        let got = metal
+            .project_wkv_f32(&embedding, positions)
+            .expect("Metal projection");
+        let reference = f64_reference(
+            &embedding,
+            (&wkv_codes, &wkv_scales),
+            positions,
+            columns * row_width,
+            outputs,
+        );
+        let report = check_parity(&want, &got, &reference);
+        eprintln!("real layer-1 WKV parity, {positions} positions: {report:?}");
+    }
+
+    /// Each output's exact value and the sum of |activation x weight x scales|
+    /// over the reduction, in f64, from the quantized activations.
+    #[cfg(feature = "metal")]
+    fn f64_reference(
+        embedding: &[u16],
+        (wkv_codes, wkv_scales): (&[u8], &[u8]),
+        positions: usize,
+        reduction: usize,
+        outputs: usize,
+    ) -> Vec<(f64, f64)> {
+        use crate::precision::{
+            ActivationGroup, decode_e4m3fn, decode_e8m0, quantize_bf16_activations_e4m3fn,
+        };
+        let groups = reduction / 32;
+        let mut codes = vec![0; positions * reduction];
+        let mut scales = vec![0; positions * groups];
+        quantize_bf16_activations_e4m3fn(
+            embedding,
+            positions,
+            reduction,
+            ActivationGroup::Elements32,
+            &mut codes,
+            &mut scales,
+        )
+        .expect("activation quantization");
+        let lut: Vec<f64> = (0..=u8::MAX)
+            .map(|code| f64::from(decode_e4m3fn(code)))
+            .collect();
+        let mut reference = Vec::with_capacity(positions * outputs);
+        for row in 0..positions {
+            let activations: Vec<f64> = codes[row * reduction..(row + 1) * reduction]
+                .iter()
+                .map(|&code| lut[usize::from(code)])
+                .collect();
+            for column in 0..outputs {
+                let weights = &wkv_codes[column * reduction..(column + 1) * reduction];
+                let (mut exact, mut magnitude) = (0.0_f64, 0.0_f64);
+                for group in 0..groups {
+                    let scale = f64::from(decode_e8m0(scales[row * groups + group]))
+                        * f64::from(decode_e8m0(wkv_scales[(column / 32) * groups + group]));
+                    let (mut dot, mut absolute) = (0.0_f64, 0.0_f64);
+                    for offset in group * 32..(group + 1) * 32 {
+                        let product = activations[offset] * lut[usize::from(weights[offset])];
+                        dot += product;
+                        absolute += product.abs();
+                    }
+                    exact += dot * scale;
+                    magnitude += absolute * scale;
+                }
+                reference.push((exact, magnitude));
+            }
+        }
+        reference
+    }
+
+    /// Worst errors, each normalized by the output's sum of |terms|.
+    #[cfg(feature = "metal")]
+    #[derive(Debug)]
+    #[allow(dead_code, reason = "fields are reported through Debug")]
+    struct ParityReport {
+        outputs: usize,
+        max_difference: f64,
+        scalar_max_error: f64,
+        metal_max_error: f64,
+        bf16_mismatches: usize,
+    }
+
+    /// Checks Metal against the scalar projection and both against the f64
+    /// reference.
+    ///
+    /// Only the order of the 32 products inside a block differs between the
+    /// two paths. Heavy cancellation (summed term magnitudes reach ~1400x the
+    /// result on random codes) makes an output-relative bound meaningless, so
+    /// the FP32 difference is bounded by the summation error bound: eps times
+    /// the sum of |terms|, with the kernel parity test's 128x budget. Because
+    /// that bound was chosen after an output-relative one failed, Metal must
+    /// also be no less accurate than the scalar path against the exact value:
+    /// its worst normalized error at most twice the scalar path's.
+    #[cfg(feature = "metal")]
+    fn check_parity(want: &[f32], got: &[f32], reference: &[(f64, f64)]) -> ParityReport {
+        assert_eq!(want.len(), reference.len());
+        assert_eq!(got.len(), reference.len());
+        let budget = 128.0 * f64::from(f32::EPSILON);
+        let mut report = ParityReport {
+            outputs: reference.len(),
+            max_difference: 0.0,
+            scalar_max_error: 0.0,
+            metal_max_error: 0.0,
+            bf16_mismatches: 0,
+        };
+        for (index, ((&want, &got), &(exact, magnitude))) in
+            want.iter().zip(got).zip(reference).enumerate()
+        {
+            let scale = magnitude.max(1.0);
+            let difference = (f64::from(got) - f64::from(want)).abs();
+            assert!(
+                difference <= budget * scale,
+                "output {index}: {got} vs {want}, sum of |terms| {magnitude}"
+            );
+            report.max_difference = report.max_difference.max(difference / scale);
+            report.scalar_max_error = report
+                .scalar_max_error
+                .max((f64::from(want) - exact).abs() / scale);
+            report.metal_max_error = report
+                .metal_max_error
+                .max((f64::from(got) - exact).abs() / scale);
+            let (got_bf16, want_bf16) = (f32_to_bf16_rne(got), f32_to_bf16_rne(want));
+            if got_bf16 != want_bf16 {
+                report.bf16_mismatches += 1;
+                let (got, want) = (
+                    f64::from(bf16_to_f32(got_bf16)),
+                    f64::from(bf16_to_f32(want_bf16)),
+                );
+                // At most one BF16 ulp beyond the FP32 difference.
+                assert!(
+                    (got - want).abs() <= want.abs() * 2.0_f64.powi(-7) + budget * scale,
+                    "BF16 output {index}: {got} vs {want}"
+                );
+            }
+        }
+        assert!(
+            report.metal_max_error <= 2.0 * report.scalar_max_error,
+            "Metal is less accurate than the scalar path: {report:?}"
+        );
+        report
     }
 }
