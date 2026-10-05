@@ -290,6 +290,9 @@ fn paged_fork_copies_the_shared_tail_and_both_branches_match() {
     // shared partial block must leave the other branch's rows intact.
     let mut parent_token = argmax(&prefill);
     let mut child_token = (parent_token + 1) % 64;
+    let before = (0..config.hidden_layers)
+        .map(|layer| buffer_address(paged.layer_arrays(layer).0))
+        .collect::<Vec<_>>();
     for step in 0..6 {
         let parent_logits = paged
             .decode_last_logits(parent, parent_token)
@@ -313,6 +316,14 @@ fn paged_fork_copies_the_shared_tail_and_both_branches_match() {
             assert_eq!(parent_table[0], child_table[0], "full block stays shared");
             assert_eq!(paged.blocks().ref_count(shared[0]), Some(2));
             assert_ne!(parent_table[1], child_table[1], "tail was copied on write");
+            // The copy wrote into the pool in place, not into a new array.
+            for (layer, address) in before.iter().enumerate() {
+                assert_eq!(
+                    buffer_address(paged.layer_arrays(layer).0),
+                    *address,
+                    "layer {layer}: copy-on-write copied the pool array"
+                );
+            }
         }
     }
 }
@@ -352,14 +363,14 @@ fn paged_out_of_blocks_leaves_the_sequence_usable() {
     assert_bits_equal(&logits, &expected, "decode into the last slot");
 }
 
-/// The address of a slab's evaluated buffer.
+/// The address of a pool array's evaluated buffer.
 fn buffer_address(array: &Array) -> usize {
-    array.eval().expect("slab evaluates");
+    array.eval().expect("pool array evaluates");
     array.as_slice::<f32>().as_ptr() as usize
 }
 
 #[test]
-fn paged_writes_reuse_the_slab_buffer() {
+fn paged_writes_reuse_the_pool_buffer() {
     let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
     let config = paged_config();
     let weights = paged_weights(&config);
@@ -374,10 +385,9 @@ fn paged_writes_reuse_the_slab_buffer() {
         .expect("live")
         .last()
         .expect("non-empty");
-    let slab = tail.slab() as usize;
     let before = (0..config.hidden_layers)
         .map(|layer| {
-            let (keys, values) = paged.slab(layer, slab);
+            let (keys, values) = paged.layer_arrays(layer);
             (buffer_address(keys), buffer_address(values))
         })
         .collect::<Vec<_>>();
@@ -385,14 +395,9 @@ fn paged_writes_reuse_the_slab_buffer() {
         .decode_last_logits(seq, argmax(&logits))
         .expect("decode");
     for (layer, (keys_before, values_before)) in before.into_iter().enumerate() {
-        let (keys, values) = paged.slab(layer, slab);
+        let (keys, values) = paged.layer_arrays(layer);
         // The decode wrote position 21, offset 5 of the tail block.
-        let row = keys.index((
-            i32::try_from(tail.index_in_slab()).expect("small"),
-            ..,
-            5,
-            ..,
-        ));
+        let row = keys.index((i32::try_from(tail.index() * 16 + 5).expect("small"), .., ..));
         let row = row.contiguous().expect("contiguous row");
         row.eval().expect("row");
         let written = row.as_slice::<f32>().iter().any(|value| *value != 0.0);
@@ -522,7 +527,7 @@ fn contiguous_reference_timing(
 }
 
 /// Decode step time and peak bytes must not depend on the pool size, and a
-/// decode must leave the slab it wrote at the same buffer.
+/// decode must leave every layer's pool arrays at the same buffers.
 fn donation_round(
     config: &Qwen3ForwardConfig,
     weights: &Weights,
@@ -546,24 +551,15 @@ fn donation_round(
     let mut steps = Vec::new();
     let mut moved = 0;
     for _ in 0..48 {
-        // A full tail block means this step writes a fresh block whose slab
-        // is known only afterwards, so record every slab of every layer.
-        let before = slab_addresses(&paged, config.hidden_layers, pool.slabs());
+        let before = layer_addresses(&paged, config.hidden_layers);
         let started = Instant::now();
         logits = paged
             .decode_last_logits(seq, argmax(&logits))
             .expect("decode");
         steps.push(started.elapsed());
-        let written = paged
-            .blocks()
-            .block_table(seq)
-            .expect("live")
-            .last()
-            .expect("tail")
-            .slab() as usize;
-        let after = slab_addresses(&paged, config.hidden_layers, pool.slabs());
+        let after = layer_addresses(&paged, config.hidden_layers);
         moved += (0..config.hidden_layers)
-            .filter(|&layer| before[layer][written] != after[layer][written])
+            .filter(|&layer| before[layer] != after[layer])
             .count();
     }
     let peak = mlx_rs::memory::peak_memory().expect("peak");
@@ -571,7 +567,7 @@ fn donation_round(
     println!(
         "paged_qwen3_06b donation round={round} pool_mib={} pool_bytes={} slabs={} \
          decode_steps=48 median_step_ms={:.3} p90_step_ms={:.3} \
-         peak_minus_active_before_bytes={} written_slabs_moved={moved}/{}",
+         peak_minus_active_before_bytes={} layer_buffers_moved={moved}/{}",
         budget / MIB,
         paged.pool_bytes(),
         pool.slabs(),
@@ -580,23 +576,18 @@ fn donation_round(
         peak.saturating_sub(active_before),
         48 * config.hidden_layers,
     );
-    assert_eq!(moved, 0, "a decode write copied its slab");
+    assert_eq!(moved, 0, "a decode write copied its layer's pool array");
 }
 
-/// Key and value buffer addresses, `[layer][slab]`.
-fn slab_addresses(
+/// Key and value buffer addresses per layer.
+fn layer_addresses(
     paged: &PagedQwen3Session<'_, std::collections::hash_map::RandomState>,
     layers: usize,
-    slabs: u32,
-) -> Vec<Vec<(usize, usize)>> {
+) -> Vec<(usize, usize)> {
     (0..layers)
         .map(|layer| {
-            (0..slabs as usize)
-                .map(|slab| {
-                    let (keys, values) = paged.slab(layer, slab);
-                    (buffer_address(keys), buffer_address(values))
-                })
-                .collect()
+            let (keys, values) = paged.layer_arrays(layer);
+            (buffer_address(keys), buffer_address(values))
         })
         .collect()
 }

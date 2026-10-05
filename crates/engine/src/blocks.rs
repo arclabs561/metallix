@@ -1,8 +1,9 @@
 //! Host-side accounting for a paged KV pool: block tables, reference counts,
 //! an LRU free queue, and hash-chained prefix caching.
 //!
-//! The pool holds a fixed number of blocks, grouped into slabs of
-//! [`SLAB_BLOCKS`] so the device side can store one tensor per slab. A block
+//! The pool holds a fixed number of blocks, sized in slabs of
+//! [`SLAB_BLOCKS`]; a device side may store one tensor per slab or one for
+//! the whole pool. A block
 //! holds `block_tokens` positions (16 by default). This module never touches
 //! device memory; it hands the device side block IDs, slot positions and
 //! copy-on-write copies to perform.
