@@ -87,12 +87,6 @@ impl LayerOneConfig {
                 attention: attention_layout.head_dimension().get(),
             });
         }
-        if owner_layout.key_dimension() != attention_layout.head_dimension() {
-            return Err(LayerOneSessionError::KeyDimensionMismatch {
-                owner: owner_layout.key_dimension().get(),
-                attention: attention_layout.head_dimension().get(),
-            });
-        }
         if owner_layout.rope_pairs() != attention_layout.rope_pairs() {
             return Err(LayerOneSessionError::RopePairMismatch {
                 owner: owner_layout.rope_pairs().get(),
@@ -589,10 +583,6 @@ pub enum LayerOneSessionError {
         "layer-one owner latent dimension {owner} differs from attention head dimension {attention}"
     )]
     LatentDimensionMismatch { owner: usize, attention: usize },
-    #[error(
-        "layer-one owner key dimension {owner} differs from attention head dimension {attention}"
-    )]
-    KeyDimensionMismatch { owner: usize, attention: usize },
     #[error("layer-one owner rope pairs {owner} differs from attention rope pairs {attention}")]
     RopePairMismatch { owner: usize, attention: usize },
     #[error("layer-one session is poisoned; reset is required")]

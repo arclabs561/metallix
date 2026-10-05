@@ -27,7 +27,10 @@ use thiserror::Error;
 
 use crate::{
     RotaryFrequency, RotaryFrequencyParameters,
-    attention::layer::{Fp8Projection, LayerAttentionLayout, LayerAttentionWeights},
+    attention::layer::{
+        CompressedAttentionPublication, Fp8Projection, LayerAttentionLayout, LayerAttentionState,
+        LayerAttentionWeights,
+    },
     checkpoint::{
         V41StorageDtype,
         range_cache::{V41RangeCache, V41RangeCacheError, V41RangeSource},
@@ -39,14 +42,16 @@ use crate::{
         owner::RatioOneOwnerWeights,
         query::{CandidateQueryLayout, CandidateQueryWeights, IndexQueryLayout, IndexQueryWeights},
     },
-    moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference},
+    moe::{Fp4ExpertWeights, Fp8ExpertWeights, MoEConfig, MoEReference, RoutedExpertSource},
     precision::{decode_e4m3fn, decode_e8m0, f32_to_bf16_rne},
 };
 
 use super::{
     AttentionInput, BlockDefinition, BlockTailReference, CandidateProjector, EngramDefinition,
-    EngramSessionConfig, EngramSessionWeights, FinalHead, LayerFourConfig, LayerFourDefinition,
-    LayerKind, LayerOneConfig, LayerOneDefinition, LayerThreeConfig, LayerThreeDefinition,
+    EngramSessionConfig, EngramSessionWeights, FinalHead, LayerFourCall, LayerFourConfig,
+    LayerFourDefinition, LayerFourSession, LayerKind, LayerOneCall, LayerOneConfig,
+    LayerOneDefinition, LayerOneSession, LayerOneStepOutput, LayerThreeCall, LayerThreeConfig,
+    LayerThreeDefinition, LayerThreePublication, LayerThreeSession, LayerThreeStepOutput,
     RatioTwoOwnerLayout, RatioTwoOwnerWeights, RequestError, RequestModel,
     ReusedAttentionDefinition, ScheduledLayer, StartupDefinition,
 };
@@ -300,6 +305,38 @@ impl V41InferenceConfig {
     }
 }
 
+/// Compressed-KV publications a teacher-forced walk carries between layers.
+#[derive(Debug, Default)]
+pub struct V41TeacherState {
+    ratio_two: Option<LayerOneStepOutput>,
+    ratio_one: Option<LayerThreeStepOutput>,
+    indexer_indices: Option<Vec<i32>>,
+}
+
+/// One teacher-forced layer's attention and tail results.
+#[derive(Debug)]
+pub struct V41LayerTrace {
+    /// Normalized attention input `[tokens, dim]`.
+    pub attention_input: Vec<u16>,
+    /// Attention output `[tokens, dim]`.
+    pub attention_output: Vec<u16>,
+    /// The tail, or why it did not run (for example an unavailable expert).
+    pub tail: Result<V41TailTrace, String>,
+}
+
+/// One teacher-forced layer's FFN results.
+#[derive(Debug)]
+pub struct V41TailTrace {
+    /// Normalized FFN input `[tokens, dim]`.
+    pub ffn_input: Vec<u16>,
+    /// `MoE` output `[tokens, dim]`.
+    pub ffn_output: Vec<u16>,
+    /// Block output stream `[tokens, hc_mult, dim]`.
+    pub output: Vec<u16>,
+    /// Outgoing pre-mix `[tokens, hc_mult]`.
+    pub next_pre: Vec<f32>,
+}
+
 /// HOOK(engram): how Engram enters the schedule.
 #[derive(Debug)]
 pub enum V41Engrams {
@@ -520,6 +557,208 @@ impl V41CheckpointWeights {
             &self.compressed_frequencies,
             self.max_tokens,
         )?)
+    }
+
+    /// Runs one layer of a start-zero prefill on a caller-supplied input
+    /// stream and pre-mix (teacher forcing), with the same components and
+    /// call order as a request step. Layers must run in order within one
+    /// `state`, because consumers read the latest owner's publication.
+    /// Engram is not applied: a caller forcing layer inputs supplies its output.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each attention role's call stays visible in one teacher-forced step"
+    )]
+    pub fn teacher_forced_layer(
+        &self,
+        layer: usize,
+        residual: &[u16],
+        pre: &[f32],
+        state: &mut V41TeacherState,
+        experts: &dyn RoutedExpertSource,
+    ) -> Result<V41LayerTrace, V41CheckpointModelError> {
+        let c = &self.config;
+        let (width, copies) = (c.dim, c.hc_mult);
+        let tokens = residual.len() / (copies * width);
+        let positions = NonZeroUsize::new(tokens).ok_or_else(|| {
+            V41CheckpointModelError::Config("teacher forcing needs at least one token".to_owned())
+        })?;
+        let span = tokens * (c.rope_head_dim / 2);
+        if residual.len() != tokens * copies * width || pre.len() != tokens * copies {
+            return Err(V41CheckpointModelError::Config(
+                "residual and pre-mix lengths disagree".to_owned(),
+            ));
+        }
+        if span > self.window_frequencies.len() {
+            return Err(V41CheckpointModelError::Config(format!(
+                "{tokens} tokens exceed the {}-position rotary table",
+                self.max_tokens
+            )));
+        }
+        let (window, compressed) = (
+            &self.window_frequencies[..span],
+            &self.compressed_frequencies[..span],
+        );
+        let input = self.attention_input(layer)?;
+        let mut attention_input = Vec::with_capacity(tokens * width);
+        for (row, pre) in residual
+            .chunks_exact(copies * width)
+            .zip(pre.chunks_exact(copies))
+        {
+            attention_input.extend_from_slice(
+                input
+                    .forward(row, pre)
+                    .map_err(component)?
+                    .normalized_bf16(),
+            );
+        }
+        let weights = self.attention_weights(layer)?;
+        let layout = c.attention_layout(layer)?;
+        let missing =
+            || V41CheckpointModelError::Config(format!("layer {layer}: no preceding owner"));
+        let attention_output = match c.role(layer)? {
+            V41LayerRole::Startup | V41LayerRole::WindowOnly => {
+                LayerAttentionState::new(layout)
+                    .forward_window_only(&attention_input, 0, window, weights)
+                    .map_err(component)?
+                    .final_output
+            }
+            V41LayerRole::RatioTwoOwner => {
+                let output = LayerOneSession::new(
+                    self.ratio_two_config(layer)?,
+                    self.bf16(&format!("layers.{layer}.attn.compressor.norm.weight"))?,
+                )
+                .map_err(component)?
+                .step(LayerOneCall::new(
+                    &attention_input,
+                    positions,
+                    &self.compressed_frequencies,
+                    self.ratio_two_weights(layer)?,
+                    self.query_weights(layer)?,
+                    c.query_layout()?,
+                    weights,
+                    None,
+                ))
+                .map_err(component)?;
+                let attended = output.attention().final_output.clone();
+                state.ratio_two = Some(output);
+                attended
+            }
+            V41LayerRole::RatioTwoConsumer { .. } => {
+                let owner = state.ratio_two.as_ref().ok_or_else(missing)?;
+                let publication = owner.publication();
+                LayerAttentionState::new(layout)
+                    .forward(
+                        &attention_input,
+                        0,
+                        compressed,
+                        weights,
+                        CompressedAttentionPublication {
+                            source_layer: publication.source_layer(),
+                            epoch: publication.epoch(),
+                            call_id: publication.call_id(),
+                            numerical_bf16: owner.kv_prefix(),
+                            indices: owner.selected_indices(),
+                        },
+                    )
+                    .map_err(component)?
+                    .final_output
+            }
+            V41LayerRole::RatioOneOwner => {
+                let output = LayerThreeSession::new(
+                    self.ratio_one_config(layer)?,
+                    u16::try_from(layer).map_err(component)?,
+                    self.bf16(&format!("layers.{layer}.attn.compressor.norm.weight"))?,
+                    c.norm_eps,
+                )
+                .map_err(component)?
+                .step(LayerThreeCall::new(
+                    &attention_input,
+                    positions,
+                    compressed,
+                    self.ratio_one_weights(layer)?,
+                    self.candidate_projector(layer)?,
+                    weights,
+                ))
+                .map_err(component)?;
+                let attended = output.attention().final_output.clone();
+                state.ratio_one = Some(output);
+                state.indexer_indices = None;
+                attended
+            }
+            V41LayerRole::RatioOneIndexer { .. } => {
+                let owner = state.ratio_one.as_ref().ok_or_else(missing)?;
+                let output = LayerFourSession::new(self.ratio_one_indexer_config(layer)?)
+                    .step(LayerFourCall::new(
+                        &attention_input,
+                        compressed,
+                        self.query_weights(layer)?,
+                        weights,
+                        LayerThreePublication::new(
+                            owner.publication(),
+                            owner.key_prefix(),
+                            owner.kv_prefix(),
+                            owner.candidate().candidates(),
+                        ),
+                    ))
+                    .map_err(component)?;
+                state.indexer_indices = Some(output.selection().indices.clone());
+                output.attention().final_output.clone()
+            }
+            V41LayerRole::RatioOneConsumer { .. } => {
+                let owner = state.ratio_one.as_ref().ok_or_else(missing)?;
+                let publication = owner.publication();
+                LayerAttentionState::new(layout)
+                    .forward(
+                        &attention_input,
+                        0,
+                        compressed,
+                        weights,
+                        CompressedAttentionPublication {
+                            source_layer: publication.source_layer(),
+                            epoch: publication.epoch(),
+                            call_id: publication.call_id(),
+                            numerical_bf16: owner.kv_prefix(),
+                            indices: state
+                                .indexer_indices
+                                .as_deref()
+                                .unwrap_or_else(|| owner.selected_indices()),
+                        },
+                    )
+                    .map_err(component)?
+                    .final_output
+            }
+        };
+        let tail = self.tail(layer)?;
+        let mut trace = V41TailTrace {
+            ffn_input: Vec::with_capacity(tokens * width),
+            ffn_output: Vec::with_capacity(tokens * width),
+            output: Vec::with_capacity(tokens * copies * width),
+            next_pre: Vec::with_capacity(tokens * copies),
+        };
+        let mut tail_result = Ok(());
+        for (row, attended) in residual
+            .chunks_exact(copies * width)
+            .zip(attention_output.chunks_exact(width))
+        {
+            match tail.forward_token_with(row, attended, experts) {
+                Ok(diagnostic) => {
+                    let ffn = diagnostic.ffn();
+                    trace.ffn_input.extend_from_slice(ffn.normalized_bf16());
+                    trace.ffn_output.extend_from_slice(ffn.moe().output_bf16());
+                    trace.output.extend_from_slice(ffn.output_bf16());
+                    trace.next_pre.extend_from_slice(ffn.coefficients().pre());
+                }
+                Err(error) => {
+                    tail_result = Err(error.to_string());
+                    break;
+                }
+            }
+        }
+        Ok(V41LayerTrace {
+            attention_input,
+            attention_output,
+            tail: tail_result.map(|()| trace),
+        })
     }
 
     #[allow(
@@ -932,6 +1171,17 @@ impl V41CheckpointWeights {
         &self,
         layer: usize,
     ) -> Result<LayerThreeDefinition<'_>, V41CheckpointModelError> {
+        Ok(LayerThreeDefinition::new(
+            self.ratio_one_config(layer)?,
+            self.bf16(&format!("layers.{layer}.attn.compressor.norm.weight"))?,
+            self.config.norm_eps,
+            self.ratio_one_weights(layer)?,
+            self.candidate_projector(layer)?,
+            self.attention_weights(layer)?,
+        ))
+    }
+
+    fn ratio_one_config(&self, layer: usize) -> Result<LayerThreeConfig, V41CheckpointModelError> {
         let c = &self.config;
         let key_layout = IndexKeyLayout::new(
             NonZeroUsize::MIN,
@@ -941,31 +1191,52 @@ impl V41CheckpointWeights {
             c.norm_eps,
         )
         .map_err(component)?;
-        Ok(LayerThreeDefinition::new(
-            LayerThreeConfig::new(
-                key_layout,
-                nonzero(c.dim)?,
-                self.max_tokens,
-                c.attention_layout(layer)?,
-                nonzero(c.window_size)?,
-                nonzero(c.index_topk)?,
-            )
-            .map_err(component)?,
-            self.bf16(&format!("layers.{layer}.attn.compressor.norm.weight"))?,
-            c.norm_eps,
-            RatioOneOwnerWeights::new(
-                self.bf16(&format!("layers.{layer}.attn.compressor.wkv.weight"))?,
-                self.index_key(layer)?,
-            ),
-            CandidateProjector::new(
-                self.query_weights(layer)?,
-                c.query_layout()?,
-                nonzero(c.index_head_dim)?,
-                nonzero(c.candidate_topk_blocks)?,
-                nonzero(c.candidate_block_size)?,
-            ),
-            self.attention_weights(layer)?,
+        LayerThreeConfig::new(
+            key_layout,
+            nonzero(c.dim)?,
+            self.max_tokens,
+            c.attention_layout(layer)?,
+            nonzero(c.window_size)?,
+            nonzero(c.index_topk)?,
+        )
+        .map_err(component)
+    }
+
+    fn ratio_one_weights(
+        &self,
+        layer: usize,
+    ) -> Result<RatioOneOwnerWeights<'_>, V41CheckpointModelError> {
+        Ok(RatioOneOwnerWeights::new(
+            self.bf16(&format!("layers.{layer}.attn.compressor.wkv.weight"))?,
+            self.index_key(layer)?,
         ))
+    }
+
+    fn candidate_projector(
+        &self,
+        layer: usize,
+    ) -> Result<CandidateProjector<'_>, V41CheckpointModelError> {
+        let c = &self.config;
+        Ok(CandidateProjector::new(
+            self.query_weights(layer)?,
+            c.query_layout()?,
+            nonzero(c.index_head_dim)?,
+            nonzero(c.candidate_topk_blocks)?,
+            nonzero(c.candidate_block_size)?,
+        ))
+    }
+
+    fn ratio_one_indexer_config(
+        &self,
+        layer: usize,
+    ) -> Result<LayerFourConfig, V41CheckpointModelError> {
+        let c = &self.config;
+        LayerFourConfig::new(
+            c.query_layout()?,
+            c.attention_layout(layer)?,
+            nonzero(c.index_topk)?,
+        )
+        .map_err(component)
     }
 
     fn layer_kind(&self, layer: usize) -> Result<LayerKind<'_>, V41CheckpointModelError> {
@@ -988,12 +1259,7 @@ impl V41CheckpointWeights {
             V41LayerRole::RatioOneOwner => LayerKind::RatioOneOwner(self.ratio_one_owner(layer)?),
             V41LayerRole::RatioOneIndexer { .. } => {
                 LayerKind::RatioOneIndexer(LayerFourDefinition::new(
-                    LayerFourConfig::new(
-                        c.query_layout()?,
-                        c.attention_layout(layer)?,
-                        nonzero(c.index_topk)?,
-                    )
-                    .map_err(component)?,
+                    self.ratio_one_indexer_config(layer)?,
                     self.query_weights(layer)?,
                     self.attention_weights(layer)?,
                 ))
@@ -1068,12 +1334,15 @@ pub enum V41CheckpointModelError {
 mod tests {
     use std::{num::NonZeroUsize, path::Path, sync::Mutex};
 
-    use super::{V41CheckpointWeights, V41InferenceConfig, V41LayerRole, le_u16};
+    use super::{V41CheckpointWeights, V41InferenceConfig, V41LayerRole, V41TeacherState, le_u16};
     use crate::{
         StartupLayout,
-        attention::layer::{CompressedAttentionPublication, LayerAttentionState},
         checkpoint::range_cache::{V41CachedRoutedExperts, V41LocalWeightsSource, V41RangeCache},
-        reduced::{FinalHead, FinalHeadError, LayerOneCall, LayerOneSession, LayerOneStepOutput},
+        indexer::key::IndexKeyLayout,
+        reduced::{
+            FinalHead, FinalHeadError, LayerFourConfig, LayerOneConfig, LayerThreeConfig,
+            RatioTwoOwnerLayout,
+        },
     };
 
     /// The schedule fields of the pinned V4.1 Flash `inference-config.json`.
@@ -1144,6 +1413,33 @@ mod tests {
         assert!(V41InferenceConfig::parse(&json.to_string()).is_err());
     }
 
+    /// V4.1 index keys are `index_head_dim` (128) wide while attention heads
+    /// are `head_dim` (512); every compressed-layer config must accept that.
+    #[test]
+    fn compressed_layer_configs_accept_index_keys_narrower_than_attention_heads() {
+        let config = V41InferenceConfig::parse(&pinned_schedule()).expect("pinned schedule");
+        let query = config.query_layout().expect("query layout");
+        assert_eq!(query.key_dimension().get(), 128);
+        let nz = |value| NonZeroUsize::new(value).expect("nonzero");
+        let owner =
+            RatioTwoOwnerLayout::new(nz(1), nz(5120), nz(512), nz(128), nz(32), nz(64), 1e-20)
+                .expect("ratio-two owner layout");
+        LayerOneConfig::new(owner, config.attention_layout(2).expect("layout"), nz(512))
+            .expect("ratio-two owner with 128-wide keys");
+        let keys = IndexKeyLayout::new(nz(1), nz(512), nz(128), nz(32), 1e-20).expect("key layout");
+        LayerThreeConfig::new(
+            keys,
+            nz(5120),
+            nz(128),
+            config.attention_layout(20).expect("layout"),
+            nz(128),
+            nz(512),
+        )
+        .expect("ratio-one owner with 128-wide keys");
+        LayerFourConfig::new(query, config.attention_layout(24).expect("layout"), nz(512))
+            .expect("ratio-one indexer");
+    }
+
     /// HOOK(startup-head): pins today's blockers so lifting either cap fails here.
     #[test]
     fn real_vocabulary_exceeds_the_startup_and_head_caps() {
@@ -1174,14 +1470,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires .agents/receipts/route-trace weights, metadata and capture-parity3 (about 0.6 GB of layers 0-2)"]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one teacher-forced walk keeps every compared stage visible"
-    )]
+    #[ignore = "requires .agents/receipts/route-trace weights, metadata and capture-parity3 (about 8 GB of non-expert layers)"]
     fn teacher_forced_layers_match_the_source_capture() {
-        // Layers 0 and 1 run; layer 2 is loaded to pin the ratio-two owner blocker.
-        const DRIVEN: usize = 2;
         const TOKENS: usize = 3;
         const REVISION: &str = "dba1be0a40aa45a94ad051997016db3960a90277";
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts");
@@ -1190,6 +1480,8 @@ mod tests {
             &std::fs::read_to_string(trace.join("inference-config.json")).expect("config"),
         )
         .expect("pinned inference config");
+        let layers = std::env::var("METALLIX_V41_TEACHER_LAYERS")
+            .map_or(config.layers(), |value| value.parse().expect("layer count"));
         let mut cache = V41RangeCache::load(
             V41LocalWeightsSource::new(trace.join("weights"), REVISION),
             &root.join(
@@ -1203,145 +1495,68 @@ mod tests {
         let weights = V41CheckpointWeights::load(
             &mut cache,
             &config,
-            0..DRIVEN + 1,
+            0..layers,
             NonZeroUsize::new(128).expect("nonzero"),
         )
-        .expect("layers 0-2");
+        .expect("non-expert layers");
+
+        // HOOK(engram-cap): `EngramSessionConfig::new` caps the WKV weight at
+        // 2^20 elements; the real one is 25600 x 6144.
+        if layers > 1 {
+            let inputs = crate::engram::inputs::EngramHashInputs::parse(
+                &std::fs::read(root.join("engram-hash/v41-engram-inputs.bin"))
+                    .expect("Engram inputs"),
+                &crate::engram::inputs::V41_ENGRAM_INPUTS_IDENTITY,
+            )
+            .expect("pinned Engram inputs");
+            let blocker = weights.engram_parts(0, &inputs).expect_err("still blocked");
+            assert!(blocker.to_string().contains("WKV weight"), "{blocker}");
+        }
+
         let cache = Mutex::new(cache);
-        let (width, copies) = (config.dim, config.hc_mult);
-        let pairs = config.rope_head_dim / 2;
-        let window = &weights.window_frequencies[..TOKENS * pairs];
-        let compressed = &weights.compressed_frequencies[..TOKENS * pairs];
         let capture = trace.join("capture-parity3");
         let read = |layer: usize, kind: &str, ty: &str| {
             std::fs::read(capture.join(format!("layer{layer:02}.{kind}.torch.{ty}.bin")))
                 .expect("captured tensor")
         };
-        let mut owner: Option<LayerOneStepOutput> = None;
-        for layer in 0..DRIVEN {
+        let mut state = V41TeacherState::default();
+        for layer in 0..layers {
             let residual = le_u16(&read(layer, "in", "bfloat16"));
             let pre: Vec<f32> = read(layer, "premix_in", "float32")
                 .chunks_exact(4)
                 .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
                 .collect();
-            let input = weights.attention_input(layer).expect("attention input");
-            let mut normalized = Vec::new();
-            for (row, pre) in residual
-                .chunks_exact(copies * width)
-                .zip(pre.chunks_exact(copies))
-            {
-                normalized
-                    .extend_from_slice(input.forward(row, pre).expect("input").normalized_bf16());
-            }
-            let attention_weights = weights.attention_weights(layer).expect("attention weights");
-            let layout = config.attention_layout(layer).expect("layout");
-            let attended = match config.role(layer).expect("role") {
-                V41LayerRole::Startup | V41LayerRole::WindowOnly => {
-                    LayerAttentionState::new(layout)
-                        .forward_window_only(&normalized, 0, window, attention_weights)
-                        .expect("window attention")
-                        .final_output
-                }
-                V41LayerRole::RatioTwoOwner => {
-                    let mut session = LayerOneSession::new(
-                        weights.ratio_two_config(layer).expect("owner config"),
-                        weights
-                            .bf16(&format!("layers.{layer}.attn.compressor.norm.weight"))
-                            .expect("compressor norm"),
-                    )
-                    .expect("owner session");
-                    let output = session
-                        .step(LayerOneCall::new(
-                            &normalized,
-                            NonZeroUsize::new(TOKENS).expect("nonzero"),
-                            &weights.compressed_frequencies,
-                            weights.ratio_two_weights(layer).expect("owner weights"),
-                            weights.query_weights(layer).expect("query weights"),
-                            config.query_layout().expect("query layout"),
-                            attention_weights,
-                            None,
-                        ))
-                        .expect("ratio-two owner");
-                    let attended = output.attention().final_output.clone();
-                    owner = Some(output);
-                    attended
-                }
-                V41LayerRole::RatioTwoConsumer { .. } => {
-                    let owner = owner.as_ref().expect("owner precedes consumer");
-                    let publication = owner.publication();
-                    LayerAttentionState::new(layout)
-                        .forward(
-                            &normalized,
-                            0,
-                            compressed,
-                            attention_weights,
-                            CompressedAttentionPublication {
-                                source_layer: publication.source_layer(),
-                                epoch: publication.epoch(),
-                                call_id: publication.call_id(),
-                                numerical_bf16: owner.kv_prefix(),
-                                indices: owner.selected_indices(),
-                            },
-                        )
-                        .expect("ratio-two consumer")
-                        .final_output
-                }
-                role => panic!("layer {layer}: {role:?} is not driven by this test yet"),
-            };
-            let attn_in = agreement(&normalized, &le_u16(&read(layer, "attn_in", "bfloat16")));
-            let attn_out = agreement(&attended, &le_u16(&read(layer, "attn_out", "bfloat16")));
+            assert_eq!(residual.len(), TOKENS * config.hc_mult * config.dim);
+            let experts =
+                V41CachedRoutedExperts::new(&cache, layer, config.dim, config.moe_inter_dim);
+            let layer_trace = weights
+                .teacher_forced_layer(layer, &residual, &pre, &mut state, &experts)
+                .unwrap_or_else(|error| panic!("layer {layer}: {error}"));
+            let attn_in = agreement(
+                &layer_trace.attention_input,
+                &le_u16(&read(layer, "attn_in", "bfloat16")),
+            );
+            let attn_out = agreement(
+                &layer_trace.attention_output,
+                &le_u16(&read(layer, "attn_out", "bfloat16")),
+            );
             eprintln!("layer {layer:02} attn_in {attn_in:?} attn_out {attn_out:?}");
             assert_eq!(
                 attn_in.0, 0,
                 "layer {layer}: attention input must match exactly"
             );
-
-            let tail = weights.tail(layer).expect("tail");
-            let experts = V41CachedRoutedExperts::new(&cache, layer, width, config.moe_inter_dim);
-            let (mut ffn_in, mut ffn_out, mut out) = (Vec::new(), Vec::new(), Vec::new());
-            let mut unavailable = None;
-            for (row, attended) in residual
-                .chunks_exact(copies * width)
-                .zip(attended.chunks_exact(width))
-            {
-                match tail.forward_token_with(row, attended, &experts) {
-                    Ok(diagnostic) => {
-                        ffn_in.extend_from_slice(diagnostic.ffn().normalized_bf16());
-                        ffn_out.extend_from_slice(diagnostic.ffn().moe().output_bf16());
-                        out.extend_from_slice(diagnostic.ffn().output_bf16());
-                    }
-                    Err(error) => {
-                        unavailable = Some(error.to_string());
-                        break;
-                    }
-                }
-            }
-            match unavailable {
-                Some(reason) => eprintln!("layer {layer:02} tail not run: {reason}"),
-                None => eprintln!(
+            match &layer_trace.tail {
+                Err(reason) => eprintln!("layer {layer:02} tail not run: {reason}"),
+                Ok(tail) => eprintln!(
                     "layer {layer:02} ffn_in {:?} ffn_out {:?} out {:?}",
-                    agreement(&ffn_in, &le_u16(&read(layer, "ffn_in", "bfloat16"))),
-                    agreement(&ffn_out, &le_u16(&read(layer, "ffn_out", "bfloat16"))),
-                    agreement(&out, &le_u16(&read(layer, "out", "bfloat16"))),
+                    agreement(&tail.ffn_input, &le_u16(&read(layer, "ffn_in", "bfloat16"))),
+                    agreement(
+                        &tail.ffn_output,
+                        &le_u16(&read(layer, "ffn_out", "bfloat16"))
+                    ),
+                    agreement(&tail.output, &le_u16(&read(layer, "out", "bfloat16"))),
                 ),
             }
         }
-        // HOOK(engram-cap): `EngramSessionConfig::new` caps the WKV weight at
-        // 2^20 elements; the real one is 25600 x 6144.
-        let inputs = crate::engram::inputs::EngramHashInputs::parse(
-            &std::fs::read(root.join("engram-hash/v41-engram-inputs.bin")).expect("Engram inputs"),
-            &crate::engram::inputs::V41_ENGRAM_INPUTS_IDENTITY,
-        )
-        .expect("pinned Engram inputs");
-        let blocker = weights.engram_parts(0, &inputs).expect_err("still blocked");
-        assert!(blocker.to_string().contains("WKV weight"), "{blocker}");
-        // HOOK(key-dimension): `LayerOneConfig::new` requires the index key width
-        // (128) to equal the attention head width (512); V4.1 has them differ.
-        // When this is lifted, extend `DRIVEN` past the ratio-two owner.
-        let blocker = weights.ratio_two_config(DRIVEN).expect_err("still blocked");
-        assert!(
-            blocker.to_string().contains("key dimension 128"),
-            "{blocker}"
-        );
     }
 }

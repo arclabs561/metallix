@@ -252,13 +252,11 @@ impl LayerFourSession {
                 expected: expected_input,
             });
         }
-        let keys = IndexKeyView::new(
-            call.publication.keys,
-            self.config.attention_layout.head_dimension(),
-        )?;
+        // Index keys are `index_head_dim` wide, independent of the attention head width.
+        let key_width = self.config.query_layout.key_dimension();
+        let keys = IndexKeyView::new(call.publication.keys, key_width)?;
         let (_, candidate_keys) = selection_call.score_shape();
-        let key_count =
-            call.publication.keys.len() / self.config.attention_layout.head_dimension().get();
+        let key_count = call.publication.keys.len() / key_width.get();
         if candidate_keys != key_count {
             return Err(LayerFourSessionError::CandidateKeyCount {
                 actual: candidate_keys,

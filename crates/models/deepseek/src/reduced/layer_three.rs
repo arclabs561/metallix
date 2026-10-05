@@ -95,12 +95,6 @@ impl LayerThreeConfig {
                 attention: attention_layout.head_dimension().get(),
             });
         }
-        if owner_key_layout.key_dimension() != attention_layout.head_dimension() {
-            return Err(LayerThreeSessionError::KeyDimensionMismatch {
-                owner: owner_key_layout.key_dimension().get(),
-                attention: attention_layout.head_dimension().get(),
-            });
-        }
         if owner_key_layout.rope_pairs() != attention_layout.rope_pairs() {
             return Err(LayerThreeSessionError::RopePairMismatch {
                 owner: owner_key_layout.rope_pairs().get(),
@@ -430,10 +424,6 @@ pub enum LayerThreeSessionError {
         "layer-three owner latent dimension {owner} differs from attention head dimension {attention}"
     )]
     LatentDimensionMismatch { owner: usize, attention: usize },
-    #[error(
-        "layer-three owner key dimension {owner} differs from attention head dimension {attention}"
-    )]
-    KeyDimensionMismatch { owner: usize, attention: usize },
     #[error("layer-three owner rope pairs {owner} differs from attention rope pairs {attention}")]
     RopePairMismatch { owner: usize, attention: usize },
     #[error("layer-three session source layer {actual} differs from its attention layout")]

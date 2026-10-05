@@ -169,6 +169,11 @@ impl CandidateQueryLayout {
         (self.index.batches.get(), self.index.hidden_dimension.get())
     }
 
+    /// Width of one index key, the index-query head dimension.
+    pub(crate) const fn key_dimension(self) -> NonZeroUsize {
+        self.index.head_dimension
+    }
+
     /// Validates the shared QR geometry and the supplied index-query geometry.
     pub fn new(
         index: IndexQueryLayout,
