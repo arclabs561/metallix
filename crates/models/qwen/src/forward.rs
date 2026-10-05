@@ -1072,8 +1072,6 @@ fn forward_cached_layer_with_capacity<S: BuildHasher>(
     resident_cache_capacity: Option<usize>,
 ) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
-    let hidden = as_i32(config.hidden_size)?;
-    let intermediate = as_i32(config.intermediate_size)?;
     let base = format!("model.layers.{layer}");
     let attention_input = rms_norm(
         hidden_states,
@@ -1091,8 +1089,23 @@ fn forward_cached_layer_with_capacity<S: BuildHasher>(
         resident_cache_capacity,
     )?;
     let residual = hidden_states.add_device(&attention, &stream)?;
+    mlp_residual(config, weights, &base, &residual, seq_len)
+}
+
+/// The post-attention half of a single-sequence decoder layer: RMS norm,
+/// `SiLU`-gated MLP, and the residual add, on `[1, seq_len, hidden]`.
+fn mlp_residual<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    base: &str,
+    residual: &Array,
+    seq_len: i32,
+) -> Result<Array, Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let hidden = as_i32(config.hidden_size)?;
+    let intermediate = as_i32(config.intermediate_size)?;
     let mlp_input = rms_norm(
-        &residual,
+        residual,
         weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
         config.rms_norm_eps,
     )?;
@@ -1130,39 +1143,8 @@ fn cached_attention<S: BuildHasher>(
     resident_cache_capacity: Option<usize>,
 ) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
-    let heads = as_i32(config.attention_heads)?;
-    let kv_heads = as_i32(config.key_value_heads)?;
-    let head_dim = as_i32(config.head_dim)?;
     let attn = format!("{base}.self_attn");
-    let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, heads, head_dim], &stream)?;
-    let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
-    let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
-    let query = fast::rope_device(
-        &qk_norm(config, weights, &attn, "q_norm", query)?
-            .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
-        head_dim,
-        false,
-        Some(config.rope_theta),
-        1.0,
-        rope_offset,
-        Option::<&Array>::None,
-        &stream,
-    )?;
-    let key = fast::rope_device(
-        &qk_norm(config, weights, &attn, "k_norm", key)?
-            .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
-        head_dim,
-        false,
-        Some(config.rope_theta),
-        1.0,
-        rope_offset,
-        Option::<&Array>::None,
-        &stream,
-    )?;
-    let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
+    let (query, key, value) = rotated_qkv(config, weights, &attn, input, seq_len, rope_offset)?;
     let (keys, values, attention_keys, attention_values, causal) = match resident_cache_capacity {
         Some(maximum_capacity) => {
             stepped_cached_kv(cache, &key, &value, rope_offset, maximum_capacity, &stream)?
@@ -1214,6 +1196,68 @@ fn cached_attention<S: BuildHasher>(
         &stream,
     )?;
     *cache = Some(Qwen3LayerKv { keys, values });
+    attention_output(config, weights, &attn, &output, seq_len)
+}
+
+/// Projects one sequence's `[1, seq_len, hidden]` attention input to query,
+/// key and value, each `[1, heads, seq_len, head_dim]`, with Qwen3's Q/K norms
+/// and `RoPE` from absolute position `rope_offset` applied.
+fn rotated_qkv<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    attn: &str,
+    input: &Array,
+    seq_len: i32,
+    rope_offset: i32,
+) -> Result<(Array, Array, Array), Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let heads = as_i32(config.attention_heads)?;
+    let kv_heads = as_i32(config.key_value_heads)?;
+    let head_dim = as_i32(config.head_dim)?;
+    let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
+        .reshape_device(&[1, seq_len, heads, head_dim], &stream)?;
+    let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
+        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
+    let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
+        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
+    let query = fast::rope_device(
+        &qk_norm(config, weights, attn, "q_norm", query)?
+            .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
+        head_dim,
+        false,
+        Some(config.rope_theta),
+        1.0,
+        rope_offset,
+        Option::<&Array>::None,
+        &stream,
+    )?;
+    let key = fast::rope_device(
+        &qk_norm(config, weights, attn, "k_norm", key)?
+            .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
+        head_dim,
+        false,
+        Some(config.rope_theta),
+        1.0,
+        rope_offset,
+        Option::<&Array>::None,
+        &stream,
+    )?;
+    let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
+    Ok((query, key, value))
+}
+
+/// Merges `[1, heads, seq_len, head_dim]` attention output back to
+/// `[1, seq_len, heads * head_dim]` and applies the output projection.
+fn attention_output<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    attn: &str,
+    output: &Array,
+    seq_len: i32,
+) -> Result<Array, Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let heads = as_i32(config.attention_heads)?;
+    let head_dim = as_i32(config.head_dim)?;
     let output = output
         .transpose_axes_device(&[0, 2, 1, 3], &stream)?
         .reshape_device(
