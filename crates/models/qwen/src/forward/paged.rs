@@ -25,9 +25,9 @@ use mlx_rs::{
 };
 
 use super::{
-    Qwen3ForwardConfig, Qwen3ForwardError, as_i32, attention_output, attention_scale,
-    chunk_causal_mask, linear, mlp_residual, read_last_logits, rms_norm, rotated_qkv,
-    validate_input_ids, weight,
+    Qwen3ForwardConfig, Qwen3ForwardError, RopePositions, as_i32, attention_output,
+    attention_scale, chunk_causal_mask, linear, mlp_residual, read_last_logits, rms_norm,
+    rotated_qkv, validate_input_ids, weight,
 };
 use crate::Qwen3Attention;
 
@@ -43,6 +43,25 @@ pub struct PagedQwen3Session<'a, S: BuildHasher> {
     blocks: BlockManager,
     pool: KvPool,
     keys: HashKeys,
+}
+
+/// What [`PagedQwen3Session::decode_batch`] reads back per row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchReadback {
+    /// Each row's full logits.
+    Logits,
+    /// Each row's greedy token, chosen on the GPU (`argmax`, lowest index on
+    /// ties); only one ID per row crosses to the host.
+    Greedy,
+}
+
+/// The per-row result of [`PagedQwen3Session::decode_batch`], in row order.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BatchDecoded {
+    /// `vocab_size` logits per row.
+    Logits(Vec<Vec<f32>>),
+    /// One token ID per row.
+    Greedy(Vec<i32>),
 }
 
 /// The device side of the pool: per layer, one K and one V array per slab.
@@ -109,17 +128,38 @@ fn write_runs(slots: &[Slot]) -> Result<Vec<WriteRun>, Qwen3ForwardError> {
     Ok(runs)
 }
 
-/// The blocks one sequence reads, grouped into runs that share a slab so
-/// each run is one `take`.
+/// One decode slot per batch row, from [`PagedQwen3Session::decode_batch`].
+struct RowSlots {
+    /// Write runs; chunk row `r` is batch row `r`.
+    runs: Vec<WriteRun>,
+    /// Each row's `RoPE` position.
+    positions: Vec<i32>,
+    /// Each row's length after the step.
+    lengths: Vec<usize>,
+}
+
+/// The blocks a batch of sequences reads. Each row's table is padded to the
+/// longest with its own first block (masked out by attention), then the
+/// flattened list is grouped into runs that share a slab so each run is one
+/// `take`.
 struct GatherPlan {
     runs: Vec<(usize, Array)>,
-    blocks: i32,
+    rows: i32,
+    blocks_per_row: i32,
     tokens: i32,
 }
 
 impl GatherPlan {
-    fn new(table: &[BlockId], tokens: usize) -> Result<Self, Qwen3ForwardError> {
-        let runs = table
+    /// `tokens` is the longest row's length; shorter rows need a mask.
+    fn new(tables: &[&[BlockId]], tokens: usize) -> Result<Self, Qwen3ForwardError> {
+        let blocks_per_row = tables.iter().map(|table| table.len()).max().unwrap_or(0);
+        let mut flat = Vec::with_capacity(tables.len() * blocks_per_row);
+        for table in tables {
+            let pad = *table.first().ok_or(Qwen3ForwardError::CacheInconsistent)?;
+            flat.extend_from_slice(table);
+            flat.extend(std::iter::repeat_n(pad, blocks_per_row - table.len()));
+        }
+        let runs = flat
             .chunk_by(|left, right| left.slab() == right.slab())
             .map(|run| {
                 let rows = run
@@ -135,7 +175,8 @@ impl GatherPlan {
             .collect::<Result<Vec<_>, Qwen3ForwardError>>()?;
         Ok(Self {
             runs,
-            blocks: as_i32(table.len())?,
+            rows: as_i32(tables.len())?,
+            blocks_per_row: as_i32(blocks_per_row)?,
             tokens: as_i32(tokens)?,
         })
     }
@@ -258,7 +299,7 @@ impl KvPool {
         Ok(())
     }
 
-    /// Gathers one sequence's keys and values as `[1, kv_heads, tokens,
+    /// Gathers each row's keys and values as `[rows, kv_heads, tokens,
     /// head_dim]`.
     fn gather(&self, layer: usize, plan: &GatherPlan) -> Result<(Array, Array), Qwen3ForwardError> {
         let stream = StreamOrDevice::gpu();
@@ -272,7 +313,7 @@ impl KvPool {
                 .iter()
                 .map(|(slab, rows)| arrays[*slab].take_axis_device(rows, 0, &stream))
                 .collect::<Result<Vec<_>, _>>()?;
-            // [blocks, kv_heads, block_tokens, head_dim]
+            // [rows * blocks_per_row, kv_heads, block_tokens, head_dim]
             let blocks = if parts.len() == 1 {
                 parts.pop().ok_or(Qwen3ForwardError::CacheInconsistent)?
             } else {
@@ -281,12 +322,22 @@ impl KvPool {
             let shape = blocks.shape();
             let (kv_heads, head_dim) = (shape[1], shape[3]);
             let tokens = plan
-                .blocks
+                .blocks_per_row
                 .checked_mul(self.block_tokens)
                 .ok_or(Qwen3ForwardError::ShapeOverflow)?;
             Ok(blocks
-                .transpose_axes_device(&[1, 0, 2, 3], &stream)?
-                .reshape_device(&[1, kv_heads, tokens, head_dim], &stream)?
+                .reshape_device(
+                    &[
+                        plan.rows,
+                        plan.blocks_per_row,
+                        kv_heads,
+                        self.block_tokens,
+                        head_dim,
+                    ],
+                    &stream,
+                )?
+                .transpose_axes_device(&[0, 2, 1, 3, 4], &stream)?
+                .reshape_device(&[plan.rows, kv_heads, tokens, head_dim], &stream)?
                 .index_device((.., .., 0..plan.tokens, ..), &stream))
         };
         Ok((gather(&slabs.keys)?, gather(&slabs.values)?))
@@ -424,6 +475,177 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         Ok(self.blocks.free(seq)?)
     }
 
+    /// Appends one token to each of several prefilled sequences in one
+    /// forward and reads back each row's logits or greedy token.
+    ///
+    /// Non-attention ops run on the packed `[1, rows, hidden]` batch, so the
+    /// weights stream once per step. Attention gathers each row's blocks,
+    /// applies `RoPE` at each row's own position, and masks positions past
+    /// each row's length when the lengths differ. Rows run different kernels
+    /// than a single decode (matrix-matrix instead of matrix-vector), so
+    /// logits match [`Self::decode_last_logits`] to rounding, not bit for
+    /// bit, except for a one-row batch.
+    ///
+    /// The block check is all or nothing: when the pool cannot take every
+    /// row, nothing changes and [`Qwen3ForwardError::KvBlocks`] is returned.
+    /// The check counts a copy for each row whose tail is shared, so two forks
+    /// of one parent may be refused one block early. Any later failure frees
+    /// every row's sequence.
+    pub fn decode_batch(
+        &mut self,
+        rows: &[(SequenceId, i32)],
+        readback: BatchReadback,
+    ) -> Result<BatchDecoded, Qwen3ForwardError> {
+        if rows.is_empty() {
+            return Err(Qwen3ForwardError::EmptyInput);
+        }
+        let mut needed = 0;
+        for (index, &(seq, token)) in rows.iter().enumerate() {
+            if rows[..index].iter().any(|(earlier, _)| *earlier == seq) {
+                return Err(Qwen3ForwardError::RepeatedBatchSequence(seq.0));
+            }
+            let cached = self.blocks.num_computed(seq)?;
+            if cached == 0 {
+                return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+            }
+            validate_input_ids(
+                self.config,
+                &[token],
+                cached,
+                self.config.max_position_embeddings,
+            )?;
+            needed += self.blocks.append_cost(seq, 1)?;
+        }
+        let free = self.blocks.free_blocks();
+        if needed > free {
+            return Err(engine::blocks::BlockError::OutOfBlocks { needed, free }.into());
+        }
+        let result = self.batch_step(rows, readback).and_then(|decoded| {
+            for &(seq, _) in rows {
+                self.blocks.commit(seq)?;
+            }
+            Ok(decoded)
+        });
+        if result.is_err() {
+            for &(seq, _) in rows {
+                let _ = self.blocks.free(seq);
+            }
+        }
+        result
+    }
+
+    /// Reserves one slot per row and performs any copy-on-write.
+    fn allocate_rows(&mut self, rows: &[(SequenceId, i32)]) -> Result<RowSlots, Qwen3ForwardError> {
+        let mut runs = Vec::with_capacity(rows.len());
+        let mut positions = Vec::with_capacity(rows.len());
+        let mut lengths = Vec::with_capacity(rows.len());
+        for (index, &(seq, token)) in rows.iter().enumerate() {
+            let allocation = self.blocks.allocate(seq, &token_ids(&[token]))?;
+            if let Some(copy) = allocation.copy {
+                self.pool.copy_block(copy)?;
+            }
+            let slot = self
+                .blocks
+                .slots(seq, allocation.positions)?
+                .next()
+                .ok_or(Qwen3ForwardError::CacheInconsistent)?;
+            runs.push(WriteRun {
+                start: SlabCoordinate::of(slot.block, slot.offset)?,
+                chunk_start: as_i32(index)?,
+                len: 1,
+            });
+            positions.push(rope_offset(allocation.positions.start())?);
+            lengths.push(allocation.positions.end().get());
+        }
+        Ok(RowSlots {
+            runs,
+            positions,
+            lengths,
+        })
+    }
+
+    fn batch_step(
+        &mut self,
+        rows: &[(SequenceId, i32)],
+        readback: BatchReadback,
+    ) -> Result<BatchDecoded, Qwen3ForwardError> {
+        let stream = StreamOrDevice::gpu();
+        let batch = as_i32(rows.len())?;
+        let RowSlots {
+            runs,
+            positions,
+            lengths,
+        } = self.allocate_rows(rows)?;
+        let tables = rows
+            .iter()
+            .map(|&(seq, _)| self.blocks.block_table(seq))
+            .collect::<Result<Vec<_>, _>>()?;
+        let longest = lengths.iter().copied().max().unwrap_or(0);
+        let plan = GatherPlan::new(&tables, longest)?;
+        let mask = length_mask(&lengths, longest)?;
+        let offsets = Array::from_slice(&positions, &[batch]);
+
+        let hidden = as_i32(self.config.hidden_size)?;
+        let ids = Array::from_slice(
+            &rows.iter().map(|&(_, token)| token).collect::<Vec<_>>(),
+            &[batch],
+        );
+        let mut hidden_states = weight(self.weights, "model.embed_tokens.weight")?
+            .take_axis_device(&ids, 0, &stream)?
+            .reshape_device(&[1, batch, hidden], &stream)?;
+        for layer in 0..self.config.hidden_layers {
+            let base = format!("model.layers.{layer}");
+            let attn = format!("{base}.self_attn");
+            let attention_input = rms_norm(
+                &hidden_states,
+                weight(self.weights, &format!("{base}.input_layernorm.weight"))?,
+                self.config.rms_norm_eps,
+            )?;
+            // [rows, heads, 1, head_dim]
+            let (query, key, value) = rotated_qkv(
+                self.config,
+                self.weights,
+                &attn,
+                &attention_input,
+                batch,
+                1,
+                RopePositions::PerRow(&offsets),
+            )?;
+            // Row r's new K/V is chunk row r of a [1, kv_heads, rows, head_dim]
+            // view.
+            let key = key.transpose_axes_device(&[2, 1, 0, 3], &stream)?;
+            let value = value.transpose_axes_device(&[2, 1, 0, 3], &stream)?;
+            self.pool.write(layer, &key, &value, &runs)?;
+            let (keys, values) = self.pool.gather(layer, &plan)?;
+            let output = fast::scaled_dot_product_attention_device(
+                &query,
+                &keys,
+                &values,
+                attention_scale(self.config)?,
+                mask.as_ref()
+                    .map(fast::ScaledDotProductAttentionMask::Array),
+                Option::<&Array>::None,
+                &stream,
+            )?;
+            let attention = attention_output(self.config, self.weights, &attn, &output, batch)?;
+            let residual = hidden_states.add_device(&attention, &stream)?;
+            hidden_states = mlp_residual(self.config, self.weights, &base, &residual, batch)?;
+        }
+
+        let normalized = rms_norm(
+            &hidden_states,
+            weight(self.weights, "model.norm.weight")?,
+            self.config.rms_norm_eps,
+        )?;
+        let vocab = as_i32(self.config.vocab_size)?;
+        let logits = linear(
+            &normalized,
+            weight(self.weights, self.config.output_weight_name())?,
+        )?
+        .reshape_device(&[batch, vocab], &stream)?;
+        read_rows(&logits, self.config.vocab_size, readback)
+    }
+
     /// Runs the forward for tokens already given slots, then commits them.
     /// Any failure after the slots were assigned frees `seq`: its blocks may
     /// hold partially written K/V.
@@ -459,7 +681,7 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         let stream = StreamOrDevice::gpu();
         let slots = self.blocks.slots(seq, positions)?.collect::<Vec<_>>();
         let runs = write_runs(&slots)?;
-        let plan = GatherPlan::new(self.blocks.block_table(seq)?, positions.end().get())?;
+        let plan = GatherPlan::new(&[self.blocks.block_table(seq)?], positions.end().get())?;
         if let Some(copy) = copy {
             self.pool.copy_block(copy)?;
         }
@@ -502,8 +724,9 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
                 self.weights,
                 &attn,
                 &attention_input,
+                1,
                 seq_len,
-                start,
+                RopePositions::Shared(start),
             )?;
             self.pool.write(layer, &key, &value, &runs)?;
             let (keys, values) = self.pool.gather(layer, &plan)?;
@@ -540,6 +763,54 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     pub(super) fn slab(&self, layer: usize, slab: usize) -> (&Array, &Array) {
         let layer = &self.pool.layers[layer];
         (&layer.keys[slab], &layer.values[slab])
+    }
+}
+
+/// `[rows, 1, 1, longest]` mask of each row's valid keys, or `None` when
+/// every row has the longest length and every gathered key is valid.
+fn length_mask(lengths: &[usize], longest: usize) -> Result<Option<Array>, Qwen3ForwardError> {
+    if lengths.iter().all(|&length| length == longest) {
+        return Ok(None);
+    }
+    let stream = StreamOrDevice::gpu();
+    let rows = as_i32(lengths.len())?;
+    let lengths = lengths
+        .iter()
+        .map(|&length| as_i32(length))
+        .collect::<Result<Vec<_>, _>>()?;
+    let keys = Array::arange_device::<i32, i32>(0, as_i32(longest)?, None, &stream)?
+        .reshape_device(&[1, 1, 1, as_i32(longest)?], &stream)?;
+    Ok(Some(keys.lt_device(
+        Array::from_slice(&lengths, &[rows, 1, 1, 1]),
+        &stream,
+    )?))
+}
+
+/// Evaluates `[rows, vocab]` logits and reads back what `readback` asks for.
+fn read_rows(
+    logits: &Array,
+    vocab_size: usize,
+    readback: BatchReadback,
+) -> Result<BatchDecoded, Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    match readback {
+        BatchReadback::Logits => {
+            let logits = logits.as_type_device::<f32>(&stream)?;
+            logits.eval()?;
+            Ok(BatchDecoded::Logits(
+                logits
+                    .as_slice::<f32>()
+                    .chunks_exact(vocab_size)
+                    .map(<[f32]>::to_vec)
+                    .collect(),
+            ))
+        }
+        BatchReadback::Greedy => {
+            let tokens = ops::indexing::argmax_axis_device(logits, 1, false, &stream)?
+                .as_type_device::<i32>(&stream)?;
+            tokens.eval()?;
+            Ok(BatchDecoded::Greedy(tokens.as_slice::<i32>().to_vec()))
+        }
     }
 }
 

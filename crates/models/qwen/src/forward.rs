@@ -31,7 +31,7 @@ use crate::{DecoderFamily, Qwen3Attention};
 mod paged;
 mod snapshot;
 
-pub use paged::PagedQwen3Session;
+pub use paged::{BatchDecoded, BatchReadback, PagedQwen3Session};
 pub use snapshot::Qwen3KvSnapshot;
 
 /// The largest prompt accepted by the uncached qualification forward path.
@@ -1146,7 +1146,15 @@ fn cached_attention<S: BuildHasher>(
 ) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
     let attn = format!("{base}.self_attn");
-    let (query, key, value) = rotated_qkv(config, weights, &attn, input, seq_len, rope_offset)?;
+    let (query, key, value) = rotated_qkv(
+        config,
+        weights,
+        &attn,
+        input,
+        1,
+        seq_len,
+        RopePositions::Shared(rope_offset),
+    )?;
     let (keys, values, attention_keys, attention_values, causal) = match resident_cache_capacity {
         Some(maximum_capacity) => {
             stepped_cached_kv(cache, &key, &value, rope_offset, maximum_capacity, &stream)?
@@ -1201,55 +1209,82 @@ fn cached_attention<S: BuildHasher>(
     attention_output(config, weights, &attn, &output, seq_len)
 }
 
-/// Projects one sequence's `[1, seq_len, hidden]` attention input to query,
-/// key and value, each `[1, heads, seq_len, head_dim]`, with Qwen3's Q/K norms
-/// and `RoPE` from absolute position `rope_offset` applied.
+/// Where `RoPE` starts for the rows of a [`rotated_qkv`] call.
+#[derive(Clone, Copy)]
+enum RopePositions<'a> {
+    /// Every row starts at this absolute position.
+    Shared(i32),
+    /// One int32 start per row, shape `[rows]`.
+    PerRow(&'a Array),
+}
+
+/// Projects attention input to query, key and value, each `[rows, heads,
+/// seq_len, head_dim]`, with Qwen3's Q/K norms and `RoPE` applied.
+///
+/// The input is `[1, rows * seq_len, hidden]` (one sequence when `rows` is
+/// one, or one token per decode row when `seq_len` is one).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row layout and RoPE positions stay explicit at this boundary"
+)]
 fn rotated_qkv<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
     attn: &str,
     input: &Array,
+    rows: i32,
     seq_len: i32,
-    rope_offset: i32,
+    positions: RopePositions<'_>,
 ) -> Result<(Array, Array, Array), Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
     let heads = as_i32(config.attention_heads)?;
     let kv_heads = as_i32(config.key_value_heads)?;
     let head_dim = as_i32(config.head_dim)?;
     let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, heads, head_dim], &stream)?;
+        .reshape_device(&[rows, seq_len, heads, head_dim], &stream)?;
     let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
+        .reshape_device(&[rows, seq_len, kv_heads, head_dim], &stream)?;
     let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
-        .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
-    let query = fast::rope_device(
-        &qk_norm(config, weights, attn, "q_norm", query)?
+        .reshape_device(&[rows, seq_len, kv_heads, head_dim], &stream)?;
+    let rope = |projected: Array| -> Result<Array, Qwen3ForwardError> {
+        Ok(match positions {
+            RopePositions::Shared(offset) => fast::rope_device(
+                &projected,
+                head_dim,
+                false,
+                Some(config.rope_theta),
+                1.0,
+                offset,
+                Option::<&Array>::None,
+                &stream,
+            )?,
+            RopePositions::PerRow(offsets) => fast::rope_dynamic_device(
+                &projected,
+                head_dim,
+                false,
+                Some(config.rope_theta),
+                1.0,
+                offsets,
+                Option::<&Array>::None,
+                &stream,
+            )?,
+        })
+    };
+    let query = rope(
+        qk_norm(config, weights, attn, "q_norm", query)?
             .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
-        head_dim,
-        false,
-        Some(config.rope_theta),
-        1.0,
-        rope_offset,
-        Option::<&Array>::None,
-        &stream,
     )?;
-    let key = fast::rope_device(
-        &qk_norm(config, weights, attn, "k_norm", key)?
+    let key = rope(
+        qk_norm(config, weights, attn, "k_norm", key)?
             .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
-        head_dim,
-        false,
-        Some(config.rope_theta),
-        1.0,
-        rope_offset,
-        Option::<&Array>::None,
-        &stream,
     )?;
     let value = value.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
     Ok((query, key, value))
 }
 
-/// Merges `[1, heads, seq_len, head_dim]` attention output back to
-/// `[1, seq_len, heads * head_dim]` and applies the output projection.
+/// Merges `[rows, heads, len, head_dim]` attention output back to the packed
+/// `[1, rows * len, heads * head_dim]` layout and applies the output
+/// projection. `seq_len` is `rows * len`.
 fn attention_output<S: BuildHasher>(
     config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
@@ -1972,6 +2007,9 @@ pub enum Qwen3ForwardError {
     /// A dimension cannot be represented by MLX's i32 shape API.
     #[error("Qwen3 shape exceeds MLX's i32 dimension limit")]
     ShapeOverflow,
+    /// A batched decode named one sequence in two rows.
+    #[error("Qwen3 batched decode names sequence {0} more than once")]
+    RepeatedBatchSequence(u64),
     /// The paged KV pool could not be sized.
     #[error("Qwen3 paged KV pool: {0}")]
     KvPoolConfig(#[from] engine::blocks::BlockConfigError),
@@ -2504,6 +2542,7 @@ mod tests {
     mod cache_component_profile;
     mod capacity_cache_profile;
     mod decode_profile;
+    mod paged_batch;
     mod paged_kv;
     mod particle_replay;
     mod prefix_extend;

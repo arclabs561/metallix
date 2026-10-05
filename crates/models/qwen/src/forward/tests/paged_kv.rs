@@ -20,9 +20,9 @@ use engine::blocks::{BlockTokens, PoolConfig, SequenceId};
 use super::*;
 use crate::forward::PagedQwen3Session;
 
-const VOCAB: usize = 64;
+pub(super) const VOCAB: usize = 64;
 
-fn paged_config() -> Qwen3ForwardConfig {
+pub(super) fn paged_config() -> Qwen3ForwardConfig {
     Qwen3ForwardConfig::parse(
         r#"{
           "model_type":"qwen3",
@@ -46,7 +46,7 @@ fn paged_config() -> Qwen3ForwardConfig {
 }
 
 /// Signed pseudo-random weights from a fixed linear congruential stream.
-fn paged_weights(config: &Qwen3ForwardConfig) -> HashMap<String, Array> {
+pub(super) fn paged_weights(config: &Qwen3ForwardConfig) -> HashMap<String, Array> {
     let mut state = 0x2545_f491_u32;
     let mut values = |count: usize, scale: f32| -> Vec<f32> {
         (0..count)
@@ -127,13 +127,13 @@ fn paged_weights(config: &Qwen3ForwardConfig) -> HashMap<String, Array> {
     weights
 }
 
-fn prompt(len: usize, seed: usize) -> Vec<i32> {
+pub(super) fn prompt(len: usize, seed: usize) -> Vec<i32> {
     (0..len)
         .map(|index| i32::try_from((index * 37 + seed * 11 + 5) % VOCAB).expect("small"))
         .collect()
 }
 
-fn argmax(logits: &[f32]) -> i32 {
+pub(super) fn argmax(logits: &[f32]) -> i32 {
     let (index, _) = logits
         .iter()
         .enumerate()
@@ -153,7 +153,7 @@ fn assert_bits_equal(paged: &[f32], contiguous: &[f32], context: &str) {
     }
 }
 
-fn pool(slabs: u32) -> PoolConfig {
+pub(super) fn pool(slabs: u32) -> PoolConfig {
     PoolConfig::new(BlockTokens::DEFAULT, slabs)
         .expect("pool")
         .with_prefix_caching(false)
@@ -404,7 +404,7 @@ fn paged_writes_reuse_the_slab_buffer() {
     }
 }
 
-fn fixed_tokens(len: usize, seed: u64) -> Vec<i32> {
+pub(super) fn fixed_tokens(len: usize, seed: u64) -> Vec<i32> {
     let mut state = seed;
     (0..len)
         .map(|_| {
@@ -417,7 +417,7 @@ fn fixed_tokens(len: usize, seed: u64) -> Vec<i32> {
         .collect()
 }
 
-const MIB: u64 = 1024 * 1024;
+pub(super) const MIB: u64 = 1024 * 1024;
 
 type Weights = HashMap<String, Array>;
 
@@ -595,6 +595,6 @@ fn slab_addresses(
         .collect()
 }
 
-fn millis(duration: Duration) -> f64 {
+pub(super) fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
