@@ -171,12 +171,76 @@ where
         });
     }
 
-    let mut emitted = Vec::with_capacity(input.len());
+    accept_and_roll_back(target, base, draft, |index| {
+        let row = logits.row(index).ok_or(SpeculationError::LogitShape)?;
+        pick(row).map_err(SpeculationError::Pick)
+    })
+}
+
+/// A target that can also pick the greedy token after every scored position
+/// on the device, so a greedy verify reads back token IDs instead of
+/// vocabulary rows.
+pub trait GreedySpeculativeTarget: SpeculativeTarget {
+    /// Appends `tokens` and returns the greedy (lowest-ID tie) token after
+    /// every appended position: entry `i` follows `tokens[..=i]`.
+    fn verify_greedy(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Self::Error>;
+}
+
+/// [`speculative_step`] for greedy decoding on a target that picks on the
+/// device. `is_stop` marks tokens that end generation. The emitted tokens
+/// are the ones plain greedy decoding would produce, given the same rows.
+///
+/// # Errors
+///
+/// Returns the target's error, or [`SpeculationError::RowCount`] when the
+/// adapter returns a different number of picks than tokens sent.
+pub fn greedy_speculative_step<T>(
+    target: &mut T,
+    last_token: i32,
+    draft: &[i32],
+    is_stop: &mut dyn FnMut(i32) -> bool,
+) -> Result<StepOutcome, SpeculationError<T::Error>>
+where
+    T: GreedySpeculativeTarget + ?Sized,
+{
+    let base = target.cached_tokens();
+    let mut input = Vec::with_capacity(draft.len() + 1);
+    input.push(last_token);
+    input.extend_from_slice(draft);
+    let picks = target
+        .verify_greedy(&input)
+        .map_err(SpeculationError::Target)?;
+    if picks.len() != input.len() {
+        return Err(SpeculationError::RowCount {
+            expected: input.len(),
+            actual: picks.len(),
+        });
+    }
+    accept_and_roll_back(target, base, draft, |index| {
+        let token = picks[index];
+        Ok(Pick {
+            token,
+            stop: is_stop(token),
+        })
+    })
+}
+
+/// Picks row by row until a pick diverges from the draft, stops, or is the
+/// bonus row, then drops cache positions conditioned on rejected drafts.
+fn accept_and_roll_back<T, P>(
+    target: &mut T,
+    base: usize,
+    draft: &[i32],
+    mut pick_at: impl FnMut(usize) -> Result<Pick, SpeculationError<T::Error, P>>,
+) -> Result<StepOutcome, SpeculationError<T::Error, P>>
+where
+    T: SpeculativeTarget + ?Sized,
+{
+    let mut emitted = Vec::with_capacity(draft.len() + 1);
     let mut accepted = 0;
     let mut stopped = false;
-    for index in 0..input.len() {
-        let row = logits.row(index).ok_or(SpeculationError::LogitShape)?;
-        let picked = pick(row).map_err(SpeculationError::Pick)?;
+    for index in 0..=draft.len() {
+        let picked = pick_at(index)?;
         emitted.push(picked.token);
         let matches_draft = draft.get(index) == Some(&picked.token);
         if matches_draft {

@@ -1,9 +1,9 @@
 use std::convert::Infallible;
 
 use super::{
-    ConfigError, DraftLength, Pick, PositionLogits, PromptLookup, SpeculationError,
-    SpeculationRequest, SpeculationStats, SpeculativeTarget, StepOutcome, Verdict, VerifyCost,
-    accept_or_resample, speculative_step,
+    ConfigError, DraftLength, GreedySpeculativeTarget, Pick, PositionLogits, PromptLookup,
+    SpeculationError, SpeculationRequest, SpeculationStats, SpeculativeTarget, StepOutcome,
+    Verdict, VerifyCost, accept_or_resample, greedy_speculative_step, speculative_step,
 };
 use crate::sampling::sample_categorical;
 
@@ -68,6 +68,57 @@ impl SpeculativeTarget for ToyModel {
         self.cache.truncate(tokens);
         Ok(())
     }
+}
+
+impl GreedySpeculativeTarget for ToyModel {
+    fn verify_greedy(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Infallible> {
+        let rows = self.verify(tokens)?;
+        Ok((0..rows.positions())
+            .map(|index| greedy(rows.row(index).expect("row")))
+            .collect())
+    }
+}
+
+#[test]
+fn device_greedy_step_reproduces_plain_greedy_and_stops() {
+    let expected = decode_plain(40, &mut greedy);
+    let mut rng = Rng(5);
+    let lookup = PromptLookup::new(1, 3).expect("valid range");
+    for random in [false, true] {
+        let (mut model, logits) = ToyModel::prefilled(&PROMPT);
+        let mut output = vec![greedy(&logits)];
+        while output.len() < 40 {
+            let mut history = PROMPT.to_vec();
+            history.extend(&output);
+            let limit = (40 - output.len() - 1).min(3);
+            let draft = if random {
+                random_draft(&mut rng)(&history, limit)
+            } else {
+                lookup.propose(&history, limit).to_vec()
+            };
+            let last = *output.last().expect("first token");
+            let outcome = greedy_speculative_step(&mut model, last, &draft, &mut |_| false)
+                .expect("toy model");
+            output.extend(outcome.emitted);
+            assert_eq!(model.cache.len(), PROMPT.len() + output.len() - 1);
+        }
+        assert_eq!(output, expected, "random={random}");
+    }
+
+    // A stop pick ends the step even when it matches the draft.
+    let (mut model, logits) = ToyModel::prefilled(&PROMPT);
+    let first = greedy(&logits);
+    let draft = expected[1..4].to_vec();
+    let stop = expected[2];
+    let outcome = greedy_speculative_step(&mut model, first, &draft, &mut |token| token == stop)
+        .expect("toy model");
+    let cut = expected[1..]
+        .iter()
+        .position(|&token| token == stop)
+        .expect("stop")
+        + 1;
+    assert_eq!(outcome.emitted, expected[1..=cut]);
+    assert!(outcome.stopped);
 }
 
 /// `SplitMix64`, enough for reproducible test uniforms.
