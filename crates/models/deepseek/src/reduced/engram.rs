@@ -332,7 +332,9 @@ impl EngramSession {
     /// order of the 32 products inside a block, so FP32 outputs agree to a
     /// few ulps and BF16 outputs can differ by one ulp at a rounding boundary.
     /// The first Metal step uploads the WKV weight once for every session
-    /// sharing these operands.
+    /// sharing these operands. An overflow is the scalar path's
+    /// [`EngramSessionError::Wkv`] error; [`EngramSessionError::MetalWkv`] is
+    /// only a device or upload failure.
     #[cfg(feature = "metal")]
     #[must_use]
     pub const fn with_metal_wkv(mut self, enabled: bool) -> Self {
@@ -611,7 +613,17 @@ impl EngramSession {
                 reduction,
             )?),
         };
-        Ok(Fp8MetalKernel::new()?.forward(codes, scales, positions, weights)?)
+        match Fp8MetalKernel::new()?.forward(codes, scales, positions, weights) {
+            // A nonfinite output is the scalar path's overflow at the same
+            // row-major position, so callers see one error for either path.
+            Err(Fp8MetalError::NonFiniteOutput { index }) => {
+                Err(EngramSessionError::Wkv(Fp8LinearError::ValueOverflow {
+                    row: index / outputs,
+                    output: index % outputs,
+                }))
+            }
+            result => Ok(result?),
+        }
     }
 
     fn split_wkv(
@@ -1192,6 +1204,80 @@ mod tests {
             "the step's BF16 WKV is the Metal FP32 projection rounded"
         );
         eprintln!("synthetic WKV parity: {report:?}");
+    }
+
+    /// Every row is the largest finite E4M3FN code with unit scales.
+    #[cfg(feature = "metal")]
+    struct MaxRows;
+
+    #[cfg(feature = "metal")]
+    impl EngramRowSource for MaxRows {
+        fn read_rows(
+            &self,
+            _: &[usize],
+            codes: &mut [u8],
+            scales: &mut [u8],
+        ) -> Result<(), EngramEmbeddingError> {
+            codes.fill(0x7e);
+            scales.fill(127);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn an_overflowing_wkv_is_the_same_error_on_both_paths() {
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        // One position, one 32-wide reduction group, two copies of width 16:
+        // 48 outputs. The largest codes and scales overflow FP32 only in
+        // output 37 (row 1 of the second weight scale tile).
+        let hash_layout =
+            EngramHashLayout::new(2, 1, 1, 1, vec![3], vec![0], vec![1, 1]).expect("hash layout");
+        let config = EngramSessionConfig::new(
+            hash_layout,
+            vec![0, 1],
+            0,
+            4,
+            2,
+            16,
+            1 << 20,
+            32,
+            1e-6,
+            1e-6,
+        )
+        .expect("config");
+        let (reduction, outputs) = (32, 48);
+        let mut wkv_codes = vec![0; outputs * reduction];
+        wkv_codes[37 * reduction..38 * reduction].fill(0x7e); // E4M3FN 448.
+        let wkv_scales = vec![127, 254]; // 1, then 2^127 for outputs 32..48.
+        let weights = EngramSessionWeights::without_embedding_table(
+            wkv_codes,
+            wkv_scales,
+            vec![0x3f80; 2 * 16],
+            vec![0x3f80; 2 * 16],
+        );
+        let residual = vec![0x3f80; 2 * 16];
+        for metal in [false, true] {
+            let mut session = EngramSession::new(config.clone(), weights.clone())
+                .expect("session")
+                .with_metal_wkv(metal);
+            let error = session
+                .step_with(0, &[1], &residual, &MaxRows)
+                .expect_err("FP32 overflow");
+            assert!(
+                matches!(
+                    error,
+                    EngramSessionError::Wkv(crate::precision::Fp8LinearError::ValueOverflow {
+                        row: 0,
+                        output: 37,
+                    })
+                ),
+                "metal {metal}: {error:?}"
+            );
+            assert_eq!(session.next_start(), 0, "a failed step commits nothing");
+        }
+        let resident = weights.0.metal_wkv.0.lock().expect("lock").is_some();
+        assert!(resident, "the Metal path ran");
     }
 
     #[cfg(feature = "metal")]
