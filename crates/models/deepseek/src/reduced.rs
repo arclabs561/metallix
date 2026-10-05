@@ -66,6 +66,7 @@ pub use engram::{
 
 mod block;
 pub use block::{BlockTailDiagnostic, BlockTailError, BlockTailReference};
+pub mod checkpoint_model;
 
 use thiserror::Error;
 

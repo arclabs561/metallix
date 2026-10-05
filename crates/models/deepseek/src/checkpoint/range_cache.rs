@@ -270,6 +270,11 @@ impl<S: V41RangeSource> V41RangeCache<S> {
         Self::new(source, index, headers, budget_bytes)
     }
 
+    /// Returns a named tensor's validated header dtype, shape and range.
+    pub fn tensor_range(&self, tensor: &str) -> Result<V41TensorRange, V41RangeCacheError> {
+        self.lookup(tensor).map(|(_, range)| range)
+    }
+
     /// Bytes currently held by the cache.
     #[must_use]
     pub const fn used_bytes(&self) -> u64 {
