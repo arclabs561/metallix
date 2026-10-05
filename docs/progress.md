@@ -69,7 +69,13 @@ choices without expanding current support claims.
   `local_embedding_rows_cold` under `cargo test` at about 3.8 s; it was about
   11.4 s (three rows), and is moot since 6e7255b. 6e7255b says concurrent
   first reads of one tensor can both hash it; a per-tensor gate already
-  prevented that (9c4fe1e).
+  prevented that (9c4fe1e). 9bc512c says LRU matched or beat LFU at every
+  replayed store size; at 128 GiB LFU was marginally ahead (0.159 miss rate
+  and 6.7 GiB re-downloaded against 0.160 and 7.6 GiB), and the two were
+  within 0.001 at 96 GiB, so LRU was chosen for simplicity and recency, not
+  on the numbers. d9d8430 states that vLLM v1 returns every freed block to the
+  back of its free queue; that came from a design survey and was not checked
+  against vLLM's code.
 
 - One real DeepSeek-V4.1 request step now runs end to end through the
   library: `RequestSession::step_with_sources` over all 40 layers, built from
