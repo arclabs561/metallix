@@ -644,6 +644,8 @@ mod tests {
                     prompt_tokens: 1,
                     generated_tokens: 1,
                 },
+                logprobs: Vec::new(),
+                seed: None,
             })
         }
     }
@@ -754,6 +756,8 @@ stream.close()
                     prompt_tokens: 1,
                     generated_tokens: 1,
                 },
+                logprobs: Vec::new(),
+                seed: None,
             })
         }
     }
@@ -1744,7 +1748,7 @@ stream.close()
                 timeout: Duration,
                 on_token: &mut dyn FnMut(&str) -> Result<(), String>,
             ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
-                let hold_after_delta = request.max_tokens == 64;
+                let hold_after_delta = request.max_tokens == Some(64);
                 let mut held = false;
                 self.session
                     .generate_with_timeout(request, timeout, &mut |delta| {

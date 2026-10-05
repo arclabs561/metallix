@@ -7,20 +7,25 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
 use crate::{
     chat_cli::message,
     chat_generation::{
-        ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
-        ChatToolCall,
+        ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRole, ChatToolCall,
+        GenerationControls, Sampling, TokenLogprob,
     },
     chat_tools,
     http_transport::Connection,
 };
 
+/// One `POST /v1/responses` body. Unknown fields are rejected so a control
+/// this server cannot honor never silently changes meaning. Fields that
+/// common clients (the `OpenAI` SDKs, Codex) send by default but that carry no
+/// generation semantics here are accepted and ignored by name.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Request {
     pub(crate) model: String,
     input: Value,
@@ -40,10 +45,179 @@ pub(crate) struct Request {
     temperature: Option<f64>,
     #[serde(default)]
     top_p: Option<f64>,
+    /// Not part of the `OpenAI` Responses schema; vLLM and llama.cpp accept it.
     #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
     store: Option<bool>,
+    #[serde(default)]
+    top_logprobs: Option<u8>,
+    #[serde(default)]
+    include: Option<Vec<String>>,
+    #[serde(default)]
+    reasoning: Option<Reasoning>,
+    #[serde(default)]
+    text: Option<TextConfig>,
+    #[serde(default)]
+    truncation: Option<String>,
+    #[serde(default)]
+    background: Option<bool>,
+    #[serde(default)]
+    max_tool_calls: Option<u32>,
+    // Accepted and ignored: attribution, routing, caching and transport hints.
+    // `parallel_tool_calls` is ignored because a turn may already carry
+    // several calls and one call per turn is the model's choice, not ours.
+    #[serde(default, rename = "parallel_tool_calls")]
+    _parallel_tool_calls: Option<IgnoredAny>,
+    #[serde(default, rename = "user")]
+    _user: Option<IgnoredAny>,
+    #[serde(default, rename = "metadata")]
+    _metadata: Option<IgnoredAny>,
+    #[serde(default, rename = "client_metadata")]
+    _client_metadata: Option<IgnoredAny>,
+    #[serde(default, rename = "safety_identifier")]
+    _safety_identifier: Option<IgnoredAny>,
+    #[serde(default, rename = "service_tier")]
+    _service_tier: Option<IgnoredAny>,
+    #[serde(default, rename = "prompt_cache_key")]
+    _prompt_cache_key: Option<IgnoredAny>,
+    #[serde(default, rename = "prompt_cache_retention")]
+    _prompt_cache_retention: Option<IgnoredAny>,
+    #[serde(default, rename = "stream_options")]
+    _stream_options: Option<IgnoredAny>,
+    #[serde(default, rename = "access_programs")]
+    _access_programs: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reasoning {
+    #[serde(default)]
+    effort: Option<String>,
+    // Qwen produces raw reasoning text, never a summary or a carried context.
+    #[serde(default, rename = "summary")]
+    _summary: Option<IgnoredAny>,
+    #[serde(default, rename = "generate_summary")]
+    _generate_summary: Option<IgnoredAny>,
+    #[serde(default, rename = "context")]
+    _context: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextConfig {
+    #[serde(default)]
+    format: Option<TextFormat>,
+    /// Ignored: the model has no verbosity control.
+    #[serde(default, rename = "verbosity")]
+    _verbosity: Option<IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum TextFormat {
+    Text,
+    JsonObject,
+    JsonSchema {
+        schema: Value,
+        #[serde(default, rename = "name")]
+        _name: Option<IgnoredAny>,
+        #[serde(default, rename = "description")]
+        _description: Option<IgnoredAny>,
+        /// Ignored: the grammar mask always enforces the schema, so
+        /// `strict: false` receives strict output.
+        #[serde(default, rename = "strict")]
+        _strict: Option<IgnoredAny>,
+    },
+}
+
+const LOGPROBS_INCLUDE: &str = "message.output_text.logprobs";
+/// Every `include` value the `OpenAI` schema defines. Only the logprobs value
+/// changes output; the rest name tools or encrypted state this server never
+/// produces, so they are accepted with nothing to include.
+const KNOWN_INCLUDES: [&str; 8] = [
+    "file_search_call.results",
+    "web_search_call.results",
+    "web_search_call.action.sources",
+    "message.input_image.image_url",
+    "computer_call_output.output.image_url",
+    "code_interpreter_call.outputs",
+    "reasoning.encrypted_content",
+    LOGPROBS_INCLUDE,
+];
+
+/// Maps the request's generation fields onto the protocol-neutral controls.
+///
+/// `reasoning.effort` maps onto Qwen's binary `enable_thinking`: absent,
+/// `none` and `minimal` keep thinking off; `low`, `medium`, `high` and `xhigh`
+/// turn it on and are passed to the template as `reasoning_effort`, which the
+/// stock Qwen3 template ignores. An omitted or zero temperature is greedy;
+/// `top_p` and `seed` apply only when temperature is positive.
+pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> {
+    if request.background == Some(true) {
+        return Err("background responses are unsupported".into());
+    }
+    if request.max_tool_calls.is_some() {
+        return Err("max_tool_calls is unsupported".into());
+    }
+    if request
+        .truncation
+        .as_deref()
+        .is_some_and(|value| value != "disabled")
+    {
+        return Err("only truncation=disabled is supported; send input that fits".into());
+    }
+    let mut logprobs = false;
+    for value in request.include.iter().flatten() {
+        if !KNOWN_INCLUDES.contains(&value.as_str()) {
+            return Err(format!("unsupported include value {value:?}"));
+        }
+        logprobs |= value == LOGPROBS_INCLUDE;
+    }
+    let (enable_thinking, reasoning_effort) = match request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_deref())
+    {
+        None | Some("none" | "minimal") => (false, None),
+        Some(effort @ ("low" | "medium" | "high" | "xhigh")) => (true, Some(effort.to_owned())),
+        Some(other) => return Err(format!("unsupported reasoning.effort {other:?}")),
+    };
+    let json_schema = match request.text.as_ref().and_then(|text| text.format.as_ref()) {
+        None | Some(TextFormat::Text) => None,
+        Some(TextFormat::JsonObject) => Some(json!({"type":"object"})),
+        Some(TextFormat::JsonSchema { schema, .. }) => {
+            if !schema.is_object() {
+                return Err("text.format.schema must be a JSON Schema object".into());
+            }
+            Some(schema.clone())
+        }
+    };
+    let sampling = match request.temperature {
+        None | Some(0.0) => Sampling::Greedy,
+        Some(temperature) => Sampling::Categorical {
+            temperature,
+            top_p: request.top_p.unwrap_or(1.0),
+            seed: request.seed,
+        },
+    };
+    let controls = GenerationControls {
+        max_tokens: request.max_output_tokens,
+        sampling,
+        top_logprobs: (logprobs || request.top_logprobs.is_some())
+            .then(|| request.top_logprobs.unwrap_or(0)),
+        enable_thinking,
+        reasoning_effort,
+        json_schema,
+    };
+    controls.validate(!request.tools.is_empty())?;
+    if let Some(top_p) = request.top_p {
+        // Validate an ignored greedy top_p too, so a typo is never accepted.
+        if !(top_p > 0.0 && top_p <= 1.0) {
+            return Err("top_p must be in (0, 1]".into());
+        }
+    }
+    Ok(controls)
 }
 
 fn input_text(content: &Value) -> Result<String, String> {
@@ -63,27 +237,12 @@ fn input_text(content: &Value) -> Result<String, String> {
     Ok(text)
 }
 
-#[allow(
-    clippy::float_cmp,
-    reason = "reject unsupported sampling values exactly"
-)]
+/// Validates the whole request, including its generation controls, and
+/// rebuilds the typed message history.
 pub(crate) fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
-    if request.temperature.is_some_and(|value| value != 0.0)
-        || request.top_p.is_some_and(|value| value != 1.0)
-        || request.seed.is_some()
-    {
-        return Err(
-            "native chat currently supports greedy sampling only (temperature=0, no seed)".into(),
-        );
-    }
+    controls(request)?;
     if request.store == Some(true) {
         return Err("response storage is unsupported; use store=false".into());
-    }
-    if request
-        .max_output_tokens
-        .is_some_and(|value| value == 0 || value > 256)
-    {
-        return Err("max_output_tokens must be 1..=256".into());
     }
     if request.previous_response_id.is_some() {
         return Err("send complete input history; previous_response_id is not supported".into());
@@ -155,6 +314,9 @@ pub(crate) fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
                 output.tool_call_id = Some(call_id.into());
                 messages.push(output);
             }
+            // Earlier reasoning is not replayed: the Qwen template drops
+            // thinking from history, and Codex echoes these items back.
+            "reasoning" => {}
             _ => return Err("unsupported Responses input item".into()),
         }
     }
@@ -218,6 +380,81 @@ pub(crate) fn json_response(mut connection: Connection, status: u16, value: &Val
     let _ = writer.flush();
 }
 
+/// The SSE half of one response. The HTTP head and `response.created` are
+/// written with the first output, so a failure before any token (context
+/// overflow, schema compilation, an expired budget) still answers with an
+/// ordinary HTTP error status instead of a `200` stream.
+struct EventStream<'a> {
+    pending: Option<Connection>,
+    writer: Option<BufWriter<Connection>>,
+    sequence: u64,
+    id: &'a str,
+    /// The message item opened with the stream when text streams live.
+    live_message: Option<&'a str>,
+}
+
+impl EventStream<'_> {
+    fn open(&mut self) -> Result<&mut BufWriter<Connection>, String> {
+        if self.writer.is_none() {
+            let mut connection = self
+                .pending
+                .take()
+                .ok_or("response connection is unavailable")?;
+            connection.begin_response();
+            let mut writer = BufWriter::new(connection);
+            write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+            event(
+                &mut writer,
+                &mut self.sequence,
+                json!({"type":"response.created","response":{"id":self.id,"object":"response","status":"in_progress","output":[]}}),
+            )?;
+            if let Some(message_id) = self.live_message {
+                event(
+                    &mut writer,
+                    &mut self.sequence,
+                    json!({"type":"response.output_item.added","output_index":0,"item":{"id":message_id,"type":"message","role":"assistant","status":"in_progress","content":[]}}),
+                )?;
+                event(
+                    &mut writer,
+                    &mut self.sequence,
+                    json!({"type":"response.content_part.added","item_id":message_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+                )?;
+            }
+            self.writer = Some(writer);
+        }
+        Ok(self.writer.as_mut().expect("opened stream writer"))
+    }
+
+    fn emit(&mut self, value: Value) -> Result<(), String> {
+        self.open()?;
+        let writer = self.writer.as_mut().expect("opened stream writer");
+        event(writer, &mut self.sequence, value)
+    }
+
+    /// Withholds incomplete tool envelopes and reasoning, but still detects
+    /// disconnects once output has begun.
+    fn keepalive(&mut self) -> Result<(), String> {
+        let writer = self.open()?;
+        writer
+            .write_all(b": generating\n\n")
+            .map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())
+    }
+}
+
+fn error_response(connection: Connection, error: &ChatGenerationError) {
+    match error {
+        ChatGenerationError::DeadlineExceeded => json_response(
+            connection,
+            408,
+            &json!({"error":{"code":"generation_timeout","message":"generation time budget exceeded"}}),
+        ),
+        ChatGenerationError::Message(message) => {
+            json_response(connection, 400, &json!({"error":{"message":message}}));
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one ordered response event lifecycle"
@@ -231,21 +468,18 @@ pub(crate) fn respond(
     id: &str,
     generation_timeout: Duration,
 ) -> Result<(), String> {
-    let mut sequence = 0;
-    let mut writer = if parsed.stream {
-        let mut writer = BufWriter::new(request);
-        writer.get_mut().begin_response();
-        write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
-        event(
-            &mut writer,
-            &mut sequence,
-            json!({"type":"response.created","response":{"id":id,"object":"response","status":"in_progress","output":[]}}),
-        )?;
-        Some(writer)
-    } else {
+    let controls = match controls(parsed) {
+        Ok(controls) => controls,
+        Err(error) => {
+            json_response(request, 400, &json!({"error":{"message":error}}));
+            return Ok(());
+        }
+    };
+    if !parsed.stream {
         respond_json(
             request,
             parsed,
+            &controls,
             messages,
             tools,
             session,
@@ -253,64 +487,57 @@ pub(crate) fn respond(
             generation_timeout,
         );
         return Ok(());
-    };
-    let message_id = format!("msg_{id}");
-    let stream_text = tools.is_empty();
-    if stream_text {
-        let writer = writer.as_mut().expect("stream writer");
-        event(
-            writer,
-            &mut sequence,
-            json!({"type":"response.output_item.added","output_index":0,"item":{"id":message_id,"type":"message","role":"assistant","status":"in_progress","content":[]}}),
-        )?;
-        event(
-            writer,
-            &mut sequence,
-            json!({"type":"response.content_part.added","item_id":message_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
-        )?;
     }
-    let generated = session.generate_with_timeout(ChatRequest {messages,tools,max_tokens:parsed.max_output_tokens.unwrap_or(128),enable_thinking:false,reasoning_effort:None}, generation_timeout, &mut |delta| {
-        if stream_text {
-            event(writer.as_mut().expect("stream writer"),&mut sequence,json!({"type":"response.output_text.delta","item_id":message_id,"output_index":0,"content_index":0,"delta":delta}))?;
-        } else {
-            // Withhold incomplete tool envelopes, but still detect disconnects.
-            let writer = writer.as_mut().expect("stream writer");
-            writer.write_all(b": generating\n\n").map_err(|error| error.to_string())?;
-            writer.flush().map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    });
+    let message_id = format!("msg_{id}");
+    // Text streams live only when no tool envelope or reasoning block has to
+    // be parsed out of it first.
+    let stream_text = tools.is_empty() && !controls.enable_thinking;
+    let mut stream = EventStream {
+        pending: Some(request),
+        writer: None,
+        sequence: 0,
+        id,
+        live_message: stream_text.then_some(message_id.as_str()),
+    };
+    let generated = session.generate_with_timeout(
+        controls.request(messages, tools),
+        generation_timeout,
+        &mut |delta| {
+            if stream_text {
+                // Per-token logprobs arrive on `response.output_text.done`.
+                stream.emit(json!({"type":"response.output_text.delta","item_id":message_id,"output_index":0,"content_index":0,"delta":delta,"logprobs":[]}))
+            } else {
+                stream.keepalive()
+            }
+        },
+    );
     let generated = match generated {
         Ok(generated) => generated,
-        Err(ChatGenerationError::DeadlineExceeded) => {
-            event(
-                writer.as_mut().expect("stream writer"),
-                &mut sequence,
-                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"generation_timeout","message":"generation time budget exceeded"}}}),
-            )?;
-            return Ok(());
-        }
         Err(error) => {
-            event(
-                writer.as_mut().expect("stream writer"),
-                &mut sequence,
-                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"generation_failed","message":error.to_string()}}}),
-            )?;
-            return Ok(());
+            if let Some(connection) = stream.pending.take() {
+                error_response(connection, &error);
+                return Ok(());
+            }
+            let (code, message) = match error {
+                ChatGenerationError::DeadlineExceeded => (
+                    "generation_timeout",
+                    "generation time budget exceeded".into(),
+                ),
+                ChatGenerationError::Message(message) => ("generation_failed", message),
+            };
+            return stream.emit(
+                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":code,"message":message}}}),
+            );
         }
     };
-    let response = match response_value(parsed, &generated, id) {
+    let response = match response_value(parsed, &controls, &generated, id) {
         Ok(response) => response,
         Err(error) => {
-            event(
-                writer.as_mut().expect("stream writer"),
-                &mut sequence,
+            return stream.emit(
                 json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"invalid_model_output","message":error}}}),
-            )?;
-            return Ok(());
+            );
         }
     };
-    let writer = writer.as_mut().expect("stream writer");
     for (index, item) in response["output"]
         .as_array()
         .ok_or("output array")?
@@ -321,71 +548,59 @@ pub(crate) fn respond(
             let mut started = item.clone();
             started["arguments"] = json!("");
             started["status"] = json!("in_progress");
-            event(
-                writer,
-                &mut sequence,
+            stream.emit(
                 json!({"type":"response.output_item.added","output_index":index,"item":started}),
             )?;
-            event(
-                writer,
-                &mut sequence,
+            stream.emit(
                 json!({"type":"response.function_call_arguments.delta","item_id":item["id"],"output_index":index,"delta":item["arguments"]}),
             )?;
-            event(
-                writer,
-                &mut sequence,
+            stream.emit(
                 json!({"type":"response.function_call_arguments.done","item_id":item["id"],"output_index":index,"arguments":item["arguments"]}),
             )?;
+        } else if item["type"] == "reasoning" {
+            stream.emit(
+                json!({"type":"response.output_item.added","output_index":index,"item":{"id":item["id"],"type":"reasoning","summary":[],"content":[]}}),
+            )?;
         } else {
+            let part = &item["content"][0];
+            let logprobs = part.get("logprobs").cloned().unwrap_or_else(|| json!([]));
             if !stream_text {
-                event(
-                    writer,
-                    &mut sequence,
+                stream.emit(
                     json!({"type":"response.output_item.added","output_index":index,"item":{"id":item["id"],"type":"message","role":"assistant","status":"in_progress","content":[]}}),
                 )?;
-                event(
-                    writer,
-                    &mut sequence,
+                stream.emit(
                     json!({"type":"response.content_part.added","item_id":item["id"],"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
                 )?;
-                event(
-                    writer,
-                    &mut sequence,
-                    json!({"type":"response.output_text.delta","item_id":item["id"],"output_index":index,"content_index":0,"delta":item["content"][0]["text"]}),
+                stream.emit(
+                    json!({"type":"response.output_text.delta","item_id":item["id"],"output_index":index,"content_index":0,"delta":part["text"],"logprobs":[]}),
                 )?;
             }
-            event(
-                writer,
-                &mut sequence,
-                json!({"type":"response.output_text.done","item_id":item["id"],"output_index":index,"content_index":0,"text":item["content"][0]["text"]}),
+            stream.emit(
+                json!({"type":"response.output_text.done","item_id":item["id"],"output_index":index,"content_index":0,"text":part["text"],"logprobs":logprobs}),
             )?;
-            event(
-                writer,
-                &mut sequence,
-                json!({"type":"response.content_part.done","item_id":item["id"],"output_index":index,"content_index":0,"part":item["content"][0]}),
+            stream.emit(
+                json!({"type":"response.content_part.done","item_id":item["id"],"output_index":index,"content_index":0,"part":part}),
             )?;
         }
-        event(
-            writer,
-            &mut sequence,
-            json!({"type":"response.output_item.done","output_index":index,"item":item}),
-        )?;
+        stream
+            .emit(json!({"type":"response.output_item.done","output_index":index,"item":item}))?;
     }
     let event_type = if response["status"] == "incomplete" {
         "response.incomplete"
     } else {
         "response.completed"
     };
-    event(
-        writer,
-        &mut sequence,
-        json!({"type":event_type,"response":response}),
-    )
+    stream.emit(json!({"type":event_type,"response":response}))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the connection, parsed request and its derived parts are one call"
+)]
 fn respond_json(
     request: Connection,
     parsed: &Request,
+    controls: &GenerationControls,
     messages: &[ChatMessage],
     tools: &[Value],
     session: &mut dyn ChatBackend,
@@ -394,48 +609,64 @@ fn respond_json(
 ) {
     let result = session
         .generate_with_timeout(
-            ChatRequest {
-                messages,
-                tools,
-                max_tokens: parsed.max_output_tokens.unwrap_or(128),
-                enable_thinking: false,
-                reasoning_effort: None,
-            },
+            controls.request(messages, tools),
             generation_timeout,
             &mut |_| Ok(()),
         )
         .and_then(|generated| {
-            response_value(parsed, &generated, id).map_err(ChatGenerationError::Message)
+            response_value(parsed, controls, &generated, id).map_err(ChatGenerationError::Message)
         });
     match result {
         Ok(response) => json_response(request, 200, &response),
-        Err(ChatGenerationError::DeadlineExceeded) => json_response(
-            request,
-            408,
-            &json!({"error":{"code":"generation_timeout","message":"generation time budget exceeded"}}),
-        ),
-        Err(error) => json_response(
-            request,
-            400,
-            &json!({"error":{"message":error.to_string()}}),
-        ),
+        Err(error) => error_response(request, &error),
     }
+}
+
+/// Splits a thinking turn into its reasoning and its answer. Qwen3 opens the
+/// block itself; templates that pre-fill `<think>` leave only the close tag.
+fn split_reasoning(text: &str) -> (&str, &str) {
+    let (opened, body) = match text.trim_start().strip_prefix("<think>") {
+        Some(body) => (true, body),
+        None => (false, text),
+    };
+    match body.split_once("</think>") {
+        Some((reasoning, answer)) => (reasoning.trim(), answer.trim_start()),
+        None if opened => (body.trim(), ""),
+        None => ("", text),
+    }
+}
+
+fn logprobs_value(logprobs: &[TokenLogprob]) -> Value {
+    serde_json::to_value(logprobs).unwrap_or_else(|_| json!([]))
 }
 
 fn response_value(
     request: &Request,
+    controls: &GenerationControls,
     generated: &crate::chat_generation::ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = chat_tools::parse_turn(&generated.text)?;
+    let (reasoning, answer) = if controls.enable_thinking {
+        split_reasoning(&generated.text)
+    } else {
+        ("", generated.text.as_str())
+    };
+    let turn = chat_tools::parse_turn(answer)?;
     let calls = turn.calls;
     let complete = generated.finish_reason == ChatFinishReason::Eos;
     if !calls.is_empty() && !complete {
         return Err("truncated tool turn; no function calls returned".into());
     }
     let mut output = Vec::new();
+    if !reasoning.is_empty() {
+        output.push(json!({"id":format!("rs_{id}"),"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":reasoning}]}));
+    }
     if calls.is_empty() || !turn.text.trim().is_empty() {
-        output.push(json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","status":if complete {"completed"} else {"incomplete"},"content":[{"type":"output_text","text":turn.text,"annotations":[]}]}));
+        let mut part = json!({"type":"output_text","text":turn.text,"annotations":[]});
+        if controls.top_logprobs.is_some() {
+            part["logprobs"] = logprobs_value(&generated.logprobs);
+        }
+        output.push(json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","status":if complete {"completed"} else {"incomplete"},"content":[part]}));
     }
     for (index, call) in calls.into_iter().enumerate() {
         let definition = request
@@ -448,9 +679,12 @@ fn response_value(
         }
         output.push(json!({"type":"function_call","id":format!("fc_{id}_{index}"),"call_id":format!("call_{id}_{index}"),"name":call.name,"arguments":call.arguments.to_string(),"status":"completed"}));
     }
-    Ok(
-        json!({"id":id,"object":"response","model":request.model,"status":if complete {"completed"} else {"incomplete"},"output":output,"incomplete_details":if complete {Value::Null} else {json!({"reason":"max_output_tokens"})},"usage":{"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()},"metrics":generated.metrics}),
-    )
+    let mut response = json!({"id":id,"object":"response","model":request.model,"status":if complete {"completed"} else {"incomplete"},"output":output,"incomplete_details":if complete {Value::Null} else {json!({"reason":"max_output_tokens"})},"usage":{"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()},"metrics":generated.metrics});
+    if let Some(seed) = generated.seed {
+        // The seed actually drawn, so an unseeded sampled turn can be replayed.
+        response["metallix"] = json!({"seed": seed});
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -532,22 +766,236 @@ mod tests {
         assert!(input_text(&json!([{"type":"input_image","image_url":"x"}])).is_err());
     }
 
+    fn request_with(extra: &Value) -> Result<Request, serde_json::Error> {
+        let mut request = json!({"model":"control","input":"hello"});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(request)
+    }
+
+    const TOOL: &str = r#"{"type":"function","name":"read_file","parameters":{"type":"object"}}"#;
+
     #[test]
     fn rejects_orphan_results_and_unsupported_request_semantics() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
         for extra in [
             json!({"input":[{"type":"function_call_output","call_id":"unknown","output":"x"}]}),
-            json!({"temperature":0.8}),
-            json!({"seed":42}),
             json!({"store":true}),
             json!({"max_output_tokens":0}),
+            json!({"temperature":2.5}),
+            json!({"temperature":-0.5}),
+            json!({"temperature":0.7,"top_p":0.0}),
+            json!({"top_p":1.5}),
+            json!({"top_logprobs":21}),
+            json!({"include":["message.output_text.bogus"]}),
+            json!({"reasoning":{"effort":"maximum"}}),
+            json!({"background":true}),
+            json!({"truncation":"auto"}),
+            json!({"max_tool_calls":1}),
+            json!({"text":{"format":{"type":"json_schema","name":"x","schema":true}}}),
+            json!({"text":{"format":{"type":"json_schema","schema":{}}},"reasoning":{"effort":"low"}}),
+            json!({"text":{"format":{"type":"json_schema","schema":{}}},"tools":[tool.clone()]}),
+            json!({"text":{"format":{"type":"json_schema","schema":{}}},"temperature":0.7,"top_p":0.9}),
+            json!({"top_logprobs":2,"tools":[tool.clone()]}),
+            json!({"top_logprobs":2,"reasoning":{"effort":"high"}}),
         ] {
-            let mut request = json!({"model":"control","input":"hello"});
-            request
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            assert!(messages(&serde_json::from_value::<Request>(request).unwrap()).is_err());
+            let request = request_with(&extra).unwrap();
+            assert!(messages(&request).is_err(), "accepted {extra}");
         }
+    }
+
+    #[test]
+    fn rejects_unknown_fields_but_accepts_client_defaults() {
+        for extra in [
+            json!({"frobnicate":true}),
+            json!({"reasoning":{"effort":"low","budget":4}}),
+            json!({"text":{"format":{"type":"text"},"style":"terse"}}),
+            json!({"text":{"format":{"type":"grammar"}}}),
+        ] {
+            let error = request_with(&extra).err().expect("unknown field rejected");
+            assert!(error.to_string().contains("unknown"), "{extra} -> {error}");
+        }
+        // Codex's default body plus the SDKs' attribution fields.
+        let request = request_with(&json!({
+            "stream": false,
+            "service_tier": "auto",
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "reasoning": {"effort": "minimal", "summary": "auto"},
+            "store": false,
+            "stream_options": {"include_obfuscation": false},
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": "session-1",
+            "text": {"verbosity": "low"},
+            "client_metadata": {"origin": "test"},
+            "access_programs": null,
+            "user": "u",
+            "metadata": {"k": "v"},
+            "safety_identifier": "s",
+            "prompt_cache_retention": "24h",
+            "truncation": "disabled",
+            "background": false,
+            "input": [
+                {"type":"reasoning","id":"rs_1","summary":[]},
+                {"role":"user","content":"hello"}
+            ],
+        }))
+        .unwrap();
+        assert_eq!(messages(&request).unwrap().len(), 1);
+        assert_eq!(controls(&request).unwrap(), GenerationControls::default());
+    }
+
+    #[test]
+    fn maps_generation_fields_onto_controls() {
+        let sampled = controls(
+            &request_with(
+                &json!({"temperature":0.7,"top_p":0.9,"seed":7,"max_output_tokens":4096}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sampled.sampling,
+            Sampling::Categorical {
+                temperature: 0.7,
+                top_p: 0.9,
+                seed: Some(7)
+            }
+        );
+        assert_eq!(sampled.max_tokens, Some(4096));
+        // A zero temperature is greedy, whatever else is sent.
+        let greedy =
+            controls(&request_with(&json!({"temperature":0.0,"top_p":0.5,"seed":1})).unwrap())
+                .unwrap();
+        assert_eq!(greedy.sampling, Sampling::Greedy);
+
+        let logprobs = |extra: Value| {
+            controls(&request_with(&extra).unwrap())
+                .unwrap()
+                .top_logprobs
+        };
+        assert_eq!(logprobs(json!({})), None);
+        assert_eq!(logprobs(json!({"include":[LOGPROBS_INCLUDE]})), Some(0));
+        assert_eq!(
+            logprobs(json!({"include":[LOGPROBS_INCLUDE],"top_logprobs":5})),
+            Some(5)
+        );
+        assert_eq!(logprobs(json!({"top_logprobs":3})), Some(3));
+
+        for (effort, thinking) in [
+            ("none", false),
+            ("minimal", false),
+            ("low", true),
+            ("medium", true),
+            ("high", true),
+            ("xhigh", true),
+        ] {
+            let mapped =
+                controls(&request_with(&json!({"reasoning":{"effort":effort}})).unwrap()).unwrap();
+            assert_eq!(mapped.enable_thinking, thinking, "{effort}");
+            assert_eq!(
+                mapped.reasoning_effort.as_deref(),
+                thinking.then_some(effort)
+            );
+        }
+
+        let schema =
+            json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]});
+        let format = |format: Value| {
+            controls(&request_with(&json!({"text":{"format":format}})).unwrap())
+                .map(|controls| controls.json_schema)
+        };
+        assert_eq!(format(json!({"type":"text"})), Ok(None));
+        if cfg!(feature = "structured-output") {
+            assert_eq!(
+                format(json!({"type":"json_schema","name":"r","strict":true,"schema":schema})),
+                Ok(Some(schema))
+            );
+            assert_eq!(
+                format(json!({"type":"json_object"})),
+                Ok(Some(json!({"type":"object"})))
+            );
+        } else {
+            // A build without the grammar must refuse, never return free text.
+            assert!(format(json!({"type":"json_object"})).is_err());
+        }
+    }
+
+    #[test]
+    fn splits_reasoning_from_the_answer() {
+        assert_eq!(
+            split_reasoning("<think>\nadd them\n</think>\n\n4"),
+            ("add them", "4")
+        );
+        assert_eq!(
+            split_reasoning("pre-filled\n</think>\n\n4"),
+            ("pre-filled", "4")
+        );
+        assert_eq!(split_reasoning("<think>\nunfinished"), ("unfinished", ""));
+        assert_eq!(split_reasoning("plain answer"), ("", "plain answer"));
+    }
+
+    fn generation(text: &str) -> crate::chat_generation::ChatGeneration {
+        use crate::chat_generation::ChatGenerationMetrics;
+        crate::chat_generation::ChatGeneration {
+            text: text.into(),
+            generated_token_ids: vec![1, 2],
+            finish_reason: ChatFinishReason::Eos,
+            metrics: ChatGenerationMetrics {
+                context_tokens: 2048,
+                planned_kv_bytes: 0,
+                session_load_ms: 0.0,
+                render_ms: 0.0,
+                prefill_ms: 0.0,
+                time_to_first_token_ms: None,
+                decode_ms: vec![],
+                decode_total_ms: 0.0,
+                prompt_tokens: 1,
+                generated_tokens: 2,
+            },
+            logprobs: Vec::new(),
+            seed: None,
+        }
+    }
+
+    #[test]
+    fn response_carries_reasoning_logprobs_and_seed() {
+        let request = request_with(&json!({"reasoning":{"effort":"low"}})).unwrap();
+        let thinking = controls(&request).unwrap();
+        let response = response_value(
+            &request,
+            &thinking,
+            &generation("<think>\nadd</think>\n\n4"),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(response["output"][0]["type"], "reasoning");
+        assert_eq!(response["output"][0]["content"][0]["text"], "add");
+        assert_eq!(response["output"][1]["content"][0]["text"], "4");
+        assert!(
+            response["output"][1]["content"][0]
+                .get("logprobs")
+                .is_none()
+        );
+
+        let request = request_with(&json!({"top_logprobs":1,"temperature":1.0})).unwrap();
+        let mut generated = generation("hi");
+        generated.seed = Some(9);
+        generated.logprobs = vec![TokenLogprob {
+            token: "hi".into(),
+            bytes: b"hi".to_vec(),
+            logprob: -0.25,
+            top_logprobs: vec![],
+        }];
+        let response =
+            response_value(&request, &controls(&request).unwrap(), &generated, "t").unwrap();
+        let logprobs = &response["output"][0]["content"][0]["logprobs"];
+        assert_eq!(logprobs[0]["token"], "hi");
+        assert_eq!(logprobs[0]["bytes"], json!([104, 105]));
+        assert_eq!(logprobs[0]["logprob"], -0.25);
+        assert_eq!(response["metallix"]["seed"], 9);
     }
 
     #[test]
@@ -562,25 +1010,12 @@ mod tests {
 
     #[test]
     fn schema_validation_rejects_undeclared_and_invalid_calls() {
-        use crate::chat_generation::ChatGenerationMetrics;
         let request: Request = serde_json::from_value(json!({"model":"control","input":"hello","tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]})).unwrap();
-        let mut generated = crate::chat_generation::ChatGeneration {
-            text: String::new(),
-            generated_token_ids: vec![1],
-            finish_reason: ChatFinishReason::Eos,
-            metrics: ChatGenerationMetrics {
-                context_tokens: 2048,
-                planned_kv_bytes: 0,
-                session_load_ms: 0.0,
-                render_ms: 0.0,
-                prefill_ms: 0.0,
-                time_to_first_token_ms: None,
-                decode_ms: vec![],
-                decode_total_ms: 0.0,
-                prompt_tokens: 1,
-                generated_tokens: 1,
-            },
+        let controls = GenerationControls::default();
+        let response_value = |request: &Request, generated: &_, id| {
+            response_value(request, &controls, generated, id)
         };
+        let mut generated = generation("");
         for text in [
             "<tool_call>{",
             r#"<tool_call>{"name":"shell","arguments":{}}</tool_call>"#,
@@ -605,5 +1040,315 @@ mod tests {
         assert_eq!(mixed["output"][1]["type"], "function_call");
         generated.finish_reason = ChatFinishReason::Length;
         assert!(response_value(&request, &generated, "test").is_err());
+    }
+
+    mod wire {
+        use std::{
+            io::Read as _,
+            net::{Shutdown, TcpListener, TcpStream},
+            thread,
+        };
+
+        use super::*;
+        use crate::{chat_generation::ChatRequest, http_transport::TransportLimits};
+
+        /// Sends one body through the real transport and `respond`, returning
+        /// the raw HTTP response.
+        pub(super) fn exchange(body: &str, backend: &mut dyn ChatBackend) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.to_owned();
+            let client = thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                write!(
+                    stream,
+                    "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                String::from_utf8(response).unwrap()
+            });
+            let (stream, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(stream, TransportLimits::default());
+            let wire = connection.read_request().unwrap();
+            let request: Request = serde_json::from_slice(&wire.body).unwrap();
+            let messages = messages(&request).unwrap();
+            let tools = tools(&request).unwrap();
+            respond(
+                connection,
+                &request,
+                &messages,
+                &tools,
+                backend,
+                "t",
+                Duration::from_secs(600),
+            )
+            .unwrap();
+            client.join().unwrap()
+        }
+
+        /// The JSON body of a non-streamed response, with its status line.
+        pub(super) fn json_body(wire: &str) -> (String, Value) {
+            let (head, body) = wire.split_once("\r\n\r\n").unwrap();
+            (
+                head.lines().next().unwrap().to_owned(),
+                serde_json::from_str(body).unwrap(),
+            )
+        }
+
+        /// The `data` payloads of a streamed response.
+        pub(super) fn events(wire: &str) -> Vec<Value> {
+            let (head, payload) = wire.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+            payload
+                .split("\n\n")
+                .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect()
+        }
+
+        /// Max tokens, sampling, top logprobs, thinking, and schema presence.
+        type Seen = (Option<u32>, Sampling, Option<u8>, bool, bool);
+
+        /// Records what reached the backend; optionally fails before any token.
+        #[derive(Default)]
+        struct Recording {
+            seen: Option<Seen>,
+            fail_before_output: bool,
+        }
+
+        impl ChatBackend for Recording {
+            fn load_ms(&self) -> f64 {
+                0.0
+            }
+
+            fn generate_with_timeout(
+                &mut self,
+                request: ChatRequest<'_>,
+                _timeout: Duration,
+                on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+                self.seen = Some((
+                    request.max_tokens,
+                    request.sampling,
+                    request.top_logprobs,
+                    request.enable_thinking,
+                    request.json_schema.is_some(),
+                ));
+                if self.fail_before_output {
+                    return Err(ChatGenerationError::Message(
+                        "chat requires prompt_tokens + max_tokens <= 16384; received 9 + 20000 = 20009".into(),
+                    ));
+                }
+                on_token("{}").map_err(ChatGenerationError::Message)?;
+                Ok(generation("{}"))
+            }
+        }
+
+        #[test]
+        fn controls_reach_the_backend_unchanged() {
+            let mut backend = Recording::default();
+            let body = r#"{"model":"control","input":"hi","max_output_tokens":9000,"temperature":0.5,"top_p":0.8,"seed":3,"top_logprobs":2}"#;
+            let (status, _) = json_body(&exchange(body, &mut backend));
+            assert_eq!(status, "HTTP/1.1 200 OK");
+            assert_eq!(
+                backend.seen,
+                Some((
+                    Some(9000),
+                    Sampling::Categorical {
+                        temperature: 0.5,
+                        top_p: 0.8,
+                        seed: Some(3)
+                    },
+                    Some(2),
+                    false,
+                    false
+                ))
+            );
+            let schema = cfg!(feature = "structured-output");
+            let body = format!(
+                r#"{{"model":"control","input":"hi","stream":true,"reasoning":{{"effort":"none"}},"text":{{"format":{{"type":"{}"}}}}}}"#,
+                if schema { "json_object" } else { "text" }
+            );
+            let events = events(&exchange(&body, &mut backend));
+            assert_eq!(
+                backend.seen,
+                Some((None, Sampling::Greedy, None, false, schema))
+            );
+            assert_eq!(events.last().unwrap()["type"], "response.completed");
+            let done = events
+                .iter()
+                .find(|event| event["type"] == "response.output_text.done")
+                .unwrap();
+            assert_eq!(done["text"], "{}");
+            assert_eq!(done["logprobs"], json!([]));
+        }
+
+        #[test]
+        fn failure_before_any_output_is_an_http_error_even_when_streaming() {
+            for stream in [false, true] {
+                let mut backend = Recording {
+                    fail_before_output: true,
+                    ..Recording::default()
+                };
+                let body = format!(
+                    r#"{{"model":"control","input":"hi","stream":{stream},"max_output_tokens":20000}}"#
+                );
+                let (status, body) = json_body(&exchange(&body, &mut backend));
+                assert_eq!(status, "HTTP/1.1 400 Bad Request", "stream={stream}");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("prompt_tokens + max_tokens <= 16384")
+                );
+            }
+        }
+    }
+
+    /// Opt-in checks against a real local Qwen3 checkpoint, for example
+    /// `METALLIX_QWEN_MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<rev>`.
+    mod real_qwen {
+        use std::path::Path;
+
+        use super::wire::{exchange, json_body};
+        use super::*;
+        use crate::chat_generation::{ChatSession, ResidentChatLimits};
+
+        fn session() -> ChatSession {
+            let model = std::env::var_os("METALLIX_QWEN_MODEL")
+                .expect("real-checkpoint test requires METALLIX_QWEN_MODEL");
+            ChatSession::load(
+                Path::new(&model),
+                ResidentChatLimits::from_mib(16_384, 8_192),
+            )
+            .expect("load local Qwen checkpoint")
+        }
+
+        fn text(response: &Value) -> &str {
+            response["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "message")
+                .unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+        }
+
+        #[test]
+        #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+        fn seeded_sampling_logprobs_and_context_cap() {
+            let mut session = session();
+            let sampled = |seed: u64, session: &mut ChatSession| {
+                let body = format!(
+                    r#"{{"model":"q","input":"Write one sentence about the sea.","temperature":1.0,"top_p":0.95,"seed":{seed},"max_output_tokens":24}}"#
+                );
+                let (status, response) = json_body(&exchange(&body, session));
+                assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+                assert_eq!(response["metallix"]["seed"], seed);
+                text(&response).to_owned()
+            };
+            let first = sampled(1234, &mut session);
+            assert_eq!(first, sampled(1234, &mut session));
+            assert_ne!(first, sampled(99, &mut session));
+
+            let body = r#"{"model":"q","input":"Say hello.","include":["message.output_text.logprobs"],"top_logprobs":3,"max_output_tokens":8}"#;
+            let (_, response) = json_body(&exchange(body, &mut session));
+            let logprobs = response["output"][0]["content"][0]["logprobs"]
+                .as_array()
+                .unwrap();
+            let output_tokens = response["usage"]["output_tokens"].as_u64().unwrap();
+            let eos = u64::from(response["status"] == "completed");
+            assert_eq!(logprobs.len() as u64, output_tokens - eos);
+            let mut joined = Vec::new();
+            for entry in logprobs {
+                let top = entry["top_logprobs"].as_array().unwrap();
+                assert_eq!(top.len(), 3);
+                // Greedy picks the most likely token, so it heads its own list.
+                assert_eq!(top[0]["token"], entry["token"]);
+                assert!(
+                    (top[0]["logprob"].as_f64().unwrap() - entry["logprob"].as_f64().unwrap())
+                        .abs()
+                        < 1e-9
+                );
+                assert!(
+                    top.windows(2)
+                        .all(|pair| pair[0]["logprob"].as_f64() >= pair[1]["logprob"].as_f64())
+                );
+                assert!(entry["logprob"].as_f64().unwrap() <= 0.0);
+                joined.extend(
+                    entry["bytes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|byte| u8::try_from(byte.as_u64().unwrap()).unwrap()),
+                );
+            }
+            assert_eq!(String::from_utf8(joined).unwrap(), text(&response));
+
+            let body = r#"{"model":"q","input":"hi","stream":true,"max_output_tokens":16384}"#;
+            let (status, response) = json_body(&exchange(body, &mut session));
+            assert_eq!(status, "HTTP/1.1 400 Bad Request");
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("16384")
+            );
+
+            let body = r#"{"model":"q","input":"What is 2+3? Answer briefly.","reasoning":{"effort":"low"},"max_output_tokens":384}"#;
+            let (_, response) = json_body(&exchange(body, &mut session));
+            assert_eq!(response["output"][0]["type"], "reasoning", "{response}");
+            assert!(
+                !response["output"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("<think>")
+            );
+        }
+
+        #[cfg(feature = "structured-output")]
+        #[test]
+        #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+        fn json_schema_output_validates_streamed_and_not() {
+            use super::wire::events;
+
+            let mut session = session();
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "maxLength": 40},
+                    "population": {"type": "integer", "minimum": 0}
+                },
+                "required": ["city", "population"],
+                "additionalProperties": false
+            });
+            let validator = chat_tools::validator(&schema).unwrap();
+            for stream in [false, true] {
+                let body = json!({
+                    "model": "q",
+                    "input": "Give the largest city in Japan and its population as JSON.",
+                    "stream": stream,
+                    "max_output_tokens": 96,
+                    "temperature": 0.7,
+                    "seed": 5,
+                    "text": {"format": {"type": "json_schema", "name": "city", "strict": true, "schema": schema}}
+                })
+                .to_string();
+                let wire = exchange(&body, &mut session);
+                let response = if stream {
+                    events(&wire).pop().unwrap()["response"].clone()
+                } else {
+                    json_body(&wire).1
+                };
+                assert_eq!(response["status"], "completed", "{response}");
+                let value: Value = serde_json::from_str(text(&response)).unwrap();
+                assert!(validator.is_valid(&value), "{value}");
+            }
+        }
     }
 }

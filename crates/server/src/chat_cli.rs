@@ -172,11 +172,8 @@ fn agent_inner(
     for turn_index in 0..max_turns {
         let result = session.generate(
             ChatRequest {
-                messages: &messages,
                 tools: &tools,
-                max_tokens,
-                enable_thinking: false,
-                reasoning_effort: None,
+                ..ChatRequest::new(&messages, max_tokens)
             },
             &mut |_| Ok(()),
         )?;
@@ -319,6 +316,8 @@ mod tests {
                     prompt_tokens: 0,
                     generated_tokens: 0,
                 },
+                logprobs: Vec::new(),
+                seed: None,
             },
         )
     }

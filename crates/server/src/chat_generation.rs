@@ -7,7 +7,7 @@
 
 use std::{
     fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::qwen_tokenizer::QwenTokenizer;
+use crate::{
+    qwen_forward::{SamplingConfiguration, SamplingPolicy},
+    qwen_tokenizer::QwenTokenizer,
+};
 
 const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
@@ -179,24 +182,153 @@ pub(crate) fn render_generation_prompt(
 pub(crate) struct ChatRequest<'a> {
     pub(crate) messages: &'a [ChatMessage],
     pub(crate) tools: &'a [Value],
-    pub(crate) max_tokens: u32,
+    /// `None` allows output up to the remaining context after the prompt.
+    pub(crate) max_tokens: Option<u32>,
     pub(crate) enable_thinking: bool,
     /// Optional model-specific reasoning effort passed through to templates.
     pub(crate) reasoning_effort: Option<&'a str>,
+    pub(crate) sampling: Sampling,
+    /// `Some(k)` records each output token's log probability and its `k`
+    /// most likely alternatives.
+    pub(crate) top_logprobs: Option<u8>,
+    /// A JSON Schema the output must satisfy, enforced by a grammar mask.
+    pub(crate) json_schema: Option<&'a Value>,
 }
 
 impl<'a> ChatRequest<'a> {
-    /// Creates a normal non-thinking turn with no tools.
+    /// Creates a normal greedy non-thinking turn with no tools.
     #[must_use]
     pub(crate) const fn new(messages: &'a [ChatMessage], max_tokens: u32) -> Self {
         Self {
             messages,
             tools: &[],
-            max_tokens,
+            max_tokens: Some(max_tokens),
             enable_thinking: false,
             reasoning_effort: None,
+            sampling: Sampling::Greedy,
+            top_logprobs: None,
+            json_schema: None,
         }
     }
+}
+
+/// How each output token is chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum Sampling {
+    /// The highest-logit token.
+    #[default]
+    Greedy,
+    /// Seeded categorical sampling through `engine::sampling` after a
+    /// temperature transform. `top_p` below one restricts each draw to the
+    /// nucleus. An absent seed is drawn per turn and reported in
+    /// [`ChatGeneration::seed`] so the turn can be replayed.
+    Categorical {
+        temperature: f64,
+        top_p: f64,
+        seed: Option<u64>,
+    },
+}
+
+pub(crate) const MAX_TOP_LOGPROBS: u8 = 20;
+
+/// Protocol-neutral generation controls. Each HTTP adapter parses its own
+/// field names into this, validates it, and borrows it as a [`ChatRequest`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct GenerationControls {
+    /// `None` allows output up to the remaining context after the prompt.
+    pub(crate) max_tokens: Option<u32>,
+    pub(crate) sampling: Sampling,
+    pub(crate) top_logprobs: Option<u8>,
+    pub(crate) enable_thinking: bool,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) json_schema: Option<Value>,
+}
+
+impl GenerationControls {
+    /// Rejects values and combinations generation cannot honor exactly.
+    ///
+    /// The grammar mask cannot also admit a tool envelope or a thinking block,
+    /// and it owns the legal-token mask that nucleus truncation would need.
+    /// Log probabilities are reported only for plain text turns, where every
+    /// generated token belongs to the visible answer.
+    pub(crate) fn validate(&self, has_tools: bool) -> Result<(), String> {
+        if self.max_tokens == Some(0) {
+            return Err("the output token limit must be positive".into());
+        }
+        if let Sampling::Categorical {
+            temperature, top_p, ..
+        } = self.sampling
+        {
+            if !(temperature > 0.0 && temperature <= 2.0) {
+                return Err("temperature must be in [0, 2]".into());
+            }
+            if !(top_p > 0.0 && top_p <= 1.0) {
+                return Err("top_p must be in (0, 1]".into());
+            }
+        }
+        if let Some(top) = self.top_logprobs {
+            if top > MAX_TOP_LOGPROBS {
+                return Err(format!("top_logprobs must be 0..={MAX_TOP_LOGPROBS}"));
+            }
+            if has_tools || self.enable_thinking {
+                return Err("logprobs cannot be combined with tools or reasoning".into());
+            }
+        }
+        if self.json_schema.is_some() {
+            if !cfg!(feature = "structured-output") {
+                return Err(
+                    "JSON schema output requires a server built with the structured-output feature"
+                        .into(),
+                );
+            }
+            if has_tools || self.enable_thinking {
+                return Err("JSON schema output cannot be combined with tools or reasoning".into());
+            }
+            if matches!(self.sampling, Sampling::Categorical { top_p, .. } if top_p < 1.0) {
+                return Err("JSON schema output cannot be combined with top_p below 1".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrows these controls as one chat turn.
+    #[must_use]
+    pub(crate) fn request<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        tools: &'a [Value],
+    ) -> ChatRequest<'a> {
+        ChatRequest {
+            messages,
+            tools,
+            max_tokens: self.max_tokens,
+            enable_thinking: self.enable_thinking,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            sampling: self.sampling,
+            top_logprobs: self.top_logprobs,
+            json_schema: self.json_schema.as_ref(),
+        }
+    }
+}
+
+/// One output token's log probability under the raw (temperature-one) model
+/// distribution, with its most likely alternatives. Probabilities are not
+/// conditioned on sampling truncation or a grammar mask.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct TokenLogprob {
+    /// The token's bytes as lossy UTF-8; a piece of a multi-byte character
+    /// appears as U+FFFD here and exactly in `bytes`.
+    pub(crate) token: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) logprob: f64,
+    pub(crate) top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct TopLogprob {
+    pub(crate) token: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) logprob: f64,
 }
 
 /// Why a chat turn stopped.
@@ -235,6 +367,12 @@ pub(crate) struct ChatGeneration {
     pub(crate) generated_token_ids: Vec<i32>,
     pub(crate) finish_reason: ChatFinishReason,
     pub(crate) metrics: ChatGenerationMetrics,
+    /// One entry per generated token except a final EOS, when requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) logprobs: Vec<TokenLogprob>,
+    /// The seed a sampled turn actually used; `None` for greedy turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) seed: Option<u64>,
 }
 
 /// A cooperative wall-clock budget for one complete chat turn.
@@ -322,6 +460,8 @@ pub(crate) struct ChatSession {
     config_sha256: String,
     tokenizer_sha256: String,
     template_sha256: String,
+    /// Checkpoint directory, read again only to compile a JSON-schema grammar.
+    model: PathBuf,
 }
 
 /// The non-generative result of a single independently-prefilled chat prompt.
@@ -389,6 +529,7 @@ impl ChatSession {
             config_sha256,
             tokenizer_sha256,
             template_sha256,
+            model: model.to_path_buf(),
         })
     }
 
@@ -497,20 +638,10 @@ impl ChatSession {
         let input_ids = self.tokenizer.encode_prompt(&prompt)?;
         deadline.check()?;
         validate_ids(&input_ids, self.eos_token_id, self.vocabulary_size)?;
-        let total_tokens = input_ids
-            .len()
-            .checked_add(request.max_tokens as usize)
-            .ok_or_else(|| {
-                ChatGenerationError::message("chat prompt plus generation budget overflows")
-            })?;
-        if total_tokens > self.context_limit {
-            return Err(ChatGenerationError::message(format!(
-                "chat requires prompt_tokens + max_tokens <= {}; received {} + {} = {total_tokens}",
-                self.context_limit,
-                input_ids.len(),
-                request.max_tokens,
-            )));
-        }
+        let max_tokens = self.output_budget(request.max_tokens, input_ids.len())?;
+        // Compiles a schema grammar before any model work, so a bad schema
+        // fails fast.
+        let mut picker = TokenPicker::new(request, &self.model, self.vocabulary_size)?;
 
         deadline.check()?;
         let mut executor = self
@@ -524,16 +655,20 @@ impl ChatSession {
             .map_err(|error| ChatGenerationError::message(error.to_string()))?;
         let prefill_ms = elapsed_ms(prefill_started.elapsed());
         deadline.check()?;
-        let mut generated = Vec::with_capacity(request.max_tokens as usize);
+        let mut generated = Vec::with_capacity(max_tokens as usize);
+        let mut logprobs = Vec::new();
         let mut emitted = String::new();
         let mut text_decoder = QwenTokenizer::generated_decoder();
         let mut decode_ms = Vec::new();
         let mut ttft = None;
         let mut finish_reason = ChatFinishReason::Length;
 
-        for step in 0..request.max_tokens {
+        for step in 0..max_tokens {
             deadline.check()?;
-            let token = greedy_token(&logits)?;
+            let (token, grammar_complete) = picker.pick(&logits)?;
+            if let Some(top) = request.top_logprobs.filter(|_| token != self.eos_token_id) {
+                logprobs.push(self.token_logprob(&logits, token, top)?);
+            }
             generated.push(token);
             if token == self.eos_token_id {
                 finish_reason = ChatFinishReason::Eos;
@@ -545,8 +680,13 @@ impl ChatSession {
             {
                 emit_delta(&delta, &mut emitted, on_token, &mut ttft, turn_started)?;
             }
+            // A schema can close on an ordinary token, such as a final `}`.
+            if grammar_complete {
+                finish_reason = ChatFinishReason::Eos;
+                break;
+            }
 
-            if step + 1 < request.max_tokens {
+            if step + 1 < max_tokens {
                 deadline.check()?;
                 let decode_started = Instant::now();
                 logits = executor
@@ -568,6 +708,7 @@ impl ChatSession {
             )
         })?;
         emit_delta(remaining, &mut emitted, on_token, &mut ttft, turn_started)?;
+        picker.check_complete_output()?;
         let decode_total_ms = decode_ms.iter().sum();
         let generated_tokens = generated.len();
         deadline.check()?;
@@ -575,6 +716,8 @@ impl ChatSession {
             text,
             generated_token_ids: generated,
             finish_reason,
+            logprobs,
+            seed: picker.seed,
             metrics: ChatGenerationMetrics {
                 context_tokens: self.context_limit,
                 planned_kv_bytes: self.planned_kv_bytes,
@@ -592,6 +735,94 @@ impl ChatSession {
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
         render_template(&self.template, request)
+    }
+
+    /// Resolves the output limit (`None` fills the remaining context) and
+    /// rejects one that cannot fit after the prompt.
+    fn output_budget(
+        &self,
+        requested: Option<u32>,
+        prompt_tokens: usize,
+    ) -> Result<u32, ChatGenerationError> {
+        let max_tokens = match requested {
+            Some(max_tokens) => max_tokens,
+            None => {
+                u32::try_from(self.context_limit.saturating_sub(prompt_tokens)).unwrap_or(u32::MAX)
+            }
+        };
+        if max_tokens == 0 {
+            return Err(ChatGenerationError::message(format!(
+                "chat prompt of {prompt_tokens} tokens leaves no room for output in the {}-token context",
+                self.context_limit,
+            )));
+        }
+        let total_tokens = prompt_tokens
+            .checked_add(max_tokens as usize)
+            .ok_or_else(|| {
+                ChatGenerationError::message("chat prompt plus generation budget overflows")
+            })?;
+        if total_tokens > self.context_limit {
+            return Err(ChatGenerationError::message(format!(
+                "chat requires prompt_tokens + max_tokens <= {}; received {prompt_tokens} + {max_tokens} = {total_tokens}",
+                self.context_limit,
+            )));
+        }
+        Ok(max_tokens)
+    }
+
+    /// Scores `token` and the `top` most likely tokens under the raw logits.
+    fn token_logprob(&self, logits: &[f32], token: i32, top: u8) -> Result<TokenLogprob, String> {
+        let maximum = logits
+            .iter()
+            .map(|&value| f64::from(value))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let log_normalizer = logits
+            .iter()
+            .map(|&value| (f64::from(value) - maximum).exp())
+            .sum::<f64>()
+            .ln();
+        let logprob = |index: usize| f64::from(logits[index]) - maximum - log_normalizer;
+        let selected = usize::try_from(token)
+            .ok()
+            .filter(|&index| index < logits.len())
+            .ok_or_else(|| String::from("selected token is outside model vocabulary"))?;
+        // Padded logit rows past the tokenizer vocabulary have no spelling;
+        // over-select a little so skipping them still leaves `top` entries.
+        let wanted = usize::from(top);
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        let head = (wanted + 8).min(order.len());
+        let by_logit = |left: &usize, right: &usize| {
+            logits[*right]
+                .total_cmp(&logits[*left])
+                .then(left.cmp(right))
+        };
+        if head < order.len() {
+            order.select_nth_unstable_by(head, by_logit);
+            order.truncate(head);
+        }
+        order.sort_unstable_by(by_logit);
+        let top_logprobs = order
+            .into_iter()
+            .filter_map(|index| {
+                let bytes = self
+                    .tokenizer
+                    .token_bytes(i32::try_from(index).ok()?)
+                    .ok()?;
+                Some(TopLogprob {
+                    token: String::from_utf8_lossy(&bytes).into_owned(),
+                    bytes,
+                    logprob: logprob(index),
+                })
+            })
+            .take(wanted)
+            .collect();
+        let bytes = self.tokenizer.token_bytes(token)?;
+        Ok(TokenLogprob {
+            token: String::from_utf8_lossy(&bytes).into_owned(),
+            bytes,
+            logprob: logprob(selected),
+            top_logprobs,
+        })
     }
 }
 
@@ -720,7 +951,7 @@ fn validate_request(request: ChatRequest<'_>) -> Result<(), String> {
             request.tools.len()
         ));
     }
-    if request.max_tokens == 0 {
+    if request.max_tokens == Some(0) {
         return Err(String::from("chat generation budget must be nonempty"));
     }
     let message_bytes = request
@@ -781,6 +1012,105 @@ fn validate_ids(ids: &[i32], eos_token_id: i32, vocabulary_size: usize) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Chooses each output token: greedy, seeded nucleus sampling, or either
+/// under a JSON-schema grammar mask.
+struct TokenPicker {
+    policy: Option<(SamplingPolicy, f64)>,
+    #[cfg(feature = "structured-output")]
+    constraint: Option<crate::qwen_constraints::ConstraintRun>,
+    seed: Option<u64>,
+}
+
+impl TokenPicker {
+    fn new(request: ChatRequest<'_>, model: &Path, vocabulary_size: usize) -> Result<Self, String> {
+        let (policy, seed) = match request.sampling {
+            Sampling::Greedy => (None, None),
+            Sampling::Categorical {
+                temperature,
+                top_p,
+                seed,
+            } => {
+                let seed = seed.unwrap_or_else(fresh_seed);
+                let configuration = SamplingConfiguration { seed, temperature };
+                (
+                    Some((SamplingPolicy::new(configuration, vocabulary_size), top_p)),
+                    Some(seed),
+                )
+            }
+        };
+        #[cfg(feature = "structured-output")]
+        let constraint = request
+            .json_schema
+            .map(|schema| {
+                crate::qwen_constraints::ConstraintRun::load(
+                    model,
+                    crate::qwen_constraints::SchemaSource::Inline(&schema.to_string()),
+                )
+                .map_err(|error| format!("JSON schema could not be compiled: {error}"))
+            })
+            .transpose()?;
+        #[cfg(not(feature = "structured-output"))]
+        if request.json_schema.is_some() {
+            let _ = model;
+            return Err(
+                "JSON schema output requires a server built with the structured-output feature"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            policy,
+            #[cfg(feature = "structured-output")]
+            constraint,
+            seed,
+        })
+    }
+
+    /// Returns the next token and whether it completed the schema grammar.
+    fn pick(&mut self, logits: &[f32]) -> Result<(i32, bool), String> {
+        #[cfg(feature = "structured-output")]
+        if let Some(constraint) = self.constraint.as_mut() {
+            let (token, _) = match self.policy.as_mut() {
+                None => constraint.sample(logits, false),
+                // Validation rejects a constrained top_p below one.
+                Some((policy, _)) => policy.sample_constrained(constraint, logits, false),
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok((token, constraint.is_complete()));
+        }
+        let token = match self.policy.as_mut() {
+            None => greedy_token(logits)?,
+            Some((policy, top_p)) => policy.sample_nucleus(logits, *top_p)?,
+        };
+        Ok((token, false))
+    }
+
+    /// Validates a completed schema output independently of the grammar.
+    #[cfg_attr(
+        not(feature = "structured-output"),
+        allow(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "only schema output has anything to validate"
+        )
+    )]
+    fn check_complete_output(&self) -> Result<(), String> {
+        #[cfg(feature = "structured-output")]
+        if let Some(constraint) = self.constraint.as_ref().filter(|run| run.is_complete()) {
+            constraint
+                .validated_output()
+                .map_err(|error| format!("schema output failed validation: {error}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// A per-turn seed for unseeded sampling, from the standard library's
+/// randomly keyed hasher.
+fn fresh_seed() -> u64 {
+    use std::hash::BuildHasher as _;
+    std::hash::RandomState::new().hash_one(std::time::SystemTime::now())
 }
 
 fn greedy_token(logits: &[f32]) -> Result<i32, String> {

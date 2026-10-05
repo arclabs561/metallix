@@ -122,6 +122,26 @@ impl QwenTokenizer {
         })
     }
 
+    /// The exact bytes one token contributes to decoded text. Added tokens
+    /// (`<think>`, `<|im_end|>`) spell themselves; vocabulary pieces are
+    /// byte-level BPE, so a piece can hold part of a multi-byte character.
+    pub(crate) fn token_bytes(&self, token_id: i32) -> Result<Vec<u8>, String> {
+        let token_id =
+            u32::try_from(token_id).map_err(|_| String::from("generated token ID is negative"))?;
+        if let Some(added) = self.tokenizer.get_added_tokens_decoder().get(&token_id) {
+            return Ok(added.content.clone().into_bytes());
+        }
+        let piece = self
+            .tokenizer
+            .id_to_token(token_id)
+            .ok_or_else(|| String::from("generated token ID is absent from local tokenizer"))?;
+        piece
+            .chars()
+            .map(byte_level_byte)
+            .collect::<Option<Vec<u8>>>()
+            .ok_or_else(|| String::from("tokenizer piece is not byte-level encoded"))
+    }
+
     /// Starts a stateful generated-token decoder for one response stream.
     #[must_use]
     pub(crate) fn generated_decoder() -> QwenIncrementalDecode {
@@ -155,6 +175,18 @@ impl QwenTokenizer {
         )
         .map_err(|_| String::from("generated token IDs could not be decoded by local tokenizer"))
     }
+}
+
+/// Inverts GPT-2's byte-to-character table: printable Latin-1 bytes stand for
+/// themselves and the 68 remaining bytes, in order, for U+0100 onward.
+fn byte_level_byte(character: char) -> Option<u8> {
+    let printable = |byte: u8| matches!(byte, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF);
+    let code = u32::from(character);
+    if let Ok(byte) = u8::try_from(code) {
+        return printable(byte).then_some(byte);
+    }
+    let offset = usize::try_from(code.checked_sub(256)?).ok()?;
+    (0..=u8::MAX).filter(|&byte| !printable(byte)).nth(offset)
 }
 
 /// Reads one bounded local regular file after rechecking the opened descriptor.
@@ -335,5 +367,23 @@ mod tests {
             tokenizer.decode_generated_token(&mut stream, 2),
             Ok(Some(String::from("é")))
         );
+    }
+
+    #[test]
+    fn byte_level_pieces_invert_the_gpt2_byte_table() {
+        use super::byte_level_byte;
+        assert_eq!(byte_level_byte('a'), Some(b'a'));
+        assert_eq!(byte_level_byte('\u{0120}'), Some(b' '));
+        assert_eq!(byte_level_byte('\u{010A}'), Some(b'\n'));
+        assert_eq!(byte_level_byte('\u{00A0}'), None);
+        let all: Vec<u8> = (0..=255_u32)
+            .filter_map(|code| byte_level_byte(char::from_u32(code)?))
+            .chain((256..256 + 68).filter_map(|code| byte_level_byte(char::from_u32(code)?)))
+            .collect();
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, (0..=255).collect::<Vec<u8>>());
+        assert_eq!(byte_level_byte('\u{0144}'), None);
     }
 }
