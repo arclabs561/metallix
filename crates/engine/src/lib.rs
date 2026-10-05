@@ -9,6 +9,7 @@ pub mod kv;
 pub mod lifecycle;
 pub mod sampling;
 pub mod smc;
+pub mod speculative;
 
 use std::num::NonZeroU32;
 
