@@ -118,7 +118,7 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
         let GenerationJob {
             connection,
             work,
-            _admission,
+            _admission: admission,
         } = job;
         match work {
             Work::Respond {
@@ -128,6 +128,7 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
                 id,
                 generation_timeout,
             } => {
+                let _admission = admission;
                 // Routing admits only models that declare generation.
                 let Some(session) = worker.chat() else {
                     unsupported_response(connection, "generate");
@@ -145,14 +146,22 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
                     eprintln!("response failed: {error}");
                 }
             }
-            Work::Decide { body, model } => match worker.decide(&body, &model) {
-                Some(Ok(receipt)) => json_response(connection, 200, &receipt),
-                Some(Err(error)) => {
-                    json_response(connection, 400, &json!({"error":{"message":error}}));
-                }
-                None => unsupported_response(connection, "decide"),
-            },
+            Work::Decide { body, model } => {
+                let outcome = worker.decide(&body, &model);
+                // Free the model before answering, so a client that sends its
+                // next request as soon as this one completes is not refused.
+                drop(admission);
+                body_response(connection, outcome, "decide");
+            }
         }
+    }
+}
+
+fn body_response(connection: Connection, outcome: Option<Result<Value, String>>, capability: &str) {
+    match outcome {
+        Some(Ok(value)) => json_response(connection, 200, &value),
+        Some(Err(error)) => json_response(connection, 400, &json!({"error":{"message":error}})),
+        None => unsupported_response(connection, capability),
     }
 }
 
@@ -1296,6 +1305,71 @@ stream.close()
             let request: Value = serde_json::from_slice(body).expect("decision JSON");
             Some(Ok(json!({"model": model, "state": request["state"]})))
         }
+    }
+
+    /// Answers with a receipt larger than the socket buffers, so writing it
+    /// blocks until the client reads.
+    struct LargeDecider;
+
+    impl ModelWorker for LargeDecider {
+        fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+            None
+        }
+
+        fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+            Some(Ok(json!({"padding": "x".repeat(16 * 1024 * 1024)})))
+        }
+    }
+
+    #[test]
+    fn a_model_is_free_before_its_decision_response_begins() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (jobs, receiver) = sync_channel(0);
+        let worker = thread::spawn(move || model_worker_loop(&mut LargeDecider, receiver));
+        let occupied = Arc::new(AtomicBool::new(false));
+        let models = [ServedModel {
+            id: "julia".into(),
+            generates: false,
+            capabilities: &["decide"],
+            jobs,
+            occupied: Arc::clone(&occupied),
+            alive: Arc::new(AtomicBool::new(true)),
+        }];
+        let server = thread::spawn(move || {
+            serve_models(
+                &listener,
+                &models,
+                Duration::from_secs(2),
+                TransportLimits::default(),
+                Some(1),
+            )
+        });
+        let body = r#"{"model":"julia","state":"s","questions":{}}"#;
+        let mut stream = TcpStream::connect(address).expect("connect");
+        write!(
+            stream,
+            "POST /v1/decisions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("request");
+        stream.shutdown(Shutdown::Write).expect("half-close");
+        // The worker is now blocked writing the rest. The next request must
+        // already be admissible; otherwise a client that sends it as soon as
+        // this response completes races the release and is refused as busy.
+        let mut first = [0_u8; 1];
+        stream.read_exact(&mut first).expect("first response byte");
+        assert!(
+            !occupied.load(Ordering::Acquire),
+            "admission held while responding"
+        );
+        let mut rest = Vec::new();
+        stream.read_to_end(&mut rest).expect("response");
+        server
+            .join()
+            .expect("join acceptor")
+            .expect("acceptor result");
+        worker.join().expect("join worker");
     }
 
     #[test]
