@@ -50,6 +50,45 @@ Each question receives fresh KV state; the model weights remain loaded within
 one invocation. Checkpoint weights are not fingerprinted in the receipt;
 configuration, tokenizer, template, and request bytes are fingerprinted.
 
+## Serving decisions over HTTP
+
+`mx serve` answers the same requests at `POST /v1/decisions`, for Qwen and for
+Julia-1 (`mx decide-julia`), with the target model named in the body:
+
+```json
+{"models": [
+  {"id": "julia-1", "kind": "julia", "path": "/path/to/Julia-1"},
+  {"id": "qwen", "kind": "qwen", "path": "/path/to/local/Qwen3"}
+]}
+```
+
+```sh
+mx serve --registry models.json
+curl -s localhost:8321/v1/decisions -d '{"model": "julia-1", "state": {"color": "blue"},
+  "questions": {"color": {"type": "choice", "instructions": "Select the color stated in the input.",
+  "criteria": {"blue": "Blue", "red": "Red"}}}}'
+```
+
+The response is the receipt the matching command prints, labelled with the
+registered ID instead of a directory; its `request_sha256` covers the HTTP body,
+which includes `model`. An opt-in test finds the served and command receipts
+identical apart from timing, that label and that hash. `GET /v1/models` lists
+each model's capabilities.
+
+- Qwen decisions over HTTP always use temperature 1, the `mx decide` default;
+  the body has no temperature field.
+- The two models keep their own option semantics: Qwen orders choice IDs
+  lexicographically and applies the temperature; Julia keeps caller order and a
+  plain softmax.
+- Each model admits one request at a time, so a Julia decision runs while a
+  Qwen generation is in progress. Admission is checked after the request is
+  read, because the body names the model. As a result `/healthz` and
+  `/v1/models` answer while a model is busy, and a malformed body sent to a
+  busy server gets 400 rather than 503.
+- Errors: an unknown model returns 404, a model without the capability returns
+  400 `unsupported_capability`, a busy model returns 503 `server_busy`, and a
+  request the model rejects returns 400 with its message.
+
 ## Flattened hierarchies
 
 A `choice` can represent a hierarchy by using full leaf paths as option IDs:

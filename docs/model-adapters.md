@@ -171,11 +171,19 @@ and memory gates rather than support implied by an inference adapter.
 
 Proposal, extending step 3. Metallix should serve generation, decision and
 embedding models from one `mx serve` process, so a client sees one model list
-and one set of routes. Today `mx serve` loads one Qwen `ChatSession` and
-answers `/healthz`, `/v1/models` and `/v1/responses`; typed decisions exist only
-as the `mx decide` (Qwen) and `mx decide-julia` commands. The principles above
-still hold: adapters own graphs and state, the server only routes typed
-requests, and every advertised capability names a qualification receipt.
+and one set of routes. The principles above still hold: adapters own graphs
+and state, the server only routes typed requests, and every advertised
+capability names a qualification receipt.
+
+Status: step 1 below is delivered. `mx serve --registry models.json` loads
+`{"models": [{"id", "kind", "path"}]}` entries of kind `qwen` (generate and
+decide) or `julia` (decide) at startup; `--model PATH` remains a one-entry Qwen
+shorthand. `/v1/models` lists each entry with its capabilities and
+`/v1/decisions` returns the same receipt as `mx decide` or `mx decide-julia`
+(see [typed decisions](typed-decisions.md#serving-decisions-over-http)). Each
+model has its own worker and admission flag. Capabilities follow the model
+kind; per-capability receipts in the manifest, on-demand loading and eviction
+remain open.
 
 ### Registry
 
@@ -259,8 +267,8 @@ reference to port, never code the server executes.
 
 ### Sequence and gates
 
-1. Registry plus `/v1/models` plus `/v1/decisions` for Qwen decide and Julia.
-   Gate: decision receipts over HTTP equal the CLI receipts for the same
+1. Delivered: registry plus `/v1/models` plus `/v1/decisions` for Qwen decide
+   and Julia. Gate: decision receipts over HTTP equal the CLI receipts for the same
    request (Julia: the six reference requests); existing `/v1/responses` tests
    pass unchanged; a Julia request completes while a Qwen request is busy.
 2. On-demand loading and eviction. Gate: measured resident memory stays under
