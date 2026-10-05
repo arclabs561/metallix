@@ -236,3 +236,91 @@ class Sampler:
             **{f"peak_{key}": value for key, value in self.peaks.items()},
             "aborted": self.aborted,
         }
+
+
+# ---------------------------------------------------------------------------
+# Idle gate
+
+# Compilers from other jobs on the machine; one running skews every arm.
+BUILD_PROCESSES = ("cargo", "rustc")
+
+
+def parse_power_source(text: str) -> str | None:
+    """The source `pmset -g batt` reports: 'AC Power' or 'Battery Power'."""
+    match = re.search(r"Now drawing from '([^']+)'", text)
+    return match.group(1) if match else None
+
+
+def parse_thermal_warnings(text: str) -> list[str]:
+    """Lines of `pmset -g therm` that report throttling.
+
+    A cool machine prints only "Note: No ... has been recorded" lines. A
+    recorded thermal or performance warning level, or a CPU speed or scheduler
+    limit under 100, counts as a warning.
+    """
+    warnings = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Note: No "):
+            continue
+        limit = re.match(r"CPU_(Speed|Scheduler)_Limit\s*=\s*(\d+)", line)
+        if limit:
+            if int(limit.group(2)) < 100:
+                warnings.append(line)
+        elif "warning level" in line.lower():
+            warnings.append(line)
+    return warnings
+
+
+def build_processes(ps_text: str) -> list[str]:
+    """Running compilers, from `ps -axo comm=` (full executable paths)."""
+    return sorted(
+        {
+            Path(line.strip()).name
+            for line in ps_text.splitlines()
+            if Path(line.strip()).name in BUILD_PROCESSES
+        }
+    )
+
+
+def idle_readings(gpu_samples: int = 5, interval: float = 1.0) -> dict:
+    """Everything the idle gate looks at, recorded with the arm it gates."""
+    utilization = []
+    for index in range(gpu_samples):
+        if index:
+            time.sleep(interval)
+        utilization.append(
+            parse_gpu_stats(
+                command_output(["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"])
+            )["utilization_pct"]
+        )
+    return {
+        "load_1m": round(os.getloadavg()[0], 2),
+        "build_processes": build_processes(command_output(["ps", "-axo", "comm="])),
+        "power_source": parse_power_source(command_output(["pmset", "-g", "batt"])),
+        "thermal_warnings": parse_thermal_warnings(
+            command_output(["pmset", "-g", "therm"])
+        ),
+        "gpu_utilization_pct": utilization,
+    }
+
+
+def idle_failures(
+    readings: dict, max_load: float = 2.0, max_gpu_pct: int = 5
+) -> list[str]:
+    """Why the machine is not idle enough to measure; empty when it is."""
+    failures = []
+    if readings["load_1m"] >= max_load:
+        failures.append(f"1-min load {readings['load_1m']} >= {max_load:g}")
+    if readings["build_processes"]:
+        failures.append(f"running: {', '.join(readings['build_processes'])}")
+    if readings["power_source"] != "AC Power":
+        failures.append(f"power source {readings['power_source']!r}, not AC")
+    if readings["thermal_warnings"]:
+        failures.append(f"thermal: {'; '.join(readings['thermal_warnings'])}")
+    gpu = readings["gpu_utilization_pct"]
+    if not gpu or any(value is None for value in gpu):
+        failures.append("GPU utilization unavailable")
+    elif max(gpu) > max_gpu_pct:
+        failures.append(f"GPU utilization up to {max(gpu)}% > {max_gpu_pct}%")
+    return failures

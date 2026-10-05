@@ -108,5 +108,72 @@ class SamplerPeaks(unittest.TestCase):
         self.assertIsNone(sampler.aborted)
 
 
+# `pmset -g therm` on a cool machine (recorded with VM_STAT above).
+THERM_COOL = """\
+Note: No thermal warning level has been recorded
+Note: No performance warning level has been recorded
+Note: No CPU power status has been recorded
+"""
+# Throttled forms, written from pmset's output format, not recorded here.
+THERM_HOT = """\
+Note: No thermal warning level has been recorded
+Performance warning level has been recorded: 1
+CPU Power notify
+\tCPU_Scheduler_Limit \t= 100
+\tCPU_Available_CPUs \t= 16
+\tCPU_Speed_Limit \t= 71
+"""
+
+
+class IdleGate(unittest.TestCase):
+    def readings(self, **overrides):
+        idle = {
+            "load_1m": 0.8,
+            "build_processes": [],
+            "power_source": "AC Power",
+            "thermal_warnings": [],
+            "gpu_utilization_pct": [0, 1, 0, 2, 0],
+        }
+        return idle | overrides
+
+    def test_power_thermal_and_process_parsers(self) -> None:
+        battery = "Now drawing from 'Battery Power'\n -InternalBattery-0 46%;"
+        self.assertEqual(bench_system.parse_power_source(battery), "Battery Power")
+        self.assertEqual(
+            bench_system.parse_power_source("Now drawing from 'AC Power'\n"),
+            "AC Power",
+        )
+        self.assertEqual(bench_system.parse_thermal_warnings(THERM_COOL), [])
+        self.assertEqual(
+            bench_system.parse_thermal_warnings(THERM_HOT),
+            [
+                "Performance warning level has been recorded: 1",
+                "CPU_Speed_Limit \t= 71",
+            ],
+        )
+        ps = "/usr/bin/zsh\n/opt/rust/bin/rustc\ncargo\nrustc-wrapper\n"
+        self.assertEqual(bench_system.build_processes(ps), ["cargo", "rustc"])
+
+    def test_an_idle_machine_passes(self) -> None:
+        self.assertEqual(bench_system.idle_failures(self.readings()), [])
+
+    def test_each_condition_fails_on_its_own(self) -> None:
+        cases = {
+            "1-min load 2.0 >= 2": {"load_1m": 2.0},
+            "running: cargo": {"build_processes": ["cargo"]},
+            "power source 'Battery Power', not AC": {"power_source": "Battery Power"},
+            "thermal: CPU_Speed_Limit = 71": {
+                "thermal_warnings": ["CPU_Speed_Limit = 71"]
+            },
+            "GPU utilization up to 29% > 5%": {"gpu_utilization_pct": [0, 29, 0]},
+            "GPU utilization unavailable": {"gpu_utilization_pct": [0, None]},
+        }
+        for expected, override in cases.items():
+            with self.subTest(expected):
+                self.assertEqual(
+                    bench_system.idle_failures(self.readings(**override)), [expected]
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

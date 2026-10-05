@@ -826,10 +826,27 @@ def server_spec(
             {"model": "default_model"},
             env_python_versions(env, ["mlx-lm", "mlx"]),
         )
+    if name in STUB_TPOT_MS:
+        return ServerSpec(
+            name,
+            "chat",
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "bench_stub_server.py"),
+                "--listen",
+                address,
+                "--tpot-ms",
+                str(STUB_TPOT_MS[name]),
+            ],
+            {},
+            {"stub": "dry run, no model"},
+        )
     raise ValueError(f"unknown server {name!r}")
 
 
-SERVERS = ("metallix", "vllm-metal", "mtplx", "mlx-lm")
+# Model-free servers for dry runs of the harness, at two fixed speeds.
+STUB_TPOT_MS = {"stub": 2.0, "stub-slow": 4.0}
+SERVERS = ("metallix", "vllm-metal", "mtplx", "mlx-lm", *STUB_TPOT_MS)
 
 # Flags that force each server's prompt-prefix cache on or off, so shared-prefix
 # results can be attributed to cache reuse or to the engine itself. MTPLX has
@@ -842,6 +859,10 @@ PREFIX_CACHE_FLAGS = {
     },
     # mlx-lm evicts as soon as its LRU holds more than this many caches.
     "mlx-lm": {"on": [], "off": ["--prompt-cache-size", "0"]},
+    **{
+        stub: {"on": ["--prefix-cache", "on"], "off": ["--prefix-cache", "off"]}
+        for stub in STUB_TPOT_MS
+    },
 }
 CACHE_ARMS = ("default", "on", "off")
 
@@ -1148,6 +1169,15 @@ def render(report: dict) -> str:
     return "\n".join(lines)
 
 
+def idle_gate() -> dict:
+    """The campaign's idle gate, recorded (not enforced) before a load run."""
+    readings = bench_system.idle_readings()
+    failures = bench_system.idle_failures(readings)
+    for failure in failures:
+        print(f"warning: machine not idle: {failure}", flush=True)
+    return {"readings": readings, "failures": failures}
+
+
 def gib(value: float | None) -> float | None:
     return None if value is None else value / 2**30
 
@@ -1163,8 +1193,9 @@ def floats(text: str) -> list[float]:
     return [float(part) for part in text.split(",") if part]
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.ArgumentParser:
+    """Every option of a load run; the campaign driver adds its own to these."""
+    parser = argparse.ArgumentParser(description=description)
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--server", help=f"comma-separated, from {', '.join(SERVERS)}")
     target.add_argument("--url", help="an already running server (no start or stop)")
@@ -1239,7 +1270,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", type=Path, help="write the full report here")
     parser.add_argument("--log-dir", type=Path, default=ENVS / "logs")
-    args = parser.parse_args()
+    return parser
+
+
+def prompt_sets(parser: argparse.ArgumentParser, args) -> list[str]:
+    """Check --sets against --prompts-file and load the file into args."""
     sets = [name for name in args.sets.split(",") if name]
     for name in sets:
         if name not in PROMPT_SETS:
@@ -1249,7 +1284,13 @@ def main() -> int:
     args.file_prompts = (
         load_prompts_file(args.prompts_file) if args.prompts_file else []
     )
+    return sets
 
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    sets = prompt_sets(parser, args)
     count_tokens = tokenizer_counter(args.model_path)
     report = {
         "machine": f"{platform.machine()} {platform.platform()} "
@@ -1270,6 +1311,7 @@ def main() -> int:
             "attainment": ATTAINMENT_GOAL,
         },
         "system": bench_system.system_info(),
+        "idle_gate": idle_gate(),
         "load_before": load_average(),
         "servers": [],
     }
