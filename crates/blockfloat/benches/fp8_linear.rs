@@ -1,7 +1,7 @@
 //! Scalar `fp8_linear_runtime_f32` at DeepSeek-V4.1 Flash projection shapes.
 //!
-//! G32 activations, `rows` of 1 (one decode token) and 3 (one short prefill
-//! step):
+//! G32 activations, `rows` of 1 (one decode token) and 17 (the 17-token
+//! teacher-forced prefill the end-to-end profile uses):
 //! - `shared_expert_w1`: 5120 -> 2304 (`w3` has the same shape).
 //! - `shared_expert_w2`: 2304 -> 5120.
 //! - `wq_b`: `q_lora_rank` 1280 -> 64 heads x 512 = 32768.
@@ -81,17 +81,17 @@ fn run(bencher: divan::Bencher, problem: &Problem) {
     });
 }
 
-#[divan::bench(args = [1, 3], sample_count = 10)]
+#[divan::bench(args = [1, 17], sample_count = 10)]
 fn shared_expert_w1(bencher: divan::Bencher, rows: usize) {
     run(bencher, &problem(rows, 5120, 2304));
 }
 
-#[divan::bench(args = [1, 3], sample_count = 10)]
+#[divan::bench(args = [1, 17], sample_count = 10)]
 fn shared_expert_w2(bencher: divan::Bencher, rows: usize) {
     run(bencher, &problem(rows, 2304, 5120));
 }
 
-#[divan::bench(args = [1, 3], sample_count = 10)]
+#[divan::bench(args = [1, 17], sample_count = 10)]
 fn wq_b(bencher: divan::Bencher, rows: usize) {
     run(bencher, &problem(rows, 1280, 32768));
 }
