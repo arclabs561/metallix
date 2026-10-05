@@ -32,6 +32,7 @@ mod julia_decisions;
 mod model_registry;
 #[cfg(feature = "metal")]
 mod qwen_decisions;
+pub mod range_fetch;
 #[cfg(feature = "metal")]
 mod responses;
 
