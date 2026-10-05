@@ -10,17 +10,20 @@ use crate::{
     chat_generation::{ChatBackend, ChatSession, ResidentChatLimits},
     julia_decisions::JuliaDecider,
     qwen_decisions,
+    qwen_embeddings::QwenEmbedder,
 };
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ModelKind {
     /// Qwen3 checkpoint: `/v1/responses` generation and `/v1/decisions`.
     Qwen,
     /// Julia-1 checkpoint on the native CPU path: `/v1/decisions` only.
     Julia,
+    /// Qwen3-Embedding checkpoint: `/v1/embeddings` only.
+    QwenEmbedding,
 }
 
 impl ModelKind {
@@ -32,6 +35,7 @@ impl ModelKind {
         match self {
             Self::Qwen => &["generate", "decide"],
             Self::Julia => &["decide"],
+            Self::QwenEmbedding => &["embed"],
         }
     }
 }
@@ -147,6 +151,10 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<ServedEntry>, String> {
 pub(crate) trait ModelWorker {
     fn chat(&mut self) -> Option<&mut dyn ChatBackend>;
     fn decide(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>>;
+
+    fn embed(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
 }
 
 impl ModelWorker for ChatSession {
@@ -169,6 +177,20 @@ impl ModelWorker for JuliaDecider {
     }
 }
 
+impl ModelWorker for QwenEmbedder {
+    fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+        None
+    }
+
+    fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
+
+    fn embed(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+        Some(QwenEmbedder::embed(self, body, model))
+    }
+}
+
 pub(crate) fn load(
     entry: &ServedEntry,
     limits: ResidentChatLimits,
@@ -176,6 +198,7 @@ pub(crate) fn load(
     Ok(match entry.kind {
         ModelKind::Qwen => Box::new(ChatSession::load(&entry.path, limits)?),
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
+        ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
     })
 }
 

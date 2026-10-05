@@ -91,6 +91,10 @@ enum Work {
         body: Vec<u8>,
         model: String,
     },
+    Embed {
+        body: Vec<u8>,
+        model: String,
+    },
 }
 
 /// Adapts a generation-only test backend to the worker loop.
@@ -152,6 +156,11 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
                 // next request as soon as this one completes is not refused.
                 drop(admission);
                 body_response(connection, outcome, "decide");
+            }
+            Work::Embed { body, model } => {
+                let outcome = worker.embed(&body, &model);
+                drop(admission);
+                body_response(connection, outcome, "embed");
             }
         }
     }
@@ -409,7 +418,7 @@ fn serve_models(
                 continue;
             }
         };
-        let generation = match (request.method.as_str(), request.path.as_str()) {
+        let capability = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
                 json_response(connection, 200, &json!({"status":"ready"}));
                 continue;
@@ -422,8 +431,9 @@ fn serve_models(
                 json_response(connection, 200, &json!({"object":"list","data":data}));
                 continue;
             }
-            ("POST", "/v1/responses") => true,
-            ("POST", "/v1/decisions") => false,
+            ("POST", "/v1/responses") => "generate",
+            ("POST", "/v1/decisions") => "decide",
+            ("POST", "/v1/embeddings") => "embed",
             _ => {
                 json_response(
                     connection,
@@ -433,6 +443,7 @@ fn serve_models(
                 continue;
             }
         };
+        let generation = capability == "generate";
         let parsed = if generation {
             serde_json::from_slice::<Request>(&request.body)
                 .map(|parsed| (parsed.model.clone(), Some(parsed)))
@@ -481,13 +492,15 @@ fn serve_models(
                 generation_timeout,
             }
         } else {
-            if !model.capabilities.contains(&"decide") {
-                unsupported_response(connection, "decide");
+            if !model.capabilities.contains(&capability) {
+                unsupported_response(connection, capability);
                 continue;
             }
-            Work::Decide {
-                body: request.body,
-                model: model_id,
+            let (body, model) = (request.body, model_id);
+            if capability == "decide" {
+                Work::Decide { body, model }
+            } else {
+                Work::Embed { body, model }
             }
         };
         let Some(admission) = Admission::try_acquire(&model.occupied) else {
@@ -1307,6 +1320,24 @@ stream.close()
         }
     }
 
+    /// Answers embeddings with a fixed response naming the requested model.
+    struct FixedEmbedder;
+
+    impl ModelWorker for FixedEmbedder {
+        fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+            None
+        }
+
+        fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+            None
+        }
+
+        fn embed(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+            let request: Value = serde_json::from_slice(body).expect("embedding JSON");
+            Some(Ok(json!({"model": model, "input": request["input"]})))
+        }
+    }
+
     /// Answers with a receipt larger than the socket buffers, so writing it
     /// blocks until the client reads.
     struct LargeDecider;
@@ -1370,6 +1401,88 @@ stream.close()
             .expect("join acceptor")
             .expect("acceptor result");
         worker.join().expect("join worker");
+    }
+
+    #[test]
+    fn embeddings_route_only_to_models_that_embed() {
+        fn post(address: std::net::SocketAddr, path: &str, body: &str) -> (u16, Value) {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            write!(
+                stream,
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("request");
+            stream.shutdown(Shutdown::Write).expect("half-close");
+            let (status, body) = fixed_http_response(&mut stream);
+            (
+                status,
+                serde_json::from_slice(&body).expect("response JSON"),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (embed_jobs, embed_receiver) = sync_channel(0);
+        let (decide_jobs, decide_receiver) = sync_channel(0);
+        let embedder = thread::spawn(move || model_worker_loop(&mut FixedEmbedder, embed_receiver));
+        let decider = thread::spawn(move || model_worker_loop(&mut FixedDecider, decide_receiver));
+        let model = |id: &str, capabilities, jobs| ServedModel {
+            id: id.into(),
+            generates: false,
+            capabilities,
+            jobs,
+            occupied: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        let models = [
+            model("embedder", &["embed"], embed_jobs),
+            model("julia", &["decide"], decide_jobs),
+        ];
+        let server = thread::spawn(move || {
+            serve_models(
+                &listener,
+                &models,
+                Duration::from_secs(2),
+                TransportLimits::default(),
+                Some(3),
+            )
+        });
+
+        let (status, response) = post(
+            address,
+            "/v1/embeddings",
+            r#"{"model":"embedder","input":"x"}"#,
+        );
+        assert_eq!(
+            (status, response),
+            (200, json!({"model":"embedder","input":"x"}))
+        );
+        let (status, error) = post(
+            address,
+            "/v1/embeddings",
+            r#"{"model":"julia","input":"x"}"#,
+        );
+        assert_eq!(
+            (status, &error["error"]["code"]),
+            (400, &json!("unsupported_capability"))
+        );
+        let (status, error) = post(
+            address,
+            "/v1/decisions",
+            r#"{"model":"embedder","state":"s","questions":{}}"#,
+        );
+        assert_eq!(
+            (status, &error["error"]["code"]),
+            (400, &json!("unsupported_capability"))
+        );
+
+        server
+            .join()
+            .expect("join acceptor")
+            .expect("acceptor result");
+        embedder.join().expect("join embedder");
+        decider.join().expect("join decider");
     }
 
     #[test]
