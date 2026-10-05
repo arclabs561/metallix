@@ -444,6 +444,7 @@ impl MetalBf16Head {
         })?;
         let columns =
             i32::try_from(width).map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
+        let _device = crate::device_lock();
         let stream = StreamOrDevice::gpu();
         let mut blocks = Vec::new();
         for block in weights.chunks(METAL_HEAD_CHUNK_ROWS * width) {
@@ -482,6 +483,7 @@ impl MetalBf16Head {
         }
         let columns = i32::try_from(self.width)
             .map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
+        let _device = crate::device_lock();
         let stream = StreamOrDevice::gpu();
         let input = Array::from_slice(input, &[columns, 1]);
         let parts = self
@@ -588,6 +590,7 @@ fn project_logits_metal(
     })?;
     let columns =
         i32::try_from(width).map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
+    let _device = crate::device_lock();
     let stream = StreamOrDevice::gpu();
     let weights = Array::from_slice(weights, &[rows, columns]);
     let input = Array::from_slice(input, &[columns, 1]);

@@ -266,6 +266,7 @@ pub fn index_scores_bf16_metal(
     let heads = metal_dimension(shape.heads, "heads")?;
     let positions = metal_dimension(shape.positions, "positions")?;
     let dimension = metal_dimension(shape.dimension, "head dimension")?;
+    let _device = crate::device_lock();
     let stream = StreamOrDevice::gpu();
     let query = metal_bf16_array(query, &[heads, dimension], &stream)?;
     let keys = metal_bf16_array(keys, &[positions, dimension], &stream)?;

@@ -47,9 +47,69 @@ pub use startup::{
     startup_selected_bf16_reference,
 };
 
+/// Serializes this crate's MLX device work across threads.
+///
+/// MLX encodes onto a shared default stream; two threads encoding at once
+/// crash the Metal driver. The lock is re-entrant per thread, so a holder can
+/// call code that locks again (a test holding it while running a routed forward).
+#[cfg(feature = "metal")]
+pub(crate) static DEVICE_LOCK: DeviceLock = DeviceLock(std::sync::Mutex::new(()));
+
 // MLX's native test operations share process-global device initialization.
 #[cfg(all(test, feature = "metal"))]
-pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use DEVICE_LOCK as GPU_TEST_LOCK;
+
+#[cfg(feature = "metal")]
+thread_local! {
+    static DEVICE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`DEVICE_LOCK`].
+#[cfg(feature = "metal")]
+pub(crate) struct DeviceLock(std::sync::Mutex<()>);
+
+/// Releases [`DEVICE_LOCK`] if this guard took it, rather than re-entering.
+#[cfg(feature = "metal")]
+pub(crate) struct DeviceGuard(Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(feature = "metal")]
+impl DeviceLock {
+    /// Takes the lock, or returns an empty guard when this thread holds it.
+    pub(crate) fn lock(&'static self) -> std::sync::LockResult<DeviceGuard> {
+        if DEVICE_HELD.get() {
+            return Ok(DeviceGuard(None));
+        }
+        let (guard, poisoned) = match self.0.lock() {
+            Ok(guard) => (guard, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        DEVICE_HELD.set(true);
+        let guard = DeviceGuard(Some(guard));
+        if poisoned {
+            Err(std::sync::PoisonError::new(guard))
+        } else {
+            Ok(guard)
+        }
+    }
+}
+
+/// Takes [`DEVICE_LOCK`] for the rest of the caller's scope, ignoring poison:
+/// a panic elsewhere leaves no partially applied device state to protect.
+#[cfg(feature = "metal")]
+pub(crate) fn device_lock() -> DeviceGuard {
+    DEVICE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(feature = "metal")]
+impl Drop for DeviceGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            DEVICE_HELD.set(false);
+        }
+    }
+}
 
 use serde::Deserialize;
 use thiserror::Error;

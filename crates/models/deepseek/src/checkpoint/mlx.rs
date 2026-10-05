@@ -419,6 +419,7 @@ pub fn collapse_hc_hidden(
 /// Converts one decoded row to an MLX array and evaluates it on the device.
 #[cfg(feature = "metal")]
 pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+    let _device = crate::device_lock();
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
@@ -442,6 +443,7 @@ pub fn apply_affine_matrix_mlx(
     width: usize,
     input: &[f32],
 ) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
+    let _device = crate::device_lock();
     assert_eq!(matrix.len(), rows * width, "matrix shape");
     assert_eq!(input.len(), width, "input shape");
     #[allow(
@@ -1309,6 +1311,7 @@ impl LayerZeroQkvResident {
             norm: &[f32],
             epsilon: f32,
         ) -> Result<Vec<f32>, MlxAffineRowError> {
+            let _device = crate::device_lock();
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_possible_wrap,

@@ -466,6 +466,7 @@ pub fn rotate_tail_metal(
         .iter()
         .map(|frequency| frequency.imaginary)
         .collect::<Vec<_>>();
+    let _device = crate::device_lock();
     let stream = StreamOrDevice::gpu();
     let values = Array::from_slice(values, &[batches, positions, heads, pairs, 2]);
     let real = values.try_index_device((.., .., .., .., 0_i32), &stream)?;

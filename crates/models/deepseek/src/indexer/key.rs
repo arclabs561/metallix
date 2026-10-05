@@ -669,6 +669,7 @@ fn prepare_index_key_stages_metal(
     let positions = i32::try_from(shape.positions).expect("bounded positions fit MLX dimensions");
     let pairs =
         i32::try_from(layout.rope_pairs.get()).expect("bounded RoPE pairs fit MLX dimensions");
+    let _device = crate::device_lock();
     let prefix = key_dim - pairs * 2;
     let stream = StreamOrDevice::gpu();
     let latent = Array::from_slice(latent, &[rows, latent_dim])

@@ -83,6 +83,10 @@ pub enum SparseAttentionMetalError {
 /// reduces probabilities against the same gathered KV. All-masked rows remain
 /// zero without submitting an undefined softmax. The precision envelope is
 /// deliberately narrower than the CPU FP64 mathematical reference.
+#[allow(
+    clippy::too_many_lines,
+    reason = "validation, host gather and the device loop share one lock scope"
+)]
 pub fn sparse_attention_metal_f32(
     query: &[f32],
     shared_kv: &[f32],
@@ -134,6 +138,7 @@ pub fn sparse_attention_metal_f32(
             elements: output_len,
         }
     })?;
+    let _device = crate::device_lock();
     output.resize(output_len, 0.0);
     let stream = StreamOrDevice::gpu();
 

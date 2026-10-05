@@ -104,6 +104,7 @@ pub fn index_scores_f32(
     let heads_i32 = as_i32(heads, "heads")?;
     let positions_i32 = as_i32(positions, "positions")?;
     let dim_i32 = as_i32(head_dim.get(), "head_dim")?;
+    let _device = crate::device_lock();
     let stream = StreamOrDevice::gpu();
     let query = Array::from_slice(query, &[heads_i32, dim_i32]);
     let keys = Array::from_slice(keys, &[positions_i32, dim_i32]);
