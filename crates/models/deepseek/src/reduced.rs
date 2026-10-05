@@ -77,7 +77,7 @@ use crate::{
 };
 
 #[cfg(feature = "metal")]
-use mlx_rs::{Array, StreamOrDevice, ops::concatenate_device};
+use mlx_rs::{Array, Dtype, StreamOrDevice, ops::concatenate_device};
 
 /// Output-projection implementation selected by a model-local final head.
 ///
@@ -372,8 +372,8 @@ impl<'a> FinalHead<'a> {
     }
 }
 
-/// Head rows widened and uploaded together: 8192 rows of a 5120-wide head
-/// are 168 MB of FP32, the largest host buffer an upload needs.
+/// Head rows uploaded and widened together: 8192 rows of a 5120-wide head
+/// are an 84 MB BF16 staging copy and a 168 MB FP32 block.
 #[cfg(feature = "metal")]
 const METAL_HEAD_CHUNK_ROWS: usize = 8192;
 
@@ -412,8 +412,8 @@ impl std::fmt::Debug for MetalBf16Head {
 #[cfg(feature = "metal")]
 impl MetalBf16Head {
     /// Validates `weights` like [`FinalHead::with_weights`] does for
-    /// [`HeadWeights::Bf16`], then widens and uploads them to the GPU in
-    /// blocks of rows.
+    /// [`HeadWeights::Bf16`], then uploads them to the GPU and widens them
+    /// there in blocks of rows.
     pub fn new(weights: &[u16], vocabulary: usize, width: usize) -> Result<Self, FinalHeadError> {
         if width == 0 {
             return Err(FinalHeadError::EmptyWidth);
@@ -436,10 +436,7 @@ impl MetalBf16Head {
                 expected,
             });
         }
-        if let Some(element) = weights
-            .iter()
-            .position(|&bits| !bf16_to_f32(bits).is_finite())
-        {
+        if let Some(element) = first_non_finite_bf16(weights) {
             return Err(FinalHeadError::NonFiniteHeadWeight { element });
         }
         i32::try_from(vocabulary).map_err(|_| FinalHeadError::MetalDimension {
@@ -447,18 +444,22 @@ impl MetalBf16Head {
         })?;
         let columns =
             i32::try_from(width).map_err(|_| FinalHeadError::MetalDimension { field: "width" })?;
-        let block_rows = METAL_HEAD_CHUNK_ROWS.min(vocabulary);
-        let mut widened = allocate_f32("metal_head_block", block_rows * width)?;
+        let stream = StreamOrDevice::gpu();
         let mut blocks = Vec::new();
-        for block in weights.chunks(block_rows * width) {
-            widened.clear();
-            widened.extend(block.iter().copied().map(bf16_to_f32));
+        for block in weights.chunks(METAL_HEAD_CHUNK_ROWS * width) {
             let rows =
                 i32::try_from(block.len() / width).map_err(|_| FinalHeadError::MetalDimension {
                     field: "vocabulary",
                 })?;
-            // `from_slice` copies into MLX-owned memory, so `widened` is reused.
-            blocks.push(Array::from_slice(&widened, &[rows, columns]));
+            // Upload BF16 and widen on the GPU (exact, like `bf16_to_f32`):
+            // half the bytes copied, and no host FP32 buffer. Evaluating per
+            // block releases each BF16 staging copy before the next upload.
+            let widened = Array::from_slice(block, &[rows, columns])
+                .view_dtype_device(Dtype::Bfloat16, &stream)
+                .and_then(|bf16| bf16.as_dtype_device(Dtype::Float32, &stream))
+                .map_err(metal_error)?;
+            widened.eval().map_err(metal_error)?;
+            blocks.push(widened);
         }
         Ok(Self {
             blocks,
@@ -492,6 +493,33 @@ impl MetalBf16Head {
         let logits = concatenate_device(&parts, &stream).map_err(metal_error)?;
         host_logits(&logits, self.vocabulary)
     }
+}
+
+/// Index of the first NaN or infinite BF16 value, scanning disjoint parts of
+/// `weights` on scoped threads: a 662M-weight head takes over half a second
+/// on one core.
+#[cfg(feature = "metal")]
+fn first_non_finite_bf16(weights: &[u16]) -> Option<usize> {
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let part = weights.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let scans: Vec<_> = weights
+            .chunks(part)
+            .enumerate()
+            .map(|(index, bits)| {
+                scope.spawn(move || {
+                    // All-ones exponent is infinity or NaN.
+                    bits.iter()
+                        .position(|&value| value & 0x7f80 == 0x7f80)
+                        .map(|element| index * part + element)
+                })
+            })
+            .collect();
+        // Parts are in order, so the first hit is the lowest index.
+        scans
+            .into_iter()
+            .find_map(|scan| scan.join().expect("finite scan thread panicked"))
+    })
 }
 
 #[cfg(feature = "metal")]
@@ -889,6 +917,13 @@ mod metal_tests {
         assert!(matches!(
             MetalBf16Head::new(&[0x7f80; 8], 2, 4),
             Err(FinalHeadError::NonFiniteHeadWeight { element: 0 })
+        ));
+        let mut late_nan = [0x3f80; 8];
+        late_nan[5] = 0x7fc0;
+        late_nan[7] = 0xff80;
+        assert!(matches!(
+            MetalBf16Head::new(&late_nan, 2, 4),
+            Err(FinalHeadError::NonFiniteHeadWeight { element: 5 })
         ));
         assert!(MetalBf16Head::new(&weights, 3, 4).is_err());
         assert_eq!(
