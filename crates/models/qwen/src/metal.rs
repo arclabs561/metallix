@@ -213,6 +213,7 @@ impl Qwen3MlxWeights {
 
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
     /// This increases resident weight memory relative to the BF16 checkpoint.
+    #[tracing::instrument(name = "qwen.weights.prepare_float32", level = "info", skip_all)]
     pub fn prepare_float32(&mut self) -> Result<(), Qwen3MetalLoadError> {
         for weight in self.tensors.values_mut() {
             let converted = weight.as_type_device::<f32>(StreamOrDevice::gpu())?;
@@ -355,6 +356,12 @@ impl Qwen3MlxWeights {
     /// Returns [`Qwen3MetalLoadError`] if checkpoint inspection fails, MLX
     /// cannot load the payloads, or the loaded embedding is inconsistent with
     /// the checkpoint contract.
+    #[tracing::instrument(
+        name = "qwen.weights.load",
+        level = "info",
+        skip_all,
+        fields(model_dir = %model_dir.as_ref().display())
+    )]
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self, Qwen3MetalLoadError> {
         let config_path = model_dir.as_ref().join("config.json");
         let config_json = fs::read_to_string(&config_path).map_err(|source| {

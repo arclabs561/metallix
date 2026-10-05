@@ -48,6 +48,8 @@ mod serving;
 #[cfg(feature = "metal")]
 mod generation_preview;
 #[cfg(feature = "metal")]
+mod gpu;
+#[cfg(feature = "metal")]
 mod parity;
 #[cfg(all(feature = "metal", feature = "structured-output"))]
 mod qwen_constraints;
@@ -59,6 +61,9 @@ mod qwen_particle_tests;
 mod qwen_tokenizer;
 #[cfg(all(feature = "metal", feature = "structured-output"))]
 mod schedule_requirements;
+mod telemetry;
+#[cfg(feature = "metal")]
+mod trace_context;
 #[cfg(feature = "metal")]
 mod v41_indexer;
 #[cfg(feature = "metal")]
@@ -148,12 +153,49 @@ fn sampling_configuration(
 
 /// Runs the shared CLI, preserving the invoked executable name in help output.
 #[must_use]
+pub fn run() -> ExitCode {
+    let cli = Cli::parse();
+    if let Err(error) = telemetry::init(cli.trace_out.as_deref()) {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+    let code = with_capture(cli);
+    telemetry::finish();
+    code
+}
+
+/// Wraps a one-shot command in `--gpu-capture`; `serve` instead hands the path
+/// to each child, which captures its first request.
+#[cfg(feature = "metal")]
+fn with_capture(cli: Cli) -> ExitCode {
+    let Some(path) = cli.gpu_capture.clone() else {
+        return dispatch(cli);
+    };
+    if matches!(cli.command, Command::Serve { .. }) {
+        return dispatch(cli);
+    }
+    let capture = match gpu::Capture::start(&path) {
+        Ok(capture) => capture,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = dispatch(cli);
+    drop(capture);
+    code
+}
+
+#[cfg(not(feature = "metal"))]
+fn with_capture(cli: Cli) -> ExitCode {
+    dispatch(cli)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "exhaustive CLI dispatch; handlers stay separate"
 )]
-pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+fn dispatch(cli: Cli) -> ExitCode {
     match cli.command {
         Command::RunDeepseekReduced(args) => args.run(),
         #[cfg(feature = "metal")]
@@ -224,9 +266,10 @@ pub fn run() -> ExitCode {
                         listen,
                         resident_chat_limits(context_tokens, kv_budget_mib),
                         Duration::from_millis(u64::from(generation_timeout_ms)),
+                        cli.gpu_capture.as_deref(),
                     ),
                     Err(error) => {
-                        eprintln!("mx serve: invalid worker entry: {error}");
+                        tracing::error!("mx serve: invalid worker entry: {error}");
                         ExitCode::FAILURE
                     }
                 };
@@ -239,6 +282,8 @@ pub fn run() -> ExitCode {
                         context_tokens,
                         kv_budget_mib,
                         generation_timeout_ms,
+                        trace_out: cli.trace_out,
+                        gpu_capture: cli.gpu_capture,
                     },
                     memory_budget_mib,
                     admission_queue::QueueSettings {
@@ -247,7 +292,7 @@ pub fn run() -> ExitCode {
                     },
                 ),
                 Err(error) => {
-                    eprintln!("mx serve: {error}");
+                    tracing::error!("mx serve: {error}");
                     ExitCode::FAILURE
                 }
             }

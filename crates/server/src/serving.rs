@@ -2,6 +2,7 @@
 
 use std::{
     net::{SocketAddr, TcpListener},
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -9,17 +10,20 @@ use std::{
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::field::Empty;
 
 use crate::{
     chat_generation::{ChatMessage, ResidentChatLimits},
+    gpu,
     http_transport::{Connection, TransportLimits},
-    responses::{Request, json_response, messages, respond, tools},
+    responses::{Request, echo_request_id, json_response, messages, respond, tools},
     serve_registry::{self, ModelWorker, ServedEntry},
+    trace_context::RequestContext,
 };
 
 #[cfg(test)]
@@ -77,6 +81,8 @@ struct GenerationJob {
     connection: Connection,
     work: Work,
     _admission: Admission,
+    /// The request's `http.request` span, entered again on the worker thread.
+    span: tracing::Span,
 }
 
 enum Work {
@@ -121,62 +127,156 @@ fn worker_loop(session: &mut dyn ChatBackend, jobs: Receiver<GenerationJob>) {
     model_worker_loop(&mut GenerationOnly(session), jobs);
 }
 
+#[cfg(test)]
 fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>) {
+    serve_jobs(worker, jobs, None);
+}
+
+/// Runs admitted jobs in order. `capture` wraps the first job in a Metal
+/// capture.
+fn serve_jobs(
+    worker: &mut dyn ModelWorker,
+    jobs: Receiver<GenerationJob>,
+    mut capture: Option<PathBuf>,
+) {
     for job in jobs {
         let GenerationJob {
             connection,
             work,
             _admission: admission,
+            span,
         } = job;
-        match work {
-            Work::Respond {
-                request,
-                messages,
-                tools,
-                id,
+        let _entered = span.enter();
+        let started = Instant::now();
+        let capturing = capture.take().and_then(|path| {
+            gpu::Capture::start(&path)
+                .inspect_err(|error| tracing::error!("{error}"))
+                .ok()
+        });
+        gpu::reset_peak_memory();
+        run_job(worker, connection, work, admission, &span);
+        gpu::Memory::record_on(&span);
+        drop(capturing);
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "request finished"
+        );
+        crate::telemetry::flush();
+    }
+}
+
+fn run_job(
+    worker: &mut dyn ModelWorker,
+    connection: Connection,
+    work: Work,
+    admission: Admission,
+    span: &tracing::Span,
+) {
+    let request_id = connection.request_id().map(str::to_owned);
+    match work {
+        Work::Respond {
+            request,
+            messages,
+            tools,
+            id,
+            generation_timeout,
+        } => {
+            // Dropped in reverse order: the model is free before the socket
+            // closes, so a front process that admits its next request when
+            // this response ends never finds the model still busy.
+            let _socket = connection.hold_open();
+            let _admission = admission;
+            // Routing admits only models that declare generation.
+            let Some(session) = worker.chat() else {
+                unsupported_response(connection, "generate");
+                return;
+            };
+            if let Err(error) = respond(
+                connection,
+                &request,
+                &messages,
+                &tools,
+                session,
+                &id,
                 generation_timeout,
-            } => {
-                // Dropped in reverse order: the model is free before the socket
-                // closes, so a front process that admits its next request when
-                // this response ends never finds the model still busy.
-                let _socket = connection.hold_open();
-                let _admission = admission;
-                // Routing admits only models that declare generation.
-                let Some(session) = worker.chat() else {
-                    unsupported_response(connection, "generate");
-                    continue;
-                };
-                if let Err(error) = respond(
-                    connection,
-                    &request,
-                    &messages,
-                    &tools,
-                    session,
-                    &id,
-                    generation_timeout,
-                ) {
-                    eprintln!("response failed: {error}");
-                }
-            }
-            Work::Decide { body, model } => {
-                let outcome = worker.decide(&body, &model);
-                // Free the model before answering, so a client that sends its
-                // next request as soon as this one completes is not refused.
-                drop(admission);
-                body_response(connection, outcome, "decide");
-            }
-            Work::Embed { body, model } => {
-                let outcome = worker.embed(&body, &model);
-                drop(admission);
-                body_response(connection, outcome, "embed");
-            }
-            Work::Rerank { body, model } => {
-                let outcome = worker.rerank(&body, &model);
-                drop(admission);
-                body_response(connection, outcome, "rerank");
+            ) {
+                span.record("error.type", "response_failed");
+                tracing::warn!("response failed: {error}");
             }
         }
+        Work::Decide { body, model } => {
+            let stage = tracing::info_span!("decide.score");
+            let outcome = staged(&stage, None, span, request_id.as_deref(), || {
+                worker.decide(&body, &model)
+            });
+            // Free the model before answering, so a client that sends its
+            // next request as soon as this one completes is not refused.
+            drop(admission);
+            body_response(connection, outcome, "decide");
+        }
+        Work::Embed { body, model } => {
+            let stage = tracing::info_span!("embed.batch", embed_ms = Empty);
+            let outcome = staged(
+                &stage,
+                Some("embed_ms"),
+                span,
+                request_id.as_deref(),
+                || worker.embed(&body, &model),
+            );
+            drop(admission);
+            body_response(connection, outcome, "embed");
+        }
+        Work::Rerank { body, model } => {
+            let stage = tracing::info_span!("rerank.score", rerank_ms = Empty);
+            let outcome = staged(
+                &stage,
+                Some("rerank_ms"),
+                span,
+                request_id.as_deref(),
+                || worker.rerank(&body, &model),
+            );
+            drop(admission);
+            body_response(connection, outcome, "rerank");
+        }
     }
+}
+
+/// Runs model work inside `stage`, which closes once the model has returned
+/// host values (and so after its MLX evaluation). The response's own
+/// `metallix` timing field, when it has one, is recorded on `stage`, so the
+/// span and the JSON agree; usage and failures go on the request span.
+fn staged(
+    stage: &tracing::Span,
+    timing: Option<&'static str>,
+    request: &tracing::Span,
+    request_id: Option<&str>,
+    run: impl FnOnce() -> Option<Result<Value, String>>,
+) -> Option<Result<Value, String>> {
+    let mut outcome = stage.in_scope(run);
+    match &mut outcome {
+        Some(Ok(value)) => {
+            if let Some((timing, ms)) =
+                timing.and_then(|timing| Some((timing, value["metallix"][timing].as_f64()?)))
+            {
+                stage.record(timing, ms);
+            }
+            let usage = &value["usage"];
+            if let Some(tokens) = usage["prompt_tokens"]
+                .as_u64()
+                .or_else(|| usage["input_tokens"].as_u64())
+            {
+                request.record("gen_ai.usage.input_tokens", tokens);
+            }
+            echo_request_id(value, request_id);
+        }
+        Some(Err(_)) => {
+            request.record("error.type", "invalid_request");
+        }
+        None => {
+            request.record("error.type", "unsupported_capability");
+        }
+    }
+    outcome
 }
 
 fn body_response(connection: Connection, outcome: Option<Result<Value, String>>, capability: &str) {
@@ -196,30 +296,30 @@ fn unsupported_response(connection: Connection, capability: &str) {
 }
 
 /// Serves `entry` in this process as a child of the `mx serve` front process,
-/// exiting when the front process closes this process's stdin.
+/// exiting when the front process closes this process's stdin. `capture`
+/// records the first request as a Metal capture.
 pub(crate) fn serve_child(
     entry: ServedEntry,
     address: SocketAddr,
     limits: ResidentChatLimits,
     generation_timeout: Duration,
+    capture: Option<&Path>,
 ) -> ExitCode {
+    if let Some(path) = capture {
+        if let Err(error) = gpu::check_capture_path(path) {
+            tracing::error!("mx serve: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     thread::spawn(|| {
         let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        crate::telemetry::finish();
         std::process::exit(0);
     });
-    serve(&[entry], address, limits, generation_timeout)
-}
-
-pub(crate) fn serve(
-    models: &[ServedEntry],
-    address: SocketAddr,
-    limits: ResidentChatLimits,
-    generation_timeout: Duration,
-) -> ExitCode {
-    match serve_inner(models, address, limits, generation_timeout) {
+    match serve_inner(&[entry], address, limits, generation_timeout, capture) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mx serve: {error}");
+            tracing::error!("mx serve: {error}");
             ExitCode::FAILURE
         }
     }
@@ -236,11 +336,16 @@ struct ServedModel {
     alive: Arc<AtomicBool>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered load, announce and serve sequence"
+)]
 fn serve_inner(
     entries: &[ServedEntry],
     address: SocketAddr,
     limits: ResidentChatLimits,
     generation_timeout: Duration,
+    capture: Option<&Path>,
 ) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
@@ -253,31 +358,54 @@ fn serve_inner(
         let alive = Arc::new(AtomicBool::new(false));
         let worker_liveness = Arc::clone(&alive);
         let worker_entry = entry.clone();
-        workers.push(thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let mut worker = match serve_registry::load(&worker_entry, limits) {
-                Ok(worker) => worker,
-                Err(error) => {
-                    let _ = startup_sender.send(Err(error));
-                    return;
+        // One model per process today, so the capture goes to its first request.
+        let worker_capture = capture.map(Path::to_path_buf);
+        // This thread owns the model's MLX arrays; its name tags every log line.
+        let worker = thread::Builder::new()
+            .name(format!("model-{}", entry.id))
+            .spawn(move || {
+                let load = tracing::info_span!(
+                    "model.load",
+                    gen_ai.request.model = %worker_entry.id,
+                    kind = ?worker_entry.kind,
+                    load_ms = Empty,
+                    mlx.active_bytes = Empty,
+                    mlx.peak_bytes = Empty,
+                    "error.type" = Empty,
+                );
+                let entered = load.enter();
+                let started = Instant::now();
+                let mut worker = match serve_registry::load(&worker_entry, limits) {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        load.record("error.type", "load_failed");
+                        let _ = startup_sender.send(Err(error));
+                        return;
+                    }
+                };
+                let liveness = WorkerLiveness {
+                    alive: worker_liveness,
+                };
+                liveness.alive.store(true, Ordering::Release);
+                // A generation backend reports its own load time; others use wall time.
+                let load_ms = worker
+                    .chat()
+                    .map_or(started.elapsed().as_secs_f64() * 1000.0, |chat| {
+                        chat.load_ms()
+                    });
+                load.record("load_ms", load_ms);
+                gpu::Memory::record_on(&load);
+                tracing::info!("model loaded");
+                drop(entered);
+                drop(load);
+                if startup_sender.send(Ok(())).is_ok() {
+                    serve_jobs(worker.as_mut(), job_receiver, worker_capture);
                 }
-            };
-            let liveness = WorkerLiveness {
-                alive: worker_liveness,
-            };
-            liveness.alive.store(true, Ordering::Release);
-            // A generation backend reports its own load time; others use wall time.
-            let load_ms = worker
-                .chat()
-                .map_or(started.elapsed().as_secs_f64() * 1000.0, |chat| {
-                    chat.load_ms()
-                });
-            if startup_sender.send(Ok(load_ms)).is_ok() {
-                model_worker_loop(worker.as_mut(), job_receiver);
-            }
-        }));
-        let load_ms = match startup_receiver.recv() {
-            Ok(Ok(load_ms)) => load_ms,
+            })
+            .map_err(|error| format!("{}: could not start the model thread: {error}", entry.id))?;
+        workers.push(worker);
+        match startup_receiver.recv() {
+            Ok(Ok(())) => {}
             failed => {
                 drop(models);
                 for worker in workers {
@@ -288,11 +416,7 @@ fn serve_inner(
                     _ => format!("{}: model worker ended before startup", entry.id),
                 });
             }
-        };
-        eprintln!(
-            "mx loaded model={}; kind={:?}; load_ms={load_ms:.2}",
-            entry.id, entry.kind
-        );
+        }
         models.push(ServedModel {
             id: entry.id.clone(),
             generates: entry.kind.generates(),
@@ -304,7 +428,8 @@ fn serve_inner(
     }
     let outcome = match TcpListener::bind(address) {
         Ok(server) => {
-            // The front process reads this line to find a child's ephemeral port.
+            // The front process reads this line to find a child's ephemeral
+            // port, so it is written raw rather than as a filtered log event.
             let address = server.local_addr().unwrap_or(address);
             eprintln!(
                 "mx listening on http://{address}; models={}; one request per model; {} total tokens; kv_budget_bytes={}",
@@ -431,6 +556,27 @@ fn serve_models(
                 continue;
             }
         };
+        let context = RequestContext::from_headers(
+            request.trace.traceparent.as_deref(),
+            request.trace.request_id.as_deref(),
+        );
+        connection.set_request_id(&context.request_id);
+        let span = tracing::info_span!(
+            "http.request",
+            request_id = %context.request_id,
+            trace_id = %context.trace.trace_id(),
+            route = %request.path,
+            http.request.method = %request.method,
+            gen_ai.operation.name = Empty,
+            gen_ai.provider.name = "metallix",
+            gen_ai.request.model = Empty,
+            gen_ai.usage.input_tokens = Empty,
+            gen_ai.usage.output_tokens = Empty,
+            mlx.active_bytes = Empty,
+            mlx.peak_bytes = Empty,
+            "error.type" = Empty,
+        );
+        let _entered = span.enter();
         let capability = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
                 json_response(connection, 200, &json!({"status":"ready"}));
@@ -457,6 +603,14 @@ fn serve_models(
                 continue;
             }
         };
+        span.record(
+            "gen_ai.operation.name",
+            match capability {
+                "generate" => "chat",
+                "embed" => "embeddings",
+                other => other,
+            },
+        );
         let generation = capability == "generate";
         let parsed = if generation {
             serde_json::from_slice::<Request>(&request.body)
@@ -476,6 +630,7 @@ fn serve_models(
                 continue;
             }
         };
+        span.record("gen_ai.request.model", model_id.as_str());
         let Some(model) = models.iter().find(|model| model.id == model_id) else {
             json_response(
                 connection,
@@ -518,6 +673,8 @@ fn serve_models(
             }
         };
         let Some(admission) = Admission::try_acquire(&model.occupied) else {
+            span.record("error.type", "server_busy");
+            tracing::info!("rejected: model is busy");
             if generation {
                 busy_response(connection);
             } else {
@@ -533,6 +690,7 @@ fn serve_models(
             connection,
             work,
             _admission: admission,
+            span: span.clone(),
         };
         if let Err(error) = model.jobs.send(job) {
             unavailable_response(error.0.connection);
@@ -1464,12 +1622,22 @@ stream.close()
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each route, its capability check and its echoed request id"
+    )]
     fn embeddings_route_only_to_models_that_embed() {
-        fn post(address: std::net::SocketAddr, path: &str, body: &str) -> (u16, Value) {
+        const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        fn post_with(
+            address: std::net::SocketAddr,
+            path: &str,
+            correlation: &str,
+            body: &str,
+        ) -> (u16, Value) {
             let mut stream = TcpStream::connect(address).expect("connect");
             write!(
                 stream,
-                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{correlation}\r\n{body}",
                 body.len()
             )
             .expect("request");
@@ -1479,6 +1647,10 @@ stream.close()
                 status,
                 serde_json::from_slice(&body).expect("response JSON"),
             )
+        }
+        // Every request names its id; the model's response echoes it.
+        fn post(address: std::net::SocketAddr, path: &str, body: &str) -> (u16, Value) {
+            post_with(address, path, "x-request-id: req-7\r\n", body)
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
@@ -1505,7 +1677,7 @@ stream.close()
                 &models,
                 Duration::from_secs(2),
                 TransportLimits::default(),
-                Some(5),
+                Some(6),
             )
         });
 
@@ -1516,7 +1688,21 @@ stream.close()
         );
         assert_eq!(
             (status, response),
-            (200, json!({"model":"embedder","input":"x"}))
+            (
+                200,
+                json!({"model":"embedder","input":"x","metallix":{"request_id":"req-7"}})
+            )
+        );
+        // Without `x-request-id`, the caller's trace id is the request id.
+        let (status, response) = post_with(
+            address,
+            "/v1/decisions",
+            &format!("traceparent: {TRACEPARENT}\r\n"),
+            r#"{"model":"julia","state":"s","questions":{}}"#,
+        );
+        assert_eq!(
+            (status, &response["metallix"]["request_id"]),
+            (200, &json!("4bf92f3577b34da6a3ce929d0e0e4736"))
         );
         let (status, error) = post(
             address,
@@ -1543,7 +1729,10 @@ stream.close()
         );
         assert_eq!(
             (status, response),
-            (200, json!({"model":"embedder","query":"q"}))
+            (
+                200,
+                json!({"model":"embedder","query":"q","metallix":{"request_id":"req-7"}})
+            )
         );
         let (status, error) = post(
             address,
@@ -1650,7 +1839,10 @@ stream.close()
         assert!(generation_occupied.load(Ordering::Acquire));
 
         let decision = br#"{"model":"julia","state":"s","questions":{}}"#;
-        let (status, receipt) = exchange(address, "POST /v1/decisions", decision);
+        let (status, mut receipt) = exchange(address, "POST /v1/decisions", decision);
+        // The request id is minted per request; the rest is the model's answer.
+        let metallix = receipt.as_object_mut().and_then(|r| r.remove("metallix"));
+        assert!(metallix.is_some_and(|block| block["request_id"].is_string()));
         assert_eq!(
             (status, receipt),
             (200, json!({"model":"julia","state":"s"}))

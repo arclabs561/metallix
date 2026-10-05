@@ -559,3 +559,72 @@ Do not log prompts, credentials, tensor contents, or unbounded labels. Model
 identity and request IDs are useful; prompt strings and arbitrary file paths
 are not metric labels. Add counters only where their ownership and units are
 defined, and test both success and cancellation/error paths.
+
+## Observability
+
+`mx` and `metallix` log through `tracing` to stderr. Writes are synchronous, so
+the last lines before an abort are not lost in a buffer. `METALLIX_LOG` sets
+the filter, falling back to `RUST_LOG`, then `warn`; it takes
+[`EnvFilter` directives](https://docs.rs/tracing-subscriber/0.3/tracing_subscriber/filter/struct.EnvFilter.html):
+
+```sh
+METALLIX_LOG=info mx serve --registry models.json
+METALLIX_LOG=warn,server=debug mx decide ...
+```
+
+Each line names its thread. A thread that owns a model's MLX arrays is
+`model-<id>`; the front process forwards on `forward` threads. Command results
+and JSON stay on stdout. Failures of one-shot commands, the interactive chat
+prompt, and `--verbose` generation diagnostics are still plain stderr text.
+The `mx listening on` lines are also plain text, because the front process and
+`scripts/bench_serve.py` parse them.
+
+Spans, with their timing fields recorded from the same `Instant` as the
+matching JSON field:
+
+| Span | Where | Fields |
+|---|---|---|
+| `http.request` | front and child, one per request | `request_id`, `trace_id`, `route`, `gen_ai.operation.name` (`chat`, `embeddings`, `rerank`, `decide`), `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `error.type`, `mlx.active_bytes`, `mlx.peak_bytes` |
+| `proxy.forward` | front | `model`, `child`, `forward_ms` |
+| `proxy.queue` | front, inside `proxy.forward` | `queue.depth`, `queue.wait_ms`, `queue.outcome` |
+| `model.load` | child | `load_ms`, `mlx.active_bytes`, `mlx.peak_bytes` |
+| `chat.render`, `chat.prefill`, `chat.decode_step` | child, Qwen generation and decisions | `render_ms`, `prefill_ms`, `decode_ms` |
+| `embed.batch`, `rerank.score`, `decide.score` | child | `embed_ms`, `rerank_ms` |
+| `qwen.weights.load`, `qwen.weights.prepare_float32`, `julia.checkpoint.load` | library crates | |
+
+Prefill and decode spans end after the logit readback, and the embedding and
+rerank spans end after the model returns host values, so they include GPU
+time. The peak memory figure is reset per request; each child serves one
+model, one request at a time.
+
+Requests through `mx serve` carry one id end to end. The front keeps a valid
+W3C `traceparent` and mints one when it is missing, malformed or all zero. It
+sends each child the same trace id with a new parent id, plus `x-request-id`.
+The request id is the caller's `x-request-id` when that is 1 to 128 characters
+of `A-Z a-z 0-9 . _ : -`, else the trace id. Every response has an
+`X-Request-Id` header, and successful JSON bodies add `metallix.request_id`.
+Child log lines reach the front's stderr prefixed with `[<model-id>]`, so one
+`grep <request_id>` follows a request across both processes.
+
+A timeline needs the `timeline` feature:
+
+```sh
+cargo build --release -p server --features metal,timeline
+METALLIX_LOG=info target/release/mx --trace-out run.json generate-qwen-metal --model "$MODEL" --prompt hi
+```
+
+Open the file at <https://ui.perfetto.dev> (Open trace file) or in
+`chrome://tracing`. Under `mx serve`, each child writes
+`run.<model-id>.json` and flushes after every request. A file whose process
+ended by signal lacks the closing `]`, which both viewers accept.
+
+A Metal capture records one command, or under `mx serve` the first request of
+each child (`run.<model-id>.gputrace`). Metal requires
+`MTL_CAPTURE_ENABLED=1`; the path must end in `.gputrace` and not exist yet.
+Open the capture in Xcode. Captures hold every buffer the work touched, so
+they are large: one 1-token Qwen3-0.6B generation, weight loading included,
+wrote 4.1 GB.
+
+```sh
+MTL_CAPTURE_ENABLED=1 mx --gpu-capture run.gputrace generate-qwen-metal --model "$MODEL" --max-tokens 4
+```

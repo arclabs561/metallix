@@ -45,6 +45,14 @@ pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) body: Vec<u8>,
+    pub(crate) trace: TraceHeaders,
+}
+
+/// Request-correlation headers; every other header is dropped after validation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TraceHeaders {
+    pub(crate) traceparent: Option<String>,
+    pub(crate) request_id: Option<String>,
 }
 
 /// A transport rejection suitable for a small JSON error response.
@@ -76,6 +84,7 @@ pub(crate) struct Connection {
     limits: TransportLimits,
     read_deadline: Instant,
     response_deadline: Option<Instant>,
+    request_id: Option<String>,
     /// HTTP minor version of the request read, once one is read.
     minor_version: Option<u8>,
     /// Whether [`Connection::client_gone`] has sent its one probe.
@@ -91,6 +100,7 @@ impl Connection {
             limits,
             read_deadline: deadline_after(limits.read_deadline),
             response_deadline: None,
+            request_id: None,
             minor_version: None,
             probed: false,
         }
@@ -99,7 +109,8 @@ impl Connection {
     /// Reads exactly one HTTP/1.0 or HTTP/1.1 request before the absolute deadline.
     pub(crate) fn read_request(&mut self) -> Result<Request, HttpError> {
         let deadline = self.read_deadline;
-        let (mut received, header_end, method, path, body_length) = self.read_head(deadline)?;
+        let (mut received, header_end, method, path, body_length, trace) =
+            self.read_head(deadline)?;
         let prefix = received.split_off(header_end);
         if prefix.len() > body_length {
             return Err(HttpError::bad_request("pipelined requests are unsupported"));
@@ -122,7 +133,24 @@ impl Connection {
             method,
             path,
             body: received,
+            trace,
         })
+    }
+
+    /// Sets the id that responses on this connection report in `X-Request-Id`.
+    pub(crate) fn set_request_id(&mut self, request_id: &str) {
+        self.request_id = Some(request_id.to_owned());
+    }
+
+    pub(crate) fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
+    }
+
+    /// The `X-Request-Id` response header line, or nothing before an id is set.
+    pub(crate) fn request_id_header(&self) -> String {
+        self.request_id
+            .as_deref()
+            .map_or_else(String::new, |id| format!("X-Request-Id: {id}\r\n"))
     }
 
     /// Whether the client has closed its connection while its request waits,
@@ -161,10 +189,14 @@ impl Connection {
         self.response_deadline = Some(deadline_after(self.limits.response_deadline));
     }
 
+    #[allow(
+        clippy::type_complexity,
+        reason = "private parse result consumed once by read_request"
+    )]
     fn read_head(
         &mut self,
         deadline: Instant,
-    ) -> Result<(Vec<u8>, usize, String, String, usize), HttpError> {
+    ) -> Result<(Vec<u8>, usize, String, String, usize, TraceHeaders), HttpError> {
         let mut input = Vec::with_capacity(self.limits.header_bytes.min(1024));
         loop {
             validate_header_wire(&input)?;
@@ -191,7 +223,8 @@ impl Connection {
                     }
                     let body_length = validate_headers(&request, &method, version, self.limits)?;
                     self.minor_version = Some(version);
-                    return Ok((input, header_end, method, path, body_length));
+                    let trace = trace_headers(&request);
+                    return Ok((input, header_end, method, path, body_length, trace));
                 }
                 Ok(httparse::Status::Partial) => {
                     if input.len() == self.limits.header_bytes {
@@ -302,6 +335,23 @@ fn validate_headers(
     }
 }
 
+/// The first `traceparent` and `x-request-id` values that are UTF-8; callers
+/// validate their content.
+fn trace_headers(request: &httparse::Request<'_, '_>) -> TraceHeaders {
+    let value = |name: &str| {
+        request
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(name))
+            .and_then(|header| std::str::from_utf8(header.value).ok())
+            .map(str::to_owned)
+    };
+    TraceHeaders {
+        traceparent: value("traceparent"),
+        request_id: value("x-request-id"),
+    }
+}
+
 fn parse_content_length(value: &[u8], maximum: usize) -> Result<usize, HttpError> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return Err(HttpError::bad_request("Content-Length must be decimal"));
@@ -397,7 +447,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{Connection, HttpError, Request, TransportLimits, time_left};
+    use super::{Connection, HttpError, Request, TraceHeaders, TransportLimits, time_left};
 
     fn limits() -> TransportLimits {
         TransportLimits {
@@ -464,6 +514,7 @@ mod tests {
                 method: "GET".into(),
                 path: "/healthz".into(),
                 body: vec![],
+                trace: TraceHeaders::default(),
             }
         );
         valid.join().unwrap();

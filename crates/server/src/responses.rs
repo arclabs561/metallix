@@ -357,8 +357,32 @@ fn event(writer: &mut dyn Write, sequence: &mut u64, mut value: Value) -> Result
     writer.flush().map_err(|e| e.to_string())
 }
 
+/// Adds the request id to the response's `metallix` block, creating the
+/// block on routes that have none.
+pub(crate) fn echo_request_id(value: &mut Value, request_id: Option<&str>) {
+    let Some(request_id) = request_id else { return };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let block = object.entry("metallix").or_insert_with(|| json!({}));
+    if let Some(block) = block.as_object_mut() {
+        block.insert("request_id".into(), json!(request_id));
+    }
+}
+
+/// Records the `GenAI` usage attributes on the current request span.
+fn record_usage(generated: &crate::chat_generation::ChatGeneration) {
+    let span = tracing::Span::current();
+    span.record("gen_ai.usage.input_tokens", generated.metrics.prompt_tokens);
+    span.record(
+        "gen_ai.usage.output_tokens",
+        generated.generated_token_ids.len(),
+    );
+}
+
 pub(crate) fn json_response(mut connection: Connection, status: u16, value: &Value) {
     connection.begin_response();
+    let request_id = connection.request_id_header();
     let mut writer = BufWriter::new(connection);
     let body = value.to_string();
     let reason = match status {
@@ -374,7 +398,7 @@ pub(crate) fn json_response(mut connection: Connection, status: u16, value: &Val
     };
     let _ = write!(
         writer,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{request_id}Connection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = writer.flush();
@@ -401,8 +425,9 @@ impl EventStream<'_> {
                 .take()
                 .ok_or("response connection is unavailable")?;
             connection.begin_response();
+            let request_id = connection.request_id_header();
             let mut writer = BufWriter::new(connection);
-            write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n").map_err(|e| e.to_string())?;
+            write!(writer,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{request_id}Connection: close\r\n\r\n").map_err(|e| e.to_string())?;
             event(
                 &mut writer,
                 &mut self.sequence,
@@ -488,6 +513,7 @@ pub(crate) fn respond(
         );
         return Ok(());
     }
+    let request_id = request.request_id().map(str::to_owned);
     let message_id = format!("msg_{id}");
     // Text streams live only when no tool envelope or reasoning block has to
     // be parsed out of it first.
@@ -530,8 +556,12 @@ pub(crate) fn respond(
             );
         }
     };
+    record_usage(&generated);
     let response = match response_value(parsed, &controls, &generated, id) {
-        Ok(response) => response,
+        Ok(mut response) => {
+            echo_request_id(&mut response, request_id.as_deref());
+            response
+        }
         Err(error) => {
             return stream.emit(
                 json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"invalid_model_output","message":error}}}),
@@ -607,6 +637,7 @@ fn respond_json(
     id: &str,
     generation_timeout: Duration,
 ) {
+    let request_id = request.request_id().map(str::to_owned);
     let result = session
         .generate_with_timeout(
             controls.request(messages, tools),
@@ -614,7 +645,11 @@ fn respond_json(
             &mut |_| Ok(()),
         )
         .and_then(|generated| {
-            response_value(parsed, controls, &generated, id).map_err(ChatGenerationError::Message)
+            record_usage(&generated);
+            let mut response = response_value(parsed, controls, &generated, id)
+                .map_err(ChatGenerationError::Message)?;
+            echo_request_id(&mut response, request_id.as_deref());
+            Ok(response)
         });
     match result {
         Ok(response) => json_response(request, 200, &response),

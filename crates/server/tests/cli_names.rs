@@ -10,7 +10,7 @@ fn both_names_share_commands_and_report_the_invoked_name() {
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
         let help = String::from_utf8(output.stdout).unwrap();
-        assert!(help.contains(&format!("Usage: {name} <COMMAND>")));
+        assert!(help.contains(&format!("Usage: {name} [OPTIONS] <COMMAND>")));
         assert!(help.contains("inspect-v41"));
         assert!(help.contains("inspect-qwen-checkpoint"));
 

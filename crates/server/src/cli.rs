@@ -21,6 +21,18 @@ Scope:
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
+    /// Write a Chrome/Perfetto JSON timeline of spans (build with --features timeline).
+    ///
+    /// `mx serve` children write `<stem>.<model-id>.<extension>` beside it.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub(crate) trace_out: Option<PathBuf>,
+    /// Record a Metal capture (`.gputrace`) of this command; needs `MTL_CAPTURE_ENABLED=1`.
+    ///
+    /// For `mx serve`, each child captures its first request to
+    /// `<stem>.<model-id>.gputrace` beside this path.
+    #[cfg(feature = "metal")]
+    #[arg(long, global = true, value_name = "PATH")]
+    pub(crate) gpu_capture: Option<PathBuf>,
 }
 
 /// Which Qwen weight residency contract a generation run uses.

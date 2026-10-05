@@ -27,12 +27,15 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::field::Empty;
 
 use crate::{
     admission_queue::{ModelQueue, QueueSettings, Refusal, Refused},
     http_transport::{Connection, Request, TransportLimits},
     responses::json_response,
     serve_registry::{Residency, ServedEntry},
+    telemetry,
+    trace_context::RequestContext,
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(300);
@@ -44,11 +47,15 @@ const MAX_IN_FLIGHT: usize = 64;
 const LISTENING: &str = "mx listening on http://";
 
 /// Command-line settings passed through to every child.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ChildSettings {
     pub(crate) context_tokens: u32,
     pub(crate) kv_budget_mib: u32,
     pub(crate) generation_timeout_ms: u32,
+    /// Each child writes its own timeline beside this path.
+    pub(crate) trace_out: Option<PathBuf>,
+    /// Each child captures its first request beside this path.
+    pub(crate) gpu_capture: Option<PathBuf>,
 }
 
 enum ChildState {
@@ -93,7 +100,7 @@ impl ChildModel {
     }
 
     fn record_error(&self, reason: String) -> String {
-        eprintln!("mx serve: model {} is unavailable: {reason}", self.entry.id);
+        tracing::warn!(model = %self.entry.id, "model is unavailable: {reason}");
         *self.last_error.lock().expect("error lock") = Some(reason.clone());
         reason
     }
@@ -249,11 +256,11 @@ impl Pool {
             if !victim.stop_if_idle() {
                 return Err(format!("{} became busy while making room", victim.entry.id));
             }
-            eprintln!(
-                "mx serve: stopped idle model {} to free {} MiB for {}",
-                victim.entry.id,
-                victim.entry.memory_mib.unwrap_or(0),
-                target.entry.id
+            tracing::info!(
+                model = %victim.entry.id,
+                freed_mib = victim.entry.memory_mib.unwrap_or(0),
+                for_model = %target.entry.id,
+                "stopped idle model"
             );
         }
         Ok(())
@@ -270,7 +277,7 @@ pub(crate) fn serve(
     match serve_inner(entries, address, settings, budget_mib, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mx serve: {error}");
+            tracing::error!("mx serve: {error}");
             ExitCode::FAILURE
         }
     }
@@ -287,6 +294,11 @@ fn serve_inner(
         return Err("this experimental server binds only to loopback".into());
     }
     crate::serve_registry::check_budget(entries, budget_mib)?;
+    if let Some(path) = &settings.gpu_capture {
+        for entry in entries {
+            crate::gpu::check_capture_path(&telemetry::child_path(path, &entry.id))?;
+        }
+    }
     let launcher = Launcher {
         executable: std::env::current_exe().map_err(|error| error.to_string())?,
         settings,
@@ -343,7 +355,7 @@ type Started = Result<(Child, std::sync::mpsc::Receiver<SocketAddr>), String>;
 /// Starts a child on an ephemeral loopback port. Its stdin stays open so the
 /// child can exit when this process does.
 fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
-    let settings = launcher.settings;
+    let settings = &launcher.settings;
     let entry_json = serde_json::to_string(entry).map_err(|error| error.to_string())?;
     let mut child = Command::new(&launcher.executable)
         .args([
@@ -359,6 +371,18 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
             "--generation-timeout-ms",
             &settings.generation_timeout_ms.to_string(),
         ])
+        .args(settings.trace_out.iter().flat_map(|path| {
+            [
+                "--trace-out".into(),
+                telemetry::child_path(path, &entry.id).into_os_string(),
+            ]
+        }))
+        .args(settings.gpu_capture.iter().flat_map(|path| {
+            [
+                "--gpu-capture".into(),
+                telemetry::child_path(path, &entry.id).into_os_string(),
+            ]
+        }))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -402,7 +426,7 @@ fn wait_for_child(started: Started) -> Result<(Child, SocketAddr), String> {
 }
 
 fn start_and_wait(launcher: &Launcher, entry: &ServedEntry) -> Result<(Child, SocketAddr), String> {
-    eprintln!("mx serve: starting model {}", entry.id);
+    tracing::info!(model = %entry.id, "starting model");
     wait_for_child(start_child(launcher, entry))
 }
 
@@ -412,6 +436,10 @@ struct Target {
 }
 
 /// Routes by the request's `model` and forwards it unchanged to that child.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered route, model, admission and forward sequence"
+)]
 fn proxy_models(
     server: &TcpListener,
     pool: &Arc<Pool>,
@@ -434,6 +462,22 @@ fn proxy_models(
                 continue;
             }
         };
+        let context = RequestContext::from_headers(
+            request.trace.traceparent.as_deref(),
+            request.trace.request_id.as_deref(),
+        );
+        connection.set_request_id(&context.request_id);
+        let span = tracing::info_span!(
+            "http.request",
+            request_id = %context.request_id,
+            trace_id = %context.trace.trace_id(),
+            route = %request.path,
+            http.request.method = %request.method,
+            gen_ai.provider.name = "metallix",
+            gen_ai.request.model = Empty,
+            "error.type" = Empty,
+        );
+        let _entered = span.enter();
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
                 json_response(connection, 200, &json!({"status":"ready"}));
@@ -471,6 +515,7 @@ fn proxy_models(
                 continue;
             }
         };
+        span.record("gen_ai.request.model", target.as_str());
         let Some(model) = pool.models.iter().find(|model| model.entry.id == target) else {
             json_response(
                 connection,
@@ -481,6 +526,7 @@ fn proxy_models(
         };
         if in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
             in_flight.fetch_sub(1, Ordering::AcqRel);
+            span.record("error.type", "server_busy");
             json_response(
                 connection,
                 503,
@@ -493,12 +539,19 @@ fn proxy_models(
         let model = Arc::clone(model);
         let pool = Arc::clone(pool);
         let in_flight = Arc::clone(&in_flight);
+        let span = span.clone();
         forwards.retain(|forward: &thread::JoinHandle<()>| !forward.is_finished());
-        forwards.push(thread::spawn(move || {
-            forward(&pool, &model, connection, &request, limits);
-            model.in_flight.fetch_sub(1, Ordering::AcqRel);
-            in_flight.fetch_sub(1, Ordering::AcqRel);
-        }));
+        let spawned = thread::Builder::new()
+            .name(String::from("forward"))
+            .spawn(move || {
+                let _entered = span.enter();
+                forward(&pool, &model, connection, &request, &context, limits);
+                model.in_flight.fetch_sub(1, Ordering::AcqRel);
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                telemetry::flush();
+            })
+            .map_err(|error| format!("could not start a forwarding thread: {error}"))?;
+        forwards.push(spawned);
     }
     for forward in forwards {
         let _ = forward.join();
@@ -511,9 +564,37 @@ fn forward(
     model: &ChildModel,
     mut connection: Connection,
     request: &Request,
+    context: &RequestContext,
     limits: TransportLimits,
 ) {
-    let admitted = match model.queue.admit(|| connection.client_gone()) {
+    let span = tracing::info_span!(
+        "proxy.forward",
+        model = %model.entry.id,
+        child = Empty,
+        forward_ms = Empty,
+        "error.type" = Empty,
+    );
+    let _entered = span.enter();
+    let started = Instant::now();
+    let admitted = {
+        let queued = tracing::info_span!(
+            "proxy.queue",
+            queue.depth = Empty,
+            queue.wait_ms = Empty,
+            queue.outcome = Empty,
+        );
+        let _entered = queued.enter();
+        let admitted = model.queue.admit(|| connection.client_gone());
+        let (depth, waited, outcome) = match &admitted {
+            Ok(admitted) => (admitted.depth, admitted.waited, "admitted"),
+            Err(refused) => (0, refused.waited, refused.refusal.as_str()),
+        };
+        queued.record("queue.depth", depth);
+        queued.record("queue.wait_ms", waited.as_secs_f64() * 1000.0);
+        queued.record("queue.outcome", outcome);
+        admitted
+    };
+    let admitted = match admitted {
         Ok(admitted) => admitted,
         Err(refused) => return refuse(connection, model, refused),
     };
@@ -524,6 +605,7 @@ fn forward(
         admitted.waited.as_millis()
     );
     let unavailable = |connection, reason: String| {
+        tracing::Span::current().record("error.type", "model_worker_unavailable");
         json_response(
             connection,
             503,
@@ -534,6 +616,7 @@ fn forward(
         Ok(address) => address,
         Err(reason) => return unavailable(connection, reason),
     };
+    span.record("child", tracing::field::display(address));
     let mut child = match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
         Ok(child) => child,
         Err(error) => {
@@ -544,12 +627,15 @@ fn forward(
     let sent = child
         .set_read_timeout(Some(limits.response_deadline + CHILD_READ_GRACE))
         .and_then(|()| {
+            // A new parent id under the caller's trace id, per W3C Trace Context.
             write!(
                 child,
-                "{} {} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\n\r\n",
+                "{} {} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\ntraceparent: {}\r\nx-request-id: {}\r\n\r\n",
                 request.method,
                 request.path,
-                request.body.len()
+                request.body.len(),
+                context.trace.child(),
+                context.request_id,
             )
         })
         .and_then(|()| child.write_all(&request.body))
@@ -560,15 +646,17 @@ fn forward(
     }
     // The child writes one complete HTTP response and closes; pass it through.
     connection.begin_response();
-    let passed =
-        pass_response(&mut child, &mut connection, &queue_headers).and_then(|_| connection.flush());
+    let passed = pass_response(&mut child, &mut connection, &queue_headers)
+        .and_then(|bytes| connection.flush().map(|()| bytes));
     // The model is free once its child has finished this response.
     drop(admitted);
-    if let Err(error) = passed {
-        eprintln!(
-            "mx serve: forwarding a {} response failed: {error}",
-            model.entry.id
-        );
+    match passed {
+        Ok(bytes) => {
+            let forward_ms = started.elapsed().as_secs_f64() * 1000.0;
+            span.record("forward_ms", forward_ms);
+            tracing::info!(bytes, forward_ms, "forwarded");
+        }
+        Err(error) => tracing::warn!("forwarding the response failed: {error}"),
     }
 }
 
@@ -601,6 +689,16 @@ fn pass_response(child: &mut impl Read, client: &mut impl Write, headers: &str) 
     Ok(written + io::copy(child, client)?)
 }
 
+impl Refusal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Expired => "expired",
+            Self::Gone => "client_gone",
+        }
+    }
+}
+
 /// Answers a request the model's queue did not admit. 503 rather than 429:
 /// the limit is this server's capacity, not a per-client rate, and the `openai`
 /// SDKs retry both alike, honoring `Retry-After`.
@@ -621,11 +719,13 @@ fn refuse(mut connection: Connection, model: &ChildModel, refused: Refused) {
         // Nobody is left to answer.
         Refusal::Gone => return,
     };
+    tracing::Span::current().record("error.type", code);
     let body = json!({"error":{"code":code,"message":message}}).to_string();
     connection.begin_response();
+    let request_id = connection.request_id_header();
     let _ = write!(
         connection,
-        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {}\r\n{request_id}Connection: close\r\n\r\n{body}",
         body.len(),
         refused.retry_after_secs,
     )
@@ -683,6 +783,26 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
                 )
                 .unwrap();
+            }
+        });
+        (address, child)
+    }
+
+    /// A stand-in child that answers with the correlation headers it received.
+    fn header_child(requests: usize) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("child listener");
+        let address = listener.local_addr().expect("child address");
+        let child = thread::spawn(move || {
+            for socket in listener.incoming().take(requests) {
+                let mut connection =
+                    Connection::accept(socket.unwrap(), TransportLimits::default());
+                let request = connection.read_request().expect("forwarded request");
+                let trace = request.trace;
+                json_response(
+                    connection,
+                    200,
+                    &json!({"traceparent": trace.traceparent, "request_id": trace.request_id}),
+                );
             }
         });
         (address, child)
@@ -964,6 +1084,87 @@ mod tests {
         let mut client = Vec::new();
         pass_response(&mut &b"garbage"[..], &mut client, "X-A: 1\r\n").unwrap();
         assert_eq!(client, b"garbage");
+    }
+
+    #[test]
+    fn forwards_a_trace_context_and_request_id_to_the_child() {
+        const INCOMING: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        fn send(address: SocketAddr, headers: &str, body: &str) -> (String, Value) {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound reads");
+            write!(
+                stream,
+                "POST /v1/decisions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+                body.len()
+            )
+            .expect("request");
+            stream.shutdown(Shutdown::Write).expect("half-close");
+            let mut wire = String::new();
+            stream.read_to_string(&mut wire).expect("response");
+            let (head, body) = wire.split_once("\r\n\r\n").expect("header end");
+            (
+                head.to_owned(),
+                serde_json::from_str(body).expect("JSON body"),
+            )
+        }
+        let forwarded = |seen: &Value| {
+            let traceparent = seen["traceparent"]
+                .as_str()
+                .expect("child got a traceparent");
+            crate::trace_context::TraceParent::parse(traceparent)
+                .expect("child traceparent is valid")
+        };
+
+        let (child, child_thread) = header_child(3);
+        let pool = Arc::new(Pool {
+            models: vec![model("julia", ModelKind::Julia, Some(child))],
+            launcher: None,
+            budget_mib: None,
+            residency: Mutex::new(()),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            proxy_models(&listener, &pool, TransportLimits::default(), Some(4))
+        });
+        let body = r#"{"model":"julia"}"#;
+
+        // No incoming context: the front mints one, and its trace id is the request id.
+        let (_, seen) = send(address, "", body);
+        let minted = forwarded(&seen);
+        assert_eq!(seen["request_id"], json!(minted.trace_id()));
+
+        // A caller's context keeps its trace id; the child gets a new parent id.
+        let (_, seen) = send(
+            address,
+            &format!("traceparent: {INCOMING}\r\nx-request-id: caller-1\r\n"),
+            body,
+        );
+        let kept = forwarded(&seen);
+        assert_eq!(kept.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_ne!(kept.to_string(), INCOMING);
+        assert_eq!(seen["request_id"], "caller-1");
+
+        // An all-zero or malformed traceparent is replaced, not forwarded.
+        let zero = "00-00000000000000000000000000000000-00f067aa0ba902b7-01";
+        let (_, seen) = send(address, &format!("traceparent: {zero}\r\n"), body);
+        let replaced = forwarded(&seen);
+        assert_ne!(replaced.trace_id(), "0".repeat(32));
+        assert_eq!(seen["request_id"], json!(replaced.trace_id()));
+
+        // Responses the front writes itself carry the request id as a header.
+        let (head, error) = send(
+            address,
+            "x-request-id: caller-2\r\n",
+            r#"{"model":"missing"}"#,
+        );
+        assert_eq!(error["error"]["message"], "model is not loaded");
+        assert!(head.contains("\r\nX-Request-Id: caller-2\r\n"), "{head}");
+
+        server.join().unwrap().unwrap();
+        child_thread.join().unwrap();
     }
 
     #[test]

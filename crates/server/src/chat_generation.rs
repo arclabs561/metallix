@@ -17,6 +17,7 @@ use qwen::metal::Qwen3MlxWeights;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracing::field::Empty;
 
 use crate::{
     qwen_forward::{SamplingConfiguration, SamplingPolicy},
@@ -573,9 +574,8 @@ impl ChatSession {
     pub(crate) fn prefill_chat(&mut self, messages: &[ChatMessage]) -> Result<ChatPrefill, String> {
         let request = ChatRequest::new(messages, 1);
         validate_request(request)?;
-        let render_started = Instant::now();
-        let prompt = self.render(request)?;
-        let render_ms = elapsed_ms(render_started.elapsed());
+        let render = tracing::info_span!("chat.render", render_ms = Empty);
+        let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
         let input_ids = self.tokenizer.encode_prompt(&prompt)?;
         validate_ids(&input_ids, self.eos_token_id, self.vocabulary_size)?;
         if input_ids.len() > self.context_limit {
@@ -589,15 +589,22 @@ impl ChatSession {
             .weights
             .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
             .map_err(|error| error.to_string())?;
-        let prefill_started = Instant::now();
-        let logits = executor
-            .prefill_last_logits(&input_ids)
-            .map_err(|error| error.to_string())?;
+        // Ends with the full-vocabulary logit readback, so it times the GPU work.
+        let prefill = tracing::info_span!(
+            "chat.prefill",
+            prompt_tokens = input_ids.len(),
+            prefill_ms = Empty
+        );
+        let (logits, prefill_ms) = timed(&prefill, "prefill_ms", || {
+            executor
+                .prefill_last_logits(&input_ids)
+                .map_err(|error| error.to_string())
+        })?;
         Ok(ChatPrefill {
             logits,
             prompt_tokens: input_ids.len(),
             render_ms,
-            prefill_ms: elapsed_ms(prefill_started.elapsed()),
+            prefill_ms,
         })
     }
 
@@ -622,6 +629,10 @@ impl ChatSession {
         self.generate_with_deadline(request, GenerationDeadline::after(timeout), on_token)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered turn: render, prefill and decode, each in its own span"
+    )]
     fn generate_with_deadline(
         &mut self,
         request: ChatRequest<'_>,
@@ -631,9 +642,8 @@ impl ChatSession {
         deadline.check()?;
         validate_request(request)?;
         let turn_started = Instant::now();
-        let render_started = Instant::now();
-        let prompt = self.render(request)?;
-        let render_ms = elapsed_ms(render_started.elapsed());
+        let render = tracing::info_span!("chat.render", render_ms = Empty);
+        let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
         deadline.check()?;
         let input_ids = self.tokenizer.encode_prompt(&prompt)?;
         deadline.check()?;
@@ -649,11 +659,17 @@ impl ChatSession {
             .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
             .map_err(|error| ChatGenerationError::message(error.to_string()))?;
         deadline.check()?;
-        let prefill_started = Instant::now();
-        let mut logits = executor
-            .prefill_last_logits(&input_ids)
-            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
-        let prefill_ms = elapsed_ms(prefill_started.elapsed());
+        // Ends with the full-vocabulary logit readback, so it times the GPU work.
+        let prefill = tracing::info_span!(
+            "chat.prefill",
+            prompt_tokens = input_ids.len(),
+            prefill_ms = Empty
+        );
+        let (mut logits, prefill_ms) = timed(&prefill, "prefill_ms", || {
+            executor
+                .prefill_last_logits(&input_ids)
+                .map_err(|error| ChatGenerationError::message(error.to_string()))
+        })?;
         deadline.check()?;
         let mut generated = Vec::with_capacity(max_tokens as usize);
         let mut logprobs = Vec::new();
@@ -688,11 +704,15 @@ impl ChatSession {
 
             if step + 1 < max_tokens {
                 deadline.check()?;
-                let decode_started = Instant::now();
-                logits = executor
-                    .decode_last_logits(token)
-                    .map_err(|error| ChatGenerationError::message(error.to_string()))?;
-                decode_ms.push(elapsed_ms(decode_started.elapsed()));
+                // One span per generated token, ending with its logit readback.
+                let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
+                let (next, step_ms) = timed(&span, "decode_ms", || {
+                    executor
+                        .decode_last_logits(token)
+                        .map_err(|error| ChatGenerationError::message(error.to_string()))
+                })?;
+                logits = next;
+                decode_ms.push(step_ms);
                 deadline.check()?;
             }
         }
@@ -1148,6 +1168,21 @@ fn emit_delta(
         }
     }
     Ok(())
+}
+
+/// Runs `work` inside `span` and records its wall time in milliseconds as
+/// `field`, returning the same figure for the JSON metrics. For MLX work that
+/// ends in a host readback, the span covers the GPU evaluation.
+fn timed<T, E>(
+    span: &tracing::Span,
+    field: &'static str,
+    work: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, f64), E> {
+    let started = Instant::now();
+    let value = span.in_scope(work)?;
+    let milliseconds = elapsed_ms(started.elapsed());
+    span.record(field, milliseconds);
+    Ok((value, milliseconds))
 }
 
 fn elapsed_ms(duration: Duration) -> f64 {

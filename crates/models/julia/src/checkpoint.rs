@@ -212,6 +212,12 @@ pub struct JuliaCheckpoint {
 
 impl JuliaCheckpoint {
     /// Loads `dir` after requiring the published artifact layout.
+    #[tracing::instrument(
+        name = "julia.checkpoint.load",
+        level = "info",
+        skip_all,
+        fields(dir = %dir.display())
+    )]
     pub fn load(dir: &Path) -> Result<Self, JuliaCheckpointError> {
         for config in ["config.json", "julia_config.json"] {
             let path = dir.join(config);
