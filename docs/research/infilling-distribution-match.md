@@ -26,12 +26,18 @@ how the slot length was proposed). Twisted SMC uses the same target with the
 suffix likelihood as potential ([2404.17546](https://arxiv.org/abs/2404.17546)
 §7.2.3, read).
 
-Metallix already computes this weight in one case. Where the grammar admits
-exactly one token, `allowed_log_mass` in
-[`constraint.rs`](../../crates/engine/src/constraint.rs) equals that token's
-model log probability, and fixed JSON keys are decoded one token at a time.
-So for a fixed-key schema, the sum of `allowed_log_mass` over a run is already
-the importance log weight toward the global conditional at temperature 1.
+Metallix already computes a weight of this kind, with one qualification.
+`allowed_log_mass` in [`constraint.rs`](../../crates/engine/src/constraint.rs)
+is the model mass of every token the grammar allows next, and fixed JSON keys
+are decoded one token at a time. The constraint uses llguidance's approximate
+(non-canonical) tokenizer environment, so a fixed key admits every
+tokenization of its bytes: on the Qwen3 vocabulary, after `{"` the mask allows
+six tokens (`d`, `de`, `des`, `desc`, `descr`, `description`). The sum of
+`allowed_log_mass` over a run is therefore the importance log weight toward
+the global conditional over byte strings, marginalizing tokenizations, at
+temperature 1. It equals the weight for canonical token sequences only with a
+canonical tokenizer environment, where those masks become single tokens.
+Each sampling mode should declare which of the two targets it uses.
 At other temperatures or with truncation, add `model_logprob -
 sampling_logprob` per step, as [Gate 1](sampling-next-gates.md) records.
 
