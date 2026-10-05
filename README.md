@@ -3,8 +3,7 @@
 </p>
 <h1 align="center">metallix</h1>
 
-A programmable local inference engine for Apple Silicon, built around Rust,
-Metal, and explicit model-state contracts.
+A local inference engine for Apple Silicon, built around Rust and Metal.
 
 ## What works today
 
