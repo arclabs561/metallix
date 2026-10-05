@@ -15,9 +15,14 @@
 //! 5120-wide BF16 `embed.weight` read through `V41CachedEmbeddingRows`:
 //! - `embedding_rows_cold` / `_warm`: a synthetic 1024-row table in memory;
 //!   cold builds a fresh cache per call, warm re-reads resident rows.
-//! - `local_embedding_rows_cold`: the real 129280-row table through
-//!   `V41LocalWeightsSource`, whose receipt check reads and hashes the whole
-//!   1.3 GB tensor for every uncached row range.
+//! - `local_embedding_rows_cold`: the real 129280-row table through a fresh
+//!   `V41LocalWeightsSource`, whose first read of the tensor hashes the whole
+//!   1.3 GB file once.
+//! - `local_embedding_rows_verified`: the same rows uncached in a fresh cache,
+//!   through one long-lived source that verified the tensor during setup, so
+//!   only the rows are read (a server's decode case).
+//!
+//! Both `local_embedding_rows_*` run only with `METALLIX_BENCH_LOCAL=1`.
 //! - `startup_selected_rows`: the startup lookup itself
 //!   (`startup_selected_bf16_reference`, 3 tokens x 4 HC copies) over rows
 //!   already read; layer 0's attention and FFN are not included.
@@ -221,31 +226,52 @@ fn embedding_rows_warm(bencher: divan::Bencher) {
     bencher.bench_local(|| black_box(read_step(&cache)));
 }
 
-#[divan::bench(sample_count = 3, sample_size = 1)]
-fn local_embedding_rows_cold(bencher: divan::Bencher) {
+/// A cache over the pinned real `embed.weight` through `source`, or `None`
+/// (bench skipped) when the local data is absent.
+fn local_embedding_cache(
+    source: V41LocalWeightsSource,
+) -> Option<Mutex<V41RangeCache<V41LocalWeightsSource>>> {
     let root = receipts();
     let trace = root.join("route-trace");
     let index =
         root.join("control/receipts/candidate-control/real-expert/model.safetensors.index.json");
-    if !trace.join("weights/embed.weight.bin").exists() || !index.exists() {
-        eprintln!("range_cache: local embed.weight absent; local_embedding_rows_cold skipped");
-        return;
+    // Each run hashes the 1.3 GB table; keep it out of `cargo test --benches`.
+    if std::env::var_os("METALLIX_BENCH_LOCAL").is_none() {
+        eprintln!("range_cache: set METALLIX_BENCH_LOCAL=1 to run local_embedding_rows_*");
+        return None;
     }
-    let cache = || {
-        Mutex::new(
-            V41RangeCache::load(
-                V41LocalWeightsSource::new(trace.join("weights"), PINNED),
-                &index,
-                &trace,
-                PINNED,
-                1 << 26,
-            )
+    if !trace.join("weights/embed.weight.bin").exists() || !index.exists() {
+        eprintln!("range_cache: local embed.weight absent; local_embedding_rows_* skipped");
+        return None;
+    }
+    Some(Mutex::new(
+        V41RangeCache::load(source, &index, &trace, PINNED, 1 << 26)
             .expect("pinned index and headers"),
-        )
-    };
-    bencher
-        .with_inputs(cache)
-        .bench_local_values(|cache| black_box(read_step(&cache)));
+    ))
+}
+
+fn local_source() -> V41LocalWeightsSource {
+    V41LocalWeightsSource::new(receipts().join("route-trace/weights"), PINNED)
+}
+
+#[divan::bench(sample_count = 3, sample_size = 1)]
+fn local_embedding_rows_cold(bencher: divan::Bencher) {
+    if local_embedding_cache(local_source()).is_some() {
+        bencher
+            .with_inputs(|| local_embedding_cache(local_source()).expect("present"))
+            .bench_local_values(|cache| black_box(read_step(&cache)));
+    }
+}
+
+#[divan::bench(sample_count = 20)]
+fn local_embedding_rows_verified(bencher: divan::Bencher) {
+    let source = local_source();
+    if let Some(cache) = local_embedding_cache(source.clone()) {
+        read_step(&cache);
+        bencher
+            .with_inputs(|| local_embedding_cache(source.clone()).expect("present"))
+            .bench_local_values(|cache| black_box(read_step(&cache)));
+    }
 }
 
 #[divan::bench]

@@ -13,10 +13,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use serde::Deserialize;
@@ -54,13 +55,25 @@ pub trait V41RangeSource {
 /// against its `<tensor>.receipt.json` (identity, header metadata, size and
 /// SHA-256) before any byte is returned.
 ///
-/// A row request still hashes the whole tensor file, because receipts only
-/// digest whole tensors.
+/// Receipts digest whole tensors, so the first read of a tensor hashes its
+/// whole file. A tensor whose file then keeps the verified digest, length and
+/// modification time is not hashed again: later reads, including row
+/// subranges, read only the requested range. Clones share that record.
+/// Concurrent first reads of one tensor hash it once: the others wait for it.
+/// Where the platform reports no modification time, the record falls back to
+/// digest and length alone.
 #[derive(Clone, Debug)]
 pub struct V41LocalWeightsSource {
     dir: PathBuf,
     revision: String,
+    verified: Arc<Mutex<HashMap<String, FileIdentity>>>,
+    hashing: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    #[cfg(test)]
+    hashes: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// The receipt digest, length and modification time a whole-file hash verified.
+type FileIdentity = (String, u64, Option<SystemTime>);
 
 impl V41LocalWeightsSource {
     /// Serves receipts for `revision` from `dir`.
@@ -68,6 +81,31 @@ impl V41LocalWeightsSource {
         Self {
             dir: dir.into(),
             revision: revision.into(),
+            verified: Arc::default(),
+            hashing: Arc::default(),
+            #[cfg(test)]
+            hashes: Arc::default(),
+        }
+    }
+
+    /// The lock one tensor's whole-file hash holds, shared by its concurrent readers.
+    fn hash_gate(&self, tensor: &str) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .hashing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(gates.entry(tensor.to_owned()).or_default())
+    }
+
+    fn is_verified(&self, tensor: &str, identity: &FileIdentity) -> bool {
+        self.verified
+            .lock()
+            .is_ok_and(|verified| verified.get(tensor) == Some(identity))
+    }
+
+    fn mark_verified(&self, tensor: &str, identity: FileIdentity) {
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.insert(tensor.to_owned(), identity);
         }
     }
 }
@@ -138,34 +176,70 @@ impl V41RangeSource for V41LocalWeightsSource {
             }
             Err(error) => return Err(V41RangeCacheError::Io(error)),
         };
-        let actual = file.metadata().map_err(V41RangeCacheError::Io)?.len();
+        let metadata = file.metadata().map_err(V41RangeCacheError::Io)?;
+        let actual = metadata.len();
         if actual != receipt.bytes {
             return Err(V41RangeCacheError::SizeMismatch {
                 expected: receipt.bytes,
                 actual,
             });
         }
-        let length = usize::try_from(actual).map_err(|_| V41RangeCacheError::Allocation)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| V41RangeCacheError::Allocation)?;
-        file.take(actual)
-            .read_to_end(&mut bytes)
-            .map_err(V41RangeCacheError::Io)?;
-        if format!("{:x}", Sha256::digest(&bytes)) != receipt.sha256 {
-            return Err(V41RangeCacheError::HashMismatch(tensor.to_owned()));
-        }
+        let identity = (receipt.sha256, actual, metadata.modified().ok());
         let base = expected.file_range().start;
-        let start = usize::try_from(request.range.start - base)
-            .map_err(|_| V41RangeCacheError::Allocation)?;
-        let end = usize::try_from(request.range.end - base)
-            .map_err(|_| V41RangeCacheError::Allocation)?;
-        if start == 0 && end == bytes.len() {
-            return Ok(bytes);
+        let (start, end) = (request.range.start - base, request.range.end - base);
+        let mut file = file;
+        let gate = (!self.is_verified(tensor, &identity)).then(|| self.hash_gate(tensor));
+        let _hashing = gate.as_ref().map(|gate| {
+            gate.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        // Recheck under the gate: a concurrent reader may have just verified it.
+        if gate.is_some() && !self.is_verified(tensor, &identity) {
+            #[cfg(test)]
+            self.hashes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if start == 0 && end == actual {
+                let bytes = read_exact_range(&mut file, 0, actual)?;
+                if format!("{:x}", Sha256::digest(&bytes)) != identity.0 {
+                    return Err(V41RangeCacheError::HashMismatch(tensor.to_owned()));
+                }
+                self.mark_verified(tensor, identity);
+                return Ok(bytes);
+            }
+            // A subrange: hash the file in bounded chunks rather than holding it.
+            let mut hasher = Sha256::new();
+            let mut chunk = vec![0; 8 << 20];
+            loop {
+                let read = file.read(&mut chunk).map_err(V41RangeCacheError::Io)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&chunk[..read]);
+            }
+            if format!("{:x}", hasher.finalize()) != identity.0 {
+                return Err(V41RangeCacheError::HashMismatch(tensor.to_owned()));
+            }
+            self.mark_verified(tensor, identity);
         }
-        Ok(bytes[start..end].to_vec())
+        read_exact_range(&mut file, start, end)
     }
+}
+
+fn read_exact_range(
+    file: &mut fs::File,
+    start: u64,
+    end: u64,
+) -> Result<Vec<u8>, V41RangeCacheError> {
+    let length = usize::try_from(end - start).map_err(|_| V41RangeCacheError::Allocation)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| V41RangeCacheError::Allocation)?;
+    bytes.resize(length, 0);
+    file.seek(SeekFrom::Start(start))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(V41RangeCacheError::Io)?;
+    Ok(bytes)
 }
 
 type Key = (String, u64, u64);
@@ -801,6 +875,100 @@ mod tests {
         for dir in [dir, wrong_hash, truncated] {
             std::fs::remove_dir_all(dir).expect("cleanup own temp dir");
         }
+    }
+
+    #[test]
+    fn local_source_hashes_a_tensor_once_until_its_file_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "metallix-range-cache-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // The 4x3 U8 `table` at payload bytes 48..60; row r holds 3r..3r+3.
+        let table: Vec<u8> = (0..12).collect();
+        let start = payload_start() + 48;
+        let bin = dir.join("table.bin");
+        std::fs::write(&bin, &table).expect("bin");
+        std::fs::write(
+            dir.join("table.receipt.json"),
+            format!(
+                r#"{{"tensor":"table","shard":"{SHARD}","range":[{start},{}],"bytes":12,"metadata":{{"dtype":"U8","shape":[4,3]}},"sha256":"{:x}","revision":"{REV}"}}"#,
+                start + 12,
+                Sha256::digest(&table)
+            ),
+        )
+        .expect("receipt");
+        let source = V41LocalWeightsSource::new(&dir, REV);
+        assert_eq!(
+            &*cache(source.clone(), 64)
+                .get_rows("table", 1..2)
+                .expect("verified"),
+            [3, 4, 5]
+        );
+
+        // Corrupt a byte outside the next row but keep the verified length and
+        // modification time: the next uncached row is read without rehashing.
+        let modified = std::fs::metadata(&bin)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        let mut corrupt = table.clone();
+        corrupt[0] = 0xff;
+        std::fs::write(&bin, &corrupt).expect("corrupt");
+        std::fs::File::options()
+            .write(true)
+            .open(&bin)
+            .and_then(|file| file.set_modified(modified))
+            .expect("restore mtime");
+        assert_eq!(
+            &*cache(source.clone(), 64)
+                .get_rows("table", 2..3)
+                .expect("not rehashed"),
+            [6, 7, 8]
+        );
+
+        // A new modification time means a different file: hash it again.
+        std::fs::File::options()
+            .write(true)
+            .open(&bin)
+            .and_then(|file| file.set_modified(modified + std::time::Duration::from_secs(5)))
+            .expect("touch");
+        assert!(matches!(
+            cache(source, 64).get_rows("table", 3..4),
+            Err(V41RangeCacheError::HashMismatch(_))
+        ));
+        std::fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn concurrent_first_reads_of_one_tensor_hash_it_once() {
+        let good: Vec<u8> = (0..16).collect();
+        let dir = weights_dir(&good, None);
+        let source = V41LocalWeightsSource::new(&dir, REV);
+        let header = header();
+        let range = header.tensor("e0").expect("e0").clone();
+        let readers: Vec<_> = (0..8)
+            .map(|row| {
+                let (source, range) = (source.clone(), range.clone());
+                std::thread::spawn(move || {
+                    let start = range.file_range().start + row * 2;
+                    source
+                        .read_range(&V41RangeRequest {
+                            tensor: "e0",
+                            shard: SHARD,
+                            tensor_range: &range,
+                            range: start..start + 2,
+                        })
+                        .expect("verified range")
+                })
+            })
+            .collect();
+        for (row, reader) in readers.into_iter().enumerate() {
+            let row = u8::try_from(row).expect("small");
+            assert_eq!(reader.join().expect("reader"), [2 * row, 2 * row + 1]);
+        }
+        assert_eq!(source.hashes.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 
     #[test]
