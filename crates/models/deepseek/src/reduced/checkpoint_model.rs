@@ -525,7 +525,7 @@ impl V41CheckpointWeights {
     }
 
     /// Selects the backend for [`Self::engram_definitions`] and
-    /// [`Self::request_model`]. [`V41Backend::Metal`] needs the head loaded:
+    /// [`Self::request_model`]. `V41Backend::Metal` needs the head loaded:
     /// it uploads a 2.6 GB FP32 copy of it to the GPU once. Each FP8 linear's
     /// weights (attention and shared expert) are uploaded on first use and
     /// stay resident while these weights live.

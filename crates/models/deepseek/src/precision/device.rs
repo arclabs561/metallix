@@ -79,7 +79,8 @@ impl ResidentFp8 {
     }
 }
 
-/// What a [`DeviceLinears`] scope ran, summed over its lifetime.
+/// What a request backend's device scope ran, summed over its lifetime; see
+/// `V41CheckpointWeights::device_counts`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct DeviceCounts {
