@@ -18,6 +18,17 @@ use super::{
     ScheduleError, ScheduledLayer, StartupDefinition, session::LayerState,
 };
 
+/// Which positions of each step get final-head logits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HeadPositions {
+    /// Every position of the step, in order.
+    #[default]
+    All,
+    /// Only the step's last position, as the source computes for generation.
+    Last,
+}
+
 /// One checkpoint-defined runtime model: startup, scheduled layers, and head.
 #[derive(Clone, Debug)]
 pub struct RequestModel<'a> {
@@ -25,6 +36,7 @@ pub struct RequestModel<'a> {
     pub(super) layers: Vec<ScheduledLayer<'a>>,
     pub(super) engrams: Vec<EngramDefinition>,
     pub(super) head: FinalHead<'a>,
+    pub(super) head_positions: HeadPositions,
     pub(super) frequencies: &'a [RotaryFrequency],
     pub(super) max_tokens: NonZeroUsize,
     pub(super) score_execution: IndexScoreExecution,
@@ -116,6 +128,7 @@ impl<'a> RequestModel<'a> {
             layers,
             engrams,
             head,
+            head_positions: HeadPositions::All,
             frequencies,
             max_tokens,
             score_execution: IndexScoreExecution::Scalar,
@@ -209,6 +222,20 @@ impl<'a> RequestModel<'a> {
     #[must_use]
     pub const fn head_execution(&self) -> FinalHeadExecution {
         self.head.execution()
+    }
+
+    /// Selects which step positions get final-head logits; the default is
+    /// [`HeadPositions::All`].
+    #[must_use]
+    pub const fn with_head_positions(mut self, positions: HeadPositions) -> Self {
+        self.head_positions = positions;
+        self
+    }
+
+    /// Returns which step positions get final-head logits.
+    #[must_use]
+    pub const fn head_positions(&self) -> HeadPositions {
+        self.head_positions
     }
 
     fn validate(&self) -> Result<(), RequestError> {

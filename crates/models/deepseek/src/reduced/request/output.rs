@@ -259,7 +259,8 @@ impl RequestStepOutput {
     pub fn incoming_pre(&self) -> &[f32] {
         &self.incoming_pre
     }
-    /// Returns one final-head result per token.
+    /// Returns one final-head result per token, or only the last token's
+    /// under [`super::HeadPositions::Last`].
     #[must_use]
     pub fn heads(&self) -> &[FinalHeadOutput] {
         &self.heads

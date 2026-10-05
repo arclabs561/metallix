@@ -42,10 +42,10 @@ pub use artifact::{
 };
 mod request;
 pub use request::{
-    BlockDefinition, EngramDefinition, LayerFourDefinition, LayerKind, LayerOneDefinition,
-    LayerStepOutput, LayerThreeDefinition, RequestError, RequestModel, RequestSession,
-    RequestStepOutput, ReusedAttentionDefinition, ScheduleError, ScheduledAttentionOutput,
-    ScheduledLayer, StartupDefinition, StepSources,
+    BlockDefinition, EngramDefinition, HeadPositions, LayerFourDefinition, LayerKind,
+    LayerOneDefinition, LayerStepOutput, LayerThreeDefinition, RequestError, RequestModel,
+    RequestSession, RequestStepOutput, ReusedAttentionDefinition, ScheduleError,
+    ScheduledAttentionOutput, ScheduledLayer, StartupDefinition, StepSources,
 };
 mod layer_four;
 pub use candidates::{CandidateProjection, CandidateProjector, CandidateProjectorError};
@@ -95,11 +95,26 @@ pub enum FinalHeadExecution {
     MetalFp32,
 }
 
+/// Largest BF16 output head: covers the real V4.1 129280 x 5120 head (662M
+/// weights, 1.3 GB). An allocation guard on the borrowed weight, not a work cap.
+pub const MAX_BF16_HEAD_ELEMENTS: usize = 1 << 30;
+
+/// Borrowed output-head weights `[vocabulary, hidden_width]`.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum HeadWeights<'a> {
+    /// FP32 storage, bounded by the scalar FP32 linear limits.
+    F32(&'a [f32]),
+    /// BF16 storage, widened exactly to FP32 per weight inside the
+    /// projection, so logits equal the FP32 path over the widened weights.
+    Bf16(&'a [u16]),
+}
+
 /// Borrowed immutable operands for one final normalization and head.
 #[derive(Clone, Copy, Debug)]
 pub struct FinalHead<'a> {
     norm_weight: &'a [u16],
-    head_weight: &'a [f32],
+    head_weight: HeadWeights<'a>,
     vocabulary: usize,
     copies: usize,
     epsilon: f32,
@@ -114,7 +129,7 @@ impl<'a> FinalHead<'a> {
         (self.copies, self.width)
     }
 
-    /// Validates the static final-normalization and output-head operands.
+    /// Validates the static final-normalization and FP32 output-head operands.
     ///
     /// `norm_weight` is BF16 storage `[hidden_width]`; `head_weight` is FP32
     /// storage `[vocabulary, hidden_width]`; and `copies` is the number of
@@ -122,6 +137,25 @@ impl<'a> FinalHead<'a> {
     pub fn new(
         norm_weight: &'a [u16],
         head_weight: &'a [f32],
+        vocabulary: usize,
+        copies: usize,
+        epsilon: f32,
+    ) -> Result<Self, FinalHeadError> {
+        Self::with_weights(
+            norm_weight,
+            HeadWeights::F32(head_weight),
+            vocabulary,
+            copies,
+            epsilon,
+        )
+    }
+
+    /// Like [`Self::new`] for either head storage. FP32 weights keep the
+    /// scalar FP32 linear limits; BF16 weights are bounded by
+    /// [`MAX_BF16_HEAD_ELEMENTS`].
+    pub fn with_weights(
+        norm_weight: &'a [u16],
+        head_weight: HeadWeights<'a>,
         vocabulary: usize,
         copies: usize,
         epsilon: f32,
@@ -151,27 +185,35 @@ impl<'a> FinalHead<'a> {
         if vocabulary == 0 {
             return Err(FinalHeadError::EmptyVocabulary);
         }
-        if vocabulary > MAX_FP32_LINEAR_ELEMENTS {
+        let maximum = match head_weight {
+            HeadWeights::F32(_) => MAX_FP32_LINEAR_ELEMENTS,
+            HeadWeights::Bf16(_) => MAX_BF16_HEAD_ELEMENTS,
+        };
+        if vocabulary > maximum {
             return Err(FinalHeadError::VocabularyTooLarge {
                 vocabulary,
-                maximum: MAX_FP32_LINEAR_ELEMENTS,
+                maximum,
             });
         }
 
         let expected_head_weight = checked_product(vocabulary, width, "head_weight")?;
         // One token performs one multiply-accumulate per weight, so the
-        // weight element cap also bounds work below the linear work cap.
-        if expected_head_weight > MAX_FP32_LINEAR_ELEMENTS {
+        // weight element cap also bounds a projection's work.
+        if expected_head_weight > maximum {
             return Err(FinalHeadError::ElementLimit {
                 field: "head_weight",
                 elements: expected_head_weight,
-                maximum: MAX_FP32_LINEAR_ELEMENTS,
+                maximum,
             });
         }
-        if head_weight.len() != expected_head_weight {
+        let actual = match head_weight {
+            HeadWeights::F32(weights) => weights.len(),
+            HeadWeights::Bf16(weights) => weights.len(),
+        };
+        if actual != expected_head_weight {
             return Err(FinalHeadError::Length {
                 field: "head_weight",
-                actual: head_weight.len(),
+                actual,
                 expected: expected_head_weight,
             });
         }
@@ -180,10 +222,14 @@ impl<'a> FinalHead<'a> {
                 return Err(FinalHeadError::NonFiniteNormWeight { element });
             }
         }
-        for (element, &weight) in head_weight.iter().enumerate() {
-            if !weight.is_finite() {
-                return Err(FinalHeadError::NonFiniteHeadWeight { element });
-            }
+        let non_finite = match head_weight {
+            HeadWeights::F32(weights) => weights.iter().position(|weight| !weight.is_finite()),
+            HeadWeights::Bf16(weights) => weights
+                .iter()
+                .position(|&bits| !bf16_to_f32(bits).is_finite()),
+        };
+        if let Some(element) = non_finite {
+            return Err(FinalHeadError::NonFiniteHeadWeight { element });
         }
 
         Ok(Self {
@@ -249,13 +295,13 @@ impl<'a> FinalHead<'a> {
 
         let mut normalized_f32 = allocate_f32("normalized_f32", self.width)?;
         normalized_f32.extend(normalized_bf16.iter().copied().map(bf16_to_f32));
-        let logits = match self.execution {
-            FinalHeadExecution::Scalar => {
+        let logits = match (self.execution, self.head_weight) {
+            (FinalHeadExecution::Scalar, HeadWeights::F32(weights)) => {
                 let mut logits = allocate_f32("logits", self.vocabulary)?;
                 logits.resize(self.vocabulary, 0.0);
                 fp32_linear_reference(
                     &normalized_f32,
-                    self.head_weight,
+                    weights,
                     1,
                     self.width,
                     self.vocabulary,
@@ -263,13 +309,17 @@ impl<'a> FinalHead<'a> {
                 )?;
                 logits
             }
+            (FinalHeadExecution::Scalar, HeadWeights::Bf16(weights)) => {
+                project_logits_bf16(&normalized_f32, weights, self.vocabulary)?
+            }
             #[cfg(feature = "metal")]
-            FinalHeadExecution::MetalFp32 => project_logits_metal(
-                &normalized_f32,
-                self.head_weight,
-                self.vocabulary,
-                self.width,
-            )?,
+            (FinalHeadExecution::MetalFp32, HeadWeights::F32(weights)) => {
+                project_logits_metal(&normalized_f32, weights, self.vocabulary, self.width)?
+            }
+            #[cfg(feature = "metal")]
+            (FinalHeadExecution::MetalFp32, HeadWeights::Bf16(_)) => {
+                return Err(FinalHeadError::UnsupportedExecution);
+            }
         };
 
         Ok(FinalHeadOutput {
@@ -480,6 +530,9 @@ pub enum FinalHeadError {
         /// Output element index.
         element: usize,
     },
+    /// The selected execution does not support this head storage.
+    #[error("final head execution does not support BF16 head weights")]
+    UnsupportedExecution,
     /// A temporary output row could not be reserved.
     #[error("could not allocate {elements} final-head elements for {field}")]
     AllocationFailed {
@@ -506,6 +559,43 @@ fn checked_product(
 ) -> Result<usize, FinalHeadError> {
     left.checked_mul(right)
         .ok_or(FinalHeadError::ShapeOverflow { field })
+}
+
+/// One-row FP32 projection over BF16 weights in [`fp32_linear_reference`]'s
+/// order and checks. Widening BF16 to FP32 is exact, so the logits equal that
+/// reference over the widened weights bit for bit.
+fn project_logits_bf16(
+    input: &[f32],
+    weights: &[u16],
+    vocabulary: usize,
+) -> Result<Vec<f32>, FinalHeadError> {
+    if let Some(element) = input.iter().position(|value| !value.is_finite()) {
+        return Err(Fp32LinearError::NonFiniteActivation { element }.into());
+    }
+    let mut logits = allocate_f32("logits", vocabulary)?;
+    for (column, row) in weights.chunks_exact(input.len()).enumerate() {
+        let mut sum = 0.0_f32;
+        for (&activation, &bits) in input.iter().zip(row) {
+            let product = activation * bf16_to_f32(bits);
+            let stage = if product.is_finite() {
+                sum += product;
+                if sum.is_finite() {
+                    continue;
+                }
+                "sum"
+            } else {
+                "product"
+            };
+            return Err(Fp32LinearError::ValueOverflow {
+                stage,
+                row: 0,
+                output: column,
+            }
+            .into());
+        }
+        logits.push(sum);
+    }
+    Ok(logits)
 }
 
 fn allocate_u16(field: &'static str, elements: usize) -> Result<Vec<u16>, FinalHeadError> {

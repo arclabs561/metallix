@@ -48,11 +48,11 @@ use crate::{
 
 use super::{
     AttentionInput, BlockDefinition, BlockTailReference, CandidateProjector, EngramDefinition,
-    EngramSessionConfig, EngramSessionWeights, FinalHead, LayerFourCall, LayerFourConfig,
-    LayerFourDefinition, LayerFourSession, LayerKind, LayerOneCall, LayerOneConfig,
-    LayerOneDefinition, LayerOneSession, LayerOneStepOutput, LayerThreeCall, LayerThreeConfig,
-    LayerThreeDefinition, LayerThreePublication, LayerThreeSession, LayerThreeStepOutput,
-    RatioTwoOwnerLayout, RatioTwoOwnerWeights, RequestError, RequestModel,
+    EngramSessionConfig, EngramSessionWeights, FinalHead, HeadPositions, HeadWeights,
+    LayerFourCall, LayerFourConfig, LayerFourDefinition, LayerFourSession, LayerKind, LayerOneCall,
+    LayerOneConfig, LayerOneDefinition, LayerOneSession, LayerOneStepOutput, LayerThreeCall,
+    LayerThreeConfig, LayerThreeDefinition, LayerThreePublication, LayerThreeSession,
+    LayerThreeStepOutput, RatioTwoOwnerLayout, RatioTwoOwnerWeights, RequestError, RequestModel,
     ReusedAttentionDefinition, ScheduledLayer, StartupDefinition,
 };
 
@@ -483,18 +483,17 @@ impl V41CheckpointWeights {
         Ok((config, weights))
     }
 
-    /// HOOK(startup-head): reads the token embedding and output head. Both
-    /// are `[vocab_size, dim]` (1.3 GB BF16 each; the head is widened to the
-    /// 2.6 GB FP32 [`FinalHead`] takes), and both currently exceed the
-    /// startup-table and final-head element caps, so a model built over them
-    /// is rejected until a row-source startup and a large-vocabulary head land.
+    /// HOOK(startup): reads the token embedding and the BF16 output head,
+    /// both `[vocab_size, dim]` (1.3 GB each). The head fits
+    /// [`super::MAX_BF16_HEAD_ELEMENTS`]; the embedding still exceeds the
+    /// startup-table cap until a row-source startup lands.
     pub fn load_embedding_and_head<S: V41RangeSource>(
         &mut self,
         cache: &mut V41RangeCache<S>,
     ) -> Result<(), V41CheckpointModelError> {
         let shape = [self.config.vocab_size, self.config.dim];
         self.read(cache, "embed.weight", Read::Bf16, &shape)?;
-        self.read(cache, "head.weight", Read::Bf16AsF32, &shape)
+        self.read(cache, "head.weight", Read::Bf16, &shape)
     }
 
     /// Assembles the request model. Requires every layer and the embedding
@@ -541,14 +540,15 @@ impl V41CheckpointWeights {
             }
             layers.push(scheduled);
         }
-        let head = FinalHead::new(
+        let head = FinalHead::with_weights(
             self.bf16("norm.weight")?,
-            self.f32("head.weight")?,
+            HeadWeights::Bf16(self.bf16("head.weight")?),
             config.vocab_size,
             config.hc_mult,
             config.norm_eps,
         )
         .map_err(component)?;
+        // The source computes logits for the last position only.
         Ok(RequestModel::from_schedule(
             startup,
             layers,
@@ -556,7 +556,8 @@ impl V41CheckpointWeights {
             head,
             &self.compressed_frequencies,
             self.max_tokens,
-        )?)
+        )?
+        .with_head_positions(HeadPositions::Last))
     }
 
     /// Runs one layer of a start-zero prefill on a caller-supplied input
@@ -1340,8 +1341,8 @@ mod tests {
         checkpoint::range_cache::{V41CachedRoutedExperts, V41LocalWeightsSource, V41RangeCache},
         indexer::key::IndexKeyLayout,
         reduced::{
-            FinalHead, FinalHeadError, LayerFourConfig, LayerOneConfig, LayerThreeConfig,
-            RatioTwoOwnerLayout,
+            FinalHead, FinalHeadError, HeadWeights, LayerFourConfig, LayerOneConfig,
+            LayerThreeConfig, RatioTwoOwnerLayout,
         },
     };
 
@@ -1440,13 +1441,26 @@ mod tests {
             .expect("ratio-one indexer");
     }
 
-    /// HOOK(startup-head): pins today's blockers so lifting either cap fails here.
+    /// HOOK(startup): pins the remaining startup-table blocker so lifting it
+    /// fails here. The real head passes every BF16 cap and reaches the
+    /// length check; the FP32 head stays bounded.
     #[test]
-    fn real_vocabulary_exceeds_the_startup_and_head_caps() {
+    fn real_vocabulary_fits_the_bf16_head_but_not_the_startup_table() {
         assert!(StartupLayout::new(129_280, 5120, 4).is_err());
         assert!(matches!(
+            FinalHead::with_weights(&[0x3f80; 5120], HeadWeights::Bf16(&[]), 129_280, 4, 1e-20),
+            Err(FinalHeadError::Length {
+                field: "head_weight",
+                actual: 0,
+                expected: 661_913_600,
+            })
+        ));
+        assert!(matches!(
             FinalHead::new(&[0x3f80; 5120], &[], 129_280, 4, 1e-20),
-            Err(FinalHeadError::VocabularyTooLarge { .. } | FinalHeadError::ElementLimit { .. })
+            Err(FinalHeadError::ElementLimit {
+                field: "head_weight",
+                ..
+            })
         ));
     }
 

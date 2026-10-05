@@ -850,8 +850,8 @@ mod tests {
 
     use super::*;
     use crate::reduced::{
-        LayerKind, RequestError, ScheduleError, ScheduledAttentionOutput, ScheduledLayer,
-        artifact::ReducedArtifact,
+        HeadPositions, LayerKind, RequestError, ScheduleError, ScheduledAttentionOutput,
+        ScheduledLayer, artifact::ReducedArtifact,
     };
 
     fn artifact() -> ReducedArtifact {
@@ -956,6 +956,38 @@ mod tests {
                             .eq(right.logits().iter().map(|value| value.to_bits()))
                     );
                 }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn last_position_heads_equal_the_last_of_all_position_heads() {
+        let artifact = artifact();
+        let ids = ids(&artifact.config);
+        with_parts(&artifact.config, &artifact.tensors, |parts| {
+            let all = from_schedule(&parts, reduced_schedule(&parts)).unwrap();
+            assert_eq!(all.head_positions(), HeadPositions::All);
+            let last = from_schedule(&parts, reduced_schedule(&parts))
+                .unwrap()
+                .with_head_positions(HeadPositions::Last);
+            let (all, last) = (run(&all, &ids), run(&last, &ids));
+            assert_eq!(
+                all[0].heads().len(),
+                3,
+                "prefill heads cover every position"
+            );
+            for (all, last) in all.iter().zip(&last) {
+                assert_eq!(last.heads().len(), 1);
+                assert_eq!(
+                    format!("{:?}", all.heads().last()),
+                    format!("{:?}", last.heads().first())
+                );
+                assert_eq!(
+                    format!("{:?}", all.layers()),
+                    format!("{:?}", last.layers())
+                );
             }
             Ok(())
         })

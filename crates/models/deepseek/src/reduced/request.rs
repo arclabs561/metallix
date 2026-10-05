@@ -21,7 +21,7 @@ pub use definition::{
     LayerThreeDefinition, ReusedAttentionDefinition, ScheduledLayer, StartupDefinition,
 };
 pub use error::{RequestError, ScheduleError};
-pub use model::RequestModel;
+pub use model::{HeadPositions, RequestModel};
 pub use output::{LayerStepOutput, RequestStepOutput, ScheduledAttentionOutput};
 pub use session::{RequestSession, StepSources};
 

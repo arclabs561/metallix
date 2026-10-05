@@ -21,8 +21,8 @@ use crate::{
 };
 
 use super::{
-    BlockDefinition, LayerKind, LayerStepOutput, RequestError, RequestModel, RequestStepOutput,
-    ScheduledAttentionOutput, reserve,
+    BlockDefinition, HeadPositions, LayerKind, LayerStepOutput, RequestError, RequestModel,
+    RequestStepOutput, ScheduledAttentionOutput, reserve,
 };
 
 /// Request-local state for one scheduled layer, matching its [`LayerKind`].
@@ -388,7 +388,21 @@ impl<'a> RequestSession<'a> {
             pre = next_pre;
         }
         let (copies, width) = self.model.startup.tail.geometry();
-        let heads = final_heads(self.model.head, &residual, &pre, ids.len(), (copies, width))?;
+        let heads = match self.model.head_positions {
+            HeadPositions::All => {
+                final_heads(self.model.head, &residual, &pre, ids.len(), (copies, width))?
+            }
+            HeadPositions::Last => {
+                let stride = copies * width;
+                final_heads(
+                    self.model.head,
+                    &residual[residual.len() - stride..],
+                    &pre[pre.len() - copies..],
+                    1,
+                    (copies, width),
+                )?
+            }
+        };
         if let Some(owner) = outputs
             .iter()
             .rev()
