@@ -410,6 +410,23 @@ impl<'a> RequestModel<'a> {
         frequencies: &'a [RotaryFrequency],
         max_tokens: NonZeroUsize,
     ) -> Result<Self, RequestError> {
+        let mut layers = layers;
+        // Incomplete ratio-two groups score the last ratio-one owner's keys.
+        let previous_owner = layers.iter().rev().find_map(|layer| match layer.kind {
+            LayerKind::RatioOneOwner(owner) => owner
+                .config
+                .attention_layout()
+                .compression()
+                .map(|(source, _)| source),
+            _ => None,
+        });
+        if let Some(previous_owner) = previous_owner {
+            for layer in &mut layers {
+                if let LayerKind::RatioTwoOwner(owner) = &mut layer.kind {
+                    owner.config = owner.config.with_previous_owner_layer(previous_owner);
+                }
+            }
+        }
         let model = Self {
             startup,
             layers,

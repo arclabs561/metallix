@@ -221,8 +221,8 @@ pub(super) fn with_parts<T>(
         attention_layout(config, Some((1, 2)))?,
         attention_weights(config, tensors, LAYER_TWO)?,
     );
-    let layer_three = layer_three(config, tensors)?;
-    let layer_four = layer_four(config, tensors)?;
+    let layer_three = layer_three(config, tensors, 3)?;
+    let layer_four = layer_four(config, tensors, 3)?;
     let head = FinalHead::new(
         tensors.u16("head.norm.weight", &[config.width])?,
         tensors.f32("head.weight", &[config.vocabulary, config.width])?,
@@ -440,6 +440,7 @@ fn layer_one<'a>(
 fn layer_three<'a>(
     config: &ArtifactConfig,
     tensors: &'a TensorStore,
+    source_layer: u16,
 ) -> Result<LayerThreeDefinition<'a>, ArtifactError> {
     let owner_key_layout = IndexKeyLayout::new(
         NonZeroUsize::MIN,
@@ -470,7 +471,7 @@ fn layer_three<'a>(
             owner_key_layout,
             nonzero(config.width)?,
             nonzero(config.max_tokens)?,
-            attention_layout(config, Some((3, 1)))?,
+            attention_layout(config, Some((source_layer, 1)))?,
             nonzero(config.window)?,
             nonzero(config.index_topk)?,
         )
@@ -495,11 +496,12 @@ fn layer_three<'a>(
 fn layer_four<'a>(
     config: &ArtifactConfig,
     tensors: &'a TensorStore,
+    source_layer: u16,
 ) -> Result<LayerFourDefinition<'a>, ArtifactError> {
     Ok(LayerFourDefinition::new(
         LayerFourConfig::new(
             query_layout(config)?,
-            attention_layout(config, Some((3, 1)))?,
+            attention_layout(config, Some((source_layer, 1)))?,
             nonzero(config.index_topk)?,
         )
         .map_err(invalid)?,
@@ -1011,6 +1013,60 @@ mod tests {
                         .all(|head| head.logits().iter().all(|value| value.is_finite()))
                 );
             }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ratio_two_owners_score_the_scheduled_ratio_one_owner_keys() {
+        let artifact = artifact();
+        let (config, tensors) = (&artifact.config, &artifact.tensors);
+        let ids = ids(config);
+        with_parts(config, tensors, |parts| {
+            let [one, two, three, _] = parts.blocks;
+            let reused = |compression, layer| -> Result<_, ArtifactError> {
+                Ok(ReusedAttentionDefinition::new(
+                    attention_layout(config, compression)?,
+                    attention_weights(config, tensors, layer)?,
+                ))
+            };
+            // V4.1-shaped: the ratio-one owner sits at layer 4, after a
+            // window-only layer, so incomplete ratio-two groups must accept
+            // layer-4 keys rather than the reduced schedule's layer 3.
+            let layers = vec![
+                ScheduledLayer::new(LayerKind::RatioTwoOwner(parts.layer_one), one).with_engram(0),
+                ScheduledLayer::new(LayerKind::RatioTwoConsumer(parts.layer_two), two),
+                ScheduledLayer::new(LayerKind::WindowOnly(reused(None, LAYER_TWO)?), two),
+                ScheduledLayer::new(
+                    LayerKind::RatioOneOwner(layer_three(config, tensors, 4)?),
+                    three,
+                )
+                .with_engram(1),
+                ScheduledLayer::new(
+                    LayerKind::RatioOneConsumer(reused(Some((4, 1)), LAYER_TWO)?),
+                    two,
+                ),
+            ];
+            let model = from_schedule(&parts, layers).unwrap();
+            let mut request = RequestSession::new(&model).unwrap();
+            request.step(&ids[..3]).unwrap();
+            let complete = request.step(&ids[3..4]).unwrap();
+            let ScheduledAttentionOutput::RatioOneOwner(owner) = complete.layers()[3].attention()
+            else {
+                panic!("layer 4 is the ratio-one owner");
+            };
+            assert_eq!(owner.publication().source_layer(), 4);
+            // Position 4 opens a ratio-two group, so layer 1 scores with the
+            // first two of layer 4's previous-call keys.
+            let partial = request.step(&ids[4..5]).unwrap();
+            assert!(partial.layer_one().owner().latent().is_none());
+            let used = partial.layer_one().score_key_prefix().len();
+            assert_eq!(used, 2 * config.head_dimension);
+            assert_eq!(
+                partial.layer_one().score_key_prefix(),
+                &owner.key_prefix()[..used]
+            );
             Ok(())
         })
         .unwrap();
