@@ -428,6 +428,15 @@ class Levels(unittest.TestCase):
         self.assertNotIn("summary", run)  # Cut-off requests are not engine failures.
         self.assertEqual(started.count("stopped"), 2)  # The abort, then cleanup.
 
+    def test_every_managed_engine_is_measured_on_chat_completions(self) -> None:
+        args = bench_load.build_parser().parse_args(
+            ["--server", "metallix", "--model-path", "model"]
+        )
+        for name in ("metallix", "vllm-metal", "mtplx", "mlx-lm"):
+            with mock.patch.object(bench_load, "env_python_versions", lambda *a: {}):
+                spec = bench_load.server_spec(name, pathlib.Path("m"), "m", "h:1", args)
+            self.assertEqual(spec.api, "chat", name)
+
     def test_prefix_cache_arms_per_server(self) -> None:
         spec = lambda name: bench_load.ServerSpec(name, "chat", [name], {}, {})
         on = bench_load.with_prefix_cache(spec("vllm-metal"), "on")

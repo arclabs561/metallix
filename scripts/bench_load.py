@@ -728,7 +728,9 @@ def server_spec(
         mx = args.mx.resolve()
         return ServerSpec(
             name,
-            "responses",
+            # The path every other engine is measured on; thinking is off
+            # unless a request sets reasoning_effort.
+            "chat",
             [
                 str(mx),
                 "serve",
