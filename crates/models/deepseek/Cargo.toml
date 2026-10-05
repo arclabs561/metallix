@@ -54,5 +54,11 @@ harness = false
 # Allocates the real 1.3 GB head; keep it out of `cargo test --all-targets`.
 test = false
 
+[[bench]]
+name = "engram_step"
+harness = false
+# Allocates the real 157 MB WKV weight; keep it out of `cargo test --all-targets`.
+test = false
+
 [lints]
 workspace = true

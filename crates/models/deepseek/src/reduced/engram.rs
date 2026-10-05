@@ -26,6 +26,13 @@ use crate::{
 };
 
 const MAX_SESSION_ELEMENTS: usize = 1 << 20;
+/// Most token positions one step may process. Prefill longer prompts in
+/// chunks. 128 keeps every later per-step stage within its own bound at V4.1
+/// width (the embedding lookup's 2^20 elements admit 170 positions).
+const MAX_ENGRAM_STEP_TOKENS: usize = 128;
+/// Per-step buffer bound: [`MAX_ENGRAM_STEP_TOKENS`] rows of the widest
+/// per-token buffer at V4.1 Flash, the WKV output `(4 + 1) * 5120`.
+const MAX_STEP_ELEMENTS: usize = MAX_ENGRAM_STEP_TOKENS * 25_600;
 
 /// Immutable layout and token-compression operands for one batch-one Engram request.
 ///
@@ -344,6 +351,12 @@ impl EngramSession {
         if positions == 0 {
             return Err(EngramSessionError::EmptyChunk);
         }
+        if positions > MAX_ENGRAM_STEP_TOKENS {
+            return Err(EngramSessionError::StepTooLong {
+                positions,
+                maximum: MAX_ENGRAM_STEP_TOKENS,
+            });
+        }
         let next_start = start
             .checked_add(positions)
             .ok_or(EngramSessionError::ShapeOverflow {
@@ -355,8 +368,8 @@ impl EngramSession {
                 capacity: self.config.capacity,
             });
         }
-        let expected_residual = checked_product(
-            checked_product(positions, self.config.copies, "residual rows")?,
+        let expected_residual = step_product(
+            step_product(positions, self.config.copies, "residual rows")?,
             self.config.width,
             "residual",
         )?;
@@ -368,7 +381,7 @@ impl EngramSession {
             });
         }
         validate_bf16(residual, "residual")?;
-        let mut tokens = reserved_vec(positions, "compressed tokens")?;
+        let mut tokens = step_vec(positions, "compressed tokens")?;
         for (index, &id) in token_ids.iter().enumerate() {
             tokens.push(self.compressed_token(index, id)?);
         }
@@ -428,12 +441,12 @@ impl EngramSession {
         hash_ids: &[i64],
         rows: Option<&dyn EngramRowSource>,
     ) -> Result<Vec<u16>, EngramSessionError> {
-        let elements = checked_product(
+        let elements = step_product(
             hash_ids.len(),
             self.config.embedding_width,
             "embedding output",
         )?;
-        let mut output = reserved_vec(elements, "embedding output")?;
+        let mut output = step_vec(elements, "embedding output")?;
         output.resize(elements, 0);
         match (rows, &self.weights.0.embedding) {
             (Some(rows), _) => engram_embedding_bf16_from_source(
@@ -467,7 +480,7 @@ impl EngramSession {
         let columns = hash_columns(&self.config.hash_layout)?;
         let reduction = checked_product(columns, self.config.embedding_width, "WKV reduction")?;
         let outputs = wkv_width(self.config.copies, self.config.width)?;
-        let activation_elements = checked_product(positions, reduction, "WKV activations")?;
+        let activation_elements = step_product(positions, reduction, "WKV activations")?;
         if embedding.len() != activation_elements {
             return Err(EngramSessionError::Length {
                 field: "embedding",
@@ -475,10 +488,10 @@ impl EngramSession {
                 expected: activation_elements,
             });
         }
-        let mut codes = reserved_vec(activation_elements, "WKV activation codes")?;
+        let mut codes = step_vec(activation_elements, "WKV activation codes")?;
         codes.resize(activation_elements, 0);
-        let scale_elements = checked_product(positions, reduction / 32, "WKV activation scales")?;
-        let mut scales = reserved_vec(scale_elements, "WKV activation scales")?;
+        let scale_elements = step_product(positions, reduction / 32, "WKV activation scales")?;
+        let mut scales = step_vec(scale_elements, "WKV activation scales")?;
         scales.resize(scale_elements, 0);
         quantize_bf16_activations_e4m3fn(
             embedding,
@@ -488,8 +501,8 @@ impl EngramSession {
             &mut codes,
             &mut scales,
         )?;
-        let output_elements = checked_product(positions, outputs, "WKV output")?;
-        let mut projected = reserved_vec(output_elements, "WKV FP32 output")?;
+        let output_elements = step_product(positions, outputs, "WKV output")?;
+        let mut projected = step_vec(output_elements, "WKV FP32 output")?;
         projected.resize(output_elements, 0.0);
         fp8_linear_runtime_f32(
             &codes,
@@ -502,7 +515,7 @@ impl EngramSession {
             ActivationGroup::Elements32,
             &mut projected,
         )?;
-        let mut wkv = reserved_vec(output_elements, "WKV BF16 output")?;
+        let mut wkv = step_vec(output_elements, "WKV BF16 output")?;
         for value in projected {
             wkv.push(f32_to_bf16_rne(value));
         }
@@ -516,7 +529,7 @@ impl EngramSession {
     ) -> Result<(Vec<u16>, Vec<u16>), EngramSessionError> {
         let key_width = checked_product(self.config.copies, self.config.width, "key width")?;
         let row_width = wkv_width(self.config.copies, self.config.width)?;
-        let expected = checked_product(positions, row_width, "WKV output")?;
+        let expected = step_product(positions, row_width, "WKV output")?;
         if wkv.len() != expected {
             return Err(EngramSessionError::Length {
                 field: "WKV output",
@@ -524,9 +537,9 @@ impl EngramSession {
                 expected,
             });
         }
-        let mut key = reserved_vec(checked_product(positions, key_width, "key")?, "key")?;
-        let mut value = reserved_vec(
-            checked_product(positions, self.config.width, "value")?,
+        let mut key = step_vec(step_product(positions, key_width, "key")?, "key")?;
+        let mut value = step_vec(
+            step_product(positions, self.config.width, "value")?,
             "value",
         )?;
         for row in wkv.chunks_exact(row_width) {
@@ -545,12 +558,12 @@ impl EngramSession {
     ) -> Result<Vec<u16>, EngramSessionError> {
         let layout = EngramGateLayout::new(1, positions, self.config.copies, self.config.width)?;
         let params = EngramGateParams::new(self.config.norm_epsilon, self.config.gate_clamp)?;
-        let elements = checked_product(
-            checked_product(positions, self.config.copies, "gate rows")?,
+        let elements = step_product(
+            step_product(positions, self.config.copies, "gate rows")?,
             self.config.width,
             "gate output",
         )?;
-        let mut output = reserved_vec(elements, "gate output")?;
+        let mut output = step_vec(elements, "gate output")?;
         output.resize(elements, 0);
         engram_residual_gate_bf16_reference(
             EngramGateInputs {
@@ -706,7 +719,7 @@ fn checked_product(
 
 /// The static WKV weight is caller-owned and only length-checked, so its size
 /// is not capped; every per-step buffer and the work a step does are bounded
-/// through [`checked_product`] (the projection output is `positions x outputs`).
+/// through [`step_product`] (the projection output is `positions x outputs`).
 fn wkv_weight_elements(
     outputs: usize,
     reduction: usize,
@@ -715,6 +728,31 @@ fn wkv_weight_elements(
     outputs
         .checked_mul(reduction)
         .ok_or(EngramSessionError::ShapeOverflow { field })
+}
+
+/// Like [`checked_product`] for a buffer sized by one step's positions.
+fn step_product(
+    positions_or_rows: usize,
+    width: usize,
+    field: &'static str,
+) -> Result<usize, EngramSessionError> {
+    match positions_or_rows.checked_mul(width) {
+        Some(elements) if elements <= MAX_STEP_ELEMENTS => Ok(elements),
+        Some(elements) => Err(EngramSessionError::ElementLimit { field, elements }),
+        None => Err(EngramSessionError::ShapeOverflow { field }),
+    }
+}
+
+/// Like [`reserved_vec`] for a buffer sized by one step's positions.
+fn step_vec<T>(elements: usize, field: &'static str) -> Result<Vec<T>, EngramSessionError> {
+    if elements > MAX_STEP_ELEMENTS {
+        return Err(EngramSessionError::ElementLimit { field, elements });
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(elements)
+        .map_err(|_| EngramSessionError::AllocationFailed { field, elements })?;
+    Ok(values)
 }
 
 fn reserved_vec<T>(elements: usize, field: &'static str) -> Result<Vec<T>, EngramSessionError> {
@@ -777,6 +815,8 @@ pub enum EngramSessionError {
     MissingEmbeddingRows,
     #[error("Engram chunk ends at {end}, beyond capacity {capacity}")]
     ChunkExceedsCapacity { end: usize, capacity: usize },
+    #[error("Engram step of {positions} positions exceeds {maximum}; prefill in chunks")]
+    StepTooLong { positions: usize, maximum: usize },
     #[error("Engram shape overflowed for {field}")]
     ShapeOverflow { field: &'static str },
     #[error("could not allocate {elements} Engram {field} elements")]
@@ -804,7 +844,7 @@ fn select_hash_column(
     hash_layer: usize,
 ) -> Result<Vec<i64>, EngramSessionError> {
     let row_width = checked_product(layers, columns, "hash row")?;
-    let expected = checked_product(positions, row_width, "hash output")?;
+    let expected = step_product(positions, row_width, "hash output")?;
     if all.len() != expected {
         return Err(EngramSessionError::Length {
             field: "hash output",
@@ -813,7 +853,7 @@ fn select_hash_column(
         });
     }
     let start = checked_product(hash_layer, columns, "hash column start")?;
-    let mut selected = reserved_vec(checked_product(positions, columns, "hash IDs")?, "hash IDs")?;
+    let mut selected = step_vec(step_product(positions, columns, "hash IDs")?, "hash IDs")?;
     for row in all.chunks_exact(row_width) {
         selected.extend_from_slice(&row[start..start + columns]);
     }
@@ -866,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn real_v41_wkv_is_admitted_and_each_step_is_bounded_by_its_buffers() {
+    fn real_v41_wkv_is_admitted_and_each_step_is_bounded_by_its_token_count() {
         // (4 + 1) * 5120 = 25600 outputs over 24 * 256 = 6144 reductions.
         let config = v41_config(5120).expect("real V4.1 WKV weight");
         let weights = EngramSessionWeights::without_embedding_table(
@@ -876,18 +916,35 @@ mod tests {
             vec![0x3f80; 4 * 5120],
         );
         let mut session = EngramSession::new(config, weights).expect("real-size session");
-        // One step's WKV output is positions x 25600; 41 positions exceed the
-        // per-step buffer bound before any projection work starts.
-        let ids = vec![1; 41];
-        let residual = vec![0x3f80; 41 * 4 * 5120];
+        let step = |session: &mut EngramSession, positions: usize| {
+            session.step_with(
+                0,
+                &vec![1; positions],
+                &vec![0x3f80; positions * 4 * 5120],
+                &ZeroRows,
+            )
+        };
+        // 129 positions exceed the per-step token bound before any work.
         assert!(matches!(
-            session.step_with(0, &ids, &residual, &ZeroRows),
-            Err(EngramSessionError::ElementLimit {
-                field: "WKV output",
-                elements: 1_049_600,
+            step(&mut session, 129),
+            Err(EngramSessionError::StepTooLong {
+                positions: 129,
+                maximum: 128,
             })
         ));
         assert_eq!(session.next_start(), 0, "a rejected step commits nothing");
+        // The bound admits the widest per-step buffer at that token count.
+        assert_eq!(
+            super::step_product(128, 25_600, "WKV output").expect("128 positions"),
+            3_276_800
+        );
+        assert!(matches!(
+            super::step_product(129, 25_600, "WKV output"),
+            Err(EngramSessionError::ElementLimit {
+                field: "WKV output",
+                elements: 3_302_400,
+            })
+        ));
     }
 
     #[test]
