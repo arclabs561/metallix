@@ -216,6 +216,95 @@ impl BlockId {
     }
 }
 
+/// A token's index in its sequence, counted from the first prompt token.
+///
+/// It is the `RoPE` position and the index the block table maps to a
+/// [`Slot`]. Block IDs, slot offsets and positions are distinct types, so
+/// passing one where another is expected does not compile:
+///
+/// ```compile_fail
+/// # use engine::blocks::{BlockManager, BlockTokens, PoolConfig, SequenceId};
+/// let manager = BlockManager::new(PoolConfig::new(BlockTokens::DEFAULT, 1).unwrap());
+/// // A raw range of integers is not a span of token positions.
+/// let _ = manager.slots(SequenceId(1), 0..4);
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TokenPosition(usize);
+
+impl TokenPosition {
+    /// The first position of a sequence.
+    pub const ZERO: Self = Self(0);
+
+    /// Creates a position.
+    #[must_use]
+    pub const fn new(position: usize) -> Self {
+        Self(position)
+    }
+
+    /// Returns the position as an index.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// A half-open run of token positions, `start..end`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TokenSpan {
+    start: usize,
+    end: usize,
+}
+
+impl TokenSpan {
+    /// The `len` positions starting at `start`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the end position overflows `usize`.
+    #[must_use]
+    pub const fn new(start: TokenPosition, len: usize) -> Self {
+        Self {
+            start: start.0,
+            end: start.0.checked_add(len).expect("token span end overflows"),
+        }
+    }
+
+    /// The first `len` positions of a sequence.
+    #[must_use]
+    pub const fn prefix(len: usize) -> Self {
+        Self { start: 0, end: len }
+    }
+
+    /// Returns the first position.
+    #[must_use]
+    pub const fn start(self) -> TokenPosition {
+        TokenPosition(self.start)
+    }
+
+    /// Returns the position after the last.
+    #[must_use]
+    pub const fn end(self) -> TokenPosition {
+        TokenPosition(self.end)
+    }
+
+    /// Returns the number of positions.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    /// Returns whether the span is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+
+    /// Iterates the positions in order.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = TokenPosition> {
+        (self.start..self.end).map(TokenPosition)
+    }
+}
+
 /// A scheduler-assigned sequence identifier.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SequenceId(pub u64);
@@ -272,10 +361,10 @@ pub enum BlockError {
     #[error("sequence {0:?} has uncommitted tokens")]
     Uncommitted(SequenceId),
     /// A position past the sequence's scheduled tokens.
-    #[error("position {position} is past the {tokens} scheduled tokens")]
+    #[error("position {} is past the {tokens} scheduled tokens", position.get())]
     PositionOutOfRange {
         /// The requested position.
-        position: usize,
+        position: TokenPosition,
         /// Tokens with slots.
         tokens: usize,
     },

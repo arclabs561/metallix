@@ -1,17 +1,16 @@
 //! The block manager: pool accounting, block tables and the prefix cache.
 
 use std::collections::HashMap;
-use std::ops::Range;
 
 use super::free_queue::FreeQueue;
 use super::hash::{BlockHash, HashKeys, hash_block};
-use super::{BlockError, BlockId, PoolConfig, SequenceId};
+use super::{BlockError, BlockId, PoolConfig, SequenceId, TokenPosition, TokenSpan};
 
 /// Positions reserved by [`BlockManager::admit`] or [`BlockManager::allocate`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Allocation {
     /// Positions to write this step.
-    pub positions: Range<usize>,
+    pub positions: TokenSpan,
     /// A copy the device side must perform before writing.
     pub copy: Option<BlockCopy>,
 }
@@ -248,22 +247,25 @@ impl BlockManager {
     pub fn slots(
         &self,
         seq: SequenceId,
-        positions: Range<usize>,
+        positions: TokenSpan,
     ) -> Result<impl ExactSizeIterator<Item = Slot> + '_, BlockError> {
         let sequence = self.sequence(seq)?;
-        if positions.end > sequence.scheduled {
+        if positions.end().get() > sequence.scheduled {
             return Err(BlockError::PositionOutOfRange {
-                position: positions.end - 1,
+                position: TokenPosition::new(positions.end().get() - 1),
                 tokens: sequence.scheduled,
             });
         }
         let block_tokens = self.pool.block_tokens;
-        Ok(positions.map(move |position| Slot {
-            block: sequence.table[position / block_tokens],
-            // The offset is below block_tokens, which is a u32.
-            #[allow(clippy::cast_possible_truncation)]
-            offset: (position % block_tokens) as u32,
-        }))
+        Ok(positions
+            .iter()
+            .map(TokenPosition::get)
+            .map(move |position| Slot {
+                block: sequence.table[position / block_tokens],
+                // The offset is below block_tokens, which is a u32.
+                #[allow(clippy::cast_possible_truncation)]
+                offset: (position % block_tokens) as u32,
+            }))
     }
 
     /// Finds the longest run of cached full blocks at the start of `prompt`.
@@ -586,7 +588,7 @@ impl Pool {
             sequence.unhashed.extend_from_slice(tokens);
         }
         Allocation {
-            positions: start..sequence.scheduled,
+            positions: TokenSpan::new(TokenPosition::new(start), tokens.len()),
             copy,
         }
     }

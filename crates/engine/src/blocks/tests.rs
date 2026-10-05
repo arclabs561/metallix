@@ -7,7 +7,8 @@ use proptest::prelude::*;
 
 use super::{
     Allocation, BlockConfigError, BlockError, BlockHash, BlockId, BlockManager, BlockTokens,
-    HashKeys, PoolConfig, SLAB_BLOCKS, SequenceId, block_hashes, hash_block,
+    HashKeys, PoolConfig, SLAB_BLOCKS, SequenceId, TokenPosition, TokenSpan, block_hashes,
+    hash_block,
 };
 
 const BLOCK: usize = 4;
@@ -86,7 +87,7 @@ impl Device {
             }
         }
         let slots: Vec<_> = manager
-            .slots(SequenceId(seq), allocation.positions.clone())
+            .slots(SequenceId(seq), allocation.positions)
             .map_err(|error| TestCaseError::fail(error.to_string()))?
             .collect();
         prop_assert_eq!(slots.len(), tokens.len());
@@ -115,7 +116,7 @@ impl Device {
     ) -> Result<(), TestCaseError> {
         for (&seq, shadow) in seqs {
             let slots = manager
-                .slots(SequenceId(seq), 0..shadow.stream.len())
+                .slots(SequenceId(seq), TokenSpan::prefix(shadow.stream.len()))
                 .map_err(|error| TestCaseError::fail(error.to_string()))?;
             for (position, slot) in slots.enumerate() {
                 let held = self.0[slot.block.index() as usize][slot.offset as usize];
@@ -581,7 +582,10 @@ fn slots_map_positions_into_blocks() {
     admit_all(&mut manager, 1, &prompt, HashKeys::new());
     let table = manager.block_table(SequenceId(1)).expect("live").to_vec();
     let slots: Vec<_> = manager
-        .slots(SequenceId(1), BLOCK - 1..BLOCK + 1)
+        .slots(
+            SequenceId(1),
+            TokenSpan::new(TokenPosition::new(BLOCK - 1), 2),
+        )
         .expect("in range")
         .collect();
     assert_eq!(
@@ -594,7 +598,7 @@ fn slots_map_positions_into_blocks() {
         u64::from(table[1].index()) * BLOCK as u64
     );
     assert!(matches!(
-        manager.slots(SequenceId(1), 0..BLOCK + 2),
+        manager.slots(SequenceId(1), TokenSpan::prefix(BLOCK + 2)),
         Err(BlockError::PositionOutOfRange { .. })
     ));
 }
