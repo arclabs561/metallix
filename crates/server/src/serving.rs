@@ -785,6 +785,7 @@ mod tests {
                 },
                 logprobs: Vec::new(),
                 sampling: None,
+                format: crate::chat_generation::QWEN3_TURN,
             })
         }
     }
@@ -898,6 +899,7 @@ stream.close()
                 },
                 logprobs: Vec::new(),
                 sampling: None,
+                format: crate::chat_generation::QWEN3_TURN,
             })
         }
     }

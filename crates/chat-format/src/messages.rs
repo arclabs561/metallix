@@ -14,7 +14,7 @@ pub enum ChatRole {
 }
 
 /// One completed assistant tool call retained in conversation history.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ChatToolCall {
     pub name: String,
     pub arguments: Value,

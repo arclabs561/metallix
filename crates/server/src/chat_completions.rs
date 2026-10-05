@@ -15,7 +15,6 @@ use crate::{
         ChatBackend, ChatGeneration, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
         ChatToolCall, GenerationControls, SamplingRequest,
     },
-    chat_tools,
     http_transport::Connection,
     responses::{
         AssistantTurn, assistant_turn, echo_request_id, json_response, logprobs_value,
@@ -275,7 +274,7 @@ fn tools(request: &Request) -> Result<Vec<Value>, String> {
             if !parameters.is_object() {
                 return Err("function parameters must be a JSON Schema object".into());
             }
-            chat_tools::validator(&parameters)?;
+            chat_format::validator(&parameters)?;
             Ok(json!({"type":"function","function":{"name":name,"description":function.get("description").cloned().unwrap_or(json!("")),"parameters":parameters}}))
         })
         .collect()
@@ -1062,7 +1061,7 @@ mod tests {
                 serde_json::from_str(shaped["choices"][0]["message"]["content"].as_str().unwrap())
                     .unwrap();
             assert!(
-                chat_tools::validator(&schema).unwrap().is_valid(&value),
+                chat_format::validator(&schema).unwrap().is_valid(&value),
                 "{value}"
             );
         }

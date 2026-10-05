@@ -238,6 +238,7 @@ pub(crate) mod test_support {
                 },
                 logprobs: Vec::new(),
                 sampling: None,
+                format: crate::chat_generation::QWEN3_TURN,
             })
         }
     }

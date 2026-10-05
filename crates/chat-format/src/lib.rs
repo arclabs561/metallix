@@ -14,6 +14,8 @@
 mod messages;
 mod template_json;
 mod tokenizer;
+mod tools;
+mod turn;
 
 use std::path::Path;
 
@@ -26,6 +28,8 @@ use sha2::{Digest, Sha256};
 pub use crate::{
     messages::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation},
     tokenizer::{QwenIncrementalDecode, QwenTokenizer, read_regular_file},
+    tools::validator,
+    turn::{AssistantTurn, ReasoningDialect, ToolDialect, TurnFormat, parse_turn},
 };
 
 pub const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
@@ -297,6 +301,7 @@ impl ChatTemplate {
 pub struct ChatFormat {
     tokenizer: QwenTokenizer,
     template: ChatTemplate,
+    turn: TurnFormat,
     stops: StopTokens,
     vocabulary_size: usize,
 }
@@ -324,10 +329,13 @@ impl ChatFormat {
         }
         let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
         let specials = SpecialTokens::from_config(&tokenizer_config, &tokenizer)?;
-        let template = ChatTemplate::parse(load_template(model, &tokenizer_config)?, specials)?;
+        let source = load_template(model, &tokenizer_config)?;
+        let turn = TurnFormat::from_template(&source);
+        let template = ChatTemplate::parse(source, specials)?;
         let format = Self {
             tokenizer,
             template,
+            turn,
             stops,
             vocabulary_size,
         };
@@ -343,6 +351,13 @@ impl ChatFormat {
     #[must_use]
     pub fn template(&self) -> &ChatTemplate {
         &self.template
+    }
+
+    /// The tool and reasoning dialects the template teaches, which
+    /// [`parse_turn`] reads generated text in.
+    #[must_use]
+    pub const fn turn_format(&self) -> TurnFormat {
+        self.turn
     }
 
     #[must_use]

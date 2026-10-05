@@ -16,7 +16,6 @@ use crate::{
         ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
         ChatToolCall, GenerationControls, SamplingRequest, TokenLogprob,
     },
-    chat_tools,
     http_transport::Connection,
 };
 
@@ -340,7 +339,7 @@ pub(crate) fn tools(request: &Request) -> Result<Vec<Value>, String> {
         if name.is_empty() || !names.insert(name) {
             return Err("function names must be nonempty and unique".into());
         }
-        chat_tools::validator(&tool["parameters"])?;
+        chat_format::validator(&tool["parameters"])?;
         Ok(json!({"type":"function","function":{"name":tool["name"],"description":tool.get("description").cloned().unwrap_or(json!("")),"parameters":tool["parameters"]}}))
     }).collect()
 }
@@ -665,73 +664,26 @@ fn respond_json(
     }
 }
 
-/// Splits a thinking turn into its reasoning and its answer. Qwen3 opens the
-/// block itself; templates that pre-fill `<think>` leave only the close tag.
-fn split_reasoning(text: &str) -> (&str, &str) {
-    let (opened, body) = match text.trim_start().strip_prefix("<think>") {
-        Some(body) => (true, body),
-        None => (false, text),
-    };
-    match body.split_once("</think>") {
-        Some((reasoning, answer)) => (reasoning.trim(), answer.trim_start()),
-        None if opened => (body.trim(), ""),
-        None => ("", text),
-    }
-}
-
 pub(crate) fn logprobs_value(logprobs: &[TokenLogprob]) -> Value {
     serde_json::to_value(logprobs).unwrap_or_else(|_| json!([]))
 }
 
-/// A finished assistant turn split into reasoning, visible text and tool calls
-/// checked against their declared schemas. Each protocol only reshapes it.
-pub(crate) struct AssistantTurn {
-    pub(crate) reasoning: String,
-    pub(crate) text: String,
-    pub(crate) calls: Vec<ChatToolCall>,
-    /// The model ended its turn; otherwise it hit the output limit.
-    pub(crate) complete: bool,
-}
+pub(crate) use chat_format::AssistantTurn;
 
-/// Parses one generation. `tools` are template-shaped definitions, as
-/// [`tools`] returns them. A truncated tool turn is an error, never a partial
-/// call.
+/// Parses one generation in its checkpoint's dialects. `tools` are
+/// template-shaped definitions, as [`tools`] returns them.
 pub(crate) fn assistant_turn(
     tools: &[Value],
     enable_thinking: bool,
     generated: &crate::chat_generation::ChatGeneration,
 ) -> Result<AssistantTurn, String> {
-    let (reasoning, answer) = if enable_thinking {
-        split_reasoning(&generated.text)
-    } else {
-        ("", generated.text.as_str())
-    };
-    let turn = chat_tools::parse_turn(answer)?;
-    let complete = generated.finish_reason == ChatFinishReason::Eos;
-    if !turn.calls.is_empty() && !complete {
-        return Err("truncated tool turn; no function calls returned".into());
-    }
-    let mut calls = Vec::new();
-    for call in turn.calls {
-        let definition = tools
-            .iter()
-            .find(|tool| tool["function"]["name"] == call.name)
-            .ok_or("model requested an undeclared tool")?;
-        if !chat_tools::validator(&definition["function"]["parameters"])?.is_valid(&call.arguments)
-        {
-            return Err("model tool arguments do not match the declared schema".into());
-        }
-        calls.push(ChatToolCall {
-            name: call.name,
-            arguments: call.arguments,
-        });
-    }
-    Ok(AssistantTurn {
-        reasoning: reasoning.to_owned(),
-        text: turn.text,
-        calls,
-        complete,
-    })
+    chat_format::parse_turn(
+        generated.format,
+        &generated.text,
+        tools,
+        enable_thinking,
+        generated.finish_reason == ChatFinishReason::Eos,
+    )
 }
 
 fn response_value(
@@ -1018,20 +970,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn splits_reasoning_from_the_answer() {
-        assert_eq!(
-            split_reasoning("<think>\nadd them\n</think>\n\n4"),
-            ("add them", "4")
-        );
-        assert_eq!(
-            split_reasoning("pre-filled\n</think>\n\n4"),
-            ("pre-filled", "4")
-        );
-        assert_eq!(split_reasoning("<think>\nunfinished"), ("unfinished", ""));
-        assert_eq!(split_reasoning("plain answer"), ("", "plain answer"));
-    }
-
     fn generation(text: &str) -> crate::chat_generation::ChatGeneration {
         use crate::chat_generation::ChatGenerationMetrics;
         crate::chat_generation::ChatGeneration {
@@ -1053,6 +991,7 @@ mod tests {
             },
             logprobs: Vec::new(),
             sampling: None,
+            format: crate::chat_generation::QWEN3_TURN,
         }
     }
 
@@ -1516,7 +1455,7 @@ mod tests {
                 "required": ["city", "population"],
                 "additionalProperties": false
             });
-            let validator = chat_tools::validator(&schema).unwrap();
+            let validator = chat_format::validator(&schema).unwrap();
             for stream in [false, true] {
                 let body = json!({
                     "model": "q",

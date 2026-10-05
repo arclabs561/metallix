@@ -19,6 +19,7 @@ use tracing::field::Empty;
 
 use chat_format::{
     ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, QwenTokenizer, TokenClass, TokenId,
+    TurnFormat,
 };
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
@@ -440,7 +441,17 @@ pub(crate) struct ChatGeneration {
     /// report one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sampling: Option<AppliedSampling>,
+    /// The checkpoint's tool and reasoning dialects, which `text` is written
+    /// in; protocols parse it only through `chat_format::parse_turn`.
+    pub(crate) format: TurnFormat,
 }
+
+/// Qwen3's dialects, for scripted backends in tests.
+#[cfg(test)]
+pub(crate) const QWEN3_TURN: TurnFormat = TurnFormat {
+    tools: chat_format::ToolDialect::JsonInTags,
+    reasoning: chat_format::ReasoningDialect::ThinkTags,
+};
 
 /// A cooperative wall-clock budget for one complete chat turn.
 ///
@@ -879,6 +890,7 @@ impl ChatSession {
             finish_reason,
             logprobs,
             sampling: Some(picker.applied),
+            format: self.format.turn_format(),
             metrics: ChatGenerationMetrics {
                 context_tokens: self.context_limit,
                 planned_kv_bytes: self.planned_kv_bytes,

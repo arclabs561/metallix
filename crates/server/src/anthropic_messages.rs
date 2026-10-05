@@ -15,7 +15,6 @@ use crate::{
         ChatBackend, ChatGeneration, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
         ChatToolCall, GenerationControls, SamplingRequest,
     },
-    chat_tools,
     http_transport::Connection,
     responses::{AssistantTurn, assistant_turn, echo_request_id, json_response, record_usage},
     sse::LazySse,
@@ -243,7 +242,7 @@ fn tools(request: &Request) -> Result<Vec<Value>, String> {
             if name.is_empty() || !names.insert(name) {
                 return Err("tool names must be nonempty and unique".into());
             }
-            chat_tools::validator(&tool["input_schema"])?;
+            chat_format::validator(&tool["input_schema"])?;
             Ok(json!({"type":"function","function":{"name":name,"description":tool.get("description").cloned().unwrap_or(json!("")),"parameters":tool["input_schema"]}}))
         })
         .collect()

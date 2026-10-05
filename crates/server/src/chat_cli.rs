@@ -178,13 +178,15 @@ fn agent_inner(
             &mut |_| Ok(()),
         )?;
         let mut turn_receipt = AgentTurnReceipt::from_generation(turn_index, &result);
-        let turn = match chat_tools::parse_turn(&result.text) {
-            Ok(turn) => turn,
-            Err(error) => {
-                receipt.push_turn(turn_receipt);
-                return Err(error);
-            }
-        };
+        let complete = result.finish_reason == ChatFinishReason::Eos;
+        let turn =
+            match chat_format::parse_turn(result.format, &result.text, &tools, false, complete) {
+                Ok(turn) => turn,
+                Err(error) => {
+                    receipt.push_turn(turn_receipt);
+                    return Err(error);
+                }
+            };
         if turn.calls.is_empty() {
             if result.finish_reason != ChatFinishReason::Eos {
                 receipt.push_turn(turn_receipt);
@@ -193,19 +195,8 @@ fn agent_inner(
             receipt.push_turn(turn_receipt);
             return Ok(turn.text);
         }
-        if result.finish_reason != ChatFinishReason::Eos {
-            receipt.push_turn(turn_receipt);
-            return Err("agent output was truncated; no tools executed".into());
-        }
         let mut assistant = message(ChatRole::Assistant, turn.text);
-        assistant.tool_calls = turn
-            .calls
-            .iter()
-            .map(|call| ChatToolCall {
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
-            })
-            .collect();
+        assistant.tool_calls.clone_from(&turn.calls);
         messages.push(assistant);
         let outputs = execute_calls(
             &mut turn_receipt,
@@ -238,11 +229,11 @@ fn agent_inner(
 fn execute_calls<F>(
     receipt: &mut AgentTurnReceipt,
     finish_reason: ChatFinishReason,
-    calls: &[chat_tools::ToolCall],
+    calls: &[ChatToolCall],
     mut execute: F,
 ) -> Vec<serde_json::Value>
 where
-    F: FnMut(&chat_tools::ToolCall) -> Result<serde_json::Value, String>,
+    F: FnMut(&ChatToolCall) -> Result<serde_json::Value, String>,
 {
     if finish_reason != ChatFinishReason::Eos {
         return Vec::new();
@@ -293,8 +284,7 @@ mod tests {
     use super::{AgentTurnReceipt, execute_calls};
     use crate::{
         agent_receipt::hash_arguments,
-        chat_generation::{ChatFinishReason, ChatGeneration, ChatGenerationMetrics},
-        chat_tools::ToolCall,
+        chat_generation::{ChatFinishReason, ChatGeneration, ChatGenerationMetrics, ChatToolCall},
     };
 
     fn turn_receipt() -> AgentTurnReceipt {
@@ -319,13 +309,14 @@ mod tests {
                 },
                 logprobs: Vec::new(),
                 sampling: None,
+                format: crate::chat_generation::QWEN3_TURN,
             },
         )
     }
 
     #[test]
     fn truncated_turn_executes_no_calls() {
-        let calls = vec![ToolCall {
+        let calls = vec![ChatToolCall {
             name: "read_file".into(),
             arguments: json!({"path":"note.txt"}),
         }];
@@ -348,11 +339,11 @@ mod tests {
     #[test]
     fn completed_turn_records_calls_in_execution_order() {
         let calls = vec![
-            ToolCall {
+            ChatToolCall {
                 name: "read_file".into(),
                 arguments: json!({"path":"first.txt"}),
             },
-            ToolCall {
+            ChatToolCall {
                 name: "search_file".into(),
                 arguments: json!({"path":"second.txt", "query":"private"}),
             },
@@ -383,7 +374,7 @@ mod tests {
             let calls: Vec<_> = outcomes
                 .iter()
                 .enumerate()
-                .map(|(index, _)| ToolCall {
+                .map(|(index, _)| ChatToolCall {
                     name: format!("tool_{index}"),
                     arguments: json!({"path":format!("nested/{index}.txt"), "query":format!("q{index}")}),
                 })
