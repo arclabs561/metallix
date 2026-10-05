@@ -94,7 +94,7 @@ proptest! {
             1 => required.saturating_add(1),
             _ => unreachable!("generated budget delta is bounded"),
         });
-        let result = config.resident_chat_plan(requested_context, budget);
+        let result = config.resident_chat_plan(requested_context, budget, qwen::forward::Qwen3WeightPrecision::Float32);
 
         if requested_context == 0 || requested_context > maximum {
             prop_assert!(matches!(
@@ -141,11 +141,11 @@ proptest! {
         .expect("generated Qwen3 layout is valid");
         let maximum = MAX_RESIDENT_CHAT_TOKENS.min(model_context);
         let admitted = config
-            .resident_chat_plan(maximum, u64::MAX)
+            .resident_chat_plan(maximum, u64::MAX, qwen::forward::Qwen3WeightPrecision::Float32)
             .expect("maximum context is admitted with an unbounded logical budget");
         prop_assert_eq!(admitted.maximum_context_tokens(), maximum);
         prop_assert!(matches!(
-            config.resident_chat_plan(maximum + 1, u64::MAX),
+            config.resident_chat_plan(maximum + 1, u64::MAX, qwen::forward::Qwen3WeightPrecision::Float32),
             Err(Qwen3ForwardError::ResidentChatContextLimit {
                 requested,
                 maximum: actual_maximum,
@@ -173,7 +173,7 @@ proptest! {
                 MAX_RESIDENT_CHAT_TOKENS,
             ))
             .expect("generated Qwen3 layout is valid")
-            .resident_chat_plan(context_tokens, u64::MAX)
+            .resident_chat_plan(context_tokens, u64::MAX, qwen::forward::Qwen3WeightPrecision::Float32)
             .expect("small generated layout fits an unbounded budget")
             .planned_kv_bytes()
         };
@@ -211,15 +211,15 @@ proptest! {
         ))
         .expect("generated Qwen3 layout is valid");
         let exact = config
-            .resident_chat_plan(context_tokens, u64::MAX)
+            .resident_chat_plan(context_tokens, u64::MAX, qwen::forward::Qwen3WeightPrecision::Float32)
             .expect("small generated layout fits an unbounded budget");
         let larger = config
-            .resident_chat_plan(context_tokens, exact.planned_kv_bytes().saturating_add(surplus))
+            .resident_chat_plan(context_tokens, exact.planned_kv_bytes().saturating_add(surplus), qwen::forward::Qwen3WeightPrecision::Float32)
             .expect("a budget at least as large as the exact plan is admitted");
 
         prop_assert_eq!(larger, exact);
         prop_assert!(matches!(
-            config.resident_chat_plan(context_tokens, exact.planned_kv_bytes() - 1),
+            config.resident_chat_plan(context_tokens, exact.planned_kv_bytes() - 1, qwen::forward::Qwen3WeightPrecision::Float32),
             Err(Qwen3ForwardError::ResidentChatKvBudget { required, maximum })
                 if required == exact.planned_kv_bytes()
                     && maximum == exact.planned_kv_bytes() - 1
@@ -248,11 +248,11 @@ proptest! {
         let maximum = MAX_RESIDENT_CHAT_TOKENS.min(model_context);
 
         prop_assert!(matches!(
-            config.resident_chat_plan(1, u64::MAX),
+            config.resident_chat_plan(1, u64::MAX, qwen::forward::Qwen3WeightPrecision::Float32),
             Err(Qwen3ForwardError::ShapeOverflow)
         ), "checked K/V sizing must reject overflow before producing a plan");
         prop_assert!(matches!(
-            config.resident_chat_plan(maximum + 1, 0),
+            config.resident_chat_plan(maximum + 1, 0, qwen::forward::Qwen3WeightPrecision::Float32),
             Err(Qwen3ForwardError::ResidentChatContextLimit { requested, maximum: actual_maximum })
                 if requested == maximum + 1 && actual_maximum == maximum
         ), "the public context cap must reject before impossible K/V sizing");

@@ -13,6 +13,7 @@ use mlx_rs::{Array, StreamOrDevice};
 use thiserror::Error;
 
 use crate::checkpoint::{Qwen3CheckpointError, Qwen3CheckpointInspection};
+pub use crate::forward::Qwen3WeightPrecision;
 
 mod layer_check;
 pub use layer_check::{LayerCheckMode, Qwen3LayerCheck, qualify_layer};
@@ -214,9 +215,11 @@ impl Qwen3MlxWeights {
         crate::forward::Qwen3ForwardExecutor<'_, std::collections::hash_map::RandomState>,
         crate::forward::Qwen3ForwardError,
     > {
-        let plan = self
-            .forward_config
-            .resident_chat_plan(maximum_context_tokens, maximum_kv_bytes)?;
+        let plan = self.forward_config.resident_chat_plan(
+            maximum_context_tokens,
+            maximum_kv_bytes,
+            crate::forward::kv_precision(&self.tensors)?,
+        )?;
         Ok(crate::forward::Qwen3ForwardExecutor::new_for_resident_chat(
             &self.forward_config,
             &self.tensors,
@@ -253,9 +256,11 @@ impl Qwen3MlxWeights {
         crate::forward::Qwen3ForwardExecutor<'_, std::collections::hash_map::RandomState>,
         crate::forward::Qwen3ForwardError,
     > {
-        let plan = self
-            .forward_config
-            .resident_chat_plan(maximum_context_tokens, maximum_kv_bytes)?;
+        let plan = self.forward_config.resident_chat_plan(
+            maximum_context_tokens,
+            maximum_kv_bytes,
+            crate::forward::kv_precision(&self.tensors)?,
+        )?;
         if snapshot.binding() != self.binding || snapshot.plan() != plan {
             return Err(crate::forward::Qwen3ForwardError::KvSnapshotMismatch);
         }
@@ -268,10 +273,28 @@ impl Qwen3MlxWeights {
 
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
     /// This increases resident weight memory relative to the BF16 checkpoint.
-    #[tracing::instrument(name = "qwen.weights.prepare_float32", level = "info", skip_all)]
     pub fn prepare_float32(&mut self) -> Result<(), Qwen3MetalLoadError> {
+        self.prepare_precision(Qwen3WeightPrecision::Float32)
+    }
+
+    /// Converts every tensor to `precision` once, so the forward graph runs
+    /// in that dtype; K/V caches take the weights' dtype.
+    #[tracing::instrument(
+        name = "qwen.weights.prepare_precision",
+        level = "info",
+        skip_all,
+        fields(?precision)
+    )]
+    pub fn prepare_precision(
+        &mut self,
+        precision: Qwen3WeightPrecision,
+    ) -> Result<(), Qwen3MetalLoadError> {
+        let dtype = precision.dtype();
         for weight in self.tensors.values_mut() {
-            let converted = weight.as_type_device::<f32>(StreamOrDevice::gpu())?;
+            if weight.dtype() == dtype {
+                continue;
+            }
+            let converted = weight.as_dtype_device(dtype, StreamOrDevice::gpu())?;
             converted.eval()?;
             *weight = converted;
         }

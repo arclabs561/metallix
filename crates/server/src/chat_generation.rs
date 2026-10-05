@@ -1095,7 +1095,11 @@ fn load_config(
     // Reject context/KV admission before checkpoint payload loading.
     let plan = qwen::forward::Qwen3ForwardConfig::parse(&raw)
         .and_then(|config| {
-            config.resident_chat_plan(limits.context_tokens(), limits.kv_budget_bytes())
+            config.resident_chat_plan(
+                limits.context_tokens(),
+                limits.kv_budget_bytes(),
+                qwen::forward::Qwen3WeightPrecision::Float32,
+            )
         })
         .map_err(|error| error.to_string())?;
     Ok((

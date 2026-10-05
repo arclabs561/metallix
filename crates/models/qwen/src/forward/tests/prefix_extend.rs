@@ -52,7 +52,7 @@ fn forked_prefix_extension_matches_fresh_prefill_for_each_suffix() {
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = config
-        .resident_chat_plan(600, u64::MAX)
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
         .expect("tiny resident plan");
     let mut shared = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
     shared.prefill_last_logits(&PREFIX).expect("shared prefill");
@@ -81,7 +81,7 @@ fn chunk_crossing_a_capacity_step_matches_fresh_prefill() {
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = config
-        .resident_chat_plan(600, u64::MAX)
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
         .expect("tiny resident plan");
     // 120 cached tokens sit in the 128-row tier; the 20-token chunk grows the
     // storage to the 512-row tier inside the same append.
@@ -211,7 +211,7 @@ fn fused_kernel_chunk_with_unaligned_offset_matches_fresh_prefill() {
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config
-        .resident_chat_plan(600, u64::MAX)
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
         .expect("tiny resident plan");
     // 64 keys fill whole key blocks while the 40-token chunk starts at 24, so
     // the first query tile's diagonal begins inside an earlier key block.
@@ -240,7 +240,7 @@ fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config
-        .resident_chat_plan(600, u64::MAX)
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
         .expect("tiny resident plan");
     let prompt = (0..64)
         .map(|index| (index * 5 + 3) % 16)
@@ -284,7 +284,7 @@ fn snapshot_refuses_unsteerable_or_out_of_range_prefixes() {
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config
-        .resident_chat_plan(600, u64::MAX)
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
         .expect("tiny resident plan");
     let mut diagnostic = Qwen3ForwardExecutor::new(&config, &weights);
     diagnostic.prefill_last_logits(&[1, 2, 3]).expect("prefill");

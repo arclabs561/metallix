@@ -857,7 +857,7 @@ proptest! {
         let config = super::long_small_config();
         let weights = super::deterministic_weights();
         let plan = config
-            .resident_chat_plan(1_024, u64::MAX)
+            .resident_chat_plan(1_024, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
             .expect("long tiny resident plan");
         let prompt = vec![prompt_token; boundary - 1];
         let mut stepped = CapacityExecutor::new_stepped(&config, &weights, 1_024);
@@ -936,7 +936,7 @@ fn stepped_capacity_decode_overflow_preserves_allocation_and_malformed_prefill_r
     let config = super::long_small_config();
     let weights = super::deterministic_weights();
     let plan = config
-        .resident_chat_plan(512, u64::MAX)
+        .resident_chat_plan(512, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
         .expect("bounded reference plan");
     let mut reference = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
     let mut full = CapacityExecutor::new_stepped(&config, &weights, 512);

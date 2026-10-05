@@ -326,7 +326,13 @@ fn paged_out_of_blocks_leaves_the_sequence_usable() {
     let mut contiguous = Qwen3ForwardExecutor::new_for_resident_chat(
         &config,
         &weights,
-        config.resident_chat_plan(1024, u64::MAX).expect("plan"),
+        config
+            .resident_chat_plan(
+                1024,
+                u64::MAX,
+                crate::forward::Qwen3WeightPrecision::Float32,
+            )
+            .expect("plan"),
     );
     let seq = SequenceId(1);
     // 31 full blocks and 15 tokens of the last: room for one more token.

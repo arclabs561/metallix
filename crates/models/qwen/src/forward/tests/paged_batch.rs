@@ -112,7 +112,13 @@ fn start_rows<'a>(
             let mut reference = Qwen3ForwardExecutor::new_for_resident_chat(
                 config,
                 weights,
-                config.resident_chat_plan(2048, u64::MAX).expect("plan"),
+                config
+                    .resident_chat_plan(
+                        2048,
+                        u64::MAX,
+                        crate::forward::Qwen3WeightPrecision::Float32,
+                    )
+                    .expect("plan"),
             );
             reference
                 .prefill_last_logits(prompt)

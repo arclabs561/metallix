@@ -20,7 +20,7 @@ use std::{
 };
 
 use mlx_rs::{
-    Array, StreamOrDevice, fast, ops,
+    Array, Dtype, StreamOrDevice, fast, ops,
     ops::indexing::{IndexMutOp, IndexOp},
 };
 use serde::Deserialize;
@@ -44,11 +44,79 @@ pub const MAX_RESIDENT_CHAT_TOKENS: usize = 16_384;
 /// Default logical K/V budget for the resident-chat control path.
 pub const DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
+/// A floating-point dtype for resident weights, and so for the K/V they
+/// produce: the cached keys and values take the projection output's dtype.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Qwen3WeightPrecision {
+    /// Serving precision: Qwen3 checkpoints ship BF16, and decode is bound
+    /// by the weight bytes read per token.
+    #[default]
+    BFloat16,
+    /// Half precision, for checkpoints stored that way.
+    Float16,
+    /// Reference precision for comparison with a CPU float32 oracle; twice
+    /// the resident bytes of BF16.
+    Float32,
+}
+
+impl Qwen3WeightPrecision {
+    /// Bytes of one stored element.
+    #[must_use]
+    pub const fn bytes_per_element(self) -> u64 {
+        match self {
+            Self::BFloat16 | Self::Float16 => 2,
+            Self::Float32 => 4,
+        }
+    }
+
+    pub(crate) const fn dtype(self) -> Dtype {
+        match self {
+            Self::BFloat16 => Dtype::Bfloat16,
+            Self::Float16 => Dtype::Float16,
+            Self::Float32 => Dtype::Float32,
+        }
+    }
+
+    const fn from_dtype(dtype: Dtype) -> Option<Self> {
+        match dtype {
+            Dtype::Bfloat16 => Some(Self::BFloat16),
+            Dtype::Float16 => Some(Self::Float16),
+            Dtype::Float32 => Some(Self::Float32),
+            _ => None,
+        }
+    }
+}
+
+/// The dtype of the K/V a cached executor over `weights` retains: that of a
+/// key projection of an embedded token, so MLX's promotion of the embedding
+/// and key-projection dtypes.
+pub(crate) fn kv_precision<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+) -> Result<Qwen3WeightPrecision, Qwen3ForwardError> {
+    let embedding = weight(weights, "model.embed_tokens.weight")?.dtype();
+    let key = weight(weights, "model.layers.0.self_attn.k_proj.weight")?.dtype();
+    let promoted = if embedding == key {
+        key
+    } else {
+        Dtype::Float32
+    };
+    for dtype in [embedding, key] {
+        if Qwen3WeightPrecision::from_dtype(dtype).is_none() {
+            return Err(Qwen3ForwardError::UnsupportedWeightDtype(format!(
+                "{dtype:?}"
+            )));
+        }
+    }
+    Qwen3WeightPrecision::from_dtype(promoted)
+        .ok_or_else(|| Qwen3ForwardError::UnsupportedWeightDtype(format!("{promoted:?}")))
+}
+
 /// A checked resident-chat context and its final logical K/V estimate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3ResidentChatPlan {
     maximum_context_tokens: usize,
     planned_kv_bytes: u64,
+    kv_precision: Qwen3WeightPrecision,
 }
 
 /// An absolute, half-open token-position range selected for a residual intervention.
@@ -229,10 +297,17 @@ impl Qwen3ResidentChatPlan {
         self.maximum_context_tokens
     }
 
-    /// Logical f32 K/V bytes estimated for that maximum context.
+    /// Logical K/V bytes estimated for that maximum context at
+    /// [`Self::kv_precision`].
     #[must_use]
     pub const fn planned_kv_bytes(self) -> u64 {
         self.planned_kv_bytes
+    }
+
+    /// The K/V element dtype the estimate assumed.
+    #[must_use]
+    pub const fn kv_precision(self) -> Qwen3WeightPrecision {
+        self.kv_precision
     }
 }
 
@@ -397,6 +472,16 @@ impl Qwen3ForwardConfig {
     /// The streamed checker stores detached f32 arrays, so this is deliberately
     /// not a checkpoint-byte estimate or a generic cache-layout abstraction.
     pub(crate) fn cached_kv_bytes(&self, tokens: usize) -> Result<u64, Qwen3ForwardError> {
+        self.cached_kv_bytes_at(tokens, Qwen3WeightPrecision::Float32)
+    }
+
+    /// Logical bytes for all layer K/V arrays at `tokens` positions stored as
+    /// `precision`.
+    pub(crate) fn cached_kv_bytes_at(
+        &self,
+        tokens: usize,
+        precision: Qwen3WeightPrecision,
+    ) -> Result<u64, Qwen3ForwardError> {
         let values = self
             .hidden_layers
             .checked_mul(2)
@@ -406,7 +491,7 @@ impl Qwen3ForwardConfig {
             .ok_or(Qwen3ForwardError::ShapeOverflow)?;
         u64::try_from(values)
             .ok()
-            .and_then(|value| value.checked_mul(u64::try_from(size_of::<f32>()).ok()?))
+            .and_then(|value| value.checked_mul(precision.bytes_per_element()))
             .ok_or(Qwen3ForwardError::ShapeOverflow)
     }
 
@@ -418,13 +503,17 @@ impl Qwen3ForwardConfig {
 
     /// Validates a resident-chat context before checkpoint payloads are loaded.
     ///
-    /// The K/V budget covers only the estimated retained f32 cache arrays. It
-    /// excludes model weights, activations, operator scratch, and allocator
-    /// headroom; it does not preallocate or reserve MLX memory.
+    /// The K/V budget covers only the estimated retained cache arrays at
+    /// `kv_precision`, which must be the dtype the executor's weights produce
+    /// (executors built from [`crate::metal::Qwen3MlxWeights`] derive it from
+    /// their tensors). It excludes model weights, activations, operator
+    /// scratch, and allocator headroom; it does not preallocate or reserve MLX
+    /// memory.
     pub fn resident_chat_plan(
         &self,
         maximum_context_tokens: usize,
         maximum_kv_bytes: u64,
+        kv_precision: Qwen3WeightPrecision,
     ) -> Result<Qwen3ResidentChatPlan, Qwen3ForwardError> {
         if self.attention != Qwen3Attention::Causal {
             return Err(Qwen3ForwardError::CachedBidirectional);
@@ -436,7 +525,7 @@ impl Qwen3ForwardConfig {
                 maximum,
             });
         }
-        let planned_kv_bytes = self.cached_kv_bytes(maximum_context_tokens)?;
+        let planned_kv_bytes = self.cached_kv_bytes_at(maximum_context_tokens, kv_precision)?;
         if planned_kv_bytes > maximum_kv_bytes {
             return Err(Qwen3ForwardError::ResidentChatKvBudget {
                 required: planned_kv_bytes,
@@ -446,6 +535,7 @@ impl Qwen3ForwardConfig {
         Ok(Qwen3ResidentChatPlan {
             maximum_context_tokens,
             planned_kv_bytes,
+            kv_precision,
         })
     }
 }
@@ -721,7 +811,11 @@ fn apply_residual_steering(
     let stream = StreamOrDevice::gpu();
     let residual = Array::from_slice(&scaled_residual, &[1, 1, hidden]);
     let mask = Array::from_slice(&mask, &[1, sequence, 1]);
-    let selected_residual = residual.multiply_device(&mask, &stream)?;
+    // The artifact is f32; keep the residual stream in the weights' precision
+    // so later layers do not promote to f32 on BF16 weights.
+    let selected_residual = residual
+        .multiply_device(&mask, &stream)?
+        .as_dtype_device(hidden_states.dtype(), &stream)?;
     hidden_states
         .add_device(&selected_residual, &stream)
         .map_err(Into::into)
@@ -850,7 +944,7 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         self.resident_chat_plan
     }
 
-    /// Estimated final logical f32 K/V bytes for a resident-chat executor.
+    /// Estimated final logical K/V bytes for a resident-chat executor.
     ///
     /// This is absent on the 512-token diagnostic executor and does not
     /// represent an MLX allocation or reservation.
@@ -2024,6 +2118,9 @@ pub enum Qwen3ForwardError {
         /// The K/V projection's element type.
         activation: mlx_rs::Dtype,
     },
+    /// A weight dtype is not one of [`Qwen3WeightPrecision`]'s.
+    #[error("Qwen3 weight dtype {0} is not a supported floating-point precision")]
+    UnsupportedWeightDtype(String),
     /// MLX could not construct, evaluate, or copy the Metal graph.
     #[error("MLX Qwen3 forward failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
@@ -2037,6 +2134,8 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::{DecoderFamily, GPU_TEST_LOCK};
+
+    const F32: super::Qwen3WeightPrecision = super::Qwen3WeightPrecision::Float32;
 
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
@@ -2126,12 +2225,12 @@ mod tests {
             for config in resident_production_layouts() {
                 let required = independent_kv_bytes(&config, context_tokens);
                 let exact = config
-                    .resident_chat_plan(context_tokens, required)
+                    .resident_chat_plan(context_tokens, required, F32)
                     .expect("exact K/V budget admits a valid context");
                 prop_assert_eq!(exact.maximum_context_tokens(), context_tokens);
                 prop_assert_eq!(exact.planned_kv_bytes(), required);
                 prop_assert!(matches!(
-                    config.resident_chat_plan(context_tokens, required - 1),
+                    config.resident_chat_plan(context_tokens, required - 1, F32),
                     Err(Qwen3ForwardError::ResidentChatKvBudget {
                         required: actual_required,
                         maximum,
@@ -2148,10 +2247,10 @@ mod tests {
         ) {
             for config in resident_production_layouts() {
                 let current = config
-                    .resident_chat_plan(context_tokens, u64::MAX)
+                    .resident_chat_plan(context_tokens, u64::MAX, F32)
                     .expect("valid production-layout context");
                 let next = config
-                    .resident_chat_plan(context_tokens + 1, u64::MAX)
+                    .resident_chat_plan(context_tokens + 1, u64::MAX, F32)
                     .expect("next valid production-layout context");
                 prop_assert_eq!(
                     next.planned_kv_bytes() - current.planned_kv_bytes(),
@@ -2166,7 +2265,7 @@ mod tests {
     fn resident_production_layouts_reject_the_token_after_the_admission_ceiling() {
         for config in resident_production_layouts() {
             assert!(matches!(
-                config.resident_chat_plan(super::MAX_RESIDENT_CHAT_TOKENS + 1, u64::MAX),
+                config.resident_chat_plan(super::MAX_RESIDENT_CHAT_TOKENS + 1, u64::MAX, F32),
                 Err(Qwen3ForwardError::ResidentChatContextLimit {
                     requested,
                     maximum,
@@ -2191,22 +2290,80 @@ mod tests {
     }
 
     #[test]
+    fn bfloat16_plan_reserves_half_the_float32_kv() {
+        let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
+        let float32 = config
+            .resident_chat_plan(4_096, u64::MAX, F32)
+            .expect("float32 plan");
+        let bfloat16 = config
+            .resident_chat_plan(4_096, u64::MAX, super::Qwen3WeightPrecision::BFloat16)
+            .expect("bfloat16 plan");
+        assert_eq!(bfloat16.planned_kv_bytes() * 2, float32.planned_kv_bytes());
+        assert_eq!(
+            bfloat16.kv_precision(),
+            super::Qwen3WeightPrecision::BFloat16
+        );
+        // A budget that holds BF16 K/V but not f32 admits only the BF16 plan.
+        assert!(
+            config
+                .resident_chat_plan(4_096, bfloat16.planned_kv_bytes(), F32)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn plan_precision_follows_the_cache_the_weights_store() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = long_small_config();
+        for precision in [
+            super::Qwen3WeightPrecision::BFloat16,
+            super::Qwen3WeightPrecision::Float16,
+            super::Qwen3WeightPrecision::Float32,
+        ] {
+            let weights: HashMap<String, Array> = deterministic_weights()
+                .into_iter()
+                .map(|(name, tensor)| {
+                    let converted = tensor.as_dtype(precision.dtype()).expect("cast");
+                    (name, converted)
+                })
+                .collect();
+            assert_eq!(
+                super::kv_precision(&weights).expect("float weights"),
+                precision
+            );
+            let plan = config
+                .resident_chat_plan(256, u64::MAX, precision)
+                .expect("plan");
+            let mut executor = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+            // 128 positions fill the first storage tier exactly, so the stored
+            // bytes equal the plan's bytes for 128 tokens.
+            let _ = executor.prefill_last_logits(&[1; 128]).expect("prefill");
+            assert_eq!(
+                u64::try_from(executor.kv_bytes()).expect("bytes fit u64"),
+                config
+                    .cached_kv_bytes_at(128, plan.kv_precision())
+                    .expect("bytes")
+            );
+        }
+    }
+
+    #[test]
     fn resident_chat_plan_is_separate_from_the_512_token_diagnostic_limit() {
         let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
         let plan = config
-            .resident_chat_plan(2_048, super::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES)
+            .resident_chat_plan(2_048, super::DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES, F32)
             .expect("512 MiB admits Qwen3-0.6B K/V at 2048 tokens");
         assert_eq!(plan.maximum_context_tokens(), 2_048);
         assert_eq!(plan.planned_kv_bytes(), 469_762_048);
         assert!(matches!(
-            config.resident_chat_plan(16_385, u64::MAX),
+            config.resident_chat_plan(16_385, u64::MAX, F32),
             Err(Qwen3ForwardError::ResidentChatContextLimit {
                 requested: 16_385,
                 maximum: 16_384,
             })
         ));
         assert!(matches!(
-            config.resident_chat_plan(2_048, plan.planned_kv_bytes() - 1),
+            config.resident_chat_plan(2_048, plan.planned_kv_bytes() - 1, F32),
             Err(Qwen3ForwardError::ResidentChatKvBudget {
                 required: 469_762_048,
                 maximum: 469_762_047,
@@ -2218,7 +2375,7 @@ mod tests {
         );
         let smaller_model = Qwen3ForwardConfig::parse(&smaller_model).expect("smaller context");
         assert!(matches!(
-            smaller_model.resident_chat_plan(2_048, u64::MAX),
+            smaller_model.resident_chat_plan(2_048, u64::MAX, F32),
             Err(Qwen3ForwardError::ResidentChatContextLimit {
                 requested: 2_048,
                 maximum: 1_024,
@@ -2554,7 +2711,7 @@ mod tests {
         let config = long_small_config();
         let weights = deterministic_weights();
         let plan = config
-            .resident_chat_plan(600, u64::MAX)
+            .resident_chat_plan(600, u64::MAX, F32)
             .expect("long tiny-model resident plan");
         let mut cached = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
         let mut prefix = vec![1; 513];
@@ -2580,7 +2737,7 @@ mod tests {
         let config = long_small_config();
         let weights = deterministic_weights();
         let plan = config
-            .resident_chat_plan(513, u64::MAX)
+            .resident_chat_plan(513, u64::MAX, F32)
             .expect("exact long tiny-model resident plan");
         let mut executor = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
         executor
@@ -2986,7 +3143,7 @@ mod tests {
             Err(Qwen3ForwardError::CachedBidirectional)
         ));
         assert!(matches!(
-            config.resident_chat_plan(8, u64::MAX),
+            config.resident_chat_plan(8, u64::MAX, F32),
             Err(Qwen3ForwardError::CachedBidirectional)
         ));
     }
