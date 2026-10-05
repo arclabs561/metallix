@@ -192,8 +192,7 @@ Metallix's broader product thesis is a measured runtime for interventions over
 model execution: symbolic constraints, activation/probe controls, verifier and
 tool feedback, recursive subqueries, hierarchical memory, and probabilistic
 search. These are distinct mechanisms with distinct evidence classes. The
-[programmatic inference design](design/programmatic-inference.md) and
-[frontiers ledger](research/programmatic-inference-frontiers.md) define their
+[frontiers ledger](research/programmatic-inference-frontiers.md) defines their
 shared boundary and limits.
 
 The Qwen controller mechanism now has accept/reject, rollback and receipt

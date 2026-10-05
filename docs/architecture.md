@@ -110,8 +110,7 @@ categorical sampling and transactional JSON Schema masking are qualified on
 the bounded Qwen diagnostic; SMC accounting is test-only. AICI and
 llguidance are external prior art and possible dependencies, not implemented
 features. Promotion requires tokenizer-aware mask parity, real logits,
-snapshot/restore and ancestry checks, and Apple-Silicon measurements. See the
-[programmatic inference design](design/programmatic-inference.md).
+snapshot/restore and ancestry checks, and Apple-Silicon measurements.
 
 Qwen3-0.6B is the resident control model used to qualify MLX loading, numerical
 forward agreement, and single-sequence cached-decode agreement before attempting
