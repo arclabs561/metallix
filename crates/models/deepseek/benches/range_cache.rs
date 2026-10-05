@@ -10,21 +10,37 @@
 //!
 //! A hit is a resident tensor. A miss alternates two tensors under a one-tensor
 //! budget, so every timed call reads and evicts.
+//!
+//! Startup embedding rows, one prefill step of 3 distinct token rows of a
+//! 5120-wide BF16 `embed.weight` read through `V41CachedEmbeddingRows`:
+//! - `embedding_rows_cold` / `_warm`: a synthetic 1024-row table in memory;
+//!   cold builds a fresh cache per call, warm re-reads resident rows.
+//! - `local_embedding_rows_cold`: the real 129280-row table through
+//!   `V41LocalWeightsSource`, whose receipt check reads and hashes the whole
+//!   1.3 GB tensor for every uncached row range.
+//! - `startup_selected_rows`: the startup lookup itself
+//!   (`startup_selected_bf16_reference`, 3 tokens x 4 HC copies) over rows
+//!   already read; layer 0's attention and FFN are not included.
 
 use std::{
     hint::black_box,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use deepseek::{
+    StartupLayout,
     checkpoint::{
         V41SafetensorsHeader,
+        embedding_rows::V41CachedEmbeddingRows,
         range_cache::{
             V41LocalWeightsSource, V41RangeCache, V41RangeCacheError, V41RangeRequest,
             V41RangeSource,
         },
     },
     manifest::V41SafetensorsIndex,
+    reduced::EmbeddingRowSource,
+    startup_selected_bf16_reference,
 };
 
 const TENSOR_BYTES: u64 = 2_304 * 2_560;
@@ -145,6 +161,105 @@ fn local_miss(bencher: divan::Bencher) {
     if let Some(cache) = local_cache(TENSOR_BYTES) {
         bench_miss(bencher, cache, REAL_A, REAL_B);
     }
+}
+
+const WIDTH: usize = 5120;
+const SYNTHETIC_ROWS: usize = 1024;
+/// One prefill step's distinct token rows (ascending), as startup requests them.
+const STEP_ROWS: [usize; 3] = [7, 42, 913];
+
+fn embedding_cache() -> V41RangeCache<Memory> {
+    let bytes = SYNTHETIC_ROWS * WIDTH * 2;
+    let header = format!(
+        r#"{{"embed.weight":{{"dtype":"BF16","shape":[{SYNTHETIC_ROWS},{WIDTH}],"data_offsets":[0,{bytes}]}}}}"#
+    );
+    let file_bytes = 8 + header.len() as u64 + bytes as u64;
+    let header =
+        V41SafetensorsHeader::parse(header.as_bytes(), file_bytes).expect("synthetic header");
+    let index = V41SafetensorsIndex::parse(&format!(
+        r#"{{"metadata":{{"total_size":1}},"weight_map":{{"embed.weight":"{SHARD}"}}}}"#
+    ))
+    .expect("synthetic index");
+    // Finite BF16 values around 1.0.
+    let shard = (0..file_bytes)
+        .map(|offset| {
+            if offset % 2 == 1 {
+                0x3f
+            } else {
+                offset.to_le_bytes()[0]
+            }
+        })
+        .collect();
+    V41RangeCache::new(
+        Memory { shard },
+        index,
+        [(SHARD.to_owned(), header)],
+        1 << 26,
+    )
+    .expect("synthetic cache")
+}
+
+fn read_step<S: V41RangeSource>(cache: &Mutex<V41RangeCache<S>>) -> Vec<u16> {
+    let mut rows = vec![0; STEP_ROWS.len() * WIDTH];
+    V41CachedEmbeddingRows::new(cache, WIDTH)
+        .read_rows(&STEP_ROWS, &mut rows)
+        .expect("embedding rows");
+    rows
+}
+
+#[divan::bench]
+fn embedding_rows_cold(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| Mutex::new(embedding_cache()))
+        .bench_local_values(|cache| black_box(read_step(&cache)));
+}
+
+#[divan::bench]
+fn embedding_rows_warm(bencher: divan::Bencher) {
+    let cache = Mutex::new(embedding_cache());
+    read_step(&cache);
+    bencher.bench_local(|| black_box(read_step(&cache)));
+}
+
+#[divan::bench(sample_count = 3, sample_size = 1)]
+fn local_embedding_rows_cold(bencher: divan::Bencher) {
+    let root = receipts();
+    let trace = root.join("route-trace");
+    let index =
+        root.join("control/receipts/candidate-control/real-expert/model.safetensors.index.json");
+    if !trace.join("weights/embed.weight.bin").exists() || !index.exists() {
+        eprintln!("range_cache: local embed.weight absent; local_embedding_rows_cold skipped");
+        return;
+    }
+    let cache = || {
+        Mutex::new(
+            V41RangeCache::load(
+                V41LocalWeightsSource::new(trace.join("weights"), PINNED),
+                &index,
+                &trace,
+                PINNED,
+                1 << 26,
+            )
+            .expect("pinned index and headers"),
+        )
+    };
+    bencher
+        .with_inputs(cache)
+        .bench_local_values(|cache| black_box(read_step(&cache)));
+}
+
+#[divan::bench]
+fn startup_selected_rows(bencher: divan::Bencher) {
+    let rows = read_step(&Mutex::new(embedding_cache()));
+    let selected: Vec<u64> = STEP_ROWS.iter().map(|&row| row as u64).collect();
+    let ids = [selected[1], selected[0], selected[2]];
+    let layout = StartupLayout::new(STEP_ROWS.len(), WIDTH, 4).expect("layout");
+    bencher.bench_local(|| {
+        black_box(
+            startup_selected_bf16_reference(black_box(&ids), &selected, &rows, layout)
+                .expect("startup"),
+        )
+    });
 }
 
 fn main() {
