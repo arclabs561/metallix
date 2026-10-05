@@ -179,6 +179,14 @@ pub struct Qwen3MlxWeights {
     forward_config: crate::forward::Qwen3ForwardConfig,
     tensors: HashMap<String, Array>,
     embedding_shape: Vec<i32>,
+    /// Process-unique identity of these tensor values, carried by detached
+    /// K/V snapshots so they cannot be restored onto other weights.
+    binding: u64,
+}
+
+fn next_weights_binding() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Qwen3MlxWeights {
@@ -211,6 +219,48 @@ impl Qwen3MlxWeights {
         ))
     }
 
+    /// Detaches the first `tokens` cached positions of a resident executor
+    /// borrowed from these weights, for a later
+    /// [`Self::resident_chat_executor_from`] on the same weights.
+    pub fn snapshot_resident_prefix(
+        &self,
+        executor: &crate::forward::Qwen3ForwardExecutor<
+            '_,
+            std::collections::hash_map::RandomState,
+        >,
+        tokens: usize,
+    ) -> Result<crate::forward::Qwen3KvSnapshot, crate::forward::Qwen3ForwardError> {
+        if !executor.borrows(&self.tensors) {
+            return Err(crate::forward::Qwen3ForwardError::KvSnapshotMismatch);
+        }
+        executor.snapshot_prefix(tokens, self.binding)
+    }
+
+    /// Starts a resident-chat executor whose cache already holds `snapshot`'s
+    /// prefix. The snapshot must come from this load (after any precision
+    /// change) and the same context and K/V limits.
+    pub fn resident_chat_executor_from(
+        &self,
+        snapshot: &crate::forward::Qwen3KvSnapshot,
+        maximum_context_tokens: usize,
+        maximum_kv_bytes: u64,
+    ) -> Result<
+        crate::forward::Qwen3ForwardExecutor<'_, std::collections::hash_map::RandomState>,
+        crate::forward::Qwen3ForwardError,
+    > {
+        let plan = self
+            .forward_config
+            .resident_chat_plan(maximum_context_tokens, maximum_kv_bytes)?;
+        if snapshot.binding() != self.binding || snapshot.plan() != plan {
+            return Err(crate::forward::Qwen3ForwardError::KvSnapshotMismatch);
+        }
+        Ok(crate::forward::Qwen3ForwardExecutor::from_snapshot(
+            &self.forward_config,
+            &self.tensors,
+            snapshot,
+        ))
+    }
+
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
     /// This increases resident weight memory relative to the BF16 checkpoint.
     #[tracing::instrument(name = "qwen.weights.prepare_float32", level = "info", skip_all)]
@@ -220,6 +270,8 @@ impl Qwen3MlxWeights {
             converted.eval()?;
             *weight = converted;
         }
+        // K/V computed from the earlier precision must not be restored here.
+        self.binding = next_weights_binding();
         Ok(())
     }
 
@@ -420,6 +472,7 @@ impl Qwen3MlxWeights {
             forward_config,
             tensors,
             embedding_shape,
+            binding: next_weights_binding(),
         })
     }
 

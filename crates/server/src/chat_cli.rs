@@ -314,6 +314,7 @@ mod tests {
                     decode_ms: Vec::new(),
                     decode_total_ms: 0.0,
                     prompt_tokens: 0,
+                    cached_prompt_tokens: 0,
                     generated_tokens: 0,
                 },
                 logprobs: Vec::new(),

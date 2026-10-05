@@ -255,6 +255,7 @@ fn dispatch(cli: Cli) -> ExitCode {
             listen,
             context_tokens,
             kv_budget_mib,
+            prefix_cache_mib,
             generation_timeout_ms,
             queue_depth,
             queue_wait_ms,
@@ -264,7 +265,8 @@ fn dispatch(cli: Cli) -> ExitCode {
                     Ok(entry) => serving::serve_child(
                         entry,
                         listen,
-                        resident_chat_limits(context_tokens, kv_budget_mib),
+                        resident_chat_limits(context_tokens, kv_budget_mib)
+                            .with_prefix_cache_mib(prefix_cache_mib),
                         Duration::from_millis(u64::from(generation_timeout_ms)),
                         cli.gpu_capture.as_deref(),
                     ),
@@ -281,6 +283,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                     serve_proxy::ChildSettings {
                         context_tokens,
                         kv_budget_mib,
+                        prefix_cache_mib,
                         generation_timeout_ms,
                         trace_out: cli.trace_out,
                         gpu_capture: cli.gpu_capture,

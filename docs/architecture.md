@@ -38,10 +38,16 @@ Prompt content is not logged by default.
 
 The current experimental control surface is intentionally narrower: one
 resident Qwen session supports local chat, a bounded read-only workspace agent,
-and loopback Responses text/function calls. Each turn starts with fresh KV
-state; it is not the planned multi-request scheduler or a general Codex
-backend. `--context-tokens` defaults to 2048 and `--kv-budget-mib` to a 512 MiB
-logical K/V admission budget, with experimental ceilings of 16,384 and 8192
+and loopback Responses text/function calls. Each turn restores the longest
+cached prompt prefix (a shared system and tool preamble, or the earlier turns
+of the same conversation) and prefills only the rest; on Qwen3-0.6B, greedy
+output with a cache hit was token-identical to prefilling the whole prompt.
+`--prefix-cache-mib` bounds that cache, 2048 MiB by default and separate from
+the K/V budget. The router in front of the server may set
+`x-metallix-cache-salt` to give each tenant its own namespace; requests
+without it share one. This is not the planned multi-request scheduler or a
+general Codex backend. `--context-tokens` defaults to 2048 and
+`--kv-budget-mib` to a 512 MiB logical K/V admission budget, with experimental ceilings of 16,384 and 8192
 MiB. The 4B checkpoint revision `cdbee75f17c01a7cc42f958dc650907174af0554`
 passed a bounded 12-trial read-tool qualification at 2048 tokens and 1024 MiB.
 That does not establish physical-memory use, the expanded ceilings, coding-agent

@@ -24,6 +24,9 @@ use crate::{
     qwen_tokenizer::QwenTokenizer,
 };
 
+#[path = "qwen_prefix_cache.rs"]
+mod prefix_cache;
+
 const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
 const MAX_GENERATION_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
@@ -33,11 +36,16 @@ const MAX_CHAT_TOOLS: usize = 64;
 const TEMPLATE_FUEL: u64 = 100_000;
 const MIB_BYTES: u64 = 1024 * 1024;
 
+/// Default prompt-prefix cache budget: room for a few multi-thousand-token
+/// agent preambles of a small Qwen3 at float32 K/V.
+pub(crate) const DEFAULT_PREFIX_CACHE_MIB: u32 = 2048;
+
 /// One resident-chat admission contract shared by session loading and turns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResidentChatLimits {
     context_tokens: usize,
     kv_budget_bytes: u64,
+    prefix_cache_bytes: u64,
 }
 
 impl ResidentChatLimits {
@@ -46,7 +54,23 @@ impl ResidentChatLimits {
         Self {
             context_tokens,
             kv_budget_bytes: (kv_budget_mib as u64) * MIB_BYTES,
+            prefix_cache_bytes: (DEFAULT_PREFIX_CACHE_MIB as u64) * MIB_BYTES,
         }
+    }
+
+    /// Sets the prompt-prefix cache budget, held apart from the resident K/V
+    /// budget; zero disables reuse across turns.
+    #[must_use]
+    pub(crate) const fn with_prefix_cache_mib(self, prefix_cache_mib: u32) -> Self {
+        Self {
+            prefix_cache_bytes: (prefix_cache_mib as u64) * MIB_BYTES,
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn prefix_cache_bytes(self) -> u64 {
+        self.prefix_cache_bytes
     }
 
     #[must_use]
@@ -195,6 +219,11 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) top_logprobs: Option<u8>,
     /// A JSON Schema the output must satisfy, enforced by a grammar mask.
     pub(crate) json_schema: Option<&'a Value>,
+    /// Prefix-cache namespace, set only from the router-owned
+    /// `x-metallix-cache-salt` header and never from a request body. Requests
+    /// with different salts never reuse each other's cached K/V; `None`
+    /// shares the default namespace.
+    pub(crate) cache_salt: Option<&'a str>,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -210,6 +239,7 @@ impl<'a> ChatRequest<'a> {
             sampling: SamplingRequest::GREEDY,
             top_logprobs: None,
             json_schema: None,
+            cache_salt: None,
         }
     }
 }
@@ -404,6 +434,7 @@ impl GenerationControls {
             sampling: self.sampling,
             top_logprobs: self.top_logprobs,
             json_schema: self.json_schema.as_ref(),
+            cache_salt: None,
         }
     }
 }
@@ -454,6 +485,8 @@ pub(crate) struct ChatGenerationMetrics {
     pub(crate) decode_ms: Vec<f64>,
     pub(crate) decode_total_ms: f64,
     pub(crate) prompt_tokens: usize,
+    /// Leading prompt tokens restored from the prefix cache, not prefilled.
+    pub(crate) cached_prompt_tokens: usize,
     pub(crate) generated_tokens: usize,
 }
 
@@ -561,6 +594,8 @@ pub(crate) struct ChatSession {
     /// Checkpoint directory, read again only to compile a JSON-schema grammar.
     model: PathBuf,
     sampling_defaults: SamplingDefaults,
+    /// Prompt-prefix K/V kept across turns, bounded by `--prefix-cache-mib`.
+    prefix_cache: prefix_cache::PrefixCache<qwen::forward::Qwen3KvSnapshot>,
 }
 
 /// The non-generative result of a single independently-prefilled chat prompt.
@@ -615,6 +650,13 @@ impl ChatSession {
         weights
             .prepare_float32()
             .map_err(|error| error.to_string())?;
+        // The template, tokenizer and config (which carries the RoPE
+        // settings) fix how tokens become K/V; the chat path loads no adapter.
+        let prefix_identity = format!(
+            "model={}\0config={config_sha256}\0tokenizer={tokenizer_sha256}\0template={template_sha256}\0adapter=none",
+            model.display()
+        );
+        let prefix_budget = usize::try_from(limits.prefix_cache_bytes()).unwrap_or(usize::MAX);
         Ok(Self {
             weights,
             tokenizer,
@@ -630,6 +672,7 @@ impl ChatSession {
             template_sha256,
             model: model.to_path_buf(),
             sampling_defaults: SamplingDefaults::load(model)?,
+            prefix_cache: prefix_cache::PrefixCache::new(prefix_identity, prefix_budget),
         })
     }
 
@@ -753,22 +796,26 @@ impl ChatSession {
         let mut picker = self.token_picker(request)?;
 
         deadline.check()?;
-        let mut executor = self
-            .weights
-            .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
-            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
-        deadline.check()?;
         // Ends with the full-vocabulary logit readback, so it times the GPU work.
         let prefill = tracing::info_span!(
             "chat.prefill",
             prompt_tokens = input_ids.len(),
+            cached_tokens = Empty,
             prefill_ms = Empty
         );
-        let (mut logits, prefill_ms) = timed(&prefill, "prefill_ms", || {
-            executor
-                .prefill_last_logits(&input_ids)
-                .map_err(|error| ChatGenerationError::message(error.to_string()))
-        })?;
+        let ((mut executor, mut logits, cached_prompt_tokens), prefill_ms) =
+            timed(&prefill, "prefill_ms", || {
+                prefix_cache::prefill(
+                    &self.weights,
+                    &mut self.prefix_cache,
+                    self.context_limit,
+                    self.kv_budget_bytes,
+                    request,
+                    &input_ids,
+                )
+                .map_err(ChatGenerationError::message)
+            })?;
+        prefill.record("cached_tokens", cached_prompt_tokens);
         deadline.check()?;
         let mut generated = Vec::with_capacity(max_tokens as usize);
         let mut logprobs = Vec::new();
@@ -815,6 +862,20 @@ impl ChatSession {
                 deadline.check()?;
             }
         }
+        // Copies the reusable prompt prefixes out of this turn's K/V; after the
+        // last token, so it never delays the first one.
+        let store = tracing::info_span!("chat.prefix_cache.store", store_ms = Empty);
+        timed(&store, "store_ms", || {
+            prefix_cache::remember(
+                &self.weights,
+                &mut self.prefix_cache,
+                &self.template,
+                &self.tokenizer,
+                &executor,
+                request,
+                &input_ids,
+            )
+        })?;
 
         let visible_generated = generated
             .strip_suffix(&[self.eos_token_id])
@@ -847,6 +908,7 @@ impl ChatSession {
                 decode_ms,
                 decode_total_ms,
                 prompt_tokens: input_ids.len(),
+                cached_prompt_tokens,
                 generated_tokens,
             },
         })
@@ -958,6 +1020,16 @@ fn render_template(
     template: &Environment<'static>,
     request: ChatRequest<'_>,
 ) -> Result<String, String> {
+    render_template_with(template, request, true)
+}
+
+/// Renders `request`, optionally without the trailing assistant generation
+/// prompt; the prefix cache renders conversation prefixes that way.
+fn render_template_with(
+    template: &Environment<'static>,
+    request: ChatRequest<'_>,
+    add_generation_prompt: bool,
+) -> Result<String, String> {
     let messages = serde_json::to_value(request.messages)
         .map_err(|_| String::from("chat messages could not be serialized"))?;
     let tools = serde_json::to_value(request.tools)
@@ -968,7 +1040,7 @@ fn render_template(
         .render(context! {
             messages => messages,
             tools => tools,
-            add_generation_prompt => true,
+            add_generation_prompt => add_generation_prompt,
             enable_thinking => request.enable_thinking,
             thinking_mode => if request.enable_thinking { "thinking" } else { "non-thinking" },
             reasoning_effort => request.reasoning_effort.unwrap_or("low"),
@@ -1363,6 +1435,11 @@ mod tests {
         let limits = ResidentChatLimits::from_mib(16_384, 8_192);
         assert_eq!(limits.context_tokens(), 16_384);
         assert_eq!(limits.kv_budget_bytes(), 8_192 * 1024 * 1024);
+        assert_eq!(limits.prefix_cache_bytes(), 2_048 * 1024 * 1024);
+        let sized = limits.with_prefix_cache_mib(3);
+        assert_eq!(sized.prefix_cache_bytes(), 3 * 1024 * 1024);
+        assert_eq!(sized.kv_budget_bytes(), limits.kv_budget_bytes());
+        assert_eq!(limits.with_prefix_cache_mib(0).prefix_cache_bytes(), 0);
     }
 
     #[test]

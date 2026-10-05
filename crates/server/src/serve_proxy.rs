@@ -51,6 +51,7 @@ const LISTENING: &str = "mx listening on http://";
 pub(crate) struct ChildSettings {
     pub(crate) context_tokens: u32,
     pub(crate) kv_budget_mib: u32,
+    pub(crate) prefix_cache_mib: u32,
     pub(crate) generation_timeout_ms: u32,
     /// Each child writes its own timeline beside this path.
     pub(crate) trace_out: Option<PathBuf>,
@@ -367,6 +368,7 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
         ])
         .args(["--context-tokens", &settings.context_tokens.to_string()])
         .args(["--kv-budget-mib", &settings.kv_budget_mib.to_string()])
+        .args(["--prefix-cache-mib", &settings.prefix_cache_mib.to_string()])
         .args([
             "--generation-timeout-ms",
             &settings.generation_timeout_ms.to_string(),
@@ -636,12 +638,18 @@ fn forward(
             // A new parent id under the caller's trace id, per W3C Trace Context.
             write!(
                 child,
-                "{} {} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\ntraceparent: {}\r\nx-request-id: {}\r\n\r\n",
+                "{} {} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\ntraceparent: {}\r\nx-request-id: {}\r\n{}\r\n",
                 request.method,
                 request.path,
                 request.body.len(),
                 context.trace.child(),
                 context.request_id,
+                // Already validated as visible ASCII by the transport.
+                request
+                    .trace
+                    .cache_salt
+                    .as_ref()
+                    .map_or_else(String::new, |salt| format!("x-metallix-cache-salt: {salt}\r\n")),
             )
         })
         .and_then(|()| child.write_all(&request.body))
@@ -807,7 +815,11 @@ mod tests {
                 json_response(
                     connection,
                     200,
-                    &json!({"traceparent": trace.traceparent, "request_id": trace.request_id}),
+                    &json!({
+                        "traceparent": trace.traceparent,
+                        "request_id": trace.request_id,
+                        "cache_salt": trace.cache_salt,
+                    }),
                 );
             }
         });
@@ -1141,17 +1153,22 @@ mod tests {
         let (_, seen) = send(address, "", body);
         let minted = forwarded(&seen);
         assert_eq!(seen["request_id"], json!(minted.trace_id()));
+        assert_eq!(seen["cache_salt"], Value::Null, "no salt is invented");
 
         // A caller's context keeps its trace id; the child gets a new parent id.
         let (_, seen) = send(
             address,
-            &format!("traceparent: {INCOMING}\r\nx-request-id: caller-1\r\n"),
+            &format!(
+                "traceparent: {INCOMING}\r\nx-request-id: caller-1\r\nx-metallix-cache-salt: tenant-1\r\n"
+            ),
             body,
         );
         let kept = forwarded(&seen);
         assert_eq!(kept.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_ne!(kept.to_string(), INCOMING);
         assert_eq!(seen["request_id"], "caller-1");
+        // The router's cache salt reaches the child that owns the cache.
+        assert_eq!(seen["cache_salt"], "tenant-1");
 
         // An all-zero or malformed traceparent is replaced, not forwarded.
         let zero = "00-00000000000000000000000000000000-00f067aa0ba902b7-01";

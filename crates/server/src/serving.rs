@@ -561,6 +561,7 @@ fn serve_models(
             request.trace.request_id.as_deref(),
         );
         connection.set_request_id(&context.request_id);
+        connection.set_cache_salt(request.trace.cache_salt.clone());
         let span = tracing::info_span!(
             "http.request",
             request_id = %context.request_id,
@@ -800,6 +801,7 @@ mod tests {
                     decode_ms: vec![],
                     decode_total_ms: 0.0,
                     prompt_tokens: 1,
+                    cached_prompt_tokens: 0,
                     generated_tokens: 1,
                 },
                 logprobs: Vec::new(),
@@ -912,6 +914,7 @@ stream.close()
                     decode_ms: vec![],
                     decode_total_ms: 0.0,
                     prompt_tokens: 1,
+                    cached_prompt_tokens: 0,
                     generated_tokens: 1,
                 },
                 logprobs: Vec::new(),

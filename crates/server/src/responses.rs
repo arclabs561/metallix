@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::{
     chat_cli::message,
     chat_generation::{
-        ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRole, ChatToolCall,
-        GenerationControls, SamplingRequest, TokenLogprob,
+        ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
+        ChatToolCall, GenerationControls, SamplingRequest, TokenLogprob,
     },
     chat_tools,
     http_transport::Connection,
@@ -507,6 +507,7 @@ pub(crate) fn respond(
         return Ok(());
     }
     let request_id = request.request_id().map(str::to_owned);
+    let cache_salt = request.cache_salt().map(str::to_owned);
     let message_id = format!("msg_{id}");
     // Text streams live only when no tool envelope or reasoning block has to
     // be parsed out of it first.
@@ -519,7 +520,10 @@ pub(crate) fn respond(
         live_message: stream_text.then_some(message_id.as_str()),
     };
     let generated = session.generate_with_timeout(
-        controls.request(messages, tools),
+        ChatRequest {
+            cache_salt: cache_salt.as_deref(),
+            ..controls.request(messages, tools)
+        },
         generation_timeout,
         &mut |delta| {
             if stream_text {
@@ -633,7 +637,10 @@ fn respond_json(
     let request_id = request.request_id().map(str::to_owned);
     let result = session
         .generate_with_timeout(
-            controls.request(messages, tools),
+            ChatRequest {
+                cache_salt: request.cache_salt(),
+                ..controls.request(messages, tools)
+            },
             generation_timeout,
             &mut |_| Ok(()),
         )
@@ -982,6 +989,7 @@ mod tests {
                 decode_ms: vec![],
                 decode_total_ms: 0.0,
                 prompt_tokens: 1,
+                cached_prompt_tokens: 0,
                 generated_tokens: 2,
             },
             logprobs: Vec::new(),

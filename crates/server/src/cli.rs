@@ -155,6 +155,11 @@ pub(crate) enum Command {
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
         #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
         kv_budget_mib: u32,
+        /// Per-model budget in MiB for prompt-prefix K/V reused across requests
+        /// (shared system and tool preambles, earlier turns); separate from
+        /// `--kv-budget-mib`. 0 disables reuse.
+        #[arg(long, default_value_t = crate::chat_generation::DEFAULT_PREFIX_CACHE_MIB, value_parser = clap::value_parser!(u32).range(0..=65_536))]
+        prefix_cache_mib: u32,
         /// Cooperative generation budget per request, in milliseconds.
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=120_000))]
         generation_timeout_ms: u32,

@@ -23,6 +23,10 @@ use thiserror::Error;
 
 use crate::Qwen3Attention;
 
+mod snapshot;
+
+pub use snapshot::Qwen3KvSnapshot;
+
 /// The largest prompt accepted by the uncached qualification forward path.
 pub const MAX_DENSE_DEBUG_TOKENS: usize = 512;
 
@@ -1840,6 +1844,13 @@ pub enum Qwen3ForwardError {
     /// The executor's layer cache no longer matches its model contract.
     #[error("Qwen3 layer KV cache is inconsistent with its configuration")]
     CacheInconsistent,
+    /// Only an unsteered resident-chat prefix of the cached tokens can be
+    /// detached.
+    #[error("Qwen3 K/V snapshot requires an unsteered resident prefix of the cached tokens")]
+    KvSnapshotUnsupported,
+    /// The snapshot came from another checkpoint load or resident plan.
+    #[error("Qwen3 K/V snapshot does not belong to this checkpoint load and resident plan")]
+    KvSnapshotMismatch,
     /// A token does not fit the checkpoint vocabulary.
     #[error("token ID {token_id} is outside vocabulary size {vocab_size}")]
     InvalidTokenId {

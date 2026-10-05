@@ -48,12 +48,21 @@ pub(crate) struct Request {
     pub(crate) trace: TraceHeaders,
 }
 
-/// Request-correlation headers; every other header is dropped after validation.
+/// Request-correlation and router headers; every other header is dropped
+/// after validation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TraceHeaders {
     pub(crate) traceparent: Option<String>,
     pub(crate) request_id: Option<String>,
+    /// `x-metallix-cache-salt`, the prefix-cache namespace. The router in
+    /// front of the server owns this header: it must set or strip it on every
+    /// request, since a client that can choose a salt can join another
+    /// tenant's namespace. Validated as 1 to 256 visible ASCII bytes.
+    pub(crate) cache_salt: Option<String>,
 }
+
+/// Longest accepted `x-metallix-cache-salt` value.
+const MAX_CACHE_SALT_BYTES: usize = 256;
 
 /// A transport rejection suitable for a small JSON error response.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +94,7 @@ pub(crate) struct Connection {
     read_deadline: Instant,
     response_deadline: Option<Instant>,
     request_id: Option<String>,
+    cache_salt: Option<String>,
     /// HTTP minor version of the request read, once one is read.
     minor_version: Option<u8>,
     /// Whether [`Connection::client_gone`] has sent its one probe.
@@ -101,6 +111,7 @@ impl Connection {
             read_deadline: deadline_after(limits.read_deadline),
             response_deadline: None,
             request_id: None,
+            cache_salt: None,
             minor_version: None,
             probed: false,
         }
@@ -144,6 +155,15 @@ impl Connection {
 
     pub(crate) fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    /// Sets the router-supplied prefix-cache salt for this request.
+    pub(crate) fn set_cache_salt(&mut self, cache_salt: Option<String>) {
+        self.cache_salt = cache_salt;
+    }
+
+    pub(crate) fn cache_salt(&self) -> Option<&str> {
+        self.cache_salt.as_deref()
     }
 
     /// The `X-Request-Id` response header line, or nothing before an id is set.
@@ -224,6 +244,15 @@ impl Connection {
                     let body_length = validate_headers(&request, &method, version, self.limits)?;
                     self.minor_version = Some(version);
                     let trace = trace_headers(&request);
+                    if trace.cache_salt.as_deref().is_some_and(|salt| {
+                        salt.is_empty()
+                            || salt.len() > MAX_CACHE_SALT_BYTES
+                            || !salt.bytes().all(|byte| byte.is_ascii_graphic())
+                    }) {
+                        return Err(HttpError::bad_request(
+                            "x-metallix-cache-salt must be 1 to 256 visible ASCII characters",
+                        ));
+                    }
                     return Ok((input, header_end, method, path, body_length, trace));
                 }
                 Ok(httparse::Status::Partial) => {
@@ -335,8 +364,8 @@ fn validate_headers(
     }
 }
 
-/// The first `traceparent` and `x-request-id` values that are UTF-8; callers
-/// validate their content.
+/// The first `traceparent`, `x-request-id` and `x-metallix-cache-salt` values
+/// that are UTF-8; callers validate their content.
 fn trace_headers(request: &httparse::Request<'_, '_>) -> TraceHeaders {
     let value = |name: &str| {
         request
@@ -349,6 +378,7 @@ fn trace_headers(request: &httparse::Request<'_, '_>) -> TraceHeaders {
     TraceHeaders {
         traceparent: value("traceparent"),
         request_id: value("x-request-id"),
+        cache_salt: value("x-metallix-cache-salt"),
     }
 }
 
@@ -594,6 +624,33 @@ mod tests {
             assert_eq!(connection.read_request().unwrap_err().status, 400);
             client.join().unwrap();
         }
+    }
+
+    #[test]
+    fn cache_salt_header_is_read_and_bounded() {
+        let wire = |salt: &str| {
+            format!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nX-Metallix-Cache-Salt: {salt}\r\nContent-Length: 2\r\n\r\n{{}}"
+            )
+            .into_bytes()
+        };
+        let request = parse_wire(wire("tenant-7"), limits()).unwrap();
+        assert_eq!(request.trace.cache_salt.as_deref(), Some("tenant-7"));
+        let longest = "s".repeat(256);
+        let request = parse_wire(wire(&longest), limits()).unwrap();
+        assert_eq!(request.trace.cache_salt, Some(longest));
+        for salt in ["", "two words", &"s".repeat(257)] {
+            assert_eq!(parse_wire(wire(salt), limits()).unwrap_err().status, 400);
+        }
+        let plain =
+            b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+        assert_eq!(
+            parse_wire(plain.to_vec(), limits())
+                .unwrap()
+                .trace
+                .cache_salt,
+            None
+        );
     }
 
     fn parse_wire(wire: Vec<u8>, limits: TransportLimits) -> Result<Request, HttpError> {

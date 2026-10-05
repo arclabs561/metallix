@@ -233,3 +233,72 @@ fn fused_kernel_chunk_with_unaligned_offset_matches_fresh_prefill() {
         );
     }
 }
+
+#[test]
+fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = fused_kernel_config();
+    let weights = fused_kernel_weights();
+    let plan = config
+        .resident_chat_plan(600, u64::MAX)
+        .expect("tiny resident plan");
+    let prompt = (0..64)
+        .map(|index| (index * 5 + 3) % 16)
+        .collect::<Vec<i32>>();
+    let mut source = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+    source.prefill_last_logits(&prompt).expect("source prefill");
+    // A prefix of a longer cached sequence: positions 0..30 depend only on
+    // tokens 0..30, so the snapshot serves any prompt starting with them.
+    let snapshot = source.snapshot_prefix(30, 7).expect("prefix snapshot");
+    assert_eq!(snapshot.tokens(), 30);
+    // Compact rows, not the 128-row stepped storage: layers x K,V x heads x
+    // rows x head width x f32.
+    assert_eq!(snapshot.kv_bytes(), 2 * 2 * 30 * 64 * 4);
+    let other = (0..20)
+        .map(|index| (index * 3 + 1) % 16)
+        .collect::<Vec<i32>>();
+    for _ in 0..2 {
+        let mut restored = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &snapshot);
+        assert_eq!(restored.cached_tokens(), 30);
+        let logits = restored.extend_last_logits(&other).expect("suffix");
+        let expected_prompt = prompt[..30]
+            .iter()
+            .chain(&other)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut fresh = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        assert_logits_match(
+            fresh.prefill_last_logits(&expected_prompt).expect("fresh"),
+            logits,
+        );
+        assert_logits_match(
+            fresh.decode_last_logits(5).expect("fresh decode"),
+            restored.decode_last_logits(5).expect("restored decode"),
+        );
+    }
+}
+
+#[test]
+fn snapshot_refuses_unsteerable_or_out_of_range_prefixes() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = fused_kernel_config();
+    let weights = fused_kernel_weights();
+    let plan = config
+        .resident_chat_plan(600, u64::MAX)
+        .expect("tiny resident plan");
+    let mut diagnostic = Qwen3ForwardExecutor::new(&config, &weights);
+    diagnostic.prefill_last_logits(&[1, 2, 3]).expect("prefill");
+    assert!(matches!(
+        diagnostic.snapshot_prefix(2, 1),
+        Err(Qwen3ForwardError::KvSnapshotUnsupported)
+    ));
+    let mut resident = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+    resident.prefill_last_logits(&[1, 2, 3]).expect("prefill");
+    for tokens in [0, 4] {
+        assert!(matches!(
+            resident.snapshot_prefix(tokens, 1),
+            Err(Qwen3ForwardError::KvSnapshotUnsupported)
+        ));
+    }
+    assert!(resident.snapshot_prefix(3, 1).is_ok());
+}
