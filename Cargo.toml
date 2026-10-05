@@ -3,6 +3,7 @@ members = [
     "crates/blockfloat",
     "crates/engine",
     "crates/models/deepseek",
+    "crates/models/gemma",
     "crates/models/julia",
     "crates/models/qwen",
     "crates/models/qwen35",

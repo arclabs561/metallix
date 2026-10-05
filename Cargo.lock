@@ -658,6 +658,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gemma"
+version = "0.1.0"
+dependencies = [
+ "minijinja",
+ "minijinja-contrib",
+ "mlx-rs",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
