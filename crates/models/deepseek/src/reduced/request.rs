@@ -20,6 +20,7 @@ use crate::{
         CompressedAttentionPublication, LayerAttentionDiagnostic, LayerAttentionError,
         LayerAttentionLayout, LayerAttentionState, LayerAttentionWeights,
     },
+    engram::embedding::EngramRowSource,
     indexer::{
         cache::IndexKeyPublicationId,
         key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
@@ -688,6 +689,27 @@ enum LayerState {
     RatioOneConsumer(LayerAttentionState),
 }
 
+/// Caller-owned numerical sources for one request step.
+///
+/// `experts[n]` serves model layer `n` (0 is startup, `n` is scheduled layer
+/// `n`); `engram_rows[i]` serves the model's `i`-th Engram definition. An
+/// empty slice or a `None` entry keeps the construction-time table.
+#[derive(Clone, Copy, Default)]
+pub struct StepSources<'a> {
+    pub experts: &'a [Option<&'a dyn RoutedExpertSource>],
+    pub engram_rows: &'a [Option<&'a dyn EngramRowSource>],
+}
+
+impl<'a> StepSources<'a> {
+    fn expert(self, layer: usize) -> Option<&'a dyn RoutedExpertSource> {
+        self.experts.get(layer).copied().flatten()
+    }
+
+    fn engram_rows(self, engram: usize) -> Option<&'a dyn EngramRowSource> {
+        self.engram_rows.get(engram).copied().flatten()
+    }
+}
+
 /// The last ratio-one owner's keys from the previous successful step.
 struct PriorRatioOneKeys {
     publication: IndexKeyPublicationId,
@@ -779,34 +801,34 @@ impl<'a> RequestSession<'a> {
 
     /// Executes a prefill at start zero or one-token decode at the request cursor.
     pub fn step(&mut self, ids: &[i64]) -> Result<RequestStepOutput, RequestError> {
-        self.step_admitting(ids, None)
+        self.step_with_sources(ids, StepSources::default())
     }
 
-    /// Same as [`Self::step`], with each layer's routed experts fetched from a source.
+    /// Same as [`Self::step`], with routed experts and Engram embedding rows
+    /// fetched from caller sources instead of construction-time tables.
     ///
-    /// `experts[n]` serves model layer `n` (0 is startup, `n` is scheduled
-    /// layer `n`); `None` keeps that layer's construction-time expert table.
-    /// The slice must have one entry per model layer.
-    pub fn step_with_experts(
+    /// Each [`StepSources`] slice is either empty (no sources of that kind)
+    /// or has exactly one entry per model layer or Engram definition; a
+    /// mismatch is rejected before admission without poisoning the session.
+    pub fn step_with_sources(
         &mut self,
         ids: &[i64],
-        experts: &[Option<&dyn RoutedExpertSource>],
+        sources: StepSources<'_>,
     ) -> Result<RequestStepOutput, RequestError> {
-        let expected = self.model.layers.len() + 1;
-        if experts.len() != expected {
+        let layers = self.model.layers.len() + 1;
+        if !sources.experts.is_empty() && sources.experts.len() != layers {
             return Err(RequestError::ExpertSourceCount {
-                expected,
-                actual: experts.len(),
+                expected: layers,
+                actual: sources.experts.len(),
             });
         }
-        self.step_admitting(ids, Some(experts))
-    }
-
-    fn step_admitting(
-        &mut self,
-        ids: &[i64],
-        experts: Option<&[Option<&dyn RoutedExpertSource>]>,
-    ) -> Result<RequestStepOutput, RequestError> {
+        let engrams = self.model.engrams.len();
+        if !sources.engram_rows.is_empty() && sources.engram_rows.len() != engrams {
+            return Err(RequestError::EngramRowSourceCount {
+                expected: engrams,
+                actual: sources.engram_rows.len(),
+            });
+        }
         if self.poisoned {
             return Err(RequestError::Poisoned);
         }
@@ -827,7 +849,7 @@ impl<'a> RequestSession<'a> {
             });
         }
         self.poisoned = true;
-        let result = self.step_admitted(ids, end, experts);
+        let result = self.step_admitted(ids, end, sources);
         if result.is_ok() {
             self.poisoned = false;
         }
@@ -842,7 +864,7 @@ impl<'a> RequestSession<'a> {
         &mut self,
         ids: &[i64],
         end: usize,
-        experts: Option<&[Option<&dyn RoutedExpertSource>]>,
+        sources: StepSources<'_>,
     ) -> Result<RequestStepOutput, RequestError> {
         let start = self.next_start;
         let positions = NonZeroUsize::new(ids.len()).expect("nonempty ids");
@@ -851,12 +873,9 @@ impl<'a> RequestSession<'a> {
         let startup_frequencies =
             frequency_span(self.model.startup.frequencies, start, ids.len(), rope_pairs)?;
         let startup_ids = ids_to_u64(ids)?;
-        let startup = self.startup.step_with(
-            start,
-            &startup_ids,
-            startup_frequencies,
-            experts.and_then(|experts| experts[0]),
-        )?;
+        let startup =
+            self.startup
+                .step_with(start, &startup_ids, startup_frequencies, sources.expert(0))?;
         let mut residual = startup.residual().to_vec();
         let mut pre = startup.next_pre().to_vec();
         let partial_group = !completes_ratio_two_group(start, ids.len());
@@ -874,7 +893,15 @@ impl<'a> RequestSession<'a> {
         {
             let engram = engram
                 .as_mut()
-                .map(|engram| engram.step(start, ids, &residual))
+                .map(|engram| {
+                    match definition
+                        .engram
+                        .and_then(|index| sources.engram_rows(index))
+                    {
+                        Some(rows) => engram.step_with(start, ids, &residual, rows),
+                        None => engram.step(start, ids, &residual),
+                    }
+                })
                 .transpose()?;
             let block_residual = engram.as_ref().map_or(&residual[..], |e| e.output());
             let attention_input = attention_inputs(&definition.block, block_residual, &pre)?;
@@ -992,7 +1019,7 @@ impl<'a> RequestSession<'a> {
                 block_residual,
                 attention.final_output(),
                 ids.len(),
-                experts.and_then(|experts| experts[index + 1]),
+                sources.expert(index + 1),
             )?;
             match attention {
                 ScheduledAttentionOutput::RatioTwoOwner(_)
@@ -1355,6 +1382,9 @@ pub enum RequestError {
     /// A per-layer expert-source slice did not have one entry per model layer.
     #[error("request needs {expected} per-layer expert sources, got {actual}")]
     ExpertSourceCount { expected: usize, actual: usize },
+    /// A per-Engram row-source slice did not have one entry per Engram definition.
+    #[error("request needs {expected} per-Engram row sources, got {actual}")]
+    EngramRowSourceCount { expected: usize, actual: usize },
     /// A requested static or dynamic request surface exceeds its bound.
     #[error("request has {elements} tokens beyond the bounded maximum")]
     ElementLimit { elements: usize },

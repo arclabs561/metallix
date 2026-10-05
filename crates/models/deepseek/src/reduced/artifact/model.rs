@@ -1106,29 +1106,115 @@ mod tests {
         }
     }
 
+    /// Lends one Engram definition's embedding rows from the artifact table.
+    struct RowSource<'a> {
+        codes: &'a [u8],
+        scales: &'a [u8],
+        width: usize,
+        calls: std::cell::Cell<usize>,
+        available: bool,
+    }
+
+    impl<'a> RowSource<'a> {
+        fn new(config: &ArtifactConfig, tensors: &'a TensorStore, layer: usize) -> Self {
+            let prefix = format!("layers.{layer}.engram");
+            let rows = config.engram_rows[usize::from(layer == LAYER_THREE)];
+            let width = config.engram_embedding_width;
+            Self {
+                codes: tensors
+                    .u8(&format!("{prefix}.embed.weight"), &[rows, width])
+                    .unwrap(),
+                scales: tensors
+                    .u8(&format!("{prefix}.embed.scale"), &[rows, width / 32])
+                    .unwrap(),
+                width,
+                calls: std::cell::Cell::new(0),
+                available: true,
+            }
+        }
+    }
+
+    impl crate::engram::embedding::EngramRowSource for RowSource<'_> {
+        fn read_rows(
+            &self,
+            rows: &[usize],
+            codes: &mut [u8],
+            scales: &mut [u8],
+        ) -> Result<(), crate::engram::embedding::EngramEmbeddingError> {
+            self.calls.set(self.calls.get() + 1);
+            if !self.available {
+                return Err(
+                    crate::engram::embedding::EngramEmbeddingError::RowsUnavailable {
+                        reason: String::from("withheld by test source"),
+                    },
+                );
+            }
+            let scale_width = self.width / 32;
+            for (index, &row) in rows.iter().enumerate() {
+                codes[index * self.width..(index + 1) * self.width]
+                    .copy_from_slice(&self.codes[row * self.width..(row + 1) * self.width]);
+                scales[index * scale_width..(index + 1) * scale_width]
+                    .copy_from_slice(&self.scales[row * scale_width..(row + 1) * scale_width]);
+            }
+            Ok(())
+        }
+    }
+
     #[test]
-    fn per_layer_expert_sources_reproduce_the_owned_expert_tables() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the equivalence run and each fail-closed source share one model"
+    )]
+    fn step_sources_reproduce_the_owned_expert_and_engram_tables() {
+        use crate::{
+            engram::embedding::EngramRowSource, moe::RoutedExpertSource, reduced::StepSources,
+        };
+
         let artifact = artifact();
         let (config, tensors) = (&artifact.config, &artifact.tensors);
         let ids = ids(config);
-        let sources = [STARTUP_LAYER, LAYER_ONE, LAYER_TWO, LAYER_THREE, LAYER_FOUR]
+        let experts = [STARTUP_LAYER, LAYER_ONE, LAYER_TWO, LAYER_THREE, LAYER_FOUR]
             .map(|layer| TableSource::new(routed(config, tensors, layer).unwrap(), true));
+        let rows = [LAYER_ONE, LAYER_THREE].map(|layer| RowSource::new(config, tensors, layer));
         with_parts(config, tensors, |parts| {
             let model = from_schedule(&parts, reduced_schedule(&parts)).unwrap();
-            // Every model layer, startup included, fetches through a source.
-            let experts: Vec<Option<&dyn crate::moe::RoutedExpertSource>> = sources
+            // Every model layer, startup included, and both Engrams fetch.
+            let expert_refs: Vec<Option<&dyn RoutedExpertSource>> = experts
                 .iter()
-                .map(|source| Some(source as &dyn crate::moe::RoutedExpertSource))
+                .map(|source| Some(source as &dyn RoutedExpertSource))
                 .collect();
+            let row_refs: Vec<Option<&dyn EngramRowSource>> = rows
+                .iter()
+                .map(|source| Some(source as &dyn EngramRowSource))
+                .collect();
+            let sources = StepSources {
+                experts: &expert_refs,
+                engram_rows: &row_refs,
+            };
             let mut owned = RequestSession::new(&model).unwrap();
             let mut fetched = RequestSession::new(&model).unwrap();
 
-            // A malformed slice is rejected before admission.
+            // Malformed slices are rejected before admission.
+            let short_experts = StepSources {
+                experts: &expert_refs[1..],
+                ..sources
+            };
             assert!(matches!(
-                fetched.step_with_experts(&ids[..3], &experts[1..]),
+                fetched.step_with_sources(&ids[..3], short_experts),
                 Err(RequestError::ExpertSourceCount {
                     expected: 5,
                     actual: 4
+                })
+            ));
+            let short_rows = StepSources {
+                engram_rows: &row_refs[1..],
+                ..sources
+            };
+            assert!(matches!(
+                fetched.step_with_sources(&ids[..3], short_rows),
+                Err(RequestError::EngramRowSourceCount {
+                    expected: 2,
+                    actual: 1
                 })
             ));
             assert!(!fetched.is_poisoned());
@@ -1136,39 +1222,57 @@ mod tests {
             let mut chunks = vec![&ids[..3]];
             chunks.extend(ids[3..].chunks(1));
             for chunk in chunks {
-                let calls: Vec<usize> = sources.iter().map(|source| source.calls.get()).collect();
+                let calls: Vec<usize> = experts
+                    .iter()
+                    .map(|source| source.calls.get())
+                    .chain(rows.iter().map(|source| source.calls.get()))
+                    .collect();
                 let left = owned.step(chunk).unwrap();
-                let right = fetched.step_with_experts(chunk, &experts).unwrap();
+                let right = fetched.step_with_sources(chunk, sources).unwrap();
                 assert_eq!(format!("{left:?}"), format!("{right:?}"));
-                for (source, before) in sources.iter().zip(calls) {
-                    assert!(
-                        source.calls.get() > before,
-                        "every layer fetched its experts"
-                    );
+                let after = experts
+                    .iter()
+                    .map(|source| source.calls.get())
+                    .chain(rows.iter().map(|source| source.calls.get()));
+                for (after, before) in after.zip(calls) {
+                    assert!(after > before, "every source was consulted");
                 }
             }
 
+            // A withheld source fails its stage and poisons the session.
+            let fails = |sources| {
+                let mut request = RequestSession::new(&model).unwrap();
+                let error = request.step_with_sources(&ids[..3], sources).unwrap_err();
+                assert!(request.is_poisoned());
+                error
+            };
             let withheld = TableSource::new(routed(config, tensors, LAYER_TWO)?, false);
-            let mut failing = experts.clone();
+            let mut failing = expert_refs.clone();
             failing[2] = Some(&withheld);
-            let mut request = RequestSession::new(&model).unwrap();
-            assert!(matches!(
-                request.step_with_experts(&ids[..3], &failing),
-                Err(RequestError::Tail(_))
-            ));
-            assert!(withheld.calls.get() > 0);
-            assert!(request.is_poisoned());
-
+            let experts_failing = StepSources {
+                experts: &failing,
+                ..sources
+            };
+            assert!(matches!(fails(experts_failing), RequestError::Tail(_)));
             let withheld = TableSource::new(routed(config, tensors, STARTUP_LAYER)?, false);
-            let mut failing = experts.clone();
-            failing[0] = Some(&withheld);
-            let mut request = RequestSession::new(&model).unwrap();
-            assert!(matches!(
-                request.step_with_experts(&ids[..3], &failing),
-                Err(RequestError::Startup(_))
-            ));
+            let mut startup_experts = expert_refs.clone();
+            startup_experts[0] = Some(&withheld);
+            let startup_failing = StepSources {
+                experts: &startup_experts,
+                ..sources
+            };
+            assert!(matches!(fails(startup_failing), RequestError::Startup(_)));
+            let withheld = RowSource {
+                available: false,
+                ..RowSource::new(config, tensors, LAYER_THREE)
+            };
+            let rows_failing = [row_refs[0], Some(&withheld as &dyn EngramRowSource)];
+            let rows_failing = StepSources {
+                engram_rows: &rows_failing,
+                ..sources
+            };
+            assert!(matches!(fails(rows_failing), RequestError::Engram(_)));
             assert!(withheld.calls.get() > 0);
-            assert!(request.is_poisoned());
             Ok(())
         })
         .unwrap();

@@ -45,7 +45,7 @@ pub use request::{
     BlockDefinition, EngramDefinition, LayerFourDefinition, LayerKind, LayerOneDefinition,
     LayerStepOutput, LayerThreeDefinition, RequestError, RequestModel, RequestSession,
     RequestStepOutput, ReusedAttentionDefinition, ScheduleError, ScheduledAttentionOutput,
-    ScheduledLayer, StartupDefinition,
+    ScheduledLayer, StartupDefinition, StepSources,
 };
 mod layer_four;
 pub use candidates::{CandidateProjection, CandidateProjector, CandidateProjectorError};
