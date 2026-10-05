@@ -570,9 +570,12 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "divan",
  "jsonschema",
  "llguidance",
+ "proptest",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 

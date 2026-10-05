@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod benchmark;
+pub mod blocks;
 #[cfg(feature = "structured-output")]
 pub mod constraint;
 pub mod kv;
