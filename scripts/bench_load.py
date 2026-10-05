@@ -15,9 +15,9 @@ as defined by DistServe (Zhong et al., OSDI '24): the highest request rate at
 which at least 90% of requests meet both the TTFT and the TPOT objective.
 
 The harness can start and stop the server under test: `mx serve`, vllm-metal,
-MTPLX or mlx-lm's server, the Python ones from virtual environments under
-.agents/bench-envs/. Every level gets a fresh server, so no level inherits an
-earlier level's prefix cache. Load averages are recorded around every run, because
+MTPLX or mlx-lm's server, the Python ones from the virtual environments in
+--envs. Every level gets a fresh server, so no level inherits an earlier
+level's prefix cache. Load averages are recorded around every run, because
 numbers from a shared machine are hard to read without them.
 
 Usage:
@@ -747,7 +747,7 @@ def server_spec(
             {"mx": str(mx), "mx_revision": args.mx_revision},
         )
     if name == "vllm-metal":
-        env = ENVS / "vllm-metal"
+        env = args.envs / "vllm-metal"
         return ServerSpec(
             name,
             "chat",
@@ -775,7 +775,7 @@ def server_spec(
             env_python_versions(env, ["vllm", "vllm-metal", "mlx", "mlx-lm"]),
         )
     if name == "mtplx":
-        env = ENVS / "mtplx"
+        env = args.envs / "mtplx"
         return ServerSpec(
             name,
             "chat",
@@ -807,7 +807,7 @@ def server_spec(
             env_python_versions(env, ["mtplx", "mlx", "mlx-lm"]),
         )
     if name == "mlx-lm":
-        env = ENVS / "mlx-lm"
+        env = args.envs / "mlx-lm"
         return ServerSpec(
             name,
             "chat",
@@ -1269,6 +1269,13 @@ def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.Argumen
     parser.add_argument("--request-timeout", type=float, default=600)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", type=Path, help="write the full report here")
+    parser.add_argument(
+        "--envs",
+        type=Path,
+        default=ENVS,
+        help="directory holding one virtual environment per Python server, "
+        "named vllm-metal, mtplx and mlx-lm",
+    )
     parser.add_argument("--log-dir", type=Path, default=ENVS / "logs")
     return parser
 
