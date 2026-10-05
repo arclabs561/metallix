@@ -7,6 +7,7 @@
 
 pub mod embedding;
 pub mod gate;
+pub mod inputs;
 
 use thiserror::Error;
 
