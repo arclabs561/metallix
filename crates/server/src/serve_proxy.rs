@@ -2,12 +2,16 @@
 //! its own loopback port, with requests forwarded byte for byte.
 //!
 //! A child owns its model's memory, so stopping it returns that memory to the
-//! system. A child that fails to start or dies makes only its model
-//! unavailable; the front process keeps serving the others.
+//! system. Resident models start with the server; on-demand models start on
+//! their first request, and idle on-demand children are stopped, least
+//! recently used first, to keep declared `memory_mib` within the budget. A
+//! child that fails to start or dies makes only its model unavailable until
+//! a later request starts it again; the front process keeps serving.
 
 use std::{
     io::{self, BufRead, BufReader, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
     process::{Child, Command, ExitCode, Stdio},
     sync::{
         Arc, Mutex,
@@ -15,7 +19,7 @@ use std::{
         mpsc::{Sender, channel},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -24,7 +28,7 @@ use serde_json::{Value, json};
 use crate::{
     http_transport::{Connection, Request, TransportLimits},
     responses::json_response,
-    serve_registry::ServedEntry,
+    serve_registry::{Residency, ServedEntry},
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(300);
@@ -43,47 +47,209 @@ pub(crate) struct ChildSettings {
     pub(crate) generation_timeout_ms: u32,
 }
 
+enum ChildState {
+    Stopped,
+    /// `child` is `None` only for test stand-ins that have no process.
+    Running {
+        child: Option<Child>,
+        address: SocketAddr,
+    },
+}
+
 /// One registered model and the child process serving it.
 struct ChildModel {
     entry: ServedEntry,
-    address: Option<SocketAddr>,
-    process: Mutex<Option<Child>>,
-    unavailable: Mutex<Option<String>>,
+    state: Mutex<ChildState>,
+    last_error: Mutex<Option<String>>,
+    /// Requests that have chosen this model and not yet finished; such a
+    /// child is never stopped to make room.
+    in_flight: AtomicUsize,
+    last_used: Mutex<Instant>,
 }
 
 impl ChildModel {
-    fn unavailable_reason(&self) -> Option<String> {
-        let recorded = self.unavailable.lock().expect("unavailable lock").clone();
-        recorded.or_else(|| {
-            self.address
-                .is_none()
-                .then(|| String::from("model did not start"))
-        })
+    fn new(entry: ServedEntry, state: ChildState) -> Self {
+        Self {
+            entry,
+            state: Mutex::new(state),
+            last_error: Mutex::new(None),
+            in_flight: AtomicUsize::new(0),
+            last_used: Mutex::new(Instant::now()),
+        }
     }
 
-    /// Records why the child cannot serve, including its exit status if it exited.
-    fn mark_unavailable(&self, cause: &str) -> String {
-        let exited = self
-            .process
-            .lock()
-            .expect("process lock")
-            .as_mut()
-            .and_then(|child| child.try_wait().ok().flatten())
-            .map(|status| format!("; child exited with {status}"))
-            .unwrap_or_default();
-        let reason = format!("{cause}{exited}");
+    fn address(&self) -> Option<SocketAddr> {
+        match &*self.state.lock().expect("state lock") {
+            ChildState::Running { address, .. } => Some(*address),
+            ChildState::Stopped => None,
+        }
+    }
+
+    fn record_error(&self, reason: String) -> String {
         eprintln!("mx serve: model {} is unavailable: {reason}", self.entry.id);
-        *self.unavailable.lock().expect("unavailable lock") = Some(reason.clone());
+        *self.last_error.lock().expect("error lock") = Some(reason.clone());
         reason
+    }
+
+    /// Stops a child that failed a request, recording its exit status if it exited.
+    fn fail(&self, cause: &str) -> String {
+        let mut state = self.state.lock().expect("state lock");
+        let exited = match &mut *state {
+            ChildState::Running {
+                child: Some(child), ..
+            } => {
+                let status = child.try_wait().ok().flatten();
+                let _ = child.kill();
+                let _ = child.wait();
+                status.map(|status| format!("; child exited with {status}"))
+            }
+            _ => None,
+        };
+        *state = ChildState::Stopped;
+        drop(state);
+        self.record_error(format!("{cause}{}", exited.unwrap_or_default()))
+    }
+
+    /// Stops this child to free memory if no request is using it.
+    fn stop_if_idle(&self) -> bool {
+        let mut state = self.state.lock().expect("state lock");
+        if self.in_flight.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        if let ChildState::Running {
+            child: Some(child), ..
+        } = &mut *state
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        *state = ChildState::Stopped;
+        true
     }
 }
 
 impl Drop for ChildModel {
     fn drop(&mut self) {
-        if let Some(child) = self.process.get_mut().expect("process lock").as_mut() {
+        if let ChildState::Running {
+            child: Some(child), ..
+        } = self.state.get_mut().expect("state lock")
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// How the front process starts children. Tests run without one.
+struct Launcher {
+    executable: PathBuf,
+    settings: ChildSettings,
+}
+
+struct Pool {
+    models: Vec<Arc<ChildModel>>,
+    launcher: Option<Launcher>,
+    budget_mib: Option<u64>,
+    /// Serializes starting children and choosing which to stop.
+    residency: Mutex<()>,
+}
+
+/// What victim selection needs to know about one model.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    running: bool,
+    evictable: bool,
+    memory_mib: u64,
+    last_used: Instant,
+}
+
+/// Least recently used idle on-demand children to stop so `target` fits.
+fn victims(slots: &[Slot], target: usize, budget_mib: u64) -> Result<Vec<usize>, String> {
+    let mut used: u64 = slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| *index != target && slot.running)
+        .map(|(_, slot)| slot.memory_mib)
+        .sum();
+    let need = slots[target].memory_mib;
+    let mut candidates: Vec<usize> = (0..slots.len())
+        .filter(|&index| index != target && slots[index].running && slots[index].evictable)
+        .collect();
+    candidates.sort_by_key(|&index| slots[index].last_used);
+    let mut chosen = Vec::new();
+    let mut candidates = candidates.into_iter();
+    while used + need > budget_mib {
+        let Some(index) = candidates.next() else {
+            return Err(format!(
+                "the {budget_mib} MiB memory budget is held by resident or busy models ({used} MiB in use, {need} MiB needed)"
+            ));
+        };
+        used -= slots[index].memory_mib;
+        chosen.push(index);
+    }
+    Ok(chosen)
+}
+
+impl Pool {
+    /// The address of `model`'s running child, starting it first if needed.
+    /// The caller has already counted the request in `model.in_flight`.
+    fn acquire(&self, model: &ChildModel) -> Result<SocketAddr, String> {
+        *model.last_used.lock().expect("last-used lock") = Instant::now();
+        if let Some(address) = model.address() {
+            return Ok(address);
+        }
+        let _residency = self.residency.lock().expect("residency lock");
+        if let Some(address) = model.address() {
+            return Ok(address);
+        }
+        self.make_room(model)?;
+        let launcher = self
+            .launcher
+            .as_ref()
+            .ok_or("this server cannot start children")?;
+        let (child, address) =
+            start_and_wait(launcher, &model.entry).map_err(|reason| model.record_error(reason))?;
+        *model.state.lock().expect("state lock") = ChildState::Running {
+            child: Some(child),
+            address,
+        };
+        *model.last_error.lock().expect("error lock") = None;
+        Ok(address)
+    }
+
+    fn make_room(&self, target: &ChildModel) -> Result<(), String> {
+        let Some(budget) = self.budget_mib else {
+            return Ok(());
+        };
+        let slots: Vec<Slot> = self
+            .models
+            .iter()
+            .map(|model| Slot {
+                running: model.address().is_some(),
+                evictable: model.entry.residency == Residency::OnDemand
+                    && model.in_flight.load(Ordering::Acquire) == 0,
+                memory_mib: model.entry.memory_mib.unwrap_or(0),
+                last_used: *model.last_used.lock().expect("last-used lock"),
+            })
+            .collect();
+        let target_index = self
+            .models
+            .iter()
+            .position(|model| std::ptr::eq(model.as_ref(), target))
+            .expect("target is registered");
+        for index in victims(&slots, target_index, budget)? {
+            let victim = &self.models[index];
+            if !victim.stop_if_idle() {
+                return Err(format!("{} became busy while making room", victim.entry.id));
+            }
+            eprintln!(
+                "mx serve: stopped idle model {} to free {} MiB for {}",
+                victim.entry.id,
+                victim.entry.memory_mib.unwrap_or(0),
+                target.entry.id
+            );
+        }
+        Ok(())
     }
 }
 
@@ -91,8 +257,9 @@ pub(crate) fn serve(
     entries: &[ServedEntry],
     address: SocketAddr,
     settings: ChildSettings,
+    budget_mib: Option<u64>,
 ) -> ExitCode {
-    match serve_inner(entries, address, settings) {
+    match serve_inner(entries, address, settings, budget_mib) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mx serve: {error}");
@@ -105,43 +272,71 @@ fn serve_inner(
     entries: &[ServedEntry],
     address: SocketAddr,
     settings: ChildSettings,
+    budget_mib: Option<u64>,
 ) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
     }
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    crate::serve_registry::check_budget(entries, budget_mib)?;
+    let launcher = Launcher {
+        executable: std::env::current_exe().map_err(|error| error.to_string())?,
+        settings,
+    };
+    // Resident children start together; on-demand ones wait for a request.
     let started: Vec<_> = entries
         .iter()
-        .map(|entry| (entry, start_child(&executable, entry, settings)))
+        .map(|entry| {
+            (entry.residency == Residency::Resident).then(|| start_child(&launcher, entry))
+        })
         .collect();
-    let models: Vec<Arc<ChildModel>> = started
-        .into_iter()
-        .map(|(entry, start)| Arc::new(wait_for_child(entry, start)))
+    let models: Vec<Arc<ChildModel>> = entries
+        .iter()
+        .zip(started)
+        .map(|(entry, started)| {
+            let model = ChildModel::new(entry.clone(), ChildState::Stopped);
+            if let Some(started) = started {
+                match wait_for_child(started) {
+                    Ok((child, address)) => {
+                        *model.state.lock().expect("state lock") = ChildState::Running {
+                            child: Some(child),
+                            address,
+                        };
+                    }
+                    Err(reason) => {
+                        model.record_error(reason);
+                    }
+                }
+            }
+            Arc::new(model)
+        })
         .collect();
     let server = TcpListener::bind(address).map_err(|error| error.to_string())?;
     let local = server.local_addr().map_err(|error| error.to_string())?;
-    let available = models
+    let running = models
         .iter()
-        .filter(|model| model.unavailable_reason().is_none())
+        .filter(|model| model.address().is_some())
         .count();
     eprintln!(
-        "mx listening on http://{local}; models={}; available={available}; one child process per model",
+        "mx listening on http://{local}; models={}; running={running}; one child process per model",
         models.len()
     );
-    proxy_models(&server, &models, TransportLimits::default(), None)
+    let pool = Arc::new(Pool {
+        models,
+        launcher: Some(launcher),
+        budget_mib,
+        residency: Mutex::new(()),
+    });
+    proxy_models(&server, &pool, TransportLimits::default(), None)
 }
 
 type Started = Result<(Child, std::sync::mpsc::Receiver<SocketAddr>), String>;
 
 /// Starts a child on an ephemeral loopback port. Its stdin stays open so the
 /// child can exit when this process does.
-fn start_child(
-    executable: &std::path::Path,
-    entry: &ServedEntry,
-    settings: ChildSettings,
-) -> Started {
+fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
+    let settings = launcher.settings;
     let entry_json = serde_json::to_string(entry).map_err(|error| error.to_string())?;
-    let mut child = Command::new(executable)
+    let mut child = Command::new(&launcher.executable)
         .args([
             "serve",
             "--worker-entry",
@@ -181,25 +376,11 @@ fn forward_child_log(id: &str, stderr: impl io::Read, address: &Sender<SocketAdd
     }
 }
 
-fn wait_for_child(entry: &ServedEntry, started: Started) -> ChildModel {
-    let model = |address, process, reason: Option<String>| {
-        if let Some(reason) = &reason {
-            eprintln!("mx serve: model {} is unavailable: {reason}", entry.id);
-        }
-        ChildModel {
-            entry: entry.clone(),
-            address,
-            process: Mutex::new(process),
-            unavailable: Mutex::new(reason),
-        }
-    };
-    let (mut child, receiver) = match started {
-        Ok(started) => started,
-        Err(error) => return model(None, None, Some(error)),
-    };
+fn wait_for_child(started: Started) -> Result<(Child, SocketAddr), String> {
+    let (mut child, receiver) = started?;
     // The log reader drops its sender when the child exits, so this returns early.
     if let Ok(address) = receiver.recv_timeout(START_TIMEOUT) {
-        return model(Some(address), Some(child), None);
+        return Ok((child, address));
     }
     let reason = if let Ok(Some(status)) = child.try_wait() {
         format!("child exited during startup with {status}")
@@ -208,7 +389,12 @@ fn wait_for_child(entry: &ServedEntry, started: Started) -> ChildModel {
         format!("child did not listen within {} s", START_TIMEOUT.as_secs())
     };
     let _ = child.wait();
-    model(None, None, Some(reason))
+    Err(reason)
+}
+
+fn start_and_wait(launcher: &Launcher, entry: &ServedEntry) -> Result<(Child, SocketAddr), String> {
+    eprintln!("mx serve: starting model {}", entry.id);
+    wait_for_child(start_child(launcher, entry))
 }
 
 #[derive(Deserialize)]
@@ -219,7 +405,7 @@ struct Target {
 /// Routes by the request's `model` and forwards it unchanged to that child.
 fn proxy_models(
     server: &TcpListener,
-    models: &[Arc<ChildModel>],
+    pool: &Arc<Pool>,
     limits: TransportLimits,
     request_limit: Option<usize>,
 ) -> Result<(), String> {
@@ -245,10 +431,11 @@ fn proxy_models(
                 continue;
             }
             ("GET", "/v1/models") => {
-                let data: Vec<Value> = models
+                let data: Vec<Value> = pool
+                    .models
                     .iter()
                     .map(|model| {
-                        json!({"id":model.entry.id,"object":"model","owned_by":"local","capabilities":model.entry.kind.capabilities(),"loaded":model.unavailable_reason().is_none()})
+                        json!({"id":model.entry.id,"object":"model","owned_by":"local","capabilities":model.entry.kind.capabilities(),"residency":model.entry.residency,"loaded":model.address().is_some()})
                     })
                     .collect();
                 json_response(connection, 200, &json!({"object":"list","data":data}));
@@ -275,7 +462,7 @@ fn proxy_models(
                 continue;
             }
         };
-        let Some(model) = models.iter().find(|model| model.entry.id == target) else {
+        let Some(model) = pool.models.iter().find(|model| model.entry.id == target) else {
             json_response(
                 connection,
                 404,
@@ -292,11 +479,15 @@ fn proxy_models(
             );
             continue;
         }
+        // Counted before the forward thread runs, so the child cannot be stopped under it.
+        model.in_flight.fetch_add(1, Ordering::AcqRel);
         let model = Arc::clone(model);
+        let pool = Arc::clone(pool);
         let in_flight = Arc::clone(&in_flight);
         forwards.retain(|forward: &thread::JoinHandle<()>| !forward.is_finished());
         forwards.push(thread::spawn(move || {
-            forward(&model, connection, &request, limits);
+            forward(&pool, &model, connection, &request, limits);
+            model.in_flight.fetch_sub(1, Ordering::AcqRel);
             in_flight.fetch_sub(1, Ordering::AcqRel);
         }));
     }
@@ -307,6 +498,7 @@ fn proxy_models(
 }
 
 fn forward(
+    pool: &Pool,
     model: &ChildModel,
     mut connection: Connection,
     request: &Request,
@@ -319,14 +511,14 @@ fn forward(
             &json!({"error":{"code":"model_worker_unavailable","message":format!("model {} is unavailable: {reason}", model.entry.id)}}),
         );
     };
-    if let Some(reason) = model.unavailable_reason() {
-        return unavailable(connection, reason);
-    }
-    let address = model.address.expect("available models have an address");
+    let address = match pool.acquire(model) {
+        Ok(address) => address,
+        Err(reason) => return unavailable(connection, reason),
+    };
     let mut child = match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
         Ok(child) => child,
         Err(error) => {
-            let reason = model.mark_unavailable(&format!("child connection failed: {error}"));
+            let reason = model.fail(&format!("child connection failed: {error}"));
             return unavailable(connection, reason);
         }
     };
@@ -344,7 +536,7 @@ fn forward(
         .and_then(|()| child.write_all(&request.body))
         .and_then(|()| child.shutdown(Shutdown::Write));
     if let Err(error) = sent {
-        let reason = model.mark_unavailable(&format!("child request failed: {error}"));
+        let reason = model.fail(&format!("child request failed: {error}"));
         return unavailable(connection, reason);
     }
     // The child writes one complete HTTP response and closes; pass it through.
@@ -416,16 +608,46 @@ mod tests {
     }
 
     fn model(id: &str, kind: ModelKind, address: Option<SocketAddr>) -> Arc<ChildModel> {
-        Arc::new(ChildModel {
-            entry: ServedEntry {
-                id: id.into(),
-                kind,
-                path: "/unused".into(),
-            },
+        let entry = ServedEntry {
+            id: id.into(),
+            kind,
+            path: "/unused".into(),
+            residency: Residency::Resident,
+            memory_mib: None,
+        };
+        let state = address.map_or(ChildState::Stopped, |address| ChildState::Running {
+            child: None,
             address,
-            process: Mutex::new(None),
-            unavailable: Mutex::new(None),
-        })
+        });
+        Arc::new(ChildModel::new(entry, state))
+    }
+
+    #[test]
+    fn stops_least_recently_used_idle_on_demand_children_to_fit() {
+        let now = Instant::now();
+        let slot = |running, evictable, memory_mib, age_ms| Slot {
+            running,
+            evictable,
+            memory_mib,
+            last_used: now.checked_sub(Duration::from_millis(age_ms)).unwrap(),
+        };
+        // 0: resident 2000; 1: idle on-demand 1000 used 5 ms ago; 2: idle
+        // on-demand 1500 used 9 ms ago; 3: busy on-demand 500; 4: target 1500.
+        let slots = [
+            slot(true, false, 2000, 1),
+            slot(true, true, 1000, 5),
+            slot(true, true, 1500, 9),
+            slot(true, false, 500, 1),
+            slot(false, true, 1500, 0),
+        ];
+        // 5000 running + 1500 needed against 6000: stopping the oldest (2) suffices.
+        assert_eq!(victims(&slots, 4, 6000), Ok(vec![2]));
+        // Against 4500 both idle on-demand children go, oldest first.
+        assert_eq!(victims(&slots, 4, 4500), Ok(vec![2, 1]));
+        // Resident and busy children are never chosen, so 3999 cannot fit.
+        assert!(victims(&slots, 4, 3999).is_err());
+        // A target that already fits stops nothing.
+        assert_eq!(victims(&slots, 4, 6500), Ok(vec![]));
     }
 
     #[test]
@@ -436,15 +658,20 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let models = vec![
-            model("qwen", ModelKind::Qwen, Some(echo)),
-            model("julia", ModelKind::Julia, Some(dead)),
-            model("broken", ModelKind::Julia, None),
-        ];
+        let pool = Arc::new(Pool {
+            models: vec![
+                model("qwen", ModelKind::Qwen, Some(echo)),
+                model("julia", ModelKind::Julia, Some(dead)),
+                model("broken", ModelKind::Julia, None),
+            ],
+            launcher: None,
+            budget_mib: None,
+            residency: Mutex::new(()),
+        });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            proxy_models(&listener, &models, TransportLimits::default(), Some(9))
+            proxy_models(&listener, &pool, TransportLimits::default(), Some(9))
         });
 
         let listed = json(&exchange(address, "GET /v1/models", b"").1);

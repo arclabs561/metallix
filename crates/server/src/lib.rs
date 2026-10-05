@@ -255,6 +255,10 @@ enum Command {
         /// JSON manifest `{"models": [{"id", "kind": "qwen"|"julia", "path"}]}`; all load at startup.
         #[arg(long)]
         registry: Option<PathBuf>,
+        /// Total `memory_mib` that running models may declare; on-demand models
+        /// are stopped, least recently used first, to stay within it.
+        #[arg(long)]
+        memory_budget_mib: Option<u64>,
         /// Internal: serve one registry entry (JSON) in this process as a child.
         #[arg(long, hide = true, conflicts_with_all = ["model", "registry"])]
         worker_entry: Option<String>,
@@ -699,6 +703,7 @@ pub fn run() -> ExitCode {
             model,
             model_id,
             registry,
+            memory_budget_mib,
             worker_entry,
             listen,
             context_tokens,
@@ -728,6 +733,7 @@ pub fn run() -> ExitCode {
                         kv_budget_mib,
                         generation_timeout_ms,
                     },
+                    memory_budget_mib,
                 ),
                 Err(error) => {
                     eprintln!("mx serve: {error}");

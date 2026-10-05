@@ -36,12 +36,27 @@ impl ModelKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Residency {
+    /// Started with the server and never stopped to make room.
+    #[default]
+    Resident,
+    /// Started on first request; stopped when idle to fit the memory budget.
+    OnDemand,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServedEntry {
     pub(crate) id: String,
     pub(crate) kind: ModelKind,
     pub(crate) path: PathBuf,
+    #[serde(default)]
+    pub(crate) residency: Residency,
+    /// Measured process footprint while serving; required with a memory budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_mib: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +80,8 @@ pub(crate) fn entries(
             id: model_id.to_owned(),
             kind: ModelKind::Qwen,
             path: model.to_owned(),
+            residency: Residency::Resident,
+            memory_mib: None,
         });
     }
     if entries.is_empty() {
@@ -79,6 +96,35 @@ pub(crate) fn entries(
         }
     }
     Ok(entries)
+}
+
+/// With a budget, every entry declares `memory_mib`, the resident entries fit
+/// together, and each on-demand entry fits on its own.
+pub(crate) fn check_budget(entries: &[ServedEntry], budget_mib: Option<u64>) -> Result<(), String> {
+    let Some(budget) = budget_mib else {
+        return Ok(());
+    };
+    let mut resident = 0_u64;
+    for entry in entries {
+        let memory = entry
+            .memory_mib
+            .ok_or_else(|| format!("{:?} needs memory_mib under a memory budget", entry.id))?;
+        if memory > budget {
+            return Err(format!(
+                "{:?} needs {memory} MiB, more than the {budget} MiB budget",
+                entry.id
+            ));
+        }
+        if entry.residency == Residency::Resident {
+            resident += memory;
+        }
+    }
+    if resident > budget {
+        return Err(format!(
+            "resident models need {resident} MiB, more than the {budget} MiB budget"
+        ));
+    }
+    Ok(())
 }
 
 fn read_manifest(path: &Path) -> Result<Vec<u8>, String> {
@@ -146,7 +192,9 @@ mod tests {
             [ServedEntry {
                 id: "julia-1".into(),
                 kind: ModelKind::Julia,
-                path: "/j".into()
+                path: "/j".into(),
+                residency: Residency::Resident,
+                memory_mib: None,
             }]
         );
         assert!(!parsed[0].kind.generates());
@@ -178,6 +226,58 @@ mod tests {
             br#"{"models": []", "other": 1}"#,
         ] {
             assert!(parse_manifest(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn budget_requires_measured_entries_that_fit() {
+        let entry = |id: &str, residency, memory_mib| ServedEntry {
+            id: id.into(),
+            kind: ModelKind::Julia,
+            path: "/j".into(),
+            residency,
+            memory_mib,
+        };
+        let parsed = parse_manifest(
+            br#"{"models": [{"id": "x", "kind": "julia", "path": "/j", "residency": "on_demand", "memory_mib": 1300}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed[0], entry("x", Residency::OnDemand, Some(1300)));
+        assert_eq!(
+            parse_manifest(br#"{"models": [{"id": "x", "kind": "julia", "path": "/x"}]}"#).unwrap()
+                [0]
+            .residency,
+            Residency::Resident
+        );
+
+        let resident = entry("r", Residency::Resident, Some(3000));
+        let on_demand = entry("d", Residency::OnDemand, Some(1500));
+        assert!(check_budget(&[entry("x", Residency::Resident, None)], None).is_ok());
+        assert!(check_budget(&[resident.clone(), on_demand.clone()], Some(4000)).is_ok());
+        // On-demand models may together exceed the budget; they take turns.
+        assert!(
+            check_budget(
+                &[
+                    resident.clone(),
+                    on_demand.clone(),
+                    entry("e", Residency::OnDemand, Some(1500))
+                ],
+                Some(4000)
+            )
+            .is_ok()
+        );
+        for (entries, budget) in [
+            (vec![entry("x", Residency::OnDemand, None)], 4000),
+            (vec![entry("x", Residency::OnDemand, Some(4001))], 4000),
+            (
+                vec![
+                    resident.clone(),
+                    entry("s", Residency::Resident, Some(1001)),
+                ],
+                4000,
+            ),
+        ] {
+            assert!(check_budget(&entries, Some(budget)).is_err(), "{entries:?}");
         }
     }
 }
