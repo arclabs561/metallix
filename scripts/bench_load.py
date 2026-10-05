@@ -40,6 +40,7 @@ import math
 import os
 import platform
 import random
+import shlex
 import signal
 import subprocess
 import sys
@@ -51,6 +52,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import bench_serve
+import bench_system
 
 ROOT = Path(__file__).resolve().parent.parent
 ENVS = ROOT / ".agents" / "bench-envs"
@@ -862,6 +864,7 @@ class ManagedServer:
         self.log_path = log_path
         self.started = time.perf_counter()
         self.ready_s: float | None = None
+        self.stop_lock = threading.Lock()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
         self.process = subprocess.Popen(
@@ -892,6 +895,13 @@ class ManagedServer:
         raise RuntimeError(f"{self.spec.name} not ready within {timeout:.0f} s")
 
     def stop(self) -> None:
+        # The load sampler may stop the server from its thread to abort a level.
+        with self.stop_lock:
+            if self.log.closed:
+                return
+            self._stop()
+
+    def _stop(self) -> None:
         # vLLM runs its engine in child processes, so signal the whole group.
         for sig, wait in ((signal.SIGTERM, 20), (signal.SIGKILL, 10)):
             try:
@@ -949,37 +959,56 @@ def measure_level(
             server.wait_ready(args.start_timeout)
             result |= {"ready_s": server.ready_s, "argv": spec.argv, "log": str(log)}
         level_concurrency = int(value) if kind == "concurrency" else 1
-        if warm:
-            run_load(
+        # Warmup is sampled too: memory it allocates stays held for the level.
+        sampler = bench_system.Sampler(
+            pgid=server.process.pid if server else None,
+            abort_load=args.abort_load,
+            on_abort=lambda reason: server.stop() if server else None,
+        )
+        with sampler:
+            if warm:
+                run_load(
+                    address,
+                    spec.api,
+                    args.model_id,
+                    warm,
+                    args.max_tokens,
+                    spec.extra,
+                    concurrency=level_concurrency,
+                    timeout=args.request_timeout,
+                )
+            before = load_average()
+            records, duration = run_load(
                 address,
                 spec.api,
                 args.model_id,
-                warm,
+                prompts,
                 args.max_tokens,
                 spec.extra,
-                concurrency=level_concurrency,
+                concurrency=level_concurrency if kind == "concurrency" else None,
+                rate=value if kind == "rate" else None,
+                seed=args.seed,
                 timeout=args.request_timeout,
             )
-        before = load_average()
-        records, duration = run_load(
-            address,
-            spec.api,
-            args.model_id,
-            prompts,
-            args.max_tokens,
-            spec.extra,
-            concurrency=level_concurrency if kind == "concurrency" else None,
-            rate=value if kind == "rate" else None,
-            seed=args.seed,
-            timeout=args.request_timeout,
-        )
         result |= {
             "load_before": before,
             "load_after": load_average(),
+            "memory": sampler.summary(),
             "summary": summarize(records, duration, args.slo_ttft_ms, args.slo_tpot_ms),
             "records": [asdict(record) for record in records],
         }
-        print(f"  {set_name} {kind}={value}: {one_line(result['summary'])}", flush=True)
+        if sampler.aborted:
+            # Requests cut off by the abort would read as engine failures.
+            result["aborted"] = sampler.aborted
+            del result["summary"]
+            print(
+                f"  {set_name} {kind}={value}: aborted: {sampler.aborted}", flush=True
+            )
+        else:
+            print(
+                f"  {set_name} {kind}={value}: {one_line(result['summary'])}",
+                flush=True,
+            )
     except (RuntimeError, OSError) as error:
         result["error"] = str(error)
         print(f"  {set_name} {kind}={value}: not measured: {error}", flush=True)
@@ -1015,6 +1044,50 @@ def measure_set(name: str, set_name: str, args, count_tokens) -> dict:
     return out
 
 
+def report_cells(servers: list[dict]) -> dict[tuple, dict[str, list[dict]]]:
+    """Records per (set, mode, level) and engine, from a report's server entries."""
+    cells: dict[tuple, dict[str, list[dict]]] = {}
+    for server in servers:
+        for result in server.get("sets", []):
+            for mode, kind, runs in (
+                ("c", "concurrency", result["concurrency"]),
+                ("r", "rate", result["rates"]),
+            ):
+                for run in runs:
+                    if "summary" in run:
+                        key = (result["set"], mode, run[kind])
+                        cells.setdefault(key, {})[server["name"]] = run["records"]
+    return cells
+
+
+def token_count_warnings(cells: dict[tuple, dict[str, list[dict]]]) -> list[str]:
+    """Cells where engines generated different output token counts for the same
+    prompts. Throughput then compares unequal work: an engine that stops early
+    at EOS, or ignores ignore_eos, looks faster than it is."""
+    warnings = []
+    for (set_name, mode, value), by_engine in cells.items():
+        counts = {
+            engine: {
+                r["index"]: r["output_tokens"] for r in records if r["outcome"] == "ok"
+            }
+            for engine, records in by_engine.items()
+        }
+        if len(counts) < 2:
+            continue
+        shared = sorted(set.intersection(*(set(c) for c in counts.values())))
+        differing = [i for i in shared if len({c[i] for c in counts.values()}) > 1]
+        if differing:
+            totals = ", ".join(
+                f"{engine} {sum(c[i] for i in shared)}" for engine, c in counts.items()
+            )
+            warnings.append(
+                f"{set_name} {mode}={value:g}: output tokens differ on "
+                f"{len(differing)}/{len(shared)} prompts completed by every engine "
+                f"(totals: {totals})"
+            )
+    return warnings
+
+
 def fmt(value, digits: int = 0) -> str:
     return "-" if value is None else f"{value:.{digits}f}"
 
@@ -1039,7 +1112,7 @@ def render(report: dict) -> str:
             f"max output {report['max_tokens']} tokens"
         ),
         "",
-        "server      set            load    mode     req/s  out tok/s  TTFT p50/p90/p99 ms   TPOT p50/p90/p99 ms  ok/n   SLO",
+        "server      set            load    mode     req/s  out tok/s  TTFT p50/p90/p99 ms   TPOT p50/p90/p99 ms  ok/n   SLO  mem GiB",
     ]
     for server in report["servers"]:
         if server.get("error"):
@@ -1052,7 +1125,8 @@ def render(report: dict) -> str:
                 if "summary" not in run:
                     lines.append(
                         f"{server['name']:<11} {result['set']:<14} {'':>5}  "
-                        f"{kind}={value:<6g} not measured: {run.get('error')}"
+                        f"{kind}={value:<6g} not measured: "
+                        f"{run.get('error') or run.get('aborted')}"
                     )
                     continue
                 s = run["summary"]
@@ -1062,14 +1136,27 @@ def render(report: dict) -> str:
                     f"{kind}={value:<6g} {s['request_throughput']:>5.2f}  {s['output_token_throughput']:>9.0f}  "
                     f"{fmt(ttft['p50']):>6}/{fmt(ttft['p90']):>6}/{fmt(ttft['p99']):>6}   "
                     f"{fmt(tpot['p50'], 1):>5}/{fmt(tpot['p90'], 1):>5}/{fmt(tpot['p99'], 1):>5}    "
-                    f"{s['outcomes'].get('ok', 0):>2}/{s['requests']:<2}  {s['slo_attainment']:>4.0%}"
+                    f"{s['outcomes'].get('ok', 0):>2}/{s['requests']:<2}  {s['slo_attainment']:>4.0%}  "
+                    f"{fmt(gib(run['memory']['peak_system_used_bytes']), 1):>7}"
                 )
             if "goodput_rps" in result:
                 lines.append(
                     f"{'':<11} {result['set']:<14} goodput {fmt(result['goodput_rps'], 2)} req/s "
                     f"(highest swept rate with >= {ATTAINMENT_GOAL:.0%} SLO attainment)"
                 )
+    lines += [f"warning: {warning}" for warning in report.get("warnings", [])]
     return "\n".join(lines)
+
+
+def gib(value: float | None) -> float | None:
+    return None if value is None else value / 2**30
+
+
+def version_pair(text: str) -> tuple[str, str]:
+    key, sep, value = text.partition("=")
+    if not sep or not key:
+        raise argparse.ArgumentTypeError(f"expected NAME=VERSION, got {text!r}")
+    return key, value
 
 
 def floats(text: str) -> list[float]:
@@ -1081,6 +1168,28 @@ def main() -> int:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--server", help=f"comma-separated, from {', '.join(SERVERS)}")
     target.add_argument("--url", help="an already running server (no start or stop)")
+    parser.add_argument(
+        "--label", default="external", help="engine name for a --url server"
+    )
+    parser.add_argument(
+        "--launch-argv",
+        type=shlex.split,
+        help="how the --url server was started, as one shell-quoted string",
+    )
+    parser.add_argument(
+        "--version",
+        type=version_pair,
+        action="append",
+        default=[],
+        dest="versions",
+        metavar="NAME=VERSION",
+        help="an engine version or commit for a --url server; repeatable",
+    )
+    parser.add_argument(
+        "--abort-load",
+        type=float,
+        help="abort a level when the 1-min load average rises above this",
+    )
     parser.add_argument("--api", choices=("chat", "responses"), default="chat")
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--model-id", default="qwen3-0.6b")
@@ -1160,10 +1269,11 @@ def main() -> int:
             "tpot_ms": args.slo_tpot_ms,
             "attainment": ATTAINMENT_GOAL,
         },
+        "system": bench_system.system_info(),
         "load_before": load_average(),
         "servers": [],
     }
-    names = args.server.split(",") if args.server else ["external"]
+    names = args.server.split(",") if args.server else [args.label]
     for name in names:
         print(f"{name}:", flush=True)
         entry: dict = {"name": name, "prefix_cache": args.prefix_cache}
@@ -1175,7 +1285,10 @@ def main() -> int:
             print(f"  not measured: {error}", flush=True)
             continue
         entry["api"] = spec.api
-        entry["versions"] = spec.versions
+        entry["versions"] = spec.versions | dict(args.versions)
+        if args.url:
+            entry["url"] = args.url
+            entry["launch_argv"] = args.launch_argv
         entry["request_extra"] = spec.extra
         entry["load_before"] = load_average()
         entry["sets"] = [
@@ -1183,6 +1296,7 @@ def main() -> int:
         ]
         entry["load_after"] = load_average()
     report["load_after"] = load_average()
+    report["warnings"] = token_count_warnings(report_cells(report["servers"]))
     print()
     print(render(report))
     if args.json:

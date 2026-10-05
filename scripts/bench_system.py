@@ -1,0 +1,238 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Machine probes for the serving benchmarks: system metadata and a 1 Hz sampler.
+
+The parsers take command output as text so tests can feed them recorded
+output; the probes run macOS tools (`sw_vers`, `vm_stat`, `ioreg`, `ps`).
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import platform
+import re
+import subprocess
+import threading
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Self
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def command_output(argv: list[str], timeout: float = 10) -> str:
+    """Stdout of a probe command, or "" when it is missing or fails."""
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=timeout
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Metadata
+
+
+def parse_sw_vers(text: str) -> dict:
+    """`sw_vers` lines (`ProductVersion:\t26.6.2`) as a dict."""
+    out = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if value.strip():
+            out[key.strip()] = value.strip()
+    return out
+
+
+def lock_versions(lock_text: str, names: tuple[str, ...]) -> dict[str, str]:
+    """Versions of the named packages in a Cargo.lock."""
+    out = {}
+    for block in lock_text.split("[[package]]"):
+        name = re.search(r'^name = "([^"]+)"', block, re.MULTILINE)
+        version = re.search(r'^version = "([^"]+)"', block, re.MULTILINE)
+        if name and version and name.group(1) in names:
+            out[name.group(1)] = version.group(1)
+    return out
+
+
+def bundled_mlx_version(mlx_sys_version: str) -> str | None:
+    """The MLX release mlx-sys fetches at build time, from its CMake file in the
+    Cargo registry (mlx-sys pins it with a FetchContent GIT_TAG)."""
+    home = os.environ.get("CARGO_HOME", str(Path.home() / ".cargo"))
+    pattern = (
+        f"{home}/registry/src/*/mlx-sys-{mlx_sys_version}/src/mlx-c/CMakeLists.txt"
+    )
+    for path in glob.glob(pattern):
+        match = re.search(
+            r"GIT_REPOSITORY\s+\"[^\"]*ml-explore/mlx\.git\"\s+GIT_TAG\s+v?([\w.]+)",
+            Path(path).read_text(),
+        )
+        if match:
+            return match.group(1)
+    return None
+
+
+def metallix_versions(root: Path = ROOT) -> dict:
+    try:
+        lock = (root / "Cargo.lock").read_text()
+    except OSError:
+        return {}
+    out = lock_versions(lock, ("mlx-rs", "mlx-sys"))
+    if "mlx-sys" in out:
+        out["mlx"] = bundled_mlx_version(out["mlx-sys"]) or "unknown"
+    return out
+
+
+def system_info() -> dict:
+    """What a result needs to be read later: OS build, chip, memory, MLX."""
+    sw = parse_sw_vers(command_output(["sw_vers"]))
+    return {
+        "macos": sw.get("ProductVersion"),
+        "macos_build": sw.get("BuildVersion"),
+        "chip": command_output(["sysctl", "-n", "machdep.cpu.brand_string"]).strip(),
+        "memory_bytes": int(command_output(["sysctl", "-n", "hw.memsize"]) or 0),
+        "machine": platform.machine(),
+        "metallix_mlx": metallix_versions(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Memory and GPU
+
+
+def parse_vm_stat(text: str) -> int | None:
+    """Memory in use, in bytes, the way Activity Monitor adds it up: app memory
+    (anonymous minus purgeable pages), wired pages, and the compressor's pages."""
+    page = re.search(r"page size of (\d+) bytes", text)
+    if not page:
+        return None
+    pages = {
+        key.strip().strip('"'): int(value)
+        for key, value in re.findall(r"^([^:\n]+):\s+(\d+)\.", text, re.MULTILINE)
+    }
+    used = (
+        pages.get("Anonymous pages", 0)
+        - pages.get("Pages purgeable", 0)
+        + pages.get("Pages wired down", 0)
+        + pages.get("Pages occupied by compressor", 0)
+    )
+    return used * int(page.group(1))
+
+
+def parse_gpu_stats(text: str) -> dict:
+    """Device utilization (%) and GPU-resident system memory (bytes) from
+    `ioreg -r -c AGXAccelerator -d 1`; None for a field it does not report."""
+
+    def field(name: str) -> int | None:
+        match = re.search(rf'"{re.escape(name)}"=(\d+)', text)
+        return int(match.group(1)) if match else None
+
+    return {
+        "utilization_pct": field("Device Utilization %"),
+        "in_use_bytes": field("In use system memory"),
+    }
+
+
+def group_rss_bytes(ps_text: str, pgid: int) -> int:
+    """Resident memory of every process in one process group, from
+    `ps -axo pid=,pgid=,rss=` (rss in KiB)."""
+    total = 0
+    for line in ps_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == str(pgid) and parts[2].isdigit():
+            total += int(parts[2]) * 1024
+    return total
+
+
+def probe(pgid: int | None) -> dict:
+    """One sample of the quantities the sampler tracks."""
+    gpu = parse_gpu_stats(
+        command_output(["ioreg", "-r", "-c", "AGXAccelerator", "-d", "1"])
+    )
+    return {
+        "load_1m": os.getloadavg()[0],
+        "system_used_bytes": parse_vm_stat(command_output(["vm_stat"])),
+        "gpu_in_use_bytes": gpu["in_use_bytes"],
+        "server_rss_bytes": (
+            group_rss_bytes(command_output(["ps", "-axo", "pid=,pgid=,rss="]), pgid)
+            if pgid is not None
+            else None
+        ),
+    }
+
+
+PEAKS = ("load_1m", "system_used_bytes", "gpu_in_use_bytes", "server_rss_bytes")
+
+
+class Sampler:
+    """Samples memory, GPU memory and load every `interval` seconds on a thread.
+
+    Keeps the peak of each quantity. When `abort_load` is set and the 1-minute
+    load average rises above it, records the reason and calls `on_abort` once.
+    """
+
+    def __init__(
+        self,
+        pgid: int | None = None,
+        interval: float = 1.0,
+        abort_load: float | None = None,
+        on_abort: Callable[[str], None] | None = None,
+        probe: Callable[[int | None], dict] = probe,
+    ):
+        self.pgid = pgid
+        self.interval = interval
+        self.abort_load = abort_load
+        self.on_abort = on_abort
+        self.probe = probe
+        self.samples = 0
+        self.peaks: dict[str, float | None] = dict.fromkeys(PEAKS)
+        self.aborted: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def take(self) -> None:
+        sample = self.probe(self.pgid)
+        self.samples += 1
+        for key in PEAKS:
+            value = sample.get(key)
+            if value is not None and (
+                self.peaks[key] is None or value > self.peaks[key]
+            ):
+                self.peaks[key] = value
+        load = sample.get("load_1m")
+        if (
+            self.abort_load is not None
+            and self.aborted is None
+            and load is not None
+            and load > self.abort_load
+        ):
+            self.aborted = f"1-min load {load:.2f} rose above {self.abort_load:g}"
+            if self.on_abort:
+                self.on_abort(self.aborted)
+
+    def _run(self) -> None:
+        while True:
+            started = time.monotonic()
+            self.take()
+            if self._stop.wait(max(0.0, self.interval - (time.monotonic() - started))):
+                return
+
+    def __enter__(self) -> Self:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def summary(self) -> dict:
+        return {
+            "interval_s": self.interval,
+            "samples": self.samples,
+            **{f"peak_{key}": value for key, value in self.peaks.items()},
+            "aborted": self.aborted,
+        }

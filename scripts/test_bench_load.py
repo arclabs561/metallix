@@ -14,6 +14,7 @@ import pathlib
 import random
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -351,18 +352,19 @@ class Levels(unittest.TestCase):
             "min_requests": 2,
             "requests_per_slot": 1,
             "rate_requests": 2,
+            "abort_load": None,
         }
         return argparse.Namespace(**(values | overrides))
 
-    def test_every_level_starts_its_own_server_and_warms_at_its_concurrency(
-        self,
-    ) -> None:
+    def fakes(self, load: float) -> tuple[list, list]:
+        """Patch servers, requests and machine probes; return (starts, warmups)."""
         started, warmups = [], []
 
         class FakeServer:
             def __init__(self, spec, address, log_path):
                 started.append(spec.argv)
                 self.ready_s = 0.1
+                self.process = argparse.Namespace(pid=4242)
 
             def wait_ready(self, timeout):
                 pass
@@ -373,8 +375,15 @@ class Levels(unittest.TestCase):
         def fake_run_load(address, api, model, prompts, max_tokens, extra, **kw):
             if kw.get("rate") is None and len(prompts) == 3:
                 warmups.append(kw["concurrency"])
+            time.sleep(0.05)  # Long enough for the sampler's first sample.
             records = [record(index=i) for i in range(len(prompts))]
             return records, 1.0
+
+        def fake_probe(pgid):
+            self.assertEqual(pgid, 4242)
+            return {"load_1m": load, "system_used_bytes": 3 * 2**30}
+
+        sampler = bench_load.bench_system.Sampler
 
         spec = bench_load.ServerSpec("vllm-metal", "chat", ["vllm"], {}, {})
         patches = [
@@ -382,10 +391,21 @@ class Levels(unittest.TestCase):
             mock.patch.object(bench_load, "run_load", fake_run_load),
             mock.patch.object(bench_load, "server_spec", lambda *a: spec),
             mock.patch.object(bench_load.bench_serve, "free_address", lambda: "h:1"),
+            mock.patch.object(
+                bench_load.bench_system,
+                "Sampler",
+                lambda **kw: sampler(probe=fake_probe, **kw),
+            ),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
+        return started, warmups
+
+    def test_every_level_starts_its_own_server_and_warms_at_its_concurrency(
+        self,
+    ) -> None:
+        started, warmups = self.fakes(load=1.0)
         count = lambda text: len(text.split())
         out = bench_load.measure_set("vllm-metal", "short", self.args(), count)
         # c=1, c=4 and one rate: three servers, each stopped before the next.
@@ -394,6 +414,19 @@ class Levels(unittest.TestCase):
         self.assertEqual(warmups, [1, 4, 1])
         self.assertTrue(all(run["restarted"] for run in out["concurrency"]))
         self.assertEqual(out["goodput_rps"], 2.0)
+        memory = out["concurrency"][0]["memory"]
+        self.assertEqual(memory["peak_system_used_bytes"], 3 * 2**30)
+        self.assertIsNone(memory["aborted"])
+
+    def test_load_above_the_abort_threshold_stops_the_level(self) -> None:
+        started, _ = self.fakes(load=4.5)
+        args = self.args(concurrency=[2], rates=[], abort_load=4.0)
+        run = bench_load.measure_set("vllm-metal", "short", args, str.split)[
+            "concurrency"
+        ][0]
+        self.assertIn("rose above 4", run["aborted"])
+        self.assertNotIn("summary", run)  # Cut-off requests are not engine failures.
+        self.assertEqual(started.count("stopped"), 2)  # The abort, then cleanup.
 
     def test_prefix_cache_arms_per_server(self) -> None:
         spec = lambda name: bench_load.ServerSpec(name, "chat", [name], {}, {})
@@ -408,6 +441,70 @@ class Levels(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             bench_load.with_prefix_cache(spec("mtplx"), "off")
+
+
+class TokenCounts(unittest.TestCase):
+    @staticmethod
+    def records(counts: list[int | None]) -> list[dict]:
+        return [
+            {
+                "index": i,
+                "outcome": "ok" if n is not None else "http_503",
+                "output_tokens": n,
+            }
+            for i, n in enumerate(counts)
+        ]
+
+    def test_differing_counts_on_shared_prompts_warn(self) -> None:
+        cells = {
+            ("short", "c", 4): {
+                "metallix": self.records([128, 128, 128]),
+                "mlx-lm": self.records([128, 90, None]),
+            }
+        }
+        (warning,) = bench_load.token_count_warnings(cells)
+        self.assertIn("short c=4", warning)
+        # Prompt 2 failed on mlx-lm, so only prompts 0 and 1 compare.
+        self.assertIn("differ on 1/2 prompts", warning)
+        self.assertIn("metallix 256, mlx-lm 218", warning)
+
+    def test_equal_counts_and_single_engines_are_quiet(self) -> None:
+        same = self.records([128, 128])
+        cells = {
+            ("short", "c", 1): {"a": same, "b": same},
+            ("long", "c", 1): {"a": self.records([5])},
+        }
+        self.assertEqual(bench_load.token_count_warnings(cells), [])
+
+    def test_cells_come_from_measured_levels_only(self) -> None:
+        run = {"concurrency": 2, "summary": {}, "records": self.records([1])}
+        servers = [
+            {
+                "name": "a",
+                "sets": [
+                    {
+                        "set": "short",
+                        "concurrency": [run, {"concurrency": 4, "error": "x"}],
+                        "rates": [],
+                    }
+                ],
+            },
+            {"name": "b", "error": "not started"},
+        ]
+        self.assertEqual(
+            bench_load.report_cells(servers), {("short", "c", 2): {"a": run["records"]}}
+        )
+
+
+class Metadata(unittest.TestCase):
+    def test_version_pairs(self) -> None:
+        self.assertEqual(
+            bench_load.version_pair("llama.cpp=7049ff0"), ("llama.cpp", "7049ff0")
+        )
+        self.assertEqual(bench_load.version_pair("a=b=c"), ("a", "b=c"))
+        for bad in ("nover", "=1"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                bench_load.version_pair(bad)
 
 
 if __name__ == "__main__":
