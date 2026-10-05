@@ -892,4 +892,42 @@ mod tests {
                 .contains("readable regular file")
         );
     }
+
+    /// Loads each checkpoint directory in `METALLIX_CHAT_FORMAT_MODELS`
+    /// (colon-separated) and prints what the format selected; load itself
+    /// checks the stop IDs, the template's variables and the BOS encoding.
+    #[test]
+    #[ignore = "requires METALLIX_CHAT_FORMAT_MODELS, local checkpoint directories"]
+    fn local_checkpoints_load_their_chat_format() {
+        let Some(models) = std::env::var_os("METALLIX_CHAT_FORMAT_MODELS") else {
+            eprintln!("skipping: METALLIX_CHAT_FORMAT_MODELS is not set");
+            return;
+        };
+        for model in std::env::split_paths(&models) {
+            let config = read_json(&model, "config.json", 1024 * 1024).expect("config.json");
+            let vocabulary = config["vocab_size"]
+                .as_u64()
+                .or_else(|| config["text_config"]["vocab_size"].as_u64())
+                .and_then(|size| usize::try_from(size).ok())
+                .expect("vocab_size");
+            let format = ChatFormat::load(&model, vocabulary)
+                .unwrap_or_else(|error| panic!("{}: {error}", model.display()));
+            let classes: Vec<_> = format
+                .stops()
+                .iter()
+                .map(|id| (id.get(), format.stops().classify(id)))
+                .collect();
+            let messages = [ChatMessage::text(ChatRole::User, "Hello")];
+            let rendered = format
+                .template()
+                .render(Conversation::new(&messages), true)
+                .expect("renders");
+            let first = format.encode(&rendered).expect("encodes")[0];
+            eprintln!(
+                "{}: {:?} stops={classes:?} first_token={first} prompt={rendered:?}",
+                model.display(),
+                format.turn_format(),
+            );
+        }
+    }
 }
