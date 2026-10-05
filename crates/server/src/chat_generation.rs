@@ -764,12 +764,19 @@ impl ChatSession {
         // A plain greedy turn without logprobs picks each token on the GPU
         // and queues step t + 1 before reading step t back. Every other turn
         // reads the full logit row, which the host picker and logprobs need.
-        let pipelined = request.top_logprobs.is_none() && picker.is_plain_greedy();
+        // The GPU pick has no suppression mask, so a checkpoint that
+        // suppresses tokens reads every row back.
+        let pipelined = request.top_logprobs.is_none()
+            && picker.is_plain_greedy()
+            && !self.format.suppresses_tokens();
         let mut pending = None;
         let mut last_token_at = Instant::now();
 
         for step in 0..max_tokens {
             deadline.check()?;
+            if pending.is_none() {
+                self.format.suppress(&mut logits);
+            }
             let (token, grammar_complete) = match pending.take() {
                 Some(current) => {
                     let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);

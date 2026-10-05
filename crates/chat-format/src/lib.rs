@@ -324,6 +324,8 @@ pub struct ChatFormat {
     template: ChatTemplate,
     turn: TurnFormat,
     stops: StopTokens,
+    /// `suppress_tokens` from `generation_config.json`.
+    suppress: Vec<TokenId>,
     vocabulary_size: usize,
 }
 
@@ -353,6 +355,7 @@ impl ChatFormat {
             .into_iter()
             .collect();
         let stops = StopTokens::from_configs(&config, generation_config.as_ref(), &tool_end)?;
+        let suppress = suppress_tokens(generation_config.as_ref(), vocabulary_size)?;
         for id in stops.iter() {
             let id = i32::try_from(id.get())
                 .map_err(|_| String::from("model EOS token ID does not fit server token IDs"))?;
@@ -365,6 +368,7 @@ impl ChatFormat {
             template,
             turn,
             stops,
+            suppress,
             vocabulary_size,
         };
         format.check_bos()?;
@@ -391,6 +395,30 @@ impl ChatFormat {
     #[must_use]
     pub fn stops(&self) -> &StopTokens {
         &self.stops
+    }
+
+    /// Whether [`ChatFormat::suppress`] masks anything; a device-side pick
+    /// that cannot apply the mask must not be used when it does.
+    #[must_use]
+    pub fn suppresses_tokens(&self) -> bool {
+        !self.suppress.is_empty()
+    }
+
+    /// Masks the checkpoint's `suppress_tokens` out of one step's logits
+    /// before a token is picked, as transformers'
+    /// `SuppressTokensLogitsProcessor` does. The list is per checkpoint:
+    /// gemma-4-12B-it suppresses `<audio|>` and `<image|>`, gemma-4-31B-it
+    /// nothing. A masked logit becomes the lowest finite `f32`, because the
+    /// samplers reject non-finite logits.
+    pub fn suppress(&self, logits: &mut [f32]) {
+        for id in &self.suppress {
+            if let Some(logit) = usize::try_from(id.get())
+                .ok()
+                .and_then(|index| logits.get_mut(index))
+            {
+                *logit = f32::MIN;
+            }
+        }
     }
 
     /// Encodes a rendered prompt exactly as written, as transformers'
@@ -442,6 +470,31 @@ impl ChatFormat {
             )),
         }
     }
+}
+
+/// `suppress_tokens` from `generation_config.json`; each must index a logit.
+fn suppress_tokens(
+    generation_config: Option<&Value>,
+    vocabulary_size: usize,
+) -> Result<Vec<TokenId>, String> {
+    let Some(listed) = generation_config.map(|config| &config["suppress_tokens"]) else {
+        return Ok(Vec::new());
+    };
+    let ids = Option::<Vec<u32>>::deserialize(listed)
+        .map_err(|_| {
+            String::from("local generation_config.json suppress_tokens must be a list of token IDs")
+        })?
+        .unwrap_or_default();
+    if ids.iter().any(|&id| {
+        usize::try_from(id)
+            .ok()
+            .is_none_or(|id| id >= vocabulary_size)
+    }) {
+        return Err(String::from(
+            "local generation_config.json suppress_tokens are outside model vocabulary",
+        ));
+    }
+    Ok(ids.into_iter().map(TokenId::new).collect())
 }
 
 fn read_json(model: &Path, file: &str, maximum_bytes: usize) -> Result<Value, String> {
@@ -832,6 +885,30 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_tokens_come_from_the_checkpoint_and_are_masked() {
+        let format = |generation: Value| {
+            let model = ModelDir::new(
+                &json!({"chat_template": "{{ messages[0].content }}"}),
+                &json!({"eos_token_id": 2}),
+                Some(&generation),
+            );
+            ChatFormat::load(model.path(), VOCABULARY_SIZE)
+        };
+        let mut logits = [1.0_f32; VOCABULARY_SIZE];
+        format(json!({"suppress_tokens": [5, 7]}))
+            .expect("suppress list loads")
+            .suppress(&mut logits);
+        assert_eq!(logits, [1.0, 1.0, 1.0, 1.0, 1.0, f32::MIN, 1.0, f32::MIN]);
+        let mut untouched = [1.0_f32; VOCABULARY_SIZE];
+        format(json!({}))
+            .expect("no suppress list")
+            .suppress(&mut untouched);
+        assert_eq!(untouched, [1.0; VOCABULARY_SIZE]);
+        assert!(format(json!({"suppress_tokens": [8]})).is_err());
+        assert!(format(json!({"suppress_tokens": 5})).is_err());
+    }
+
+    #[test]
     fn external_chat_template_is_accepted_when_config_has_none() {
         let model = ModelDir::new(&json!({}), &json!({}), None);
         fs::write(model.path().join("chat_template.jinja"), b"{{ messages }}")
@@ -924,9 +1001,14 @@ mod tests {
                 .expect("renders");
             let first = format.encode(&rendered).expect("encodes")[0];
             eprintln!(
-                "{}: {:?} stops={classes:?} first_token={first} prompt={rendered:?}",
+                "{}: {:?} stops={classes:?} suppress={:?} first_token={first} prompt={rendered:?}",
                 model.display(),
                 format.turn_format(),
+                format
+                    .suppress
+                    .iter()
+                    .map(|id| id.get())
+                    .collect::<Vec<_>>(),
             );
         }
     }
