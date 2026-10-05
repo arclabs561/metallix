@@ -40,7 +40,7 @@ harness = false
 [[bench]]
 name = "moe_provider"
 harness = false
-# Loads real expert weights when present; keep it out of .
+# Loads real expert weights when present; keep it out of `cargo test --all-targets`.
 test = false
 
 [[bench]]
