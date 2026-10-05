@@ -25,6 +25,7 @@ sha2 = "=0.10.9"
 mlx-rs = { version = "=0.25.3", default-features = false, features = ["metal", "safetensors"] }
 rand_chacha = "=0.9.0"
 rand_core = "=0.9.3"
+tracing = "=0.1.44"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

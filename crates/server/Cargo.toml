@@ -16,8 +16,10 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib", "dep:httparse", "dep:jsonschema", "dep:rustix"]
+metal = ["qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:minijinja", "dep:minijinja-contrib", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys"]
 structured-output = ["dep:engine", "engine/structured-output"]
+# Chrome/Perfetto JSON timeline behind `--trace-out`.
+timeline = ["dep:tracing-chrome"]
 
 [dependencies]
 clap.workspace = true
@@ -36,6 +38,11 @@ minijinja-contrib = { version = "=2.24.0", features = ["pycompat"], optional = t
 httparse = { version = "=1.10.1", optional = true }
 jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 rustix = { version = "=1.1.4", features = ["fs"], optional = true }
+mlx-rs = { workspace = true, optional = true }
+mlx-sys = { version = "=0.2.0", optional = true }
+tracing.workspace = true
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "env-filter", "tracing-log", "ansi"] }
+tracing-chrome = { version = "=0.7.2", optional = true }
 
 [dev-dependencies]
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
