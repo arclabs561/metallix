@@ -854,6 +854,21 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         self.append(&[input_id])
     }
 
+    /// Appends a chunk of one or more prompt tokens to a prefilled sequence
+    /// and returns the chunk's final logits.
+    ///
+    /// This lets a caller prefill a shared token prefix once, fork it, and
+    /// finish each branch's distinct suffix. A chunk attends causally to the
+    /// cached prefix and to its own earlier positions. Logits agree with a
+    /// single prefill of the concatenated tokens up to kernel reduction order,
+    /// not bit-for-bit: MLX may tile the shorter matmuls differently.
+    pub fn extend_last_logits(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
+        if self.cached_tokens == 0 {
+            return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+        }
+        self.append(input_ids)
+    }
+
     /// Creates an independent decoder branch from this fully materialized KV
     /// snapshot. The branch borrows the same weights and owns independent
     /// cache handles; it is safe to discard when a controller or verifier
@@ -869,7 +884,12 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         if self.cache.len() != self.config.hidden_layers || self.cache.iter().any(Option::is_none) {
             return Err(Qwen3ForwardError::CacheInconsistent);
         }
-        let stored_tokens = self.resident_cache_capacity.unwrap_or(self.cached_tokens);
+        // Resident storage holds the stepped tier for the current length, the
+        // same capacity `stepped_cached_kv` allocated for the last append.
+        let stored_tokens = match self.resident_cache_capacity {
+            Some(maximum_capacity) => stepped_capacity(self.cached_tokens, maximum_capacity)?,
+            None => self.cached_tokens,
+        };
         let expected_shape = [
             1,
             as_i32(self.config.key_value_heads)?,
@@ -926,9 +946,6 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             self.cached_tokens,
             self.maximum_context_tokens,
         )?;
-        if self.cached_tokens != 0 && input_ids.len() != 1 {
-            return Err(Qwen3ForwardError::CachedAppendRequiresOneToken);
-        }
 
         let stream = StreamOrDevice::gpu();
         let seq_len =
@@ -1135,30 +1152,37 @@ fn cached_attention<S: BuildHasher>(
             }
         }
     };
+    // A multi-token chunk after cached positions needs a causal mask aligned
+    // to the last key: chunk query i sees the cached keys and its own earlier
+    // chunk positions. MLX 0.25's fused Metal kernel under-masks `Causal` when
+    // that offset is not a multiple of its key block (masking starts at a
+    // block computed from the tile end), so the chunk passes an explicit mask.
+    // A single decode token sees every key and keeps the unmasked kernel.
+    let chunk_mask = if !causal && seq_len > 1 {
+        Some(chunk_causal_mask(rope_offset, seq_len, &stream)?)
+    } else {
+        None
+    };
     let attention_keys = attention_keys.as_ref().unwrap_or(&keys);
     let attention_values = attention_values.as_ref().unwrap_or(&values);
     // Keep KV as dependencies of attention. The final-logits readback evaluates
     // the complete graph, including these retained arrays, in one submission
     // instead of blocking twice per layer. Reset drops all request-owned KV.
-    let output = if causal {
-        fast::scaled_dot_product_attention_device(
-            &query,
-            attention_keys,
-            attention_values,
-            attention_scale(config)?,
-            Some(fast::ScaledDotProductAttentionMask::Causal),
-            &stream,
-        )?
+    let mask = if causal {
+        Some(fast::ScaledDotProductAttentionMask::Causal)
     } else {
-        fast::scaled_dot_product_attention_device(
-            &query,
-            attention_keys,
-            attention_values,
-            attention_scale(config)?,
-            None::<fast::ScaledDotProductAttentionMask<'_>>,
-            &stream,
-        )?
+        chunk_mask
+            .as_ref()
+            .map(fast::ScaledDotProductAttentionMask::Array)
     };
+    let output = fast::scaled_dot_product_attention_device(
+        &query,
+        attention_keys,
+        attention_values,
+        attention_scale(config)?,
+        mask,
+        &stream,
+    )?;
     *cache = Some(Qwen3LayerKv { keys, values });
     let output = output
         .transpose_axes_device(&[0, 2, 1, 3], &stream)?
@@ -1173,6 +1197,23 @@ fn cached_attention<S: BuildHasher>(
             &stream,
         )?;
     linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
+}
+
+/// `[chunk, cached + chunk]` boolean mask letting chunk position `i` (absolute
+/// `cached + i`) attend to every key at or before it.
+fn chunk_causal_mask(
+    cached_tokens: i32,
+    chunk_tokens: i32,
+    stream: &StreamOrDevice,
+) -> Result<Array, Qwen3ForwardError> {
+    let total = cached_tokens
+        .checked_add(chunk_tokens)
+        .ok_or(Qwen3ForwardError::ShapeOverflow)?;
+    let queries = Array::arange_device::<i32, i32>(cached_tokens, total, None, stream)?
+        .reshape_device(&[chunk_tokens, 1], stream)?;
+    let keys = Array::arange_device::<i32, i32>(0, total, None, stream)?
+        .reshape_device(&[1, total], stream)?;
+    queries.ge_device(&keys, stream).map_err(Into::into)
 }
 
 type SteppedKv = (Array, Array, Option<Array>, Option<Array>, bool);
@@ -1792,7 +1833,8 @@ pub enum Qwen3ForwardError {
     /// Decode needs a preceding prefill on this executor.
     #[error("Qwen3 decode requires a populated KV cache")]
     DecodeWithoutPrefill,
-    /// Only decode-sized appends preserve the uncached reference contract.
+    /// Retained for API compatibility; chunked appends are now accepted by
+    /// [`Qwen3ForwardExecutor::extend_last_logits`].
     #[error("Qwen3 cached append requires exactly one token")]
     CachedAppendRequiresOneToken,
     /// The executor's layer cache no longer matches its model contract.
@@ -2325,6 +2367,7 @@ mod tests {
     mod capacity_cache_profile;
     mod decode_profile;
     mod particle_replay;
+    mod prefix_extend;
     mod steering_checkpoint;
 
     #[test]
