@@ -211,6 +211,7 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         sampling: SamplingRequest {
             temperature: request.temperature,
             top_p: request.top_p,
+            top_k: None,
             seed: request.seed,
         },
         top_logprobs: (logprobs || request.top_logprobs.is_some())
@@ -945,6 +946,7 @@ mod tests {
             SamplingRequest {
                 temperature: Some(0.7),
                 top_p: Some(0.9),
+                top_k: None,
                 seed: Some(7)
             }
         );
@@ -1322,6 +1324,7 @@ mod tests {
                     SamplingRequest {
                         temperature: Some(0.5),
                         top_p: Some(0.8),
+                        top_k: None,
                         seed: Some(3)
                     },
                     Some(2),

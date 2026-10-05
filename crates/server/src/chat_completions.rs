@@ -233,6 +233,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         sampling: SamplingRequest {
             temperature: request.temperature,
             top_p: request.top_p,
+            top_k: None,
             seed: request.seed,
         },
         top_logprobs,
@@ -750,6 +751,7 @@ mod tests {
             SamplingRequest {
                 temperature: Some(0.7),
                 top_p: Some(0.9),
+                top_k: None,
                 seed: Some(3)
             }
         );

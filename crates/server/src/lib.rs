@@ -11,6 +11,8 @@ mod admission_queue;
 #[cfg(feature = "metal")]
 mod agent_receipt;
 #[cfg(feature = "metal")]
+mod anthropic_messages;
+#[cfg(feature = "metal")]
 mod chat_cli;
 #[cfg(feature = "metal")]
 mod chat_completions;

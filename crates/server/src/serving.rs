@@ -1913,7 +1913,7 @@ stream.close()
                 &occupied,
                 &alive,
                 Duration::from_secs(2),
-                Some(3),
+                Some(5),
             )
         });
         let (status, completion) = post(
@@ -1937,6 +1937,20 @@ stream.close()
             r#"{"model":"control","input":"hello"}"#,
         );
         assert_eq!((status, &response["object"]), (200, &json!("response")));
+        let (status, message) = post(
+            address,
+            "/v1/messages",
+            r#"{"model":"control","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["content"], json!([{"type":"text","text":"hi"}]));
+        let (status, rejected) = post(
+            address,
+            "/v1/messages",
+            r#"{"model":"control","messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        assert_eq!(status, 400);
+        assert_eq!(rejected["error"]["type"], "invalid_request_error");
         server
             .join()
             .expect("join acceptor")

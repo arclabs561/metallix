@@ -251,6 +251,8 @@ impl<'a> ChatRequest<'a> {
 pub(crate) struct SamplingRequest {
     pub(crate) temperature: Option<f64>,
     pub(crate) top_p: Option<f64>,
+    /// Only the Messages protocol has a `top_k` field.
+    pub(crate) top_k: Option<u32>,
     pub(crate) seed: Option<u64>,
 }
 
@@ -311,6 +313,7 @@ impl SamplingRequest {
     pub(crate) const GREEDY: Self = Self {
         temperature: Some(0.0),
         top_p: None,
+        top_k: None,
         seed: None,
     };
 
@@ -342,10 +345,14 @@ impl SamplingRequest {
             }
             (None, _) => 1.0,
         };
-        let top_k = defaults.top_k.filter(|_| !constrained);
-        if top_k.is_some() {
-            defaults_applied.push("top_k");
-        }
+        let top_k = match (self.top_k, defaults.top_k) {
+            (Some(value), _) => Some(value),
+            (None, Some(value)) if !constrained => {
+                defaults_applied.push("top_k");
+                Some(value)
+            }
+            (None, _) => None,
+        };
         AppliedSampling {
             temperature,
             top_p,
@@ -392,6 +399,9 @@ impl GenerationControls {
                 return Err("top_p must be in (0, 1]".into());
             }
         }
+        if self.sampling.top_k == Some(0) {
+            return Err("top_k must be positive".into());
+        }
         if let Some(top) = self.top_logprobs {
             if top > MAX_TOP_LOGPROBS {
                 return Err(format!("top_logprobs must be 0..={MAX_TOP_LOGPROBS}"));
@@ -413,6 +423,9 @@ impl GenerationControls {
             let greedy = self.sampling.temperature == Some(0.0);
             if !greedy && self.sampling.top_p.is_some_and(|top_p| top_p < 1.0) {
                 return Err("JSON schema output cannot be combined with top_p below 1".into());
+            }
+            if !greedy && self.sampling.top_k.is_some() {
+                return Err("JSON schema output cannot be combined with top_k".into());
             }
         }
         Ok(())
