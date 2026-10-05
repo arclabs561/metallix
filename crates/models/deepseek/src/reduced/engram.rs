@@ -26,6 +26,10 @@ use crate::{
 };
 
 const MAX_SESSION_ELEMENTS: usize = 1 << 20;
+/// Largest owned FP8 WKV weight: the real V4.1 Flash projection,
+/// `[(hc_mult + 1) * dim, columns * embedding_width]` = 25600 x 6144.
+/// An allocation guard for the static weight, not a per-step work limit.
+const MAX_WKV_ELEMENTS: usize = 25_600 * 6_144;
 
 /// Immutable layout and token-compression operands for one batch-one Engram request.
 ///
@@ -100,17 +104,13 @@ impl EngramSessionConfig {
         let wkv_width = wkv_width(copies, width)?;
         // The embedding table is bounded where it is owned (see
         // `validate_weights`); a row-source table may be any size.
-        for (field, elements) in [
-            ("history", capacity),
-            (
-                "WKV weight",
-                checked_product(wkv_width, reduction, "WKV weight")?,
-            ),
-        ] {
-            if elements > MAX_SESSION_ELEMENTS {
-                return Err(EngramSessionError::ElementLimit { field, elements });
-            }
+        if capacity > MAX_SESSION_ELEMENTS {
+            return Err(EngramSessionError::ElementLimit {
+                field: "history",
+                elements: capacity,
+            });
         }
+        wkv_weight_elements(wkv_width, reduction, "WKV weight")?;
         Ok(Self {
             hash_layout,
             token_map: token_map.into(),
@@ -581,7 +581,7 @@ fn validate_weights(
     let columns = hash_columns(&config.hash_layout)?;
     let reduction = checked_product(columns, config.embedding_width, "WKV reduction")?;
     let outputs = wkv_width(config.copies, config.width)?;
-    let wkv_elements = checked_product(outputs, reduction, "WKV weights")?;
+    let wkv_elements = wkv_weight_elements(outputs, reduction, "WKV weights")?;
     let wkv_scale_elements = checked_product(outputs.div_ceil(32), reduction / 32, "WKV scales")?;
     let gate_elements = checked_product(config.copies, config.width, "gate weights")?;
     if let Some((codes, scales)) = &weights.embedding {
@@ -708,6 +708,18 @@ fn checked_product(
     }
 }
 
+fn wkv_weight_elements(
+    outputs: usize,
+    reduction: usize,
+    field: &'static str,
+) -> Result<usize, EngramSessionError> {
+    match outputs.checked_mul(reduction) {
+        Some(elements) if elements <= MAX_WKV_ELEMENTS => Ok(elements),
+        Some(elements) => Err(EngramSessionError::ElementLimit { field, elements }),
+        None => Err(EngramSessionError::ShapeOverflow { field }),
+    }
+}
+
 fn reserved_vec<T>(elements: usize, field: &'static str) -> Result<Vec<T>, EngramSessionError> {
     if elements > MAX_SESSION_ELEMENTS {
         return Err(EngramSessionError::ElementLimit { field, elements });
@@ -815,8 +827,40 @@ fn select_hash_column(
 mod tests {
     use std::sync::Arc;
 
-    use super::{EngramSession, EngramSessionConfig, EngramSessionWeights};
+    use super::{EngramSession, EngramSessionConfig, EngramSessionError, EngramSessionWeights};
     use crate::engram::EngramHashLayout;
+
+    /// A config with V4.1 Flash Engram geometry (4-grams, 8 heads, 256-wide
+    /// rows, 4 HC copies) at hidden width `width`.
+    fn v41_config(width: usize) -> Result<EngramSessionConfig, EngramSessionError> {
+        let hash_layout = EngramHashLayout::new(4, 8, 1, 2, vec![3; 24], vec![0; 24], vec![1; 4])
+            .expect("hash layout");
+        EngramSessionConfig::new(
+            hash_layout,
+            vec![0, 1],
+            0,
+            128,
+            4,
+            width,
+            384_006_168,
+            256,
+            1e-20,
+            1e-6,
+        )
+    }
+
+    #[test]
+    fn wkv_cap_admits_the_real_v41_projection_and_nothing_larger() {
+        // (4 + 1) * 5120 = 25600 outputs over 24 * 256 = 6144 reductions.
+        v41_config(5120).expect("real V4.1 WKV weight");
+        assert!(matches!(
+            v41_config(5152),
+            Err(EngramSessionError::ElementLimit {
+                field: "WKV weight",
+                elements: 158_269_440,
+            })
+        ));
+    }
 
     #[test]
     fn sessions_share_definition_operands_instead_of_copying_them() {

@@ -1500,8 +1500,7 @@ mod tests {
         )
         .expect("non-expert layers");
 
-        // HOOK(engram-cap): `EngramSessionConfig::new` caps the WKV weight at
-        // 2^20 elements; the real one is 25600 x 6144.
+        // The real layer-1 Engram config and weights build a session.
         if layers > 1 {
             let inputs = crate::engram::inputs::EngramHashInputs::parse(
                 &std::fs::read(root.join("engram-hash/v41-engram-inputs.bin"))
@@ -1509,8 +1508,11 @@ mod tests {
                 &crate::engram::inputs::V41_ENGRAM_INPUTS_IDENTITY,
             )
             .expect("pinned Engram inputs");
-            let blocker = weights.engram_parts(0, &inputs).expect_err("still blocked");
-            assert!(blocker.to_string().contains("WKV weight"), "{blocker}");
+            let (engram_config, engram_weights) = weights
+                .engram_parts(0, &inputs)
+                .expect("layer-1 Engram parts");
+            crate::reduced::EngramSession::new(engram_config, engram_weights)
+                .expect("layer-1 Engram session");
         }
 
         let cache = Mutex::new(cache);
