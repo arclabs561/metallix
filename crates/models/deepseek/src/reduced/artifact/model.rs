@@ -136,6 +136,47 @@ pub(super) fn with_request_model<T>(
     head_execution: FinalHeadExecution,
     body: impl FnOnce(&RequestModel<'_>) -> Result<T, ArtifactError>,
 ) -> Result<T, ArtifactError> {
+    with_parts(config, tensors, |parts| {
+        let model = RequestModel::new(
+            parts.startup,
+            parts.blocks,
+            parts.engrams,
+            parts.layer_one,
+            parts.layer_two,
+            parts.layer_three,
+            parts.layer_four,
+            parts.head,
+            parts.frequencies,
+            parts.max_tokens,
+        )
+        .map_err(ArtifactError::from)?
+        .with_score_execution(execution)
+        .with_key_preparation_execution(key_preparation_execution)
+        .with_head_execution(head_execution);
+        body(&model)
+    })
+}
+
+/// Decoded immutable operands of the fixed five-block request.
+pub(super) struct Parts<'a> {
+    pub(super) startup: StartupDefinition<'a>,
+    pub(super) blocks: [BlockDefinition<'a>; 4],
+    pub(super) engrams: [EngramDefinition; 2],
+    pub(super) layer_one: LayerOneDefinition<'a>,
+    pub(super) layer_two: ReusedAttentionDefinition<'a>,
+    pub(super) layer_three: LayerThreeDefinition<'a>,
+    pub(super) layer_four: LayerFourDefinition<'a>,
+    pub(super) head: FinalHead<'a>,
+    pub(super) frequencies: &'a [RotaryFrequency],
+    pub(super) max_tokens: NonZeroUsize,
+}
+
+/// Lends every decoded operand while the callback assembles a request model.
+pub(super) fn with_parts<T>(
+    config: &ArtifactConfig,
+    tensors: &TensorStore,
+    body: impl FnOnce(Parts<'_>) -> Result<T, ArtifactError>,
+) -> Result<T, ArtifactError> {
     let startup_frequencies = frequencies(config, tensors, "rotary.startup")?;
     let shared_frequencies = frequencies(config, tensors, "rotary.shared")?;
     let routed_zero = routed(config, tensors, STARTUP_LAYER)?;
@@ -190,7 +231,7 @@ pub(super) fn with_request_model<T>(
         config.norm_epsilon,
     )
     .map_err(invalid)?;
-    let model = RequestModel::new(
+    body(Parts {
         startup,
         blocks,
         engrams,
@@ -199,14 +240,9 @@ pub(super) fn with_request_model<T>(
         layer_three,
         layer_four,
         head,
-        &shared_frequencies,
-        nonzero(config.max_tokens)?,
-    )
-    .map_err(ArtifactError::from)?
-    .with_score_execution(execution)
-    .with_key_preparation_execution(key_preparation_execution)
-    .with_head_execution(head_execution);
-    body(&model)
+        frequencies: &shared_frequencies,
+        max_tokens: nonzero(config.max_tokens)?,
+    })
 }
 
 /// Builds and runs the fixed five-block synthetic request over supplied IDs.
@@ -804,4 +840,291 @@ fn nonzero(value: usize) -> Result<NonZeroUsize, ArtifactError> {
 
 fn invalid(error: impl std::fmt::Display) -> ArtifactError {
     ArtifactError::Invalid(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::Path, process::Command};
+
+    use super::*;
+    use crate::reduced::{
+        LayerKind, RequestError, ScheduleError, ScheduledAttentionOutput, ScheduledLayer,
+        artifact::ReducedArtifact,
+    };
+
+    fn artifact() -> ReducedArtifact {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let output = Command::new("python3")
+            .arg(root.join("scripts/export_v41_reduced_artifact.py"))
+            .arg("--source")
+            .arg(root.join("fixtures/deepseek-v41/reduced-runner-reference.json"))
+            .args(["--output", "-"])
+            .output()
+            .expect("repository Python exporter launches");
+        assert!(
+            output.status.success(),
+            "exporter failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ReducedArtifact::parse(&output.stdout).expect("exported artifact parses")
+    }
+
+    /// A prefill of three, then decodes through an incomplete ratio-two group.
+    fn ids(config: &ArtifactConfig) -> Vec<i64> {
+        assert!(
+            config.max_tokens >= 5,
+            "decode must reach an incomplete group"
+        );
+        (0..config.max_tokens.min(7))
+            .map(|index| i64::try_from((index * 7 + 1) % config.vocabulary).unwrap())
+            .collect()
+    }
+
+    fn run(model: &RequestModel<'_>, ids: &[i64]) -> Vec<RequestStepOutput> {
+        let mut request = RequestSession::new(model).unwrap();
+        let mut outputs = vec![request.step(&ids[..3]).unwrap()];
+        for id in &ids[3..] {
+            outputs.push(request.step(std::slice::from_ref(id)).unwrap());
+        }
+        request.restart().unwrap();
+        let mut rerun = vec![request.step(&ids[..3]).unwrap()];
+        for id in &ids[3..] {
+            rerun.push(request.step(std::slice::from_ref(id)).unwrap());
+        }
+        assert_eq!(
+            format!("{outputs:?}"),
+            format!("{rerun:?}"),
+            "restart is pristine"
+        );
+        outputs
+    }
+
+    fn reduced_schedule<'a>(parts: &Parts<'a>) -> Vec<ScheduledLayer<'a>> {
+        let [one, two, three, four] = parts.blocks;
+        vec![
+            ScheduledLayer::new(LayerKind::RatioTwoOwner(parts.layer_one), one).with_engram(0),
+            ScheduledLayer::new(LayerKind::RatioTwoConsumer(parts.layer_two), two),
+            ScheduledLayer::new(LayerKind::RatioOneOwner(parts.layer_three), three).with_engram(1),
+            ScheduledLayer::new(LayerKind::RatioOneIndexer(parts.layer_four), four),
+        ]
+    }
+
+    fn from_schedule<'a>(
+        parts: &Parts<'a>,
+        layers: Vec<ScheduledLayer<'a>>,
+    ) -> Result<RequestModel<'a>, RequestError> {
+        RequestModel::from_schedule(
+            parts.startup,
+            layers,
+            parts.engrams.to_vec(),
+            parts.head,
+            parts.frequencies,
+            parts.max_tokens,
+        )
+    }
+
+    #[test]
+    fn reduced_schedule_constructor_matches_fixed_constructor_bitwise() {
+        let artifact = artifact();
+        let ids = ids(&artifact.config);
+        with_parts(&artifact.config, &artifact.tensors, |parts| {
+            let fixed = RequestModel::new(
+                parts.startup,
+                parts.blocks,
+                parts.engrams.clone(),
+                parts.layer_one,
+                parts.layer_two,
+                parts.layer_three,
+                parts.layer_four,
+                parts.head,
+                parts.frequencies,
+                parts.max_tokens,
+            )
+            .unwrap();
+            let scheduled = from_schedule(&parts, reduced_schedule(&parts)).unwrap();
+            let (fixed, scheduled) = (run(&fixed, &ids), run(&scheduled, &ids));
+            assert_eq!(fixed.len(), ids.len() - 2);
+            for (fixed, scheduled) in fixed.iter().zip(&scheduled) {
+                assert_eq!(format!("{fixed:?}"), format!("{scheduled:?}"));
+                for (left, right) in fixed.heads().iter().zip(scheduled.heads()) {
+                    assert!(
+                        left.logits()
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .eq(right.logits().iter().map(|value| value.to_bits()))
+                    );
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn window_only_and_ratio_one_consumer_layers_extend_the_reduced_schedule() {
+        let artifact = artifact();
+        let (config, tensors) = (&artifact.config, &artifact.tensors);
+        let ids = ids(config);
+        with_parts(config, tensors, |parts| {
+            let mut layers = reduced_schedule(&parts);
+            // Layer 5 is window-only between the ratio-one owner and its
+            // consumer at layer 6, which must still borrow L3's KV and L4's indices.
+            layers.push(ScheduledLayer::new(
+                LayerKind::WindowOnly(ReusedAttentionDefinition::new(
+                    attention_layout(config, None)?,
+                    attention_weights(config, tensors, LAYER_ONE)?,
+                )),
+                parts.blocks[0],
+            ));
+            layers.push(ScheduledLayer::new(
+                LayerKind::RatioOneConsumer(ReusedAttentionDefinition::new(
+                    attention_layout(config, Some((3, 1)))?,
+                    attention_weights(config, tensors, LAYER_TWO)?,
+                )),
+                parts.blocks[1],
+            ));
+            let extended = run(&from_schedule(&parts, layers).unwrap(), &ids);
+            let reduced = run(
+                &from_schedule(&parts, reduced_schedule(&parts)).unwrap(),
+                &ids,
+            );
+            for (extended, reduced) in extended.iter().zip(&reduced) {
+                assert_eq!(extended.layers().len(), 6);
+                assert_eq!(
+                    format!("{:?}", &extended.layers()[..4]),
+                    format!("{:?}", reduced.layers()),
+                    "appended layers leave the producers they read untouched"
+                );
+                assert!(matches!(
+                    extended.layers()[4].attention(),
+                    ScheduledAttentionOutput::WindowOnly(_)
+                ));
+                assert!(matches!(
+                    extended.layers()[5].attention(),
+                    ScheduledAttentionOutput::RatioOneConsumer(_)
+                ));
+                assert_ne!(extended.residual(), reduced.residual());
+                assert!(
+                    extended
+                        .heads()
+                        .iter()
+                        .all(|head| head.logits().iter().all(|value| value.is_finite()))
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one rejection case per schedule error stays in one table"
+    )]
+    fn invalid_schedules_are_rejected_before_allocation() {
+        let artifact = artifact();
+        let (config, tensors) = (&artifact.config, &artifact.tensors);
+        with_parts(config, tensors, |parts| {
+            let [one, two, three, four] = parts.blocks;
+            let window = ReusedAttentionDefinition::new(
+                attention_layout(config, None)?,
+                attention_weights(config, tensors, LAYER_TWO)?,
+            );
+            let reject = |layers: Vec<ScheduledLayer<'_>>| match from_schedule(&parts, layers) {
+                Err(RequestError::Schedule { layer, reason }) => (layer, reason),
+                other => panic!("expected a schedule rejection, got {other:?}"),
+            };
+            let owner_two = ScheduledLayer::new(LayerKind::RatioTwoOwner(parts.layer_one), one);
+            let consumer_two =
+                ScheduledLayer::new(LayerKind::RatioTwoConsumer(parts.layer_two), two);
+            let owner_one = ScheduledLayer::new(LayerKind::RatioOneOwner(parts.layer_three), three);
+            let indexer = ScheduledLayer::new(LayerKind::RatioOneIndexer(parts.layer_four), four);
+
+            assert_eq!(
+                reject(vec![consumer_two]),
+                (
+                    1,
+                    ScheduleError::MissingProducer {
+                        source_layer: 1,
+                        ratio: 2
+                    }
+                )
+            );
+            assert_eq!(
+                reject(vec![owner_two, consumer_two, indexer]),
+                (
+                    3,
+                    ScheduleError::MissingProducer {
+                        source_layer: 3,
+                        ratio: 1
+                    }
+                )
+            );
+            assert_eq!(
+                reject(vec![owner_two, owner_one]),
+                (
+                    2,
+                    ScheduleError::OwnerSource {
+                        expected: 2,
+                        actual: 3
+                    }
+                )
+            );
+            assert_eq!(
+                reject(vec![
+                    owner_two,
+                    consumer_two,
+                    owner_one,
+                    indexer,
+                    consumer_two
+                ]),
+                (5, ScheduleError::RatioOrder)
+            );
+            assert_eq!(
+                reject(vec![owner_two, consumer_two]),
+                (2, ScheduleError::MissingRatioOneOwner)
+            );
+            assert_eq!(
+                reject(vec![owner_two.with_engram(2)]),
+                (
+                    1,
+                    ScheduleError::EngramIndex {
+                        index: 2,
+                        available: 2
+                    }
+                )
+            );
+            assert_eq!(
+                reject(vec![ScheduledLayer::new(
+                    LayerKind::WindowOnly(parts.layer_two),
+                    one
+                )]),
+                (1, ScheduleError::WindowLayoutCompressed)
+            );
+            assert_eq!(
+                reject(vec![
+                    owner_two,
+                    ScheduledLayer::new(LayerKind::RatioTwoConsumer(window), two)
+                ]),
+                (2, ScheduleError::MissingCompression)
+            );
+            assert_eq!(
+                reject(vec![
+                    owner_two,
+                    consumer_two,
+                    owner_one,
+                    ScheduledLayer::new(LayerKind::RatioOneConsumer(parts.layer_two), four),
+                ]),
+                (
+                    4,
+                    ScheduleError::CompressionRatio {
+                        expected: 1,
+                        actual: 2
+                    }
+                )
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 }

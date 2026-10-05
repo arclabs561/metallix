@@ -1,8 +1,14 @@
-//! Fixed five-block reduced request composition over live numerical operands.
+//! V4.1-shaped request composition over live numerical operands.
 //!
-//! This module is deliberately a single V4.1-shaped path: startup, Engram,
-//! L1, L2, Engram, L3, L4, and final head. It has no checkpoint loader,
-//! fixture decoder, callback graph, or generic scheduler.
+//! A request is startup, a validated list of typed layers, and the final head.
+//! Each layer is one of six fixed kinds (window-only, ratio-two owner or
+//! consumer, ratio-one owner, candidate indexer or consumer) with an optional
+//! Engram before its block. [`RequestSession::step`] walks that list in one
+//! visible loop; consumers borrow the latest same-step publication of the
+//! producer their attention layout names. The reduced five-block fixture and
+//! the 40-layer checkpoint schedule are two lists of the same kinds. This
+//! module has no checkpoint loader, fixture decoder, callback graph, or
+//! general graph interpreter.
 
 use std::num::NonZeroUsize;
 
@@ -201,9 +207,14 @@ impl<'a> LayerThreeDefinition<'a> {
         self,
         key_preparation_execution: IndexKeyPreparationExecution,
     ) -> Result<LayerThreeSession, RequestError> {
+        let source_layer = self
+            .config
+            .attention_layout()
+            .compression()
+            .map_or(0, |(source, _)| source);
         Ok(LayerThreeSession::new(
             self.config,
-            3,
+            source_layer,
             self.compressor_norm,
             self.compressor_epsilon,
         )?
@@ -239,7 +250,10 @@ impl<'a> LayerFourDefinition<'a> {
     }
 }
 
-/// Immutable L2 attention operands which reuse the live L1 publication.
+/// Immutable attention operands for a layer which owns no compressed state.
+///
+/// A compressed layout makes this a consumer of the latest publication from
+/// its layout's source layer; a window-only layout makes it a window-only layer.
 #[derive(Clone, Copy, Debug)]
 pub struct ReusedAttentionDefinition<'a> {
     layout: LayerAttentionLayout,
@@ -247,23 +261,85 @@ pub struct ReusedAttentionDefinition<'a> {
 }
 
 impl<'a> ReusedAttentionDefinition<'a> {
-    /// Groups L2 attention layout and weights for live L1 publication reuse.
+    /// Groups one non-owning layer's attention layout and weights.
     #[must_use]
     pub const fn new(layout: LayerAttentionLayout, weights: LayerAttentionWeights<'a>) -> Self {
         Self { layout, weights }
     }
 }
 
-/// One fixed five-block reduced runtime model definition.
+/// The attention role of one scheduled layer.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum LayerKind<'a> {
+    /// Sliding-window attention only (`compress_ratio` 0 after startup).
+    WindowOnly(ReusedAttentionDefinition<'a>),
+    /// Ratio-two compressed-KV owner with its own direct indexer.
+    RatioTwoOwner(LayerOneDefinition<'a>),
+    /// Ratio-two attention over the latest ratio-two owner's KV and indices.
+    RatioTwoConsumer(ReusedAttentionDefinition<'a>),
+    /// Ratio-one compressed-KV owner and candidate-block source.
+    RatioOneOwner(LayerThreeDefinition<'a>),
+    /// Ratio-one indexer scoring inside the owner's candidate blocks.
+    RatioOneIndexer(LayerFourDefinition<'a>),
+    /// Ratio-one attention over the owner's KV and the latest ratio-one indices.
+    RatioOneConsumer(ReusedAttentionDefinition<'a>),
+}
+
+impl LayerKind<'_> {
+    fn attention_layout(&self) -> LayerAttentionLayout {
+        match self {
+            Self::WindowOnly(definition)
+            | Self::RatioTwoConsumer(definition)
+            | Self::RatioOneConsumer(definition) => definition.layout,
+            Self::RatioTwoOwner(definition) => definition.config.attention_layout(),
+            Self::RatioOneOwner(definition) => definition.config.attention_layout(),
+            Self::RatioOneIndexer(definition) => definition.config.attention_layout(),
+        }
+    }
+
+    const fn ratio(&self) -> usize {
+        match self {
+            Self::WindowOnly(_) => 0,
+            Self::RatioTwoOwner(_) | Self::RatioTwoConsumer(_) => 2,
+            Self::RatioOneOwner(_) | Self::RatioOneIndexer(_) | Self::RatioOneConsumer(_) => 1,
+        }
+    }
+}
+
+/// One numbered layer after startup: its kind, block operands, and optional Engram.
+#[derive(Clone, Copy, Debug)]
+pub struct ScheduledLayer<'a> {
+    kind: LayerKind<'a>,
+    block: BlockDefinition<'a>,
+    engram: Option<usize>,
+}
+
+impl<'a> ScheduledLayer<'a> {
+    /// Groups one layer's attention kind with its HC input and tail operands.
+    #[must_use]
+    pub const fn new(kind: LayerKind<'a>, block: BlockDefinition<'a>) -> Self {
+        Self {
+            kind,
+            block,
+            engram: None,
+        }
+    }
+
+    /// Applies the model's `engram`-th Engram definition before this block.
+    #[must_use]
+    pub const fn with_engram(mut self, engram: usize) -> Self {
+        self.engram = Some(engram);
+        self
+    }
+}
+
+/// One checkpoint-defined runtime model: startup, scheduled layers, and head.
 #[derive(Clone, Debug)]
 pub struct RequestModel<'a> {
     startup: StartupDefinition<'a>,
-    blocks: [BlockDefinition<'a>; 4],
-    engrams: [EngramDefinition; 2],
-    layer_one: LayerOneDefinition<'a>,
-    layer_two: ReusedAttentionDefinition<'a>,
-    layer_three: LayerThreeDefinition<'a>,
-    layer_four: LayerFourDefinition<'a>,
+    layers: Vec<ScheduledLayer<'a>>,
+    engrams: Vec<EngramDefinition>,
     head: FinalHead<'a>,
     frequencies: &'a [RotaryFrequency],
     max_tokens: NonZeroUsize,
@@ -272,7 +348,11 @@ pub struct RequestModel<'a> {
 }
 
 impl<'a> RequestModel<'a> {
-    /// Validates immutable operands for the fixed five-block request path.
+    /// Validates immutable operands for the reduced five-block schedule.
+    ///
+    /// This is [`Self::from_schedule`] over startup, Engram, L1 ratio-two
+    /// owner, L2 ratio-two consumer, Engram, L3 ratio-one owner, and L4
+    /// candidate indexer.
     #[allow(
         clippy::too_many_arguments,
         reason = "the fixed numbered block definitions are explicit"
@@ -289,14 +369,51 @@ impl<'a> RequestModel<'a> {
         frequencies: &'a [RotaryFrequency],
         max_tokens: NonZeroUsize,
     ) -> Result<Self, RequestError> {
+        let compression = |layout: LayerAttentionLayout| {
+            layout
+                .compression()
+                .map(|(source, ratio)| (source, ratio.get()))
+        };
+        if compression(layer_two.layout) != compression(layer_one.config.attention_layout()) {
+            return Err(RequestError::LayerTwoGeometry);
+        }
+        let [one, two, three, four] = blocks;
+        Self::from_schedule(
+            startup,
+            vec![
+                ScheduledLayer::new(LayerKind::RatioTwoOwner(layer_one), one).with_engram(0),
+                ScheduledLayer::new(LayerKind::RatioTwoConsumer(layer_two), two),
+                ScheduledLayer::new(LayerKind::RatioOneOwner(layer_three), three).with_engram(1),
+                ScheduledLayer::new(LayerKind::RatioOneIndexer(layer_four), four),
+            ],
+            engrams.into(),
+            head,
+            frequencies,
+            max_tokens,
+        )
+    }
+
+    /// Validates a layer schedule before any request state is allocated.
+    ///
+    /// `layers[i]` is model layer `i + 1`. An owner must publish under its own
+    /// layer number; a consumer or indexer needs the latest preceding owner
+    /// of its ratio to be the source its attention layout names; ratio-two
+    /// layers precede ratio-one layers, and a ratio-two owner needs a
+    /// ratio-one owner whose previous-step keys score incomplete groups.
+    /// Window-only layers use the startup rotary table; every compressed
+    /// layer uses `frequencies`.
+    pub fn from_schedule(
+        startup: StartupDefinition<'a>,
+        layers: Vec<ScheduledLayer<'a>>,
+        engrams: Vec<EngramDefinition>,
+        head: FinalHead<'a>,
+        frequencies: &'a [RotaryFrequency],
+        max_tokens: NonZeroUsize,
+    ) -> Result<Self, RequestError> {
         let model = Self {
             startup,
-            blocks,
+            layers,
             engrams,
-            layer_one,
-            layer_two,
-            layer_three,
-            layer_four,
             head,
             frequencies,
             max_tokens,
@@ -305,6 +422,12 @@ impl<'a> RequestModel<'a> {
         };
         model.validate()?;
         Ok(model)
+    }
+
+    /// Returns the scheduled layers after startup, in execution order.
+    #[must_use]
+    pub fn layers(&self) -> &[ScheduledLayer<'a>] {
+        &self.layers
     }
 
     /// Selects the index-score implementation for every indexed request layer.
@@ -323,7 +446,7 @@ impl<'a> RequestModel<'a> {
         self.score_execution
     }
 
-    /// Selects the complete index-key preparation implementation for L1 and L3 owners.
+    /// Selects the complete index-key preparation implementation for every owner.
     #[must_use]
     pub const fn with_key_preparation_execution(
         mut self,
@@ -388,50 +511,32 @@ impl<'a> RequestModel<'a> {
     }
 
     fn validate(&self) -> Result<(), RequestError> {
-        let (_, width) = self.blocks[0].geometry();
-        let copies = self.blocks[0].geometry().0;
-        if self.blocks.iter().any(|block| {
-            block.geometry() != (copies, width) || block.input.geometry() != (copies, width)
+        let (copies, width) = self.startup.tail.geometry();
+        if self.layers.iter().any(|layer| {
+            layer.block.geometry() != (copies, width)
+                || layer.block.input.geometry() != (copies, width)
         }) {
             return Err(RequestError::BlockGeometry);
         }
-        if self.startup.tail.geometry() != (copies, width)
-            || self.startup.norm.len() != width
-            || self.head.geometry() != (copies, width)
+        if self.startup.norm.len() != width || self.head.geometry() != (copies, width) {
+            return Err(RequestError::BlockGeometry);
+        }
+        let rope_pairs = self.startup.attention_layout.rope_pairs();
+        if std::iter::once(self.startup.attention_layout)
+            .chain(
+                self.layers
+                    .iter()
+                    .map(|layer| layer.kind.attention_layout()),
+            )
+            .any(|layout| {
+                layout.batches().get() != 1
+                    || layout.hidden_dimension().get() != width
+                    || layout.rope_pairs() != rope_pairs
+            })
         {
-            return Err(RequestError::BlockGeometry);
-        }
-        let rope_pairs = self.layer_two.layout.rope_pairs();
-        let attention_layouts = [
-            self.startup.attention_layout,
-            self.layer_one.config.attention_layout(),
-            self.layer_two.layout,
-            self.layer_three.config.attention_layout(),
-            self.layer_four.config.attention_layout(),
-        ];
-        if attention_layouts.iter().any(|layout| {
-            layout.batches().get() != 1
-                || layout.hidden_dimension().get() != width
-                || layout.rope_pairs() != rope_pairs
-        }) {
             return Err(RequestError::AttentionGeometry);
         }
-        if self.layer_two.layout.batches().get() != 1
-            || self.layer_two.layout.hidden_dimension().get() != width
-            || self
-                .layer_two
-                .layout
-                .compression()
-                .map(|(source, ratio)| (source, ratio.get()))
-                != self
-                    .layer_one
-                    .config
-                    .attention_layout()
-                    .compression()
-                    .map(|(source, ratio)| (source, ratio.get()))
-        {
-            return Err(RequestError::LayerTwoGeometry);
-        }
+        self.validate_schedule()?;
         if self.max_tokens.get() > MAX_REQUEST_ELEMENTS {
             return Err(RequestError::ElementLimit {
                 elements: self.max_tokens.get(),
@@ -440,53 +545,144 @@ impl<'a> RequestModel<'a> {
         let required_frequencies = self
             .max_tokens
             .get()
-            .checked_mul(self.layer_two.layout.rope_pairs().get())
+            .checked_mul(rope_pairs.get())
             .ok_or(RequestError::PositionOverflow)?;
-        if self.frequencies.len() < required_frequencies {
-            return Err(RequestError::FrequencyTable {
-                required: required_frequencies,
-                available: self.frequencies.len(),
-            });
-        }
-        let required_startup_frequencies = self
-            .max_tokens
-            .get()
-            .checked_mul(self.startup.attention_layout.rope_pairs().get())
-            .ok_or(RequestError::PositionOverflow)?;
-        if self.startup.frequencies.len() < required_startup_frequencies {
-            return Err(RequestError::FrequencyTable {
-                required: required_startup_frequencies,
-                available: self.startup.frequencies.len(),
-            });
+        for available in [self.frequencies.len(), self.startup.frequencies.len()] {
+            if available < required_frequencies {
+                return Err(RequestError::FrequencyTable {
+                    required: required_frequencies,
+                    available,
+                });
+            }
         }
         let _ = self.startup.session()?;
-        let _ = self.engrams[0].session()?;
-        let _ = self.engrams[1].session()?;
-        let _ = self
-            .layer_one
-            .session(self.score_execution, self.key_preparation_execution)?;
-        let _ = self.layer_three.session(self.key_preparation_execution)?;
-        let _ = self.layer_four.session(self.score_execution);
+        for engram in &self.engrams {
+            let _ = engram.session()?;
+        }
+        for layer in &self.layers {
+            let _ = self.layer_state(layer)?;
+        }
         Ok(())
+    }
+
+    fn validate_schedule(&self) -> Result<(), RequestError> {
+        let mut latest_owner: Option<(u16, usize)> = None;
+        let mut has_ratio_one_owner = false;
+        let mut has_ratio_two_owner = false;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let fail = |reason| RequestError::Schedule {
+                layer: index + 1,
+                reason,
+            };
+            let number = u16::try_from(index + 1).map_err(|_| fail(ScheduleError::LayerCount))?;
+            if let Some(engram) = layer.engram.filter(|&engram| engram >= self.engrams.len()) {
+                return Err(fail(ScheduleError::EngramIndex {
+                    index: engram,
+                    available: self.engrams.len(),
+                }));
+            }
+            let compression = layer
+                .kind
+                .attention_layout()
+                .compression()
+                .map(|(source, ratio)| (source, ratio.get()));
+            let ratio = layer.kind.ratio();
+            if ratio == 0 {
+                if compression.is_some() {
+                    return Err(fail(ScheduleError::WindowLayoutCompressed));
+                }
+                continue;
+            }
+            if ratio == 2 && has_ratio_one_owner {
+                return Err(fail(ScheduleError::RatioOrder));
+            }
+            let Some((source, layout_ratio)) = compression else {
+                return Err(fail(ScheduleError::MissingCompression));
+            };
+            if layout_ratio != ratio {
+                return Err(fail(ScheduleError::CompressionRatio {
+                    expected: ratio,
+                    actual: layout_ratio,
+                }));
+            }
+            match layer.kind {
+                LayerKind::RatioTwoOwner(_) | LayerKind::RatioOneOwner(_) => {
+                    if source != number {
+                        return Err(fail(ScheduleError::OwnerSource {
+                            expected: number,
+                            actual: source,
+                        }));
+                    }
+                    latest_owner = Some((source, ratio));
+                    has_ratio_two_owner |= ratio == 2;
+                    has_ratio_one_owner |= ratio == 1;
+                }
+                _ => {
+                    if latest_owner != Some((source, ratio)) {
+                        return Err(fail(ScheduleError::MissingProducer {
+                            source_layer: source,
+                            ratio,
+                        }));
+                    }
+                }
+            }
+        }
+        if has_ratio_two_owner && !has_ratio_one_owner {
+            return Err(RequestError::Schedule {
+                layer: self.layers.len(),
+                reason: ScheduleError::MissingRatioOneOwner,
+            });
+        }
+        Ok(())
+    }
+
+    fn layer_state(&self, layer: &ScheduledLayer<'_>) -> Result<LayerState, RequestError> {
+        Ok(match layer.kind {
+            LayerKind::WindowOnly(definition) => {
+                LayerState::WindowOnly(LayerAttentionState::new(definition.layout))
+            }
+            LayerKind::RatioTwoOwner(definition) => LayerState::RatioTwoOwner(
+                definition.session(self.score_execution, self.key_preparation_execution)?,
+            ),
+            LayerKind::RatioTwoConsumer(definition) => {
+                LayerState::RatioTwoConsumer(LayerAttentionState::new(definition.layout))
+            }
+            LayerKind::RatioOneOwner(definition) => {
+                LayerState::RatioOneOwner(definition.session(self.key_preparation_execution)?)
+            }
+            LayerKind::RatioOneIndexer(definition) => {
+                LayerState::RatioOneIndexer(definition.session(self.score_execution))
+            }
+            LayerKind::RatioOneConsumer(definition) => {
+                LayerState::RatioOneConsumer(LayerAttentionState::new(definition.layout))
+            }
+        })
     }
 }
 
-struct PriorLayerThreePublication {
+/// Request-local state for one scheduled layer, matching its [`LayerKind`].
+enum LayerState {
+    WindowOnly(LayerAttentionState),
+    RatioTwoOwner(LayerOneSession),
+    RatioTwoConsumer(LayerAttentionState),
+    RatioOneOwner(LayerThreeSession),
+    RatioOneIndexer(LayerFourSession),
+    RatioOneConsumer(LayerAttentionState),
+}
+
+/// The last ratio-one owner's keys from the previous successful step.
+struct PriorRatioOneKeys {
     publication: IndexKeyPublicationId,
     keys: Vec<u16>,
 }
 
-/// Mutable five-block request state rebuilt as one unit on restart.
+/// Mutable request state for every scheduled layer, rebuilt as one unit on restart.
 pub struct RequestSession<'a> {
     model: &'a RequestModel<'a>,
     startup: StartupSession<'a>,
-    engram_one: EngramSession,
-    layer_one: LayerOneSession,
-    layer_two: LayerAttentionState,
-    engram_three: EngramSession,
-    layer_three: LayerThreeSession,
-    layer_four: LayerFourSession,
-    prior_layer_three: Option<PriorLayerThreePublication>,
+    engrams: Vec<Option<EngramSession>>,
+    layers: Vec<LayerState>,
+    prior_ratio_one: Option<PriorRatioOneKeys>,
     next_start: usize,
     poisoned: bool,
 }
@@ -498,18 +694,24 @@ impl<'a> RequestSession<'a> {
     }
 
     fn build(model: &'a RequestModel<'a>) -> Result<Self, RequestError> {
+        let startup = model.startup.session()?;
+        let mut engrams = Vec::with_capacity(model.layers.len());
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            engrams.push(
+                layer
+                    .engram
+                    .map(|index| model.engrams[index].session())
+                    .transpose()?,
+            );
+            layers.push(model.layer_state(layer)?);
+        }
         Ok(Self {
             model,
-            startup: model.startup.session()?,
-            engram_one: model.engrams[0].session()?,
-            layer_one: model
-                .layer_one
-                .session(model.score_execution, model.key_preparation_execution)?,
-            layer_two: LayerAttentionState::new(model.layer_two.layout),
-            engram_three: model.engrams[1].session()?,
-            layer_three: model.layer_three.session(model.key_preparation_execution)?,
-            layer_four: model.layer_four.session(model.score_execution),
-            prior_layer_three: None,
+            startup,
+            engrams,
+            layers,
+            prior_ratio_one: None,
             next_start: 0,
             poisoned: false,
         })
@@ -588,7 +790,7 @@ impl<'a> RequestSession<'a> {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "the fixed five-block numerical order is intentionally visible in one request path"
+        reason = "the scheduled numerical order is intentionally visible in one request path"
     )]
     fn step_admitted(
         &mut self,
@@ -596,261 +798,442 @@ impl<'a> RequestSession<'a> {
         end: usize,
     ) -> Result<RequestStepOutput, RequestError> {
         let start = self.next_start;
-        let frequencies = frequency_span(
-            self.model.frequencies,
-            start,
-            ids.len(),
-            self.model.layer_two.layout.rope_pairs().get(),
-        )?;
-        let startup_frequencies = frequency_span(
-            self.model.startup.frequencies,
-            start,
-            ids.len(),
-            self.model.startup.attention_layout.rope_pairs().get(),
-        )?;
+        let positions = NonZeroUsize::new(ids.len()).expect("nonempty ids");
+        let rope_pairs = self.model.startup.attention_layout.rope_pairs().get();
+        let frequencies = frequency_span(self.model.frequencies, start, ids.len(), rope_pairs)?;
+        let startup_frequencies =
+            frequency_span(self.model.startup.frequencies, start, ids.len(), rope_pairs)?;
         let startup_ids = ids_to_u64(ids)?;
         let startup = self
             .startup
             .step(start, &startup_ids, startup_frequencies)?;
-        let engram_one = self.engram_one.step(start, ids, startup.residual())?;
-        let attention_one = attention_inputs(
-            &self.model.blocks[0],
-            engram_one.output(),
-            startup.next_pre(),
-        )?;
-        let l1_is_partial = !completes_ratio_two_group(start, ids.len());
-        let l1_prior = previous_l3_if_partial(self.prior_layer_three.as_ref(), start, ids.len());
-        if l1_is_partial && l1_prior.is_none() {
-            return Err(RequestError::MissingPriorLayerThree);
+        let mut residual = startup.residual().to_vec();
+        let mut pre = startup.next_pre().to_vec();
+        let partial_group = !completes_ratio_two_group(start, ids.len());
+        let mut outputs: Vec<LayerStepOutput> = reserve(self.layers.len(), "layer outputs")?;
+        // Indices into `outputs` of the latest owner and latest index publisher.
+        let mut latest_owner = None;
+        let mut latest_indices = None;
+        for ((definition, state), engram) in self
+            .model
+            .layers
+            .iter()
+            .zip(&mut self.layers)
+            .zip(&mut self.engrams)
+        {
+            let engram = engram
+                .as_mut()
+                .map(|engram| engram.step(start, ids, &residual))
+                .transpose()?;
+            let block_residual = engram.as_ref().map_or(&residual[..], |e| e.output());
+            let attention_input = attention_inputs(&definition.block, block_residual, &pre)?;
+            let input = normalized_rows(&attention_input)?;
+            let attention = match (definition.kind, state) {
+                (LayerKind::WindowOnly(layer), LayerState::WindowOnly(state)) => {
+                    ScheduledAttentionOutput::WindowOnly(state.forward_window_only(
+                        &input,
+                        start,
+                        startup_frequencies,
+                        layer.weights,
+                    )?)
+                }
+                (LayerKind::RatioTwoOwner(layer), LayerState::RatioTwoOwner(session)) => {
+                    let prior = if partial_group {
+                        let prior = self
+                            .prior_ratio_one
+                            .as_ref()
+                            .ok_or(RequestError::MissingPriorLayerThree)?;
+                        Some(PreviousLayerThreeKeys::new(prior.publication, &prior.keys))
+                    } else {
+                        None
+                    };
+                    ScheduledAttentionOutput::RatioTwoOwner(session.step(LayerOneCall::new(
+                        &input,
+                        positions,
+                        self.model.frequencies,
+                        layer.owner_weights,
+                        layer.query_weights,
+                        layer.query_layout,
+                        layer.attention_weights,
+                        prior,
+                    ))?)
+                }
+                (LayerKind::RatioTwoConsumer(layer), LayerState::RatioTwoConsumer(state)) => {
+                    let Some(ScheduledAttentionOutput::RatioTwoOwner(owner)) =
+                        latest_owner.map(|index: usize| &outputs[index].attention)
+                    else {
+                        unreachable!("validated schedules precede consumers with their owner")
+                    };
+                    ScheduledAttentionOutput::RatioTwoConsumer(state.forward(
+                        &input,
+                        start,
+                        frequencies,
+                        layer.weights,
+                        CompressedAttentionPublication {
+                            source_layer: owner.publication().source_layer(),
+                            epoch: owner.publication().epoch(),
+                            call_id: owner.publication().call_id(),
+                            numerical_bf16: owner.kv_prefix(),
+                            indices: owner.selected_indices(),
+                        },
+                    )?)
+                }
+                (LayerKind::RatioOneOwner(layer), LayerState::RatioOneOwner(session)) => {
+                    ScheduledAttentionOutput::RatioOneOwner(
+                        session.step(LayerThreeCall::new(
+                            &input,
+                            positions,
+                            frequencies,
+                            layer.owner_weights,
+                            layer
+                                .candidate
+                                .with_score_execution(self.model.score_execution),
+                            layer.attention_weights,
+                        ))?,
+                    )
+                }
+                (LayerKind::RatioOneIndexer(layer), LayerState::RatioOneIndexer(session)) => {
+                    let owner = ratio_one_owner(&outputs, latest_owner);
+                    ScheduledAttentionOutput::RatioOneIndexer(session.step(LayerFourCall::new(
+                        &input,
+                        frequencies,
+                        layer.query_weights,
+                        layer.attention_weights,
+                        LayerThreePublication::new(
+                            owner.publication(),
+                            owner.key_prefix(),
+                            owner.kv_prefix(),
+                            owner.candidate().candidates(),
+                        ),
+                    ))?)
+                }
+                (LayerKind::RatioOneConsumer(layer), LayerState::RatioOneConsumer(state)) => {
+                    let owner = ratio_one_owner(&outputs, latest_owner);
+                    let indices = match latest_indices.map(|index: usize| &outputs[index].attention)
+                    {
+                        Some(ScheduledAttentionOutput::RatioOneIndexer(indexer)) => {
+                            indexer.selection().indices.as_slice()
+                        }
+                        _ => owner.selected_indices(),
+                    };
+                    ScheduledAttentionOutput::RatioOneConsumer(state.forward(
+                        &input,
+                        start,
+                        frequencies,
+                        layer.weights,
+                        CompressedAttentionPublication {
+                            source_layer: owner.publication().source_layer(),
+                            epoch: owner.publication().epoch(),
+                            call_id: owner.publication().call_id(),
+                            numerical_bf16: owner.kv_prefix(),
+                            indices,
+                        },
+                    )?)
+                }
+                _ => unreachable!("layer state is built from its own kind"),
+            };
+            let TailOutputs {
+                diagnostics: tails,
+                residual: next_residual,
+                pre: next_pre,
+            } = tails(
+                &definition.block,
+                block_residual,
+                attention.final_output(),
+                ids.len(),
+            )?;
+            match attention {
+                ScheduledAttentionOutput::RatioTwoOwner(_)
+                | ScheduledAttentionOutput::RatioOneOwner(_) => {
+                    latest_owner = Some(outputs.len());
+                    latest_indices = Some(outputs.len());
+                }
+                ScheduledAttentionOutput::RatioOneIndexer(_) => {
+                    latest_indices = Some(outputs.len());
+                }
+                _ => {}
+            }
+            outputs.push(LayerStepOutput {
+                engram,
+                attention_input,
+                attention,
+                tails,
+            });
+            residual = next_residual;
+            pre = next_pre;
         }
-        let l1_input = normalized_rows(&attention_one)?;
-        let layer_one = self.layer_one.step(LayerOneCall::new(
-            &l1_input,
-            NonZeroUsize::new(ids.len()).expect("nonempty ids"),
-            self.model.frequencies,
-            self.model.layer_one.owner_weights,
-            self.model.layer_one.query_weights,
-            self.model.layer_one.query_layout,
-            self.model.layer_one.attention_weights,
-            l1_prior,
-        ))?;
-        let TailOutputs {
-            diagnostics: tails_one,
-            residual: residual_one,
-            pre: pre_one,
-        } = tails(
-            &self.model.blocks[0],
-            engram_one.output(),
-            layer_one.attention().final_output.as_slice(),
-            ids.len(),
-        )?;
-        let attention_two = attention_inputs(&self.model.blocks[1], &residual_one, &pre_one)?;
-        let l2_input = normalized_rows(&attention_two)?;
-        let layer_two = self.layer_two.forward(
-            &l2_input,
-            start,
-            frequencies,
-            self.model.layer_two.weights,
-            CompressedAttentionPublication {
-                source_layer: layer_one.publication().source_layer(),
-                epoch: layer_one.publication().epoch(),
-                call_id: layer_one.publication().call_id(),
-                numerical_bf16: layer_one.kv_prefix(),
-                indices: layer_one.selected_indices(),
-            },
-        )?;
-        let TailOutputs {
-            diagnostics: tails_two,
-            residual: residual_two,
-            pre: pre_two,
-        } = tails(
-            &self.model.blocks[1],
-            &residual_one,
-            &layer_two.final_output,
-            ids.len(),
-        )?;
-        let engram_three = self.engram_three.step(start, ids, &residual_two)?;
-        let attention_three =
-            attention_inputs(&self.model.blocks[2], engram_three.output(), &pre_two)?;
-        let l3_input = normalized_rows(&attention_three)?;
-        let layer_three = self.layer_three.step(LayerThreeCall::new(
-            &l3_input,
-            NonZeroUsize::new(ids.len()).expect("nonempty ids"),
-            frequencies,
-            self.model.layer_three.owner_weights,
-            self.model
-                .layer_three
-                .candidate
-                .with_score_execution(self.model.score_execution),
-            self.model.layer_three.attention_weights,
-        ))?;
-        let TailOutputs {
-            diagnostics: tails_three,
-            residual: residual_three,
-            pre: pre_three,
-        } = tails(
-            &self.model.blocks[2],
-            engram_three.output(),
-            layer_three.attention().final_output.as_slice(),
-            ids.len(),
-        )?;
-        let attention_four = attention_inputs(&self.model.blocks[3], &residual_three, &pre_three)?;
-        let l4_input = normalized_rows(&attention_four)?;
-        let layer_four = self.layer_four.step(LayerFourCall::new(
-            &l4_input,
-            frequencies,
-            self.model.layer_four.query_weights,
-            self.model.layer_four.attention_weights,
-            LayerThreePublication::new(
-                layer_three.publication(),
-                layer_three.key_prefix(),
-                layer_three.kv_prefix(),
-                layer_three.candidate().candidates(),
-            ),
-        ))?;
-        let TailOutputs {
-            diagnostics: tails_four,
-            residual: residual_four,
-            pre: pre_four,
-        } = tails(
-            &self.model.blocks[3],
-            &residual_three,
-            &layer_four.attention().final_output,
-            ids.len(),
-        )?;
-        let heads = final_heads(
-            self.model.head,
-            &residual_four,
-            &pre_four,
-            ids.len(),
-            self.model.blocks[3].geometry(),
-        )?;
-        self.prior_layer_three = Some(PriorLayerThreePublication {
-            publication: layer_three.publication(),
-            keys: layer_three.key_prefix().to_vec(),
-        });
+        let (copies, width) = self.model.startup.tail.geometry();
+        let heads = final_heads(self.model.head, &residual, &pre, ids.len(), (copies, width))?;
+        if let Some(owner) = outputs
+            .iter()
+            .rev()
+            .find_map(|output| match &output.attention {
+                ScheduledAttentionOutput::RatioOneOwner(owner) => Some(owner),
+                _ => None,
+            })
+        {
+            self.prior_ratio_one = Some(PriorRatioOneKeys {
+                publication: owner.publication(),
+                keys: owner.key_prefix().to_vec(),
+            });
+        }
         self.next_start = end;
         Ok(RequestStepOutput {
             startup,
-            engram_one,
-            attention_one,
-            layer_one,
-            tails_one,
-            attention_two,
-            layer_two,
-            tails_two,
-            engram_three,
-            attention_three,
-            layer_three,
-            tails_three,
-            attention_four,
-            layer_four,
-            tails_four,
-            residual: residual_four,
-            incoming_pre: pre_four,
+            layers: outputs,
+            residual,
+            incoming_pre: pre,
             heads,
         })
     }
 }
 
-/// Owned numerical boundaries from one fixed request chunk.
+fn ratio_one_owner(outputs: &[LayerStepOutput], latest: Option<usize>) -> &LayerThreeStepOutput {
+    match latest.map(|index| &outputs[index].attention) {
+        Some(ScheduledAttentionOutput::RatioOneOwner(owner)) => owner,
+        _ => unreachable!("validated schedules precede ratio-one layers with their owner"),
+    }
+}
+
+/// The attention stages of one scheduled layer, by kind.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ScheduledAttentionOutput {
+    /// Window-only attention stages.
+    WindowOnly(LayerAttentionDiagnostic),
+    /// Ratio-two owner, direct-score, and attention stages.
+    RatioTwoOwner(LayerOneStepOutput),
+    /// Attention over the latest ratio-two publication.
+    RatioTwoConsumer(LayerAttentionDiagnostic),
+    /// Ratio-one owner, candidate, selection, and attention stages.
+    RatioOneOwner(LayerThreeStepOutput),
+    /// Candidate-restricted scores, selection, and attention stages.
+    RatioOneIndexer(LayerFourStepOutput),
+    /// Attention over the ratio-one owner's KV and latest ratio-one indices.
+    RatioOneConsumer(LayerAttentionDiagnostic),
+}
+
+impl ScheduledAttentionOutput {
+    /// Returns this layer's attention output rows.
+    #[must_use]
+    pub fn final_output(&self) -> &[u16] {
+        match self {
+            Self::WindowOnly(attention)
+            | Self::RatioTwoConsumer(attention)
+            | Self::RatioOneConsumer(attention) => &attention.final_output,
+            Self::RatioTwoOwner(layer) => &layer.attention().final_output,
+            Self::RatioOneOwner(layer) => &layer.attention().final_output,
+            Self::RatioOneIndexer(layer) => &layer.attention().final_output,
+        }
+    }
+}
+
+/// Owned numerical boundaries of one scheduled layer in one request chunk.
+#[derive(Debug)]
+pub struct LayerStepOutput {
+    engram: Option<EngramStepOutput>,
+    attention_input: Vec<AttentionInputOutput>,
+    attention: ScheduledAttentionOutput,
+    tails: Vec<BlockTailDiagnostic>,
+}
+
+impl LayerStepOutput {
+    /// Returns the Engram operation applied before this block, if scheduled.
+    #[must_use]
+    pub const fn engram(&self) -> Option<&EngramStepOutput> {
+        self.engram.as_ref()
+    }
+    /// Returns HC-collapse and normalization rows.
+    #[must_use]
+    pub fn attention_input(&self) -> &[AttentionInputOutput] {
+        &self.attention_input
+    }
+    /// Returns this layer's attention stages.
+    #[must_use]
+    pub const fn attention(&self) -> &ScheduledAttentionOutput {
+        &self.attention
+    }
+    /// Returns block tail diagnostics.
+    #[must_use]
+    pub fn tails(&self) -> &[BlockTailDiagnostic] {
+        &self.tails
+    }
+}
+
+/// Owned numerical boundaries from one scheduled request chunk.
+///
+/// The numbered accessors (`layer_one` through `tails_four`) name the
+/// reduced schedule built by [`RequestModel::new`]; [`Self::layers`] covers
+/// any schedule.
 #[derive(Debug)]
 pub struct RequestStepOutput {
     startup: StartupStepOutput,
-    engram_one: EngramStepOutput,
-    attention_one: Vec<AttentionInputOutput>,
-    layer_one: LayerOneStepOutput,
-    tails_one: Vec<BlockTailDiagnostic>,
-    attention_two: Vec<AttentionInputOutput>,
-    layer_two: LayerAttentionDiagnostic,
-    tails_two: Vec<BlockTailDiagnostic>,
-    engram_three: EngramStepOutput,
-    attention_three: Vec<AttentionInputOutput>,
-    layer_three: LayerThreeStepOutput,
-    tails_three: Vec<BlockTailDiagnostic>,
-    attention_four: Vec<AttentionInputOutput>,
-    layer_four: LayerFourStepOutput,
-    tails_four: Vec<BlockTailDiagnostic>,
+    layers: Vec<LayerStepOutput>,
     residual: Vec<u16>,
     incoming_pre: Vec<f32>,
     heads: Vec<FinalHeadOutput>,
 }
 
 impl RequestStepOutput {
+    fn numbered(&self, number: usize) -> &LayerStepOutput {
+        self.layers
+            .get(number - 1)
+            .expect("numbered accessors require the reduced schedule")
+    }
+
+    fn engram_at(&self, number: usize) -> &EngramStepOutput {
+        self.numbered(number)
+            .engram()
+            .expect("numbered Engram accessors require the reduced schedule")
+    }
+
     /// Returns startup stages and its first block tail.
     #[must_use]
     pub const fn startup(&self) -> &StartupStepOutput {
         &self.startup
     }
-    /// Returns the first live Engram operation.
+    /// Returns every scheduled layer's boundaries in execution order.
     #[must_use]
-    pub const fn engram_one(&self) -> &EngramStepOutput {
-        &self.engram_one
+    pub fn layers(&self) -> &[LayerStepOutput] {
+        &self.layers
+    }
+    /// Returns the first live Engram operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless layer one applied an Engram, as in the reduced schedule.
+    #[must_use]
+    pub fn engram_one(&self) -> &EngramStepOutput {
+        self.engram_at(1)
     }
     /// Returns L1 HC-collapse and normalization rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer one.
     #[must_use]
     pub fn attention_one(&self) -> &[AttentionInputOutput] {
-        &self.attention_one
+        self.numbered(1).attention_input()
     }
     /// Returns the L1 owner, direct-score, and attention stages.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless layer one is a ratio-two owner, as in the reduced schedule.
     #[must_use]
-    pub const fn layer_one(&self) -> &LayerOneStepOutput {
-        &self.layer_one
+    pub fn layer_one(&self) -> &LayerOneStepOutput {
+        match self.numbered(1).attention() {
+            ScheduledAttentionOutput::RatioTwoOwner(layer) => layer,
+            _ => panic!("reduced layer one is a ratio-two owner"),
+        }
     }
     /// Returns numbered block-one tail diagnostics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer one.
     #[must_use]
     pub fn tails_one(&self) -> &[BlockTailDiagnostic] {
-        &self.tails_one
+        self.numbered(1).tails()
     }
     /// Returns L2 HC-collapse and normalization rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer two.
     #[must_use]
     pub fn attention_two(&self) -> &[AttentionInputOutput] {
-        &self.attention_two
+        self.numbered(2).attention_input()
     }
     /// Returns L2 attention over the live L1 publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless layer two is a ratio-two consumer, as in the reduced schedule.
     #[must_use]
-    pub const fn layer_two(&self) -> &LayerAttentionDiagnostic {
-        &self.layer_two
+    pub fn layer_two(&self) -> &LayerAttentionDiagnostic {
+        match self.numbered(2).attention() {
+            ScheduledAttentionOutput::RatioTwoConsumer(layer) => layer,
+            _ => panic!("reduced layer two is a ratio-two consumer"),
+        }
     }
     /// Returns numbered block-two tail diagnostics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer two.
     #[must_use]
     pub fn tails_two(&self) -> &[BlockTailDiagnostic] {
-        &self.tails_two
+        self.numbered(2).tails()
     }
     /// Returns the second live Engram operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless layer three applied an Engram, as in the reduced schedule.
     #[must_use]
-    pub const fn engram_three(&self) -> &EngramStepOutput {
-        &self.engram_three
+    pub fn engram_three(&self) -> &EngramStepOutput {
+        self.engram_at(3)
     }
     /// Returns L3 HC-collapse and normalization rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer three.
     #[must_use]
     pub fn attention_three(&self) -> &[AttentionInputOutput] {
-        &self.attention_three
+        self.numbered(3).attention_input()
     }
     /// Returns L3 owner, candidate, selection, and attention stages.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless layer three is a ratio-one owner, as in the reduced schedule.
     #[must_use]
-    pub const fn layer_three(&self) -> &LayerThreeStepOutput {
-        &self.layer_three
+    pub fn layer_three(&self) -> &LayerThreeStepOutput {
+        match self.numbered(3).attention() {
+            ScheduledAttentionOutput::RatioOneOwner(layer) => layer,
+            _ => panic!("reduced layer three is a ratio-one owner"),
+        }
     }
     /// Returns numbered block-three tail diagnostics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer three.
     #[must_use]
     pub fn tails_three(&self) -> &[BlockTailDiagnostic] {
-        &self.tails_three
+        self.numbered(3).tails()
     }
     /// Returns L4 HC-collapse and normalization rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer four.
     #[must_use]
     pub fn attention_four(&self) -> &[AttentionInputOutput] {
-        &self.attention_four
+        self.numbered(4).attention_input()
     }
     /// Returns L4 scores, selection, and attention stages.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless layer four is a ratio-one indexer, as in the reduced schedule.
     #[must_use]
-    pub const fn layer_four(&self) -> &LayerFourStepOutput {
-        &self.layer_four
+    pub fn layer_four(&self) -> &LayerFourStepOutput {
+        match self.numbered(4).attention() {
+            ScheduledAttentionOutput::RatioOneIndexer(layer) => layer,
+            _ => panic!("reduced layer four is a ratio-one indexer"),
+        }
     }
     /// Returns numbered block-four tail diagnostics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schedule has no layer four.
     #[must_use]
     pub fn tails_four(&self) -> &[BlockTailDiagnostic] {
-        &self.tails_four
+        self.numbered(4).tails()
     }
     /// Returns the final copy-major residual rows.
     #[must_use]
@@ -869,18 +1252,54 @@ impl RequestStepOutput {
     }
 }
 
+/// Why a layer schedule was rejected before request allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+#[non_exhaustive]
+pub enum ScheduleError {
+    /// More layers than a `u16` source-layer identity can name.
+    #[error("schedule has more layers than source identities")]
+    LayerCount,
+    /// A layer names an Engram definition the model does not hold.
+    #[error("Engram index {index} is outside {available} definitions")]
+    EngramIndex { index: usize, available: usize },
+    /// A window-only layer was given a compressed attention layout.
+    #[error("window-only layer has a compressed attention layout")]
+    WindowLayoutCompressed,
+    /// A compressed kind was given a window-only attention layout.
+    #[error("compressed layer has a window-only attention layout")]
+    MissingCompression,
+    /// The attention layout's ratio disagrees with the layer kind.
+    #[error("layer kind needs compression ratio {expected}, layout has {actual}")]
+    CompressionRatio { expected: usize, actual: usize },
+    /// An owner does not publish under its own layer number.
+    #[error("owner must publish as layer {expected}, layout names {actual}")]
+    OwnerSource { expected: u16, actual: u16 },
+    /// A consumer or indexer has no matching latest preceding owner.
+    #[error("no latest preceding ratio-{ratio} owner at source layer {source_layer}")]
+    MissingProducer { source_layer: u16, ratio: usize },
+    /// A ratio-two layer follows a ratio-one owner.
+    #[error("ratio-two layers must precede ratio-one layers")]
+    RatioOrder,
+    /// Ratio-two owners have no ratio-one keys for incomplete groups.
+    #[error("ratio-two owners need a ratio-one owner for incomplete groups")]
+    MissingRatioOneOwner,
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RequestError {
-    /// Numbered block tails disagree on copy or hidden width.
-    #[error("fixed request blocks do not share copy/hidden geometry")]
+    /// Block tails, startup, or head disagree on copy or hidden width.
+    #[error("request blocks do not share copy/hidden geometry")]
     BlockGeometry,
     /// L2 does not consume the fixed L1 ratio-two publication geometry.
     #[error("reused L2 attention must be batch-one source-one ratio-two with block hidden width")]
     LayerTwoGeometry,
-    /// One numbered attention layout disagrees on batch, hidden width, or `RoPE` pairs.
-    #[error("fixed request attention layouts do not share batch-one hidden/rotary geometry")]
+    /// One attention layout disagrees on batch, hidden width, or `RoPE` pairs.
+    #[error("request attention layouts do not share batch-one hidden/rotary geometry")]
     AttentionGeometry,
+    /// The layer schedule is not a valid sequence of producers and consumers.
+    #[error("schedule layer {layer}: {reason}")]
+    Schedule { layer: usize, reason: ScheduleError },
     /// A requested static or dynamic request surface exceeds its bound.
     #[error("request has {elements} tokens beyond the bounded maximum")]
     ElementLimit { elements: usize },
@@ -905,8 +1324,8 @@ pub enum RequestError {
     /// Startup accepts unsigned IDs and rejected a negative input ID.
     #[error("request token ID {id} cannot convert to startup unsigned form")]
     NegativeToken { id: i64 },
-    /// A ratio-two L1 partial group had no earlier successful L3 key prefix.
-    #[error("a partial L1 call needs an earlier successful L3 publication")]
+    /// An incomplete ratio-two group had no previous-step ratio-one owner keys.
+    #[error("a partial ratio-two owner call needs an earlier successful ratio-one publication")]
     MissingPriorLayerThree,
     /// A composed buffer did not match its exact stage geometry.
     #[error("request buffer {field} has {actual} elements, expected {expected}")]
@@ -924,45 +1343,30 @@ pub enum RequestError {
     /// Startup execution rejected its live input or operands.
     #[error(transparent)]
     Startup(#[from] StartupSessionError),
-    /// Either Engram state rejected its live stream.
+    /// An Engram state rejected its live stream.
     #[error(transparent)]
     Engram(#[from] EngramSessionError),
     /// An HC-collapse or RMS-normalization boundary failed.
     #[error(transparent)]
     Input(#[from] AttentionInputError),
-    /// L1 owner, scoring, or attention failed.
+    /// A ratio-two owner, its scoring, or its attention failed.
     #[error(transparent)]
     LayerOne(#[from] LayerOneSessionError),
-    /// Reused-publication L2 attention failed.
+    /// Window-only or reused-publication consumer attention failed.
     #[error(transparent)]
     LayerTwo(#[from] LayerAttentionError),
-    /// L3 owner, candidate, selection, or attention failed.
+    /// A ratio-one owner, candidate, selection, or attention failed.
     #[error(transparent)]
     LayerThree(#[from] LayerThreeSessionError),
-    /// L4 query, candidate selection, or attention failed.
+    /// A candidate indexer's query, selection, or attention failed.
     #[error(transparent)]
     LayerFour(#[from] LayerFourSessionError),
-    /// A numbered block tail failed.
+    /// A block tail failed.
     #[error(transparent)]
     Tail(#[from] BlockTailError),
     /// Final normalization or vocabulary projection failed.
     #[error(transparent)]
     Head(#[from] FinalHeadError),
-}
-
-fn previous_l3_if_partial(
-    prior: Option<&PriorLayerThreePublication>,
-    start: usize,
-    positions: usize,
-) -> Option<PreviousLayerThreeKeys<'_>> {
-    let completes = completes_ratio_two_group(start, positions);
-    if completes {
-        None
-    } else {
-        prior
-            .as_ref()
-            .map(|value| PreviousLayerThreeKeys::new(value.publication, &value.keys))
-    }
 }
 
 fn completes_ratio_two_group(start: usize, positions: usize) -> bool {

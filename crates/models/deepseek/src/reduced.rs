@@ -42,9 +42,10 @@ pub use artifact::{
 };
 mod request;
 pub use request::{
-    BlockDefinition, EngramDefinition, LayerFourDefinition, LayerOneDefinition,
-    LayerThreeDefinition, RequestError, RequestModel, RequestSession, RequestStepOutput,
-    ReusedAttentionDefinition, StartupDefinition,
+    BlockDefinition, EngramDefinition, LayerFourDefinition, LayerKind, LayerOneDefinition,
+    LayerStepOutput, LayerThreeDefinition, RequestError, RequestModel, RequestSession,
+    RequestStepOutput, ReusedAttentionDefinition, ScheduleError, ScheduledAttentionOutput,
+    ScheduledLayer, StartupDefinition,
 };
 mod layer_four;
 pub use candidates::{CandidateProjection, CandidateProjector, CandidateProjectorError};
