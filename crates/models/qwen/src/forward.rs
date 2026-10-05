@@ -28,8 +28,10 @@ use thiserror::Error;
 
 use crate::{DecoderFamily, Qwen3Attention};
 
+mod paged;
 mod snapshot;
 
+pub use paged::PagedQwen3Session;
 pub use snapshot::Qwen3KvSnapshot;
 
 /// The largest prompt accepted by the uncached qualification forward path.
@@ -1970,6 +1972,20 @@ pub enum Qwen3ForwardError {
     /// A dimension cannot be represented by MLX's i32 shape API.
     #[error("Qwen3 shape exceeds MLX's i32 dimension limit")]
     ShapeOverflow,
+    /// The paged KV pool could not be sized.
+    #[error("Qwen3 paged KV pool: {0}")]
+    KvPoolConfig(#[from] engine::blocks::BlockConfigError),
+    /// The paged KV block manager refused an operation; nothing changed.
+    #[error("Qwen3 paged KV: {0}")]
+    KvBlocks(#[from] engine::blocks::BlockError),
+    /// The paged KV pool was built for different weights or another dtype.
+    #[error("Qwen3 paged KV pool dtype {pool:?} differs from activation dtype {activation:?}")]
+    KvPoolDtype {
+        /// The pool's element type.
+        pool: mlx_rs::Dtype,
+        /// The K/V projection's element type.
+        activation: mlx_rs::Dtype,
+    },
     /// MLX could not construct, evaluate, or copy the Metal graph.
     #[error("MLX Qwen3 forward failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
@@ -2488,6 +2504,7 @@ mod tests {
     mod cache_component_profile;
     mod capacity_cache_profile;
     mod decode_profile;
+    mod paged_kv;
     mod particle_replay;
     mod prefix_extend;
     mod steering_checkpoint;
