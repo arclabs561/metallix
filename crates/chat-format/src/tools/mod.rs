@@ -3,6 +3,7 @@
 
 pub(crate) mod json_in_tags;
 pub(crate) mod minicpm_xml;
+pub(crate) mod xml_function_params;
 
 use serde::Deserialize;
 use serde_json::Value;

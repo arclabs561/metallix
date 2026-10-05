@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     messages::ChatToolCall,
-    tools::{self, ParsedTurn, json_in_tags, minicpm_xml},
+    tools::{self, ParsedTurn, json_in_tags, minicpm_xml, xml_function_params},
 };
 
 /// How a template tells the model to write tool calls.
@@ -19,6 +19,9 @@ use crate::{
 pub enum ToolDialect {
     /// `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` (Qwen3).
     JsonInTags,
+    /// `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`
+    /// (Qwen3.5 and later, Qwen3-Coder).
+    XmlFunctionParams,
     /// `<function name="NAME"><param name="K">V</param></function>` (`MiniCPM5`).
     MiniCpmXml,
     /// No calls are parsed; the whole answer is text.
@@ -50,12 +53,18 @@ impl TurnFormat {
     };
 
     /// Selects each dialect whose markers the template source spells. A
-    /// template matching several tool dialects selects none.
+    /// template matching several tool dialects selects none, except that
+    /// [`ToolDialect::XmlFunctionParams`] wraps its calls in `<tool_call>`
+    /// and so also spells [`ToolDialect::JsonInTags`]' marker.
     #[must_use]
     pub fn from_template(source: &str) -> Self {
         let spells = |markers: &[&str]| markers.iter().all(|marker| source.contains(marker));
-        let tools: Vec<ToolDialect> = [
+        let mut tools: Vec<ToolDialect> = [
             (ToolDialect::JsonInTags, &["<tool_call>"][..]),
+            (
+                ToolDialect::XmlFunctionParams,
+                &["<tool_call>", "<function=", "<parameter="],
+            ),
             (
                 ToolDialect::MiniCpmXml,
                 &["<function name=", "<param name="],
@@ -65,6 +74,9 @@ impl TurnFormat {
         .filter(|(_, markers)| spells(markers))
         .map(|(dialect, _)| dialect)
         .collect();
+        if tools.contains(&ToolDialect::XmlFunctionParams) {
+            tools.retain(|&dialect| dialect != ToolDialect::JsonInTags);
+        }
         let reasoning = if spells(&["<think>", "</think>"]) {
             ReasoningDialect::ThinkTags
         } else {
@@ -86,6 +98,7 @@ impl ToolDialect {
     fn parse(self, answer: &str, tools: &[Value]) -> Result<ParsedTurn, String> {
         match self {
             Self::JsonInTags => json_in_tags::parse(answer),
+            Self::XmlFunctionParams => xml_function_params::parse(answer, tools),
             Self::MiniCpmXml => minicpm_xml::parse(answer, tools),
             Self::PlainText => Ok(ParsedTurn {
                 text: answer.to_owned(),
@@ -202,6 +215,21 @@ mod tests {
             TurnFormat::from_template(MINICPM5_TEMPLATE),
             TurnFormat {
                 tools: ToolDialect::MiniCpmXml,
+                reasoning: ReasoningDialect::ThinkTags,
+            }
+        );
+        // Qwen3.5-0.8B's chat_template.jinja (sha256 273d8e0e...): the
+        // lines that spell its call format and its generation prompt.
+        let qwen35 = concat!(
+            r"{{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}",
+            r"{{- '<parameter=' + args_name + '>\n' }}",
+            r"{{- '</function>\n</tool_call>' }}",
+            r"{{- '<think>\n\n</think>\n\n' }}",
+        );
+        assert_eq!(
+            TurnFormat::from_template(qwen35),
+            TurnFormat {
+                tools: ToolDialect::XmlFunctionParams,
                 reasoning: ReasoningDialect::ThinkTags,
             }
         );
