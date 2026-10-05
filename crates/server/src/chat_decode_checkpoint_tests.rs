@@ -7,7 +7,8 @@
 use std::{env, fmt::Write as _, path::PathBuf, time::Instant};
 
 use super::{
-    ChatMessage, ChatRequest, ChatRole, ChatSession, ResidentChatLimits, SamplingRequest, full_row,
+    ChatMessage, ChatRequest, ChatRole, ChatSession, GenerationDeadline, ResidentChatLimits,
+    SamplingRequest, TurnStart, full_row,
 };
 
 const MAX_TOKENS: u32 = 128;
@@ -71,48 +72,59 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
         let mut request = ChatRequest::new(&messages, 64);
         request.sampling = sampling;
         request.top_logprobs = top_logprobs;
-        let input_ids = session
-            .format
-            .encode(&session.render(request).expect("render"))
-            .expect("encode");
-        let mut host = session.token_picker(request).expect("picker");
-        let mut gpu = session.token_picker(request).expect("picker");
+        let prepare = || {
+            TurnStart::prepare(
+                session.turn_model(),
+                request,
+                GenerationDeadline::unlimited(),
+            )
+            .expect("prepare")
+            .into_parts()
+        };
+        let (input_ids, mut host, _) = prepare();
+        let (_, mut gpu, _) = prepare();
+        let format = &session.format;
         let mut executor = session
             .weights
             .resident_chat_executor(session.context_limit, session.kv_budget_bytes)
             .expect("executor");
         let logits = executor.prefill_last_logits(&input_ids).expect("prefill");
-        let (mut token, _) = host.pick(&logits).expect("host pick");
-        assert_eq!(gpu.pick(&logits).expect("gpu-side pick").0, token);
+        let mut token = host
+            .pick(format, &mut logits.clone())
+            .expect("host pick")
+            .token;
+        assert_eq!(
+            gpu.pick(format, &mut logits.clone())
+                .expect("gpu-side pick")
+                .token,
+            token
+        );
         let mut gpu_draws_rejected = 0;
         for step in 1..64 {
             let rule = gpu
-                .gpu_rule(0, top_logprobs, session.vocabulary_size)
+                .gpu_rule(format, 0)
                 .expect("this case takes the GPU path");
             let picks = executor.decode_picks(token, &rule).expect("decode");
-            let row = full_row(&picks).expect("row");
-            let (expected, _) = host.pick(&row).expect("host pick");
-            let (settled, gpu_token, receipt) = session
-                .settle_gpu_step(&mut gpu, &picks, top_logprobs)
-                .expect("settle");
-            assert_eq!(settled, expected, "{name} step {step}");
-            if gpu_token != settled {
+            let mut row = full_row(&picks).expect("row");
+            let expected = host.pick(format, &mut row).expect("host pick").token;
+            let (settled, gpu_token) = gpu.settle(format, &picks).expect("settle");
+            assert_eq!(settled.token, expected, "{name} step {step}");
+            if gpu_token != settled.token {
                 gpu_draws_rejected += 1;
             }
-            if let Some(top) = top_logprobs {
-                let expected = session
-                    .token_logprob(&row, expected, top)
-                    .expect("host receipt");
-                let receipt = receipt.expect("receipt was requested");
-                assert_eq!(receipt.token, expected.token);
-                assert!((receipt.logprob - expected.logprob).abs() < LOGPROB_TOLERANCE);
-                assert_eq!(receipt.top_logprobs.len(), expected.top_logprobs.len());
-                for (actual, expected) in receipt.top_logprobs.iter().zip(&expected.top_logprobs) {
-                    assert_eq!(actual.bytes, expected.bytes, "{name} step {step}");
-                    assert!((actual.logprob - expected.logprob).abs() < LOGPROB_TOLERANCE);
-                }
-            }
             token = expected;
+        }
+        // Receipts were recorded by both loops for the same tokens.
+        let (host, gpu) = (host.finish().expect("host"), gpu.finish().expect("gpu"));
+        assert_eq!(gpu.logprobs.len(), host.logprobs.len(), "{name}");
+        for (step, (receipt, expected)) in gpu.logprobs.iter().zip(&host.logprobs).enumerate() {
+            assert_eq!(receipt.token, expected.token, "{name} receipt {step}");
+            assert!((receipt.logprob - expected.logprob).abs() < LOGPROB_TOLERANCE);
+            assert_eq!(receipt.top_logprobs.len(), expected.top_logprobs.len());
+            for (actual, expected) in receipt.top_logprobs.iter().zip(&expected.top_logprobs) {
+                assert_eq!(actual.bytes, expected.bytes, "{name} receipt {step}");
+                assert!((actual.logprob - expected.logprob).abs() < LOGPROB_TOLERANCE);
+            }
         }
         println!("decode_checkpoint case={name} steps=63 gpu_draws_rejected={gpu_draws_rejected}");
     }

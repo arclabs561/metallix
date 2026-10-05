@@ -20,16 +20,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
-use chat_format::{
-    ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, QwenTokenizer, TokenClass, TokenId,
-    TurnFormat,
-};
+use chat_format::{ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, TurnFormat};
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
 use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
 
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
+#[path = "chat_turn.rs"]
+mod turn;
+
+pub(crate) use turn::{TurnModel, TurnStart, TurnStep};
 
 #[cfg(test)]
 #[path = "chat_decode_checkpoint_tests.rs"]
@@ -718,7 +719,7 @@ impl ChatSession {
 
     #[allow(
         clippy::too_many_lines,
-        reason = "one ordered turn: render, prefill and decode, each in its own span"
+        reason = "one ordered turn: prefill, decode and the prefix-cache store, each in its own span"
     )]
     fn generate_with_deadline(
         &mut self,
@@ -726,18 +727,9 @@ impl ChatSession {
         deadline: GenerationDeadline,
         on_token: &mut dyn FnMut(&str) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
-        deadline.check()?;
-        validate_request(request)?;
-        let turn_started = Instant::now();
-        let render = tracing::info_span!("chat.render", render_ms = Empty);
-        let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
-        deadline.check()?;
-        let input_ids = self.format.encode(&prompt)?;
-        deadline.check()?;
-        let max_tokens = self.output_budget(request.max_tokens, input_ids.len())?;
-        // Compiles a schema grammar before any model work, so a bad schema
-        // fails fast.
-        let mut picker = self.token_picker(request)?;
+        let start = TurnStart::prepare(self.turn_model(), request, deadline)?;
+        let (render_ms, max_tokens) = (start.render_ms, start.max_tokens);
+        let (input_ids, mut turn, mut text) = start.into_parts();
 
         deadline.check()?;
         // Ends with the full-vocabulary logit readback, so it times the GPU work.
@@ -761,58 +753,42 @@ impl ChatSession {
             })?;
         prefill.record("cached_tokens", cached_prompt_tokens);
         deadline.check()?;
-        let mut generated = Vec::with_capacity(max_tokens as usize);
-        let mut logprobs = Vec::new();
-        let mut emitted = String::new();
-        let mut text_decoder = QwenTokenizer::generated_decoder();
         let mut decode_ms = Vec::new();
-        let mut ttft = None;
         let mut finish_reason = ChatFinishReason::Length;
         // Greedy turns, and sampled turns with top_k, pick each token on the
         // GPU and queue step t + 1 before reading step t back; the host then
         // settles the token and any logprobs exactly from a few top
-        // candidates. Grammar turns, sampling without top_k, and checkpoints
-        // that suppress tokens (the GPU pick has no suppression mask) read
-        // the full logit row each step.
-        let pipelined = !self.format.suppresses_tokens()
-            && picker
-                .gpu_rule(0, request.top_logprobs, self.vocabulary_size)
-                .is_some();
+        // candidates. Other turns read the full logit row each step.
+        let pipelined = turn.gpu_rule(&self.format, 0).is_some();
         let mut pending: Option<Qwen3TokenPicks> = None;
         let mut last_token_at = Instant::now();
 
         for step in 0..max_tokens {
             deadline.check()?;
-            if pending.is_none() {
-                self.format.suppress(&mut logits);
-            }
-            let mut receipt = None;
-            let (token, grammar_complete) = match pending.take() {
+            let accepted = match pending.take() {
                 Some(current) => {
                     let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
-                    let (token, gpu_token, settled_receipt) = span.in_scope(|| {
+                    let (accepted, gpu_token) = span.in_scope(|| {
                         if step + 1 < max_tokens {
                             // This step's draw is not committed yet, so the
                             // next step's variate is one draw ahead.
-                            let rule = picker
-                                .gpu_rule(1, request.top_logprobs, self.vocabulary_size)
-                                .ok_or_else(|| {
-                                    String::from("GPU pick rule changed within a turn")
-                                })?;
+                            let rule = turn.gpu_rule(&self.format, 1).ok_or_else(|| {
+                                String::from("GPU pick rule changed within a turn")
+                            })?;
                             pending = Some(
                                 executor
                                     .decode_picks_after(&current, &rule)
                                     .map_err(|error| error.to_string())?,
                             );
                         }
-                        self.settle_gpu_step(&mut picker, &current, request.top_logprobs)
+                        turn.settle(&self.format, &current)
                     })?;
                     // Time between token readbacks: with a step always queued,
                     // that is the per-token cost, not one step's latency.
                     let step_ms = elapsed_ms(last_token_at.elapsed());
                     span.record("decode_ms", step_ms);
                     decode_ms.push(step_ms);
-                    if token != gpu_token && pending.take().is_some() {
+                    if accepted.token != gpu_token && pending.take().is_some() {
                         // The f32 GPU draw landed across a cumulative-mass
                         // boundary from the exact draw; the queued step was
                         // built on the wrong token.
@@ -820,69 +796,44 @@ impl ChatSession {
                             .truncate_cached_tokens(executor.cached_tokens() - 1)
                             .map_err(|error| ChatGenerationError::message(error.to_string()))?;
                     }
-                    receipt = settled_receipt;
-                    (token, false)
+                    accepted
                 }
-                None => picker.pick(&logits)?,
+                None => turn.pick(&self.format, &mut logits)?,
             };
             last_token_at = Instant::now();
-            let class = self.format.stops().classify(TokenId::from_model(token)?);
-            if let Some(top) = request.top_logprobs.filter(|_| class == TokenClass::Normal) {
-                logprobs.push(match receipt {
-                    Some(receipt) => receipt,
-                    None => self.token_logprob(&logits, token, top)?,
-                });
+            if accepted.visible {
+                text.push(&self.format, accepted.token, on_token)?;
             }
-            generated.push(token);
-            match class {
-                TokenClass::Normal => {}
-                // Stop tokens are never visible text; a tool turn's end is
-                // complete like any other.
-                TokenClass::EndTurn | TokenClass::ToolEnd => {
-                    if pending.is_some() {
-                        // The queued step appended this stop token.
-                        executor
-                            .truncate_cached_tokens(executor.cached_tokens() - 1)
-                            .map_err(|error| ChatGenerationError::message(error.to_string()))?;
-                    }
-                    finish_reason = ChatFinishReason::Eos;
-                    break;
+            if let TurnStep::Stop(reason) = accepted.step {
+                if !accepted.visible && pending.is_some() {
+                    // The queued step appended this stop token.
+                    executor
+                        .truncate_cached_tokens(executor.cached_tokens() - 1)
+                        .map_err(|error| ChatGenerationError::message(error.to_string()))?;
                 }
-            }
-            if let Some(delta) = self
-                .format
-                .tokenizer()
-                .decode_generated_token(&mut text_decoder, token)?
-            {
-                emit_delta(&delta, &mut emitted, on_token, &mut ttft, turn_started)?;
-            }
-            // A schema can close on an ordinary token, such as a final `}`.
-            if grammar_complete {
-                finish_reason = ChatFinishReason::Eos;
+                finish_reason = reason;
                 break;
             }
 
-            if pipelined && step + 1 < max_tokens && pending.is_none() {
+            if pipelined && pending.is_none() {
                 // After the prefill token or a rejected GPU draw; later steps
                 // were queued above. Every draw so far is committed.
                 deadline.check()?;
-                let rule = picker
-                    .gpu_rule(0, request.top_logprobs, self.vocabulary_size)
-                    .ok_or_else(|| {
-                        ChatGenerationError::message("GPU pick rule changed within a turn")
-                    })?;
+                let rule = turn.gpu_rule(&self.format, 0).ok_or_else(|| {
+                    ChatGenerationError::message("GPU pick rule changed within a turn")
+                })?;
                 pending = Some(
                     executor
-                        .decode_picks(token, &rule)
+                        .decode_picks(accepted.token, &rule)
                         .map_err(|error| ChatGenerationError::message(error.to_string()))?,
                 );
-            } else if !pipelined && step + 1 < max_tokens {
+            } else if !pipelined {
                 deadline.check()?;
                 // One span per generated token, ending with its logit readback.
                 let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
                 let (next, step_ms) = timed(&span, "decode_ms", || {
                     executor
-                        .decode_last_logits(token)
+                        .decode_last_logits(accepted.token)
                         .map_err(|error| ChatGenerationError::message(error.to_string()))
                 })?;
                 logits = next;
@@ -904,36 +855,19 @@ impl ChatSession {
             )
         })?;
 
-        let visible_generated = match generated.split_last() {
-            Some((&last, visible))
-                if self.format.stops().classify(TokenId::from_model(last)?)
-                    != TokenClass::Normal =>
-            {
-                visible
-            }
-            _ => &generated,
-        };
         deadline.check()?;
-        let text = self
-            .format
-            .tokenizer()
-            .decode_generated(visible_generated)?;
-        let remaining = text.strip_prefix(&emitted).ok_or_else(|| {
-            ChatGenerationError::message(
-                "incremental tokenizer decoder diverged from complete generated text",
-            )
-        })?;
-        emit_delta(remaining, &mut emitted, on_token, &mut ttft, turn_started)?;
-        picker.check_complete_output()?;
+        let (text, time_to_first_token_ms) =
+            text.finish(&self.format, turn.generated(), on_token)?;
+        let output = turn.finish()?;
         let decode_total_ms = decode_ms.iter().sum();
-        let generated_tokens = generated.len();
+        let generated_tokens = output.generated.len();
         deadline.check()?;
         Ok(ChatGeneration {
             text,
-            generated_token_ids: generated,
+            generated_token_ids: output.generated,
             finish_reason,
-            logprobs,
-            sampling: Some(picker.applied),
+            logprobs: output.logprobs,
+            sampling: Some(output.sampling),
             format: self.format.turn_format(),
             metrics: ChatGenerationMetrics {
                 context_tokens: self.context_limit,
@@ -941,7 +875,7 @@ impl ChatSession {
                 session_load_ms: self.load_ms,
                 render_ms,
                 prefill_ms,
-                time_to_first_token_ms: ttft,
+                time_to_first_token_ms,
                 decode_ms,
                 decode_total_ms,
                 prompt_tokens: input_ids.len(),
@@ -951,187 +885,19 @@ impl ChatSession {
         })
     }
 
+    /// The checkpoint facts every turn is prepared from.
+    pub(crate) fn turn_model(&self) -> TurnModel<'_> {
+        TurnModel {
+            format: &self.format,
+            sampling_defaults: self.sampling_defaults,
+            model: &self.model,
+            vocabulary_size: self.vocabulary_size,
+            context_limit: self.context_limit,
+        }
+    }
+
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
         self.format.template().render(request.conversation(), true)
-    }
-
-    fn token_picker(&self, request: ChatRequest<'_>) -> Result<TokenPicker, String> {
-        TokenPicker::new(
-            request,
-            self.sampling_defaults,
-            &self.model,
-            self.vocabulary_size,
-        )
-    }
-
-    /// Resolves the output limit (`None` fills the remaining context) and
-    /// rejects one that cannot fit after the prompt.
-    fn output_budget(
-        &self,
-        requested: Option<u32>,
-        prompt_tokens: usize,
-    ) -> Result<u32, ChatGenerationError> {
-        let max_tokens = match requested {
-            Some(max_tokens) => max_tokens,
-            None => {
-                u32::try_from(self.context_limit.saturating_sub(prompt_tokens)).unwrap_or(u32::MAX)
-            }
-        };
-        if max_tokens == 0 {
-            return Err(ChatGenerationError::message(format!(
-                "chat prompt of {prompt_tokens} tokens leaves no room for output in the {}-token context",
-                self.context_limit,
-            )));
-        }
-        let total_tokens = prompt_tokens
-            .checked_add(max_tokens as usize)
-            .ok_or_else(|| {
-                ChatGenerationError::message("chat prompt plus generation budget overflows")
-            })?;
-        if total_tokens > self.context_limit {
-            return Err(ChatGenerationError::message(format!(
-                "chat requires prompt_tokens + max_tokens <= {}; received {prompt_tokens} + {max_tokens} = {total_tokens}",
-                self.context_limit,
-            )));
-        }
-        Ok(max_tokens)
-    }
-
-    /// Reads back a GPU-picked step and settles its token, and its logprob
-    /// receipt when asked, as the full-row host path would: from the step's
-    /// top candidates when they decide it, else from the whole row. Returns
-    /// the settled token, the GPU's own pick, and the receipt.
-    fn settle_gpu_step(
-        &self,
-        picker: &mut TokenPicker,
-        picks: &Qwen3TokenPicks,
-        top_logprobs: Option<u8>,
-    ) -> Result<(i32, i32, Option<TokenLogprob>), String> {
-        let (tokens, candidates) = picks
-            .wait_with_candidates()
-            .map_err(|error| error.to_string())?;
-        let [gpu_token] = tokens[..] else {
-            return Err("a decode step picks one token".into());
-        };
-        let candidates = candidates.as_ref().and_then(|rows| rows.first());
-        let mut row = None;
-        let token = if let Some(token) = picker.pick_from_candidates(gpu_token, candidates)? {
-            token
-        } else {
-            let full = full_row(picks)?;
-            let (token, _) = picker.pick(&full)?;
-            row = Some(full);
-            token
-        };
-        let Some(top) = top_logprobs else {
-            return Ok((token, gpu_token, None));
-        };
-        let settled = match candidates {
-            Some(candidates) => self.candidate_logprob(candidates, token, top)?,
-            None => None,
-        };
-        let receipt = if let Some(receipt) = settled {
-            receipt
-        } else {
-            let full = match row {
-                Some(full) => full,
-                None => full_row(picks)?,
-            };
-            self.token_logprob(&full, token, top)?
-        };
-        Ok((token, gpu_token, Some(receipt)))
-    }
-
-    /// [`Self::token_logprob`] from a row's top candidates, or `None` when
-    /// they cannot settle it: `token` is not among them, or the `top + 8`
-    /// most likely tokens the host would rank are not certain to be. Only the
-    /// softmax normalizer differs from the host's, by its f32 summation.
-    fn candidate_logprob(
-        &self,
-        candidates: &Qwen3RowCandidates,
-        token: i32,
-        top: u8,
-    ) -> Result<Option<TokenLogprob>, String> {
-        let head = usize::from(top) + 8;
-        let selected = candidates.top.iter().find(|&&(id, _)| id == token);
-        let Some(&(_, selected_logit)) = selected.filter(|_| candidates.settles_head(head)) else {
-            return Ok(None);
-        };
-        let top_logprobs = candidates.top[..head]
-            .iter()
-            .filter_map(|&(id, logit)| {
-                let bytes = self.format.tokenizer().token_bytes(id).ok()?;
-                Some(TopLogprob {
-                    token: String::from_utf8_lossy(&bytes).into_owned(),
-                    bytes,
-                    logprob: candidates.logprob(logit),
-                })
-            })
-            .take(usize::from(top))
-            .collect();
-        let bytes = self.format.tokenizer().token_bytes(token)?;
-        Ok(Some(TokenLogprob {
-            token: String::from_utf8_lossy(&bytes).into_owned(),
-            bytes,
-            logprob: candidates.logprob(selected_logit),
-            top_logprobs,
-        }))
-    }
-
-    /// Scores `token` and the `top` most likely tokens under the raw logits.
-    fn token_logprob(&self, logits: &[f32], token: i32, top: u8) -> Result<TokenLogprob, String> {
-        let maximum = logits
-            .iter()
-            .map(|&value| f64::from(value))
-            .fold(f64::NEG_INFINITY, f64::max);
-        let log_normalizer = logits
-            .iter()
-            .map(|&value| (f64::from(value) - maximum).exp())
-            .sum::<f64>()
-            .ln();
-        let logprob = |index: usize| f64::from(logits[index]) - maximum - log_normalizer;
-        let selected = usize::try_from(token)
-            .ok()
-            .filter(|&index| index < logits.len())
-            .ok_or_else(|| String::from("selected token is outside model vocabulary"))?;
-        // Padded logit rows past the tokenizer vocabulary have no spelling;
-        // over-select a little so skipping them still leaves `top` entries.
-        let wanted = usize::from(top);
-        let mut order: Vec<usize> = (0..logits.len()).collect();
-        let head = (wanted + 8).min(order.len());
-        let by_logit = |left: &usize, right: &usize| {
-            logits[*right]
-                .total_cmp(&logits[*left])
-                .then(left.cmp(right))
-        };
-        if head < order.len() {
-            order.select_nth_unstable_by(head, by_logit);
-            order.truncate(head);
-        }
-        order.sort_unstable_by(by_logit);
-        let top_logprobs = order
-            .into_iter()
-            .filter_map(|index| {
-                let bytes = self
-                    .format
-                    .tokenizer()
-                    .token_bytes(i32::try_from(index).ok()?)
-                    .ok()?;
-                Some(TopLogprob {
-                    token: String::from_utf8_lossy(&bytes).into_owned(),
-                    bytes,
-                    logprob: logprob(index),
-                })
-            })
-            .take(wanted)
-            .collect();
-        let bytes = self.format.tokenizer().token_bytes(token)?;
-        Ok(TokenLogprob {
-            token: String::from_utf8_lossy(&bytes).into_owned(),
-            bytes,
-            logprob: logprob(selected),
-            top_logprobs,
-        })
     }
 }
 
@@ -1429,23 +1195,6 @@ fn full_row(picks: &Qwen3TokenPicks) -> Result<Vec<f32>, String> {
         .map_err(|error| error.to_string())?
         .pop()
         .ok_or_else(|| String::from("a decode step has one logit row"))
-}
-
-fn emit_delta(
-    delta: &str,
-    emitted: &mut String,
-    on_token: &mut dyn FnMut(&str) -> Result<(), String>,
-    ttft: &mut Option<f64>,
-    turn_started: Instant,
-) -> Result<(), String> {
-    if !delta.is_empty() {
-        on_token(delta)?;
-        emitted.push_str(delta);
-        if ttft.is_none() {
-            *ttft = Some(elapsed_ms(turn_started.elapsed()));
-        }
-    }
-    Ok(())
 }
 
 /// Runs `work` inside `span` and records its wall time in milliseconds as
