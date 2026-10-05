@@ -13,12 +13,15 @@ use crate::{
     },
     moe::RoutedExpertSource,
     reduced::{
-        AttentionInputOutput, BlockTailDiagnostic, EmbeddingRowSource, EngramSession, FinalHead,
+        AttentionInputOutput, BlockTailDiagnostic, EmbeddingRowSource, EngramSession,
         FinalHeadExecution, FinalHeadOutput, LayerFourCall, LayerFourSession, LayerOneCall,
         LayerOneSession, LayerThreeCall, LayerThreePublication, LayerThreeSession,
         LayerThreeStepOutput, PreviousLayerThreeKeys, StartupSession,
     },
 };
+
+#[cfg(feature = "metal")]
+use crate::precision::DeviceLinears;
 
 use super::{
     BlockDefinition, HeadPositions, LayerKind, LayerStepOutput, RequestError, RequestModel,
@@ -225,6 +228,8 @@ impl<'a> RequestSession<'a> {
             });
         }
         self.poisoned = true;
+        #[cfg(feature = "metal")]
+        let _device = self.model.device.as_ref().map(DeviceLinears::enter);
         let result = self.step_admitted(ids, end, sources);
         if result.is_ok() {
             self.poisoned = false;
@@ -424,12 +429,12 @@ impl<'a> RequestSession<'a> {
         let (copies, width) = self.model.startup.tail.geometry();
         let heads = match self.model.head_positions {
             HeadPositions::All => {
-                final_heads(self.model.head, &residual, &pre, ids.len(), (copies, width))?
+                final_heads(self.model, &residual, &pre, ids.len(), (copies, width))?
             }
             HeadPositions::Last => {
                 let stride = copies * width;
                 final_heads(
-                    self.model.head,
+                    self.model,
                     &residual[residual.len() - stride..],
                     &pre[pre.len() - copies..],
                     1,
@@ -614,7 +619,7 @@ fn tails(
 }
 
 fn final_heads(
-    head: FinalHead<'_>,
+    model: &RequestModel<'_>,
     residual: &[u16],
     pre: &[f32],
     positions: usize,
@@ -641,7 +646,14 @@ fn final_heads(
     }
     let mut outputs = reserve(positions, "head outputs")?;
     for (row, coefficients) in residual.chunks_exact(stride).zip(pre.chunks_exact(copies)) {
-        outputs.push(head.forward(row, coefficients)?);
+        #[cfg(feature = "metal")]
+        let output = match model.metal_head {
+            Some(metal) => model.head.forward_metal(row, coefficients, metal)?,
+            None => model.head.forward(row, coefficients)?,
+        };
+        #[cfg(not(feature = "metal"))]
+        let output = model.head.forward(row, coefficients)?;
+        outputs.push(output);
     }
     Ok(outputs)
 }

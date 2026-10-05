@@ -12,6 +12,12 @@ use crate::{
     reduced::{FinalHead, FinalHeadExecution},
 };
 
+#[cfg(feature = "metal")]
+use std::sync::Arc;
+
+#[cfg(feature = "metal")]
+use crate::{precision::DeviceLinears, reduced::MetalBf16Head};
+
 use super::{
     BlockDefinition, EngramDefinition, LayerFourDefinition, LayerKind, LayerOneDefinition,
     LayerThreeDefinition, MAX_REQUEST_ELEMENTS, RequestError, ReusedAttentionDefinition,
@@ -37,6 +43,13 @@ pub struct RequestModel<'a> {
     pub(super) engrams: Vec<EngramDefinition>,
     pub(super) head: FinalHead<'a>,
     pub(super) head_positions: HeadPositions,
+    /// Projects the final head on the GPU when set; see [`Self::with_metal_head`].
+    #[cfg(feature = "metal")]
+    pub(super) metal_head: Option<&'a MetalBf16Head>,
+    /// Runs the FP8 linears and routed experts on the GPU when set; see
+    /// [`Self::with_device_linears`].
+    #[cfg(feature = "metal")]
+    pub(super) device: Option<Arc<DeviceLinears>>,
     max_step_tokens: Option<NonZeroUsize>,
     pub(super) frequencies: &'a [RotaryFrequency],
     pub(super) max_tokens: NonZeroUsize,
@@ -130,6 +143,10 @@ impl<'a> RequestModel<'a> {
             engrams,
             head,
             head_positions: HeadPositions::All,
+            #[cfg(feature = "metal")]
+            metal_head: None,
+            #[cfg(feature = "metal")]
+            device: None,
             max_step_tokens: None,
             frequencies,
             max_tokens,
@@ -238,6 +255,28 @@ impl<'a> RequestModel<'a> {
     #[must_use]
     pub const fn head_positions(&self) -> HeadPositions {
         self.head_positions
+    }
+
+    /// Projects every final-head row with `head`, a GPU copy of this model's
+    /// BF16 head weights, instead of the scalar FP32 projection. Logits then
+    /// differ from the scalar path only by FP32 summation order. `head` is
+    /// not `Sync`, so a model holding one stays on the thread that built it.
+    #[cfg(feature = "metal")]
+    #[must_use]
+    pub const fn with_metal_head(mut self, head: &'a MetalBf16Head) -> Self {
+        self.metal_head = Some(head);
+        self
+    }
+
+    /// Runs every step's FP8 linears and routed FP4 experts through `device`
+    /// on the GPU, with its resident weights, instead of the scalar
+    /// references. Outputs then differ from the scalar path by FP32
+    /// summation order inside each 32-element block.
+    #[cfg(feature = "metal")]
+    #[must_use]
+    pub(crate) fn with_device_linears(mut self, device: Arc<DeviceLinears>) -> Self {
+        self.device = Some(device);
+        self
     }
 
     /// Sets the most tokens [`super::RequestSession::prefill_with_sources`]

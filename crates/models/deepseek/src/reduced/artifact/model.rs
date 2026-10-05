@@ -1114,6 +1114,100 @@ mod tests {
         .unwrap();
     }
 
+    /// The Metal backend's switches reach the step: a BF16 head projected by
+    /// `MetalBf16Head`, Engram definitions built with the Metal WKV, and the
+    /// FP8 linears and routed experts run through `DeviceLinears`.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_backend_paths_are_used_and_keep_the_argmax() {
+        use std::sync::Arc;
+
+        use crate::{
+            precision::{DeviceLinears, f32_to_bf16_rne},
+            reduced::{FinalHead, HeadWeights, MetalBf16Head},
+        };
+        let artifact = artifact();
+        let config = &artifact.config;
+        let ids = ids(config);
+        let tensors = &artifact.tensors;
+        let norm = tensors.u16("head.norm.weight", &[config.width]).unwrap();
+        let weights: Vec<u16> = tensors
+            .f32("head.weight", &[config.vocabulary, config.width])
+            .unwrap()
+            .iter()
+            .map(|&value| f32_to_bf16_rne(value))
+            .collect();
+        let head = FinalHead::with_weights(
+            norm,
+            HeadWeights::Bf16(&weights),
+            config.vocabulary,
+            config.copies,
+            config.norm_epsilon,
+        )
+        .unwrap();
+        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let metal = MetalBf16Head::new(&weights, config.vocabulary, config.width).unwrap();
+        let short = MetalBf16Head::new(
+            &weights[..(config.vocabulary - 1) * config.width],
+            config.vocabulary - 1,
+            config.width,
+        )
+        .unwrap();
+        with_parts(config, tensors, |parts| {
+            let model = |engrams: Vec<EngramDefinition>| {
+                RequestModel::from_schedule(
+                    parts.startup,
+                    reduced_schedule(&parts),
+                    engrams,
+                    head,
+                    parts.frequencies,
+                    parts.max_tokens,
+                )
+                .unwrap()
+            };
+            let scalar = model(parts.engrams.to_vec());
+            let metal_engrams: Vec<_> = parts
+                .engrams
+                .iter()
+                .cloned()
+                .map(|engram| engram.with_metal_wkv(true))
+                .collect();
+            let device = Arc::new(DeviceLinears::default());
+            let on_metal = model(metal_engrams.clone())
+                .with_metal_head(&metal)
+                .with_device_linears(Arc::clone(&device));
+            let expected = RequestSession::new(&scalar)
+                .unwrap()
+                .step(&ids[..3])
+                .unwrap();
+            let actual = RequestSession::new(&on_metal)
+                .unwrap()
+                .step(&ids[..3])
+                .unwrap();
+            for (scalar, metal) in expected.heads().iter().zip(actual.heads()) {
+                let argmax = |logits: &[f32]| {
+                    (0..logits.len())
+                        .max_by(|&a, &b| logits[a].total_cmp(&logits[b]))
+                        .unwrap()
+                };
+                assert_eq!(argmax(scalar.logits()), argmax(metal.logits()));
+            }
+            let counts = device.counts();
+            assert!(
+                counts.uploaded_fp8 > 0 && counts.fp4_experts > 0 && counts.scalar_fallbacks == 0,
+                "{counts:?}"
+            );
+            // A head of the wrong shape fails the step, so the Metal head is consulted.
+            let wrong = model(metal_engrams).with_metal_head(&short);
+            assert!(matches!(
+                RequestSession::new(&wrong).unwrap().step(&ids[..3]),
+                Err(RequestError::Head(_))
+            ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn last_position_heads_equal_the_last_of_all_position_heads() {
         let artifact = artifact();

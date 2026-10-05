@@ -55,6 +55,11 @@ use super::{
     ReusedAttentionDefinition, ScheduledLayer, StartupDefinition,
 };
 
+#[cfg(feature = "metal")]
+use super::MetalBf16Head;
+#[cfg(feature = "metal")]
+use crate::precision::{DeviceCounts, DeviceLinears, Fp8Buffers};
+
 /// Largest routed-expert count the static empty table covers.
 const MAX_ROUTED_EXPERTS: usize = 384;
 
@@ -360,6 +365,26 @@ pub struct V41CheckpointWeights {
     window_frequencies: Vec<RotaryFrequency>,
     compressed_frequencies: Vec<RotaryFrequency>,
     max_tokens: NonZeroUsize,
+    backend: V41Backend,
+    #[cfg(feature = "metal")]
+    metal_head: Option<MetalBf16Head>,
+    #[cfg(feature = "metal")]
+    device: Option<Arc<DeviceLinears>>,
+}
+
+/// Which implementation runs the request paths that have a Metal variant: the
+/// FP8 attention and shared-expert linears, the routed FP4 experts, the Engram
+/// WKV projection and the final-head projection. Everything else (norms,
+/// routing, attention, the HC mixes) stays on the scalar CPU path either way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum V41Backend {
+    /// The scalar CPU reference.
+    #[default]
+    Scalar,
+    /// Metal kernels where they exist.
+    #[cfg(feature = "metal")]
+    Metal,
 }
 
 impl std::fmt::Debug for V41CheckpointWeights {
@@ -419,6 +444,11 @@ impl V41CheckpointWeights {
             window_frequencies,
             compressed_frequencies,
             max_tokens,
+            backend: V41Backend::Scalar,
+            #[cfg(feature = "metal")]
+            metal_head: None,
+            #[cfg(feature = "metal")]
+            device: None,
         };
         weights.read(cache, "norm.weight", Read::Bf16, &[config.dim])?;
         for layer in layers {
@@ -438,7 +468,10 @@ impl V41CheckpointWeights {
         (0..self.config.engram_layer_ids.len())
             .map(|index| {
                 let (config, weights) = self.engram_parts(index, inputs)?;
-                Ok(EngramDefinition::new(config, weights))
+                let definition = EngramDefinition::new(config, weights);
+                #[cfg(feature = "metal")]
+                let definition = definition.with_metal_wkv(self.backend == V41Backend::Metal);
+                Ok(definition)
             })
             .collect()
     }
@@ -489,6 +522,65 @@ impl V41CheckpointWeights {
     ) -> Result<(), V41CheckpointModelError> {
         let shape = [self.config.vocab_size, self.config.dim];
         self.read(cache, "head.weight", Read::Bf16, &shape)
+    }
+
+    /// Selects the backend for [`Self::engram_definitions`] and
+    /// [`Self::request_model`]. [`V41Backend::Metal`] needs the head loaded:
+    /// it uploads a 2.6 GB FP32 copy of it to the GPU once. Each FP8 linear's
+    /// weights (attention and shared expert) are uploaded on first use and
+    /// stay resident while these weights live.
+    pub fn set_backend(&mut self, backend: V41Backend) -> Result<(), V41CheckpointModelError> {
+        #[cfg(feature = "metal")]
+        {
+            (self.metal_head, self.device) = match backend {
+                V41Backend::Metal => {
+                    let head = MetalBf16Head::new(
+                        self.bf16("head.weight")?,
+                        self.config.vocab_size,
+                        self.config.dim,
+                    )
+                    .map_err(component)?;
+                    (
+                        Some(head),
+                        Some(Arc::new(DeviceLinears::new(self.fp8_tensors()))),
+                    )
+                }
+                V41Backend::Scalar => (None, None),
+            };
+        }
+        self.backend = backend;
+        Ok(())
+    }
+
+    /// Every `(codes, scales)` pair stored as `<name>.weight` and `<name>.scale` bytes.
+    #[cfg(feature = "metal")]
+    fn fp8_tensors(&self) -> Vec<Fp8Buffers> {
+        self.tensors
+            .iter()
+            .filter_map(|(name, stored)| {
+                let base = name.strip_suffix(".weight")?;
+                match (stored, self.tensors.get(&format!("{base}.scale"))?) {
+                    (Stored::Bytes(codes), Stored::Bytes(scales)) => {
+                        Some((Arc::clone(codes), Arc::clone(scales)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// What the Metal backend's FP8 linears and routed experts have run so
+    /// far, or `None` on the scalar backend.
+    #[cfg(feature = "metal")]
+    #[must_use]
+    pub fn device_counts(&self) -> Option<DeviceCounts> {
+        self.device.as_ref().map(|device| device.counts())
+    }
+
+    /// Returns the selected backend.
+    #[must_use]
+    pub const fn backend(&self) -> V41Backend {
+        self.backend
     }
 
     /// Assembles the request model. Requires every layer and the head. Steps
@@ -545,7 +637,7 @@ impl V41CheckpointWeights {
         )
         .map_err(component)?;
         // The source computes logits for the last position only.
-        Ok(RequestModel::from_schedule(
+        let model = RequestModel::from_schedule(
             startup,
             layers,
             engrams.unwrap_or_default(),
@@ -555,7 +647,18 @@ impl V41CheckpointWeights {
         )?
         .with_head_positions(HeadPositions::Last)
         // The startup and Engram per-step token bounds.
-        .with_max_step_tokens(nonzero(128)?))
+        .with_max_step_tokens(nonzero(128)?);
+        #[cfg(feature = "metal")]
+        let model = match &self.metal_head {
+            Some(head) => model.with_metal_head(head),
+            None => model,
+        };
+        #[cfg(feature = "metal")]
+        let model = match &self.device {
+            Some(device) => model.with_device_linears(Arc::clone(device)),
+            None => model,
+        };
+        Ok(model)
     }
 
     /// Runs one layer of a start-zero prefill on a caller-supplied input

@@ -52,6 +52,15 @@ pub use startup::{
 /// MLX encodes onto a shared default stream; two threads encoding at once
 /// crash the Metal driver. The lock is re-entrant per thread, so a holder can
 /// call code that locks again (a test holding it while running a routed forward).
+///
+/// Which forward work runs on the device is chosen separately, per request
+/// step: `RequestSession` enters a `precision::DeviceLinears` scope when its
+/// model carries one, and the FP8 linears and routed FP4 experts consult that
+/// scope through thread-local state. Outside a scope they are scalar, so
+/// building with `metal` changes nothing by itself. This assumes a step's
+/// forward runs on the one thread that entered the scope; work moved to
+/// another thread would silently run scalar. The scope guard is not `Send`,
+/// and debug builds assert that scopes do not nest and end on their thread.
 #[cfg(feature = "metal")]
 pub(crate) static DEVICE_LOCK: DeviceLock = DeviceLock(std::sync::Mutex::new(()));
 

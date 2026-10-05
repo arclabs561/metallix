@@ -4,13 +4,11 @@
 //! It has no fixture, checkpoint, or expected-output dependency.
 
 use std::sync::{Arc, OnceLock};
-#[cfg(feature = "metal")]
-use std::sync::{Mutex, PoisonError};
 
 use thiserror::Error;
 
 #[cfg(feature = "metal")]
-use crate::precision::{Fp8MetalError, Fp8MetalKernel, Fp8MetalWeights};
+use crate::precision::{Fp8MetalError, ResidentFp8};
 
 use crate::{
     engram::{
@@ -152,29 +150,10 @@ struct WeightsInner {
     k_weight: Vec<u16>,
     scan: OnceLock<Result<(), ScanFault>>,
     #[cfg(feature = "metal")]
-    metal_wkv: ResidentWkv,
-}
-
-/// The WKV weight uploaded for Metal on the first Metal step, then shared by
-/// every session built from these operands. MLX arrays are `Send` but not
-/// `Sync`, so the shared copy sits behind a lock.
-#[cfg(feature = "metal")]
-#[derive(Default)]
-struct ResidentWkv(Mutex<Option<Fp8MetalWeights>>);
-
-#[cfg(feature = "metal")]
-impl std::fmt::Debug for ResidentWkv {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let resident = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some();
-        formatter
-            .debug_struct("ResidentWkv")
-            .field("resident", &resident)
-            .finish()
-    }
+    /// The WKV weight uploaded for Metal on the first Metal step, then shared
+    /// by every session built from these operands.
+    #[cfg(feature = "metal")]
+    metal_wkv: ResidentFp8,
 }
 
 /// The first nonfinite value found by the shared operand scan.
@@ -242,7 +221,7 @@ impl EngramSessionWeights {
             k_weight,
             scan: OnceLock::new(),
             #[cfg(feature = "metal")]
-            metal_wkv: ResidentWkv::default(),
+            metal_wkv: ResidentFp8::default(),
         }))
     }
 }
@@ -596,24 +575,14 @@ impl EngramSession {
         reduction: usize,
         outputs: usize,
     ) -> Result<Vec<f32>, EngramSessionError> {
-        // A panic while holding the lock leaves either no upload or a complete one.
-        let mut resident = self
-            .weights
-            .0
-            .metal_wkv
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let weights = match &mut *resident {
-            Some(weights) => weights,
-            empty => empty.insert(Fp8MetalWeights::new(
-                &self.weights.0.wkv_codes,
-                &self.weights.0.wkv_scales,
-                outputs,
-                reduction,
-            )?),
-        };
-        match Fp8MetalKernel::new()?.forward(codes, scales, positions, weights) {
+        let inner = &self.weights.0;
+        match inner.metal_wkv.forward(
+            (codes, scales),
+            (&inner.wkv_codes, &inner.wkv_scales),
+            positions,
+            reduction,
+            outputs,
+        ) {
             // A nonfinite output is the scalar path's overflow at the same
             // row-major position, so callers see one error for either path.
             Err(Fp8MetalError::NonFiniteOutput { index }) => {
@@ -1176,7 +1145,7 @@ mod tests {
                 .expect("FP32 projection");
             runs.push((step, projected));
         }
-        let resident = weights.0.metal_wkv.0.lock().expect("lock").is_some();
+        let resident = weights.0.metal_wkv.is_resident();
         assert!(
             resident,
             "the Metal session uploaded and used the WKV weight"
@@ -1276,7 +1245,7 @@ mod tests {
             );
             assert_eq!(session.next_start(), 0, "a failed step commits nothing");
         }
-        let resident = weights.0.metal_wkv.0.lock().expect("lock").is_some();
+        let resident = weights.0.metal_wkv.is_resident();
         assert!(resident, "the Metal path ran");
     }
 

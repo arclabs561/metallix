@@ -9,8 +9,8 @@ use thiserror::Error;
 
 use crate::{
     precision::{
-        ActivationGroup, ActivationQuantError, Fp4LinearError, Fp8LinearError, bf16_to_f32,
-        f32_to_bf16_rne, fp4_linear_runtime_f32_owned, fp8_linear_runtime_f32,
+        ActivationGroup, ActivationQuantError, Fp4LinearError, Fp8ForwardError, Fp8LinearError,
+        bf16_to_f32, f32_to_bf16_rne, fp4_linear_runtime_f32_owned, fp8_linear_f32,
         quantize_bf16_activations_e4m3fn,
     },
     routing::{ExpertRoute, FlashGateProjectionError, flash_bf16_gate_routes},
@@ -643,6 +643,20 @@ pub enum MoEError {
     /// Existing BF16 gate projection or routing rejected the token.
     #[error(transparent)]
     Routing(#[from] FlashGateProjectionError),
+    /// Inside a device scope, a Metal FP8 linear or FP4 expert failed.
+    #[cfg(feature = "metal")]
+    #[error("Metal expert projection failed: {0}")]
+    Device(crate::precision::Fp8MetalError),
+}
+
+impl From<Fp8ForwardError> for MoEError {
+    fn from(error: Fp8ForwardError) -> Self {
+        match error {
+            Fp8ForwardError::Scalar(error) => Self::Fp8(error),
+            #[cfg(feature = "metal")]
+            Fp8ForwardError::Device(error) => Self::Device(error),
+        }
+    }
 }
 
 fn validate_width(field: &'static str, width: usize) -> Result<(), MoEError> {
@@ -790,7 +804,7 @@ fn fp8_projection(
         &mut activation_scales,
     )?;
     let mut projected = allocate_f32("FP8 projection", output_width)?;
-    fp8_linear_runtime_f32(
+    fp8_linear_f32(
         &activation_codes,
         &activation_scales,
         codes,
@@ -804,7 +818,50 @@ fn fp8_projection(
     narrow_row(&projected, "FP8 linear output")
 }
 
+/// The routed expert: on the device inside a `DeviceLinears`
+/// scope, scalar otherwise or when the device cannot run it.
 fn project_fp4_expert(
+    input: &[u16],
+    expert: &Fp4ExpertWeights<'_>,
+    swiglu_limit: f32,
+    route_weight: Option<f32>,
+) -> Result<Vec<u16>, MoEError> {
+    #[cfg(feature = "metal")]
+    if let Some(device) = crate::precision::active_device() {
+        let mut codes = allocate_u8("FP4 expert activation codes", input.len())?;
+        let mut scales = allocate_u8("FP4 expert activation scales", input.len() / GROUP_WIDTH)?;
+        quantize_bf16_activations_e4m3fn(
+            input,
+            1,
+            expert.hidden_width,
+            ActivationGroup::Elements32,
+            &mut codes,
+            &mut scales,
+        )?;
+        match crate::precision::metal_fp4_expert(
+            (&codes, &scales),
+            expert.hidden_width,
+            expert.intermediate_width,
+            (expert.w1_codes, expert.w1_scales),
+            (expert.w2_codes, expert.w2_scales),
+            (expert.w3_codes, expert.w3_scales),
+            swiglu_limit,
+            route_weight,
+        )
+        .map_err(MoEError::Device)?
+        {
+            Some(output) => {
+                device.count_fp4_expert();
+                return Ok(output);
+            }
+            None => device.count_fallback(),
+        }
+    }
+    project_fp4_expert_scalar(input, expert, swiglu_limit, route_weight)
+}
+
+/// The scalar routed expert: the reference the device path is checked against.
+pub(crate) fn project_fp4_expert_scalar(
     input: &[u16],
     expert: &Fp4ExpertWeights<'_>,
     swiglu_limit: f32,

@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use crate::{
     RotaryDirection, RotaryFrequency, RotaryTailLayout,
     precision::{
-        ActivationGroup, f32_to_bf16_rne, fp8_linear_runtime_f32, quantize_bf16_activations_e4m3fn,
+        ActivationGroup, f32_to_bf16_rne, fp8_linear_f32, quantize_bf16_activations_e4m3fn,
     },
     rms_norm_bf16_reference, rotate_tail,
 };
@@ -46,7 +46,7 @@ pub(super) fn fp8_project_bf16(
         &mut scales,
     )?;
     let mut fp32 = vec![0.0; output_elements];
-    fp8_linear_runtime_f32(
+    fp8_linear_f32(
         &codes,
         &scales,
         projection.codes,

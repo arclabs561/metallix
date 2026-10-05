@@ -132,20 +132,35 @@ impl<'a> BlockDefinition<'a> {
 pub struct EngramDefinition {
     config: EngramSessionConfig,
     weights: EngramSessionWeights,
+    #[cfg(feature = "metal")]
+    metal_wkv: bool,
 }
 
 impl EngramDefinition {
     /// Takes owned Engram configuration and numerical weights for fresh sessions.
     #[must_use]
     pub const fn new(config: EngramSessionConfig, weights: EngramSessionWeights) -> Self {
-        Self { config, weights }
+        Self {
+            config,
+            weights,
+            #[cfg(feature = "metal")]
+            metal_wkv: false,
+        }
+    }
+
+    /// Builds every session with [`EngramSession::with_metal_wkv`].
+    #[cfg(feature = "metal")]
+    #[must_use]
+    pub const fn with_metal_wkv(mut self, enabled: bool) -> Self {
+        self.metal_wkv = enabled;
+        self
     }
 
     pub(super) fn session(&self) -> Result<EngramSession, RequestError> {
-        Ok(EngramSession::new(
-            self.config.clone(),
-            self.weights.clone(),
-        )?)
+        let session = EngramSession::new(self.config.clone(), self.weights.clone())?;
+        #[cfg(feature = "metal")]
+        let session = session.with_metal_wkv(self.metal_wkv);
+        Ok(session)
     }
 }
 

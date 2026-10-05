@@ -8,7 +8,7 @@ use crate::{
         AttentionOutputError, AttentionOutputLayoutError, SparseAttentionBf16Error,
         SparseAttentionError, window::WindowError,
     },
-    precision::{ActivationQuantError, ActivationRoundtripError, Fp8LinearError},
+    precision::{ActivationQuantError, ActivationRoundtripError, Fp8ForwardError, Fp8LinearError},
 };
 
 use super::MAX_LAYER_ATTENTION_ELEMENTS;
@@ -51,6 +51,10 @@ pub enum LayerAttentionError {
     ActivationQuant(#[from] ActivationQuantError),
     #[error(transparent)]
     Fp8Linear(#[from] Fp8LinearError),
+    /// Inside a device scope, a Metal FP8 projection failed.
+    #[cfg(feature = "metal")]
+    #[error("Metal FP8 projection failed: {0}")]
+    Fp8Device(crate::precision::Fp8MetalError),
     #[error(transparent)]
     Norm(#[from] crate::RmsNormError),
     #[error(transparent)]
@@ -132,4 +136,14 @@ pub enum LayerAttentionError {
     NonFiniteProjection { element: usize },
     #[error("rotary result was nonfinite after BF16 narrowing at tail element {element}")]
     NonFiniteRotary { element: usize },
+}
+
+impl From<Fp8ForwardError> for LayerAttentionError {
+    fn from(error: Fp8ForwardError) -> Self {
+        match error {
+            Fp8ForwardError::Scalar(error) => Self::Fp8Linear(error),
+            #[cfg(feature = "metal")]
+            Fp8ForwardError::Device(error) => Self::Fp8Device(error),
+        }
+    }
 }

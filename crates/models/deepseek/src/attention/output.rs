@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::{
     RotaryDirection, RotaryError, RotaryFrequency, RotaryTailLayout,
     precision::{
-        ActivationGroup, ActivationQuantError, Bf16LinearError, Fp8LinearError,
-        bf16_linear_reference, fp8_linear_runtime_f32, quantize_bf16_activations_e4m3fn,
+        ActivationGroup, ActivationQuantError, Bf16LinearError, Fp8ForwardError, Fp8LinearError,
+        bf16_linear_reference, fp8_linear_f32, quantize_bf16_activations_e4m3fn,
     },
     rotate_tail,
 };
@@ -282,6 +282,20 @@ pub enum AttentionOutputError {
     /// The FP8 `wo_b` FP32 output could not narrow to finite BF16 storage.
     #[error("attention-output wo_b result was nonfinite at element {element}")]
     NonFiniteWoBOutput { element: usize },
+    /// Inside a device scope, the Metal `wo_b` linear failed.
+    #[cfg(feature = "metal")]
+    #[error("Metal wo_b linear failed: {0}")]
+    WoBDevice(crate::precision::Fp8MetalError),
+}
+
+impl From<Fp8ForwardError> for AttentionOutputError {
+    fn from(error: Fp8ForwardError) -> Self {
+        match error {
+            Fp8ForwardError::Scalar(error) => Self::WoB(error),
+            #[cfg(feature = "metal")]
+            Fp8ForwardError::Device(error) => Self::WoBDevice(error),
+        }
+    }
 }
 
 /// Composes V4.1 inverse `RoPE`, grouped BF16 `wo_a`, and FP8 `wo_b`.
@@ -361,7 +375,7 @@ pub(crate) fn attention_output_reference(
         &mut activation_scales,
     )?;
     let mut fp32_output = vec![0.0_f32; layout.output_elements()?];
-    fp8_linear_runtime_f32(
+    fp8_linear_f32(
         &activation_codes,
         &activation_scales,
         wo_b_codes,
