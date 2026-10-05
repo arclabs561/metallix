@@ -276,6 +276,13 @@ impl Qwen3MlxWeights {
         )
     }
 
+    /// Returns whether this checkpoint's decoder attends causally or
+    /// bidirectionally, which decides the pooling it was trained for.
+    #[must_use]
+    pub fn attention(&self) -> crate::Qwen3Attention {
+        self.forward_config.attention()
+    }
+
     fn require_attention(
         &self,
         required: crate::Qwen3Attention,

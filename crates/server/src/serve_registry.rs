@@ -9,6 +9,7 @@ use serde_json::Value;
 use crate::{
     chat_generation::{ChatBackend, ChatSession, ResidentChatLimits},
     julia_decisions::JuliaDecider,
+    pplx_context_embeddings::PplxContextEmbedder,
     qwen_decisions,
     qwen_embeddings::QwenEmbedder,
 };
@@ -24,6 +25,9 @@ pub(crate) enum ModelKind {
     Julia,
     /// Qwen3-Embedding checkpoint: `/v1/embeddings` only.
     QwenEmbedding,
+    /// pplx-embed-context checkpoint: `/v1/embeddings` with one vector per
+    /// chunk of each document.
+    PplxContext,
 }
 
 impl ModelKind {
@@ -35,7 +39,7 @@ impl ModelKind {
         match self {
             Self::Qwen => &["generate", "decide"],
             Self::Julia => &["decide"],
-            Self::QwenEmbedding => &["embed"],
+            Self::QwenEmbedding | Self::PplxContext => &["embed"],
         }
     }
 }
@@ -191,6 +195,20 @@ impl ModelWorker for QwenEmbedder {
     }
 }
 
+impl ModelWorker for PplxContextEmbedder {
+    fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+        None
+    }
+
+    fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
+
+    fn embed(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+        Some(PplxContextEmbedder::embed(self, body, model))
+    }
+}
+
 pub(crate) fn load(
     entry: &ServedEntry,
     limits: ResidentChatLimits,
@@ -199,6 +217,7 @@ pub(crate) fn load(
         ModelKind::Qwen => Box::new(ChatSession::load(&entry.path, limits)?),
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
         ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
+        ModelKind::PplxContext => Box::new(PplxContextEmbedder::load(&entry.path)?),
     })
 }
 
@@ -222,6 +241,12 @@ mod tests {
         );
         assert!(!parsed[0].kind.generates());
         assert_eq!(ModelKind::Qwen.capabilities(), ["generate", "decide"]);
+        let context =
+            parse_manifest(br#"{"models": [{"id": "c", "kind": "pplx_context", "path": "/c"}]}"#)
+                .unwrap();
+        assert_eq!(context[0].kind, ModelKind::PplxContext);
+        assert_eq!(context[0].kind.capabilities(), ["embed"]);
+        assert!(!context[0].kind.generates());
 
         let shorthand = entries(None, Some(Path::new("/q")), "qwen").unwrap();
         assert_eq!(shorthand[0].kind, ModelKind::Qwen);

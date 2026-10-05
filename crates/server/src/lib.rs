@@ -26,6 +26,8 @@ mod inspect;
 mod julia_decisions;
 mod model_registry;
 #[cfg(feature = "metal")]
+mod pplx_context_embeddings;
+#[cfg(feature = "metal")]
 mod qwen_decisions;
 #[cfg(feature = "metal")]
 mod qwen_embeddings;
