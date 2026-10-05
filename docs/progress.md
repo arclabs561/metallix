@@ -11,6 +11,66 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+- The real 17-token held-shell prompt now prefills end to end and predicts
+  the source's greedy token (id 1; native logit 20.07 against the source's
+  18.09), through bounded steps: the first step takes up to 128 tokens and
+  later tokens decode one at a time, because layer attention does not yet
+  accept multi-token steps after the first. Chained per-layer cosine against
+  the source is 0.984 at layer 10 and 0.929 at layer 38, less drift than the
+  3-token prompt (0.70 at layer 38). Startup's real per-step limit had been
+  51 tokens, not about 204; it now has an explicit 128-token bound, matching
+  the Engram step bound. On the CPU path the run takes 1,904 s (c95dda3).
+
+- Profile-driven CPU work, all bit-identical to the previous outputs: the
+  scalar FP8 and FP4 linears computed every output twice (an overflow-check
+  pass, then a write pass) and decoded each code per product; single-pass
+  computation, decode tables and once-per-row activation decoding make FP8
+  about 8-10x and FP4 3-7x faster at the real shapes (a07c6bc, 0018420,
+  556ada1). The end-to-end profile had put FP8 linears at about 72% of model
+  time and SHA-256 weight verification at 11%; the local store now hashes a
+  tensor once per process and refuses a file whose ctime, device or inode
+  changed after verification (6e7255b, 9c4fe1e), taking an uncached
+  embedding-row step from about 3.8 s to 6.5 ms.
+
+- Opt-in Metal paths, not yet wired into requests: the final head (FP32
+  weights resident, 7.2 ms per step against about 430 ms scalar; 655c227,
+  3c8cb09) and the Engram WKV projection through the existing FP8 kernel
+  (about 95x; d5781fc, 33bcd03). The WKV tolerance was replaced after a
+  failure caused by cancellation (sum of |terms| 2.5e7 for a 1.8e4 result);
+  both paths are then checked against an f64 reference, and an injected bias
+  shows the check can fail.
+
+- Embeddings now cover all three requested scopes: Qwen3-Embedding with
+  instructions and Matryoshka dimensions, batched per request (16 short
+  inputs 137 ms to 30 ms over HTTP; b309825); contextual chunk embeddings with
+  pplx-embed-context-v1-0.6b (49281c1); and multi-vector late interaction with
+  pplx-embed-v1-late-0.6b (c78e8d5), plus `POST /v1/rerank` scoring with MaxSim
+  (95ade8c). Each matches a pinned source oracle within tolerances declared
+  before its first native run. See [embeddings](embeddings.md).
+
+- MLX 0.25 (mlx-sys 0.2.0) returns wrong rows from causal fast attention for
+  batches of two or more sequences with 2 to 8 positions at head width 64 or
+  128; batched embeddings pad such batches to 9 positions, and
+  `tests/mlx_short_batch_attention.rs` asserts the bug so the planned MLX 0.32
+  upgrade (which fixes it) flips that test.
+
+- Results that did not pan out, recorded so they are not retried blindly:
+  FP8 scalar runs at about 0.75 ns per multiply-add for one row under the
+  fixed summation order even with no table lookup in the inner loop; a
+  65536-entry pair table, 64-bit lane extraction and a 4x unroll were all
+  1.2-1.4x slower. Reusing a decoded weight column across rows gives 1.7x
+  only when more than one row is computed, and was not kept because prefill
+  is moving to Metal. The BF16 `wo_a` linear is one 4096-long dependent add
+  chain near its floor and was left alone.
+
+- Corrections to commit messages in this range: 0018420 and 2d9074e say FP8
+  is bound by a serial add chain; it is not, since each 32-element block is
+  an independent chain (556ada1 explains). f8239f8 puts the one-time cost of
+  `local_embedding_rows_cold` under `cargo test` at about 3.8 s; it was about
+  11.4 s (three rows), and is moot since 6e7255b. 6e7255b says concurrent
+  first reads of one tensor can both hash it; a per-tensor gate already
+  prevented that (9c4fe1e).
+
 - One real DeepSeek-V4.1 request step now runs end to end through the
   library: `RequestSession::step_with_sources` over all 40 layers, built from
   checkpoint tensors by `reduced::checkpoint_model`, with routed experts,
