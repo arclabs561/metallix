@@ -292,7 +292,8 @@ Relevant work (Firecrawl arXiv index):
   [distinct-leaf enumeration (2604.20500)](https://arxiv.org/abs/2604.20500)
   make many samples from one prompt cheap and non-redundant.
 - Sequential Monte Carlo steering ([2306.03081](https://arxiv.org/abs/2306.03081),
-  [twisted SMC (2507.02315)](https://arxiv.org/abs/2507.02315)) already informs
+  [twisted SMC (2404.17546)](https://arxiv.org/abs/2404.17546),
+  [self-distilled twisted SMC (2507.02315)](https://arxiv.org/abs/2507.02315)) already informs
   Metallix's [sampling gates](sampling-next-gates.md).
 
 Hypotheses specific to an expert-streaming Mac (untested):

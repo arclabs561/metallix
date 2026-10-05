@@ -16,7 +16,9 @@ arXiv:2602.10273v2, 23 March 2026.  This memo covers the complete v2 HTML
 article: sections 1--8 and appendices A--E, including equations, proof,
 algorithm, cost model, experimental setup, and cache/EOS appendices.  The
 rendered HTML was used because it exposes the same versioned mathematical
-content; no claim here depends on uninspected PDF-only material.
+content; no claim here depends on uninspected PDF-only material. A v3 was
+posted on 2 October 2026 and has not been read; recheck this memo against it
+before relying on version-specific details.
 
 ## What distribution it targets
 

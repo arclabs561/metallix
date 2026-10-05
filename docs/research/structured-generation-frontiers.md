@@ -29,7 +29,12 @@ for constrained decoding. AICI is broader: token masks, forced tokens,
 backtracking, generation forks and controller communication. Its Wasm runtime
 and process protocol are not prerequisites for native Rust grammar masking.
 GitHub metadata reports `archived: false` and last push 2025-01-22; low recent
-activity is not the same as repository archival.
+activity is not the same as repository archival. Its vLLM integration
+([PR 2888](https://github.com/vllm-project/vllm/pull/2888)) closed unmerged and
+listed fast-forward, backtracking and forking as unsupported; the tracking
+issue ([3714](https://github.com/vllm-project/vllm/issues/3714)) closed as not
+planned. See the [infilling plan](infilling-distribution-match.md#prompts-as-programs)
+for the typed-operation alternative.
 
 The transferable idea is to keep generation control separate from model
 execution, with tokenizer-specific state. Ordinary masked sampling comes first.
@@ -43,6 +48,10 @@ LLGuidance's [fast-forward discussion](https://github.com/guidance-ai/llguidance
 explains why known bytes cannot simply be encoded independently and appended:
 alternate tokenization and boundary healing affect which tokens can be forced.
 Qualify exact tokenizer bytes and ordinary masks before enabling fast-forward.
+Fast-forwarded tokens also carry probability: under a global target their
+model log probabilities belong in the importance weight, so a fast-forward
+path needs per-position log probabilities, not unit weight
+([infilling plan](infilling-distribution-match.md#the-target-and-its-weight)).
 
 XGrammar's [matcher API](https://github.com/mlc-ai/xgrammar/blob/d02ad2b155a5f0c3eaa711950d154218d982ae7e/include/xgrammar/matcher.h)
 separates compiled grammar from mutable matching and exposes fork, rollback and
@@ -96,6 +105,9 @@ There is a separate distribution question:
 valid-token masking from sampling the original model conditioned on the whole
 output satisfying a grammar. They are not generally equivalent. This pass
 checked its abstract only; no implementation or convergence claim is adopted.
+A later read of §§2-4 found its KL measure is computed from a 500-sample
+window, not an enumerated target; see the
+[infilling plan](infilling-distribution-match.md#how-to-tell-whether-a-sampler-matches).
 
 [DCCD, arXiv:2603.03305v2](https://arxiv.org/html/2603.03305v2), separates semantic
 planning from structural realization: generate an unconstrained draft, then

@@ -159,6 +159,11 @@ capabilities.
 
 ## Gates and recommendation
 
+Revised 2026-10-05: the first candidate is now SDAR, a Qwen3-shaped
+block-diffusion model, with Dream second; see the
+[infilling plan](infilling-distribution-match.md#diffusion-models). The gates
+below still apply, with SDAR substituted for Dream in the real-model gate.
+
 **Do not start runtime work before the V4.1 text execution gate.**  After that,
 prefer Dream 7B for the first real candidate because its observed model-card
 license is Apache-2.0 and it exposes Safetensors; its `trust_remote_code`

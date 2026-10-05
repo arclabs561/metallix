@@ -281,6 +281,14 @@ predeclared distribution/quality gain, do not pursue particle serving on this
 Mac. DeepSeek V4.1 Flash forward and cache qualification still take precedence
 over all three gates.
 
+The [infilling plan](infilling-distribution-match.md#stop-rule-made-concrete)
+proposes the predeclared gain: at matched forward tokens, SMC must beat
+reweighted best-of-N by more than a null band on an enumerated template where
+middle text is informative, and must not on one where only the final text is.
+It also moves the `N=2` latency check after batched decode, since two
+sequential single-row forwards would measure missing batching rather than
+particle cost.
+
 ## Fresh GenLM Control check: integration traps
 
 Fresh primary-source read on 2026-09-11: `genlm-control` main commit

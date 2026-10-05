@@ -17,6 +17,7 @@ explicit gaps, not retrospectively pinned evidence.
 | Which mathematical proposals survived checking, and what remains hypothetical? | [Math corrections and experiment gates](math-validation.md) |
 | Which precision and quantization ideas are faithful formats versus new quality experiments? | [Quantization and precision](quantization-precision.md) |
 | What gates separate categorical sampling, particle control, and calibrated uncertainty? | [Sampling implementation gates](sampling-next-gates.md) |
+| How should multi-slot infilling sample the model's own conditional, and how is that measured? | [Infilling and distribution matching](infilling-distribution-match.md) |
 | How would diffusion text generation differ from the token-step decoder? | [Diffusion text models](diffusion-text.md) |
 | Which other runtimes offer ideas worth testing? | [Runtime patterns](reusable-runtime-patterns.md) |
 | What have we reproduced for V4.1? | [Sparse-indexer qualification](../experiments/v41-candidates.md) |
