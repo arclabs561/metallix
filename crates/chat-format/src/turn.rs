@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     messages::ChatToolCall,
-    tools::{self, ParsedTurn, json_in_tags},
+    tools::{self, ParsedTurn, json_in_tags, minicpm_xml},
 };
 
 /// How a template tells the model to write tool calls.
@@ -19,6 +19,8 @@ use crate::{
 pub enum ToolDialect {
     /// `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` (Qwen3).
     JsonInTags,
+    /// `<function name="NAME"><param name="K">V</param></function>` (`MiniCPM5`).
+    MiniCpmXml,
     /// No calls are parsed; the whole answer is text.
     PlainText,
 }
@@ -27,7 +29,7 @@ pub enum ToolDialect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningDialect {
-    /// `<think>...</think>` (Qwen3).
+    /// `<think>...</think>` (Qwen3, `MiniCPM5`).
     ThinkTags,
     /// No reasoning is split from the answer.
     None,
@@ -52,11 +54,17 @@ impl TurnFormat {
     #[must_use]
     pub fn from_template(source: &str) -> Self {
         let spells = |markers: &[&str]| markers.iter().all(|marker| source.contains(marker));
-        let tools: Vec<ToolDialect> = [(ToolDialect::JsonInTags, &["<tool_call>"][..])]
-            .into_iter()
-            .filter(|(_, markers)| spells(markers))
-            .map(|(dialect, _)| dialect)
-            .collect();
+        let tools: Vec<ToolDialect> = [
+            (ToolDialect::JsonInTags, &["<tool_call>"][..]),
+            (
+                ToolDialect::MiniCpmXml,
+                &["<function name=", "<param name="],
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, markers)| spells(markers))
+        .map(|(dialect, _)| dialect)
+        .collect();
         let reasoning = if spells(&["<think>", "</think>"]) {
             ReasoningDialect::ThinkTags
         } else {
@@ -73,9 +81,12 @@ impl TurnFormat {
 }
 
 impl ToolDialect {
-    fn parse(self, answer: &str) -> Result<ParsedTurn, String> {
+    /// `tools` give parameter types to dialects that write every value as
+    /// text.
+    fn parse(self, answer: &str, tools: &[Value]) -> Result<ParsedTurn, String> {
         match self {
             Self::JsonInTags => json_in_tags::parse(answer),
+            Self::MiniCpmXml => minicpm_xml::parse(answer, tools),
             Self::PlainText => Ok(ParsedTurn {
                 text: answer.to_owned(),
                 calls: Vec::new(),
@@ -131,7 +142,7 @@ pub fn parse_turn(
     } else {
         ("", text)
     };
-    let turn = format.tools.parse(answer)?;
+    let turn = format.tools.parse(answer, tools)?;
     if !turn.calls.is_empty() && !complete {
         return Err("truncated tool turn; no function calls returned".into());
     }
@@ -165,6 +176,8 @@ mod tests {
     use crate::ChatToolCall;
 
     const QWEN3_TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
+    const MINICPM5_TEMPLATE: &str =
+        include_str!("../../../fixtures/minicpm5-2b/chat-template.jinja");
 
     const QWEN3: TurnFormat = TurnFormat {
         tools: ToolDialect::JsonInTags,
@@ -185,6 +198,30 @@ mod tests {
             TurnFormat::from_template("{{ messages }}"),
             TurnFormat::PLAIN
         );
+        assert_eq!(
+            TurnFormat::from_template(MINICPM5_TEMPLATE),
+            TurnFormat {
+                tools: ToolDialect::MiniCpmXml,
+                reasoning: ReasoningDialect::ThinkTags,
+            }
+        );
+        // A template spelling two dialects' markers selects neither.
+        assert_eq!(
+            TurnFormat::from_template(&format!("{QWEN3_TEMPLATE}{MINICPM5_TEMPLATE}")).tools,
+            ToolDialect::PlainText
+        );
+    }
+
+    /// `MiniCPM5-2B`'s greedy output for the `chat_tool_call` reference
+    /// case, up to its `<|im_end|>` stop token.
+    #[test]
+    fn minicpm5_reference_call_parses_and_qwen3_leaves_it_as_text() {
+        let text = r#"<function name="read_file"><param name="path">README.md</param></function>"#;
+        let minicpm5 = TurnFormat::from_template(MINICPM5_TEMPLATE);
+        let turn = parse_turn(minicpm5, text, &read_file(), false, true).unwrap();
+        assert_eq!(turn.calls[0].arguments, json!({"path":"README.md"}));
+        let qwen3 = parse_turn(QWEN3, text, &read_file(), false, true).unwrap();
+        assert!(qwen3.calls.is_empty());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source": {
+    "model_id": "openbmb/MiniCPM5-2B",
+    "revision": "f97400052a43d642bbc6e9975e2397e3ae6a6b52",
+    "field": "chat_template.jinja",
+    "tokenizer_config_sha256": "e9b1064649e771d7a8e15637c68b2d2749724877ba3648bd74a4ece31c26303b",
+    "template_sha256": "bc1f78ef8a86b6bdf64a056cf89dd0ac506db4f198ab363d85168e2500ab44dd",
+    "bos_token": "<s>",
+    "eos_token": "</s>"
+  }
+}

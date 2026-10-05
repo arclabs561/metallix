@@ -2,6 +2,7 @@
 //! validation. Reached only through [`crate::parse_turn`].
 
 pub(crate) mod json_in_tags;
+pub(crate) mod minicpm_xml;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -22,6 +23,36 @@ pub(crate) struct ToolCall {
 pub(crate) struct ParsedTurn {
     pub(crate) text: String,
     pub(crate) calls: Vec<ToolCall>,
+}
+
+/// Types a parameter written as text, for dialects that write every value as
+/// text. A value is a JSON string when the tool schema types the parameter
+/// `string`, and is otherwise decoded as JSON when it parses, as `SGLang`'s
+/// `minicpm5` and vLLM's `qwen3_coder` parsers do; schema validation
+/// follows. Templates print non-string history values with Python's `str`,
+/// so the bare literals `True`, `False` and `None` are accepted too.
+fn typed_parameter(tools: &[Value], function: &str, key: &str, raw: String) -> Value {
+    let declared = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == function)
+        .map(|tool| &tool["function"]["parameters"]["properties"][key]["type"]);
+    let is_string = match declared {
+        Some(Value::String(kind)) => kind == "string",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "string"),
+        _ => false,
+    };
+    if is_string {
+        return Value::String(raw);
+    }
+    if let Ok(value) = serde_json::from_str(&raw) {
+        return value;
+    }
+    match raw.as_str() {
+        "True" => Value::Bool(true),
+        "False" => Value::Bool(false),
+        "None" => Value::Null,
+        _ => Value::String(raw),
+    }
 }
 
 /// Compile only bounded local schemas; tool schemas must not cause retrieval.
@@ -52,6 +83,14 @@ pub fn validator(schema: &Value) -> Result<jsonschema::Validator, String> {
     }
     check_refs(schema)?;
     jsonschema::validator_for(schema).map_err(|e| format!("invalid tool schema: {e}"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_definitions() -> Vec<Value> {
+    vec![
+        serde_json::json!({"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}),
+        serde_json::json!({"type":"function","function":{"name":"list_files","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}),
+    ]
 }
 
 #[cfg(test)]

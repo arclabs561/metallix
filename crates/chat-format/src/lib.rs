@@ -203,6 +203,21 @@ impl SpecialTokens {
             eos: token("eos_token")?,
         })
     }
+
+    /// Spellings without IDs, for template tests that load no tokenizer.
+    #[cfg(test)]
+    fn spelled(bos: Option<&str>, eos: Option<&str>) -> Self {
+        let token = |text: Option<&str>| {
+            text.map(|text| SpecialToken {
+                text: text.to_owned(),
+                id: TokenId::new(0),
+            })
+        };
+        Self {
+            bos: token(bos),
+            eos: token(eos),
+        }
+    }
 }
 
 /// Everything a chat template sees. Built only by [`ChatTemplate::render`],
@@ -548,7 +563,7 @@ mod tests {
         TokenClass, TokenId, load_template, read_json,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
-    use crate::{ChatMessage, ChatRole, Conversation};
+    use crate::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation};
 
     fn render(format: &ChatFormat, content: &str) -> String {
         let messages = [ChatMessage::text(ChatRole::User, content)];
@@ -637,6 +652,97 @@ mod tests {
             ),
             Ok(String::from("ok"))
         );
+    }
+
+    /// The `MiniCPM5` template, rendered with its special tokens from typed
+    /// messages, equals transformers' `apply_chat_template` byte for byte,
+    /// leading `<s>` included (fixture from `scripts/minicpm5-reference.py`).
+    #[test]
+    fn minicpm5_template_matches_transformers_rendering() {
+        const TEMPLATE: &str = include_str!("../../../fixtures/minicpm5-2b/chat-template.jinja");
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/minicpm5-2b/logit-reference.json"
+        ))
+        .expect("fixture JSON");
+        let template = ChatTemplate::parse(
+            TEMPLATE.to_owned(),
+            SpecialTokens::spelled(Some("<s>"), Some("</s>")),
+        )
+        .expect("MiniCPM5 template parses");
+        assert_eq!(
+            template.sha256(),
+            fixture["reference"]["chat_template_sha256"]
+                .as_str()
+                .expect("hash")
+        );
+        let message = |value: &Value| -> ChatMessage {
+            let content = value["content"].as_str().unwrap_or_default();
+            match value["role"].as_str().expect("role") {
+                "system" => ChatMessage::text(ChatRole::System, content),
+                "user" => ChatMessage::text(ChatRole::User, content),
+                "tool" => ChatToolResult {
+                    tool_call_id: String::from("call_0"),
+                    name: None,
+                    content: content.to_owned(),
+                }
+                .into_message(),
+                _ => ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: content.to_owned(),
+                    reasoning_content: None,
+                    tool_calls: value["tool_calls"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|call| ChatToolCall {
+                            name: call["function"]["name"].as_str().expect("name").to_owned(),
+                            arguments: call["function"]["arguments"].clone(),
+                        })
+                        .collect(),
+                    tool_call_id: None,
+                    name: None,
+                },
+            }
+        };
+        // The logit case `chat_user` plus the render-only cases.
+        let chat_user = &fixture["cases"][2];
+        assert_eq!(chat_user["name"], "chat_user");
+        let mut cases = vec![json!({
+            "name": "chat_user",
+            "messages": [{"role": "user", "content": "What is the capital of France? Answer in one word."}],
+            "rendered": chat_user["rendered"],
+        })];
+        cases.extend(
+            fixture["template_cases"]
+                .as_array()
+                .expect("template cases")
+                .iter()
+                .cloned(),
+        );
+        assert_eq!(cases.len(), 5);
+        for case in &cases {
+            let messages: Vec<ChatMessage> = case["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(message)
+                .collect();
+            let tools: Vec<Value> = case["tools"].as_array().cloned().unwrap_or_default();
+            let conversation = Conversation {
+                messages: &messages,
+                tools: &tools,
+                enable_thinking: case["enable_thinking"].as_bool().unwrap_or(false),
+                reasoning_effort: None,
+            };
+            let rendered = template.render(conversation, true).expect("renders");
+            assert!(rendered.starts_with("<s>"), "{}", case["name"]);
+            assert_eq!(
+                rendered,
+                case["rendered"].as_str().expect("rendered"),
+                "{}",
+                case["name"]
+            );
+        }
     }
 
     /// `MiniCPM5` lists `eos_token_id: [1, 130073]` and Gemma 4 `[1, 106, 50]`;
