@@ -22,6 +22,8 @@ mod commands;
 mod decision_cli;
 mod deepseek_reduced_cli;
 #[cfg(feature = "metal")]
+mod generation_routes;
+#[cfg(feature = "metal")]
 mod http_transport;
 mod inspect;
 #[cfg(feature = "metal")]

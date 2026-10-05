@@ -18,10 +18,11 @@ use serde_json::{Value, json};
 use tracing::field::Empty;
 
 use crate::{
-    chat_generation::{ChatMessage, ResidentChatLimits},
+    chat_generation::ResidentChatLimits,
+    generation_routes::Generation,
     gpu,
     http_transport::{Connection, TransportLimits},
-    responses::{Request, echo_request_id, json_response, messages, respond, tools},
+    responses::{echo_request_id, json_response},
     serve_registry::{self, ModelWorker, ServedEntry},
     trace_context::RequestContext,
 };
@@ -87,9 +88,8 @@ struct GenerationJob {
 
 enum Work {
     Respond {
-        request: Box<Request>,
-        messages: Vec<ChatMessage>,
-        tools: Vec<Value>,
+        generation: Box<Generation>,
+        /// The server-unique suffix each protocol prefixes with its own style.
         id: String,
         generation_timeout: Duration,
     },
@@ -175,9 +175,7 @@ fn run_job(
     let request_id = connection.request_id().map(str::to_owned);
     match work {
         Work::Respond {
-            request,
-            messages,
-            tools,
+            generation,
             id,
             generation_timeout,
         } => {
@@ -191,15 +189,7 @@ fn run_job(
                 unsupported_response(connection, "generate");
                 return;
             };
-            if let Err(error) = respond(
-                connection,
-                &request,
-                &messages,
-                &tools,
-                session,
-                &id,
-                generation_timeout,
-            ) {
+            if let Err(error) = generation.respond(connection, session, &id, generation_timeout) {
                 span.record("error.type", "response_failed");
                 tracing::warn!("response failed: {error}");
             }
@@ -591,7 +581,7 @@ fn serve_models(
                 json_response(connection, 200, &json!({"object":"list","data":data}));
                 continue;
             }
-            ("POST", "/v1/responses") => "generate",
+            ("POST", path) if Generation::serves(path) => "generate",
             ("POST", "/v1/decisions") => "decide",
             ("POST", "/v1/embeddings") => "embed",
             ("POST", "/v1/rerank") => "rerank",
@@ -614,20 +604,17 @@ fn serve_models(
         );
         let generation = capability == "generate";
         let parsed = if generation {
-            serde_json::from_slice::<Request>(&request.body)
-                .map(|parsed| (parsed.model.clone(), Some(parsed)))
+            Generation::parse(&request.path, &request.body)
+                .map(|(model, generation)| (model, Some(generation)))
         } else {
             serde_json::from_slice::<DecisionTarget>(&request.body)
                 .map(|target| (target.model, None))
+                .map_err(|error| json!({"error":{"message":error.to_string()}}))
         };
         let (model_id, parsed) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
-                json_response(
-                    connection,
-                    400,
-                    &json!({"error":{"message":error.to_string()}}),
-                );
+                json_response(connection, 400, &error);
                 continue;
             }
         };
@@ -645,20 +632,9 @@ fn serve_models(
                 unsupported_response(connection, "generate");
                 continue;
             }
-            let prepared = messages(&parsed)
-                .and_then(|messages| tools(&parsed).map(|tools| (messages, tools)));
-            let (messages, tools) = match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    json_response(connection, 400, &json!({"error":{"message":error}}));
-                    continue;
-                }
-            };
             Work::Respond {
-                request: Box::new(parsed),
-                messages,
-                tools,
-                id: format!("resp_{}_{}", std::process::id(), index),
+                generation: Box::new(parsed),
+                id: format!("{}_{}", std::process::id(), index),
                 generation_timeout,
             }
         } else {
@@ -718,7 +694,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::chat_generation::{ChatFinishReason, ChatGenerationError, ChatRequest};
+    use crate::{
+        chat_generation::{ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest},
+        responses::{Request, messages, respond, tools},
+    };
 
     #[derive(Default)]
     struct DeadlineBackend {

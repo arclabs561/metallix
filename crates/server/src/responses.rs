@@ -146,16 +146,28 @@ const KNOWN_INCLUDES: [&str; 8] = [
     LOGPROBS_INCLUDE,
 ];
 
+/// Maps an `OpenAI` reasoning effort onto Qwen's binary `enable_thinking`:
+/// absent, `none` and `minimal` keep thinking off; `low` through `max` turn it
+/// on and are passed to the template as `reasoning_effort`, which the stock
+/// Qwen3 template ignores. An unknown effort is returned as the error.
+pub(crate) fn thinking_for_effort(effort: Option<&str>) -> Result<(bool, Option<String>), &str> {
+    match effort {
+        None | Some("none" | "minimal") => Ok((false, None)),
+        Some(effort @ ("low" | "medium" | "high" | "xhigh" | "max")) => {
+            Ok((true, Some(effort.to_owned())))
+        }
+        Some(other) => Err(other),
+    }
+}
+
 /// Maps the request's generation fields onto the protocol-neutral controls.
 ///
-/// `reasoning.effort` maps onto Qwen's binary `enable_thinking`: absent,
-/// `none` and `minimal` keep thinking off; `low`, `medium`, `high` and `xhigh`
-/// turn it on and are passed to the template as `reasoning_effort`, which the
-/// stock Qwen3 template ignores. As in vLLM, an omitted `temperature` or
-/// `top_p` takes the checkpoint's `generation_config.json` default (and its
-/// `top_k`, which has no request field), greedy if it has none; an explicit
-/// temperature of zero is greedy. The response's `metallix.sampling` records
-/// the policy used and which defaults applied.
+/// `reasoning.effort` maps through [`thinking_for_effort`]. As in vLLM, an
+/// omitted `temperature` or `top_p` takes the checkpoint's
+/// `generation_config.json` default (and its `top_k`, which has no Responses
+/// field), greedy if it has none; an explicit temperature of zero is greedy.
+/// The response's `metallix.sampling` records the policy used and which
+/// defaults applied.
 pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> {
     if request.background == Some(true) {
         return Err("background responses are unsupported".into());
@@ -177,15 +189,13 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         }
         logprobs |= value == LOGPROBS_INCLUDE;
     }
-    let (enable_thinking, reasoning_effort) = match request
-        .reasoning
-        .as_ref()
-        .and_then(|reasoning| reasoning.effort.as_deref())
-    {
-        None | Some("none" | "minimal") => (false, None),
-        Some(effort @ ("low" | "medium" | "high" | "xhigh")) => (true, Some(effort.to_owned())),
-        Some(other) => return Err(format!("unsupported reasoning.effort {other:?}")),
-    };
+    let (enable_thinking, reasoning_effort) = thinking_for_effort(
+        request
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref()),
+    )
+    .map_err(|effort| format!("unsupported reasoning.effort {effort:?}"))?;
     let json_schema = match request.text.as_ref().and_then(|text| text.format.as_ref()) {
         None | Some(TextFormat::Text) => None,
         Some(TextFormat::JsonObject) => Some(json!({"type":"object"})),
@@ -364,7 +374,7 @@ pub(crate) fn echo_request_id(value: &mut Value, request_id: Option<&str>) {
 }
 
 /// Records the `GenAI` usage attributes on the current request span.
-fn record_usage(generated: &crate::chat_generation::ChatGeneration) {
+pub(crate) fn record_usage(generated: &crate::chat_generation::ChatGeneration) {
     let span = tracing::Span::current();
     span.record("gen_ai.usage.input_tokens", generated.metrics.prompt_tokens);
     span.record(
@@ -671,8 +681,59 @@ fn split_reasoning(text: &str) -> (&str, &str) {
     }
 }
 
-fn logprobs_value(logprobs: &[TokenLogprob]) -> Value {
+pub(crate) fn logprobs_value(logprobs: &[TokenLogprob]) -> Value {
     serde_json::to_value(logprobs).unwrap_or_else(|_| json!([]))
+}
+
+/// A finished assistant turn split into reasoning, visible text and tool calls
+/// checked against their declared schemas. Each protocol only reshapes it.
+pub(crate) struct AssistantTurn {
+    pub(crate) reasoning: String,
+    pub(crate) text: String,
+    pub(crate) calls: Vec<ChatToolCall>,
+    /// The model ended its turn; otherwise it hit the output limit.
+    pub(crate) complete: bool,
+}
+
+/// Parses one generation. `tools` are template-shaped definitions, as
+/// [`tools`] returns them. A truncated tool turn is an error, never a partial
+/// call.
+pub(crate) fn assistant_turn(
+    tools: &[Value],
+    enable_thinking: bool,
+    generated: &crate::chat_generation::ChatGeneration,
+) -> Result<AssistantTurn, String> {
+    let (reasoning, answer) = if enable_thinking {
+        split_reasoning(&generated.text)
+    } else {
+        ("", generated.text.as_str())
+    };
+    let turn = chat_tools::parse_turn(answer)?;
+    let complete = generated.finish_reason == ChatFinishReason::Eos;
+    if !turn.calls.is_empty() && !complete {
+        return Err("truncated tool turn; no function calls returned".into());
+    }
+    let mut calls = Vec::new();
+    for call in turn.calls {
+        let definition = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == call.name)
+            .ok_or("model requested an undeclared tool")?;
+        if !chat_tools::validator(&definition["function"]["parameters"])?.is_valid(&call.arguments)
+        {
+            return Err("model tool arguments do not match the declared schema".into());
+        }
+        calls.push(ChatToolCall {
+            name: call.name,
+            arguments: call.arguments,
+        });
+    }
+    Ok(AssistantTurn {
+        reasoning: reasoning.to_owned(),
+        text: turn.text,
+        calls,
+        complete,
+    })
 }
 
 fn response_value(
@@ -681,37 +742,24 @@ fn response_value(
     generated: &crate::chat_generation::ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let (reasoning, answer) = if controls.enable_thinking {
-        split_reasoning(&generated.text)
-    } else {
-        ("", generated.text.as_str())
-    };
-    let turn = chat_tools::parse_turn(answer)?;
-    let calls = turn.calls;
-    let complete = generated.finish_reason == ChatFinishReason::Eos;
-    if !calls.is_empty() && !complete {
-        return Err("truncated tool turn; no function calls returned".into());
-    }
+    let AssistantTurn {
+        reasoning,
+        text,
+        calls,
+        complete,
+    } = assistant_turn(&tools(request)?, controls.enable_thinking, generated)?;
     let mut output = Vec::new();
     if !reasoning.is_empty() {
         output.push(json!({"id":format!("rs_{id}"),"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":reasoning}]}));
     }
-    if calls.is_empty() || !turn.text.trim().is_empty() {
-        let mut part = json!({"type":"output_text","text":turn.text,"annotations":[]});
+    if calls.is_empty() || !text.trim().is_empty() {
+        let mut part = json!({"type":"output_text","text":text,"annotations":[]});
         if controls.top_logprobs.is_some() {
             part["logprobs"] = logprobs_value(&generated.logprobs);
         }
         output.push(json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","status":if complete {"completed"} else {"incomplete"},"content":[part]}));
     }
     for (index, call) in calls.into_iter().enumerate() {
-        let definition = request
-            .tools
-            .iter()
-            .find(|tool| tool["name"] == call.name)
-            .ok_or("model requested an undeclared tool")?;
-        if !chat_tools::validator(&definition["parameters"])?.is_valid(&call.arguments) {
-            return Err("model tool arguments do not match the declared schema".into());
-        }
         output.push(json!({"type":"function_call","id":format!("fc_{id}_{index}"),"call_id":format!("call_{id}_{index}"),"name":call.name,"arguments":call.arguments.to_string(),"status":"completed"}));
     }
     let mut response = json!({"id":id,"object":"response","model":request.model,"status":if complete {"completed"} else {"incomplete"},"output":output,"incomplete_details":if complete {Value::Null} else {json!({"reason":"max_output_tokens"})},"usage":{"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()},"metrics":generated.metrics});
@@ -929,6 +977,7 @@ mod tests {
             ("medium", true),
             ("high", true),
             ("xhigh", true),
+            ("max", true),
         ] {
             let mapped =
                 controls(&request_with(&json!({"reasoning":{"effort":effort}})).unwrap()).unwrap();
