@@ -16,7 +16,8 @@ which at least 90% of requests meet both the TTFT and the TPOT objective.
 
 The harness can start and stop the server under test: `mx serve`, vllm-metal,
 MTPLX or mlx-lm's server, the Python ones from virtual environments under
-.agents/bench-envs/. Load averages are recorded around every run, because
+.agents/bench-envs/. Every level gets a fresh server, so no level inherits an
+earlier level's prefix cache. Load averages are recorded around every run, because
 numbers from a shared machine are hard to read without them.
 
 Usage:
@@ -46,7 +47,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import bench_serve
@@ -828,6 +829,29 @@ def server_spec(
 
 SERVERS = ("metallix", "vllm-metal", "mtplx", "mlx-lm")
 
+# Flags that force each server's prompt-prefix cache on or off, so shared-prefix
+# results can be attributed to cache reuse or to the engine itself. MTPLX has
+# no in-memory switch, so it runs only the "default" arm.
+PREFIX_CACHE_FLAGS = {
+    "metallix": {"on": [], "off": ["--prefix-cache-mib", "0"]},
+    "vllm-metal": {
+        "on": ["--enable-prefix-caching"],
+        "off": ["--no-enable-prefix-caching"],
+    },
+    # mlx-lm evicts as soon as its LRU holds more than this many caches.
+    "mlx-lm": {"on": [], "off": ["--prompt-cache-size", "0"]},
+}
+CACHE_ARMS = ("default", "on", "off")
+
+
+def with_prefix_cache(spec: ServerSpec, arm: str) -> ServerSpec:
+    if arm == "default":
+        return spec
+    flags = PREFIX_CACHE_FLAGS.get(spec.name)
+    if flags is None:
+        raise ValueError(f"{spec.name} has no prefix-cache switch; use the default arm")
+    return replace(spec, argv=spec.argv + flags[arm])
+
 
 class ManagedServer:
     """A server process in its own process group, logging to a file."""
@@ -890,62 +914,103 @@ def load_average() -> list[float]:
     return [round(value, 2) for value in os.getloadavg()]
 
 
-def measure_set(
-    address: str, spec: ServerSpec, model_id: str, set_name: str, args, count_tokens
+def level_spec(name: str, address: str, args) -> ServerSpec:
+    """The spec for one engine; an empty argv for an already running --url server."""
+    if args.url:
+        return ServerSpec(name, args.api, [], {}, {})
+    spec = server_spec(name, args.model_path, args.model_id, address, args)
+    return with_prefix_cache(spec, args.prefix_cache)
+
+
+def measure_level(
+    name: str, set_name: str, kind: str, value: float, count: int, args, count_tokens
 ) -> dict:
-    out: dict = {"set": set_name, "concurrency": [], "rates": []}
+    """One concurrency or rate level on a fresh server: warm up, then measure.
+
+    A server that lived through earlier levels carries their prefix cache and
+    allocator state into this one, so every managed level starts its own
+    process. A --url server cannot be restarted; its levels share one lifetime.
+    """
+    result: dict = {kind: value, "restarted": not args.url}
+    prompts = set_prompts(set_name, count, count_tokens, args.seed, args.file_prompts)
     warm = warmup_prompts(
         set_name, args.warmup, count_tokens, args.seed, args.file_prompts
     )
-    if warm:
-        run_load(
-            address,
-            spec.api,
-            model_id,
-            warm,
-            args.max_tokens,
-            spec.extra,
-            concurrency=1,
-        )
-
-    def one_run(kind: str, value: float, prompts: list[Prompt]) -> dict:
+    server = None
+    try:
+        if args.url:
+            address = args.url.removeprefix("http://").rstrip("/")
+        else:
+            address = bench_serve.free_address()
+        spec = level_spec(name, address, args)
+        if not args.url:
+            log = args.log_dir / f"{name}-{set_name}-{kind}{value:g}.log"
+            server = ManagedServer(spec, address, log)
+            server.wait_ready(args.start_timeout)
+            result |= {"ready_s": server.ready_s, "argv": spec.argv, "log": str(log)}
+        level_concurrency = int(value) if kind == "concurrency" else 1
+        if warm:
+            run_load(
+                address,
+                spec.api,
+                args.model_id,
+                warm,
+                args.max_tokens,
+                spec.extra,
+                concurrency=level_concurrency,
+                timeout=args.request_timeout,
+            )
         before = load_average()
         records, duration = run_load(
             address,
             spec.api,
-            model_id,
+            args.model_id,
             prompts,
             args.max_tokens,
             spec.extra,
-            concurrency=int(value) if kind == "concurrency" else None,
+            concurrency=level_concurrency if kind == "concurrency" else None,
             rate=value if kind == "rate" else None,
             seed=args.seed,
             timeout=args.request_timeout,
         )
-        result = {
-            kind: value,
+        result |= {
             "load_before": before,
             "load_after": load_average(),
             "summary": summarize(records, duration, args.slo_ttft_ms, args.slo_tpot_ms),
             "records": [asdict(record) for record in records],
         }
         print(f"  {set_name} {kind}={value}: {one_line(result['summary'])}", flush=True)
-        return result
+    except (RuntimeError, OSError) as error:
+        result["error"] = str(error)
+        print(f"  {set_name} {kind}={value}: not measured: {error}", flush=True)
+    finally:
+        if server:
+            server.stop()
+    return result
 
+
+def measure_set(name: str, set_name: str, args, count_tokens) -> dict:
+    out: dict = {"set": set_name, "concurrency": [], "rates": []}
     for concurrency in args.concurrency:
         count = max(args.min_requests, args.requests_per_slot * concurrency)
-        prompts = set_prompts(
-            set_name, count, count_tokens, args.seed, args.file_prompts
+        out["concurrency"].append(
+            measure_level(
+                name, set_name, "concurrency", concurrency, count, args, count_tokens
+            )
         )
-        out["concurrency"].append(one_run("concurrency", concurrency, prompts))
     for rate in args.rates:
-        prompts = set_prompts(
-            set_name, args.rate_requests, count_tokens, args.seed, args.file_prompts
+        out["rates"].append(
+            measure_level(
+                name, set_name, "rate", rate, args.rate_requests, args, count_tokens
+            )
         )
-        out["rates"].append(one_run("rate", rate, prompts))
     if out["rates"]:
+        # A rate that could not be measured counts as a miss.
         out["goodput_rps"] = goodput(
-            {run["rate"]: run["summary"]["slo_attainment"] for run in out["rates"]}
+            {
+                run["rate"]: run["summary"]["slo_attainment"] if "summary" in run else 0
+                for run in out["rates"]
+            }
         )
     return out
 
@@ -984,6 +1049,12 @@ def render(report: dict) -> str:
             runs = [("c", r["concurrency"], r) for r in result["concurrency"]]
             runs += [("r", r["rate"], r) for r in result["rates"]]
             for kind, value, run in runs:
+                if "summary" not in run:
+                    lines.append(
+                        f"{server['name']:<11} {result['set']:<14} {'':>5}  "
+                        f"{kind}={value:<6g} not measured: {run.get('error')}"
+                    )
+                    continue
                 s = run["summary"]
                 ttft, tpot = s["ttft_ms"], s["tpot_ms"]
                 lines.append(
@@ -1029,7 +1100,19 @@ def main() -> int:
     parser.add_argument("--requests-per-slot", type=int, default=2)
     parser.add_argument("--min-requests", type=int, default=6)
     parser.add_argument("--rate-requests", type=int, default=16)
-    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        help="discarded requests before each level, sent at its concurrency",
+    )
+    parser.add_argument(
+        "--prefix-cache",
+        choices=CACHE_ARMS,
+        default="default",
+        help="force each managed server's prompt-prefix cache on or off; with "
+        "--url only a label for how the server was started",
+    )
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--slo-ttft-ms", type=float, default=2000)
     parser.add_argument("--slo-tpot-ms", type=float, default=50)
@@ -1083,36 +1166,22 @@ def main() -> int:
     names = args.server.split(",") if args.server else ["external"]
     for name in names:
         print(f"{name}:", flush=True)
-        entry: dict = {"name": name}
+        entry: dict = {"name": name, "prefix_cache": args.prefix_cache}
         report["servers"].append(entry)
-        server = None
         try:
-            if args.url:
-                address = args.url.removeprefix("http://").rstrip("/")
-                spec = ServerSpec(name, args.api, [], {}, {})
-            else:
-                address = bench_serve.free_address()
-                spec = server_spec(name, args.model_path, args.model_id, address, args)
-                server = ManagedServer(spec, address, args.log_dir / f"{name}.log")
-                server.wait_ready(args.start_timeout)
-                entry["ready_s"] = server.ready_s
-                entry["argv"] = spec.argv
-                entry["log"] = str(server.log_path)
-            entry["api"] = spec.api
-            entry["versions"] = spec.versions
-            entry["request_extra"] = spec.extra
-            entry["load_before"] = load_average()
-            entry["sets"] = [
-                measure_set(address, spec, args.model_id, set_name, args, count_tokens)
-                for set_name in sets
-            ]
-        except (RuntimeError, OSError) as error:
+            spec = level_spec(name, "127.0.0.1:0", args)
+        except (ValueError, OSError) as error:
             entry["error"] = str(error)
             print(f"  not measured: {error}", flush=True)
-        finally:
-            if server:
-                server.stop()
-            entry["load_after"] = load_average()
+            continue
+        entry["api"] = spec.api
+        entry["versions"] = spec.versions
+        entry["request_extra"] = spec.extra
+        entry["load_before"] = load_average()
+        entry["sets"] = [
+            measure_set(name, set_name, args, count_tokens) for set_name in sets
+        ]
+        entry["load_after"] = load_average()
     report["load_after"] = load_average()
     print()
     print(render(report))

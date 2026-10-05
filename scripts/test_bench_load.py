@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import itertools
 import json
@@ -14,6 +15,7 @@ import random
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPTS = pathlib.Path(__file__).parent
 sys.path.insert(0, str(SCRIPTS))  # bench_load imports its sibling bench_serve.
@@ -325,6 +327,87 @@ class PromptsFile(unittest.TestCase):
         self.assertEqual([p.label for p in cell], ["p0", "p1", "p2", "p3", "p0", "p1"])
         warm = bench_load.warmup_prompts("file", 2, None, 0, prompts)
         self.assertEqual([p.label for p in warm], ["p3", "p2"])
+
+
+class Levels(unittest.TestCase):
+    def args(self, **overrides):
+        values = {
+            "url": None,
+            "api": "chat",
+            "model_path": pathlib.Path("model"),
+            "model_id": "m",
+            "prefix_cache": "off",
+            "seed": 0,
+            "warmup": 3,
+            "file_prompts": [],
+            "max_tokens": 8,
+            "request_timeout": 5,
+            "start_timeout": 5,
+            "slo_ttft_ms": 2000,
+            "slo_tpot_ms": 50,
+            "log_dir": pathlib.Path(tempfile.gettempdir()),
+            "concurrency": [1, 4],
+            "rates": [2.0],
+            "min_requests": 2,
+            "requests_per_slot": 1,
+            "rate_requests": 2,
+        }
+        return argparse.Namespace(**(values | overrides))
+
+    def test_every_level_starts_its_own_server_and_warms_at_its_concurrency(
+        self,
+    ) -> None:
+        started, warmups = [], []
+
+        class FakeServer:
+            def __init__(self, spec, address, log_path):
+                started.append(spec.argv)
+                self.ready_s = 0.1
+
+            def wait_ready(self, timeout):
+                pass
+
+            def stop(self):
+                started.append("stopped")
+
+        def fake_run_load(address, api, model, prompts, max_tokens, extra, **kw):
+            if kw.get("rate") is None and len(prompts) == 3:
+                warmups.append(kw["concurrency"])
+            records = [record(index=i) for i in range(len(prompts))]
+            return records, 1.0
+
+        spec = bench_load.ServerSpec("vllm-metal", "chat", ["vllm"], {}, {})
+        patches = [
+            mock.patch.object(bench_load, "ManagedServer", FakeServer),
+            mock.patch.object(bench_load, "run_load", fake_run_load),
+            mock.patch.object(bench_load, "server_spec", lambda *a: spec),
+            mock.patch.object(bench_load.bench_serve, "free_address", lambda: "h:1"),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        count = lambda text: len(text.split())
+        out = bench_load.measure_set("vllm-metal", "short", self.args(), count)
+        # c=1, c=4 and one rate: three servers, each stopped before the next.
+        argv = ["vllm", "--no-enable-prefix-caching"]
+        self.assertEqual(started, [argv, "stopped"] * 3)
+        self.assertEqual(warmups, [1, 4, 1])
+        self.assertTrue(all(run["restarted"] for run in out["concurrency"]))
+        self.assertEqual(out["goodput_rps"], 2.0)
+
+    def test_prefix_cache_arms_per_server(self) -> None:
+        spec = lambda name: bench_load.ServerSpec(name, "chat", [name], {}, {})
+        on = bench_load.with_prefix_cache(spec("vllm-metal"), "on")
+        self.assertEqual(on.argv, ["vllm-metal", "--enable-prefix-caching"])
+        off = bench_load.with_prefix_cache(spec("metallix"), "off")
+        self.assertEqual(off.argv, ["metallix", "--prefix-cache-mib", "0"])
+        off = bench_load.with_prefix_cache(spec("mlx-lm"), "off")
+        self.assertEqual(off.argv, ["mlx-lm", "--prompt-cache-size", "0"])
+        self.assertEqual(
+            bench_load.with_prefix_cache(spec("mtplx"), "default").argv, ["mtplx"]
+        )
+        with self.assertRaises(ValueError):
+            bench_load.with_prefix_cache(spec("mtplx"), "off")
 
 
 if __name__ == "__main__":
