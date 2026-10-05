@@ -21,6 +21,7 @@ mod decision_cli;
 mod deepseek_reduced_cli;
 #[cfg(feature = "metal")]
 mod http_transport;
+mod inspect;
 #[cfg(feature = "metal")]
 mod julia_decisions;
 mod model_registry;
@@ -71,9 +72,10 @@ use commands::{
 };
 #[cfg(all(test, feature = "metal"))]
 use commands::{checked_row_range, layer_check_cycles};
-use commands::{
-    fetch_deepseek, free_space_bytes, inspect_qwen, inspect_qwen_checkpoint, inspect_v41,
-    inspect_v41_artifact, inspect_v41_embedding_row, inspect_v41_index, inspect_v41_shard,
+use commands::{fetch_deepseek, free_space_bytes};
+use inspect::{
+    inspect_qwen, inspect_qwen_checkpoint, inspect_v41, inspect_v41_artifact,
+    inspect_v41_embedding_row, inspect_v41_index, inspect_v41_shard,
 };
 
 #[cfg(feature = "metal")]
