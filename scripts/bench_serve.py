@@ -165,7 +165,9 @@ class Server:
         threading.Thread(target=self._read_log, daemon=True).start()
 
     def _read_log(self) -> None:
-        for line in self.process.stderr:
+        stderr = self.process.stderr
+        assert stderr is not None, "started with stderr=PIPE"
+        for line in stderr:
             if child := child_address(line):
                 self.children[child[0]] = child[1]
             if front_address(line):
@@ -188,7 +190,7 @@ def measure(server: Server, samples: int) -> list[dict]:
         cases = requests_for(model["id"], model["capabilities"])
         if not cases:
             continue
-        label, path, body = cases[0]
+        _, path, body = cases[0]
         first_ms, _ = post(server.address, path, body)
         record = {
             "model": model["id"],
@@ -220,7 +222,7 @@ def measure(server: Server, samples: int) -> list[dict]:
 
 def render(report: dict) -> str:
     lines = [
-        f"mx {report['mx']} at {report['revision']} on {report['machine']}",
+        f"mx {report['mx']}; repo at {report['revision']}; {report['machine']}",
         f"load average before {report['load_before']}, after {report['load_after']}",
         f"front listening after {report['ready_ms']:.0f} ms",
     ]
