@@ -35,6 +35,8 @@ mod qwen_decisions;
 pub mod range_fetch;
 #[cfg(feature = "metal")]
 mod responses;
+#[cfg(feature = "metal")]
+mod serve_registry;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
@@ -238,13 +240,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Serve the native Qwen control model through a local Responses endpoint.
+    /// Serve registered models: Qwen generation and decisions, Julia decisions.
     #[cfg(feature = "metal")]
     Serve {
-        #[arg(long)]
-        model: PathBuf,
+        /// Qwen checkpoint served as `--model-id`; shorthand for a one-entry registry.
+        #[arg(long, required_unless_present = "registry")]
+        model: Option<PathBuf>,
         #[arg(long, default_value = "metallix-qwen3")]
         model_id: String,
+        /// JSON manifest `{"models": [{"id", "kind": "qwen"|"julia", "path"}]}`; all load at startup.
+        #[arg(long)]
+        registry: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:8321")]
         listen: std::net::SocketAddr,
         /// Total prompt plus output budget for each request.
@@ -685,17 +691,23 @@ pub fn run() -> ExitCode {
         Command::Serve {
             model,
             model_id,
+            registry,
             listen,
             context_tokens,
             kv_budget_mib,
             generation_timeout_ms,
-        } => responses::serve(
-            &model,
-            &model_id,
-            listen,
-            resident_chat_limits(context_tokens, kv_budget_mib),
-            Duration::from_millis(u64::from(generation_timeout_ms)),
-        ),
+        } => match serve_registry::entries(registry.as_deref(), model.as_deref(), &model_id) {
+            Ok(models) => responses::serve(
+                &models,
+                listen,
+                resident_chat_limits(context_tokens, kv_budget_mib),
+                Duration::from_millis(u64::from(generation_timeout_ms)),
+            ),
+            Err(error) => {
+                eprintln!("mx serve: {error}");
+                ExitCode::FAILURE
+            }
+        },
         #[cfg(feature = "metal")]
         Command::CheckV41RotaryMetal { fixture, repeats } => v41_rotary::run(&fixture, repeats),
         #[cfg(feature = "metal")]

@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, HashSet},
     io::{BufWriter, Write},
     net::{SocketAddr, TcpListener},
-    path::Path,
     process::ExitCode,
     sync::{
         Arc,
@@ -22,11 +21,15 @@ use crate::{
     chat_cli::message,
     chat_generation::{
         ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
-        ChatSession, ChatToolCall, ResidentChatLimits,
+        ChatToolCall, ResidentChatLimits,
     },
     chat_tools,
     http_transport::{Connection, TransportLimits},
+    serve_registry::{self, ModelWorker, ServedEntry},
 };
+
+#[cfg(test)]
+use crate::chat_generation::ChatSession;
 
 #[derive(Deserialize)]
 struct Request {
@@ -260,39 +263,96 @@ impl Drop for Admission {
     }
 }
 
+/// One admitted request for a model worker: a generation or a decision.
 struct GenerationJob {
     connection: Connection,
-    request: Request,
-    messages: Vec<ChatMessage>,
-    tools: Vec<Value>,
-    id: String,
-    generation_timeout: Duration,
+    work: Work,
     _admission: Admission,
 }
 
+enum Work {
+    Respond {
+        request: Box<Request>,
+        messages: Vec<ChatMessage>,
+        tools: Vec<Value>,
+        id: String,
+        generation_timeout: Duration,
+    },
+    Decide {
+        body: Vec<u8>,
+        model: String,
+    },
+}
+
+/// Adapts a generation-only test backend to the worker loop.
+#[cfg(test)]
+struct GenerationOnly<'a>(&'a mut dyn ChatBackend);
+
+#[cfg(test)]
+impl ModelWorker for GenerationOnly<'_> {
+    fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+        Some(&mut *self.0)
+    }
+
+    fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
+}
+
+#[cfg(test)]
 fn worker_loop(session: &mut dyn ChatBackend, jobs: Receiver<GenerationJob>) {
+    model_worker_loop(&mut GenerationOnly(session), jobs);
+}
+
+fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>) {
     for job in jobs {
         let GenerationJob {
             connection,
-            request,
-            messages,
-            tools,
-            id,
-            generation_timeout,
+            work,
             _admission,
         } = job;
-        if let Err(error) = respond(
-            connection,
-            &request,
-            &messages,
-            &tools,
-            session,
-            &id,
-            generation_timeout,
-        ) {
-            eprintln!("response failed: {error}");
+        match work {
+            Work::Respond {
+                request,
+                messages,
+                tools,
+                id,
+                generation_timeout,
+            } => {
+                // Routing admits only models that declare generation.
+                let Some(session) = worker.chat() else {
+                    unsupported_response(connection, "generate");
+                    continue;
+                };
+                if let Err(error) = respond(
+                    connection,
+                    &request,
+                    &messages,
+                    &tools,
+                    session,
+                    &id,
+                    generation_timeout,
+                ) {
+                    eprintln!("response failed: {error}");
+                }
+            }
+            Work::Decide { body, model } => match worker.decide(&body, &model) {
+                Some(Ok(receipt)) => json_response(connection, 200, &receipt),
+                Some(Err(error)) => {
+                    json_response(connection, 400, &json!({"error":{"message":error}}));
+                }
+                None => unsupported_response(connection, "decide"),
+            },
         }
     }
+}
+
+fn unsupported_response(connection: Connection, capability: &str) {
+    json_response(
+        connection,
+        400,
+        &json!({"error":{"code":"unsupported_capability","message":format!("model does not support {capability}")}}),
+    );
 }
 
 fn event(writer: &mut dyn Write, sequence: &mut u64, mut value: Value) -> Result<(), String> {
@@ -309,13 +369,12 @@ fn event(writer: &mut dyn Write, sequence: &mut u64, mut value: Value) -> Result
 }
 
 pub(crate) fn serve(
-    model: &Path,
-    model_id: &str,
+    models: &[ServedEntry],
     address: SocketAddr,
     limits: ResidentChatLimits,
     generation_timeout: Duration,
 ) -> ExitCode {
-    match serve_inner(model, model_id, address, limits, generation_timeout) {
+    match serve_inner(models, address, limits, generation_timeout) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mx serve: {error}");
@@ -324,9 +383,19 @@ pub(crate) fn serve(
     }
 }
 
+/// A registered model as the acceptor sees it: identity, capability and its
+/// own worker channel, admission flag and liveness.
+struct ServedModel {
+    id: String,
+    generates: bool,
+    capabilities: &'static [&'static str],
+    jobs: SyncSender<GenerationJob>,
+    occupied: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+}
+
 fn serve_inner(
-    model: &Path,
-    model_id: &str,
+    entries: &[ServedEntry],
     address: SocketAddr,
     limits: ResidentChatLimits,
     generation_timeout: Duration,
@@ -334,70 +403,91 @@ fn serve_inner(
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
     }
-    let (job_sender, job_receiver) = sync_channel(0);
-    let (startup_sender, startup_receiver) = sync_channel(1);
-    let worker_model = model.to_owned();
-    let worker_alive = Arc::new(AtomicBool::new(false));
-    let worker_liveness = Arc::clone(&worker_alive);
-    let worker = thread::spawn(move || {
-        let mut session = match ChatSession::load(&worker_model, limits) {
-            Ok(session) => session,
-            Err(error) => {
-                let _ = startup_sender.send(Err(error));
-                return;
+    let mut models = Vec::with_capacity(entries.len());
+    let mut workers = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (job_sender, job_receiver) = sync_channel(0);
+        let (startup_sender, startup_receiver) = sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_liveness = Arc::clone(&alive);
+        let worker_entry = entry.clone();
+        workers.push(thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut worker = match serve_registry::load(&worker_entry, limits) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    let _ = startup_sender.send(Err(error));
+                    return;
+                }
+            };
+            let liveness = WorkerLiveness {
+                alive: worker_liveness,
+            };
+            liveness.alive.store(true, Ordering::Release);
+            // A generation backend reports its own load time; others use wall time.
+            let load_ms = worker
+                .chat()
+                .map_or(started.elapsed().as_secs_f64() * 1000.0, |chat| {
+                    chat.load_ms()
+                });
+            if startup_sender.send(Ok(load_ms)).is_ok() {
+                model_worker_loop(worker.as_mut(), job_receiver);
+            }
+        }));
+        let load_ms = match startup_receiver.recv() {
+            Ok(Ok(load_ms)) => load_ms,
+            failed => {
+                drop(models);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err(match failed {
+                    Ok(Err(error)) => format!("{}: {error}", entry.id),
+                    _ => format!("{}: model worker ended before startup", entry.id),
+                });
             }
         };
-        let liveness = WorkerLiveness {
-            alive: worker_liveness,
-        };
-        liveness.alive.store(true, Ordering::Release);
-        let load_ms = (&session as &dyn ChatBackend).load_ms();
-        if startup_sender.send(Ok(load_ms)).is_ok() {
-            worker_loop(&mut session, job_receiver);
+        eprintln!(
+            "mx loaded model={}; kind={:?}; load_ms={load_ms:.2}",
+            entry.id, entry.kind
+        );
+        models.push(ServedModel {
+            id: entry.id.clone(),
+            generates: entry.kind.generates(),
+            capabilities: entry.kind.capabilities(),
+            jobs: job_sender,
+            occupied: Arc::new(AtomicBool::new(false)),
+            alive,
+        });
+    }
+    let outcome = match TcpListener::bind(address) {
+        Ok(server) => {
+            eprintln!(
+                "mx listening on http://{address}; models={}; one request per model; {} total tokens; kv_budget_bytes={}",
+                entries.len(),
+                limits.context_tokens(),
+                limits.kv_budget_bytes(),
+            );
+            serve_models(
+                &server,
+                &models,
+                generation_timeout,
+                TransportLimits::default(),
+                None,
+            )
         }
-    });
-    let session_load_ms = match startup_receiver.recv() {
-        Ok(Ok(load_ms)) => load_ms,
-        Ok(Err(error)) => {
-            let _ = worker.join();
-            return Err(error);
-        }
-        Err(_) => {
-            let _ = worker.join();
-            return Err(String::from("model worker ended before startup"));
-        }
+        Err(error) => Err(error.to_string()),
     };
-    let server = match TcpListener::bind(address) {
-        Ok(server) => server,
-        Err(error) => {
-            drop(job_sender);
-            let _ = worker.join();
-            return Err(error.to_string());
-        }
-    };
-    eprintln!(
-        "mx listening on http://{address}; model={model_id}; single request; {} total tokens; kv_budget_bytes={}; load_ms={:.2}",
-        limits.context_tokens(),
-        limits.kv_budget_bytes(),
-        session_load_ms
-    );
-    let occupied = Arc::new(AtomicBool::new(false));
-    let outcome = serve_listener(
-        &server,
-        model_id,
-        &job_sender,
-        &occupied,
-        &worker_alive,
-        generation_timeout,
-        None,
-    );
-    drop(job_sender);
-    worker
-        .join()
-        .map_err(|_| String::from("model worker panicked"))?;
+    drop(models);
+    for worker in workers {
+        worker
+            .join()
+            .map_err(|_| String::from("model worker panicked"))?;
+    }
     outcome
 }
 
+#[cfg(test)]
 fn serve_listener(
     server: &TcpListener,
     model_id: &str,
@@ -423,12 +513,48 @@ fn serve_listener(
     clippy::too_many_arguments,
     reason = "private transport-limit seam shares the production acceptor with bounded socket tests"
 )]
+#[cfg(test)]
 fn serve_listener_with_limits(
     server: &TcpListener,
     model_id: &str,
     job_sender: &SyncSender<GenerationJob>,
     occupied: &Arc<AtomicBool>,
     worker_alive: &Arc<AtomicBool>,
+    generation_timeout: Duration,
+    transport_limits: TransportLimits,
+    request_limit: Option<usize>,
+) -> Result<(), String> {
+    let models = [ServedModel {
+        id: model_id.to_owned(),
+        generates: true,
+        capabilities: &["generate"],
+        jobs: job_sender.clone(),
+        occupied: Arc::clone(occupied),
+        alive: Arc::clone(worker_alive),
+    }];
+    serve_models(
+        server,
+        &models,
+        generation_timeout,
+        transport_limits,
+        request_limit,
+    )
+}
+
+#[derive(Deserialize)]
+struct DecisionTarget {
+    model: String,
+}
+
+/// Routes each request to the model it names. Admission is per model and is
+/// taken after the request is read, since the body names the model.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one ordered route, model, capability and admission sequence"
+)]
+fn serve_models(
+    server: &TcpListener,
+    models: &[ServedModel],
     generation_timeout: Duration,
     transport_limits: TransportLimits,
     request_limit: Option<usize>,
@@ -440,14 +566,15 @@ fn serve_listener_with_limits(
     {
         let socket = socket.map_err(|error| error.to_string())?;
         let connection = Connection::accept(socket, transport_limits);
-        if !worker_alive.load(Ordering::Acquire) {
+        // ponytail: one dead worker stops the server, as with a single model;
+        // per-model unavailability belongs with on-demand loading.
+        if models
+            .iter()
+            .any(|model| !model.alive.load(Ordering::Acquire))
+        {
             unavailable_response(connection);
             return Err(String::from("model worker is unavailable"));
         }
-        let Some(admission) = Admission::try_acquire(occupied) else {
-            busy_response(connection);
-            continue;
-        };
         let mut connection = connection;
         let request = match connection.read_request() {
             Ok(request) => request,
@@ -460,20 +587,21 @@ fn serve_listener_with_limits(
                 continue;
             }
         };
-        match (request.method.as_str(), request.path.as_str()) {
+        let generation = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
                 json_response(connection, 200, &json!({"status":"ready"}));
                 continue;
             }
             ("GET", "/v1/models") => {
-                json_response(
-                    connection,
-                    200,
-                    &json!({"object":"list","data":[{"id":model_id,"object":"model","owned_by":"local"}]}),
-                );
+                let data: Vec<Value> = models
+                    .iter()
+                    .map(|model| json!({"id":model.id,"object":"model","owned_by":"local","capabilities":model.capabilities}))
+                    .collect();
+                json_response(connection, 200, &json!({"object":"list","data":data}));
                 continue;
             }
-            ("POST", "/v1/responses") => {}
+            ("POST", "/v1/responses") => true,
+            ("POST", "/v1/decisions") => false,
             _ => {
                 json_response(
                     connection,
@@ -482,44 +610,82 @@ fn serve_listener_with_limits(
                 );
                 continue;
             }
-        }
-        let parsed =
-            serde_json::from_slice::<Request>(&request.body).map_err(|error| error.to_string());
-        let parsed = match parsed {
+        };
+        let parsed = if generation {
+            serde_json::from_slice::<Request>(&request.body)
+                .map(|parsed| (parsed.model.clone(), Some(parsed)))
+        } else {
+            serde_json::from_slice::<DecisionTarget>(&request.body)
+                .map(|target| (target.model, None))
+        };
+        let (model_id, parsed) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
-                json_response(connection, 400, &json!({"error":{"message":error}}));
+                json_response(
+                    connection,
+                    400,
+                    &json!({"error":{"message":error.to_string()}}),
+                );
                 continue;
             }
         };
-        if parsed.model != model_id {
+        let Some(model) = models.iter().find(|model| model.id == model_id) else {
             json_response(
                 connection,
                 404,
                 &json!({"error":{"message":"model is not loaded"}}),
             );
             continue;
-        }
-        let prepared =
-            messages(&parsed).and_then(|messages| tools(&parsed).map(|tools| (messages, tools)));
-        let (messages, tools) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                json_response(connection, 400, &json!({"error":{"message":error}}));
+        };
+        let work = if let Some(parsed) = parsed {
+            if !model.generates {
+                unsupported_response(connection, "generate");
                 continue;
             }
+            let prepared = messages(&parsed)
+                .and_then(|messages| tools(&parsed).map(|tools| (messages, tools)));
+            let (messages, tools) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    json_response(connection, 400, &json!({"error":{"message":error}}));
+                    continue;
+                }
+            };
+            Work::Respond {
+                request: Box::new(parsed),
+                messages,
+                tools,
+                id: format!("resp_{}_{}", std::process::id(), index),
+                generation_timeout,
+            }
+        } else {
+            if !model.capabilities.contains(&"decide") {
+                unsupported_response(connection, "decide");
+                continue;
+            }
+            Work::Decide {
+                body: request.body,
+                model: model_id,
+            }
         };
-        let id = format!("resp_{}_{}", std::process::id(), index);
+        let Some(admission) = Admission::try_acquire(&model.occupied) else {
+            if generation {
+                busy_response(connection);
+            } else {
+                json_response(
+                    connection,
+                    503,
+                    &json!({"error":{"code":"server_busy","message":"the model is busy with another request"}}),
+                );
+            }
+            continue;
+        };
         let job = GenerationJob {
             connection,
-            request: parsed,
-            messages,
-            tools,
-            id,
-            generation_timeout,
+            work,
             _admission: admission,
         };
-        if let Err(error) = job_sender.send(job) {
+        if let Err(error) = model.jobs.send(job) {
             unavailable_response(error.0.connection);
             return Err(String::from("model worker is unavailable"));
         }
@@ -1602,6 +1768,157 @@ stream.close()
         assert!(wire.contains(r#""code":"model_worker_unavailable""#));
         assert!(server.join().expect("join unavailable acceptor").is_err());
         assert!(!occupied.load(Ordering::Acquire));
+    }
+
+    /// Answers decisions with a fixed receipt that names the requested model.
+    struct FixedDecider;
+
+    impl ModelWorker for FixedDecider {
+        fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+            None
+        }
+
+        fn decide(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {
+            let request: Value = serde_json::from_slice(body).expect("decision JSON");
+            Some(Ok(json!({"model": model, "state": request["state"]})))
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the busy-generation and concurrent-decision lifecycle is the assertion under test"
+    )]
+    fn decisions_route_by_model_with_per_model_admission() {
+        fn exchange(address: std::net::SocketAddr, request: &str, body: &[u8]) -> (u16, Value) {
+            let mut stream = TcpStream::connect(address).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("bound reads");
+            write!(
+                stream,
+                "{request} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .expect("request header");
+            stream.write_all(body).expect("request body");
+            stream.shutdown(Shutdown::Write).expect("half-close");
+            let (status, body) = fixed_http_response(&mut stream);
+            (
+                status,
+                serde_json::from_slice(&body).expect("response JSON"),
+            )
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        let (chat_jobs, chat_receiver) = sync_channel(0);
+        let (decide_jobs, decide_receiver) = sync_channel(0);
+        let (entered_sender, entered_receiver) = sync_channel(1);
+        let (release_sender, release_receiver) = sync_channel(1);
+        let chat_worker = thread::spawn(move || {
+            let mut backend = BlockingBackend {
+                turns: 0,
+                entered: entered_sender,
+                release: release_receiver,
+            };
+            worker_loop(&mut backend, chat_receiver);
+        });
+        let decide_worker = thread::spawn(move || {
+            model_worker_loop(&mut FixedDecider, decide_receiver);
+        });
+        let model = |id: &str, generates, capabilities, jobs| ServedModel {
+            id: id.into(),
+            generates,
+            capabilities,
+            jobs,
+            occupied: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        let models = [
+            model("chat", true, &["generate"], chat_jobs),
+            model("julia", false, &["decide"], decide_jobs),
+        ];
+        let generation_occupied = Arc::clone(&models[0].occupied);
+        let server = thread::spawn(move || {
+            serve_models(
+                &listener,
+                &models,
+                Duration::from_secs(2),
+                TransportLimits::default(),
+                Some(7),
+            )
+        });
+
+        let (status, listed) = exchange(address, "GET /v1/models", b"");
+        assert_eq!(status, 200);
+        assert_eq!(
+            listed["data"],
+            json!([
+                {"id":"chat","object":"model","owned_by":"local","capabilities":["generate"]},
+                {"id":"julia","object":"model","owned_by":"local","capabilities":["decide"]},
+            ])
+        );
+
+        // Hold the generation model mid-response.
+        let generation = thread::spawn(move || {
+            let body = br#"{"model":"chat","input":"hello"}"#;
+            exchange(address, "POST /v1/responses", body)
+        });
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("generation holds its worker");
+        assert!(generation_occupied.load(Ordering::Acquire));
+
+        let decision = br#"{"model":"julia","state":"s","questions":{}}"#;
+        let (status, receipt) = exchange(address, "POST /v1/decisions", decision);
+        assert_eq!(
+            (status, receipt),
+            (200, json!({"model":"julia","state":"s"}))
+        );
+        let (status, busy) = exchange(
+            address,
+            "POST /v1/responses",
+            br#"{"model":"chat","input":"again"}"#,
+        );
+        assert_eq!(
+            (status, &busy["error"]["code"]),
+            (503, &json!("server_busy"))
+        );
+        let (status, error) = exchange(
+            address,
+            "POST /v1/decisions",
+            br#"{"model":"chat","state":"s","questions":{}}"#,
+        );
+        assert_eq!(
+            (status, &error["error"]["code"]),
+            (400, &json!("unsupported_capability"))
+        );
+        let (status, error) = exchange(
+            address,
+            "POST /v1/responses",
+            br#"{"model":"julia","input":"hello"}"#,
+        );
+        assert_eq!(
+            (status, &error["error"]["code"]),
+            (400, &json!("unsupported_capability"))
+        );
+        let (status, _) = exchange(
+            address,
+            "POST /v1/decisions",
+            br#"{"model":"missing","state":"s","questions":{}}"#,
+        );
+        assert_eq!(status, 404);
+
+        release_sender.send(()).expect("release generation");
+        let (status, completed) = generation.join().expect("generation client");
+        assert_eq!((status, &completed["status"]), (200, &json!("completed")));
+        server
+            .join()
+            .expect("join bounded acceptor")
+            .expect("acceptor result");
+        chat_worker.join().expect("join chat worker");
+        decide_worker.join().expect("join decision worker");
     }
 
     mod checkpoint_reset {

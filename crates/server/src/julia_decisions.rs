@@ -3,7 +3,11 @@
 //! Accepts the same request shape as `decide`; rows, serialization and
 //! readout follow the pinned source's `predict_typed` and strict `sequence`.
 
-use std::{path::PathBuf, process::ExitCode, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Instant,
+};
 
 use clap::Args;
 use julia::{
@@ -28,7 +32,13 @@ pub(crate) struct JuliaDecisionArgs {
 
 impl JuliaDecisionArgs {
     pub(crate) fn run(self) -> ExitCode {
-        match self.decide() {
+        let outcome = read_request(&self.request).and_then(|request_bytes| {
+            // Reject malformed requests before the checkpoint load.
+            typed::parse_typed_request(&request_bytes).map_err(|error| error.to_string())?;
+            JuliaDecider::load(&self.model)?
+                .decide(&request_bytes, &self.model.display().to_string())
+        });
+        match outcome {
             Ok(output) => {
                 println!("{output}");
                 ExitCode::SUCCESS
@@ -39,34 +49,54 @@ impl JuliaDecisionArgs {
             }
         }
     }
+}
 
-    fn decide(&self) -> Result<Value, String> {
-        let request_bytes = read_request(&self.request)?;
-        let request =
-            typed::parse_typed_request(&request_bytes).map_err(|error| error.to_string())?;
-        let tokenizer_dir = self.model.join("tokenizer");
+/// A loaded Julia checkpoint and tokenizer, shared by the CLI and `mx serve`.
+pub(crate) struct JuliaDecider {
+    tokenizer: Tokenizer,
+    tokenizer_sha256: String,
+    special: SpecialTokens,
+    checkpoint: JuliaCheckpoint,
+    load_ms: u128,
+}
+
+impl JuliaDecider {
+    pub(crate) fn load(model: &Path) -> Result<Self, String> {
+        let tokenizer_dir = model.join("tokenizer");
         let tokenizer_bytes = std::fs::read(tokenizer_dir.join("tokenizer.json"))
             .map_err(|error| format!("tokenizer/tokenizer.json could not be read: {error}"))?;
         let tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
             .map_err(|error| format!("tokenizer/tokenizer.json could not be parsed: {error}"))?;
         let special = special_tokens(&tokenizer, &tokenizer_dir)?;
+        let started = Instant::now();
+        let checkpoint = JuliaCheckpoint::load(model).map_err(|error| error.to_string())?;
+        Ok(Self {
+            tokenizer,
+            tokenizer_sha256: format!("{:x}", Sha256::digest(&tokenizer_bytes)),
+            special,
+            checkpoint,
+            load_ms: started.elapsed().as_millis(),
+        })
+    }
+
+    /// The `mx decide-julia` receipt for `request_bytes`; `model` labels it.
+    pub(crate) fn decide(&self, request_bytes: &[u8], model: &str) -> Result<Value, String> {
+        let request =
+            typed::parse_typed_request(request_bytes).map_err(|error| error.to_string())?;
         let encode = |text: &str| {
-            tokenizer
+            self.tokenizer
                 .encode(text, false)
                 .map(|encoding| encoding.get_ids().to_vec())
                 .map_err(|error| format!("text could not be tokenized: {error}"))
         };
-        // Encode everything before the expensive checkpoint load so bad requests fail fast.
+        // Encode every question before running any, so a bad question fails fast.
         let serialized = request
             .rows
             .iter()
-            .map(|row| typed::sequence(encode, &special, row, &request.state_text))
+            .map(|row| typed::sequence(encode, &self.special, row, &request.state_text))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
-
-        let started = Instant::now();
-        let checkpoint = JuliaCheckpoint::load(&self.model).map_err(|error| error.to_string())?;
-        let load_ms = started.elapsed().as_millis();
+        let checkpoint = &self.checkpoint;
         let mut answers = serde_json::Map::new();
         let mut input_tokens = 0;
         for (row, serialized) in request.rows.iter().zip(serialized) {
@@ -102,9 +132,9 @@ impl JuliaDecisionArgs {
         Ok(json!({
             "schema_version": 1,
             "operation": "julia_typed_decision",
-            "model": self.model.display().to_string(),
+            "model": model,
             "backend": "native CPU float32",
-            "checkpoint_load_ms": load_ms,
+            "checkpoint_load_ms": self.load_ms,
             "encoding": {
                 "source": "data.sequence",
                 "max_length": typed::MAX_LENGTH,
@@ -119,8 +149,8 @@ impl JuliaDecisionArgs {
             "answers": answers,
             "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             "provenance": {
-                "request_sha256": format!("{:x}", Sha256::digest(&request_bytes)),
-                "tokenizer_json_sha256": format!("{:x}", Sha256::digest(&tokenizer_bytes)),
+                "request_sha256": format!("{:x}", Sha256::digest(request_bytes)),
+                "tokenizer_json_sha256": self.tokenizer_sha256,
                 "model_identity_scope": "local directory, tensor names/dtypes/shapes and tokenizer bytes; checkpoint weights are not fingerprinted",
             },
         }))

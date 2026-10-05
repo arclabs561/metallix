@@ -48,11 +48,47 @@ fn decide_inner(
         ));
     }
     let request_bytes = read_request(request_path)?;
-    let request: DecisionRequest = serde_json::from_slice(&request_bytes)
+    let request = parse_request(&request_bytes)?;
+    let mut session = ChatSession::load(model, limits)?;
+    let receipt = decision_receipt(
+        &mut session,
+        &request_bytes,
+        &request,
+        temperature,
+        &model.display().to_string(),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+/// The `mx decide` receipt for `request_bytes` on an already loaded session,
+/// at the CLI's default temperature of one. `model` labels the receipt.
+pub(crate) fn decide_with_session(
+    session: &mut ChatSession,
+    request_bytes: &[u8],
+    model: &str,
+) -> Result<Value, String> {
+    let request = parse_request(request_bytes)?;
+    decision_receipt(session, request_bytes, &request, 1.0, model)
+}
+
+fn parse_request(request_bytes: &[u8]) -> Result<DecisionRequest, String> {
+    let request: DecisionRequest = serde_json::from_slice(request_bytes)
         .map_err(|error| format!("decision request JSON could not be parsed: {error}"))?;
     validate_request(&request)?;
+    Ok(request)
+}
 
-    let mut session = ChatSession::load(model, limits)?;
+fn decision_receipt(
+    session: &mut ChatSession,
+    request_bytes: &[u8],
+    request: &DecisionRequest,
+    temperature: f64,
+    model: &str,
+) -> Result<Value, String> {
     let maximum_options = request
         .questions
         .values()
@@ -62,7 +98,7 @@ fn decide_inner(
         .map(Vec::len)
         .max()
         .ok_or_else(|| String::from("decision request needs questions"))?;
-    let label_tokens = answer_tokens(&session, maximum_options)?;
+    let label_tokens = answer_tokens(session, maximum_options)?;
     let mut answers = serde_json::Map::new();
     let mut total_input_tokens = 0_usize;
     for (name, question) in &request.questions {
@@ -79,27 +115,23 @@ fn decide_inner(
             answer_receipt(question, &options, &label_tokens, &probabilities, &prefill)?,
         );
     }
-    let provenance = provenance(&request_bytes, &session);
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "schema_version": 1,
-            "operation": "qwen_typed_decision_prefill",
-            "model": model.display().to_string(),
-            "backend": "mlx-rs 0.25.3 Metal float32",
-            "session_load_ms": session.load_ms(),
-            "calibration": {
-                "status": "uncalibrated",
-                "method": "temperature_scaled_option_softmax",
-                "temperature": temperature,
-                "note": "These are normalized probabilities over supplied answer letters, not calibrated confidence. External fitting and held-out validation are required for calibration claims."
-            },
-            "answers": answers,
-            "usage": {"input_tokens": total_input_tokens, "output_tokens": 0},
-            "provenance": provenance,
-        })).map_err(|error| error.to_string())?
-    );
-    Ok(())
+    let provenance = provenance(request_bytes, session);
+    Ok(json!({
+        "schema_version": 1,
+        "operation": "qwen_typed_decision_prefill",
+        "model": model,
+        "backend": "mlx-rs 0.25.3 Metal float32",
+        "session_load_ms": session.load_ms(),
+        "calibration": {
+            "status": "uncalibrated",
+            "method": "temperature_scaled_option_softmax",
+            "temperature": temperature,
+            "note": "These are normalized probabilities over supplied answer letters, not calibrated confidence. External fitting and held-out validation are required for calibration claims."
+        },
+        "answers": answers,
+        "usage": {"input_tokens": total_input_tokens, "output_tokens": 0},
+        "provenance": provenance,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
