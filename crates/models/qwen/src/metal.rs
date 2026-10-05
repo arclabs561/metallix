@@ -320,6 +320,19 @@ impl Qwen3MlxWeights {
         self.forward_config.attention()
     }
 
+    /// Every position's final-norm hidden state for one sequence, flattened
+    /// `[positions, hidden_size]`, under this checkpoint's attention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::forward::Qwen3ForwardError`] when the forward pass fails.
+    pub fn hidden_states(
+        &self,
+        input_ids: &[i32],
+    ) -> Result<Vec<f32>, crate::forward::Qwen3ForwardError> {
+        crate::forward::forward_hidden_states(&self.tensors, &self.forward_config, input_ids)
+    }
+
     fn require_attention(
         &self,
         required: crate::Qwen3Attention,

@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod embedding;
 #[cfg(feature = "metal")]
 pub mod forward;
+pub mod late;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod preflight;
