@@ -16,9 +16,14 @@ arXiv:2602.10273v2, 23 March 2026.  This memo covers the complete v2 HTML
 article: sections 1--8 and appendices A--E, including equations, proof,
 algorithm, cost model, experimental setup, and cache/EOS appendices.  The
 rendered HTML was used because it exposes the same versioned mathematical
-content; no claim here depends on uninspected PDF-only material. A v3 was
-posted on 2 October 2026 and has not been read; recheck this memo against it
-before relying on version-specific details.
+content; no claim here depends on uninspected PDF-only material. A v3 posted on
+2 October 2026 was checked against this memo on 5 October 2026 through quoted
+extracts of its HTML, not a full read. It keeps the target, incremental weight,
+Theorem 1, bridge correction, EOS rule and final weighted categorical draw. It
+adds a resampling check every $B = 64$ tokens and in-paper prompt-cache sharing
+and copy-on-write ancestor deduplication with memory numbers (appendices F and
+H). It moves the cost lemmas to appendix E and adds GSM8K, GPQA, HumanEval and
+ablations. Section letters below follow v2.
 
 ## What distribution it targets
 
@@ -67,7 +72,8 @@ particle-weight variance.
 
 Use log weights, normalize with `logsumexp`, and compute normalized
 $w_{i}$ before $\mathrm{ESS}=1/\sum_{i} w_{i}^2$.  Resampling is triggered
-only at the chosen ESS rule (the paper uses a threshold $\kappa N$) and
+only at the chosen ESS rule (the paper uses a threshold $\kappa N$, checked every token in v2 and every
+$B=64$ tokens in v3 while weights still accumulate per token) and
 uses an explicit ancestor vector whose entries may repeat.  Systematic
 resampling is an unbiased resampling scheme and usually lower variance than
 multinomial resampling; it does not make a finite particle population an exact
@@ -110,7 +116,7 @@ computing an unconstrained target is not an exact Power-SMC variant.
 | Prefix-target, incremental factor, and bridge identity | Exact algebraic specification |
 | Locally optimal temperature proposal | Exact conditional variance result in the paper |
 | A finite particle population plus selected final particle | Approximation to the target, with Monte Carlo/resampling variance |
-| Paper's reported speedups | H100/Hugging Face experiment result, not Mac evidence |
+| Paper's reported speedups | GPU/Hugging Face experiment result (neither version names the GPU), not Mac evidence |
 | CUDA cache optimizations in the authors' repository | Candidate implementation ideas, not an adapter-independent proof |
 
 ## Cache and particle cost on one Mac
@@ -123,8 +129,9 @@ Mac has useful $s(N)$, enough memory, or cheap cache gathers.  Measure all
 three rather than extrapolating GPU results.
 
 Naively, active decode state scales as $O(N\,\text{KV bytes})$, while a
-resample may gather/copy it and duplicate ancestors.  The paper's companion
-implementation proposes two useful but conditional ideas:
+resample may gather/copy it and duplicate ancestors.  The paper (v3
+appendices F and H; in v2 only the companion implementation) describes two
+useful but conditional ideas:
 
 1. Process an immutable prompt once, then share/replicate its cache for the
    initially identical particles.
@@ -135,7 +142,11 @@ implementation proposes two useful but conditional ideas:
 The latter can lower *post-resample* residency but cannot remove the normal
 peak of divergent particles.  It also requires genuine copy-on-write or
 otherwise immutable shared pages; aliasing a mutable Metal buffer is a
-correctness bug, not an optimization.  On a single Mac, prompt length,
+correctness bug, not an optimization.
+v3 reports that copy-on-write lowers the transient resample peak from $2N$ to
+$N+U$ cache equivalents, measuring an 18.38 GB peak on Qwen2.5-7B with $N=64$,
+2.9 GB above single-sequence decoding. That is CUDA/Hugging Face evidence, not
+a Mac measurement.  On a single Mac, prompt length,
 generated length, particle count, cache representation, resample frequency,
 and memory pressure all have to be observed together.
 

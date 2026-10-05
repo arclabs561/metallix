@@ -61,7 +61,7 @@ measurements.
 |---|---|---|---|
 | 0 | Left-to-right masked, fixed text appended, weight ignored | none | Locally normalized; each slot ignores later text |
 | 1 | Best-of-N reweighted by the forced-text weight, weighted categorical pick | `N` times rung 0 | Consistent as `N` grows |
-| 1b | Independence Metropolis-Hastings over the same `N` draws | selection rule only | At least as close as rung 1 in every f-divergence ([2610.03480](https://arxiv.org/abs/2610.03480) Thm 1, posted this month, re-read before relying on it) |
+| 1b | Independence Metropolis-Hastings over the same `N` draws: start at draw 1, move to draw `j` with probability `min(1, w_j / w_current)`, return the final state | selection rule only, `O(N)` scalar work | At least as close to `pi` as rung 1 in every f-divergence for every `N`, if `w` is exactly proportional to `pi/q`, `q > 0` wherever `pi > 0`, and lengths are capped ([2610.03480](https://arxiv.org/abs/2610.03480) Thm 1, whose proof does not use autoregressive structure; strict for `N >= 2` when `q != pi`) |
 | 2 | Importance-sampling ensemble | as rung 1 | Weighted set plus a normalizer estimate |
 | 3 | SMC, resampling at fragment boundaries | KV forks, `N`-way residency | Helps only with two or more slots; equals rung 1 with one |
 | 4 | Lookahead: score the next fixed text on a discarded fork | extra prefill per check | Any positive twist stays consistent |
@@ -77,13 +77,28 @@ sampling needs roughly `exp(KL(pi || q))` samples
 ([1511.01437](https://arxiv.org/abs/1511.01437)), which the enumerated
 benchmark predicts before anything runs.
 
-MCMC notes. Gonzalez et al. regenerate a suffix from a truncation point and
-report KL falling over 1 to 10 steps
-([2506.05754](https://arxiv.org/abs/2506.05754), Llama-3.1-8B only).
+The 1b guarantee is lost under top-k or top-p, a sampling temperature the
+weight does not record, a slot-ending rule that gives zero probability to some
+target length, uncapped lengths, or weights computed on a different numerical
+path from the sampler. It covers one returned sample per pool; several outputs
+need independent pools.
+
+MCMC notes. Gonzalez et al. truncate at a sampled position, regenerate the
+suffix with grammar-constrained decoding, and accept with
+`min(1, P(w') q(w | w') / (P(w) q(w' | w)))`, where the grammar normalizer
+cancels. On one representative SyGuS benchmark their KL falls over 1 to 10
+steps, but it is the GAD proxy computed over observed samples
+([2506.05754](https://arxiv.org/abs/2506.05754) §3, §4.1,
+Llama-3.1-8B-Instruct only). Their convergence theorem (App. E, Thm 3) needs
+truncation at position 0 to have positive probability.
 [Large Language Gibbs](https://arxiv.org/abs/2606.19264) regenerates one
-variable with the others serialized into the prompt; its stationary law is a
-compromise among the model's conditionals, not `pi`, so it is useful only as
-a proposal inside an MH step. A single MH chain needs one fork, not `N`-way KV,
+variable with the others serialized into the prompt in random order. Its
+stationary law is defined only implicitly, as a compromise among the model's
+conditionals; it equals the random-order autoregressive law only under an
+order-invariance assumption that the authors say fails in general (§3, Prop.
+3.2). Neither law is `pi`, which fixes the template's serialization, so we
+would use it only as a proposal inside an MH step; that use is our inference,
+not the paper's. A single MH chain needs one fork, not `N`-way KV,
 so it is not blocked behind particle cache work. No paper measures mixing for
 2 to 5 slots.
 
@@ -249,6 +264,8 @@ benchmark and the scoring API do not touch serving and can run alongside it:
 Read in full: LLaMPPL pp. 1-9, Loula pp. 1-10, twisted SMC selected sections
 including §5 and §7.2.3, AWRS pp. 3-8, GAD pp. 3-9. Read through summaries or
 abstracts only: the MCMC, Large Language Gibbs, Pie, SDAR and I-DLM papers and
-2610.03480 (theorem statement quoted). AICI, vLLM, llguidance and toktrie
+2610.03480 (theorem, hypotheses, Algorithm 1 and the generality remark quoted
+from the v1 HTML; the appendix proof not checked line by line). Power-SMC v3
+was checked the same way. AICI, vLLM, llguidance and toktrie
 facts come from pinned source or issue history. No benchmark in this note has
 been run.
