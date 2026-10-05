@@ -175,14 +175,24 @@ and one set of routes. The principles above still hold: adapters own graphs
 and state, the server only routes typed requests, and every advertised
 capability names a qualification receipt.
 
-Status: step 1 below is delivered. `mx serve --registry models.json` loads
-`{"models": [{"id", "kind", "path"}]}` entries of kind `qwen` (generate and
-decide) or `julia` (decide) at startup; `--model PATH` remains a one-entry Qwen
-shorthand. `/v1/models` lists each entry with its capabilities and
-`/v1/decisions` returns the same receipt as `mx decide` or `mx decide-julia`
-(see [typed decisions](typed-decisions.md#serving-decisions-over-http)). Each
-model has its own worker and admission flag. Capabilities follow the model
-kind; per-capability receipts in the manifest, on-demand loading and eviction
+Status: steps 1 through 3 below are delivered. `mx serve --registry
+models.json` loads `{"models": [{"id", "kind", "path"}]}` entries of kind
+`qwen` (generate and decide), `julia` (decide) or `qwen_embedding` (embed);
+`--model PATH` remains a one-entry Qwen shorthand. `/v1/models` lists each
+entry with its capabilities and whether it is loaded. `/v1/decisions` returns
+the same receipt as `mx decide` or `mx decide-julia` (see
+[typed decisions](typed-decisions.md#serving-decisions-over-http)), and
+`/v1/embeddings` returns single pooled vectors (see [embeddings](embeddings.md)).
+
+Each model runs in its own child `mx serve` process on a loopback port, and the
+front process forwards requests to it unchanged. A model unloaded inside one
+process kept its memory (about 1.2 GB for Julia, 3.4 GB for Qwen3-0.6B), so
+stopping the child is how memory is returned. Entries are `resident` (started
+with the server) or `on_demand` (started on first request) and declare a
+measured `memory_mib`; under `--memory-budget-mib`, idle on-demand children are
+stopped least recently used first to make room. A child that fails to start or
+dies makes only its model unavailable until a later request restarts it.
+Capabilities follow the model kind; per-capability receipts in the manifest
 remain open.
 
 ### Registry
@@ -271,10 +281,10 @@ reference to port, never code the server executes.
    and Julia. Gate: decision receipts over HTTP equal the CLI receipts for the same
    request (Julia: the six reference requests); existing `/v1/responses` tests
    pass unchanged; a Julia request completes while a Qwen request is busy.
-2. On-demand loading and eviction. Gate: measured resident memory stays under
+2. Delivered: on-demand loading and eviction. Gate: measured resident memory stays under
    the declared budget across a load/evict cycle; an evicted model reloads
    with an identical receipt.
-3. `/v1/embeddings` with Qwen3-Embedding-0.6B. Gate: embeddings match the
+3. Delivered: `/v1/embeddings` with Qwen3-Embedding-0.6B. Gate: embeddings match the
    source within a recorded tolerance on fixed inputs, with pooling and
    normalization recorded.
 4. Decision-2.0-Kai as the second Qwen-backbone decision model, then further
