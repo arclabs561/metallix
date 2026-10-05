@@ -117,20 +117,11 @@ pub fn fp8_linear_runtime_f32(
         weight_scales,
     )?;
 
+    // Compute once into scratch and copy on success, so an overflow partway
+    // through still leaves `output` unchanged.
+    let mut scratch = vec![0.0_f32; output.len()];
     for row in 0..shape.rows {
-        for column in 0..shape.outputs {
-            let _ = shape.compute(
-                activation_codes,
-                activation_scales,
-                weight_codes,
-                weight_scales,
-                row,
-                column,
-            )?;
-        }
-    }
-    for row in 0..shape.rows {
-        let destination = &mut output[row * shape.outputs..(row + 1) * shape.outputs];
+        let destination = &mut scratch[row * shape.outputs..(row + 1) * shape.outputs];
         for (column, slot) in destination.iter_mut().enumerate() {
             *slot = shape.compute(
                 activation_codes,
@@ -142,6 +133,7 @@ pub fn fp8_linear_runtime_f32(
             )?;
         }
     }
+    output.copy_from_slice(&scratch);
     Ok(())
 }
 
