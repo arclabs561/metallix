@@ -244,10 +244,47 @@ impl Qwen3MlxWeights {
         input_ids: &[i32],
         dimensions: Option<usize>,
     ) -> Result<Vec<f32>, crate::embedding::Qwen3EmbeddingError> {
+        self.require_attention(crate::Qwen3Attention::Causal)?;
         crate::embedding::check_embedding_input(input_ids)?;
         let hidden =
             crate::forward::forward_last_hidden(&self.tensors, &self.forward_config, input_ids)?;
         crate::embedding::normalize_embedding(&hidden, dimensions)
+    }
+
+    /// Embeds each chunk of one pplx-embed-context document, encoded from
+    /// [`crate::embedding::join_context_chunks`]: the mean of its final-norm
+    /// hidden states under bidirectional attention, one float vector per chunk.
+    ///
+    /// Apply [`crate::embedding::quantize_int8_tanh`] (the model's default) or
+    /// [`crate::embedding::quantize_binary`] to match its published outputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::embedding::Qwen3EmbeddingError`] when the checkpoint is
+    /// not bidirectional or the forward pass fails.
+    pub fn embed_context_chunks(
+        &self,
+        input_ids: &[i32],
+    ) -> Result<Vec<Vec<f32>>, crate::embedding::Qwen3EmbeddingError> {
+        self.require_attention(crate::Qwen3Attention::Bidirectional)?;
+        let hidden =
+            crate::forward::forward_hidden_states(&self.tensors, &self.forward_config, input_ids)?;
+        crate::embedding::mean_pool_context_chunks(
+            &hidden,
+            self.forward_config.hidden_size(),
+            input_ids,
+        )
+    }
+
+    fn require_attention(
+        &self,
+        required: crate::Qwen3Attention,
+    ) -> Result<(), crate::embedding::Qwen3EmbeddingError> {
+        if self.forward_config.attention() == required {
+            Ok(())
+        } else {
+            Err(crate::embedding::Qwen3EmbeddingError::AttentionMismatch { required })
+        }
     }
 
     /// Loads all validated safetensors shards as MLX arrays for Metal execution.

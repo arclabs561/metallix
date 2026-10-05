@@ -16,6 +16,29 @@ pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Which positions a Qwen3 decoder layer attends to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen3Attention {
+    /// Each position attends to itself and earlier positions (`qwen3`).
+    Causal,
+    /// Each position attends to every position: `bidirectional_pplx_qwen3`
+    /// with `use_bidirectional_attention`, as in pplx-embed.
+    Bidirectional,
+}
+
+impl Qwen3Attention {
+    /// Maps a configuration's model type and bidirectional flag to an attention
+    /// layout, or `None` for an unknown type or a flag that contradicts it.
+    #[must_use]
+    pub fn from_config(model_type: &str, use_bidirectional_attention: bool) -> Option<Self> {
+        match (model_type, use_bidirectional_attention) {
+            ("qwen3", false) => Some(Self::Causal),
+            ("bidirectional_pplx_qwen3", true) => Some(Self::Bidirectional),
+            _ => None,
+        }
+    }
+}
+
 /// The validated text-execution contract extracted from a Qwen3 configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3TextContract {
@@ -37,7 +60,9 @@ impl Qwen3TextContract {
     /// Qwen3 configuration, or omits a positive execution dimension.
     pub fn parse(json: &str) -> Result<Self, Qwen3ConfigError> {
         let config: RawConfig = serde_json::from_str(json).map_err(Qwen3ConfigError::Json)?;
-        if config.model_type != "qwen3" {
+        if Qwen3Attention::from_config(&config.model_type, config.use_bidirectional_attention)
+            .is_none()
+        {
             return Err(Qwen3ConfigError::UnexpectedModelType(config.model_type));
         }
         if config.num_hidden_layers == 0 {
@@ -121,6 +146,8 @@ struct RawConfig {
     #[serde(default)]
     model_type: String,
     #[serde(default)]
+    use_bidirectional_attention: bool,
+    #[serde(default)]
     num_hidden_layers: u32,
     #[serde(default)]
     hidden_size: u32,
@@ -143,8 +170,11 @@ pub enum Qwen3ConfigError {
     /// The supplied document was not JSON.
     #[error("invalid configuration JSON: {0}")]
     Json(serde_json::Error),
-    /// The configuration was not a Qwen3 text model.
-    #[error("expected model_type qwen3, got {0:?}")]
+    /// The configuration was not a Qwen3 text model, or its attention flag
+    /// disagrees with its model type.
+    #[error(
+        "expected model_type qwen3, or bidirectional_pplx_qwen3 with use_bidirectional_attention, got {0:?}"
+    )]
     UnexpectedModelType(String),
     /// The configuration does not expose transformer layers.
     #[error("Qwen3 configuration has no usable transformer layers")]
@@ -194,6 +224,39 @@ mod tests {
         assert_eq!(contract.key_value_heads(), 8);
         assert_eq!(contract.head_dim(), 128);
         assert_eq!(contract.max_position_embeddings(), 40_960);
+    }
+
+    #[test]
+    fn maps_model_type_and_bidirectional_flag_to_attention() {
+        use super::Qwen3Attention;
+        assert_eq!(
+            Qwen3Attention::from_config("qwen3", false),
+            Some(Qwen3Attention::Causal)
+        );
+        assert_eq!(
+            Qwen3Attention::from_config("bidirectional_pplx_qwen3", true),
+            Some(Qwen3Attention::Bidirectional)
+        );
+        for (model_type, flag) in [
+            ("qwen3", true),
+            ("bidirectional_pplx_qwen3", false),
+            ("llama", false),
+        ] {
+            assert_eq!(Qwen3Attention::from_config(model_type, flag), None);
+        }
+        let bidirectional = CONFIG.replace(
+            r#""model_type":"qwen3""#,
+            r#""model_type":"bidirectional_pplx_qwen3","use_bidirectional_attention":true"#,
+        );
+        assert!(Qwen3TextContract::parse(&bidirectional).is_ok());
+        let contradictory = CONFIG.replace(
+            r#""model_type":"qwen3""#,
+            r#""model_type":"qwen3","use_bidirectional_attention":true"#,
+        );
+        assert!(matches!(
+            Qwen3TextContract::parse(&contradictory),
+            Err(Qwen3ConfigError::UnexpectedModelType(_))
+        ));
     }
 
     #[test]

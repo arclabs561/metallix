@@ -21,6 +21,8 @@ use mlx_rs::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::Qwen3Attention;
+
 /// The largest prompt accepted by the uncached qualification forward path.
 pub const MAX_DENSE_DEBUG_TOKENS: usize = 512;
 
@@ -236,6 +238,7 @@ pub struct Qwen3ForwardConfig {
     max_position_embeddings: usize,
     rms_norm_eps: f32,
     rope_theta: f32,
+    attention: Qwen3Attention,
 }
 
 impl Qwen3ForwardConfig {
@@ -244,9 +247,11 @@ impl Qwen3ForwardConfig {
     /// reference vectors, so they are refused rather than silently ignored.
     pub fn parse(json: &str) -> Result<Self, Qwen3ForwardError> {
         let raw: RawForwardConfig = serde_json::from_str(json)?;
-        if raw.model_type != "qwen3" {
+        let Some(attention) =
+            Qwen3Attention::from_config(&raw.model_type, raw.use_bidirectional_attention)
+        else {
             return Err(Qwen3ForwardError::UnsupportedModelType(raw.model_type));
-        }
+        };
         if raw.attention_bias || raw.mlp_bias {
             return Err(Qwen3ForwardError::UnsupportedBiasLayout);
         }
@@ -311,7 +316,14 @@ impl Qwen3ForwardConfig {
             max_position_embeddings: raw.max_position_embeddings,
             rms_norm_eps: raw.rms_norm_eps,
             rope_theta: raw.rope_theta,
+            attention,
         })
+    }
+
+    /// Returns whether decoder layers attend causally or bidirectionally.
+    #[must_use]
+    pub const fn attention(&self) -> Qwen3Attention {
+        self.attention
     }
 
     /// Returns the residual-stream width used by every decoder layer.
@@ -360,6 +372,9 @@ impl Qwen3ForwardConfig {
         maximum_context_tokens: usize,
         maximum_kv_bytes: u64,
     ) -> Result<Qwen3ResidentChatPlan, Qwen3ForwardError> {
+        if self.attention != Qwen3Attention::Causal {
+            return Err(Qwen3ForwardError::CachedBidirectional);
+        }
         let maximum = MAX_RESIDENT_CHAT_TOKENS.min(self.max_position_embeddings);
         if maximum_context_tokens == 0 || maximum_context_tokens > maximum {
             return Err(Qwen3ForwardError::ResidentChatContextLimit {
@@ -425,7 +440,49 @@ pub fn forward_last_hidden<S: BuildHasher>(
     read_last_logits(&normalized, 1, config.hidden_size)
 }
 
+/// Runs a complete uncached Qwen3 forward pass and reads back every
+/// position's final-norm hidden state, flattened `[positions, hidden_size]`.
+///
+/// This is a source `Qwen3Model`'s `last_hidden_state` for one sequence.
+pub fn forward_hidden_states<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    input_ids: &[i32],
+) -> Result<Vec<f32>, Qwen3ForwardError> {
+    let normalized = rms_norm(
+        &decoder_states(weights, config, input_ids, None)?,
+        weight(weights, "model.norm.weight")?,
+        config.rms_norm_eps,
+    )?
+    .as_type_device::<f32>(StreamOrDevice::gpu())?;
+    normalized.eval()?;
+    Ok(normalized.as_slice::<f32>().to_vec())
+}
+
 fn last_normalized_hidden<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    input_ids: &[i32],
+    steering: Option<&Qwen3ResidualSteering>,
+) -> Result<Array, Qwen3ForwardError> {
+    let hidden_states = decoder_states(weights, config, input_ids, steering)?;
+    let seq_len = i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    // Only the final position is requested; normalization and the tied output
+    // projection are position-independent after the decoder layers.
+    let last_hidden = hidden_states.take_axis_device(
+        Array::from_slice(&[seq_len - 1], &[1]),
+        1,
+        StreamOrDevice::gpu(),
+    )?;
+    rms_norm(
+        &last_hidden,
+        weight(weights, "model.norm.weight")?,
+        config.rms_norm_eps,
+    )
+}
+
+/// The residual stream after every decoder layer, `[1, positions, hidden]`.
+fn decoder_states<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     config: &Qwen3ForwardConfig,
     input_ids: &[i32],
@@ -451,16 +508,7 @@ fn last_normalized_hidden<S: BuildHasher>(
         hidden_states =
             apply_residual_steering(steering, layer, 0, input_ids.len(), &hidden_states)?;
     }
-
-    // Only the final position is requested; normalization and the tied output
-    // projection are position-independent after the decoder layers.
-    let last_hidden =
-        hidden_states.take_axis_device(Array::from_slice(&[seq_len - 1], &[1]), 1, &stream)?;
-    rms_norm(
-        &last_hidden,
-        weight(weights, "model.norm.weight")?,
-        config.rms_norm_eps,
-    )
+    Ok(hidden_states)
 }
 
 /// Executes one uncached dense Qwen3 decoder layer.
@@ -786,6 +834,11 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     fn append_inner(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
+        // A cache of earlier positions cannot serve a layer whose earlier
+        // positions also attend to later ones.
+        if self.config.attention != Qwen3Attention::Causal {
+            return Err(Qwen3ForwardError::CachedBidirectional);
+        }
         validate_input_ids(
             self.config,
             input_ids,
@@ -1297,7 +1350,11 @@ fn attention<S: BuildHasher>(
         &key,
         &value,
         attention_scale(config)?,
-        Some(fast::ScaledDotProductAttentionMask::Causal),
+        match config.attention {
+            Qwen3Attention::Causal => Some(fast::ScaledDotProductAttentionMask::Causal),
+            // One unpadded sequence: every position attends to every position.
+            Qwen3Attention::Bidirectional => None,
+        },
         &stream,
     )?
     .transpose_axes_device(&[0, 2, 1, 3], &stream)?
@@ -1446,6 +1503,8 @@ struct RawForwardConfig {
     #[serde(default)]
     model_type: String,
     #[serde(default)]
+    use_bidirectional_attention: bool,
+    #[serde(default)]
     num_hidden_layers: usize,
     #[serde(default)]
     hidden_size: usize,
@@ -1569,8 +1628,14 @@ pub enum Qwen3ForwardError {
     /// The configuration was not JSON.
     #[error("invalid Qwen3 forward configuration: {0}")]
     Json(#[from] serde_json::Error),
-    /// The configuration selected a non-Qwen3 architecture.
-    #[error("expected model_type qwen3, got {0:?}")]
+    /// The KV-cache executor only supports causal attention.
+    #[error("the Qwen3 KV-cache executor requires causal attention")]
+    CachedBidirectional,
+    /// The configuration selected a non-Qwen3 architecture, or its attention
+    /// flag disagrees with its model type.
+    #[error(
+        "expected model_type qwen3, or bidirectional_pplx_qwen3 with use_bidirectional_attention, got {0:?}"
+    )]
     UnsupportedModelType(String),
     /// The forward path needs a positive model dimension.
     #[error("Qwen3 configuration has no usable {0}")]
@@ -1695,8 +1760,9 @@ mod tests {
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
         Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
-        forward_last_hidden, forward_last_logits, forward_last_logits_with_residual_steering,
-        forward_layer, linear, read_last_logits, rms_norm, stepped_capacity, weight,
+        forward_hidden_states, forward_last_hidden, forward_last_logits,
+        forward_last_logits_with_residual_steering, forward_layer, linear, read_last_logits,
+        rms_norm, stepped_capacity, weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -2416,6 +2482,89 @@ mod tests {
                 "row {row}: {projected} vs {logit}"
             );
         }
+    }
+
+    fn bidirectional_config() -> Qwen3ForwardConfig {
+        let json = r#"{
+              "model_type":"bidirectional_pplx_qwen3",
+              "use_bidirectional_attention":true,
+              "num_hidden_layers":1,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "head_dim":4,
+              "max_position_embeddings":16,
+              "rms_norm_eps":0.000001,
+              "rope_theta":1000000,
+              "hidden_act":"silu",
+              "tie_word_embeddings":true,
+              "attention_bias":false,
+              "mlp_bias":false
+            }"#;
+        Qwen3ForwardConfig::parse(json).expect("bidirectional Qwen3 config")
+    }
+
+    #[test]
+    fn bidirectional_attention_lets_early_positions_see_later_tokens() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let weights = deterministic_weights();
+        let causal = small_dense_config();
+        let bidirectional = bidirectional_config();
+        assert_eq!(causal.attention(), crate::Qwen3Attention::Causal);
+        assert_eq!(
+            bidirectional.attention(),
+            crate::Qwen3Attention::Bidirectional
+        );
+        let row = |config: &Qwen3ForwardConfig, ids: &[i32], position: usize| {
+            forward_hidden_states(&weights, config, ids).expect("hidden states")
+                [position * 4..position * 4 + 4]
+                .to_vec()
+        };
+        // Changing only the last token moves position 0 under bidirectional
+        // attention and leaves it untouched under causal attention.
+        assert_eq!(row(&causal, &[1, 2, 3], 0), row(&causal, &[1, 2, 6], 0));
+        assert_ne!(
+            row(&bidirectional, &[1, 2, 3], 0),
+            row(&bidirectional, &[1, 2, 6], 0)
+        );
+        // The last position attends to everything either way.
+        for (left, right) in
+            row(&causal, &[1, 2, 3], 2)
+                .iter()
+                .zip(row(&bidirectional, &[1, 2, 3], 2))
+        {
+            assert!((left - right).abs() <= 1e-6, "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn per_token_states_end_with_the_last_hidden_state() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = small_dense_config();
+        let weights = deterministic_weights();
+        let all = forward_hidden_states(&weights, &config, &[1, 2, 3]).expect("all positions");
+        assert_eq!(all.len(), 3 * 4);
+        let last = forward_last_hidden(&weights, &config, &[1, 2, 3]).expect("last position");
+        for (left, right) in all[8..].iter().zip(&last) {
+            assert!((left - right).abs() <= 1e-6, "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn kv_cache_executor_refuses_bidirectional_attention() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = bidirectional_config();
+        let weights = deterministic_weights();
+        assert!(matches!(
+            Qwen3ForwardExecutor::new(&config, &weights).prefill_last_logits(&[1, 2]),
+            Err(Qwen3ForwardError::CachedBidirectional)
+        ));
+        assert!(matches!(
+            config.resident_chat_plan(8, u64::MAX),
+            Err(Qwen3ForwardError::CachedBidirectional)
+        ));
     }
 
     fn deterministic_weights() -> HashMap<String, Array> {
