@@ -186,6 +186,23 @@ pub fn parse_turn(
     enable_thinking: bool,
     complete: bool,
 ) -> Result<AssistantTurn, String> {
+    let turn = parse_turn_unchecked(format, text, tools, enable_thinking, complete)?;
+    for call in &turn.calls {
+        check_call(tools, call)?;
+    }
+    Ok(turn)
+}
+
+/// [`parse_turn`] without checking calls against their declarations, for
+/// a caller that reports an invalid call back to the model (the agent
+/// loop) through [`check_call`] instead of failing the turn.
+pub fn parse_turn_unchecked(
+    format: TurnFormat,
+    text: &str,
+    tools: &[Value],
+    enable_thinking: bool,
+    complete: bool,
+) -> Result<AssistantTurn, String> {
     let (reasoning, answer) = if enable_thinking {
         format.reasoning.split(text)
     } else {
@@ -195,33 +212,40 @@ pub fn parse_turn(
     if !turn.calls.is_empty() && !complete {
         return Err("truncated tool turn; no function calls returned".into());
     }
-    let mut calls = Vec::new();
-    for call in turn.calls {
-        let definition = tools
-            .iter()
-            .find(|tool| tool["function"]["name"] == call.name)
-            .ok_or("model requested an undeclared tool")?;
-        if !tools::validator(&definition["function"]["parameters"])?.is_valid(&call.arguments) {
-            return Err("model tool arguments do not match the declared schema".into());
-        }
-        calls.push(ChatToolCall {
-            name: call.name,
-            arguments: call.arguments,
-        });
-    }
     Ok(AssistantTurn {
         reasoning: reasoning.to_owned(),
         text: turn.text,
-        calls,
+        calls: turn
+            .calls
+            .into_iter()
+            .map(|call| ChatToolCall {
+                name: call.name,
+                arguments: call.arguments,
+            })
+            .collect(),
         complete,
     })
+}
+
+/// Checks one call against the declared `tools`: the tool must exist and
+/// its arguments must satisfy the parameter schema.
+pub fn check_call(tools: &[Value], call: &ChatToolCall) -> Result<(), String> {
+    let definition = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == call.name)
+        .ok_or("model requested an undeclared tool")?;
+    tools::validator(&definition["function"]["parameters"])?
+        .validate(&call.arguments)
+        .map_err(|error| format!("model tool arguments do not match the declared schema: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{ReasoningDialect, ToolDialect, TurnFormat, parse_turn};
+    use super::{
+        ReasoningDialect, ToolDialect, TurnFormat, check_call, parse_turn, parse_turn_unchecked,
+    };
     use crate::ChatToolCall;
 
     const QWEN3_TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
@@ -424,6 +448,14 @@ mod tests {
         let wrong =
             "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": 5}}</tool_call>";
         assert!(parse_turn(QWEN3, wrong, &read_file(), false, true).is_err());
+        // Unchecked parsing keeps the call for a caller that reports the
+        // error to the model; check_call gives that error.
+        let kept = parse_turn_unchecked(QWEN3, wrong, &read_file(), false, true).unwrap();
+        assert!(
+            check_call(&read_file(), &kept.calls[0])
+                .is_err_and(|error| error.contains("declared schema"))
+        );
+        assert!(parse_turn_unchecked(QWEN3, call, &read_file(), true, false).is_err());
         // Plain text keeps any markup the model writes as text.
         let plain = parse_turn(TurnFormat::PLAIN, call, &read_file(), true, true).unwrap();
         assert_eq!((plain.reasoning.as_str(), plain.text.as_str()), ("", call));

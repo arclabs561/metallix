@@ -29,7 +29,10 @@ pub use crate::{
     messages::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation},
     tokenizer::{QwenIncrementalDecode, QwenTokenizer, read_regular_file},
     tools::validator,
-    turn::{AssistantTurn, ReasoningDialect, ToolDialect, TurnFormat, parse_turn},
+    turn::{
+        AssistantTurn, ReasoningDialect, ToolDialect, TurnFormat, check_call, parse_turn,
+        parse_turn_unchecked,
+    },
 };
 
 pub const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;

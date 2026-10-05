@@ -179,14 +179,21 @@ fn agent_inner(
         )?;
         let mut turn_receipt = AgentTurnReceipt::from_generation(turn_index, &result);
         let complete = result.finish_reason == ChatFinishReason::Eos;
-        let turn =
-            match chat_format::parse_turn(result.format, &result.text, &tools, false, complete) {
-                Ok(turn) => turn,
-                Err(error) => {
-                    receipt.push_turn(turn_receipt);
-                    return Err(error);
-                }
-            };
+        // Invalid calls are answered with their error, so the model can
+        // correct them; only unparseable or truncated turns end the run.
+        let turn = match chat_format::parse_turn_unchecked(
+            result.format,
+            &result.text,
+            &tools,
+            false,
+            complete,
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                receipt.push_turn(turn_receipt);
+                return Err(error);
+            }
+        };
         if turn.calls.is_empty() {
             if result.finish_reason != ChatFinishReason::Eos {
                 receipt.push_turn(turn_receipt);
@@ -206,7 +213,7 @@ fn agent_inner(
                 if report_tools {
                     eprintln!("tool: {}", call.name);
                 }
-                workspace.execute(call)
+                checked_call(&tools, call, |call| workspace.execute(call))
             },
         );
         for (index, (call, output)) in turn.calls.iter().zip(outputs).enumerate() {
@@ -222,6 +229,20 @@ fn agent_inner(
         receipt.push_turn(turn_receipt);
     }
     Err(format!("agent stopped at the {max_turns}-turn limit"))
+}
+
+/// Runs `call` only when it matches its declaration; otherwise returns the
+/// validation error as the tool's result.
+fn checked_call<F>(
+    tools: &[serde_json::Value],
+    call: &ChatToolCall,
+    execute: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(&ChatToolCall) -> Result<serde_json::Value, String>,
+{
+    chat_format::check_call(tools, call)?;
+    execute(call)
 }
 
 /// Executes calls only after a complete model turn, and records the precise
@@ -281,7 +302,7 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    use super::{AgentTurnReceipt, execute_calls};
+    use super::{AgentTurnReceipt, checked_call, execute_calls};
     use crate::{
         agent_receipt::hash_arguments,
         chat_generation::{ChatFinishReason, ChatGeneration, ChatGenerationMetrics, ChatToolCall},
@@ -312,6 +333,38 @@ mod tests {
                 format: crate::chat_generation::QWEN3_TURN,
             },
         )
+    }
+
+    /// An invalid call is answered with its validation error and not run;
+    /// the valid call beside it still runs.
+    #[test]
+    fn invalid_calls_return_their_validation_error_to_the_model() {
+        let tools = crate::chat_tools::definitions();
+        let mut receipt = turn_receipt();
+        let calls = vec![
+            ChatToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": 5}),
+            },
+            ChatToolCall {
+                name: "read_file".into(),
+                arguments: json!({"path": "a.md"}),
+            },
+        ];
+        let mut executed = Vec::new();
+        let output = execute_calls(&mut receipt, ChatFinishReason::Eos, &calls, |call| {
+            checked_call(&tools, call, |call| {
+                executed.push(call.arguments.clone());
+                Ok(json!({"text": "ok"}))
+            })
+        });
+        assert!(
+            output[0]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("declared schema"))
+        );
+        assert_eq!(output[1], json!({"text": "ok"}));
+        assert_eq!(executed, [json!({"path": "a.md"})]);
     }
 
     #[test]
