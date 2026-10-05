@@ -230,8 +230,10 @@ impl EngramHashState {
     ///
     /// `tokens` is batch-major `[batch, positions]`. Returned addresses are
     /// flattened `[batch, positions, layer, ngram(2..=max), head]`, with head
-    /// varying fastest. All validation and calculation complete against a copy
-    /// of the history before this state is updated.
+    /// varying fastest. All validation and calculation complete before this
+    /// state is updated: positions inside the chunk read `tokens`, earlier ones
+    /// read the committed history, so a call costs its chunk and lookback, not
+    /// the history capacity.
     ///
     /// # Errors
     ///
@@ -292,27 +294,18 @@ impl EngramHashState {
             return Err(EngramHashError::WorkLimit { elements: work });
         }
 
-        let mut next_history = Vec::new();
-        next_history
-            .try_reserve_exact(self.history.len())
-            .map_err(|_| EngramHashError::AllocationFailed {
-                elements: self.history.len(),
-            })?;
-        next_history.extend_from_slice(&self.history);
+        let output = self.hash_chunk(tokens, positions, start_position, output_elements)?;
         if start_position == 0 {
-            next_history.fill(None);
+            self.history.fill(None);
         }
         for batch in 0..self.batches {
             let source = &tokens[batch * positions..(batch + 1) * positions];
             let destination = batch * self.capacity + start_position;
-            next_history[destination..destination + positions]
+            self.history[destination..destination + positions]
                 .iter_mut()
                 .zip(source)
                 .for_each(|(slot, &token)| *slot = Some(token));
         }
-
-        let output = self.hash_chunk(&next_history, positions, start_position, output_elements)?;
-        self.history = next_history;
         Ok(output)
     }
 
@@ -330,9 +323,10 @@ impl EngramHashState {
         })
     }
 
+    /// Hashes a chunk as if it were already written at `start_position`.
     fn hash_chunk(
         &self,
-        history: &[Option<CompressedToken>],
+        tokens: &[CompressedToken],
         positions: usize,
         start_position: usize,
         output_elements: usize,
@@ -358,12 +352,16 @@ impl EngramHashState {
                             self.layout.compressed_pad_id
                         } else {
                             let source_position = absolute_position - lookback;
-                            let token = history[batch * self.capacity + source_position].ok_or(
-                                EngramHashError::UninitializedHistory {
-                                    batch,
-                                    position: source_position,
-                                },
-                            )?;
+                            let token = if source_position >= start_position {
+                                tokens[batch * positions + source_position - start_position]
+                            } else {
+                                self.history[batch * self.capacity + source_position].ok_or(
+                                    EngramHashError::UninitializedHistory {
+                                        batch,
+                                        position: source_position,
+                                    },
+                                )?
+                            };
                             match token {
                                 CompressedToken::Dead => {
                                     blocked = true;
@@ -553,6 +551,7 @@ fn check_length(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::Value;
 
     use super::{CompressedToken, EngramHashError, EngramHashLayout, EngramHashState};
@@ -755,5 +754,80 @@ mod tests {
             })
         ));
         assert!(state.history[1..].iter().all(Option::is_none));
+    }
+
+    fn token() -> impl Strategy<Value = CompressedToken> {
+        prop_oneof![
+            1 => Just(CompressedToken::Dead),
+            5 => (0_i64..1_000_000).prop_map(CompressedToken::Live),
+        ]
+    }
+
+    /// Writes per-batch streams as consecutive chunks from position 0 and
+    /// returns per-batch addresses, concatenated batch-major.
+    fn write_chunks(
+        state: &mut EngramHashState,
+        streams: &[Vec<CompressedToken>],
+        widths: &[usize],
+    ) -> Vec<i64> {
+        let columns = 2 * 6;
+        let mut per_batch = vec![Vec::new(); streams.len()];
+        let mut start = 0;
+        for &width in widths {
+            let chunk: Vec<_> = streams
+                .iter()
+                .flat_map(|stream| stream[start..start + width].iter().copied())
+                .collect();
+            let addresses = state.write_and_hash(&chunk, width, start).expect("chunk");
+            for (batch, rows) in addresses.chunks_exact(width * columns).enumerate() {
+                per_batch[batch].extend_from_slice(rows);
+            }
+            start += width;
+        }
+        per_batch.concat()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Chunked and token-by-token decode reproduce one-shot prefill,
+        /// including after a start-zero reset over a longer stale stream.
+        #[test]
+        fn chunked_decode_matches_one_shot_prefill(
+            (streams, stale, cuts, extra) in (1_usize..=3, 1_usize..=24).prop_flat_map(
+                |(batches, length)| (
+                    prop::collection::vec(prop::collection::vec(token(), length), batches),
+                    prop::collection::vec(prop::collection::vec(token(), length..=length + 8), batches),
+                    prop::collection::vec(1_usize..=length, 0..4),
+                    0_usize..40,
+                ),
+            ),
+        ) {
+            let fixture = fixture();
+            let batches = streams.len();
+            let length = streams[0].len();
+            let stale_length = stale.iter().map(Vec::len).min().expect("batches");
+            let stale: Vec<Vec<_>> =
+                stale.into_iter().map(|stream| stream[..stale_length].to_vec()).collect();
+            let capacity = stale_length + extra;
+            let new_state = || {
+                EngramHashState::new(layout(&fixture), batches, capacity).expect("state")
+            };
+            let one_shot = write_chunks(&mut new_state(), &streams, &[length]);
+
+            let mut bounds: Vec<usize> = cuts.into_iter().chain([0, length]).collect();
+            bounds.sort_unstable();
+            bounds.dedup();
+            let widths: Vec<usize> = bounds.windows(2).map(|pair| pair[1] - pair[0]).collect();
+            prop_assert_eq!(&write_chunks(&mut new_state(), &streams, &widths), &one_shot);
+            prop_assert_eq!(
+                &write_chunks(&mut new_state(), &streams, &vec![1; length]),
+                &one_shot
+            );
+
+            let mut reused = new_state();
+            write_chunks(&mut reused, &stale, &[stale_length]);
+            prop_assert_eq!(&write_chunks(&mut reused, &streams, &widths), &one_shot);
+        }
     }
 }
