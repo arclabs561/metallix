@@ -100,6 +100,7 @@ def main() -> int:
         ),
         (["cargo", "doc", "--workspace", "--no-deps", *feature_args], True),
         ([sys.executable, "scripts/test_benchmark_qwen.py"], False),
+        ([sys.executable, "scripts/test_bench_serve.py"], False),
         ([sys.executable, "scripts/test_compare_qwen.py"], False),
         ([sys.executable, "scripts/test_checkpoint_io.py"], False),
         ([sys.executable, "scripts/test_replay_v41_route_trace.py"], False),
