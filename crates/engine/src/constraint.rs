@@ -177,6 +177,10 @@ pub enum ConstraintError {
     SchemaValidation,
 }
 
+/// How many of the highest logits greedy selection checks one token at a
+/// time before it computes the full vocabulary mask.
+pub const LAZY_ARGMAX_CANDIDATES: usize = 8;
+
 /// One JSON-Schema grammar session bound to a tokenizer and model logit width.
 pub struct JsonConstraintSession {
     env: TokEnv,
@@ -265,8 +269,116 @@ impl JsonConstraintSession {
     }
 
     /// Selects and consumes the finite maximum grammar-allowed tokenizer logit.
+    ///
+    /// The model's own top choices are usually legal, so the few highest
+    /// logits are checked one token at a time first, in the order the full
+    /// mask would rank them (higher logit, then lower ID); the first legal
+    /// one is exactly the constrained maximum. Only after
+    /// [`LAZY_ARGMAX_CANDIDATES`] illegal candidates does this compute the
+    /// mask over the whole vocabulary.
     pub fn select_argmax(&mut self, logits: &[f32]) -> Result<ConstraintStep, ConstraintError> {
+        if let Some(index) = self.first_legal_by_logit(logits)? {
+            return self.commit_in_place(index);
+        }
+        self.select_argmax_by_mask(logits)
+    }
+
+    /// [`Self::select_argmax`] through the full vocabulary mask.
+    fn select_argmax_by_mask(&mut self, logits: &[f32]) -> Result<ConstraintStep, ConstraintError> {
         self.select(logits, false).map(|(step, _)| step)
+    }
+
+    /// The highest-ranked legal token among the [`LAZY_ARGMAX_CANDIDATES`]
+    /// best logits, or `None` to fall back to the mask (including every case
+    /// the mask path reports as an error, so errors stay identical).
+    fn first_legal_by_logit(&mut self, logits: &[f32]) -> Result<Option<usize>, ConstraintError> {
+        if self.state != SessionState::Active
+            || logits.len() != self.model_vocab_size
+            || logits.iter().any(|logit| !logit.is_finite())
+            || self.matcher.is_stopped()
+            // With a canonical tokenizer, llguidance's mask allows only the
+            // canonical tokenization of forced bytes, while validate_tokens
+            // accepts any split of them. The approximate environment built
+            // here is not canonical, so both allow the same tokens.
+            || self.env.tokenize_is_canonical()
+        {
+            return Ok(None);
+        }
+        // Padded model rows past the tokenizer are never selectable.
+        let ranked = |left: &usize, right: &usize| {
+            logits[*right]
+                .total_cmp(&logits[*left])
+                .then(left.cmp(right))
+        };
+        let mut candidates: Vec<usize> = Vec::with_capacity(LAZY_ARGMAX_CANDIDATES + 1);
+        for (index, &logit) in logits[..self.tokenizer_vocab_size].iter().enumerate() {
+            // Indices rise, so a logit that does not beat the current
+            // last-ranked one (ties included) ranks below it: the common
+            // case costs one comparison.
+            if candidates.len() == LAZY_ARGMAX_CANDIDATES
+                && logit <= logits[candidates[LAZY_ARGMAX_CANDIDATES - 1]]
+            {
+                continue;
+            }
+            let position = candidates
+                .binary_search_by(|candidate| ranked(candidate, &index))
+                .unwrap_or_else(|position| position);
+            candidates.insert(position, index);
+            candidates.truncate(LAZY_ARGMAX_CANDIDATES);
+        }
+        for index in candidates {
+            let token_id =
+                u32::try_from(index).map_err(|_| ConstraintError::TokenizerCompilation)?;
+            let legal = self
+                .matcher
+                .validate_tokens(&[token_id])
+                .map_err(|_| ConstraintError::NonAcceptingStop)?;
+            if legal == 1 {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Consumes a token already validated against the live matcher, without
+    /// the clone the mask path commits from. A completion that does not
+    /// accept is rolled back. Validation rules out a failed consumption; if
+    /// llguidance failed anyway, the matcher would keep its error state.
+    fn commit_in_place(
+        &mut self,
+        selected_index: usize,
+    ) -> Result<ConstraintStep, ConstraintError> {
+        let token_id =
+            u32::try_from(selected_index).map_err(|_| ConstraintError::TokenizerCompilation)?;
+        let token_bytes = if token_id == self.eos_token_id {
+            Vec::new()
+        } else {
+            self.env.tok_trie().decode(&[token_id])
+        };
+        if self.output.len().saturating_add(token_bytes.len()) > self.limits.max_output_bytes {
+            return Err(ConstraintError::OutputTooLarge);
+        }
+        self.matcher
+            .consume_token(token_id)
+            .map_err(|_| ConstraintError::NonAcceptingStop)?;
+        let complete = if self.matcher.is_stopped() {
+            if !is_accepting_terminal(&mut self.matcher)? {
+                self.matcher
+                    .rollback(1)
+                    .map_err(|_| ConstraintError::NonAcceptingStop)?;
+                return Err(ConstraintError::NonAcceptingStop);
+            }
+            true
+        } else {
+            false
+        };
+        self.output.extend_from_slice(&token_bytes);
+        if complete {
+            self.state = SessionState::Complete;
+            Ok(ConstraintStep::Complete { token_id })
+        } else {
+            Ok(ConstraintStep::Token { token_id })
+        }
     }
 
     /// Captures grammar state and decoded bytes for a reversible branch.
@@ -747,6 +859,137 @@ mod tests {
             b'l' => 12,
             b's' => 13,
             _ => panic!("test tokenizer has no ID for this byte"),
+        }
+    }
+
+    /// The `{"ok": true}` schema with an `ok` token beside `o` and `k`. After
+    /// `{"` the grammar forces the bytes `ok":true}`, and the mask allows only
+    /// the forced tokenization while llguidance's `validate_tokens` accepts
+    /// any token those bytes start with.
+    fn forced_session() -> JsonConstraintSession {
+        let tokenizer = json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [{"id": 15, "content": "<eos>", "special": true}],
+            "model": {"vocab": {
+                "{": 0, "}": 1, "\"": 2, "o": 3, "k": 4, ":": 5,
+                "t": 6, "r": 7, "u": 8, "e": 9, "f": 10, "a": 11,
+                "l": 12, "s": 13, "ok": 14
+            }}
+        });
+        JsonConstraintSession::new(&tokenizer, 15, MODEL_VOCAB, schema(), limits())
+            .expect("bounded forced-bytes session")
+    }
+
+    /// A greedy tokenizer that llguidance may treat as canonical, which
+    /// turns on its forced-token mask.
+    struct CanonicalEnv(llguidance::toktrie::TokTrie);
+
+    impl llguidance::toktrie::TokenizerEnv for CanonicalEnv {
+        fn tok_trie(&self) -> &llguidance::toktrie::TokTrie {
+            &self.0
+        }
+
+        fn tokenize_bytes(&self, s: &[u8]) -> Vec<u32> {
+            self.0.greedy_tokenize(s)
+        }
+
+        fn tokenize_is_canonical(&self) -> bool {
+            true
+        }
+    }
+
+    /// The forced-bytes session rebuilt over [`CanonicalEnv`].
+    fn canonical_forced_session() -> JsonConstraintSession {
+        let mut session = forced_session();
+        let env: llguidance::toktrie::TokEnv =
+            std::sync::Arc::new(CanonicalEnv(session.env.tok_trie().clone()));
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        session.matcher = llguidance::Matcher::new(
+            factory.create_parser(llguidance::api::TopLevelGrammar::from_json_schema(schema())),
+        );
+        session.env = env;
+        session
+    }
+
+    /// Under a canonical tokenizer the mask forces `ok` after `{"` while
+    /// validation also accepts `o`, so the first-legal walk must not run.
+    #[test]
+    fn canonical_forcing_falls_back_to_the_mask() {
+        let mut probe = canonical_forced_session();
+        let mut values = vec![0.0; MODEL_VOCAB];
+        for favored in [0, 2] {
+            values.fill(0.0);
+            values[favored] = 5.0;
+            probe.select_argmax_by_mask(&values).expect("prefix");
+        }
+        let mask = probe.matcher.compute_mask().expect("mask");
+        assert!(mask.is_allowed(14) && !mask.is_allowed(3));
+        assert_eq!(probe.matcher.validate_tokens(&[3]).ok(), Some(1));
+
+        let (mut lazy, mut masked) = (canonical_forced_session(), canonical_forced_session());
+        for favored in [0, 2, 3, 14, 2, 5] {
+            values.fill(0.0);
+            values[favored] = 5.0;
+            values[3] = 4.0;
+            let expected = masked.select_argmax_by_mask(&values);
+            assert_eq!(lazy.select_argmax(&values), expected, "favored {favored}");
+            assert_eq!(lazy.decoded_bytes(), masked.decoded_bytes());
+        }
+    }
+
+    #[test]
+    fn forced_bytes_pick_the_masks_token() {
+        let (mut lazy, mut masked) = (forced_session(), forced_session());
+        for favored in [0, 2, 14, 3, 4] {
+            let mut values = vec![0.0; MODEL_VOCAB];
+            values[favored] = 5.0;
+            values[14] = 4.0;
+            let expected = masked.select_argmax_by_mask(&values);
+            assert_eq!(lazy.select_argmax(&values), expected, "favored {favored}");
+            assert_eq!(lazy.decoded_bytes(), masked.decoded_bytes());
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Greedy selection through first-legal candidates picks the same
+        /// token as the full mask at every step, ties and padded rows
+        /// included, until both complete or fail the same way.
+        #[test]
+        fn first_legal_argmax_matches_the_mask(
+            kind in 0_usize..4,
+            steps in proptest::collection::vec(
+                proptest::collection::vec(-3_i8..=3, MODEL_VOCAB),
+                1..40,
+            ),
+        ) {
+            let make = || match kind {
+                0 => session(),
+                1 => boolean_session(),
+                2 => number_session(),
+                _ => forced_session(),
+            };
+            let (mut lazy, mut masked) = (make(), make());
+            for step in steps {
+                let values: Vec<f32> = step.into_iter().map(f32::from).collect();
+                // The walk relies on validation allowing exactly the mask's
+                // tokens, forced-bytes states included.
+                let mut probe = lazy.matcher.deep_clone();
+                if let Ok(mask) = probe.compute_mask() {
+                    for token in 0..lazy.tokenizer_vocab_size {
+                        let token = u32::try_from(token).expect("small vocabulary");
+                        let valid = probe.validate_tokens(&[token]).ok() == Some(1);
+                        proptest::prop_assert_eq!(mask.is_allowed(token), valid, "token {}", token);
+                    }
+                }
+                let expected = masked.select_argmax_by_mask(&values);
+                proptest::prop_assert_eq!(lazy.select_argmax(&values), expected);
+                proptest::prop_assert_eq!(lazy.decoded_bytes(), masked.decoded_bytes());
+                if expected.is_err() || masked.is_complete() {
+                    break;
+                }
+            }
         }
     }
 
