@@ -163,14 +163,15 @@ fn served_adapters_accept_their_published_configs() {
     assert_classified(MINICPM5_2B, Some(Adapter::Llama), true);
     assert_classified(PPLX_QWEN3, Some(Adapter::PplxQwen3), true);
     assert_classified(JULIA_1, Some(Adapter::Julia), true);
+    let gemma4 = assert_classified(GEMMA4_12B, Some(Adapter::Gemma4), true);
+    assert!(gemma4.reason().contains("gemma4"), "{gemma4:?}");
+    assert!(gemma4.reason().contains("vision encoder not loaded"));
 }
 
 #[test]
 fn unserved_adapters_name_themselves_but_are_not_supported() {
     let qwen35 = assert_classified(QWEN35_08B, Some(Adapter::Qwen35), false);
     assert!(qwen35.reason().contains("no mx serve kind loads it"));
-    let gemma4 = assert_classified(GEMMA4_12B, Some(Adapter::Gemma4), false);
-    assert!(gemma4.reason().contains("vision encoder not loaded"));
     assert_classified(DEEPSEEK_V41, Some(Adapter::DeepseekV41), false);
 }
 
@@ -267,7 +268,7 @@ fn json_lines_follow_the_contract_and_io_errors_exit_2() {
         lines[0]["architectures"],
         serde_json::json!(["Qwen3ForCausalLM"])
     );
-    assert_eq!(lines[1]["supported"], false);
+    assert_eq!(lines[1]["supported"], true);
     assert_eq!(lines[1]["adapter"], "gemma4");
 
     let paths: Vec<PathBuf> = vec![broken, qwen, missing];

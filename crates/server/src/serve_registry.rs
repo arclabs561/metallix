@@ -11,7 +11,10 @@ use serde_json::Value;
 
 use crate::{
     admission_queue::QueueSettings,
-    chat_generation::{ChatBackend, ChatSession, GemmaChatSession, ResidentChatLimits},
+    chat_generation::{
+        ChatBackend, ChatDecoderSession, ChatSession, FullRowDecoder, GemmaDecoder,
+        ResidentChatLimits,
+    },
     julia_decisions::JuliaDecider,
     pplx_context_embeddings::PplxContextEmbedder,
     pplx_late_embeddings::PplxLateEmbedder,
@@ -222,7 +225,7 @@ impl ModelWorker for ChatSession {
     }
 }
 
-impl ModelWorker for GemmaChatSession {
+impl<D: FullRowDecoder> ModelWorker for ChatDecoderSession<D> {
     fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
         Some(self)
     }
@@ -294,7 +297,10 @@ pub(crate) fn load(
 ) -> Result<Box<dyn ModelWorker>, String> {
     Ok(match entry.kind {
         ModelKind::Qwen => Box::new(ChatSession::load(&entry.path, limits)?),
-        ModelKind::Gemma4 => Box::new(GemmaChatSession::load(&entry.path, limits)?),
+        ModelKind::Gemma4 => Box::new(ChatDecoderSession::<GemmaDecoder>::load(
+            &entry.path,
+            limits,
+        )?),
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
         ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
         ModelKind::PplxContext => Box::new(PplxContextEmbedder::load(&entry.path)?),

@@ -61,7 +61,8 @@ impl Adapter {
             Self::Llama => &[ModelKind::Qwen],
             Self::PplxQwen3 => &[ModelKind::PplxContext, ModelKind::PplxLate],
             Self::Julia => &[ModelKind::Julia],
-            Self::Qwen35 | Self::Gemma4 | Self::DeepseekV41 => &[],
+            Self::Gemma4 => &[ModelKind::Gemma4],
+            Self::Qwen35 | Self::DeepseekV41 => &[],
         }
     }
 

@@ -28,6 +28,8 @@ pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult
 
 use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
 
+#[path = "chat_decoder.rs"]
+pub(crate) mod decoder;
 #[path = "gemma_chat.rs"]
 mod gemma;
 #[path = "qwen_prefix_cache.rs"]
@@ -37,7 +39,8 @@ mod speculation;
 #[path = "chat_turn.rs"]
 mod turn;
 
-pub(crate) use gemma::GemmaChatSession;
+pub(crate) use decoder::{ChatDecoderSession, FullRowDecoder};
+pub(crate) use gemma::GemmaDecoder;
 pub(crate) use turn::{TurnModel, TurnStart, TurnStep};
 
 #[cfg(test)]
