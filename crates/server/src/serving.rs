@@ -719,10 +719,11 @@ mod tests {
             &mut self,
             _request: ChatRequest<'_>,
             _timeout: Duration,
-            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
         ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
             self.calls += 1;
-            on_token("partial").map_err(ChatGenerationError::Message)?;
+            on_token(chat_format::TurnDelta::Text("partial".into()))
+                .map_err(ChatGenerationError::Message)?;
             Err(ChatGenerationError::DeadlineExceeded)
         }
     }
@@ -748,7 +749,7 @@ mod tests {
             &mut self,
             _request: ChatRequest<'_>,
             _timeout: Duration,
-            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
         ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
             self.turns += 1;
             if self.turns == 1 {
@@ -758,7 +759,7 @@ mod tests {
                 let payload = "x".repeat(256 * 1024);
                 for _ in 0..32 {
                     let began = Instant::now();
-                    if let Err(error) = on_token(&payload) {
+                    if let Err(error) = on_token(chat_format::TurnDelta::Text(payload.clone())) {
                         self.write_failure
                             .send((began.elapsed(), error.clone()))
                             .map_err(|_| {
@@ -771,28 +772,30 @@ mod tests {
                     "bounded backpressure payload was fully accepted",
                 )));
             }
-            on_token("recovered").map_err(ChatGenerationError::Message)?;
-            Ok(crate::chat_generation::ChatGeneration {
-                text: String::from("recovered"),
-                generated_token_ids: vec![1],
-                finish_reason: ChatFinishReason::Eos,
-                metrics: crate::chat_generation::ChatGenerationMetrics {
-                    context_tokens: 2_048,
-                    planned_kv_bytes: 0,
-                    session_load_ms: 0.0,
-                    render_ms: 0.0,
-                    prefill_ms: 0.0,
-                    time_to_first_token_ms: Some(0.0),
-                    decode_ms: vec![],
-                    decode_total_ms: 0.0,
-                    prompt_tokens: 1,
-                    cached_prompt_tokens: 0,
-                    generated_tokens: 1,
-                    speculation: None,
-                },
-                logprobs: Vec::new(),
-                sampling: None,
-                format: crate::chat_generation::QWEN3_TURN,
+            on_token(chat_format::TurnDelta::Text("recovered".into()))
+                .map_err(ChatGenerationError::Message)?;
+            Ok({
+                let mut generated = crate::chat_generation::ChatGeneration::scripted(
+                    String::from("recovered"),
+                    true,
+                    ChatFinishReason::Eos,
+                    crate::chat_generation::ChatGenerationMetrics {
+                        context_tokens: 2_048,
+                        planned_kv_bytes: 0,
+                        session_load_ms: 0.0,
+                        render_ms: 0.0,
+                        prefill_ms: 0.0,
+                        time_to_first_token_ms: Some(0.0),
+                        decode_ms: vec![],
+                        decode_total_ms: 0.0,
+                        prompt_tokens: 1,
+                        cached_prompt_tokens: 0,
+                        generated_tokens: 1,
+                        speculation: None,
+                    },
+                );
+                generated.generated_token_ids = vec![1];
+                generated
             })
         }
     }
@@ -868,7 +871,7 @@ stream.close()
             &mut self,
             _request: ChatRequest<'_>,
             _timeout: Duration,
-            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
         ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
             self.turns += 1;
             let text = if self.turns == 1 {
@@ -876,7 +879,8 @@ stream.close()
             } else {
                 "recovered"
             };
-            on_token(text).map_err(ChatGenerationError::Message)?;
+            on_token(chat_format::TurnDelta::Text(text.into()))
+                .map_err(ChatGenerationError::Message)?;
             if self.turns == 1 {
                 self.entered.send(()).map_err(|_| {
                     ChatGenerationError::Message(String::from("test barrier closed"))
@@ -885,27 +889,28 @@ stream.close()
                     ChatGenerationError::Message(String::from("test barrier timed out"))
                 })?;
             }
-            Ok(crate::chat_generation::ChatGeneration {
-                text: text.into(),
-                generated_token_ids: vec![1],
-                finish_reason: ChatFinishReason::Eos,
-                metrics: crate::chat_generation::ChatGenerationMetrics {
-                    context_tokens: 2_048,
-                    planned_kv_bytes: 0,
-                    session_load_ms: 0.0,
-                    render_ms: 0.0,
-                    prefill_ms: 0.0,
-                    time_to_first_token_ms: Some(0.0),
-                    decode_ms: vec![],
-                    decode_total_ms: 0.0,
-                    prompt_tokens: 1,
-                    cached_prompt_tokens: 0,
-                    generated_tokens: 1,
-                    speculation: None,
-                },
-                logprobs: Vec::new(),
-                sampling: None,
-                format: crate::chat_generation::QWEN3_TURN,
+            Ok({
+                let mut generated = crate::chat_generation::ChatGeneration::scripted(
+                    text,
+                    true,
+                    ChatFinishReason::Eos,
+                    crate::chat_generation::ChatGenerationMetrics {
+                        context_tokens: 2_048,
+                        planned_kv_bytes: 0,
+                        session_load_ms: 0.0,
+                        render_ms: 0.0,
+                        prefill_ms: 0.0,
+                        time_to_first_token_ms: Some(0.0),
+                        decode_ms: vec![],
+                        decode_total_ms: 0.0,
+                        prompt_tokens: 1,
+                        cached_prompt_tokens: 0,
+                        generated_tokens: 1,
+                        speculation: None,
+                    },
+                );
+                generated.generated_token_ids = vec![1];
+                generated
             })
         }
     }
@@ -1974,7 +1979,7 @@ stream.close()
                 &mut self,
                 request: ChatRequest<'_>,
                 timeout: Duration,
-                on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+                on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
             ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
                 let mut failed = false;
                 let result = self
@@ -2005,7 +2010,7 @@ stream.close()
                 &mut self,
                 request: ChatRequest<'_>,
                 timeout: Duration,
-                on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+                on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
             ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
                 let hold_after_delta = request.max_tokens == Some(64);
                 let mut held = false;

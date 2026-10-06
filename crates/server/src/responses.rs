@@ -7,14 +7,15 @@ use std::{
     time::Duration,
 };
 
+use chat_format::TurnDelta;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
 use crate::{
     chat_cli::message,
     chat_generation::{
-        ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
-        ChatToolCall, GenerationControls, SamplingRequest, TokenLogprob,
+        ChatBackend, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatToolCall,
+        GenerationControls, SamplingRequest, TokenLogprob,
     },
     http_transport::Connection,
 };
@@ -543,6 +544,9 @@ pub(crate) fn respond(
         },
         generation_timeout,
         &mut |delta| {
+            let TurnDelta::Text(delta) = delta else {
+                return stream.keepalive();
+            };
             if stream_text {
                 // Per-token logprobs arrive on `response.output_text.done`.
                 stream.emit(json!({"type":"response.output_text.delta","item_id":message_id,"output_index":0,"content_index":0,"delta":delta,"logprobs":[]}))
@@ -680,20 +684,18 @@ pub(crate) fn logprobs_value(logprobs: &[TokenLogprob]) -> Value {
 
 pub(crate) use chat_format::AssistantTurn;
 
-/// Parses one generation in its checkpoint's dialects. `tools` are
-/// template-shaped definitions, as [`tools`] returns them.
+/// The turn a session parsed, with each call checked against its
+/// declaration. `tools` are template-shaped definitions, as [`tools`]
+/// returns them.
 pub(crate) fn assistant_turn(
     tools: &[Value],
-    enable_thinking: bool,
     generated: &crate::chat_generation::ChatGeneration,
 ) -> Result<AssistantTurn, String> {
-    chat_format::parse_turn(
-        generated.format,
-        &generated.text,
-        tools,
-        enable_thinking,
-        generated.finish_reason == ChatFinishReason::Eos,
-    )
+    let turn = generated.turn.clone()?;
+    for call in &turn.calls {
+        chat_format::check_call(tools, call)?;
+    }
+    Ok(turn)
 }
 
 fn response_value(
@@ -707,7 +709,7 @@ fn response_value(
         text,
         calls,
         complete,
-    } = assistant_turn(&tools(request)?, controls.enable_thinking, generated)?;
+    } = assistant_turn(&tools(request)?, generated)?;
     let mut output = Vec::new();
     if !reasoning.is_empty() {
         output.push(json!({"id":format!("rs_{id}"),"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":reasoning}]}));
@@ -734,6 +736,7 @@ fn response_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_generation::ChatFinishReason;
     use proptest::prelude::*;
 
     proptest! {
@@ -1001,12 +1004,19 @@ mod tests {
     }
 
     fn generation(text: &str) -> crate::chat_generation::ChatGeneration {
+        generation_ending(text, ChatFinishReason::Eos)
+    }
+
+    fn generation_ending(
+        text: &str,
+        finish_reason: ChatFinishReason,
+    ) -> crate::chat_generation::ChatGeneration {
         use crate::chat_generation::ChatGenerationMetrics;
-        crate::chat_generation::ChatGeneration {
-            text: text.into(),
-            generated_token_ids: vec![1, 2],
-            finish_reason: ChatFinishReason::Eos,
-            metrics: ChatGenerationMetrics {
+        let mut generated = crate::chat_generation::ChatGeneration::scripted(
+            text,
+            true,
+            finish_reason,
+            ChatGenerationMetrics {
                 context_tokens: 2048,
                 planned_kv_bytes: 0,
                 session_load_ms: 0.0,
@@ -1020,10 +1030,9 @@ mod tests {
                 generated_tokens: 2,
                 speculation: None,
             },
-            logprobs: Vec::new(),
-            sampling: None,
-            format: crate::chat_generation::QWEN3_TURN,
-        }
+        );
+        generated.generated_token_ids = vec![1, 2];
+        generated
     }
 
     #[test]
@@ -1154,31 +1163,32 @@ mod tests {
         let response_value = |request: &Request, generated: &_, id| {
             response_value(request, &controls, generated, id)
         };
-        let mut generated = generation("");
         for text in [
             "<tool_call>{",
             r#"<tool_call>{"name":"shell","arguments":{}}</tool_call>"#,
             r#"<tool_call>{"name":"read_file","arguments":{"path":5}}</tool_call>"#,
         ] {
-            generated.text = text.into();
-            assert!(response_value(&request, &generated, "test").is_err());
+            assert!(response_value(&request, &generation(text), "test").is_err());
         }
-        generated.text =
-            r#"<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>"#
-                .into();
-        let response = response_value(&request, &generated, "test").unwrap();
+        let call =
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>"#;
+        let response = response_value(&request, &generation(call), "test").unwrap();
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(
             response["output"][0]["arguments"],
             r#"{"path":"README.md"}"#
         );
-        generated.text = format!("I'll read it. {}", generated.text);
-        let mixed = response_value(&request, &generated, "test").unwrap();
+        let mixed = response_value(
+            &request,
+            &generation(&format!("I'll read it. {call}")),
+            "test",
+        )
+        .unwrap();
         assert_eq!(mixed["output"][0]["type"], "message");
         assert_eq!(mixed["output"][0]["content"][0]["text"], "I'll read it. ");
         assert_eq!(mixed["output"][1]["type"], "function_call");
-        generated.finish_reason = ChatFinishReason::Length;
-        assert!(response_value(&request, &generated, "test").is_err());
+        let truncated = generation_ending(call, ChatFinishReason::Length);
+        assert!(response_value(&request, &truncated, "test").is_err());
     }
 
     mod wire {
@@ -1268,7 +1278,7 @@ mod tests {
                 &mut self,
                 request: ChatRequest<'_>,
                 _timeout: Duration,
-                on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+                on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
             ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
                 self.seen = Some((
                     request.max_tokens,
@@ -1282,7 +1292,8 @@ mod tests {
                         "chat requires prompt_tokens + max_tokens <= 16384; received 9 + 20000 = 20009".into(),
                     ));
                 }
-                on_token("{}").map_err(ChatGenerationError::Message)?;
+                on_token(chat_format::TurnDelta::Text("{}".into()))
+                    .map_err(ChatGenerationError::Message)?;
                 Ok(generation("{}"))
             }
         }

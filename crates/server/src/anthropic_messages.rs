@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use chat_format::TurnDelta;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
@@ -429,11 +430,7 @@ fn message_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(
-        &prepared.tools,
-        prepared.controls.enable_thinking,
-        generated,
-    )?;
+    let turn = assistant_turn(&prepared.tools, generated)?;
     Ok(
         json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":blocks(&turn, id),"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":{"sampling":generated.sampling,"metrics":generated.metrics}}),
     )
@@ -524,6 +521,9 @@ fn stream(
         request,
         generation_timeout,
         &mut |delta| {
+            let TurnDelta::Text(delta) = delta else {
+                return sse.keepalive();
+            };
             if !live {
                 return sse.keepalive();
             }
@@ -553,11 +553,7 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(
-        &prepared.tools,
-        prepared.controls.enable_thinking,
-        &generated,
-    ) {
+    let turn = match assistant_turn(&prepared.tools, &generated) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "api_error", &error),
     };

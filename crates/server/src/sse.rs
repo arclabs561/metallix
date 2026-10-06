@@ -223,7 +223,7 @@ pub(crate) mod test_support {
             &mut self,
             request: ChatRequest<'_>,
             _timeout: Duration,
-            on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+            on_token: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
         ) -> Result<ChatGeneration, ChatGenerationError> {
             self.seen = Some((!request.tools.is_empty(), request.enable_thinking));
             self.salt = request.cache_salt.map(str::to_owned);
@@ -248,7 +248,8 @@ pub(crate) mod test_support {
                         break;
                     }
                     self.deltas += 1;
-                    on_token(spell(token)).map_err(ChatGenerationError::Message)?;
+                    on_token(chat_format::TurnDelta::Text(spell(token).into()))
+                        .map_err(ChatGenerationError::Message)?;
                 }
                 let visible = match generated.split_last() {
                     Some((&last, visible)) if class(last) != TokenClass::Normal => visible,
@@ -260,17 +261,17 @@ pub(crate) mod test_support {
                 let characters: Vec<char> = self.text.chars().collect();
                 for piece in characters.chunks(2) {
                     self.deltas += 1;
-                    on_token(&piece.iter().collect::<String>())
+                    on_token(chat_format::TurnDelta::Text(piece.iter().collect()))
                         .map_err(ChatGenerationError::Message)?;
                 }
                 (self.text.clone(), vec![1, 2], ChatFinishReason::Eos)
             };
             let generated_tokens = generated_token_ids.len();
-            Ok(ChatGeneration {
+            let mut generated = crate::chat_generation::ChatGeneration::scripted(
                 text,
-                generated_token_ids,
+                true,
                 finish_reason,
-                metrics: ChatGenerationMetrics {
+                ChatGenerationMetrics {
                     context_tokens: 2048,
                     planned_kv_bytes: 0,
                     session_load_ms: 0.0,
@@ -284,10 +285,9 @@ pub(crate) mod test_support {
                     generated_tokens,
                     speculation: None,
                 },
-                logprobs: Vec::new(),
-                sampling: None,
-                format: crate::chat_generation::QWEN3_TURN,
-            })
+            );
+            generated.generated_token_ids = generated_token_ids;
+            Ok(generated)
         }
     }
 }

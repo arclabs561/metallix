@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use chat_format::TurnDelta;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Map, Value, json};
 
@@ -427,11 +428,7 @@ fn completion_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(
-        &prepared.tools,
-        prepared.controls.enable_thinking,
-        generated,
-    )?;
+    let turn = assistant_turn(&prepared.tools, generated)?;
     let mut message = json!({"role":"assistant","content":if turn.calls.is_empty() || !turn.text.trim().is_empty() {json!(turn.text)} else {Value::Null},"refusal":null});
     if !turn.calls.is_empty() {
         let calls: Vec<Value> = tool_calls(&turn, id)
@@ -541,6 +538,9 @@ fn stream(
     let mut sse = LazySse::new(connection);
     let mut role_sent = false;
     let generated = session.generate_with_timeout(request, generation_timeout, &mut |delta| {
+        let TurnDelta::Text(delta) = delta else {
+            return sse.keepalive();
+        };
         if !live {
             return sse.keepalive();
         }
@@ -587,11 +587,7 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(
-        &prepared.tools,
-        prepared.controls.enable_thinking,
-        &generated,
-    ) {
+    let turn = match assistant_turn(&prepared.tools, &generated) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "invalid_model_output", &error),
     };

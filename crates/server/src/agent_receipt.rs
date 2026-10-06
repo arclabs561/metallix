@@ -92,8 +92,8 @@ impl AgentTurnReceipt {
             turn_index,
             finish_reason: generation.finish_reason,
             metrics: generation.metrics.clone(),
-            generated_text_sha256: sha256(generation.text.as_bytes()),
-            generated_text_utf8_bytes: generation.text.len(),
+            generated_text_sha256: generation.text_digest().0,
+            generated_text_utf8_bytes: generation.text_digest().1,
             calls: Vec::new(),
         }
     }

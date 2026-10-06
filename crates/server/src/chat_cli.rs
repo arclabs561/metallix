@@ -6,6 +6,7 @@ use std::{
     process::ExitCode,
 };
 
+use chat_format::TurnDelta;
 use serde_json::json;
 
 use crate::{
@@ -43,7 +44,7 @@ fn chat_inner(
     if let Some(prompt) = prompt {
         messages.push(message(ChatRole::User, prompt));
         let result = session.generate(ChatRequest::new(&messages, max_tokens), &mut |delta| {
-            if !json_output {
+            if let (false, TurnDelta::Text(delta)) = (json_output, delta) {
                 print!("{delta}");
                 io::stdout().flush().map_err(|e| e.to_string())?;
             }
@@ -81,12 +82,14 @@ fn chat_inner(
         }
         messages.push(message(ChatRole::User, line));
         let result = session.generate(ChatRequest::new(&messages, max_tokens), &mut |delta| {
-            print!("{delta}");
+            if let TurnDelta::Text(text) = delta {
+                print!("{text}");
+            }
             io::stdout().flush().map_err(|e| e.to_string())
         });
         println!();
-        match result {
-            Ok(result) => messages.push(message(ChatRole::Assistant, result.text)),
+        match result.and_then(|result| result.turn) {
+            Ok(turn) => messages.push(message(ChatRole::Assistant, turn.text)),
             Err(error) => {
                 messages.pop();
                 eprintln!("chat: {error}; history unchanged, use /reset if full");
@@ -178,16 +181,9 @@ fn agent_inner(
             &mut |_| Ok(()),
         )?;
         let mut turn_receipt = AgentTurnReceipt::from_generation(turn_index, &result);
-        let complete = result.finish_reason == ChatFinishReason::Eos;
         // Invalid calls are answered with their error, so the model can
         // correct them; only unparseable or truncated turns end the run.
-        let turn = match chat_format::parse_turn_unchecked(
-            result.format,
-            &result.text,
-            &tools,
-            false,
-            complete,
-        ) {
+        let turn = match result.turn.clone() {
             Ok(turn) => turn,
             Err(error) => {
                 receipt.push_turn(turn_receipt);
@@ -305,17 +301,16 @@ mod tests {
     use super::{AgentTurnReceipt, checked_call, execute_calls};
     use crate::{
         agent_receipt::hash_arguments,
-        chat_generation::{ChatFinishReason, ChatGeneration, ChatGenerationMetrics, ChatToolCall},
+        chat_generation::{ChatFinishReason, ChatGenerationMetrics, ChatToolCall},
     };
 
     fn turn_receipt() -> AgentTurnReceipt {
-        AgentTurnReceipt::from_generation(
-            0,
-            &ChatGeneration {
-                text: String::new(),
-                generated_token_ids: Vec::new(),
-                finish_reason: ChatFinishReason::Eos,
-                metrics: ChatGenerationMetrics {
+        AgentTurnReceipt::from_generation(0, &{
+            let mut generated = crate::chat_generation::ChatGeneration::scripted(
+                String::new(),
+                true,
+                ChatFinishReason::Eos,
+                ChatGenerationMetrics {
                     context_tokens: 1,
                     planned_kv_bytes: 1,
                     session_load_ms: 0.0,
@@ -329,11 +324,10 @@ mod tests {
                     generated_tokens: 0,
                     speculation: None,
                 },
-                logprobs: Vec::new(),
-                sampling: None,
-                format: crate::chat_generation::QWEN3_TURN,
-            },
-        )
+            );
+            generated.generated_token_ids = Vec::new();
+            generated
+        })
     }
 
     /// An invalid call is answered with its validation error and not run;

@@ -167,7 +167,7 @@ impl ReasoningDialect {
 
 /// A finished assistant turn split into reasoning, visible text and tool calls
 /// checked against their declared schemas. Each protocol only reshapes it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AssistantTurn {
     pub reasoning: String,
     pub text: String,

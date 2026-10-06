@@ -21,7 +21,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
-use chat_format::{ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TurnFormat};
+use chat_format::{
+    AssistantTurn, ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TurnDelta,
+};
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
 use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
@@ -514,10 +516,16 @@ impl SpeculationReceipt {
     }
 }
 
-/// The completed visible text and model-level generation details for one turn.
+/// One finished turn, parsed, with its model-level generation details.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ChatGeneration {
-    pub(crate) text: String,
+    /// The decoded output, markup included. Private to this module, so
+    /// protocols read the turn only as `turn`.
+    text: String,
+    /// The turn parsed in the checkpoint's dialects, or why its text did
+    /// not parse. Calls are not yet checked against their declarations.
+    #[serde(skip)]
+    pub(crate) turn: Result<AssistantTurn, String>,
     pub(crate) generated_token_ids: Vec<i32>,
     pub(crate) finish_reason: ChatFinishReason,
     pub(crate) metrics: ChatGenerationMetrics,
@@ -528,17 +536,50 @@ pub(crate) struct ChatGeneration {
     /// report one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sampling: Option<AppliedSampling>,
-    /// The checkpoint's tool and reasoning dialects, which `text` is written
-    /// in; protocols parse it only through `chat_format::parse_turn`.
-    pub(crate) format: TurnFormat,
 }
 
-/// Qwen3's dialects, for scripted backends in tests.
-#[cfg(test)]
-pub(crate) const QWEN3_TURN: TurnFormat = TurnFormat {
-    tools: chat_format::ToolDialect::JsonInTags,
-    reasoning: chat_format::ReasoningDialect::ThinkTags,
-};
+impl ChatGeneration {
+    /// SHA-256 and byte length of the decoded output, for receipts that
+    /// identify a turn without carrying its text.
+    #[must_use]
+    pub(crate) fn text_digest(&self) -> (String, usize) {
+        (
+            format!("{:x}", Sha256::digest(self.text.as_bytes())),
+            self.text.len(),
+        )
+    }
+
+    /// A finished turn for scripted backends in tests: `text` written in
+    /// Qwen3's dialects, parsed as a session would parse it.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        text: impl Into<String>,
+        enable_thinking: bool,
+        finish_reason: ChatFinishReason,
+        metrics: ChatGenerationMetrics,
+    ) -> Self {
+        let text = text.into();
+        let qwen3 = chat_format::TurnFormat {
+            tools: chat_format::ToolDialect::JsonInTags,
+            reasoning: chat_format::ReasoningDialect::ThinkTags,
+        };
+        Self {
+            turn: chat_format::parse_turn_unchecked(
+                qwen3,
+                &text,
+                &[],
+                enable_thinking,
+                finish_reason == ChatFinishReason::Eos,
+            ),
+            text,
+            generated_token_ids: Vec::new(),
+            finish_reason,
+            metrics,
+            logprobs: Vec::new(),
+            sampling: None,
+        }
+    }
+}
 
 /// A cooperative wall-clock budget for one complete chat turn.
 ///
@@ -655,7 +696,7 @@ pub(crate) trait ChatBackend {
         &mut self,
         request: ChatRequest<'_>,
         timeout: Duration,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError>;
 }
 
@@ -779,7 +820,7 @@ impl ChatSession {
     pub(crate) fn generate(
         &mut self,
         request: ChatRequest<'_>,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, String> {
         self.generate_with_deadline(request, GenerationDeadline::unlimited(), on_token)
             .map_err(|error| error.to_string())
@@ -790,7 +831,7 @@ impl ChatSession {
         &mut self,
         request: ChatRequest<'_>,
         timeout: Duration,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
         // Start before validation and rendering so the caller budgets the full turn.
         self.generate_with_deadline(request, GenerationDeadline::after(timeout), on_token)
@@ -804,7 +845,7 @@ impl ChatSession {
         &mut self,
         request: ChatRequest<'_>,
         deadline: GenerationDeadline,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
         let start = TurnStart::prepare(self.turn_model(), request, deadline)?;
         let (render_ms, max_tokens) = (start.render_ms, start.max_tokens);
@@ -1008,26 +1049,31 @@ impl ChatSession {
         })?;
 
         deadline.check()?;
-        let (text, time_to_first_token_ms) =
-            text.finish(&self.format, turn.generated(), on_token)?;
+        let end = text.finish(
+            &self.format,
+            turn.generated(),
+            request.tools,
+            finish_reason == ChatFinishReason::Eos,
+            on_token,
+        )?;
         let output = turn.finish()?;
         let decode_total_ms = decode_ms.iter().sum();
         let generated_tokens = output.generated.len();
         deadline.check()?;
         Ok(ChatGeneration {
-            text,
+            text: end.text,
+            turn: end.turn,
             generated_token_ids: output.generated,
             finish_reason,
             logprobs: output.logprobs,
             sampling: Some(output.sampling),
-            format: self.format.turn_format(),
             metrics: ChatGenerationMetrics {
                 context_tokens: self.context_limit,
                 planned_kv_bytes: self.planned_kv_bytes,
                 session_load_ms: self.load_ms,
                 render_ms,
                 prefill_ms,
-                time_to_first_token_ms,
+                time_to_first_token_ms: end.time_to_first_token_ms,
                 decode_ms,
                 decode_total_ms,
                 prompt_tokens: input_ids.len(),
@@ -1064,7 +1110,7 @@ impl ChatBackend for ChatSession {
         &mut self,
         request: ChatRequest<'_>,
         timeout: Duration,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
         self.generate_with_timeout(request, timeout, on_token)
     }
@@ -1479,7 +1525,9 @@ mod tests {
                 let accepted = turn.pick(&format, &mut logits).expect("pick");
                 if accepted.visible {
                     text.push(&format, accepted.token, &mut |delta| {
-                        streamed.push_str(delta);
+                        if let chat_format::TurnDelta::Text(delta) = delta {
+                            streamed.push_str(&delta);
+                        }
                         Ok(())
                     })
                     .expect("push");
@@ -1489,12 +1537,15 @@ mod tests {
                     break;
                 }
             }
-            let (final_text, _) = text
-                .finish(&format, turn.generated(), &mut |delta| {
-                    streamed.push_str(delta);
+            let final_text = text
+                .finish(&format, turn.generated(), &[], true, &mut |delta| {
+                    if let chat_format::TurnDelta::Text(delta) = delta {
+                        streamed.push_str(&delta);
+                    }
                     Ok(())
                 })
-                .expect("final text agrees with the streamed text");
+                .expect("final text agrees with the streamed text")
+                .text;
             assert_eq!(final_text, streamed);
             if ignore_eos {
                 let continued = (true, TurnStep::Continue);
@@ -1612,7 +1663,7 @@ mod tests {
             ChatRequest::new(&cancelled_messages, 32),
             Duration::from_secs(60),
             &mut |delta| {
-                cancelled_deltas.push(delta.to_owned());
+                cancelled_deltas.push(delta);
                 Err(String::from(
                     "test cancellation after first generated delta",
                 ))
@@ -1624,7 +1675,9 @@ mod tests {
                 if message == "test cancellation after first generated delta"
         ));
         assert_eq!(cancelled_deltas.len(), 1);
-        assert!(!cancelled_deltas[0].is_empty());
+        assert!(
+            matches!(&cancelled_deltas[0], chat_format::TurnDelta::Text(text) if !text.is_empty())
+        );
 
         let recovered = session
             .generate_with_timeout(

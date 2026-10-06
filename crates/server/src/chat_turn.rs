@@ -9,8 +9,8 @@
 //! - [`TurnLoop`]: per step, pick a token from logits (or accept a token the
 //!   GPU picked), classify it against the checkpoint's stop tokens, record its
 //!   log probability, and decide whether the turn continues.
-//! - [`TurnText`]: turn accepted tokens into streamed text deltas and the
-//!   final text.
+//! - [`TurnText`]: turn accepted tokens into streamed reasoning and text
+//!   deltas, which never carry the checkpoint's markup, and the parsed turn.
 //!
 //! The loop and the text can run on different threads: the engine keeps the
 //! loop next to the logits and sends accepted tokens to the request's writer,
@@ -18,8 +18,11 @@
 
 use std::{path::Path, time::Instant};
 
-use chat_format::{ChatFormat, QwenIncrementalDecode, TokenClass, TokenId};
+use chat_format::{
+    AssistantTurn, ChatFormat, QwenIncrementalDecode, TokenClass, TokenId, TurnDelta, TurnStream,
+};
 use qwen::forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
+use serde_json::Value;
 
 use super::{
     AppliedSampling, ChatFinishReason, ChatGenerationError, ChatRequest, GenerationDeadline,
@@ -39,6 +42,7 @@ pub(crate) struct TurnStart {
     top_logprobs: Option<u8>,
     ignore_eos: bool,
     vocabulary_size: usize,
+    stream: TurnStream,
 }
 
 /// What a checkpoint contributes to preparing a turn.
@@ -85,6 +89,7 @@ impl TurnStart {
             picker,
             top_logprobs: request.top_logprobs,
             ignore_eos: request.ignore_eos,
+            stream: TurnStream::new(model.format.turn_format(), request.enable_thinking),
             vocabulary_size: model.vocabulary_size,
         })
     }
@@ -100,8 +105,11 @@ impl TurnStart {
             generated: Vec::with_capacity(self.max_tokens.min(4096) as usize),
             logprobs: Vec::new(),
         };
-        let text = TurnText::new(self.started, self.ignore_eos);
-        (self.input_ids, turn_loop, text)
+        (
+            self.input_ids,
+            turn_loop,
+            TurnText::new(self.started, self.ignore_eos, self.stream),
+        )
     }
 }
 
@@ -424,52 +432,75 @@ fn token_logprob(
     })
 }
 
-/// A turn's streamed and final text.
+/// A turn's streamed deltas, final text and parsed turn.
 pub(crate) struct TurnText {
     decoder: QwenIncrementalDecode,
-    emitted: String,
+    /// Decoded text so far, which the stream splits into deltas.
+    decoded: String,
+    stream: TurnStream,
     time_to_first_token_ms: Option<f64>,
     started: Instant,
     /// Keeps a final end-of-turn token as text, as [`TurnLoop`] streamed it.
     ignore_eos: bool,
 }
 
+/// The end of a turn's text.
+pub(crate) struct TurnTextEnd {
+    /// The decoded output without a final stop token, markup included.
+    pub(crate) text: String,
+    /// Parsed in the checkpoint's dialects; calls are not yet checked
+    /// against their declarations.
+    pub(crate) turn: Result<AssistantTurn, String>,
+    pub(crate) time_to_first_token_ms: Option<f64>,
+}
+
 impl TurnText {
-    pub(crate) fn new(started: Instant, ignore_eos: bool) -> Self {
+    pub(crate) fn new(started: Instant, ignore_eos: bool, stream: TurnStream) -> Self {
         Self {
             decoder: chat_format::QwenTokenizer::generated_decoder(),
-            emitted: String::new(),
+            decoded: String::new(),
+            stream,
             time_to_first_token_ms: None,
             started,
             ignore_eos,
         }
     }
 
-    /// Streams the text a visible token completes, if any.
+    /// Streams the reasoning and text a visible token settles, if any.
     pub(crate) fn push(
         &mut self,
         format: &ChatFormat,
         token: i32,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<(), String> {
         if let Some(delta) = format
             .tokenizer()
             .decode_generated_token(&mut self.decoder, token)?
         {
-            self.emit(&delta, on_token)?;
+            self.decoded.push_str(&delta);
+            let deltas = self.stream.push(&delta);
+            emit(
+                deltas,
+                on_token,
+                &mut self.time_to_first_token_ms,
+                self.started,
+            )?;
         }
         Ok(())
     }
 
-    /// Decodes the whole output (without a final stop token), streams what
-    /// the incremental decoder held back, and returns the text and the time
-    /// to first token.
+    /// Decodes the whole output (without a final stop token), parses it,
+    /// and streams what was still held back. `tools` type the arguments of
+    /// dialects that write every value as text; `complete` says the model
+    /// ended its turn.
     pub(crate) fn finish(
         mut self,
         format: &ChatFormat,
         generated: &[i32],
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
-    ) -> Result<(String, Option<f64>), ChatGenerationError> {
+        tools: &[Value],
+        complete: bool,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
+    ) -> Result<TurnTextEnd, ChatGenerationError> {
         let visible = match generated.split_last() {
             Some((&last, visible))
                 if format
@@ -482,28 +513,43 @@ impl TurnText {
             _ => generated,
         };
         let text = format.tokenizer().decode_generated(visible)?;
-        let remaining = text.strip_prefix(&self.emitted).ok_or_else(|| {
+        let remaining = text.strip_prefix(&self.decoded).ok_or_else(|| {
             ChatGenerationError::message(
                 "incremental tokenizer decoder diverged from complete generated text",
             )
         })?;
-        let remaining = remaining.to_owned();
-        self.emit(&remaining, on_token)?;
-        Ok((text, self.time_to_first_token_ms))
+        let mut deltas = self.stream.push(remaining);
+        let Self {
+            stream,
+            mut time_to_first_token_ms,
+            started,
+            ..
+        } = self;
+        let turn = stream.finish(tools, complete).map(|(turn, last)| {
+            deltas.extend(last);
+            turn
+        });
+        emit(deltas, on_token, &mut time_to_first_token_ms, started)?;
+        Ok(TurnTextEnd {
+            text,
+            turn,
+            time_to_first_token_ms,
+        })
     }
+}
 
-    fn emit(
-        &mut self,
-        delta: &str,
-        on_token: &mut dyn FnMut(&str) -> Result<(), String>,
-    ) -> Result<(), String> {
-        if !delta.is_empty() {
-            on_token(delta)?;
-            self.emitted.push_str(delta);
-            if self.time_to_first_token_ms.is_none() {
-                self.time_to_first_token_ms = Some(elapsed_ms(self.started.elapsed()));
-            }
+/// Hands `deltas` to the caller, noting when the first one arrived.
+fn emit(
+    deltas: Vec<TurnDelta>,
+    on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
+    time_to_first_token_ms: &mut Option<f64>,
+    started: Instant,
+) -> Result<(), String> {
+    for delta in deltas {
+        on_token(delta)?;
+        if time_to_first_token_ms.is_none() {
+            *time_to_first_token_ms = Some(elapsed_ms(started.elapsed()));
         }
-        Ok(())
     }
+    Ok(())
 }
