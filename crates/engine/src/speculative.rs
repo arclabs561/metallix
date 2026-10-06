@@ -506,6 +506,11 @@ pub struct DraftLength {
 
 /// Weight kept by older observations at each update.
 const ACCEPTANCE_DECAY: f64 = 0.9;
+/// Weight kept by the estimate at each step decoded without a draft, while
+/// it relaxes toward the prior. Idle steps carry no evidence, so this is
+/// slow (half-life ~140 steps): fast relaxation restarted rejected drafting
+/// every few tokens on text with nothing to copy.
+const IDLE_DECAY: f64 = 0.995;
 /// Optimistic prior (a = 0.75), so the first matches are tried at a useful
 /// length; a few rejections pull it down quickly.
 const PRIOR_ACCEPTED: f64 = 3.0;
@@ -577,7 +582,7 @@ impl DraftLength {
     /// the prior, so a stretch of low acceptance does not switch drafting
     /// off for the rest of the request.
     pub fn idle(&mut self) {
-        let keep = ACCEPTANCE_DECAY;
+        let keep = IDLE_DECAY;
         self.accepted = self.accepted.mul_add(keep, PRIOR_ACCEPTED * (1.0 - keep));
         self.rejected = self.rejected.mul_add(keep, PRIOR_REJECTED * (1.0 - keep));
     }

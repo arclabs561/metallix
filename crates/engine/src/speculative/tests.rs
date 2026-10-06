@@ -582,7 +582,7 @@ fn draft_length_follows_acceptance_and_verify_cost() {
     }
     assert!(controller.acceptance_rate() < 0.05);
     assert_eq!(controller.next(), 0, "constant rejection stops drafting");
-    for _ in 0..40 {
+    for _ in 0..400 {
         controller.idle();
     }
     assert!(
@@ -624,6 +624,43 @@ fn draft_length_follows_acceptance_and_verify_cost() {
     assert_eq!(DraftLength::new(0, measured), Err(ConfigError::DraftRange));
     assert_eq!(VerifyCost::new(-0.1, 0.0), Err(ConfigError::VerifyCost));
     assert_eq!(VerifyCost::new(0.1, f64::NAN), Err(ConfigError::VerifyCost));
+}
+
+/// Verifies a policy starts over `steps` decode steps when every step has a
+/// draft available (the worst case for the drafter) and every draft token is
+/// accepted with probability `accept`. Mirrors the server driver: a step
+/// whose length choice is zero decodes plainly and calls `idle`.
+fn verifies_started(steps: usize, accept: bool) -> usize {
+    let cost = VerifyCost::new(0.2, 0.055).expect("server cost terms");
+    let mut length = DraftLength::new(8, cost).expect("valid");
+    let mut verifies = 0;
+    for _ in 0..steps {
+        // A pipelined step is always queued when a draft appears.
+        let k = length.next_with_overhead(1.0);
+        if k == 0 {
+            length.idle();
+        } else {
+            verifies += 1;
+            length.observe(k, if accept { k } else { 0 });
+        }
+    }
+    verifies
+}
+
+#[test]
+fn rejected_drafts_switch_drafting_off_for_long_stretches() {
+    // Text with nothing to copy: after the optimistic start a few rejected
+    // verifies stop drafting, and idle steps must not bring it back every
+    // few tokens.
+    let wasted = verifies_started(160, false);
+    assert!(
+        wasted <= 3,
+        "{wasted} verifies over 160 rejected-draft steps"
+    );
+    // A long turn retries now and then, so a later copyable span is found.
+    assert!(verifies_started(2_000, false) > wasted);
+    // Copyable text keeps verifying.
+    assert!(verifies_started(160, true) > 150);
 }
 
 #[test]
