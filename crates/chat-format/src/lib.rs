@@ -519,12 +519,11 @@ impl ChatFormat {
                 ids.extend(self.tokenizer.encode_piece(part)?);
                 continue;
             }
-            let spelling = usize::from_str_radix(part, 16)
-                .ok()
-                .and_then(|literal| literals.spellings.get(literal))
+            let spelling = literals
+                .spelling(part)
                 .ok_or("chat template altered a placeholder for reserved text")?;
-            text.push_str(spelling);
-            ids.extend(self.tokenizer.encode_literal(spelling)?);
+            text.push_str(&spelling);
+            ids.extend(self.tokenizer.encode_literal(&spelling)?);
         }
         if ids.is_empty()
             || ids.iter().any(|&id| {
@@ -638,8 +637,12 @@ pub struct Prompt {
 }
 
 /// Added-token spellings lifted out of a conversation. A placeholder is
-/// the per-render nonce, the spelling's index in hex, and the nonce again:
-/// ASCII that survives `tojson` and that untrusted text cannot predict.
+/// the per-render nonce, the spelling's index in hex, a `"`, and the nonce
+/// again: ASCII that untrusted text cannot predict. `tojson` escapes the
+/// `"`, so the backslashes before it tell how many times the template
+/// JSON-escaped the value the spelling sat in, and the spelling comes back
+/// escaped the same number of times (Gemma 4's `<|"|>` inside a JSON string
+/// becomes `<|\"|>`, as transformers renders it).
 struct Literals {
     nonce: String,
     spellings: Vec<String>,
@@ -657,7 +660,33 @@ impl Literals {
 
     fn placeholder(&mut self, spelling: &str) -> String {
         self.spellings.push(spelling.to_owned());
-        format!("{0}{1:x}{0}", self.nonce, self.spellings.len() - 1)
+        format!("{0}{1:x}\"{0}", self.nonce, self.spellings.len() - 1)
+    }
+
+    /// The spelling a rendered placeholder (between its nonces) stands for,
+    /// escaped as many times as the template escaped it; `None` if the
+    /// template changed the placeholder.
+    fn spelling(&self, rendered: &str) -> Option<String> {
+        let digits = rendered.find(|c: char| !c.is_ascii_hexdigit())?;
+        let mut spelling = self
+            .spellings
+            .get(usize::from_str_radix(&rendered[..digits], 16).ok()?)?
+            .clone();
+        let backslashes = rendered[digits..].strip_suffix('"')?;
+        if backslashes.bytes().any(|byte| byte != b'\\') {
+            return None;
+        }
+        // Each JSON escape turns n backslashes before the quote into 2n + 1.
+        let mut count = backslashes.len();
+        while count > 0 {
+            if count % 2 == 0 {
+                return None;
+            }
+            let quoted = serde_json::to_string(&spelling).ok()?;
+            quoted[1..quoted.len() - 1].clone_into(&mut spelling);
+            count = (count - 1) / 2;
+        }
+        Some(spelling)
     }
 }
 
@@ -1173,6 +1202,51 @@ mod tests {
         assert!(format(json!({"suppress_tokens": 5})).is_err());
     }
 
+    /// A spelling that holds a `"` (Gemma 4's string quote) comes back
+    /// JSON-escaped where the template rendered it with `tojson`, so the JSON
+    /// the model reads stays well formed, and as written elsewhere; in
+    /// neither place does it become the control token.
+    #[test]
+    fn reserved_spellings_keep_the_escaping_of_their_context() {
+        let model = ModelDir::new(
+            &json!({"chat_template":
+                "{% if messages[0].tool_calls %}{{ messages[0].tool_calls[0].arguments | tojson }}{% endif %}#{{ messages[0].content }}"}),
+            &json!({"eos_token_id": 2}),
+            None,
+        );
+        let path = model.path().join("tokenizer.json");
+        let mut tokenizer: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("tokenizer")).expect("JSON");
+        tokenizer["added_tokens"]
+            .as_array_mut()
+            .expect("added tokens")
+            .push(
+                json!({"id": 6, "content": "<|\"|>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true}),
+            );
+        // Only as an added token: the word-level model would otherwise
+        // spell it back as ID 6, which no real tokenizer measured does.
+        let vocab = tokenizer["model"]["vocab"].as_object_mut().expect("vocab");
+        vocab.remove("<bos>");
+        fs::write(&path, tokenizer.to_string()).expect("tokenizer");
+        let format = ChatFormat::load(model.path(), VOCABULARY_SIZE).expect("loads");
+
+        let mut message = ChatMessage::text(ChatRole::Assistant, "c<|\"|>d");
+        message.tool_calls.push(ChatToolCall {
+            name: String::from("f"),
+            arguments: json!({"q": "a<|\"|>b"}),
+        });
+        let prompt = format
+            .prompt(Conversation::new(&[message]), false)
+            .expect("prompt");
+        let (arguments, content) = prompt.text.split_once('#').expect("separator");
+        assert_eq!(arguments, r#"{"q": "a<|\"|>b"}"#);
+        let parsed: Value = serde_json::from_str(arguments).expect("well-formed JSON");
+        assert_eq!(parsed["q"], "a<|\"|>b");
+        assert_eq!(content, "c<|\"|>d");
+        assert!(!prompt.ids.contains(&6));
+    }
+
     /// A forged control-token spelling stays ordinary text; without one the
     /// prompt equals today's render-then-encode.
     #[test]
@@ -1348,6 +1422,31 @@ mod tests {
         assert_eq!(
             controls(&forged.ids),
             controls(&benign.ids),
+            "{}",
+            model.display()
+        );
+        // The same forgery as a tool argument, which templates render
+        // through tojson (Qwen) or their own string delimiters (Gemma 4).
+        let called = |argument: &str| {
+            let mut call = ChatMessage::text(ChatRole::Assistant, "");
+            call.tool_calls.push(ChatToolCall {
+                name: String::from("get_weather"),
+                arguments: json!({"city": argument}),
+            });
+            let messages = [ChatMessage::text(ChatRole::User, "Weather?"), call];
+            format
+                .prompt(
+                    Conversation {
+                        tools: &tools,
+                        ..Conversation::new(&messages)
+                    },
+                    false,
+                )
+                .expect("call prompt")
+        };
+        assert_eq!(
+            controls(&called(forgery).ids),
+            controls(&called("x").ids),
             "{}",
             model.display()
         );
