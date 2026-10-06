@@ -424,8 +424,10 @@ struct EventStream<'a> {
     writer: Option<BufWriter<Connection>>,
     sequence: u64,
     id: &'a str,
-    /// The message item opened with the stream when text streams live.
-    live_message: Option<&'a str>,
+    /// Whether the reasoning item streamed live.
+    live_reasoning: bool,
+    /// The message item's output index, once its text began to stream.
+    live_message: Option<usize>,
 }
 
 impl EventStream<'_> {
@@ -444,18 +446,6 @@ impl EventStream<'_> {
                 &mut self.sequence,
                 json!({"type":"response.created","response":{"id":self.id,"object":"response","status":"in_progress","output":[]}}),
             )?;
-            if let Some(message_id) = self.live_message {
-                event(
-                    &mut writer,
-                    &mut self.sequence,
-                    json!({"type":"response.output_item.added","output_index":0,"item":{"id":message_id,"type":"message","role":"assistant","status":"in_progress","content":[]}}),
-                )?;
-                event(
-                    &mut writer,
-                    &mut self.sequence,
-                    json!({"type":"response.content_part.added","item_id":message_id,"output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
-                )?;
-            }
             self.writer = Some(writer);
         }
         Ok(self.writer.as_mut().expect("opened stream writer"))
@@ -467,14 +457,44 @@ impl EventStream<'_> {
         event(writer, &mut self.sequence, value)
     }
 
-    /// Withholds incomplete tool envelopes and reasoning, but still detects
-    /// disconnects once output has begun.
+    /// Writes an SSE comment while output is held back, so a disconnect is
+    /// still noticed.
     fn keepalive(&mut self) -> Result<(), String> {
         let writer = self.open()?;
         writer
             .write_all(b": generating\n\n")
             .map_err(|error| error.to_string())?;
         writer.flush().map_err(|error| error.to_string())
+    }
+
+    /// Streams one delta, opening the reasoning item (always output 0) or
+    /// the message item (after any reasoning) on its first delta.
+    fn delta(&mut self, delta: TurnDelta) -> Result<(), String> {
+        match delta {
+            TurnDelta::Held => self.keepalive(),
+            TurnDelta::Reasoning(reasoning) => {
+                let item_id = format!("rs_{}", self.id);
+                if !self.live_reasoning {
+                    self.live_reasoning = true;
+                    self.emit(json!({"type":"response.output_item.added","output_index":0,"item":{"id":item_id,"type":"reasoning","summary":[],"content":[]}}))?;
+                }
+                self.emit(json!({"type":"response.reasoning_text.delta","item_id":item_id,"output_index":0,"content_index":0,"delta":reasoning}))
+            }
+            TurnDelta::Text(text) => {
+                let item_id = format!("msg_{}", self.id);
+                let index = if let Some(index) = self.live_message {
+                    index
+                } else {
+                    let index = usize::from(self.live_reasoning);
+                    self.live_message = Some(index);
+                    self.emit(json!({"type":"response.output_item.added","output_index":index,"item":{"id":item_id,"type":"message","role":"assistant","status":"in_progress","content":[]}}))?;
+                    self.emit(json!({"type":"response.content_part.added","item_id":item_id,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}))?;
+                    index
+                };
+                // Per-token logprobs arrive on `response.output_text.done`.
+                self.emit(json!({"type":"response.output_text.delta","item_id":item_id,"output_index":index,"content_index":0,"delta":text,"logprobs":[]}))
+            }
+        }
     }
 }
 
@@ -526,16 +546,15 @@ pub(crate) fn respond(
     }
     let request_id = request.request_id().map(str::to_owned);
     let cache_salt = request.cache_salt().map(str::to_owned);
-    let message_id = format!("msg_{id}");
-    // Text streams live only when no tool envelope or reasoning block has to
-    // be parsed out of it first.
-    let stream_text = tools.is_empty() && !controls.enable_thinking;
+    // Reasoning and text stream as they settle; the session holds back
+    // markup, and function calls arrive whole once the turn ends.
     let mut stream = EventStream {
         pending: Some(request),
         writer: None,
         sequence: 0,
         id,
-        live_message: stream_text.then_some(message_id.as_str()),
+        live_reasoning: false,
+        live_message: None,
     };
     let generated = session.generate_with_timeout(
         ChatRequest {
@@ -543,17 +562,7 @@ pub(crate) fn respond(
             ..controls.request(messages, tools)
         },
         generation_timeout,
-        &mut |delta| {
-            let TurnDelta::Text(delta) = delta else {
-                return stream.keepalive();
-            };
-            if stream_text {
-                // Per-token logprobs arrive on `response.output_text.done`.
-                stream.emit(json!({"type":"response.output_text.delta","item_id":message_id,"output_index":0,"content_index":0,"delta":delta,"logprobs":[]}))
-            } else {
-                stream.keepalive()
-            }
-        },
+        &mut |delta| stream.delta(delta),
     );
     let generated = match generated {
         Ok(generated) => generated,
@@ -606,13 +615,19 @@ pub(crate) fn respond(
                 json!({"type":"response.function_call_arguments.done","item_id":item["id"],"output_index":index,"arguments":item["arguments"]}),
             )?;
         } else if item["type"] == "reasoning" {
-            stream.emit(
-                json!({"type":"response.output_item.added","output_index":index,"item":{"id":item["id"],"type":"reasoning","summary":[],"content":[]}}),
-            )?;
+            if stream.live_reasoning {
+                stream.emit(
+                    json!({"type":"response.reasoning_text.done","item_id":item["id"],"output_index":index,"content_index":0,"text":item["content"][0]["text"]}),
+                )?;
+            } else {
+                stream.emit(
+                    json!({"type":"response.output_item.added","output_index":index,"item":{"id":item["id"],"type":"reasoning","summary":[],"content":[]}}),
+                )?;
+            }
         } else {
             let part = &item["content"][0];
             let logprobs = part.get("logprobs").cloned().unwrap_or_else(|| json!([]));
-            if !stream_text {
+            if stream.live_message.is_none() {
                 stream.emit(
                     json!({"type":"response.output_item.added","output_index":index,"item":{"id":item["id"],"type":"message","role":"assistant","status":"in_progress","content":[]}}),
                 )?;

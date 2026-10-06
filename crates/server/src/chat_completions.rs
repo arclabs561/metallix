@@ -532,16 +532,12 @@ fn stream(
         }
         chunk
     };
-    // Text streams live only when no tool envelope or reasoning block has to
-    // be parsed out of it first.
-    let live = prepared.tools.is_empty() && !prepared.controls.enable_thinking;
+    // Reasoning and text stream as they settle; the session holds back
+    // markup, and tool calls arrive whole once the turn ends.
     let mut sse = LazySse::new(connection);
     let mut role_sent = false;
     let generated = session.generate_with_timeout(request, generation_timeout, &mut |delta| {
-        let TurnDelta::Text(delta) = delta else {
-            return sse.keepalive();
-        };
-        if !live {
+        if delta == TurnDelta::Held {
             return sse.keepalive();
         }
         if !role_sent {
@@ -555,10 +551,12 @@ fn stream(
                 ),
             )?;
         }
-        sse.event(
-            None,
-            &chunk(json!({"content":delta}), Value::Null, Value::Null),
-        )
+        let delta = match delta {
+            TurnDelta::Reasoning(reasoning) => json!({"reasoning_content":reasoning}),
+            TurnDelta::Text(text) => json!({"content":text}),
+            TurnDelta::Held => unreachable!("held deltas keep the stream alive above"),
+        };
+        sse.event(None, &chunk(delta, Value::Null, Value::Null))
     });
     let failure = |sse: &mut LazySse, code: &str, message: &str| {
         sse.event(
@@ -601,29 +599,11 @@ fn stream(
             ),
         )?;
     }
-    if !live {
-        if !turn.reasoning.is_empty() {
-            sse.event(
-                None,
-                &chunk(
-                    json!({"reasoning_content":turn.reasoning}),
-                    Value::Null,
-                    Value::Null,
-                ),
-            )?;
-        }
-        if !turn.text.is_empty() {
-            sse.event(
-                None,
-                &chunk(json!({"content":turn.text}), Value::Null, Value::Null),
-            )?;
-        }
-        for call in tool_calls(&turn, id) {
-            sse.event(
-                None,
-                &chunk(json!({"tool_calls":[call]}), Value::Null, Value::Null),
-            )?;
-        }
+    for call in tool_calls(&turn, id) {
+        sse.event(
+            None,
+            &chunk(json!({"tool_calls":[call]}), Value::Null, Value::Null),
+        )?;
     }
     let logprobs = if prepared.controls.top_logprobs.is_some() {
         json!({"content":logprobs_value(&generated.logprobs),"refusal":null})

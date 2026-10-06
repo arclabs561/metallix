@@ -500,6 +500,56 @@ fn event(sse: &mut LazySse, data: &Value) -> Result<(), String> {
     sse.event(data["type"].as_str(), data)
 }
 
+/// The thinking and text blocks a stream has opened, in order.
+#[derive(Default)]
+struct LiveBlocks {
+    /// The open block's index and whether it holds thinking.
+    open: Option<(usize, bool)>,
+    count: usize,
+}
+
+impl LiveBlocks {
+    /// Streams one delta, closing the open block when the kind changes.
+    fn push(&mut self, sse: &mut LazySse, delta: &TurnDelta) -> Result<(), String> {
+        let (thinking, body) = match delta {
+            TurnDelta::Reasoning(text) => (true, json!({"type":"thinking_delta","thinking":text})),
+            TurnDelta::Text(text) => (false, json!({"type":"text_delta","text":text})),
+            TurnDelta::Held => return sse.keepalive(),
+        };
+        let index = match self.open {
+            Some((index, open_thinking)) if open_thinking == thinking => index,
+            _ => {
+                self.close(sse)?;
+                let index = self.count;
+                self.count += 1;
+                let block = if thinking {
+                    json!({"type":"thinking","thinking":"","signature":""})
+                } else {
+                    json!({"type":"text","text":""})
+                };
+                event(
+                    sse,
+                    &json!({"type":"content_block_start","index":index,"content_block":block}),
+                )?;
+                self.open = Some((index, thinking));
+                index
+            }
+        };
+        event(
+            sse,
+            &json!({"type":"content_block_delta","index":index,"delta":body}),
+        )
+    }
+
+    /// Closes the open block and returns how many blocks were streamed.
+    fn close(&mut self, sse: &mut LazySse) -> Result<usize, String> {
+        if let Some((index, _)) = self.open.take() {
+            event(sse, &json!({"type":"content_block_stop","index":index}))?;
+        }
+        Ok(self.count)
+    }
+}
+
 #[allow(clippy::too_many_lines, reason = "one ordered event lifecycle")]
 fn stream(
     connection: Connection,
@@ -512,29 +562,21 @@ fn stream(
     // The prompt is counted only once generation ends, so the opening usage
     // is zero and `message_delta` carries the real counts.
     let start = json!({"type":"message_start","message":{"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}});
-    // Text streams live only when no tool envelope or thinking block has to
-    // be parsed out of it first.
-    let live = prepared.tools.is_empty() && !prepared.controls.enable_thinking;
+    // Thinking and text stream as blocks while they settle; the session
+    // holds back markup, and tool calls arrive whole once the turn ends.
     let mut sse = LazySse::new(connection);
     let mut started = false;
-    let generated = session.generate_with_timeout(
-        request,
-        generation_timeout,
-        &mut |delta| {
-            let TurnDelta::Text(delta) = delta else {
-                return sse.keepalive();
-            };
-            if !live {
-                return sse.keepalive();
-            }
-            if !started {
-                started = true;
-                event(&mut sse, &start)?;
-                event(&mut sse, &json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))?;
-            }
-            event(&mut sse, &json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":delta}}))
-        },
-    );
+    let mut blocks = LiveBlocks::default();
+    let generated = session.generate_with_timeout(request, generation_timeout, &mut |delta| {
+        if delta == TurnDelta::Held {
+            return sse.keepalive();
+        }
+        if !started {
+            started = true;
+            event(&mut sse, &start)?;
+        }
+        blocks.push(&mut sse, &delta)
+    });
     let failure =
         |sse: &mut LazySse, kind: &str, message: &str| event(sse, &error_body(kind, message));
     let generated = match generated {
@@ -560,43 +602,37 @@ fn stream(
     if !started {
         event(&mut sse, &start)?;
     }
-    if live {
-        if !started {
-            event(
-                &mut sse,
-                &json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
-            )?;
-        }
-        event(&mut sse, &json!({"type":"content_block_stop","index":0}))?;
-    } else {
-        for (index, block) in blocks(&turn, id).into_iter().enumerate() {
-            let (opened, delta) = match block["type"].as_str() {
-                Some("thinking") => (
-                    json!({"type":"thinking","thinking":"","signature":""}),
-                    json!({"type":"thinking_delta","thinking":block["thinking"]}),
-                ),
-                Some("tool_use") => (
-                    json!({"type":"tool_use","id":block["id"],"name":block["name"],"input":{}}),
-                    json!({"type":"input_json_delta","partial_json":block["input"].to_string()}),
-                ),
-                _ => (
-                    json!({"type":"text","text":""}),
-                    json!({"type":"text_delta","text":block["text"]}),
-                ),
-            };
-            event(
-                &mut sse,
-                &json!({"type":"content_block_start","index":index,"content_block":opened}),
-            )?;
-            event(
-                &mut sse,
-                &json!({"type":"content_block_delta","index":index,"delta":delta}),
-            )?;
-            event(
-                &mut sse,
-                &json!({"type":"content_block_stop","index":index}),
-            )?;
-        }
+    // The blocks streamed so far are exactly the leading thinking and text
+    // blocks of the final message; the rest follow whole.
+    let final_blocks = self::blocks(&turn, id);
+    let streamed = blocks.close(&mut sse)?;
+    for (index, block) in final_blocks.into_iter().enumerate().skip(streamed) {
+        let (opened, delta) = match block["type"].as_str() {
+            Some("thinking") => (
+                json!({"type":"thinking","thinking":"","signature":""}),
+                json!({"type":"thinking_delta","thinking":block["thinking"]}),
+            ),
+            Some("tool_use") => (
+                json!({"type":"tool_use","id":block["id"],"name":block["name"],"input":{}}),
+                json!({"type":"input_json_delta","partial_json":block["input"].to_string()}),
+            ),
+            _ => (
+                json!({"type":"text","text":""}),
+                json!({"type":"text_delta","text":block["text"]}),
+            ),
+        };
+        event(
+            &mut sse,
+            &json!({"type":"content_block_start","index":index,"content_block":opened}),
+        )?;
+        event(
+            &mut sse,
+            &json!({"type":"content_block_delta","index":index,"delta":delta}),
+        )?;
+        event(
+            &mut sse,
+            &json!({"type":"content_block_stop","index":index}),
+        )?;
     }
     event(
         &mut sse,
@@ -824,10 +860,13 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         streamed["stream"] = json!(true);
         let mut backend = Scripted::new(text);
         let frames = events(&run(&streamed, &mut backend));
-        let kinds: Vec<_> = frames
+        // Thinking and text stream as many deltas; the tool call as one.
+        let names: Vec<_> = frames
             .iter()
             .map(|(name, _)| name.clone().unwrap())
             .collect();
+        let mut kinds = names.clone();
+        kinds.dedup();
         assert_eq!(
             kinds,
             [
@@ -849,20 +888,35 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
             .iter()
             .map(|(_, data)| serde_json::from_str(data).unwrap())
             .collect();
-        for (name, value) in kinds.iter().zip(&data) {
+        for (name, value) in names.iter().zip(&data) {
             assert_eq!(value["type"], name.as_str(), "event name matches its data");
         }
-        assert_eq!(data[1]["content_block"]["type"], "thinking");
-        assert_eq!(data[2]["delta"]["type"], "thinking_delta");
+        let starts: Vec<&Value> = data
+            .iter()
+            .filter(|value| value["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts[0]["content_block"]["type"], "thinking");
+        assert_eq!(starts[1]["content_block"]["type"], "text");
         assert_eq!(
-            data[7]["content_block"],
+            starts[2]["content_block"],
             json!({"type":"tool_use","id":"toolu_t_0","name":"read_file","input":{}})
         );
-        let partial: Value =
-            serde_json::from_str(data[8]["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        let streamed = |index: u64, field: &str| -> String {
+            data.iter()
+                .filter(|value| value["type"] == "content_block_delta" && value["index"] == index)
+                .map(|value| value["delta"][field].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(streamed(0, "thinking"), "need the file");
+        assert_eq!(streamed(1, "text"), "Let me look.");
+        let partial: Value = serde_json::from_str(&streamed(2, "partial_json")).unwrap();
         assert_eq!(partial, json!({"path":"README.md"}));
-        assert_eq!(data[10]["delta"]["stop_reason"], "tool_use");
-        assert_eq!(data[10]["usage"]["input_tokens"], 1);
+        let end = data
+            .iter()
+            .find(|value| value["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(end["delta"]["stop_reason"], "tool_use");
+        assert_eq!(end["usage"]["input_tokens"], 1);
     }
 
     #[test]

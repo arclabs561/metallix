@@ -258,18 +258,33 @@ pub(crate) mod test_support {
                 let text: String = visible.iter().map(|&token| spell(token)).collect();
                 (text, generated, finish)
             } else {
+                // Two characters per decoded piece, split as a session splits them.
+                let mut stream = chat_format::TurnStream::new(
+                    crate::chat_generation::QWEN3_TURN,
+                    request.enable_thinking,
+                );
                 let characters: Vec<char> = self.text.chars().collect();
                 for piece in characters.chunks(2) {
                     self.deltas += 1;
-                    on_token(chat_format::TurnDelta::Text(piece.iter().collect()))
-                        .map_err(ChatGenerationError::Message)?;
+                    let mut deltas = stream.push(&piece.iter().collect::<String>());
+                    if deltas.is_empty() {
+                        deltas.push(chat_format::TurnDelta::Held);
+                    }
+                    for delta in deltas {
+                        on_token(delta).map_err(ChatGenerationError::Message)?;
+                    }
+                }
+                if let Ok((_, last)) = stream.finish(request.tools, true) {
+                    for delta in last {
+                        on_token(delta).map_err(ChatGenerationError::Message)?;
+                    }
                 }
                 (self.text.clone(), vec![1, 2], ChatFinishReason::Eos)
             };
             let generated_tokens = generated_token_ids.len();
             let mut generated = crate::chat_generation::ChatGeneration::scripted(
                 text,
-                true,
+                request.enable_thinking,
                 finish_reason,
                 ChatGenerationMetrics {
                     context_tokens: 2048,

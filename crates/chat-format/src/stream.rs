@@ -17,6 +17,10 @@ use crate::turn::{AssistantTurn, ToolDialect, TurnFormat, parse_turn_unchecked};
 pub enum TurnDelta {
     Reasoning(String),
     Text(String),
+    /// A token arrived whose text is still held back (markup, or text that
+    /// may become markup). It carries nothing to show; a protocol can use
+    /// it to notice a disconnected client.
+    Held,
 }
 
 /// Splits one turn's decoded text into [`TurnDelta`]s.
@@ -266,6 +270,7 @@ mod tests {
             match delta {
                 TurnDelta::Reasoning(piece) => reasoning.push_str(&piece),
                 TurnDelta::Text(piece) => text.push_str(&piece),
+                TurnDelta::Held => unreachable!("the stream itself never holds a token"),
             }
         }
         Ok((reasoning, text, (turn.reasoning, turn.text)))

@@ -478,7 +478,10 @@ impl TurnText {
             .decode_generated_token(&mut self.decoder, token)?
         {
             self.decoded.push_str(&delta);
-            let deltas = self.stream.push(&delta);
+            let mut deltas = self.stream.push(&delta);
+            if deltas.is_empty() {
+                deltas.push(TurnDelta::Held);
+            }
             emit(
                 deltas,
                 on_token,
@@ -546,8 +549,9 @@ fn emit(
     started: Instant,
 ) -> Result<(), String> {
     for delta in deltas {
+        let visible = delta != TurnDelta::Held;
         on_token(delta)?;
-        if time_to_first_token_ms.is_none() {
+        if visible && time_to_first_token_ms.is_none() {
             *time_to_first_token_ms = Some(elapsed_ms(started.elapsed()));
         }
     }

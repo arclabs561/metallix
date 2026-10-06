@@ -550,7 +550,7 @@ impl ChatGeneration {
     }
 
     /// A finished turn for scripted backends in tests: `text` written in
-    /// Qwen3's dialects, parsed as a session would parse it.
+    /// [`QWEN3_TURN`], parsed as a session would parse it.
     #[cfg(test)]
     pub(crate) fn scripted(
         text: impl Into<String>,
@@ -559,13 +559,9 @@ impl ChatGeneration {
         metrics: ChatGenerationMetrics,
     ) -> Self {
         let text = text.into();
-        let qwen3 = chat_format::TurnFormat {
-            tools: chat_format::ToolDialect::JsonInTags,
-            reasoning: chat_format::ReasoningDialect::ThinkTags,
-        };
         Self {
             turn: chat_format::parse_turn_unchecked(
-                qwen3,
+                QWEN3_TURN,
                 &text,
                 &[],
                 enable_thinking,
@@ -580,6 +576,13 @@ impl ChatGeneration {
         }
     }
 }
+
+/// Qwen3's dialects, which scripted backends in tests write.
+#[cfg(test)]
+pub(crate) const QWEN3_TURN: chat_format::TurnFormat = chat_format::TurnFormat {
+    tools: chat_format::ToolDialect::JsonInTags,
+    reasoning: chat_format::ReasoningDialect::ThinkTags,
+};
 
 /// A cooperative wall-clock budget for one complete chat turn.
 ///
