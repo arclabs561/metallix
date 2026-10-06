@@ -64,6 +64,7 @@ impl TurnStart {
         let started = Instant::now();
         let render = tracing::info_span!("chat.render", render_ms = tracing::field::Empty);
         let (prompt, render_ms) = timed(&render, "render_ms", || {
+            model.format.check_untrusted(request.conversation())?;
             model.format.template().render(request.conversation(), true)
         })?;
         deadline.check()?;

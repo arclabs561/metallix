@@ -897,6 +897,7 @@ impl ChatSession {
     }
 
     fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
+        self.format.check_untrusted(request.conversation())?;
         self.format.template().render(request.conversation(), true)
     }
 }

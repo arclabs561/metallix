@@ -81,6 +81,22 @@ impl QwenTokenizer {
         self.tokenizer.token_to_id(text)
     }
 
+    /// The first added token (`<|im_end|>`, `<|"|>`, `<think>`) that encoding
+    /// `text` would produce, by its spelling. Added tokens are split out of
+    /// text whether or not special tokens are requested, so such text would
+    /// reach the model as a control token.
+    pub fn added_token_in(&self, text: &str) -> Result<Option<String>, String> {
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|_| String::from("chat input could not be encoded by local tokenizer"))?;
+        let added = self.tokenizer.get_added_tokens_decoder();
+        Ok(encoding
+            .get_ids()
+            .iter()
+            .find_map(|id| added.get(id).map(|token| token.content.clone())))
+    }
+
     /// Encodes prompt bytes exactly as supplied: no chat template or special
     /// tokens are added by this CLI layer.
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<i32>, String> {
