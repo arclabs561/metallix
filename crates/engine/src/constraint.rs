@@ -92,7 +92,7 @@ pub enum ConstraintFinish {
 /// This does not snapshot model logits, RNG state, or model/cache state. A
 /// caller that branches model execution must checkpoint those layers too.
 pub struct JsonConstraintCheckpoint {
-    env: TokEnv,
+    owner: Arc<()>,
     matcher: Matcher,
     output: Vec<u8>,
     state: SessionState,
@@ -181,37 +181,41 @@ pub enum ConstraintError {
 /// time before it computes the full vocabulary mask.
 pub const LAZY_ARGMAX_CANDIDATES: usize = 8;
 
-/// One JSON-Schema grammar session bound to a tokenizer and model logit width.
-pub struct JsonConstraintSession {
+/// The tokenizer half of constrained decoding: the token trie and llguidance's
+/// parser factory for one tokenizer, EOS ID and model logit width.
+///
+/// Building it walks the whole vocabulary several times (hundreds of
+/// milliseconds for a 151k-token tokenizer), while each schema then compiles
+/// in under a millisecond, so callers build one per model and share it
+/// across requests. Sessions from one compiler use the same trie and parser
+/// factory, so their masks are the ones a freshly built session would compute.
+pub struct JsonConstraintCompiler {
     env: TokEnv,
-    matcher: Matcher,
-    validator: Validator,
+    factory: ParserFactory,
     model_vocab_size: usize,
     tokenizer_vocab_size: usize,
     eos_token_id: u32,
-    output: Vec<u8>,
-    legal_mask: Vec<bool>,
-    limits: ConstraintLimits,
-    state: SessionState,
 }
 
-impl JsonConstraintSession {
-    /// Builds a bounded session for one tokenizer vocabulary and JSON Schema.
+impl JsonConstraintCompiler {
+    /// Builds the trie and parser factory for one bounded tokenizer.
     pub fn new(
         tokenizer_json: &Value,
         eos_token_id: u32,
         model_vocab_size: usize,
-        schema: Value,
         limits: ConstraintLimits,
     ) -> Result<Self, ConstraintError> {
         let limits = limits.validate()?;
         check_serialized_bound(tokenizer_json, limits.max_tokenizer_bytes)
             .map_err(|()| ConstraintError::TokenizerTooLarge)?;
-        check_serialized_bound(&schema, limits.max_schema_bytes)
-            .map_err(|()| ConstraintError::SchemaTooLarge)?;
-        reject_non_local_references(&schema)?;
-        reject_non_202012_dialect(&schema)?;
+        Self::compile(tokenizer_json, eos_token_id, model_vocab_size)
+    }
 
+    fn compile(
+        tokenizer_json: &Value,
+        eos_token_id: u32,
+        model_vocab_size: usize,
+    ) -> Result<Self, ConstraintError> {
         let declared_tokenizer_vocab = declared_tokenizer_vocab_size(tokenizer_json)?;
         if declared_tokenizer_vocab > MAX_TOKENIZER_VOCABULARY {
             return Err(ConstraintError::TokenizerVocabularyTooLarge);
@@ -243,29 +247,107 @@ impl JsonConstraintSession {
         let env: TokEnv = Arc::new(ApproximateTokEnv::new(TokTrie::from(&info, &token_bytes)));
         let factory =
             ParserFactory::new_simple(&env).map_err(|_| ConstraintError::SchemaCompilation)?;
+        Ok(Self {
+            env,
+            factory,
+            model_vocab_size,
+            tokenizer_vocab_size,
+            eos_token_id,
+        })
+    }
+
+    /// The EOS ID the grammar ends output on.
+    #[must_use]
+    pub const fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    /// The model logit width every session's logits must have.
+    #[must_use]
+    pub const fn model_vocab_size(&self) -> usize {
+        self.model_vocab_size
+    }
+
+    /// Compiles one bounded JSON Schema into a fresh session.
+    pub fn session(
+        &self,
+        schema: Value,
+        limits: ConstraintLimits,
+    ) -> Result<JsonConstraintSession, ConstraintError> {
+        let limits = limits.validate()?;
+        check_schema(&schema, limits)?;
+        self.compile_session(schema, limits)
+    }
+
+    fn compile_session(
+        &self,
+        schema: Value,
+        limits: ConstraintLimits,
+    ) -> Result<JsonConstraintSession, ConstraintError> {
         let validator = jsonschema::options()
             .with_draft(Draft::Draft202012)
             .offline()
             .build(&schema)
             .map_err(|_| ConstraintError::SchemaCompilation)?;
-        let mut matcher =
-            Matcher::new(factory.create_parser(TopLevelGrammar::from_json_schema(schema)));
+        let mut matcher = Matcher::new(
+            self.factory
+                .create_parser(TopLevelGrammar::from_json_schema(schema)),
+        );
         if matcher.is_error() || !matcher.grammar_warnings().is_empty() {
             return Err(ConstraintError::GrammarWarning);
         }
 
-        Ok(Self {
-            env,
+        Ok(JsonConstraintSession {
+            env: Arc::clone(&self.env),
+            owner: Arc::new(()),
             matcher,
             validator,
-            model_vocab_size,
-            tokenizer_vocab_size,
-            eos_token_id,
+            model_vocab_size: self.model_vocab_size,
+            tokenizer_vocab_size: self.tokenizer_vocab_size,
+            eos_token_id: self.eos_token_id,
             output: Vec::new(),
-            legal_mask: vec![false; model_vocab_size],
+            legal_mask: vec![false; self.model_vocab_size],
             limits,
             state: SessionState::Active,
         })
+    }
+}
+
+/// One JSON-Schema grammar session bound to a tokenizer and model logit width.
+pub struct JsonConstraintSession {
+    env: TokEnv,
+    /// Identifies this session's checkpoints; the trie may be shared.
+    owner: Arc<()>,
+    matcher: Matcher,
+    validator: Validator,
+    model_vocab_size: usize,
+    tokenizer_vocab_size: usize,
+    eos_token_id: u32,
+    output: Vec<u8>,
+    legal_mask: Vec<bool>,
+    limits: ConstraintLimits,
+    state: SessionState,
+}
+
+impl JsonConstraintSession {
+    /// Builds a bounded session for one tokenizer vocabulary and JSON Schema.
+    ///
+    /// This compiles the tokenizer too; a caller serving many requests for one
+    /// model builds a [`JsonConstraintCompiler`] once and calls
+    /// [`JsonConstraintCompiler::session`] instead.
+    pub fn new(
+        tokenizer_json: &Value,
+        eos_token_id: u32,
+        model_vocab_size: usize,
+        schema: Value,
+        limits: ConstraintLimits,
+    ) -> Result<Self, ConstraintError> {
+        let limits = limits.validate()?;
+        check_serialized_bound(tokenizer_json, limits.max_tokenizer_bytes)
+            .map_err(|()| ConstraintError::TokenizerTooLarge)?;
+        check_schema(&schema, limits)?;
+        JsonConstraintCompiler::compile(tokenizer_json, eos_token_id, model_vocab_size)?
+            .compile_session(schema, limits)
     }
 
     /// Selects and consumes the finite maximum grammar-allowed tokenizer logit.
@@ -385,7 +467,7 @@ impl JsonConstraintSession {
     #[must_use]
     pub fn checkpoint(&self) -> JsonConstraintCheckpoint {
         JsonConstraintCheckpoint {
-            env: Arc::clone(&self.env),
+            owner: Arc::clone(&self.owner),
             matcher: self.matcher.deep_clone(),
             output: self.output.clone(),
             state: self.state,
@@ -397,7 +479,7 @@ impl JsonConstraintSession {
     /// The checkpoint is consumed so a caller cannot accidentally reuse a
     /// stale branch after restoring it once.
     pub fn restore(&mut self, checkpoint: JsonConstraintCheckpoint) -> Result<(), ConstraintError> {
-        if !Arc::ptr_eq(&self.env, &checkpoint.env) {
+        if !Arc::ptr_eq(&self.owner, &checkpoint.owner) {
             return Err(ConstraintError::CheckpointMismatch);
         }
         self.matcher = checkpoint.matcher;
@@ -696,6 +778,14 @@ fn declared_tokenizer_vocab_size(tokenizer_json: &Value) -> Result<usize, Constr
     Ok(vocabulary_size)
 }
 
+/// The schema checks that need no tokenizer, in the order sessions apply them.
+fn check_schema(schema: &Value, limits: ConstraintLimits) -> Result<(), ConstraintError> {
+    check_serialized_bound(schema, limits.max_schema_bytes)
+        .map_err(|()| ConstraintError::SchemaTooLarge)?;
+    reject_non_local_references(schema)?;
+    reject_non_202012_dialect(schema)
+}
+
 fn check_serialized_bound(value: &Value, limit: usize) -> Result<(), ()> {
     (serde_json::to_vec(value).map_err(|_| ())?.len() <= limit)
         .then_some(())
@@ -755,7 +845,8 @@ fn reject_non_202012_dialect(schema: &Value) -> Result<(), ConstraintError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConstraintError, ConstraintFinish, ConstraintLimits, ConstraintStep, JsonConstraintSession,
+        ConstraintError, ConstraintFinish, ConstraintLimits, ConstraintStep,
+        JsonConstraintCompiler, JsonConstraintSession,
     };
     use serde_json::{Value, json};
 
@@ -1119,6 +1210,92 @@ mod tests {
             .select_argmax(&logits(token_id(b'"')))
             .expect("restored branch remains usable");
         assert_eq!(session.decoded_bytes(), b"{\"");
+    }
+
+    /// The vocabulary of [`number_session`], which covers all three test schemas.
+    fn wide_tokenizer() -> Value {
+        json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [{"id": 15, "content": "<eos>", "special": true}],
+            "model": {"vocab": {
+                "{": 0, "}": 1, "\"": 2, "o": 3, "k": 4, ":": 5,
+                "t": 6, "r": 7, "u": 8, "e": 9, "f": 10, "a": 11,
+                "l": 12, "s": 13, "1": 14
+            }}
+        })
+    }
+
+    fn mask_words(session: &JsonConstraintSession) -> Option<Vec<u32>> {
+        let mut probe = session.matcher.deep_clone();
+        probe
+            .compute_mask()
+            .ok()
+            .map(|mask| mask.as_slice().to_vec())
+    }
+
+    /// Consecutive requests on one shared compiler see the masks, tokens and
+    /// bytes a freshly built session sees, step for step, including after an
+    /// earlier session from the same compiler has run to completion.
+    #[test]
+    fn shared_compiler_sessions_match_fresh_sessions() {
+        let compiler = JsonConstraintCompiler::new(&wide_tokenizer(), 15, MODEL_VOCAB, limits())
+            .expect("bounded compiler");
+        let schemas = [
+            schema(),
+            json!({"type": "boolean"}),
+            json!({"type": "number"}),
+        ];
+        let mut seed = 0x2545_f491_u32;
+        for round in 0..4 {
+            for schema in &schemas {
+                let mut shared = compiler.session(schema.clone(), limits()).expect("shared");
+                let mut fresh = JsonConstraintSession::new(
+                    &wide_tokenizer(),
+                    15,
+                    MODEL_VOCAB,
+                    schema.clone(),
+                    limits(),
+                )
+                .expect("fresh");
+                for _ in 0..24 {
+                    assert_eq!(mask_words(&shared), mask_words(&fresh), "round {round}");
+                    let values: Vec<f32> = (0..MODEL_VOCAB)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            f32::from(i8::try_from(seed % 7).expect("small") - 3)
+                        })
+                        .collect();
+                    let expected = fresh.select_argmax(&values);
+                    assert_eq!(shared.select_argmax(&values), expected, "round {round}");
+                    assert_eq!(shared.decoded_bytes(), fresh.decoded_bytes());
+                    if expected.is_err() || fresh.is_complete() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_cannot_cross_sessions_of_one_compiler() {
+        let compiler = JsonConstraintCompiler::new(&tokenizer(), EOS, MODEL_VOCAB, limits())
+            .expect("bounded compiler");
+        let source = compiler.session(schema(), limits()).expect("source");
+        let mut destination = compiler.session(schema(), limits()).expect("destination");
+        assert_eq!(
+            destination.restore(source.checkpoint()),
+            Err(ConstraintError::CheckpointMismatch)
+        );
+        let mut same = compiler.session(schema(), limits()).expect("same");
+        assert_eq!(same.restore(same.checkpoint()), Ok(()));
+    }
+
+    #[test]
+    fn compiler_can_be_shared_across_threads() {
+        fn shareable<T: Send + Sync>() {}
+        shareable::<JsonConstraintCompiler>();
     }
 
     #[test]

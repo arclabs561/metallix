@@ -1,9 +1,17 @@
 //! Bounded local inputs and diagnostics for constrained Qwen generation.
 
-use std::{fs::File, io::Read, path::Path, time::Instant};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
+    time::{Instant, SystemTime},
+};
 
 use engine::constraint::{
-    ConstraintLimits, ConstraintStep, JsonConstraintCheckpoint, JsonConstraintSession,
+    ConstraintLimits, ConstraintStep, JsonConstraintCheckpoint, JsonConstraintCompiler,
+    JsonConstraintSession,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -165,29 +173,9 @@ impl ConstraintRun {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let started = Instant::now();
         let schema = schema_source.read()?;
-        let config = read_json(&model.join("config.json"), MAX_SCHEMA_BYTES)?;
-        // The grammar ends output on one ID; any other stop the checkpoint
-        // lists still ends the turn when the decode loop samples it.
-        let eos = chat_format::StopTokens::load(model)?.end_turn().get();
-        let vocab = config["vocab_size"]
-            .as_u64()
-            .and_then(|value| usize::try_from(value).ok())
-            .ok_or("configuration requires a vocabulary size")?;
-        let tokenizer = read_json(&model.join("tokenizer.json"), MAX_TOKENIZER_BYTES)?;
+        let (compiler, tokenizer_json_sha256) = compiler_for(model)?;
         let schema_json_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&schema)?));
-        let tokenizer_json_sha256 =
-            format!("{:x}", Sha256::digest(serde_json::to_vec(&tokenizer)?));
-        let session = JsonConstraintSession::new(
-            &tokenizer,
-            eos,
-            vocab,
-            schema,
-            ConstraintLimits {
-                max_schema_bytes: MAX_SCHEMA_BYTES,
-                max_tokenizer_bytes: MAX_TOKENIZER_BYTES,
-                max_output_bytes: 1024 * 1024,
-            },
-        )?;
+        let session = compiler.session(schema, CONSTRAINT_LIMITS)?;
         Ok(Self {
             session,
             setup_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -354,6 +342,101 @@ impl ConstraintRun {
     }
 }
 
+const CONSTRAINT_LIMITS: ConstraintLimits = ConstraintLimits {
+    max_schema_bytes: MAX_SCHEMA_BYTES,
+    max_tokenizer_bytes: MAX_TOKENIZER_BYTES,
+    max_output_bytes: 1024 * 1024,
+};
+
+/// Checkpoint files the compiler is built from, directly or through the
+/// stop-token loader. A change in any one's size or modification time
+/// rebuilds it.
+const COMPILER_INPUTS: [&str; 4] = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+/// Most model directories one process keeps compiled tokenizers for.
+const MAX_CACHED_COMPILERS: usize = 4;
+
+type InputStamp = Vec<Option<(u64, SystemTime)>>;
+
+struct CachedCompiler {
+    stamp: InputStamp,
+    compiler: Arc<JsonConstraintCompiler>,
+    tokenizer_json_sha256: String,
+}
+
+/// Compiled tokenizers by model directory. Compiling one walks the whole
+/// vocabulary (about 0.4 s for Qwen3's 151k tokens) and does not depend on
+/// the schema, so requests after the first reuse it.
+static COMPILERS: OnceLock<Mutex<HashMap<PathBuf, CachedCompiler>>> = OnceLock::new();
+
+fn input_stamp(model: &Path) -> InputStamp {
+    COMPILER_INPUTS
+        .iter()
+        .map(|name| {
+            let metadata = std::fs::metadata(model.join(name)).ok()?;
+            Some((metadata.len(), metadata.modified().ok()?))
+        })
+        .collect()
+}
+
+/// The model's compiled tokenizer and the digest its receipts cite, built on
+/// first use and rebuilt when a checkpoint input changes.
+fn compiler_for(
+    model: &Path,
+) -> Result<(Arc<JsonConstraintCompiler>, String), Box<dyn std::error::Error>> {
+    // Stamped before reading, so an input changed mid-build forces a rebuild
+    // on the next request rather than being cached under its new stamp.
+    let stamp = input_stamp(model);
+    let cache = COMPILERS.get_or_init(Mutex::default);
+    if let Some(entry) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(model)
+        .filter(|entry| entry.stamp == stamp)
+    {
+        return Ok((
+            Arc::clone(&entry.compiler),
+            entry.tokenizer_json_sha256.clone(),
+        ));
+    }
+
+    let config = read_json(&model.join("config.json"), MAX_SCHEMA_BYTES)?;
+    // The grammar ends output on one ID; any other stop the checkpoint
+    // lists still ends the turn when the decode loop samples it.
+    let eos = chat_format::StopTokens::load(model)?.end_turn().get();
+    let vocab = config["vocab_size"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or("configuration requires a vocabulary size")?;
+    let tokenizer = read_json(&model.join("tokenizer.json"), MAX_TOKENIZER_BYTES)?;
+    let tokenizer_json_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&tokenizer)?));
+    let compiler = Arc::new(JsonConstraintCompiler::new(
+        &tokenizer,
+        eos,
+        vocab,
+        CONSTRAINT_LIMITS,
+    )?);
+
+    let mut entries = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if entries.len() >= MAX_CACHED_COMPILERS && !entries.contains_key(model) {
+        entries.clear();
+    }
+    entries.insert(
+        model.to_path_buf(),
+        CachedCompiler {
+            stamp,
+            compiler: Arc::clone(&compiler),
+            tokenizer_json_sha256: tokenizer_json_sha256.clone(),
+        },
+    );
+    Ok((compiler, tokenizer_json_sha256))
+}
+
 fn read_json(path: &Path, maximum: usize) -> Result<Value, Box<dyn std::error::Error>> {
     if !path.metadata()?.is_file() {
         return Err("constraint input must be a regular file".into());
@@ -451,5 +534,44 @@ mod source_tests {
             let result = verify_non_overlapping_schedule(&value);
             assert_eq!(result.rejection, Some(rejection));
         }
+    }
+
+    /// The second request on one model reuses the compiled tokenizer and
+    /// picks the same tokens the first did on the same logits.
+    #[test]
+    #[ignore = "requires METALLIX_QWEN_MODEL pointing to a local Qwen3 checkpoint directory"]
+    fn second_request_reuses_the_compiled_tokenizer() {
+        let model = std::path::PathBuf::from(
+            std::env::var("METALLIX_QWEN_MODEL").expect("METALLIX_QWEN_MODEL"),
+        );
+        let schema = r#"{"type":"object","properties":{"name":{"type":"string","enum":["get_weather","search_web"]},"days":{"type":"integer"}},"required":["name","days"],"additionalProperties":false}"#;
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut run = super::ConstraintRun::load(&model, SchemaSource::Inline(schema))
+                .expect("constraint run");
+            let width = super::compiler_for(&model)
+                .expect("cached compiler")
+                .0
+                .model_vocab_size();
+            let mut seed = 0x9e37_79b9_u32;
+            let mut tokens = Vec::new();
+            while tokens.len() < 64 && !run.is_complete() {
+                let logits: Vec<f32> = (0..width)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        f32::from(u16::try_from(seed % 1000).expect("small")) / 100.0
+                    })
+                    .collect();
+                tokens.push(run.sample(&logits, false).expect("constrained step").0);
+            }
+            eprintln!("setup_ms={:.3} tokens={}", run.setup_ms, tokens.len());
+            runs.push((run.setup_ms, tokens));
+        }
+        assert_eq!(runs[0].1, runs[1].1);
+        let (first, _) = super::compiler_for(&model).expect("first compiler");
+        let (second, _) = super::compiler_for(&model).expect("second compiler");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 }
