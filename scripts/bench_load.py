@@ -954,8 +954,11 @@ def level_spec(name: str, address: str, args) -> ServerSpec:
     """The spec for one engine; an empty argv for an already running --url server."""
     if args.url:
         return ServerSpec(name, args.api, [], {}, {})
-    spec = server_spec(name, args.model_path, args.model_id, address, args)
-    return with_prefix_cache(spec, args.prefix_cache)
+    spec = with_prefix_cache(
+        server_spec(name, args.model_path, args.model_id, address, args),
+        args.prefix_cache,
+    )
+    return replace(spec, argv=spec.argv + args.server_args)
 
 
 @functools.cache
@@ -1390,6 +1393,15 @@ def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.Argumen
         "--mx-revision", default="unknown", help="source revision of --mx"
     )
     parser.add_argument("--mx-kv-budget-mib", type=int, default=4096)
+    parser.add_argument(
+        "--server-arg",
+        action="append",
+        default=[],
+        dest="server_args",
+        metavar="ARG",
+        help="append ARG to each managed server's command line; repeatable "
+        "(write --server-arg=--flag for values that start with a dash)",
+    )
     parser.add_argument(
         "--mx-spans",
         action="store_true",

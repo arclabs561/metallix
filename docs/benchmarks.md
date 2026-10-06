@@ -149,6 +149,23 @@ uv run scripts/bench_campaign.py --server stub,stub-slow --subject stub \
   --cooldown 0 --skip-idle-gate --requests 8
 ```
 
+## Comparing two builds on a busy machine
+
+`scripts/bench_pair.py` answers a narrower question than the protocol: is
+configuration B faster or slower than A? It runs the two arms at one level in
+the order A,B, B,A, A,B, ..., each on a fresh server, and reports the median
+of the per-pair ratios B/A with a bootstrap 95% confidence interval, plus the
+load when each run started. Slow changes in machine load affect both runs of
+a pair about equally, and alternating the order cancels a steady trend, so an
+interval that excludes 1 shows a difference even under load. Its absolute
+numbers are not results; those come only from the idle protocol above.
+
+```sh
+uv run scripts/bench_pair.py --server metallix --model-path MODEL_DIR \
+  --sets short --concurrency 1 --pairs 8 \
+  --a-args "--mx build-a/mx" --b-args "--mx build-b/mx"
+```
+
 ## Results
 
 No runs have passed the protocol yet.

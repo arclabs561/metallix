@@ -22,7 +22,12 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def handler(tpot_s: float, ttft_s: float):
+def handler(tpot_s: float, ttft_s: float, drift_per_s: float = 0.0, epoch: float = 0.0):
+    def slowdown() -> float:
+        """1 at `epoch`, growing by `drift_per_s` each second after it: a
+        stand-in for a machine whose load changes during a comparison."""
+        return 1 + drift_per_s * max(0.0, time.time() - epoch)
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -53,7 +58,7 @@ def handler(tpot_s: float, ttft_s: float):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
             self.end_headers()
-            time.sleep(ttft_s)
+            time.sleep(ttft_s * slowdown())
             chat = self.path == "/v1/chat/completions"
             for _ in range(tokens):
                 if chat:
@@ -62,7 +67,7 @@ def handler(tpot_s: float, ttft_s: float):
                     event = {"type": "response.output_text.delta", "delta": " tok"}
                 self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
                 self.wfile.flush()
-                time.sleep(tpot_s)
+                time.sleep(tpot_s * slowdown())
             if chat:
                 usage = {"prompt_tokens": 1, "completion_tokens": tokens}
                 events = [{"choices": [], "usage": usage}, "[DONE]"]
@@ -84,10 +89,21 @@ def main() -> int:
     parser.add_argument("--ttft-ms", type=float, default=20.0)
     # Accepted so the campaign's cache arms can be dry-run; the stub has no cache.
     parser.add_argument("--prefix-cache", choices=("on", "off"))
+    parser.add_argument(
+        "--drift-per-s",
+        type=float,
+        default=0.0,
+        help="slow down by this fraction per second after --drift-epoch",
+    )
+    parser.add_argument(
+        "--drift-epoch", type=float, help="Unix time the drift starts (default: now)"
+    )
     args = parser.parse_args()
     host, port = args.listen.rsplit(":", 1)
+    epoch = args.drift_epoch if args.drift_epoch is not None else time.time()
     server = ThreadingHTTPServer(
-        (host, int(port)), handler(args.tpot_ms / 1000, args.ttft_ms / 1000)
+        (host, int(port)),
+        handler(args.tpot_ms / 1000, args.ttft_ms / 1000, args.drift_per_s, epoch),
     )
     server.daemon_threads = True
     server.serve_forever()

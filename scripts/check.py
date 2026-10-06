@@ -105,6 +105,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_bench_system.py"], False),
         ([sys.executable, "scripts/test_bench_campaign.py"], False),
         ([sys.executable, "scripts/test_mx_spans.py"], False),
+        ([sys.executable, "scripts/test_bench_pair.py"], False),
         ([sys.executable, "scripts/test_compare_qwen.py"], False),
         ([sys.executable, "scripts/test_checkpoint_io.py"], False),
         ([sys.executable, "scripts/test_replay_v41_route_trace.py"], False),

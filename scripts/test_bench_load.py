@@ -354,6 +354,7 @@ class Levels(unittest.TestCase):
             "rate_requests": 2,
             "abort_load": None,
             "abort_gpu_gib": None,
+            "server_args": [],
         }
         return argparse.Namespace(**(values | overrides))
 
@@ -440,14 +441,23 @@ class Levels(unittest.TestCase):
     def test_metallix_levels_admit_every_request_in_flight(self) -> None:
         started, _ = self.fakes(load=1.0, name="metallix")
         args = self.args(
-            concurrency=[2, 16], rates=[], prefix_cache="default", mx=pathlib.Path("mx")
+            concurrency=[2, 16],
+            rates=[],
+            prefix_cache="default",
+            mx=pathlib.Path("mx"),
+            server_args=["--draft", "d"],
         )
         flags = frozenset({"--queue-depth", "--prefix-cache-mib"})
         with mock.patch.object(bench_load, "mx_serve_flags", lambda mx: flags):
             bench_load.measure_set("metallix", "short", args, str.split)
         argvs = [argv for argv in started if argv != "stopped"]
+        # --server-arg values come before the level's own sizing flags.
         self.assertEqual(
-            argvs, [["vllm", "--queue-depth", "8"], ["vllm", "--queue-depth", "16"]]
+            argvs,
+            [
+                ["vllm", "--draft", "d", "--queue-depth", "8"],
+                ["vllm", "--draft", "d", "--queue-depth", "16"],
+            ],
         )
 
     def test_metallix_level_flags_follow_what_the_build_accepts(self) -> None:
