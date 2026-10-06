@@ -80,8 +80,9 @@ pub(crate) struct Request {
     _parallel_tool_calls: Option<IgnoredAny>,
     #[serde(default, rename = "user")]
     _user: Option<IgnoredAny>,
-    #[serde(default, rename = "metadata")]
-    _metadata: Option<IgnoredAny>,
+    /// Echoed on the response, as the Responses API does.
+    #[serde(default)]
+    metadata: Option<Value>,
     #[serde(default, rename = "client_metadata")]
     _client_metadata: Option<IgnoredAny>,
     #[serde(default, rename = "safety_identifier")]
@@ -425,6 +426,8 @@ struct EventStream<'a> {
     writer: Option<BufWriter<Connection>>,
     sequence: u64,
     id: &'a str,
+    /// The in-progress `Response` that `response.created` and a failure carry.
+    envelope: Value,
     /// Whether the reasoning item streamed live.
     live_reasoning: bool,
     /// The message item's output index, once its text began to stream.
@@ -445,7 +448,7 @@ impl EventStream<'_> {
             event(
                 &mut writer,
                 &mut self.sequence,
-                json!({"type":"response.created","response":{"id":self.id,"object":"response","status":"in_progress","output":[]}}),
+                json!({"type":"response.created","response":self.envelope}),
             )?;
             self.writer = Some(writer);
         }
@@ -489,7 +492,7 @@ impl EventStream<'_> {
                     let index = usize::from(self.live_reasoning);
                     self.live_message = Some(index);
                     self.emit(json!({"type":"response.output_item.added","output_index":index,"item":{"id":item_id,"type":"message","role":"assistant","status":"in_progress","content":[]}}))?;
-                    self.emit(json!({"type":"response.content_part.added","item_id":item_id,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}))?;
+                    self.emit(json!({"type":"response.content_part.added","item_id":item_id,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}))?;
                     index
                 };
                 // Per-token logprobs arrive on `response.output_text.done`.
@@ -555,6 +558,7 @@ pub(crate) fn respond(
         writer: None,
         sequence: 0,
         id,
+        envelope: envelope(parsed, id, unix_now()),
         live_reasoning: false,
         live_message: None,
     };
@@ -580,21 +584,21 @@ pub(crate) fn respond(
                 ),
                 ChatGenerationError::Message(message) => ("generation_failed", message),
             };
-            return stream.emit(
-                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":code,"message":message}}}),
-            );
+            let failure = failed(&stream.envelope, code, &message);
+            return stream.emit(failure);
         }
     };
     record_usage(&generated);
     let response = match response_value(parsed, &controls, &generated, id) {
         Ok(mut response) => {
+            // One creation time across the stream's events.
+            response["created_at"] = stream.envelope["created_at"].clone();
             echo_request_id(&mut response, request_id.as_deref());
             response
         }
         Err(error) => {
-            return stream.emit(
-                json!({"type":"response.failed","response":{"id":id,"status":"failed","error":{"code":"invalid_model_output","message":error}}}),
-            );
+            let failure = failed(&stream.envelope, "invalid_model_output", &error);
+            return stream.emit(failure);
         }
     };
     for (index, item) in response["output"]
@@ -634,7 +638,7 @@ pub(crate) fn respond(
                     json!({"type":"response.output_item.added","output_index":index,"item":{"id":item["id"],"type":"message","role":"assistant","status":"in_progress","content":[]}}),
                 )?;
                 stream.emit(
-                    json!({"type":"response.content_part.added","item_id":item["id"],"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
+                    json!({"type":"response.content_part.added","item_id":item["id"],"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}),
                 )?;
                 stream.emit(
                     json!({"type":"response.output_text.delta","item_id":item["id"],"output_index":index,"content_index":0,"delta":part["text"],"logprobs":[]}),
@@ -716,6 +720,64 @@ pub(crate) fn assistant_turn(
     Ok(turn)
 }
 
+/// The `Response` fields a reply carries before any output, filled from the
+/// request. The `OpenAPI` document (<https://github.com/openai/openai-openapi>
+/// at 8f5077ae70efcd2755a24d4df3c705de26ce84d2, schema `Response`) requires
+/// `id`, `object`, `created_at`, `error`, `incomplete_details`,
+/// `instructions`, `model`, `tools`, `output`, `parallel_tool_calls`,
+/// `metadata`, `tool_choice`, `temperature`, `top_p` and `access_programs`;
+/// the nullable ones are null here only when the request set nothing.
+/// `parallel_tool_calls` is true because a turn may carry several calls
+/// whatever the request asked, and `access_programs` is always null. Echoed
+/// function tools get `strict: null` when the request left it out, since
+/// `FunctionTool` requires the key.
+fn envelope(request: &Request, id: &str, created_at: u64) -> Value {
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| {
+            let mut tool = tool.clone();
+            if let Some(fields) = tool.as_object_mut() {
+                fields.entry("strict").or_insert(Value::Null);
+            }
+            tool
+        })
+        .collect();
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": created_at,
+        "status": "in_progress",
+        "model": request.model,
+        "output": [],
+        "error": null,
+        "incomplete_details": null,
+        "instructions": request.instructions,
+        "tools": tools,
+        "tool_choice": request.tool_choice.clone().unwrap_or_else(|| json!("auto")),
+        "parallel_tool_calls": true,
+        "metadata": request.metadata,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "access_programs": null,
+        "usage": null,
+    })
+}
+
+/// `envelope` for a failed reply, with a `ResponseError` code and message.
+fn failed(envelope: &Value, code: &str, message: &str) -> Value {
+    let mut response = envelope.clone();
+    response["status"] = json!("failed");
+    response["error"] = json!({"code": code, "message": message});
+    json!({"type": "response.failed", "response": response})
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 fn response_value(
     request: &Request,
     controls: &GenerationControls,
@@ -728,24 +790,44 @@ fn response_value(
         calls,
         complete,
     } = assistant_turn(&tools(request)?, generated)?;
+    let reasoned = !reasoning.is_empty();
     let mut output = Vec::new();
     if !reasoning.is_empty() {
         output.push(json!({"id":format!("rs_{id}"),"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":reasoning}]}));
     }
     if calls.is_empty() || !text.trim().is_empty() {
-        let mut part = json!({"type":"output_text","text":text,"annotations":[]});
-        if controls.top_logprobs.is_some() {
-            part["logprobs"] = logprobs_value(&generated.logprobs);
-        }
+        // `OutputTextContent` requires `logprobs`; it is empty unless asked for.
+        let logprobs = if controls.top_logprobs.is_some() {
+            logprobs_value(&generated.logprobs)
+        } else {
+            json!([])
+        };
+        let part = json!({"type":"output_text","text":text,"annotations":[],"logprobs":logprobs});
         output.push(json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","status":if complete {"completed"} else {"incomplete"},"content":[part]}));
     }
     for (index, call) in calls.into_iter().enumerate() {
         output.push(json!({"type":"function_call","id":format!("fc_{id}_{index}"),"call_id":format!("call_{id}_{index}"),"name":call.name,"arguments":call.arguments.to_string(),"status":"completed"}));
     }
-    let mut response = json!({"id":id,"object":"response","model":request.model,"status":if complete {"completed"} else {"incomplete"},"output":output,"incomplete_details":if complete {Value::Null} else {json!({"reason":"max_output_tokens"})},"usage":{"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()},"metrics":generated.metrics});
+    let mut response = envelope(request, id, unix_now());
+    response["status"] = json!(if complete { "completed" } else { "incomplete" });
+    response["output"] = json!(output);
+    if !complete {
+        response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+    }
+    response["usage"] = json!({"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()});
     response["usage"]["input_tokens_details"]["cached_tokens"] =
         generated.metrics.cached_prompt_tokens.into();
+    // `ResponseUsage` requires output_tokens_details.reasoning_tokens. A turn
+    // without reasoning has none; with reasoning the count is not tracked
+    // per token yet, so the detail is left out rather than guessed.
+    if !reasoned {
+        response["usage"]["output_tokens_details"] = json!({"reasoning_tokens": 0});
+    }
+    response["metrics"] = json!(generated.metrics);
     if let Some(sampling) = &generated.sampling {
+        // The values the turn used, which may come from generation_config.json.
+        response["temperature"] = json!(sampling.temperature);
+        response["top_p"] = json!(sampling.top_p);
         response["metallix"] = json!({ "sampling": sampling });
     }
     Ok(response)
@@ -1021,6 +1103,97 @@ mod tests {
         }
     }
 
+    /// The fields the `OpenAPI` `Response`, `ResponseUsage` and
+    /// `OutputTextContent` schemas require (openai-openapi 8f5077ae), filled
+    /// from the request where it set them.
+    #[test]
+    fn responses_carry_every_field_the_published_schema_requires() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        let request = request_with(&json!({
+            "instructions": "be brief",
+            "metadata": {"run": "7"},
+            "tools": [tool.clone()],
+            "temperature": 0.0,
+        }))
+        .unwrap();
+        let response = response_value(
+            &request,
+            &controls(&request).unwrap(),
+            &generation("hi"),
+            "t",
+        )
+        .unwrap();
+        for field in [
+            "access_programs",
+            "id",
+            "object",
+            "created_at",
+            "error",
+            "incomplete_details",
+            "instructions",
+            "model",
+            "tools",
+            "output",
+            "parallel_tool_calls",
+            "metadata",
+            "tool_choice",
+            "temperature",
+            "top_p",
+        ] {
+            assert!(response.get(field).is_some(), "Response.{field} is missing");
+        }
+        assert_eq!(response["instructions"], "be brief");
+        assert_eq!(response["metadata"], json!({"run": "7"}));
+        let mut echoed = tool.clone();
+        echoed["strict"] = Value::Null;
+        assert_eq!(
+            response["tools"],
+            json!([echoed]),
+            "FunctionTool requires strict"
+        );
+        assert_eq!(response["tool_choice"], "auto");
+        assert!(response["created_at"].as_u64().unwrap() > 1_700_000_000);
+        assert!(response["error"].is_null());
+        let usage = &response["usage"];
+        for field in [
+            "input_tokens",
+            "input_tokens_details",
+            "output_tokens",
+            "output_tokens_details",
+            "total_tokens",
+        ] {
+            assert!(
+                usage.get(field).is_some(),
+                "ResponseUsage.{field} is missing"
+            );
+        }
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
+        let part = &response["output"][0]["content"][0];
+        assert_eq!(part["logprobs"], json!([]), "OutputTextContent.logprobs");
+
+        let bare = request_with(&json!({})).unwrap();
+        let envelope = envelope(&bare, "t", 1);
+        for field in [
+            "instructions",
+            "metadata",
+            "temperature",
+            "top_p",
+            "access_programs",
+        ] {
+            assert!(
+                envelope[field].is_null(),
+                "{field} is null when the request set nothing"
+            );
+        }
+        assert_eq!(envelope["tools"], json!([]));
+        let failure = failed(&envelope, "server_error", "boom");
+        assert_eq!(failure["response"]["status"], "failed");
+        assert_eq!(
+            failure["response"]["error"],
+            json!({"code": "server_error", "message": "boom"})
+        );
+    }
+
     fn generation(text: &str) -> crate::chat_generation::ChatGeneration {
         generation_ending(text, ChatFinishReason::Eos)
     }
@@ -1123,11 +1296,8 @@ mod tests {
         assert_eq!(response["output"][0]["type"], "reasoning");
         assert_eq!(response["output"][0]["content"][0]["text"], "add");
         assert_eq!(response["output"][1]["content"][0]["text"], "4");
-        assert!(
-            response["output"][1]["content"][0]
-                .get("logprobs")
-                .is_none()
-        );
+        // `OutputTextContent` requires the key; it is empty unless asked for.
+        assert_eq!(response["output"][1]["content"][0]["logprobs"], json!([]));
 
         let request = request_with(&json!({"top_logprobs":1,"temperature":1.0})).unwrap();
         let mut generated = generation("hi");
