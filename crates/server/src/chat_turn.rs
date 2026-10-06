@@ -19,7 +19,7 @@
 use std::{path::Path, time::Instant};
 
 use chat_format::{ChatFormat, QwenIncrementalDecode, TokenClass, TokenId};
-use qwen::forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3TokenPicks};
+use qwen::forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
 
 use super::{
     AppliedSampling, ChatFinishReason, ChatGenerationError, ChatRequest, GenerationDeadline,
@@ -244,6 +244,30 @@ impl TurnLoop {
             }
         };
         Ok((self.accept(format, token, false, receipt)?, gpu_token))
+    }
+
+    /// Whether a speculative verify may take the GPU's argmax of each
+    /// verified row as this turn's pick: a plain greedy turn without
+    /// logprobs or suppression, whose GPU rule reads back only token IDs.
+    pub(crate) fn verifies_with_gpu_greedy(&self, format: &ChatFormat) -> bool {
+        self.gpu_rule(format, 0).is_some_and(|rule| {
+            matches!(rule.selection, Qwen3Selection::Greedy) && rule.candidates == 0
+        })
+    }
+
+    /// Accepts the GPU's greedy pick from a verified row, for turns where
+    /// [`Self::verifies_with_gpu_greedy`] holds; any other turn must pick
+    /// from the row with [`Self::pick`].
+    pub(crate) fn accept_gpu_greedy(
+        &mut self,
+        format: &ChatFormat,
+        gpu_token: i32,
+    ) -> Result<Accepted, String> {
+        let token = self
+            .picker
+            .pick_from_candidates(gpu_token, None)?
+            .ok_or("only a greedy turn can accept a GPU pick without candidates")?;
+        self.accept(format, token, false, None)
     }
 
     /// The `top_logprobs` to record for `token`: only ordinary text tokens

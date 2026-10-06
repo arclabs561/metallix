@@ -282,6 +282,7 @@ pub(crate) mod test_support {
                     prompt_tokens: self.prompt_tokens,
                     cached_prompt_tokens: self.cached_prompt_tokens,
                     generated_tokens,
+                    speculation: None,
                 },
                 logprobs: Vec::new(),
                 sampling: None,

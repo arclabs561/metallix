@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use engine::speculative::{SpeculationRequest, SpeculationStats};
 use qwen::{
     forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks},
     metal::{Qwen3MlxWeights, Qwen3WeightPrecision},
@@ -27,6 +28,8 @@ use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
 
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
+#[path = "qwen_speculation.rs"]
+mod speculation;
 #[path = "chat_turn.rs"]
 mod turn;
 
@@ -35,6 +38,10 @@ pub(crate) use turn::{TurnModel, TurnStart, TurnStep};
 #[cfg(test)]
 #[path = "chat_decode_checkpoint_tests.rs"]
 mod decode_checkpoint;
+
+#[cfg(test)]
+#[path = "chat_speculation_checkpoint_tests.rs"]
+mod speculation_checkpoint;
 
 const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
@@ -148,6 +155,10 @@ pub(crate) struct ChatRequest<'a> {
     /// Treats end-of-turn as an ordinary token, so the turn runs to
     /// `max_tokens` (vLLM's `ignore_eos`, for equal-length benchmarks).
     pub(crate) ignore_eos: bool,
+    /// Whether decode may verify prompt-lookup drafts several tokens at a
+    /// time. Greedy output is the plain greedy output up to floating-point
+    /// near-ties; sampled output keeps the sampling distribution.
+    pub(crate) speculation: SpeculationRequest,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -165,6 +176,7 @@ impl<'a> ChatRequest<'a> {
             json_schema: None,
             cache_salt: None,
             ignore_eos: false,
+            speculation: SpeculationRequest::Automatic,
         }
     }
 
@@ -314,6 +326,32 @@ pub(crate) struct GenerationControls {
     pub(crate) json_schema: Option<Value>,
     /// See [`ChatRequest::ignore_eos`].
     pub(crate) ignore_eos: bool,
+    /// See [`ChatRequest::speculation`].
+    pub(crate) speculation: SpeculationRequest,
+}
+
+/// The `speculation` request field, a metallix extension shared by every
+/// HTTP adapter. Unknown strings fail deserialization with the allowed values.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SpeculationField {
+    /// Speculate while this is the only request the model is decoding.
+    #[default]
+    Auto,
+    /// Speculate even when other requests share the model.
+    On,
+    /// Never speculate.
+    Off,
+}
+
+impl From<SpeculationField> for SpeculationRequest {
+    fn from(field: SpeculationField) -> Self {
+        match field {
+            SpeculationField::Auto => Self::Automatic,
+            SpeculationField::On => Self::Enabled,
+            SpeculationField::Off => Self::Disabled,
+        }
+    }
 }
 
 impl GenerationControls {
@@ -363,6 +401,11 @@ impl GenerationControls {
             if self.ignore_eos {
                 return Err("JSON schema output cannot be combined with ignore_eos".into());
             }
+            // Drafts would have to pass the grammar mask before verification;
+            // automatic speculation simply skips schema turns.
+            if self.speculation == SpeculationRequest::Enabled {
+                return Err("JSON schema output cannot be combined with speculation \"on\"".into());
+            }
             let greedy = self.sampling.temperature == Some(0.0);
             if !greedy && self.sampling.top_p.is_some_and(|top_p| top_p < 1.0) {
                 return Err("JSON schema output cannot be combined with top_p below 1".into());
@@ -392,6 +435,7 @@ impl GenerationControls {
             json_schema: self.json_schema.as_ref(),
             cache_salt: None,
             ignore_eos: self.ignore_eos,
+            speculation: self.speculation,
         }
     }
 }
@@ -445,6 +489,29 @@ pub(crate) struct ChatGenerationMetrics {
     /// Leading prompt tokens restored from the prefix cache, not prefilled.
     pub(crate) cached_prompt_tokens: usize,
     pub(crate) generated_tokens: usize,
+    /// Draft verification counts, present only when a verify step ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) speculation: Option<SpeculationReceipt>,
+}
+
+/// How speculative decoding went in one turn.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct SpeculationReceipt {
+    pub(crate) verify_steps: usize,
+    pub(crate) drafted_tokens: usize,
+    pub(crate) accepted_tokens: usize,
+    pub(crate) acceptance_rate: f64,
+}
+
+impl SpeculationReceipt {
+    fn from_stats(stats: SpeculationStats) -> Option<Self> {
+        Some(Self {
+            verify_steps: stats.verify_steps,
+            drafted_tokens: stats.drafted_tokens,
+            accepted_tokens: stats.accepted_tokens,
+            acceptance_rate: stats.acceptance_rate()?,
+        })
+    }
 }
 
 /// The completed visible text and model-level generation details for one turn.
@@ -774,14 +841,23 @@ impl ChatSession {
         let pipelined = turn.gpu_rule(&self.format, 0).is_some();
         let mut pending: Option<Qwen3TokenPicks> = None;
         let mut last_token_at = Instant::now();
+        // A model worker decodes one request at a time today, so no other
+        // sequence competes for the compute a verify uses, and requests
+        // waiting in the front queue finish sooner when this one does. Once
+        // decode batches requests, pass the batch here.
+        let speculating = request.speculation.allows(0, 0) && request.json_schema.is_none();
+        let gpu_verify = turn.verifies_with_gpu_greedy(&self.format);
+        let lookup = engine::speculative::PromptLookup::default();
+        let mut draft_length = speculation::draft_length();
+        let mut speculation_stats = SpeculationStats::default();
 
-        for step in 0..max_tokens {
+        'decode: for step in 0..max_tokens {
             deadline.check()?;
             let accepted = match pending.take() {
                 Some(current) => {
                     let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
                     let (accepted, gpu_token) = span.in_scope(|| {
-                        if step + 1 < max_tokens {
+                        if turn.generated().len() + 1 < max_tokens as usize {
                             // This step's draw is not committed yet, so the
                             // next step's variate is one draw ahead.
                             let rule = turn.gpu_rule(&self.format, 1).ok_or_else(|| {
@@ -827,6 +903,70 @@ impl ChatSession {
                 break;
             }
 
+            let mut last_token = accepted.token;
+            // Verify drafts back to back while the history keeps proposing
+            // them; decode one token when it does not.
+            while speculating && turn.generated().len() < max_tokens as usize {
+                // Discarding a step already queued ahead costs about one
+                // decode step on top of the verify.
+                let overhead = if pending.is_some() { 1.0 } else { 0.0 };
+                let remaining = max_tokens as usize - turn.generated().len();
+                let limit = draft_length
+                    .next_with_overhead(overhead)
+                    .min(remaining.saturating_sub(1));
+                let mut history = input_ids.clone();
+                history.extend_from_slice(turn.generated());
+                let draft = lookup.propose(&history, limit).to_vec();
+                if draft.is_empty() {
+                    draft_length.idle();
+                    break;
+                }
+                deadline.check()?;
+                if pending.take().is_some() {
+                    // The queued step appended `last_token`; the verify
+                    // scores it together with the draft instead.
+                    executor
+                        .truncate_cached_tokens(executor.cached_tokens() - 1)
+                        .map_err(|error| ChatGenerationError::message(error.to_string()))?;
+                }
+                let span = tracing::info_span!(
+                    "chat.verify_step",
+                    step,
+                    drafted = draft.len(),
+                    accepted = Empty,
+                    decode_ms = Empty
+                );
+                let ((outcome, verified), step_ms) = timed(&span, "decode_ms", || {
+                    speculation::verify(
+                        &self.format,
+                        &mut executor,
+                        &mut turn,
+                        last_token,
+                        &draft,
+                        gpu_verify,
+                    )
+                    .map_err(ChatGenerationError::message)
+                })?;
+                span.record("accepted", outcome.accepted);
+                decode_ms.push(step_ms);
+                draft_length.observe(outcome.drafted, outcome.accepted);
+                speculation_stats.record(&outcome);
+                last_token_at = Instant::now();
+                for verified_token in &verified {
+                    if verified_token.visible {
+                        text.push(&self.format, verified_token.token, on_token)?;
+                    }
+                    if let TurnStep::Stop(reason) = verified_token.step {
+                        finish_reason = reason;
+                        break 'decode;
+                    }
+                }
+                last_token = verified
+                    .last()
+                    .ok_or_else(|| ChatGenerationError::message("a verify emits a token"))?
+                    .token;
+            }
+
             if pipelined && pending.is_none() {
                 // After the prefill token or a rejected GPU draw; later steps
                 // were queued above. Every draw so far is committed.
@@ -836,7 +976,7 @@ impl ChatSession {
                 })?;
                 pending = Some(
                     executor
-                        .decode_picks(accepted.token, &rule)
+                        .decode_picks(last_token, &rule)
                         .map_err(|error| ChatGenerationError::message(error.to_string()))?,
                 );
             } else if !pipelined {
@@ -845,7 +985,7 @@ impl ChatSession {
                 let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
                 let (next, step_ms) = timed(&span, "decode_ms", || {
                     executor
-                        .decode_last_logits(accepted.token)
+                        .decode_last_logits(last_token)
                         .map_err(|error| ChatGenerationError::message(error.to_string()))
                 })?;
                 logits = next;
@@ -893,6 +1033,7 @@ impl ChatSession {
                 prompt_tokens: input_ids.len(),
                 cached_prompt_tokens,
                 generated_tokens,
+                speculation: SpeculationReceipt::from_stats(speculation_stats),
             },
         })
     }
@@ -1250,6 +1391,23 @@ mod tests {
         ChatFormat, ChatTemplate, SpecialTokens,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn speculation_on_refuses_json_schema_output_and_auto_allows_it() {
+        use engine::speculative::SpeculationRequest;
+        let mut controls = super::GenerationControls {
+            json_schema: Some(json!({"type":"object"})),
+            speculation: SpeculationRequest::Enabled,
+            ..super::GenerationControls::default()
+        };
+        let error = controls.validate(false).expect_err("on with a schema");
+        assert!(error.contains("speculation"), "{error}");
+        controls.speculation = SpeculationRequest::Automatic;
+        controls
+            .validate(false)
+            .expect("automatic speculation skips schema turns");
+    }
 
     const TEMPLATE: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
     const MANIFEST: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.manifest.json");

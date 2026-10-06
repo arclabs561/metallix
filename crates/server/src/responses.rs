@@ -27,6 +27,10 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
     pub(crate) model: String,
+    /// Metallix extension: "auto" (default), "on" or "off" for
+    /// prompt-lookup speculative decoding.
+    #[serde(default)]
+    speculation: crate::chat_generation::SpeculationField,
     input: Value,
     #[serde(default)]
     instructions: Option<String>,
@@ -223,6 +227,7 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         reasoning_effort,
         json_schema,
         ignore_eos: request.ignore_eos,
+        speculation: request.speculation.into(),
     };
     controls.validate(!request.tools.is_empty())?;
     Ok(controls)
@@ -914,6 +919,23 @@ mod tests {
             }
         );
         assert_eq!(sampled.max_tokens, Some(4096));
+        assert_eq!(
+            sampled.speculation,
+            engine::speculative::SpeculationRequest::Automatic
+        );
+        for (field, expected) in [
+            ("auto", engine::speculative::SpeculationRequest::Automatic),
+            ("on", engine::speculative::SpeculationRequest::Enabled),
+            ("off", engine::speculative::SpeculationRequest::Disabled),
+        ] {
+            let parsed = controls(&request_with(&json!({"speculation":field})).unwrap()).unwrap();
+            assert_eq!(parsed.speculation, expected, "{field}");
+        }
+        let Err(unknown) = request_with(&json!({"speculation":"maybe"})) else {
+            panic!("unknown speculation mode must not parse");
+        };
+        let unknown = unknown.to_string();
+        assert!(unknown.contains("`auto`, `on`, `off`"), "{unknown}");
         assert!(!sampled.ignore_eos);
         let ignoring = controls(&request_with(&json!({"ignore_eos":true})).unwrap()).unwrap();
         assert!(ignoring.ignore_eos);
@@ -996,6 +1018,7 @@ mod tests {
                 prompt_tokens: 1,
                 cached_prompt_tokens: 0,
                 generated_tokens: 2,
+                speculation: None,
             },
             logprobs: Vec::new(),
             sampling: None,

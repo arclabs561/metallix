@@ -27,6 +27,10 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub(crate) struct Request {
     pub(crate) model: String,
+    /// Metallix extension: "auto" (default), "on" or "off" for
+    /// prompt-lookup speculative decoding.
+    #[serde(default)]
+    speculation: crate::chat_generation::SpeculationField,
     max_tokens: u32,
     messages: Vec<Value>,
     #[serde(default)]
@@ -215,6 +219,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         reasoning_effort,
         json_schema,
         ignore_eos: request.ignore_eos,
+        speculation: request.speculation.into(),
     };
     controls.validate(has_tools)?;
     Ok(controls)

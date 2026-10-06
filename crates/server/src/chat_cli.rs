@@ -327,6 +327,7 @@ mod tests {
                     prompt_tokens: 0,
                     cached_prompt_tokens: 0,
                     generated_tokens: 0,
+                    speculation: None,
                 },
                 logprobs: Vec::new(),
                 sampling: None,
