@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal"]
+metal = ["qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook"]
 structured-output = ["dep:engine", "engine/structured-output"]
 # Chrome/Perfetto JSON timeline behind `--trace-out`.
 timeline = ["dep:tracing-chrome"]
@@ -39,6 +39,8 @@ tokenizers = { version = "0.22.2", default-features = false, features = ["onig"]
 httparse = { version = "=1.10.1", optional = true }
 jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 rustix = { version = "=1.1.4", features = ["fs"], optional = true }
+# Stops `mx serve` on SIGTERM/SIGINT with its telemetry written.
+signal-hook = { version = "=0.4.4", default-features = false, features = ["iterator"], optional = true }
 mlx-rs = { workspace = true, optional = true }
 mlx-sys = { version = "=0.6.0", optional = true }
 tracing.workspace = true
