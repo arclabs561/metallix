@@ -745,6 +745,87 @@ mod tests {
         );
     }
 
+    /// Typed messages from a transformers fixture's OpenAI-shaped ones. A tool
+    /// result takes its function name from the call it answers, as the
+    /// protocols resolve it.
+    fn fixture_messages(values: &[Value]) -> Vec<ChatMessage> {
+        let mut names = std::collections::HashMap::new();
+        values
+            .iter()
+            .map(|value| {
+                let content = value["content"].as_str().unwrap_or_default();
+                match value["role"].as_str().expect("role") {
+                    "system" => ChatMessage::text(ChatRole::System, content),
+                    "user" => ChatMessage::text(ChatRole::User, content),
+                    "tool" => {
+                        let id = value["tool_call_id"].as_str().unwrap_or("call_0");
+                        ChatToolResult {
+                            tool_call_id: id.to_owned(),
+                            name: names.get(id).cloned(),
+                            content: content.to_owned(),
+                        }
+                        .into_message()
+                    }
+                    _ => {
+                        let mut message = ChatMessage::text(ChatRole::Assistant, content);
+                        for call in value["tool_calls"].as_array().into_iter().flatten() {
+                            let name = call["function"]["name"].as_str().expect("name");
+                            if let Some(id) = call["id"].as_str() {
+                                names.insert(id.to_owned(), name.to_owned());
+                            }
+                            message.tool_calls.push(ChatToolCall {
+                                name: name.to_owned(),
+                                arguments: call["function"]["arguments"].clone(),
+                            });
+                        }
+                        message
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn render_case(template: &ChatTemplate, case: &Value) -> String {
+        let messages = fixture_messages(case["messages"].as_array().expect("messages"));
+        let tools: Vec<Value> = case["tools"].as_array().cloned().unwrap_or_default();
+        let conversation = Conversation {
+            messages: &messages,
+            tools: &tools,
+            enable_thinking: case["enable_thinking"].as_bool().unwrap_or(false),
+            reasoning_effort: None,
+        };
+        template.render(conversation, true).expect("renders")
+    }
+
+    /// gemma-4-12B-it's template, rendered from typed messages, equals
+    /// transformers' rendering for all six reference prompts: a lone user
+    /// turn, history, Unicode, thinking, a tool declaration, and a call with
+    /// its OpenAI-style tool result.
+    #[test]
+    fn gemma4_template_matches_transformers_rendering() {
+        const TEMPLATE: &str = include_str!("../../../fixtures/gemma-4-12b/chat-template.jinja");
+        let reference: Value =
+            serde_json::from_str(include_str!("../../../fixtures/gemma-4-12b/reference.json"))
+                .expect("fixture JSON");
+        let template = ChatTemplate::parse(
+            TEMPLATE.to_owned(),
+            SpecialTokens::spelled(Some("<bos>"), Some("<eos>")),
+        )
+        .expect("Gemma 4 template parses");
+        let cases = reference["templates"].as_array().expect("templates");
+        assert_eq!(cases.len(), 6);
+        for case in cases {
+            let rendered = render_case(&template, case);
+            assert!(rendered.starts_with("<bos><|turn>"), "{}", case["name"]);
+            assert_eq!(
+                rendered,
+                case["rendered"].as_str().expect("rendered"),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     /// The `MiniCPM5` template, rendered with its special tokens from typed
     /// messages, equals transformers' `apply_chat_template` byte for byte,
     /// leading `<s>` included (fixture from `scripts/minicpm5-reference.py`).
@@ -766,35 +847,6 @@ mod tests {
                 .as_str()
                 .expect("hash")
         );
-        let message = |value: &Value| -> ChatMessage {
-            let content = value["content"].as_str().unwrap_or_default();
-            match value["role"].as_str().expect("role") {
-                "system" => ChatMessage::text(ChatRole::System, content),
-                "user" => ChatMessage::text(ChatRole::User, content),
-                "tool" => ChatToolResult {
-                    tool_call_id: String::from("call_0"),
-                    name: None,
-                    content: content.to_owned(),
-                }
-                .into_message(),
-                _ => ChatMessage {
-                    role: ChatRole::Assistant,
-                    content: content.to_owned(),
-                    reasoning_content: None,
-                    tool_calls: value["tool_calls"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|call| ChatToolCall {
-                            name: call["function"]["name"].as_str().expect("name").to_owned(),
-                            arguments: call["function"]["arguments"].clone(),
-                        })
-                        .collect(),
-                    tool_call_id: None,
-                    name: None,
-                },
-            }
-        };
         // The logit case `chat_user` plus the render-only cases.
         let chat_user = &fixture["cases"][2];
         assert_eq!(chat_user["name"], "chat_user");
@@ -812,20 +864,7 @@ mod tests {
         );
         assert_eq!(cases.len(), 5);
         for case in &cases {
-            let messages: Vec<ChatMessage> = case["messages"]
-                .as_array()
-                .expect("messages")
-                .iter()
-                .map(message)
-                .collect();
-            let tools: Vec<Value> = case["tools"].as_array().cloned().unwrap_or_default();
-            let conversation = Conversation {
-                messages: &messages,
-                tools: &tools,
-                enable_thinking: case["enable_thinking"].as_bool().unwrap_or(false),
-                reasoning_effort: None,
-            };
-            let rendered = template.render(conversation, true).expect("renders");
+            let rendered = render_case(&template, case);
             assert!(rendered.starts_with("<s>"), "{}", case["name"]);
             assert_eq!(
                 rendered,
