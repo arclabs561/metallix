@@ -227,6 +227,29 @@ class Summaries(unittest.TestCase):
         )
 
 
+class Unmeasured(unittest.TestCase):
+    def test_an_all_refused_campaign_says_why(self) -> None:
+        arms = [
+            {"skipped": "not idle: 1-min load 16.25 >= 2"},
+            {"skipped": "not idle: running: cargo"},
+            {"result": {"aborted": "GPU memory 30.0 GiB rose above 24 GiB"}},
+            {"result": {"error": "metallix exited with 1"}},
+            {"result": {"summary": {}}},
+        ]
+        lines = bench_campaign.unmeasured_arms(arms)
+        self.assertEqual(
+            lines,
+            [
+                "2/5 arms skipped; first: not idle: 1-min load 16.25 >= 2",
+                "1/5 arms aborted; first: GPU memory 30.0 GiB rose above 24 GiB",
+                "1/5 arms not measured; first: metallix exited with 1",
+            ],
+        )
+        summary = bench_campaign.summarize_rows([])
+        summary["unmeasured"] = lines
+        self.assertIn("no numbers: 2/5 arms skipped", bench_campaign.render(summary))
+
+
 class StubEndToEnd(unittest.TestCase):
     def test_measure_a_fresh_stub_server(self) -> None:
         logs = tempfile.TemporaryDirectory()

@@ -300,6 +300,24 @@ def rows_from_load_report(report: dict, name: str) -> list[dict]:
     return rows
 
 
+def unmeasured_arms(arms: list[dict]) -> list[str]:
+    """Counts of arms with no numbers (skipped by the idle gate, aborted, or
+    failed to start), each with its first reason, so an empty table says why."""
+    kinds: dict[str, list[str]] = {}
+    for arm in arms:
+        result = arm.get("result") or {}
+        if "skipped" in arm:
+            kinds.setdefault("skipped", []).append(arm["skipped"])
+        elif result.get("aborted"):
+            kinds.setdefault("aborted", []).append(result["aborted"])
+        elif result.get("error"):
+            kinds.setdefault("not measured", []).append(result["error"])
+    return [
+        f"{len(reasons)}/{len(arms)} arms {kind}; first: {reasons[0]}"
+        for kind, reasons in kinds.items()
+    ]
+
+
 def summarize_rows(rows: list[dict], subject: str = SUBJECT) -> dict:
     """Per-cell statistics, claims against each competitor, and warnings."""
     cells: dict[tuple, dict[str, list[dict]]] = {}
@@ -409,6 +427,7 @@ def render(summary: dict) -> str:
                 if name in METRICS
             ) + ("" if claims["claim_grade"] else "; NOT CLAIM-GRADE")
             lines.append(f"{'':<23} {summary['subject']} vs {engine}: {verdicts}")
+    lines += [f"no numbers: {line}" for line in summary.get("unmeasured", [])]
     lines += [f"warning: {warning}" for warning in summary["warnings"]]
     return "\n".join(lines)
 
@@ -418,14 +437,19 @@ def render(summary: dict) -> str:
 
 
 def summarize_files(paths: list[Path], subject: str) -> int:
-    rows = []
+    rows, unmeasured = [], []
     for path in paths:
         report = json.loads(path.read_text())
         if "arms" in report:
             rows += rows_from_campaign(report)
+            unmeasured += [
+                f"{path.name}: {line}" for line in unmeasured_arms(report["arms"])
+            ]
         else:
             rows += rows_from_load_report(report, path.name)
-    print(render(summarize_rows(rows, subject)))
+    summary = summarize_rows(rows, subject)
+    summary["unmeasured"] = unmeasured
+    print(render(summary))
     return 0
 
 
@@ -521,6 +545,7 @@ def main() -> int:
     finally:
         # Keep whatever was measured if the run is interrupted.
         report["summary"] = summarize_rows(rows_from_campaign(report), args.subject)
+        report["summary"]["unmeasured"] = unmeasured_arms(arms)
         if args.json:
             args.json.parent.mkdir(parents=True, exist_ok=True)
             args.json.write_text(json.dumps(report, indent=1) + "\n")
