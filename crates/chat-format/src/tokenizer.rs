@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 
 const MAX_TOKENIZER_BYTES: usize = 64 * 1024 * 1024;
+/// A prompt piece's IDs, and its byte length and ID count up to the end of
+/// its last special added token.
+pub(crate) type PieceIds = (Vec<i32>, Option<(usize, usize)>);
+
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 
 /// A locally loaded tokenizer whose checkpoint-configured padding and
@@ -123,9 +127,33 @@ impl QwenTokenizer {
     }
 
     /// Encodes one piece of a prompt; added-token spellings become their
-    /// tokens. Empty text has no IDs.
-    pub fn encode_piece(&self, text: &str) -> Result<Vec<i32>, String> {
-        token_ids(&self.tokenizer, text)
+    /// tokens. Empty text has no IDs. Also returns the byte length and ID
+    /// count of the piece up to the end of its last special added token:
+    /// added tokens split the input before the model reads it, so the IDs
+    /// after that point do not depend on the text before it.
+    pub(crate) fn encode_piece(&self, text: &str) -> Result<PieceIds, String> {
+        if text.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|_| String::from("prompt could not be encoded by local tokenizer"))?;
+        let added = self.tokenizer.get_added_tokens_decoder();
+        let split = encoding
+            .get_ids()
+            .iter()
+            .rposition(|id| added.get(id).is_some_and(|token| token.special))
+            .map(|index| (encoding.get_offsets()[index].1, index + 1));
+        let ids = encoding
+            .get_ids()
+            .iter()
+            .map(|&token_id| {
+                i32::try_from(token_id)
+                    .map_err(|_| String::from("tokenizer token ID does not fit server token IDs"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok((ids, split))
     }
 
     /// Encodes `text` as ordinary text, so an added token's spelling never

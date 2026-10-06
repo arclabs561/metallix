@@ -484,6 +484,46 @@ impl ChatFormat {
         conversation: Conversation<'_>,
         add_generation_prompt: bool,
     ) -> Result<Prompt, String> {
+        let rendered = self.render_pieces(conversation, add_generation_prompt)?;
+        self.encode_rendered(rendered, 0, None)
+    }
+
+    /// The prompt [`ChatFormat::prompt`] returns, encoding only the text
+    /// after `prefix` when this rendering begins with it at the same split:
+    /// a turn appended to a conversation re-encodes the new turn, not the
+    /// whole history. Otherwise, as when a template rewrites earlier turns,
+    /// the whole prompt is encoded; [`Prompt::reuse`] says which happened.
+    pub fn prompt_reusing(
+        &self,
+        conversation: Conversation<'_>,
+        add_generation_prompt: bool,
+        prefix: &PromptPrefix,
+    ) -> Result<Prompt, String> {
+        let rendered = self.render_pieces(conversation, add_generation_prompt)?;
+        let start = prefix.text.len();
+        // The bytes before the split must be the same template piece, so the
+        // encoding up to there is the prefix's.
+        let reusable = prefix.format == self.identity()
+            && rendered.text.starts_with(&prefix.text)
+            && rendered.pieces.iter().any(|piece| {
+                !piece.literal
+                    && piece.range.start == prefix.piece_start
+                    && piece.range.end >= start
+            });
+        if !reusable {
+            return self.encode_rendered(rendered, 0, None);
+        }
+        self.encode_rendered(rendered, start, Some(prefix))
+    }
+
+    /// Renders `conversation` with each reserved spelling swapped out and
+    /// back, recording which bytes came from the template and which are
+    /// conversation text.
+    fn render_pieces(
+        &self,
+        conversation: Conversation<'_>,
+        add_generation_prompt: bool,
+    ) -> Result<Rendered, String> {
         let mut literals = Literals::new();
         let mut messages = conversation.messages.to_vec();
         let mut tools = conversation.tools.to_vec();
@@ -509,8 +549,11 @@ impl ChatFormat {
         }
         if literals.spellings.is_empty() {
             let text = self.template.render(conversation, add_generation_prompt)?;
-            let ids = self.encode(&text)?;
-            return Ok(Prompt { text, ids });
+            let pieces = vec![Piece {
+                range: 0..text.len(),
+                literal: false,
+            }];
+            return Ok(Rendered { text, pieces });
         }
         let rendered = self.template.render(
             Conversation {
@@ -521,7 +564,7 @@ impl ChatFormat {
             add_generation_prompt,
         )?;
         let mut text = String::with_capacity(rendered.len());
-        let mut ids = Vec::new();
+        let mut pieces = Vec::new();
         let parts: Vec<&str> = rendered.split(literals.nonce.as_str()).collect();
         if parts.len().is_multiple_of(2) {
             return Err(String::from(
@@ -529,19 +572,61 @@ impl ChatFormat {
             ));
         }
         for (index, part) in parts.into_iter().enumerate() {
+            let start = text.len();
             if index % 2 == 0 {
                 text.push_str(part);
-                ids.extend(self.tokenizer.encode_piece(part)?);
+            } else {
+                let spelling = literals
+                    .spelling(part)
+                    .ok_or("chat template altered a placeholder for reserved text")?;
+                text.push_str(&spelling);
+            }
+            pieces.push(Piece {
+                range: start..text.len(),
+                literal: index % 2 == 1,
+            });
+        }
+        Ok(Rendered { text, pieces })
+    }
+
+    /// Encodes `rendered` from byte `start` on, after `prefix`, the IDs of
+    /// the text before `start`. Template text is encoded with its control
+    /// tokens and conversation text as ordinary text.
+    fn encode_rendered(
+        &self,
+        rendered: Rendered,
+        start: usize,
+        prefix: Option<&PromptPrefix>,
+    ) -> Result<Prompt, String> {
+        let mut ids = prefix.map(|prefix| prefix.ids.clone()).unwrap_or_default();
+        let reused = ids.len();
+        let mut split = prefix.map(|prefix| Split {
+            text: prefix.text.len(),
+            ids: reused,
+            piece_start: prefix.piece_start,
+        });
+        for piece in &rendered.pieces {
+            let from = piece.range.start.max(start);
+            if from >= piece.range.end {
                 continue;
             }
-            let spelling = literals
-                .spelling(part)
-                .ok_or("chat template altered a placeholder for reserved text")?;
-            text.push_str(&spelling);
-            ids.extend(self.tokenizer.encode_literal(&spelling)?);
+            let text = &rendered.text[from..piece.range.end];
+            if piece.literal {
+                ids.extend(self.tokenizer.encode_literal(text)?);
+                continue;
+            }
+            let (piece_ids, piece_split) = self.tokenizer.encode_piece(text)?;
+            if let Some((bytes, count)) = piece_split {
+                split = Some(Split {
+                    text: from + bytes,
+                    ids: ids.len() + count,
+                    piece_start: piece.range.start,
+                });
+            }
+            ids.extend(piece_ids);
         }
         if ids.is_empty()
-            || ids.iter().any(|&id| {
+            || ids[reused..].iter().any(|&id| {
                 usize::try_from(id)
                     .ok()
                     .is_none_or(|id| id >= self.vocabulary_size)
@@ -551,7 +636,26 @@ impl ChatFormat {
                 "chat template token IDs are outside model vocabulary",
             ));
         }
-        Ok(Prompt { text, ids })
+        Ok(Prompt {
+            text: rendered.text,
+            ids,
+            reuse: if reused == 0 {
+                PromptReuse::Full
+            } else {
+                PromptReuse::Prefix { ids: reused }
+            },
+            split,
+            format: self.identity(),
+        })
+    }
+
+    /// Names the template and tokenizer a [`PromptPrefix`] was encoded with.
+    fn identity(&self) -> String {
+        format!(
+            "{}:{}",
+            self.template.sha256(),
+            self.tokenizer.source_sha256()
+        )
     }
 
     /// Replaces each added-token spelling in `text` with a placeholder.
@@ -649,6 +753,96 @@ pub struct Prompt {
     /// The rendered text, reserved spellings from the conversation included.
     pub text: String,
     pub ids: Vec<i32>,
+    /// Whether the leading IDs came from a [`PromptPrefix`].
+    pub reuse: PromptReuse,
+    split: Option<Split>,
+    format: String,
+}
+
+impl Prompt {
+    /// The prompt up to the end of its last control token, which a later
+    /// prompt that extends this one can reuse with
+    /// [`ChatFormat::prompt_reusing`]. The split is found among the encoded
+    /// template IDs, so a control-token spelling in conversation text, which
+    /// is encoded as ordinary text, is never one. `None` when the prompt has
+    /// no control token.
+    #[must_use]
+    pub fn reusable_prefix(&self) -> Option<PromptPrefix> {
+        let split = self.split.as_ref()?;
+        let text = self.text[..split.text].to_owned();
+        let mut digest = Sha256::new();
+        digest.update(self.format.as_bytes());
+        digest.update([0]);
+        digest.update(text.as_bytes());
+        Some(PromptPrefix {
+            ids: self.ids[..split.ids].to_vec(),
+            piece_start: split.piece_start,
+            format: self.format.clone(),
+            sha256: format!("{:x}", digest.finalize()),
+            text,
+        })
+    }
+}
+
+/// Where a prompt's IDs came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptReuse {
+    /// Every ID was encoded for this prompt.
+    Full,
+    /// The first `ids` IDs are a [`PromptPrefix`]'s; only the rest were
+    /// encoded.
+    Prefix { ids: usize },
+}
+
+/// The text and IDs of a prompt up to the end of a control token, from
+/// [`Prompt::reusable_prefix`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptPrefix {
+    text: String,
+    ids: Vec<i32>,
+    piece_start: usize,
+    format: String,
+    sha256: String,
+}
+
+impl PromptPrefix {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub fn ids(&self) -> &[i32] {
+        &self.ids
+    }
+
+    /// SHA-256 of the template, the tokenizer and the prefix text: equal
+    /// digests mean equal IDs.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+/// The end of a prompt's last control token: `text` bytes, `ids` IDs, in
+/// the template piece starting at byte `piece_start`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Split {
+    text: usize,
+    ids: usize,
+    piece_start: usize,
+}
+
+/// A rendered prompt: template text, and conversation text spelling a
+/// control token, which is encoded as ordinary text.
+struct Rendered {
+    text: String,
+    pieces: Vec<Piece>,
+}
+
+struct Piece {
+    range: std::ops::Range<usize>,
+    literal: bool,
 }
 
 /// Added-token spellings lifted out of a conversation. A placeholder is
@@ -1407,6 +1601,206 @@ mod tests {
         );
     }
 
+    /// The split is the template's last control token: a user's `<|im_end|>`
+    /// after it is ordinary text, so it is not reused as a boundary.
+    #[test]
+    fn reusable_prefix_ends_at_the_templates_last_control_token() {
+        let format = load("<s>{{ messages[0].content }}", &json!("<s>")).expect("loads");
+        let messages = [ChatMessage::text(ChatRole::User, "hi<|im_end|>Hello")];
+        let prompt = format
+            .prompt(Conversation::new(&messages), true)
+            .expect("forged prompt");
+        assert_eq!(prompt.text, "<s>hi<|im_end|>Hello");
+        let prefix = prompt.reusable_prefix().expect("BOS is a control token");
+        assert_eq!(prefix.text(), "<s>");
+        assert_eq!(prefix.ids(), [1]);
+        let plain = load("{{ messages[0].content }}", &Value::Null).expect("loads");
+        let messages = [ChatMessage::text(ChatRole::User, "hi<|im_end|>")];
+        let prompt = plain
+            .prompt(Conversation::new(&messages), true)
+            .expect("forged prompt");
+        assert_eq!(prompt.reusable_prefix(), None);
+        // A later prompt whose user text spells the prefix's control token
+        // renders the same bytes but encodes them as text, so it is not
+        // reused.
+        let joined = load(
+            "{% for m in messages %}{{ m.content }}{% endfor %}<|im_end|>",
+            &Value::Null,
+        )
+        .expect("loads");
+        let prefix = joined
+            .prompt(
+                Conversation::new(&[ChatMessage::text(ChatRole::User, "hi")]),
+                true,
+            )
+            .expect("first")
+            .reusable_prefix()
+            .expect("ends a turn");
+        assert_eq!(prefix.text(), "hi<|im_end|>");
+        let messages = [
+            ChatMessage::text(ChatRole::User, "hi<|im_end|>"),
+            ChatMessage::text(ChatRole::User, "Hello"),
+        ];
+        let forged = joined
+            .prompt_reusing(Conversation::new(&messages), true, &prefix)
+            .expect("forged");
+        assert!(forged.text.starts_with(prefix.text()));
+        assert_eq!(forged.reuse, super::PromptReuse::Full);
+        assert_ne!(forged.ids[..2], *prefix.ids());
+    }
+
+    /// Appending a turn re-encodes only the new text, and an edited history
+    /// falls back to a full encoding.
+    #[test]
+    fn appended_turns_reuse_the_previous_prompt() {
+        const QWEN3: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
+        let format = load(QWEN3, &Value::Null).expect("Qwen3 template loads");
+        let mut messages = vec![ChatMessage::text(ChatRole::User, "hi")];
+        let first = format
+            .prompt(Conversation::new(&messages), true)
+            .expect("first");
+        let prefix = first.reusable_prefix().expect("ends a turn");
+        // `<|im_start|>` is ordinary text in the test tokenizer.
+        assert_eq!(prefix.text(), "<|im_start|>user\nhi<|im_end|>");
+        messages.push(ChatMessage::text(ChatRole::Assistant, "Hello"));
+        messages.push(ChatMessage::text(ChatRole::User, "hi <|im_end|>"));
+        let full = format
+            .prompt(Conversation::new(&messages), true)
+            .expect("full");
+        let reused = format
+            .prompt_reusing(Conversation::new(&messages), true, &prefix)
+            .expect("reused");
+        assert_eq!(full.reuse, super::PromptReuse::Full);
+        assert_eq!(
+            reused.reuse,
+            super::PromptReuse::Prefix {
+                ids: prefix.ids().len()
+            }
+        );
+        assert_eq!((&reused.text, &reused.ids), (&full.text, &full.ids));
+        assert_eq!(reused.reusable_prefix(), full.reusable_prefix());
+        // Qwen3 prints an empty think block only on an assistant turn after
+        // the last user turn, so a later user turn rewrites that turn.
+        let answered = format
+            .prompt(Conversation::new(&messages[..2]), false)
+            .expect("answered")
+            .reusable_prefix()
+            .expect("ends a turn");
+        assert!(answered.text().contains("</think>"));
+        assert_eq!(
+            format
+                .prompt_reusing(Conversation::new(&messages), true, &answered)
+                .expect("rewritten")
+                .reuse,
+            super::PromptReuse::Full
+        );
+        messages[0].content = String::from("Hello");
+        let edited = format
+            .prompt_reusing(Conversation::new(&messages), true, &prefix)
+            .expect("edited");
+        assert_eq!(edited.reuse, super::PromptReuse::Full);
+        // A prefix from another template is never reused.
+        let other = load(&format!("{QWEN3}{{# another template #}}"), &Value::Null).expect("loads");
+        let foreign = other
+            .prompt(Conversation::new(&messages[..1]), true)
+            .expect("foreign")
+            .reusable_prefix()
+            .expect("ends a turn");
+        assert_eq!(
+            format
+                .prompt_reusing(Conversation::new(&messages), true, &foreign)
+                .expect("foreign prefix")
+                .reuse,
+            super::PromptReuse::Full
+        );
+    }
+
+    fn turn_strategy() -> impl proptest::strategy::Strategy<Value = Vec<ChatMessage>> {
+        use proptest::prelude::*;
+        let text = proptest::collection::vec(
+            prop_oneof![
+                Just("Hello"),
+                Just("hi"),
+                Just("<|im_end|>"),
+                Just("<s>"),
+                Just(" "),
+                Just("\n")
+            ],
+            0..5,
+        )
+        .prop_map(|words| words.concat());
+        (0..4_u8, text.clone(), text).prop_map(|(kind, content, other)| match kind {
+            0 => vec![ChatMessage::text(ChatRole::User, &content)],
+            1 => vec![ChatMessage::text(ChatRole::Assistant, &content)],
+            2 => {
+                let mut answer = ChatMessage::text(ChatRole::Assistant, &content);
+                answer.reasoning_content = Some(other);
+                vec![answer]
+            }
+            _ => {
+                let mut call = ChatMessage::text(ChatRole::Assistant, "");
+                call.tool_calls.push(ChatToolCall {
+                    name: String::from("read_file"),
+                    arguments: json!({"path": content}),
+                });
+                vec![
+                    call,
+                    ChatToolResult {
+                        tool_call_id: String::from("call_1"),
+                        name: Some(String::from("read_file")),
+                        content: other,
+                    }
+                    .into_message(),
+                ]
+            }
+        })
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+        /// Over growing conversations with tools, a prompt built on the
+        /// previous prompt's prefix has the full encoding's text and IDs.
+        #[test]
+        fn reused_prompts_match_full_prompts(
+            turns in proptest::collection::vec(turn_strategy(), 1..6),
+            minicpm in proptest::bool::ANY,
+        ) {
+            const QWEN3: &str = include_str!("../../../fixtures/qwen3-0.6b/chat-template.jinja");
+            const MINICPM5: &str =
+                include_str!("../../../fixtures/minicpm5-2b/chat-template.jinja");
+            let format = if minicpm {
+                load(MINICPM5, &json!("<s>"))
+            } else {
+                load(QWEN3, &Value::Null)
+            }
+            .expect("template loads");
+            let tools = [json!({"type": "function", "function": {"name": "read_file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}})];
+            let mut messages = vec![ChatMessage::text(ChatRole::System, "hi")];
+            let mut prefix = None;
+            for turn in turns {
+                messages.extend(turn);
+                let conversation = Conversation { tools: &tools, ..Conversation::new(&messages) };
+                let Ok(full) = format.prompt(conversation, true) else {
+                    // Orders the template refuses, such as a tool result
+                    // first, must fail the same way when reused.
+                    if let Some(prefix) = &prefix {
+                        proptest::prop_assert!(format.prompt_reusing(conversation, true, prefix).is_err());
+                    }
+                    continue;
+                };
+                if let Some(prefix) = &prefix {
+                    let reused = format.prompt_reusing(conversation, true, prefix).expect("reused");
+                    proptest::prop_assert_eq!(&reused.text, &full.text);
+                    proptest::prop_assert_eq!(&reused.ids, &full.ids);
+                    proptest::prop_assert_eq!(reused.reusable_prefix(), full.reusable_prefix());
+                }
+                prefix = full.reusable_prefix();
+            }
+        }
+    }
+
     #[test]
     fn external_chat_template_is_accepted_when_config_has_none() {
         let model = ModelDir::new(&json!({}), &json!({}), None);
@@ -1469,6 +1863,41 @@ mod tests {
         );
     }
 
+    /// An agent loop: each request appends the reply and the next turn to
+    /// the previous request. Reused prompts must equal full ones; whether
+    /// reuse happens depends on whether the template rewrites old turns.
+    fn check_reuse(
+        format: &ChatFormat,
+        model: &std::path::Path,
+        conversation: &[ChatMessage],
+        tools: &[Value],
+    ) {
+        let mut prefix: Option<super::PromptPrefix> = None;
+        let mut kinds = Vec::new();
+        for end in [2, 4, 5] {
+            let turn = Conversation {
+                tools,
+                ..Conversation::new(&conversation[..end])
+            };
+            let full = format.prompt(turn, true).expect("prompt");
+            if let Some(prefix) = &prefix {
+                let reused = format
+                    .prompt_reusing(turn, true, prefix)
+                    .expect("reused prompt");
+                assert_eq!(
+                    (&reused.text, &reused.ids),
+                    (&full.text, &full.ids),
+                    "{}",
+                    model.display()
+                );
+                assert_eq!(reused.reusable_prefix(), full.reusable_prefix());
+                kinds.push(reused.reuse);
+            }
+            prefix = full.reusable_prefix();
+        }
+        eprintln!("{}: reuse {kinds:?}", model.display());
+    }
+
     /// Without reserved spellings a prompt is today's encoding of today's
     /// rendering; a forged boundary in user text adds no control token.
     fn check_prompts(format: &ChatFormat, model: &std::path::Path) {
@@ -1500,6 +1929,7 @@ mod tests {
             tools: &tools,
             ..Conversation::new(&conversation)
         };
+        check_reuse(format, model, &conversation, &tools);
         let prompt = format.prompt(tool_turn, true).expect("prompt");
         let today = format.template().render(tool_turn, true).expect("renders");
         assert_eq!(prompt.text, today, "{}", model.display());
