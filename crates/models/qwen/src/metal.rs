@@ -453,6 +453,7 @@ impl Qwen3MlxWeights {
         let forward_config = crate::forward::Qwen3ForwardConfig::parse(&config_json)?;
         let inspection = Qwen3CheckpointInspection::inspect(model_dir)?;
         let mut tensors = HashMap::with_capacity(inspection.tensor_count());
+        let mut tied_duplicates = 0_usize;
         for shard in inspection.shards() {
             // MLX safetensors I/O is defined on the CPU stream. Subsequent
             // graph operations choose the GPU stream explicitly.
@@ -460,16 +461,21 @@ impl Qwen3MlxWeights {
             // Inspection keyed tensors by canonical name; the loaded map must
             // agree so forward code sees one naming for every checkpoint.
             let naming = inspection.tensor_naming();
-            tensors.extend(
-                shard_tensors
-                    .into_iter()
-                    .map(|(name, tensor)| (naming.canonical_name(&name), tensor)),
-            );
+            for (name, tensor) in shard_tensors {
+                // Tied checkpoints may still store `lm_head.weight`. Logits
+                // project through the embedding, so the copy is never read,
+                // and keeping it would count its bytes in the resident total.
+                if name == "lm_head.weight" && forward_config.tied_output_embedding() {
+                    tied_duplicates += 1;
+                    continue;
+                }
+                tensors.insert(naming.canonical_name(&name), tensor);
+            }
         }
 
-        if tensors.len() != inspection.tensor_count() {
+        if tensors.len() + tied_duplicates != inspection.tensor_count() {
             return Err(Qwen3MetalLoadError::UnexpectedTensorCount {
-                expected: inspection.tensor_count(),
+                expected: inspection.tensor_count() - tied_duplicates,
                 actual: tensors.len(),
             });
         }
@@ -504,7 +510,8 @@ impl Qwen3MlxWeights {
         })
     }
 
-    /// Returns the number of loaded tensors.
+    /// Returns the number of loaded tensors, excluding a tied checkpoint's
+    /// stored copy of `lm_head.weight`.
     #[must_use]
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
@@ -795,8 +802,10 @@ mod tests {
         ));
     }
 
-    /// Writes a one-layer BF16 checkpoint whose names carry `prefix`.
-    fn write_tiny_checkpoint(dir: &std::path::Path, prefix: &str) {
+    /// Writes a one-layer BF16 checkpoint whose names carry `prefix`. With
+    /// `stored_head`, the tied checkpoint also stores an `lm_head.weight`
+    /// whose values differ from the embedding.
+    fn write_tiny_checkpoint(dir: &std::path::Path, prefix: &str, stored_head: bool) {
         std::fs::create_dir_all(dir).expect("checkpoint dir");
         std::fs::write(
             dir.join("config.json"),
@@ -804,7 +813,7 @@ mod tests {
         )
         .expect("config");
         let layer = "layers.0";
-        let tensors: Vec<(String, Vec<i64>)> = [
+        let mut tensors: Vec<(String, Vec<i64>)> = [
             ("embed_tokens.weight".to_owned(), vec![8, 4]),
             ("norm.weight".to_owned(), vec![4]),
             (format!("{layer}.input_layernorm.weight"), vec![4]),
@@ -820,22 +829,33 @@ mod tests {
             (format!("{layer}.mlp.down_proj.weight"), vec![4, 8]),
         ]
         .into();
+        if stored_head {
+            tensors.push(("lm_head.weight".to_owned(), vec![8, 4]));
+        }
         let mut header = serde_json::Map::new();
         let mut payload = Vec::new();
         for (name, shape) in tensors {
             let count = usize::try_from(shape.iter().product::<i64>()).expect("small");
             let start = payload.len();
+            // A different period keeps the stored head unlike the embedding.
+            let period = if name == "lm_head.weight" { 7 } else { 11 };
             for index in 0..count {
                 // Multiples of 1/16 are exact in BF16.
-                let value = f32::from(u8::try_from(index % 11).expect("small") + 1) / 16.0;
+                let value = f32::from(u8::try_from(index % period).expect("small") + 1) / 16.0;
                 payload.extend_from_slice(
                     &u16::try_from(value.to_bits() >> 16)
                         .expect("bf16")
                         .to_le_bytes(),
                 );
             }
+            // Hugging Face stores the head outside the `model.` namespace.
+            let key = if name == "lm_head.weight" {
+                name
+            } else {
+                format!("{prefix}{name}")
+            };
             header.insert(
-                format!("{prefix}{name}"),
+                key,
                 serde_json::json!({"dtype":"BF16","shape":shape,"data_offsets":[start, payload.len()]}),
             );
         }
@@ -853,8 +873,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root =
             std::env::temp_dir().join(format!("metallix-qwen-naming-{}", std::process::id()));
-        write_tiny_checkpoint(&root.join("prefixed"), "model.");
-        write_tiny_checkpoint(&root.join("bare"), "");
+        write_tiny_checkpoint(&root.join("prefixed"), "model.", false);
+        write_tiny_checkpoint(&root.join("bare"), "", false);
         let prefixed = super::Qwen3MlxWeights::load(root.join("prefixed")).expect("prefixed load");
         let bare = super::Qwen3MlxWeights::load(root.join("bare")).expect("bare load");
         std::fs::remove_dir_all(&root).expect("remove fixture");
@@ -873,6 +893,41 @@ mod tests {
             bare.embed(&ids, None),
             Err(crate::embedding::Qwen3EmbeddingError::MissingEndOfText { last: Some(3) })
         ));
+    }
+
+    #[test]
+    fn tied_checkpoint_drops_its_stored_head_from_resident_weights() {
+        let _guard = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!("metallix-qwen-tied-{}", std::process::id()));
+        write_tiny_checkpoint(&root.join("stored"), "model.", true);
+        write_tiny_checkpoint(&root.join("absent"), "model.", false);
+        let stored = super::Qwen3MlxWeights::load(root.join("stored")).expect("stored-head load");
+        let absent = super::Qwen3MlxWeights::load(root.join("absent")).expect("no-head load");
+        std::fs::remove_dir_all(&root).expect("remove fixture");
+
+        // The header declares the head (8 x 4 BF16 = 64 bytes); residency omits it.
+        let inspection = stored.inspection();
+        assert_eq!(stored.tensor_count() + 1, inspection.tensor_count());
+        assert_eq!(stored.tensor_count(), absent.tensor_count());
+        assert_eq!(
+            u64::try_from(stored.logical_weight_bytes()).expect("small") + 64,
+            inspection.tensor_bytes()
+        );
+        assert_eq!(stored.logical_weight_bytes(), absent.logical_weight_bytes());
+        // The stored head differs from the embedding, so equal logits show
+        // the projection still reads the embedding.
+        let ids = [1_i32, 5, 3];
+        let bits = |weights: &super::Qwen3MlxWeights| {
+            weights
+                .forward_last_logits(&ids)
+                .expect("forward")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&stored), bits(&absent));
     }
 
     #[test]
