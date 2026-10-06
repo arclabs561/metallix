@@ -2,6 +2,7 @@
 members = [
     "crates/blockfloat",
     "crates/chat-format",
+    "crates/diffusion",
     "crates/engine",
     "crates/models/deepseek",
     "crates/models/gemma",
