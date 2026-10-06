@@ -679,6 +679,12 @@ fn serve_models(
 
 #[cfg(test)]
 mod tests {
+    /// How long a test waits for a response, event or release before it
+    /// calls the server hung. Generous because a loaded machine (other
+    /// builds, MLX work) stretches these waits to seconds; what each test
+    /// asserts does not depend on it.
+    const HUNG: Duration = Duration::from_secs(30);
+
     use std::{
         env,
         io::{Read as _, Write as _},
@@ -875,11 +881,9 @@ stream.close()
                 self.entered.send(()).map_err(|_| {
                     ChatGenerationError::Message(String::from("test barrier closed"))
                 })?;
-                self.release
-                    .recv_timeout(Duration::from_secs(2))
-                    .map_err(|_| {
-                        ChatGenerationError::Message(String::from("test barrier timed out"))
-                    })?;
+                self.release.recv_timeout(HUNG).map_err(|_| {
+                    ChatGenerationError::Message(String::from("test barrier timed out"))
+                })?;
             }
             Ok(crate::chat_generation::ChatGeneration {
                 text: text.into(),
@@ -998,9 +1002,7 @@ stream.close()
         let client = thread::spawn(move || {
             let body = br#"{"model":"control","input":"hello","stream":true}"#;
             let mut stream = TcpStream::connect(address).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            stream.set_read_timeout(Some(HUNG)).unwrap();
             write!(
                 stream,
                 "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
@@ -1130,7 +1132,7 @@ stream.close()
 
         let mut malformed = TcpStream::connect(address).expect("connect malformed request");
         malformed
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(HUNG))
             .expect("bound malformed reads");
         malformed
             .write_all(
@@ -1153,7 +1155,7 @@ stream.close()
         let body = request_body();
         let mut primary = TcpStream::connect(address).expect("connect primary request");
         primary
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(HUNG))
             .expect("bound primary reads");
         request(&mut primary, &body);
         let mut primary_prefix = Vec::new();
@@ -1167,12 +1169,11 @@ stream.close()
             primary_prefix.extend_from_slice(&chunk[..read]);
         }
         entered_receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(HUNG)
             .expect("worker holds after the real callback delta");
 
         let mut busy = TcpStream::connect(address).expect("connect concurrent request");
-        busy.set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("bound busy reads");
+        busy.set_read_timeout(Some(HUNG)).expect("bound busy reads");
         request(&mut busy, &body);
         let (busy_status, busy_body) = fixed_http_response(&mut busy);
         assert_eq!(busy_status, 503);
@@ -1193,7 +1194,7 @@ stream.close()
 
         let mut recovery = TcpStream::connect(address).expect("connect recovery request");
         recovery
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(HUNG))
             .expect("bound recovery reads");
         request(&mut recovery, &body);
         let mut recovery_wire = Vec::new();
@@ -1225,7 +1226,7 @@ stream.close()
         const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
 
         fn wait_for_admission_release(occupied: &AtomicBool) {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + HUNG;
             while occupied.load(Ordering::Acquire) {
                 assert!(
                     Instant::now() < deadline,
@@ -1273,10 +1274,10 @@ stream.close()
 
         let mut stalled_reader = StalledReader::start(address);
         started_receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(HUNG)
             .expect("worker begins the stalled response");
         let (elapsed, error) = failure_receiver
-            .recv_timeout(RESPONSE_DEADLINE + Duration::from_secs(1))
+            .recv_timeout(RESPONSE_DEADLINE + HUNG)
             .expect("stalled response reports a callback write failure");
         let lower_error = error.to_ascii_lowercase();
         let pressure_error = lower_error.contains("timed out")
@@ -1292,7 +1293,7 @@ stream.close()
         let body = br#"{"model":"control","input":"recover","stream":true}"#;
         let mut recovery = TcpStream::connect(address).expect("connect recovery request");
         recovery
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(HUNG))
             .expect("bound recovery reads");
         write!(
             recovery,
@@ -1328,7 +1329,7 @@ stream.close()
             let body = br#"{"model":"control","input":"hello","stream":true}"#;
             let mut stream = TcpStream::connect(address).expect("connect request");
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(HUNG))
                 .expect("bound request reads");
             write!(
                 stream,
@@ -1409,7 +1410,7 @@ stream.close()
 
         let mut client = TcpStream::connect(address).expect("connect without request headers");
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(HUNG))
             .expect("bound unavailable read");
         let mut wire = Vec::new();
         client
@@ -1447,7 +1448,7 @@ stream.close()
         let body = br#"{"model":"control","input":"hello","stream":true}"#;
         let mut client = TcpStream::connect(address).expect("connect valid request");
         client
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(HUNG))
             .expect("bound unavailable read");
         write!(
             client,
@@ -1746,9 +1747,7 @@ stream.close()
     fn decisions_route_by_model_with_per_model_admission() {
         fn exchange(address: std::net::SocketAddr, request: &str, body: &[u8]) -> (u16, Value) {
             let mut stream = TcpStream::connect(address).expect("connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("bound reads");
+            stream.set_read_timeout(Some(HUNG)).expect("bound reads");
             write!(
                 stream,
                 "{request} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
@@ -1820,7 +1819,7 @@ stream.close()
             exchange(address, "POST /v1/responses", body)
         });
         entered_receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(HUNG)
             .expect("generation holds its worker");
         assert!(generation_occupied.load(Ordering::Acquire));
 
@@ -1883,9 +1882,7 @@ stream.close()
         use crate::sse::test_support::Scripted;
         fn post(address: std::net::SocketAddr, path: &str, body: &str) -> (u16, Value) {
             let mut stream = TcpStream::connect(address).expect("connect");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("bound reads");
+            stream.set_read_timeout(Some(HUNG)).expect("bound reads");
             write!(
                 stream,
                 "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
