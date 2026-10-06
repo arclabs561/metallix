@@ -980,12 +980,16 @@ impl ChatSession {
                         .truncate_cached_tokens(executor.cached_tokens() - 1)
                         .map_err(|error| ChatGenerationError::message(error.to_string()))?;
                 }
+                // The serial worker verifies one sequence at a time.
                 let span = tracing::info_span!(
                     "chat.verify_step",
                     step,
+                    batch = 1,
                     drafted = draft.len(),
                     accepted = Empty,
-                    decode_ms = Empty
+                    decode_ms = Empty,
+                    mlx.active_bytes = Empty,
+                    mlx.peak_bytes = Empty
                 );
                 let ((outcome, verified), step_ms) = timed(&span, "decode_ms", || {
                     speculation::verify(
@@ -999,6 +1003,7 @@ impl ChatSession {
                     .map_err(ChatGenerationError::message)
                 })?;
                 span.record("accepted", outcome.accepted);
+                crate::gpu::Memory::record_on(&span);
                 decode_ms.push(step_ms);
                 draft_length.observe(outcome.drafted, outcome.accepted);
                 speculation_stats.record(&outcome);

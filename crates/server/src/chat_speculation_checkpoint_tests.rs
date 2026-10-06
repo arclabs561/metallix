@@ -120,7 +120,8 @@ fn speculation_accepts_edit_drafts_in_every_decode_mode() {
 
 /// Automatic speculation on a turn with little to copy: drafts are rarer,
 /// and a verify that discards a queued step must not make it slower than
-/// pipelined greedy decode. Prints both rates; asserts nothing about speed.
+/// pipelined greedy decode. The two arms alternate so machine load drifts
+/// over both alike. Prints both rates; asserts nothing about speed.
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn speculation_on_original_writing_reports_its_cost() {
@@ -129,27 +130,35 @@ fn speculation_on_original_writing_reports_its_cost() {
         ChatRole::User,
         "Write a short original story about a lighthouse keeper who collects lost keys.",
     )];
-    for speculation in [SpeculationRequest::Disabled, SpeculationRequest::Automatic] {
-        let mut request = ChatRequest::new(&messages, MAX_TOKENS);
-        request.speculation = speculation;
-        let _ = session.generate(request, &mut |_| Ok(())).expect("warmup");
-        let mut rates = Vec::new();
-        let mut receipt = None;
-        for _ in 0..3 {
+    let arms = [SpeculationRequest::Disabled, SpeculationRequest::Automatic];
+    let mut rates = [Vec::new(), Vec::new()];
+    let mut receipt = None;
+    for repeat in 0..6 {
+        for (arm, &speculation) in arms.iter().enumerate() {
+            let mut request = ChatRequest::new(&messages, MAX_TOKENS);
+            request.speculation = speculation;
             let turn = session.generate(request, &mut |_| Ok(())).expect("turn");
-            #[allow(clippy::cast_precision_loss, reason = "small token counts")]
-            let rate = turn.generated_token_ids.len().saturating_sub(1) as f64
-                / turn.metrics.decode_total_ms
-                * 1e3;
-            rates.push(rate);
-            receipt = turn.metrics.speculation;
+            // The first round warms the graph caches.
+            if repeat > 0 {
+                #[allow(clippy::cast_precision_loss, reason = "small token counts")]
+                let rate = turn.generated_token_ids.len().saturating_sub(1) as f64
+                    / turn.metrics.decode_total_ms
+                    * 1e3;
+                rates[arm].push(rate);
+            }
+            if arm == 1 {
+                receipt = turn.metrics.speculation;
+            }
         }
-        rates.sort_by(f64::total_cmp);
+    }
+    for (arm, speculation) in arms.iter().enumerate() {
+        rates[arm].sort_by(f64::total_cmp);
         println!(
-            "speculation_turn case=original speculation={speculation:?} median_tok_s={:.1} receipt={receipt:?}",
-            rates[1]
+            "speculation_turn case=original speculation={speculation:?} median_tok_s={:.1} rates={:?}",
+            rates[arm][2], rates[arm]
         );
     }
+    println!("speculation_turn case=original receipt={receipt:?}");
 }
 
 /// Under `ignore_eos` a verified end-of-turn token is ordinary output, so a
