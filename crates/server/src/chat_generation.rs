@@ -503,6 +503,9 @@ pub(crate) struct ChatGenerationMetrics {
     pub(crate) prompt_tokens: usize,
     /// Leading prompt tokens restored from the prefix cache, not prefilled.
     pub(crate) cached_prompt_tokens: usize,
+    /// Leading prompt tokens this turn copied into the prefix cache for later
+    /// requests: the longest prefix it stored, or 0.
+    pub(crate) cache_write_tokens: usize,
     pub(crate) generated_tokens: usize,
     /// Draft verification counts, present only when a verify step ran.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1058,7 +1061,7 @@ impl ChatSession {
         // Copies the reusable prompt prefixes out of this turn's K/V; after the
         // last token, so it never delays the first one.
         let store = tracing::info_span!("chat.prefix_cache.store", store_ms = Empty);
-        timed(&store, "store_ms", || {
+        let (cache_write_tokens, _) = timed(&store, "store_ms", || {
             prefix_cache::remember(
                 &self.weights,
                 &mut self.prefix_cache,
@@ -1099,6 +1102,7 @@ impl ChatSession {
                 decode_total_ms,
                 prompt_tokens: input_ids.len(),
                 cached_prompt_tokens,
+                cache_write_tokens,
                 generated_tokens,
                 speculation: SpeculationReceipt::from_stats(speculation_stats),
             },

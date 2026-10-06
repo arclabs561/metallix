@@ -213,6 +213,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
                 decode_total_ms,
                 prompt_tokens: input_ids.len(),
                 cached_prompt_tokens: 0,
+                cache_write_tokens: 0,
                 generated_tokens,
                 // Prompt-lookup speculation runs on the Qwen executor only;
                 // it never changes output, so a request asking for it is

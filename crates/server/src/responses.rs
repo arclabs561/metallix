@@ -817,6 +817,8 @@ fn response_value(
     response["usage"] = json!({"input_tokens":generated.metrics.prompt_tokens,"output_tokens":generated.generated_token_ids.len(),"total_tokens":generated.metrics.prompt_tokens+generated.generated_token_ids.len()});
     response["usage"]["input_tokens_details"]["cached_tokens"] =
         generated.metrics.cached_prompt_tokens.into();
+    response["usage"]["input_tokens_details"]["cache_write_tokens"] =
+        generated.metrics.cache_write_tokens.into();
     // `ResponseUsage` requires output_tokens_details.reasoning_tokens. A turn
     // without reasoning has none; with reasoning the count is not tracked
     // per token yet, so the detail is left out rather than guessed.
@@ -1116,13 +1118,10 @@ mod tests {
             "temperature": 0.0,
         }))
         .unwrap();
-        let response = response_value(
-            &request,
-            &controls(&request).unwrap(),
-            &generation("hi"),
-            "t",
-        )
-        .unwrap();
+        let mut generated = generation("hi");
+        generated.metrics.cache_write_tokens = 7;
+        let response =
+            response_value(&request, &controls(&request).unwrap(), &generated, "t").unwrap();
         for field in [
             "access_programs",
             "id",
@@ -1168,6 +1167,13 @@ mod tests {
             );
         }
         assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
+        for field in ["cached_tokens", "cache_write_tokens"] {
+            assert!(
+                usage["input_tokens_details"].get(field).is_some(),
+                "input_tokens_details.{field} is missing"
+            );
+        }
+        assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 7);
         let part = &response["output"][0]["content"][0];
         assert_eq!(part["logprobs"], json!([]), "OutputTextContent.logprobs");
 
@@ -1218,6 +1224,7 @@ mod tests {
                 decode_total_ms: 0.0,
                 prompt_tokens: 1,
                 cached_prompt_tokens: 0,
+                cache_write_tokens: 0,
                 generated_tokens: 2,
                 speculation: None,
             },

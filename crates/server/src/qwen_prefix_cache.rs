@@ -73,7 +73,8 @@ pub(super) fn remember(
     executor: &Executor<'_>,
     request: ChatRequest<'_>,
     input_ids: &[i32],
-) -> Result<(), String> {
+) -> Result<usize, String> {
+    let mut written = 0;
     let leading_system = request
         .messages
         .iter()
@@ -105,9 +106,12 @@ pub(super) fn remember(
             .snapshot_resident_prefix(executor, ids.len())
             .map_err(|error| error.to_string())?;
         let bytes = snapshot.kv_bytes();
-        cache.insert(request.cache_salt, ids, snapshot, bytes);
+        let tokens = ids.len();
+        if cache.insert(request.cache_salt, ids, snapshot, bytes) {
+            written = written.max(tokens);
+        }
     }
-    Ok(())
+    Ok(written)
 }
 
 struct Entry<V> {

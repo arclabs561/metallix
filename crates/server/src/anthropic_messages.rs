@@ -400,13 +400,20 @@ fn stop_reason(turn: &AssistantTurn) -> &'static str {
     }
 }
 
-/// Anthropic counts cached prompt tokens apart from `input_tokens`.
+/// Anthropic partitions the prompt into uncached, cache-read and newly
+/// cache-created tokens, without counting copied prefix positions twice.
 fn usage(generated: &ChatGeneration) -> Value {
-    let cached = generated.metrics.cached_prompt_tokens;
-    // The cache serves a prefix of the prompt, so cached never exceeds the
-    // prompt; saturate so a metrics bug cannot panic the response.
-    let input = generated.metrics.prompt_tokens.saturating_sub(cached);
-    json!({"input_tokens":input,"output_tokens":generated.generated_token_ids.len(),"cache_read_input_tokens":cached,"cache_creation_input_tokens":0})
+    let prompt = generated.metrics.prompt_tokens;
+    let cached = generated.metrics.cached_prompt_tokens.min(prompt);
+    // A stored snapshot includes its already-read prefix; only the extension
+    // is newly created input. Clamp inconsistent metrics to the prompt size.
+    let created = generated
+        .metrics
+        .cache_write_tokens
+        .saturating_sub(cached)
+        .min(prompt - cached);
+    let input = prompt - cached - created;
+    json!({"input_tokens":input,"output_tokens":generated.generated_token_ids.len(),"cache_read_input_tokens":cached,"cache_creation_input_tokens":created})
 }
 
 /// The content blocks of a finished turn, in order.
@@ -944,22 +951,42 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
 
     #[test]
     fn cached_prompt_tokens_are_reported_apart_from_input_tokens() {
-        for stream in [false, true] {
-            let mut backend = Scripted::new("hi");
-            backend.prompt_tokens = 10;
-            backend.cached_prompt_tokens = 4;
-            let wire = run(&with(&json!({"stream":stream})), &mut backend);
-            let usage = if stream {
-                let (_, data) = events(&wire)
-                    .into_iter()
-                    .find(|(name, _)| name.as_deref() == Some("message_delta"))
-                    .unwrap();
-                serde_json::from_str::<Value>(&data).unwrap()["usage"].clone()
-            } else {
-                json_body(&wire).1["usage"].clone()
-            };
-            assert_eq!(usage["input_tokens"], 6, "stream={stream}");
-            assert_eq!(usage["cache_read_input_tokens"], 4, "stream={stream}");
+        for (cached, written, input, created) in [
+            (4, 9, 1, 5),
+            (0, 9, 1, 9),
+            (4, 0, 6, 0),
+            (4, 2, 6, 0),
+            (4, 99, 0, 6),
+        ] {
+            for stream in [false, true] {
+                let mut backend = Scripted::new("hi");
+                backend.prompt_tokens = 10;
+                backend.cached_prompt_tokens = cached;
+                backend.cache_write_tokens = written;
+                let wire = run(&with(&json!({"stream":stream})), &mut backend);
+                let usage = if stream {
+                    let (_, data) = events(&wire)
+                        .into_iter()
+                        .find(|(name, _)| name.as_deref() == Some("message_delta"))
+                        .unwrap();
+                    serde_json::from_str::<Value>(&data).unwrap()["usage"].clone()
+                } else {
+                    json_body(&wire).1["usage"].clone()
+                };
+                assert_eq!(usage["input_tokens"], input, "stream={stream}");
+                assert_eq!(usage["cache_read_input_tokens"], cached, "stream={stream}");
+                assert_eq!(
+                    usage["cache_creation_input_tokens"], created,
+                    "stream={stream}"
+                );
+                assert_eq!(
+                    usage["input_tokens"].as_u64().unwrap()
+                        + usage["cache_read_input_tokens"].as_u64().unwrap()
+                        + usage["cache_creation_input_tokens"].as_u64().unwrap(),
+                    10,
+                    "usage partitions the prompt: stream={stream}"
+                );
+            }
         }
         let mut backend = Scripted::new("hi");
         backend.prompt_tokens = 3;
@@ -970,6 +997,8 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
             "inconsistent metrics do not panic"
         );
         assert_eq!(body["usage"]["input_tokens"], 0);
+        assert_eq!(body["usage"]["cache_read_input_tokens"], 3);
+        assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
     }
 
     /// A reply written only at the end still notices a client that left:

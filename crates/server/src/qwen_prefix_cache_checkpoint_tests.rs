@@ -67,6 +67,38 @@ fn conversation(system: &str, user: &str) -> Vec<ChatMessage> {
 
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+fn checkpoint_cache_write_tokens_count_only_accepted_prefixes() {
+    let model = env::var_os("METALLIX_QWEN_MODEL")
+        .map(PathBuf::from)
+        .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+    let limits = ResidentChatLimits::from_mib(128, 64).with_prefix_cache_mib(64);
+    let mut session = ChatSession::load(&model, limits).expect("load");
+    let messages = conversation("Answer briefly.", "Say hello.");
+    let request = ChatRequest::new(&messages, 1);
+    let accepted = session
+        .generate(request, &mut |_| Ok(()))
+        .expect("generation");
+    assert!(accepted.metrics.cache_write_tokens > 0);
+    assert!(accepted.metrics.cache_write_tokens < accepted.metrics.prompt_tokens);
+    assert_eq!(session.prefix_cache_stats().entries, 2);
+    let repeated = session
+        .generate(request, &mut |_| Ok(()))
+        .expect("generation");
+    assert_eq!(repeated.metrics.cache_write_tokens, 0, "already cached");
+    assert_eq!(repeated.generated_token_ids, accepted.generated_token_ids);
+    for budget in [0, 1] {
+        session.reset_prefix_cache(budget);
+        let refused = session
+            .generate(request, &mut |_| Ok(()))
+            .expect("generation");
+        assert_eq!(refused.metrics.cache_write_tokens, 0, "budget {budget}");
+        assert_eq!(session.prefix_cache_stats().entries, 0);
+        assert_eq!(refused.generated_token_ids, accepted.generated_token_ids);
+    }
+}
+
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
 fn checkpoint_prefix_hits_are_greedy_identical_and_changed_preambles_miss() {
     let Some(mut session) = load_session() else {
         return;

@@ -206,6 +206,8 @@ pub(crate) mod test_support {
         /// Prompt tokens to report, and how many of them the cache served.
         pub(crate) prompt_tokens: usize,
         pub(crate) cached_prompt_tokens: usize,
+        /// Prompt tokens to report as copied into the prefix cache.
+        pub(crate) cache_write_tokens: usize,
         /// A pause before each text piece, as a model spends per token.
         pub(crate) piece_delay: Duration,
     }
@@ -221,6 +223,7 @@ pub(crate) mod test_support {
                 salt: None,
                 prompt_tokens: 1,
                 cached_prompt_tokens: 0,
+                cache_write_tokens: 0,
                 piece_delay: Duration::ZERO,
             }
         }
@@ -326,6 +329,7 @@ pub(crate) mod test_support {
                     decode_total_ms: 0.0,
                     prompt_tokens: self.prompt_tokens,
                     cached_prompt_tokens: self.cached_prompt_tokens,
+                    cache_write_tokens: self.cache_write_tokens,
                     generated_tokens,
                     speculation: None,
                 },
