@@ -898,7 +898,6 @@ impl ChatSession {
 
     /// Renders and encodes one turn; the render span covers both.
     fn render(&self, request: ChatRequest<'_>) -> Result<Prompt, String> {
-        self.format.check_untrusted(request.conversation())?;
         self.format.prompt(request.conversation(), true)
     }
 }

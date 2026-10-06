@@ -65,7 +65,6 @@ impl TurnStart {
         let render = tracing::info_span!("chat.render", render_ms = tracing::field::Empty);
         // Renders and encodes; the render span covers both.
         let (prompt, render_ms) = timed(&render, "render_ms", || {
-            model.format.check_untrusted(request.conversation())?;
             model.format.prompt(request.conversation(), true)
         })?;
         let input_ids = prompt.ids;
