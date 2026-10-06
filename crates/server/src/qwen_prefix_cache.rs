@@ -59,6 +59,16 @@ pub(super) fn prefill<'w>(
     Ok((executor, logits, 0))
 }
 
+/// Extent of the longest accepted snapshot, including any restored prefix.
+/// Convert explicitly before reporting newly created prompt tokens.
+pub(super) struct AcceptedPrefixTokens(usize);
+
+impl AcceptedPrefixTokens {
+    pub(super) fn new_tokens_after(self, cached: usize) -> usize {
+        self.0.saturating_sub(cached)
+    }
+}
+
 /// Caches the prompt's reusable prefixes from `executor`: the leading system
 /// and tool preamble, which a later request with the same preamble shares,
 /// and the whole conversation before the generation prompt, which the next
@@ -73,7 +83,7 @@ pub(super) fn remember(
     executor: &Executor<'_>,
     request: ChatRequest<'_>,
     input_ids: &[i32],
-) -> Result<usize, String> {
+) -> Result<AcceptedPrefixTokens, String> {
     let mut written = 0;
     let leading_system = request
         .messages
@@ -111,7 +121,7 @@ pub(super) fn remember(
             written = written.max(tokens);
         }
     }
-    Ok(written)
+    Ok(AcceptedPrefixTokens(written))
 }
 
 struct Entry<V> {

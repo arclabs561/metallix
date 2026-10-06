@@ -152,9 +152,11 @@ pub(crate) enum Command {
         /// Total prompt plus output budget for each request.
         #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
         context_tokens: u32,
-        /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
-        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
-        kv_budget_mib: u32,
+        /// Paged K/V pool per generating model, in MiB, allocated when the
+        /// model loads. Defaults to the smaller of 4096 and a quarter of
+        /// physical memory.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=32768))]
+        kv_budget_mib: Option<u32>,
         /// Per-model budget in MiB for prompt-prefix K/V reused across requests
         /// (shared system and tool preambles, earlier turns); separate from
         /// `--kv-budget-mib`. 0 disables reuse.
@@ -171,6 +173,12 @@ pub(crate) enum Command {
         /// registry entry's `queue_wait_ms` overrides it.
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=600_000))]
         queue_wait_ms: u32,
+        /// Sequences a generating model decodes together in one batched
+        /// step; the paged K/V pool is `--kv-budget-mib`. The default, 1,
+        /// serves one request at a time without the batching engine, which
+        /// is faster for a single stream until its per-step cost is closed.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
+        max_num_seqs: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]

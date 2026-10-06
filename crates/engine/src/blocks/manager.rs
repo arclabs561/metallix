@@ -103,8 +103,13 @@ struct Sequence {
     computed: usize,
     /// Keys of the leading full computed blocks.
     hashes: Vec<BlockHash>,
-    /// Tokens after the last hashed block, up to `scheduled`.
+    /// Tokens after the last hashed block, up to `scheduled`, except the
+    /// last `unresolved`.
     unhashed: Vec<u32>,
+    /// Trailing scheduled positions whose token values are not known yet: a
+    /// pipelined step reserves a slot for an input the device has not read
+    /// back. See [`BlockManager::allocate_unresolved`].
+    unresolved: usize,
 }
 
 /// Block tables, reference counts, the free queue, and the prefix cache for
@@ -127,6 +132,7 @@ struct Pool {
     free: FreeQueue,
     cached: HashMap<BlockHash, BlockId>,
     counters: KvCounters,
+    published_tokens: usize,
 }
 
 impl BlockManager {
@@ -144,6 +150,7 @@ impl BlockManager {
                 free: FreeQueue::full(blocks),
                 cached: HashMap::new(),
                 counters: KvCounters::default(),
+                published_tokens: 0,
             },
             sequences: HashMap::new(),
         }
@@ -187,6 +194,13 @@ impl BlockManager {
         self.pool.counters
     }
 
+    /// Tokens in full blocks newly published by successful commits. Repeated
+    /// commits and duplicate block hashes do not increment this counter.
+    #[must_use]
+    pub const fn published_tokens(&self) -> usize {
+        self.pool.published_tokens
+    }
+
     /// Returns the number of live sequences.
     #[must_use]
     pub fn sequences(&self) -> usize {
@@ -226,6 +240,16 @@ impl BlockManager {
     /// Returns [`BlockError::UnknownSequence`].
     pub fn num_tokens(&self, seq: SequenceId) -> Result<usize, BlockError> {
         Ok(self.sequence(seq)?.scheduled)
+    }
+
+    /// Returns the number of scheduled tokens whose values are not known yet
+    /// (see [`Self::allocate_unresolved`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError::UnknownSequence`].
+    pub fn num_unresolved(&self, seq: SequenceId) -> Result<usize, BlockError> {
+        Ok(self.sequence(seq)?.unresolved)
     }
 
     /// Returns the number of committed tokens.
@@ -365,6 +389,7 @@ impl BlockManager {
             computed: hit.cached_tokens,
             hashes: hit.hashes,
             unhashed: Vec::new(),
+            unresolved: 0,
         };
         let allocation = pool.append(&mut sequence, chunk);
         self.sequences.insert(seq, sequence);
@@ -394,6 +419,9 @@ impl BlockManager {
             .sequences
             .get_mut(&seq)
             .ok_or(BlockError::UnknownSequence(seq))?;
+        if sequence.unresolved > 0 {
+            return Err(BlockError::Unresolved(seq));
+        }
         let needed = self.pool.cost(sequence, tokens.len());
         if needed > self.pool.free.len() {
             return Err(BlockError::OutOfBlocks {
@@ -402,6 +430,57 @@ impl BlockManager {
             });
         }
         Ok(self.pool.append(sequence, tokens))
+    }
+
+    /// Reserves slots for `count` next tokens of `seq` whose values are not
+    /// known yet, such as the input of a decode step queued before the
+    /// previous step's pick is read back. [`Self::resolve`] supplies the
+    /// values, in order, before they can be hashed.
+    ///
+    /// # Errors
+    ///
+    /// [`BlockError::UnknownSequence`] or [`BlockError::OutOfBlocks`]; the
+    /// manager is unchanged on error.
+    pub fn allocate_unresolved(
+        &mut self,
+        seq: SequenceId,
+        count: usize,
+    ) -> Result<Allocation, BlockError> {
+        let sequence = self
+            .sequences
+            .get_mut(&seq)
+            .ok_or(BlockError::UnknownSequence(seq))?;
+        let needed = self.pool.cost(sequence, count);
+        if needed > self.pool.free.len() {
+            return Err(BlockError::OutOfBlocks {
+                needed,
+                free: self.pool.free.len(),
+            });
+        }
+        let allocation = self.pool.reserve(sequence, count);
+        sequence.unresolved += count;
+        Ok(allocation)
+    }
+
+    /// Supplies the values of the oldest unresolved tokens of `seq`.
+    ///
+    /// # Errors
+    ///
+    /// [`BlockError::UnknownSequence`], or [`BlockError::Unresolved`] when
+    /// `tokens` is longer than the unresolved run.
+    pub fn resolve(&mut self, seq: SequenceId, tokens: &[u32]) -> Result<(), BlockError> {
+        let sequence = self
+            .sequences
+            .get_mut(&seq)
+            .ok_or(BlockError::UnknownSequence(seq))?;
+        if tokens.len() > sequence.unresolved {
+            return Err(BlockError::Unresolved(seq));
+        }
+        sequence.unresolved -= tokens.len();
+        if self.pool.prefix_caching {
+            sequence.unhashed.extend_from_slice(tokens);
+        }
+        Ok(())
     }
 
     /// Marks every scheduled token of `seq` computed and publishes newly full
@@ -414,15 +493,40 @@ impl BlockManager {
     ///
     /// Returns [`BlockError::UnknownSequence`].
     pub fn commit(&mut self, seq: SequenceId) -> Result<(), BlockError> {
+        let scheduled = self.num_tokens(seq)?;
+        self.commit_through(seq, scheduled)
+    }
+
+    /// Marks the first `computed` tokens of `seq` computed, for a pipelined
+    /// step that finished while a later one is still queued, and publishes
+    /// newly full blocks whose tokens are all computed and resolved.
+    ///
+    /// # Errors
+    ///
+    /// [`BlockError::UnknownSequence`], or
+    /// [`BlockError::PositionOutOfRange`] when `computed` is past the
+    /// scheduled tokens.
+    pub fn commit_through(&mut self, seq: SequenceId, computed: usize) -> Result<(), BlockError> {
         let sequence = self
             .sequences
             .get_mut(&seq)
             .ok_or(BlockError::UnknownSequence(seq))?;
-        sequence.computed = sequence.scheduled;
+        if computed > sequence.scheduled {
+            return Err(BlockError::PositionOutOfRange {
+                position: TokenPosition::new(computed.saturating_sub(1)),
+                tokens: sequence.scheduled,
+            });
+        }
+        sequence.computed = sequence.computed.max(computed);
         let pool = &mut self.pool;
         let block_tokens = pool.block_tokens;
+        // Only tokens whose K/V exists may be published.
+        let hashable = sequence
+            .computed
+            .saturating_sub(sequence.hashes.len() * block_tokens)
+            .min(sequence.unhashed.len());
         let mut hashed = 0;
-        for tokens in sequence.unhashed.chunks_exact(block_tokens) {
+        for tokens in sequence.unhashed[..hashable].chunks_exact(block_tokens) {
             let hash = hash_block(sequence.hashes.last(), tokens, &sequence.keys);
             let block = sequence.table[sequence.hashes.len()];
             sequence.hashes.push(hash);
@@ -431,6 +535,7 @@ impl BlockManager {
             if key.is_none() && !pool.cached.contains_key(&hash) {
                 *key = Some(hash);
                 pool.cached.insert(hash, block);
+                pool.published_tokens = pool.published_tokens.saturating_add(block_tokens);
             }
         }
         sequence.unhashed.drain(..hashed);
@@ -452,7 +557,7 @@ impl BlockManager {
         if self.sequences.contains_key(&child) {
             return Err(BlockError::SequenceExists(child));
         }
-        if source.scheduled != source.computed {
+        if source.scheduled != source.computed || source.unresolved > 0 {
             return Err(BlockError::Uncommitted(parent));
         }
         let copy = source.clone();
@@ -507,6 +612,16 @@ impl BlockManager {
             }
             if sequence.computed > sequence.scheduled {
                 return Err(format!("{id:?}: computed past scheduled"));
+            }
+            if pool.prefix_caching {
+                let tail = sequence.scheduled - sequence.hashes.len() * pool.block_tokens;
+                if sequence.unhashed.len() + sequence.unresolved != tail {
+                    return Err(format!(
+                        "{id:?}: {} unhashed and {} unresolved tokens for a {tail}-token tail",
+                        sequence.unhashed.len(),
+                        sequence.unresolved
+                    ));
+                }
             }
         }
         for (index, (&count, &want)) in pool.ref_counts.iter().zip(&expected).enumerate() {
@@ -564,9 +679,18 @@ impl Pool {
 
     /// Appends after the caller checked `cost` against the free queue.
     fn append(&mut self, sequence: &mut Sequence, tokens: &[u32]) -> Allocation {
+        let allocation = self.reserve(sequence, tokens.len());
+        if self.prefix_caching {
+            sequence.unhashed.extend_from_slice(tokens);
+        }
+        allocation
+    }
+
+    /// Reserves slots for `count` tokens after the caller checked `cost`.
+    fn reserve(&mut self, sequence: &mut Sequence, count: usize) -> Allocation {
         let start = sequence.scheduled;
         let mut copy = None;
-        if !tokens.is_empty() && self.needs_copy(sequence) {
+        if count > 0 && self.needs_copy(sequence) {
             let last = sequence.table.len() - 1;
             let src = sequence.table[last];
             let dst = self.take_free();
@@ -578,17 +702,14 @@ impl Pool {
                 tokens: start % self.block_tokens,
             });
         }
-        let blocks = (start + tokens.len()).div_ceil(self.block_tokens);
+        let blocks = (start + count).div_ceil(self.block_tokens);
         while sequence.table.len() < blocks {
             let block = self.take_free();
             sequence.table.push(block);
         }
-        sequence.scheduled += tokens.len();
-        if self.prefix_caching {
-            sequence.unhashed.extend_from_slice(tokens);
-        }
+        sequence.scheduled += count;
         Allocation {
-            positions: TokenSpan::new(TokenPosition::new(start), tokens.len()),
+            positions: TokenSpan::new(TokenPosition::new(start), count),
             copy,
         }
     }

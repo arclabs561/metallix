@@ -195,7 +195,61 @@ fn next_weights_binding() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// An owned handle on loaded Qwen3 weights for a paged session.
+///
+/// The tensors are MLX array handles: cloning them shares the device
+/// buffers, so this copies no weight data. It lets a model thread hold a
+/// [`crate::forward::PagedQwen3Session`] for its whole life while the
+/// [`Qwen3MlxWeights`] it came from stays free for other borrows.
+pub struct Qwen3PagedWeights {
+    config: crate::forward::Qwen3ForwardConfig,
+    tensors: HashMap<String, Array>,
+}
+
+impl Qwen3PagedWeights {
+    /// The decoder configuration.
+    #[must_use]
+    pub const fn config(&self) -> &crate::forward::Qwen3ForwardConfig {
+        &self.config
+    }
+
+    /// Sizes a pool from a K/V byte budget at these weights' K/V precision.
+    pub fn pool_for_budget(
+        &self,
+        budget_bytes: u64,
+        block_tokens: engine::blocks::BlockTokens,
+    ) -> Result<engine::blocks::PoolConfig, crate::forward::Qwen3ForwardError> {
+        crate::forward::PagedQwen3Session::pool_for_budget(
+            &self.config,
+            &self.tensors,
+            budget_bytes,
+            block_tokens,
+        )
+    }
+
+    /// Allocates a paged K/V pool over these weights.
+    pub fn session(
+        &self,
+        pool: engine::blocks::PoolConfig,
+    ) -> Result<
+        crate::forward::PagedQwen3Session<'_, std::collections::hash_map::RandomState>,
+        crate::forward::Qwen3ForwardError,
+    > {
+        crate::forward::PagedQwen3Session::new(&self.config, &self.tensors, pool)
+    }
+}
+
 impl Qwen3MlxWeights {
+    /// An owned handle on these weights, in their current precision, for a
+    /// paged session.
+    #[must_use]
+    pub fn paged_weights(&self) -> Qwen3PagedWeights {
+        Qwen3PagedWeights {
+            config: self.forward_config.clone(),
+            tensors: self.tensors.clone(),
+        }
+    }
+
     /// Starts an independent sequence executor borrowing this checkpoint.
     /// Its KV state cannot be transferred to a different checkpoint.
     #[must_use]

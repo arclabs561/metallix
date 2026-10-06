@@ -102,6 +102,12 @@ impl ServedEntry {
             wait: self
                 .queue_wait_ms
                 .map_or(defaults.wait, Duration::from_millis),
+            // Only generating models batch; the rest run one request at a time.
+            max_running: if self.kind.generates() {
+                defaults.max_running
+            } else {
+                1
+            },
         }
     }
 }
@@ -207,6 +213,13 @@ fn parse_manifest(bytes: &[u8]) -> Result<Vec<ServedEntry>, String> {
 /// a capability the model lacks returns `None`.
 pub(crate) trait ModelWorker {
     fn chat(&mut self) -> Option<&mut dyn ChatBackend>;
+
+    /// Parts for a batching engine, when the model decodes through a paged
+    /// pool. Decoders whose state cannot be paged (recurrent hybrids) keep
+    /// the default and are served one request at a time.
+    fn engine_seed(&mut self) -> Option<Result<crate::chat_generation::EngineSeed, String>> {
+        None
+    }
     fn decide(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>>;
 
     fn embed(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
@@ -225,6 +238,10 @@ pub(crate) trait ModelWorker {
 }
 
 impl ModelWorker for ChatSession {
+    fn engine_seed(&mut self) -> Option<Result<crate::chat_generation::EngineSeed, String>> {
+        Some(ChatSession::engine_seed(self))
+    }
+
     fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
         Some(self)
     }
@@ -464,7 +481,8 @@ mod tests {
             parsed[0].queue(defaults),
             QueueSettings {
                 depth: 0,
-                wait: Duration::from_millis(2500)
+                wait: Duration::from_millis(2500),
+                max_running: 1,
             }
         );
         assert_eq!(parsed[1].queue(defaults), defaults);

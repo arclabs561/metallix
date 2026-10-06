@@ -546,6 +546,36 @@ fn stale_hit_is_rejected() {
 }
 
 #[test]
+fn publication_receipts_count_only_newly_published_blocks() {
+    let mut manager = manager(1);
+    let prompt: Vec<u32> = (0..=(2 * BLOCK as u32)).collect();
+    // Admit concurrent misses before either has published the same prefix.
+    for seq in [SequenceId(1), SequenceId(2)] {
+        let hit = manager.lookup_prefix(&prompt, HashKeys::new());
+        manager.admit(seq, hit, &prompt).unwrap();
+    }
+    assert_eq!(manager.published_tokens(), 0);
+    manager.commit(SequenceId(1)).unwrap();
+    assert_eq!(manager.published_tokens(), 2 * BLOCK);
+    manager.commit(SequenceId(1)).unwrap();
+    assert_eq!(manager.published_tokens(), 2 * BLOCK);
+    manager.commit(SequenceId(2)).unwrap();
+    assert_eq!(manager.published_tokens(), 2 * BLOCK);
+    assert!(manager.commit(SequenceId(3)).is_err());
+    assert_eq!(manager.published_tokens(), 2 * BLOCK);
+    assert!(
+        manager
+            .commit_through(SequenceId(1), prompt.len() + 1)
+            .is_err()
+    );
+    assert_eq!(manager.published_tokens(), 2 * BLOCK);
+    let hit = manager.lookup_prefix(&prompt, HashKeys::new().with_salt("other"));
+    manager.admit(SequenceId(3), hit, &prompt).unwrap();
+    manager.commit(SequenceId(3)).unwrap();
+    assert_eq!(manager.published_tokens(), 4 * BLOCK);
+}
+
+#[test]
 fn disabled_prefix_caching_never_publishes() {
     let tokens = BlockTokens::new(BLOCK as u32).expect("power of two");
     let config = PoolConfig::new(tokens, 1)
@@ -555,6 +585,7 @@ fn disabled_prefix_caching_never_publishes() {
     let prompt: Vec<u32> = (0..3 * BLOCK as u32).collect();
     admit_all(&mut manager, 1, &prompt, HashKeys::new());
     assert_eq!(manager.cached_blocks(), 0);
+    assert_eq!(manager.published_tokens(), 0);
     assert_eq!(
         manager
             .lookup_prefix(&prompt, HashKeys::new())
@@ -655,4 +686,94 @@ fn config_validates_and_sizes_from_budget() {
     );
     let block = BlockId(70);
     assert_eq!((block.slab(), block.index_in_slab()), (2, 6));
+}
+
+/// A pipelined decode reserves each step's slot before its input token is
+/// known, resolves it when the previous step is read back, and commits only
+/// through the finished step. It must publish exactly the blocks, under
+/// exactly the keys, that plain allocate-and-commit publishes.
+#[test]
+fn pipelined_steps_publish_the_same_prefix_as_plain_steps() {
+    let prompt: Vec<u32> = (0..6).collect();
+    let generated: Vec<u32> = (100..111).collect();
+    let keys = HashKeys::new().with_salt("tenant");
+
+    let mut plain = manager(1);
+    admit_all(&mut plain, 1, &prompt, keys.clone());
+    for &token in &generated {
+        plain.allocate(SequenceId(1), &[token]).expect("room");
+        plain.commit(SequenceId(1)).expect("live");
+    }
+
+    let mut piped = manager(1);
+    admit_all(&mut piped, 1, &prompt, keys.clone());
+    let seq = SequenceId(1);
+    // The first generated token comes from the prefill's host pick.
+    piped.allocate(seq, &generated[..1]).expect("room");
+    for (step, &token) in generated.iter().enumerate().skip(1) {
+        // Step `step` is queued before step `step - 1` finishes.
+        piped.allocate_unresolved(seq, 1).expect("room");
+        assert!(matches!(
+            piped.allocate(seq, &[token]),
+            Err(BlockError::Unresolved(_))
+        ));
+        piped
+            .check_invariants()
+            .expect("invariants with a queued step");
+        // Step `step - 1` finishes: its input is computed, and its pick is
+        // the queued step's input.
+        piped
+            .commit_through(seq, prompt.len() + step)
+            .expect("live");
+        piped.resolve(seq, &[token]).expect("one unresolved");
+        piped
+            .check_invariants()
+            .expect("invariants after resolving");
+    }
+    piped
+        .commit_through(seq, prompt.len() + generated.len())
+        .expect("live");
+
+    let table = |manager: &BlockManager| {
+        manager
+            .block_table(seq)
+            .expect("live")
+            .iter()
+            .map(|block| manager.cached_hash(*block))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(table(&piped), table(&plain));
+    assert_eq!(piped.cached_blocks(), plain.cached_blocks());
+    assert!(piped.cached_blocks() >= 3, "full blocks were published");
+    let mut lookup = prompt.clone();
+    lookup.extend(&generated);
+    assert_eq!(
+        piped.lookup_prefix(&lookup, keys.clone()).cached_tokens(),
+        plain.lookup_prefix(&lookup, keys).cached_tokens()
+    );
+}
+
+/// A block holding a queued step's slot is never published before that
+/// step's K/V exists, even when its token value is already resolved.
+#[test]
+fn unfinished_positions_are_not_published() {
+    let mut blocks = manager(1);
+    let seq = SequenceId(1);
+    admit_all(&mut blocks, 1, &[1, 2, 3], HashKeys::new());
+    blocks.allocate_unresolved(seq, 1).expect("room");
+    blocks.resolve(seq, &[4]).expect("one unresolved");
+    // The fourth token completes block 0, but its step has not finished.
+    blocks.commit_through(seq, 3).expect("live");
+    assert_eq!(blocks.cached_blocks(), 0);
+    assert!(matches!(
+        blocks.fork(seq, SequenceId(2)),
+        Err(BlockError::Uncommitted(_))
+    ));
+    blocks.commit_through(seq, 4).expect("live");
+    assert_eq!(blocks.cached_blocks(), 1);
+    assert!(matches!(
+        blocks.resolve(seq, &[5]),
+        Err(BlockError::Unresolved(_))
+    ));
+    blocks.check_invariants().expect("invariants");
 }

@@ -532,3 +532,154 @@ fn paged_batch_qwen3_06b_profile() {
         }
     }
 }
+
+/// Queued (pipelined) greedy steps pick the same tokens as synchronous
+/// greedy batches of the same composition. Step k + 1 is queued with every
+/// row's input still on the device before step k is read back. A row that
+/// leaves after step k stays allocated until its queued step k + 1 settles;
+/// a row that joins brings a host token. The synchronous run decodes the leaving
+/// row in step k + 1 too and frees it after, so both runs batch the same rows
+/// in the same order at every step.
+#[test]
+fn queued_steps_match_synchronous_greedy_steps() {
+    use crate::forward::{QueuedDecode, StepInput};
+
+    const LEAVE_AFTER: usize = 3;
+    const JOIN_AT: usize = 5;
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = paged_config();
+    let weights = paged_weights(&config);
+    let prompts = mixed_prompts(5, 4);
+    let mut sync = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged");
+    let mut piped = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged");
+    let prefill = |session: &mut PagedQwen3Session<'_, RandomState>, row: usize| {
+        let seq = SequenceId(row as u64 + 1);
+        let logits = session
+            .prefill_last_logits(seq, &prompts[row])
+            .expect("prefill");
+        (seq, first_argmax(&logits))
+    };
+    let leaving = SequenceId(2);
+
+    // Synchronous reference: every step's rows and picks.
+    let mut rows = (0..4)
+        .map(|row| prefill(&mut sync, row))
+        .collect::<Vec<_>>();
+    let mut expected = Vec::new();
+    for step in 0..10 {
+        if step == JOIN_AT {
+            rows.push(prefill(&mut sync, 4));
+        }
+        let BatchDecoded::Greedy(tokens) = sync
+            .decode_batch(&rows, BatchReadback::Greedy)
+            .expect("sync step")
+        else {
+            panic!("asked for greedy tokens");
+        };
+        expected.push(
+            rows.iter()
+                .map(|&(seq, _)| seq)
+                .zip(tokens.clone())
+                .collect::<Vec<_>>(),
+        );
+        for (row, token) in rows.iter_mut().zip(tokens) {
+            row.1 = token;
+        }
+        if step == LEAVE_AFTER + 1 {
+            sync.free(leaving).expect("live");
+            rows.retain(|&(seq, _)| seq != leaving);
+        }
+    }
+
+    // Pipelined: queue step k + 1, then read step k.
+    let start = (0..4)
+        .map(|row| prefill(&mut piped, row))
+        .collect::<Vec<_>>();
+    let mut pending: QueuedDecode = piped
+        .queue_decode(
+            &start
+                .iter()
+                .map(|&(seq, token)| (seq, StepInput::Host(token)))
+                .collect::<Vec<_>>(),
+            None,
+        )
+        .expect("queue step 0");
+    let mut live = start.iter().map(|&(seq, _)| seq).collect::<Vec<_>>();
+    for (step, expected) in expected.iter().enumerate() {
+        let mut next = pending
+            .rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, seq)| live.contains(seq))
+            .map(|(index, &seq)| (seq, StepInput::Previous(index)))
+            .collect::<Vec<_>>();
+        if step + 1 == JOIN_AT {
+            let (seq, token) = prefill(&mut piped, 4);
+            next.push((seq, StepInput::Host(token)));
+            live.push(seq);
+        }
+        let queued =
+            (step + 1 < 10).then(|| piped.queue_decode(&next, Some(&pending)).expect("queue"));
+        let tokens = piped.finish_decode(&pending).expect("finish");
+        let actual = pending
+            .rows()
+            .iter()
+            .copied()
+            .zip(tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(&actual, expected, "step {step}");
+        if step == LEAVE_AFTER {
+            // Stop scheduling it; the already queued next step still owns it.
+            live.retain(|&seq| seq != leaving);
+        }
+        if step == LEAVE_AFTER + 1 {
+            // Its last queued step has settled; its slots are reusable now.
+            piped.free(leaving).expect("live");
+        }
+        match queued {
+            Some(queued) => pending = queued,
+            None => break,
+        }
+    }
+    assert_eq!(
+        piped.blocks().free_blocks(),
+        sync.blocks().free_blocks(),
+        "both runs hold the same blocks"
+    );
+}
+
+/// A failed readback must not return rows to the allocator while the next
+/// queued step still owns them. Cleanup belongs to the scheduling caller.
+#[test]
+fn failed_queued_readback_retains_rows_until_caller_retires_them() {
+    use crate::forward::StepInput;
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = paged_config();
+    let weights = paged_weights(&config);
+    let mut session = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged");
+    let seq = SequenceId(1);
+    let logits = session
+        .prefill_last_logits(seq, &[1, 2, 4])
+        .expect("prefill");
+    let mut first = session
+        .queue_decode(&[(seq, StepInput::Host(first_argmax(&logits)))], None)
+        .expect("first step");
+    let next = session
+        .queue_decode(&[(seq, StepInput::Previous(0))], Some(&first))
+        .expect("next step");
+    first.invalidate_commit_length();
+    assert!(session.finish_decode(&first).is_err());
+    let retained = session.blocks().num_tokens(seq).is_ok();
+    // Always settle pending GPU work, including when the old behavior is red.
+    let _ = session.finish_decode(&next);
+    let _ = session.free(seq);
+    assert!(
+        retained,
+        "failed readback freed rows owned by a queued next step"
+    );
+    assert_eq!(session.blocks().sequences(), 0);
+    assert_eq!(
+        session.blocks().free_blocks(),
+        session.blocks().total_blocks()
+    );
+}

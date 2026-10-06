@@ -6,19 +6,21 @@ use std::{
     process::ExitCode,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
     thread,
     time::{Duration, Instant},
 };
 
+use engine::blocks::BlockTokens;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::field::Empty;
 
 use crate::{
-    chat_generation::ResidentChatLimits,
+    chat_generation::{EngineSeed, ResidentChatLimits},
+    engine_loop::{self, EngineClient, EngineLimits, EngineMessage, EngineModel},
     generation_routes::{Generation, error_body, error_response},
     gpu,
     http_transport::{Connection, TransportLimits},
@@ -134,6 +136,81 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
     serve_jobs(worker, jobs, None);
 }
 
+/// The startup report from a model thread: a batching engine's client, or
+/// `None` for a model served one job at a time.
+type Startup = Result<Option<EngineClient<GenerationJob>>, String>;
+
+/// The batching engine's parts when `limits` ask for batching and the model
+/// can page its state; otherwise the model is served one job at a time.
+fn engine_seed(
+    worker: &mut dyn ModelWorker,
+    limits: EngineLimits,
+) -> Option<Result<EngineSeed, String>> {
+    if limits.batches() {
+        worker.engine_seed()
+    } else {
+        None
+    }
+}
+
+/// Builds a paged pool from `seed` and runs the batching engine on this
+/// thread until the acceptor drops its client. Non-generation jobs run
+/// between engine steps.
+fn serve_engine(
+    worker: &mut dyn ModelWorker,
+    seed: Result<EngineSeed, String>,
+    limits: EngineLimits,
+    startup: &SyncSender<Startup>,
+) {
+    let built = seed.and_then(|seed| {
+        let pool = seed
+            .weights
+            .pool_for_budget(seed.kv_budget_bytes, BlockTokens::DEFAULT)
+            .map_err(|error| format!("KV pool: {error}"))?;
+        Ok((seed, pool))
+    });
+    let (seed, pool) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            let _ = startup.send(Err(error));
+            return;
+        }
+    };
+    let session = match seed.weights.session(pool) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = startup.send(Err(format!("KV pool: {error}")));
+            return;
+        }
+    };
+    tracing::info!(
+        pool_bytes = session.pool_bytes(),
+        blocks = session.blocks().total_blocks(),
+        max_num_seqs = limits.max_num_seqs,
+        cache_limit_bytes = gpu::cache_limit_bytes(),
+        "batching engine ready"
+    );
+    let model = Arc::new(EngineModel {
+        format: Arc::clone(&seed.format),
+        sampling_defaults: seed.sampling_defaults,
+        model: seed.model.clone(),
+        vocabulary_size: seed.vocabulary_size,
+        context_limit: seed.context_limit,
+        pool_bytes: session.pool_bytes() as u64,
+        load_ms: seed.load_ms,
+    });
+    let (messages, receiver) = sync_channel(limits.capacity());
+    if startup
+        .send(Ok(Some(EngineClient::new(model, messages))))
+        .is_err()
+    {
+        return;
+    }
+    engine_loop::run(session, &seed.format, limits, &receiver, |job| {
+        serve_job(worker, job, None);
+    });
+}
+
 /// Runs admitted jobs in order, keeping wired model memory resident between
 /// them (see [`gpu::keep_resident`]). `capture` wraps the first job in a
 /// Metal capture.
@@ -143,31 +220,35 @@ fn serve_jobs(
     mut capture: Option<PathBuf>,
 ) {
     for job in gpu::keep_resident(jobs) {
-        let GenerationJob {
-            connection,
-            work,
-            _admission: admission,
-            span,
-        } = job;
-        span.in_scope(|| {
-            let started = Instant::now();
-            let capturing = capture.take().and_then(|path| {
-                gpu::Capture::start(&path)
-                    .inspect_err(|error| tracing::error!("{error}"))
-                    .ok()
-            });
-            gpu::reset_peak_memory();
-            run_job(worker, connection, work, admission, &span);
-            gpu::Memory::record_on(&span);
-            drop(capturing);
-            tracing::info!(
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "request finished"
-            );
-        });
-        // The request span has exited, so its end is in this flush.
-        crate::telemetry::flush();
+        serve_job(worker, job, capture.take());
     }
+}
+
+/// Runs one admitted job inside its request span, flushing after it exits.
+fn serve_job(worker: &mut dyn ModelWorker, job: GenerationJob, capture: Option<PathBuf>) {
+    let GenerationJob {
+        connection,
+        work,
+        _admission: admission,
+        span,
+    } = job;
+    span.in_scope(|| {
+        let started = Instant::now();
+        let capturing = capture.and_then(|path| {
+            gpu::Capture::start(&path)
+                .inspect_err(|error| tracing::error!("{error}"))
+                .ok()
+        });
+        gpu::reset_peak_memory();
+        run_job(worker, connection, work, admission, &span);
+        gpu::Memory::record_on(&span);
+        drop(capturing);
+        tracing::info!(
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "request finished"
+        );
+    });
+    crate::telemetry::flush();
 }
 
 fn run_job(
@@ -298,6 +379,7 @@ pub(crate) fn serve_child(
     entry: ServedEntry,
     address: SocketAddr,
     limits: ResidentChatLimits,
+    engine_limits: EngineLimits,
     generation_timeout: Duration,
     capture: Option<&Path>,
 ) -> ExitCode {
@@ -316,7 +398,14 @@ pub(crate) fn serve_child(
         crate::telemetry::finish();
         std::process::exit(0);
     });
-    match serve_inner(&[entry], address, limits, generation_timeout, capture) {
+    match serve_inner(
+        &[entry],
+        address,
+        limits,
+        engine_limits,
+        generation_timeout,
+        capture,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("mx serve: {error}");
@@ -332,8 +421,65 @@ struct ServedModel {
     generates: bool,
     capabilities: &'static [&'static str],
     jobs: SyncSender<GenerationJob>,
+    /// Admits one job at a time: a serial model's every request, or an
+    /// engine model's non-generation work.
     occupied: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    /// Set when the model decodes in batches: generation goes through the
+    /// engine, up to its capacity, and other work runs between its steps.
+    engine: Option<EngineRoute>,
+}
+
+/// How the acceptor reaches a batching engine.
+struct EngineRoute {
+    client: EngineClient<GenerationJob>,
+    /// Admitted generations: running in the engine or waiting in it.
+    admitted: Arc<AtomicUsize>,
+    capacity: usize,
+}
+
+/// One admitted engine generation, released when its writer finishes.
+struct EngineAdmission {
+    admitted: Arc<AtomicUsize>,
+}
+
+impl EngineAdmission {
+    fn try_acquire(route: &EngineRoute) -> Option<Self> {
+        Self::reserve(&route.admitted, route.capacity)
+    }
+
+    /// Takes one of `capacity` slots counted by `admitted`, if one is free.
+    fn reserve(admitted: &Arc<AtomicUsize>, capacity: usize) -> Option<Self> {
+        let mut current = admitted.load(Ordering::Acquire);
+        loop {
+            if current >= capacity {
+                return None;
+            }
+            match admitted.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => current = now,
+            }
+        }
+        Some(Self {
+            admitted: Arc::clone(admitted),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_engine_admission(admitted: &Arc<AtomicUsize>) -> impl Send + use<> {
+    EngineAdmission::reserve(admitted, 1).expect("free test admission")
+}
+
+impl Drop for EngineAdmission {
+    fn drop(&mut self) {
+        self.admitted.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[allow(
@@ -344,6 +490,7 @@ fn serve_inner(
     entries: &[ServedEntry],
     address: SocketAddr,
     limits: ResidentChatLimits,
+    engine_limits: EngineLimits,
     generation_timeout: Duration,
     capture: Option<&Path>,
 ) -> Result<(), String> {
@@ -416,14 +563,25 @@ fn serve_inner(
                 }
                 drop(entered);
                 drop(load);
-                if startup_sender.send(Ok(())).is_ok() {
-                    serve_jobs(worker.as_mut(), job_receiver, worker_capture);
+                match engine_seed(worker.as_mut(), engine_limits) {
+                    Some(seed) => {
+                        serve_engine(worker.as_mut(), seed, engine_limits, &startup_sender);
+                    }
+                    None => {
+                        if startup_sender.send(Ok(None)).is_ok() {
+                            serve_jobs(worker.as_mut(), job_receiver, worker_capture);
+                        }
+                    }
                 }
             })
             .map_err(|error| format!("{}: could not start the model thread: {error}", entry.id))?;
         workers.push(worker);
-        match startup_receiver.recv() {
-            Ok(Ok(())) => {}
+        let engine = match startup_receiver.recv() {
+            Ok(Ok(client)) => client.map(|client| EngineRoute {
+                client,
+                admitted: Arc::new(AtomicUsize::new(0)),
+                capacity: engine_limits.capacity(),
+            }),
             failed => {
                 drop(models);
                 for worker in workers {
@@ -434,7 +592,7 @@ fn serve_inner(
                     _ => format!("{}: model worker ended before startup", entry.id),
                 });
             }
-        }
+        };
         models.push(ServedModel {
             id: entry.id.clone(),
             generates: entry.kind.generates(),
@@ -442,6 +600,7 @@ fn serve_inner(
             jobs: job_sender,
             occupied: Arc::new(AtomicBool::new(false)),
             alive,
+            engine,
         });
     }
     let outcome = match TcpListener::bind(address) {
@@ -449,8 +608,18 @@ fn serve_inner(
             // The front process reads this line to find a child's ephemeral
             // port, so it is written raw rather than as a filtered log event.
             let address = server.local_addr().unwrap_or(address);
+            let max_running = models
+                .iter()
+                .map(|model| {
+                    model
+                        .engine
+                        .as_ref()
+                        .map_or(1, |_| engine_limits.max_num_seqs)
+                })
+                .max()
+                .unwrap_or(1);
             eprintln!(
-                "mx listening on http://{address}; models={}; one request per model; {} total tokens; kv_budget_bytes={}",
+                "mx listening on http://{address}; models={}; max_running={max_running}; {} total tokens; kv_budget_bytes={}",
                 entries.len(),
                 limits.context_tokens(),
                 limits.kv_budget_bytes(),
@@ -517,6 +686,7 @@ fn serve_listener_with_limits(
         capabilities: &["generate"],
         jobs: job_sender.clone(),
         occupied: Arc::clone(occupied),
+        engine: None,
         alive: Arc::clone(worker_alive),
     }];
     serve_models(
@@ -674,6 +844,10 @@ fn serve_models(
                 _ => Work::Embed { body, model },
             }
         };
+        if let Some(route) = &model.engine {
+            route_to_engine(route, &model.occupied, connection, work, &span)?;
+            continue;
+        }
         let Some(admission) = Admission::try_acquire(&model.occupied) else {
             span.record("error.type", "server_busy");
             tracing::info!("rejected: model is busy");
@@ -703,6 +877,87 @@ fn serve_models(
     Ok(())
 }
 
+/// Admits `work` for an engine model. A generation gets its own writer
+/// thread, which prepares the turn and streams the engine's tokens; other work
+/// waits for the engine to run it between steps. Errs only when the engine is
+/// gone.
+fn route_to_engine(
+    route: &EngineRoute,
+    occupied: &Arc<AtomicBool>,
+    connection: Connection,
+    work: Work,
+    span: &tracing::Span,
+) -> Result<(), String> {
+    match work {
+        Work::Respond {
+            generation,
+            id,
+            generation_timeout,
+        } => {
+            let Some(admission) = EngineAdmission::try_acquire(route) else {
+                span.record("error.type", "server_busy");
+                tracing::info!("rejected: model is at its batching capacity");
+                busy_response(connection);
+                return Ok(());
+            };
+            let mut client = route.client.clone();
+            let span = span.clone();
+            let spawned = thread::Builder::new()
+                .name(String::from("writer"))
+                .spawn(move || {
+                    span.in_scope(|| {
+                        // Dropped in reverse order: capacity is released before
+                        // the socket closes, as for serial jobs.
+                        let _socket = connection.hold_open();
+                        let _admission = admission;
+                        if let Err(error) =
+                            generation.respond(connection, &mut client, &id, generation_timeout)
+                        {
+                            span.record("error.type", "response_failed");
+                            tracing::warn!("response failed: {error}");
+                        }
+                        gpu::Memory::record_on(&span);
+                    });
+                    // The writer span has exited, so this flush includes its end.
+                    crate::telemetry::flush();
+                });
+            if let Err(error) = spawned {
+                tracing::error!("could not start a response writer: {error}");
+            }
+            Ok(())
+        }
+        work => {
+            let Some(admission) = Admission::try_acquire(occupied) else {
+                span.record("error.type", "server_busy");
+                tracing::info!("rejected: model is busy");
+                error_response(
+                    connection,
+                    503,
+                    Some("server_busy"),
+                    "the model is busy with another request",
+                );
+                return Ok(());
+            };
+            let job = GenerationJob {
+                connection,
+                work,
+                _admission: admission,
+                span: span.clone(),
+            };
+            route
+                .client
+                .messages()
+                .send(EngineMessage::Exclusive(job))
+                .map_err(|error| {
+                    if let EngineMessage::Exclusive(job) = error.0 {
+                        unavailable_response(job.connection);
+                    }
+                    String::from("model worker is unavailable")
+                })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// How long a test waits for a response, event or release before it
@@ -730,6 +985,18 @@ mod tests {
         chat_generation::{ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest},
         responses::{Request, messages, respond, tools},
     };
+
+    #[test]
+    fn engine_admission_counts_up_to_capacity_and_releases_on_drop() {
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let held = (0..3)
+            .map(|_| EngineAdmission::reserve(&admitted, 3).expect("a free slot"))
+            .collect::<Vec<_>>();
+        assert!(EngineAdmission::reserve(&admitted, 3).is_none());
+        drop(held);
+        assert_eq!(admitted.load(Ordering::Acquire), 0);
+        assert!(EngineAdmission::reserve(&admitted, 3).is_some());
+    }
 
     #[derive(Default)]
     struct DeadlineBackend {
@@ -1502,6 +1769,38 @@ stream.close()
         assert!(!occupied.load(Ordering::Acquire));
     }
 
+    /// A generating model that can batch, and records whether the engine
+    /// asked for its parts.
+    struct BatchCapable {
+        asked: bool,
+    }
+
+    impl ModelWorker for BatchCapable {
+        fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+            None
+        }
+
+        fn engine_seed(&mut self) -> Option<Result<EngineSeed, String>> {
+            self.asked = true;
+            Some(Err(String::from("not built in this test")))
+        }
+
+        fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+            None
+        }
+    }
+
+    #[test]
+    fn one_sequence_at_a_time_keeps_the_serial_path() {
+        let mut worker = BatchCapable { asked: false };
+        let serial = EngineLimits { max_num_seqs: 1 };
+        assert!(super::engine_seed(&mut worker, serial).is_none());
+        assert!(!worker.asked, "the serial default never builds an engine");
+        let batching = EngineLimits { max_num_seqs: 2 };
+        assert!(super::engine_seed(&mut worker, batching).is_some());
+        assert!(worker.asked);
+    }
+
     /// Answers decisions with a fixed receipt that names the requested model.
     struct FixedDecider;
 
@@ -1595,6 +1894,7 @@ stream.close()
                 capabilities: &["decide", "embed", "rerank"],
                 jobs,
                 occupied: Arc::clone(&occupied),
+                engine: None,
                 alive: Arc::new(AtomicBool::new(true)),
             }];
             let server = thread::spawn(move || {
@@ -1686,6 +1986,7 @@ stream.close()
             jobs,
             occupied: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
+            engine: None,
         };
         let models = [
             model("embedder", &["embed", "rerank"], embed_jobs),
@@ -1820,6 +2121,7 @@ stream.close()
             jobs,
             occupied: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
+            engine: None,
         };
         let models = [
             model("chat", true, &["generate"], chat_jobs),

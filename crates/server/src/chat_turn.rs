@@ -171,6 +171,7 @@ pub(crate) struct TurnLoop {
 }
 
 /// What a finished token loop hands to the response.
+#[derive(Debug)]
 pub(crate) struct TurnOutput {
     pub(crate) generated: Vec<i32>,
     pub(crate) logprobs: Vec<TokenLogprob>,

@@ -44,7 +44,9 @@ mod turn;
 pub(crate) use decoder::{ChatDecoderSession, FullRowDecoder};
 pub(crate) use gemma::GemmaDecoder;
 pub(crate) use qwen35_decoder::Qwen35Decoder;
-pub(crate) use turn::{TurnModel, TurnStart, TurnStep};
+pub(crate) use turn::{
+    Accepted, TurnLoop, TurnModel, TurnOutput, TurnStart, TurnStep, TurnTextEnd,
+};
 
 #[cfg(test)]
 #[path = "chat_decode_checkpoint_tests.rs"]
@@ -503,8 +505,9 @@ pub(crate) struct ChatGenerationMetrics {
     pub(crate) prompt_tokens: usize,
     /// Leading prompt tokens restored from the prefix cache, not prefilled.
     pub(crate) cached_prompt_tokens: usize,
-    /// Leading prompt tokens this turn copied into the prefix cache for later
-    /// requests: the longest prefix it stored, or 0.
+    /// Newly created prompt-cache positions, excluding restored tokens.
+    /// The paged engine reports full blocks published during initial prefill;
+    /// later decode/resume publications are not included.
     pub(crate) cache_write_tokens: usize,
     pub(crate) generated_tokens: usize,
     /// Draft verification counts, present only when a verify step ran.
@@ -555,6 +558,25 @@ pub(crate) struct ChatGeneration {
 }
 
 impl ChatGeneration {
+    /// A turn finished outside this module's serial driver, such as by the
+    /// batching engine: the text side's end and the token loop's output.
+    pub(crate) fn finished(
+        end: TurnTextEnd,
+        output: TurnOutput,
+        finish_reason: ChatFinishReason,
+        metrics: ChatGenerationMetrics,
+    ) -> Self {
+        Self {
+            text: end.text,
+            turn: end.turn,
+            generated_token_ids: output.generated,
+            finish_reason,
+            metrics,
+            logprobs: output.logprobs,
+            sampling: Some(output.sampling),
+        }
+    }
+
     /// SHA-256 and byte length of the decoded output, for receipts that
     /// identify a turn without carrying its text.
     #[must_use]
@@ -625,11 +647,11 @@ impl GenerationDeadline {
         }
     }
 
-    fn check(self) -> Result<(), ChatGenerationError> {
+    pub(crate) fn check(self) -> Result<(), ChatGenerationError> {
         self.check_at(Instant::now())
     }
 
-    fn check_at(self, now: Instant) -> Result<(), ChatGenerationError> {
+    pub(crate) fn check_at(self, now: Instant) -> Result<(), ChatGenerationError> {
         if self.expired_at(now) {
             Err(ChatGenerationError::DeadlineExceeded)
         } else {
@@ -651,7 +673,7 @@ pub(crate) enum ChatGenerationError {
 }
 
 impl ChatGenerationError {
-    fn message(message: impl Into<String>) -> Self {
+    pub(crate) fn message(message: impl Into<String>) -> Self {
         Self::Message(message.into())
     }
 }
@@ -687,6 +709,20 @@ pub(crate) struct ChatSession {
     sampling_defaults: SamplingDefaults,
     /// Prompt-prefix K/V kept across turns, bounded by `--prefix-cache-mib`.
     prefix_cache: prefix_cache::PrefixCache<qwen::forward::Qwen3KvSnapshot>,
+}
+
+/// The parts of a loaded session a batched engine is built from; see
+/// [`ChatSession::engine_seed`].
+pub(crate) struct EngineSeed {
+    pub(crate) weights: qwen::metal::Qwen3PagedWeights,
+    pub(crate) format: std::sync::Arc<ChatFormat>,
+    pub(crate) sampling_defaults: SamplingDefaults,
+    pub(crate) model: PathBuf,
+    pub(crate) vocabulary_size: usize,
+    pub(crate) context_limit: usize,
+    /// The paged pool's size.
+    pub(crate) kv_budget_bytes: u64,
+    pub(crate) load_ms: f64,
 }
 
 /// The non-generative result of a single independently-prefilled chat prompt.
@@ -952,7 +988,7 @@ impl ChatSession {
                         if turn.generated().len() + 1 < max_tokens as usize {
                             // This step's draw is not committed yet, so the
                             // next step's variate is one draw ahead.
-                            let rule = turn.gpu_rule(&self.format, 1).ok_or_else(|| {
+                            let rule = turn.gpu_rule(&self.format, ahead(1)).ok_or_else(|| {
                                 String::from("GPU pick rule changed within a turn")
                             })?;
                             pending = Some(
@@ -968,6 +1004,10 @@ impl ChatSession {
                     let step_ms = elapsed_ms(last_token_at.elapsed());
                     span.record("decode_ms", step_ms);
                     decode_ms.push(step_ms);
+                    if accepted.token != gpu_token {
+                        #[cfg(test)]
+                        draw_checks::rejected();
+                    }
                     if accepted.token != gpu_token && pending.take().is_some() {
                         // The f32 GPU draw landed across a cumulative-mass
                         // boundary from the exact draw; the queued step was
@@ -1068,7 +1108,7 @@ impl ChatSession {
                 // After the prefill token or a rejected GPU draw; later steps
                 // were queued above. Every draw so far is committed.
                 deadline.check()?;
-                let rule = turn.gpu_rule(&self.format, 0).ok_or_else(|| {
+                let rule = turn.gpu_rule(&self.format, ahead(0)).ok_or_else(|| {
                     ChatGenerationError::message("GPU pick rule changed within a turn")
                 })?;
                 pending = Some(
@@ -1093,7 +1133,7 @@ impl ChatSession {
         // Copies the reusable prompt prefixes out of this turn's K/V; after the
         // last token, so it never delays the first one.
         let store = tracing::info_span!("chat.prefix_cache.store", store_ms = Empty);
-        let (cache_write_tokens, _) = timed(&store, "store_ms", || {
+        let (accepted_prefix, _) = timed(&store, "store_ms", || {
             prefix_cache::remember(
                 &self.weights,
                 &mut self.prefix_cache,
@@ -1103,6 +1143,7 @@ impl ChatSession {
                 &input_ids,
             )
         })?;
+        let cache_write_tokens = accepted_prefix.new_tokens_after(cached_prompt_tokens);
 
         deadline.check()?;
         let end = text.finish(
@@ -1138,6 +1179,22 @@ impl ChatSession {
                 generated_tokens,
                 speculation: SpeculationReceipt::from_stats(speculation_stats),
             },
+        })
+    }
+
+    /// What a batched engine over these weights needs: a handle on the
+    /// weights that shares their buffers, and the facts writers prepare turns
+    /// from, with a chat format of its own that writer threads can share.
+    pub(crate) fn engine_seed(&self) -> Result<EngineSeed, String> {
+        Ok(EngineSeed {
+            weights: self.weights.paged_weights(),
+            format: std::sync::Arc::new(ChatFormat::load(&self.model, self.vocabulary_size)?),
+            sampling_defaults: self.sampling_defaults,
+            model: self.model.clone(),
+            vocabulary_size: self.vocabulary_size,
+            context_limit: self.context_limit,
+            kv_budget_bytes: self.kv_budget_bytes,
+            load_ms: self.load_ms,
         })
     }
 
@@ -1467,6 +1524,46 @@ fn timed<T, E>(
     let milliseconds = elapsed_ms(started.elapsed());
     span.record(field, milliseconds);
     Ok((value, milliseconds))
+}
+
+/// The variate offset for a queued GPU step: one ahead when the previous
+/// step's draw is still uncommitted, none after the prefill token or a
+/// requeue. Tests may skew it to simulate the off-by-one bug, which changes no
+/// output but makes the GPU draws disagree with the host's.
+fn ahead(offset: usize) -> usize {
+    #[cfg(test)]
+    return offset + draw_checks::skew();
+    #[cfg(not(test))]
+    offset
+}
+
+/// Test-only counters for GPU-drawn tokens the host rejected.
+#[cfg(test)]
+pub(crate) mod draw_checks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REJECTED: Cell<usize> = const { Cell::new(0) };
+        static SKEW: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn rejected() {
+        REJECTED.with(|count| count.set(count.get() + 1));
+    }
+
+    /// Returns and clears this thread's rejected-draw count.
+    pub(crate) fn take_rejected() -> usize {
+        REJECTED.with(|count| count.replace(0))
+    }
+
+    pub(crate) fn skew() -> usize {
+        SKEW.with(Cell::get)
+    }
+
+    /// Adds `skew` to every queued step's variate offset on this thread.
+    pub(crate) fn set_skew(skew: usize) {
+        SKEW.with(|value| value.set(skew));
+    }
 }
 
 fn elapsed_ms(duration: Duration) -> f64 {

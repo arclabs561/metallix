@@ -358,6 +358,11 @@ pub enum BlockError {
     /// A block of the prefix hit was evicted or re-keyed after the lookup.
     #[error("prefix hit is stale; look it up again")]
     StalePrefixHit,
+    /// The sequence has tokens reserved by
+    /// [`BlockManager::allocate_unresolved`] whose values are still unknown,
+    /// or fewer than were supplied.
+    #[error("sequence {0:?} has unresolved tokens out of order")]
+    Unresolved(SequenceId),
     /// Fork needs every scheduled token committed first.
     #[error("sequence {0:?} has uncommitted tokens")]
     Uncommitted(SequenceId),

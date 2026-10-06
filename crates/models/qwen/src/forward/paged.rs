@@ -41,7 +41,51 @@ pub struct PagedQwen3Session<'a, S: BuildHasher> {
     weights: &'a HashMap<String, Array, S>,
     blocks: BlockManager,
     pool: KvPool,
-    keys: HashKeys,
+}
+
+/// Where a queued decode row's input token comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StepInput {
+    /// A token the host holds.
+    Host(i32),
+    /// The token the previous queued step picked for this row index, still
+    /// on the device.
+    Previous(usize),
+}
+
+/// A decode step queued by [`PagedQwen3Session::queue_decode`] and not yet
+/// read back.
+pub struct QueuedDecode {
+    picks: super::Qwen3TokenPicks,
+    rows: Vec<SequenceId>,
+    /// Each row's length once this step is computed.
+    lengths: Vec<usize>,
+}
+
+impl QueuedDecode {
+    /// The rows, in step order.
+    #[must_use]
+    pub fn rows(&self) -> &[SequenceId] {
+        &self.rows
+    }
+
+    /// Fault injection for the real readback error path, after GPU completion.
+    #[cfg(test)]
+    pub(super) fn invalidate_commit_length(&mut self) {
+        self.lengths[0] = usize::MAX;
+    }
+}
+
+/// The result of [`PagedQwen3Session::prefill_with_keys`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PagedPrefill {
+    /// The last prompt token's logits.
+    pub logits: Vec<f32>,
+    /// Leading prompt tokens served from the prefix cache, not computed.
+    pub cached_tokens: usize,
+    /// Prompt tokens in full blocks newly published during this prefill.
+    /// Later decode may complete a partial prompt block; that is excluded.
+    pub cache_write_tokens: usize,
 }
 
 /// What [`PagedQwen3Session::decode_batch`] reads back per row.
@@ -296,7 +340,6 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
             weights,
             blocks: BlockManager::new(pool),
             pool: KvPool::new(config, pool, dtype)?,
-            keys: HashKeys::new(),
         })
     }
 
@@ -319,12 +362,40 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
 
     /// Starts `seq` (replacing any earlier sequence with that ID), fills its
     /// K/V and returns the last prompt token's logits. Cached prefix blocks
-    /// are reused when the pool has prefix caching enabled.
+    /// are reused when the pool has prefix caching enabled; this prefill is
+    /// keyed with no salt and no extra keys.
     pub fn prefill_last_logits(
         &mut self,
         seq: SequenceId,
         input_ids: &[i32],
     ) -> Result<Vec<f32>, Qwen3ForwardError> {
+        Ok(self
+            .prefill_with_keys(seq, input_ids, HashKeys::new())?
+            .logits)
+    }
+
+    /// Free blocks a [`Self::prefill_with_keys`] of `input_ids` under `keys`
+    /// would consume now, counting cached prefix blocks it would pin.
+    #[must_use]
+    pub fn prefill_cost(&self, input_ids: &[i32], keys: HashKeys) -> usize {
+        let tokens = token_ids(input_ids);
+        let hit = self.blocks.lookup_prefix(&tokens, keys);
+        let cached = hit.cached_tokens();
+        self.blocks.admit_cost(&hit, tokens.len() - cached)
+    }
+
+    /// [`Self::prefill_last_logits`] under `keys`: blocks are shared only
+    /// with prompts hashed under equal keys (the same cache salt and extra
+    /// keys). Also reports how many leading prompt tokens came from cache.
+    ///
+    /// A pool without room returns [`Qwen3ForwardError::KvBlocks`] and leaves
+    /// the manager unchanged.
+    pub fn prefill_with_keys(
+        &mut self,
+        seq: SequenceId,
+        input_ids: &[i32],
+        keys: HashKeys,
+    ) -> Result<PagedPrefill, Qwen3ForwardError> {
         validate_input_ids(
             self.config,
             input_ids,
@@ -335,15 +406,21 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
             self.blocks.free(seq)?;
         }
         let tokens = token_ids(input_ids);
-        let hit = self.blocks.lookup_prefix(&tokens, self.keys.clone());
+        let hit = self.blocks.lookup_prefix(&tokens, keys);
         let cached = hit.cached_tokens();
         let allocation = self.blocks.admit(seq, hit, &tokens[cached..])?;
-        self.run(
+        let published_before = self.blocks.published_tokens();
+        let logits = self.run(
             seq,
             &input_ids[cached..],
             allocation.positions,
             allocation.copy,
-        )
+        )?;
+        Ok(PagedPrefill {
+            logits,
+            cached_tokens: cached,
+            cache_write_tokens: self.blocks.published_tokens() - published_before,
+        })
     }
 
     /// Appends one or more tokens to a prefilled `seq` and returns the last
@@ -385,7 +462,9 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         Ok(self.blocks.fork(parent, child)?)
     }
 
-    /// Releases `seq`'s blocks.
+    /// Releases `seq`'s blocks. Before calling this, finish every queued step
+    /// that references `seq`, including steps left outstanding after errors.
+    /// A completed turn alone does not mean its queued writes have settled.
     pub fn free(&mut self, seq: SequenceId) -> Result<(), Qwen3ForwardError> {
         Ok(self.blocks.free(seq)?)
     }
@@ -449,13 +528,169 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         result
     }
 
-    /// Reserves one slot per row and performs any copy-on-write.
-    fn allocate_rows(&mut self, rows: &[(SequenceId, i32)]) -> Result<RowSlots, Qwen3ForwardError> {
+    /// Queues one greedy decode step without waiting for it, so the next step
+    /// can be built before this one is read back. Each row's input is a host
+    /// token, or [`StepInput::Previous`]: the token `previous` picked for one
+    /// of its rows, still on the device. Such a row's slot is reserved
+    /// unresolved, and [`Self::finish_decode`] of `previous` resolves it.
+    ///
+    /// Picks are the argmax of each row's logits, lowest ID on ties, as
+    /// [`BatchReadback::Greedy`]. The block check is all or nothing, as for
+    /// [`Self::decode_batch`]. On a later failure, rows remain allocated but
+    /// their state may be partially advanced. Do not resume them: finish any
+    /// outstanding steps that reference them, then explicitly [`Self::free`]
+    /// each failed row. An error cannot free rows owned by `previous`.
+    pub fn queue_decode(
+        &mut self,
+        rows: &[(SequenceId, StepInput)],
+        previous: Option<&QueuedDecode>,
+    ) -> Result<QueuedDecode, Qwen3ForwardError> {
+        if rows.is_empty() {
+            return Err(Qwen3ForwardError::EmptyInput);
+        }
+        let mut needed = 0;
+        for (index, &(seq, input)) in rows.iter().enumerate() {
+            if rows[..index].iter().any(|(earlier, _)| *earlier == seq) {
+                return Err(Qwen3ForwardError::RepeatedBatchSequence(seq.0));
+            }
+            let scheduled = self.blocks.num_tokens(seq)?;
+            if scheduled == 0 {
+                return Err(Qwen3ForwardError::DecodeWithoutPrefill);
+            }
+            match input {
+                StepInput::Host(token) => validate_input_ids(
+                    self.config,
+                    &[token],
+                    scheduled,
+                    self.config.max_position_embeddings,
+                )?,
+                StepInput::Previous(row) => {
+                    let previous = previous.ok_or(Qwen3ForwardError::CacheInconsistent)?;
+                    if previous.rows.get(row) != Some(&seq) {
+                        return Err(Qwen3ForwardError::CacheInconsistent);
+                    }
+                    if scheduled >= self.config.max_position_embeddings {
+                        return Err(Qwen3ForwardError::PromptTooLong {
+                            actual: scheduled + 1,
+                            maximum: self.config.max_position_embeddings,
+                        });
+                    }
+                }
+            }
+            needed += self.blocks.append_cost(seq, 1)?;
+        }
+        let free = self.blocks.free_blocks();
+        if needed > free {
+            return Err(engine::blocks::BlockError::OutOfBlocks { needed, free }.into());
+        }
+        self.queue_step(rows, previous)
+    }
+
+    fn queue_step(
+        &mut self,
+        rows: &[(SequenceId, StepInput)],
+        previous: Option<&QueuedDecode>,
+    ) -> Result<QueuedDecode, Qwen3ForwardError> {
+        let stream = StreamOrDevice::gpu();
+        let batch = as_i32(rows.len())?;
+        let reserved = rows
+            .iter()
+            .map(|&(seq, input)| {
+                (
+                    seq,
+                    match input {
+                        StepInput::Host(token) => Some(token),
+                        StepInput::Previous(_) => None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let slots = self.allocate_rows(&reserved)?;
+        let lengths = slots.lengths.clone();
+        let seqs = rows.iter().map(|&(seq, _)| seq).collect::<Vec<_>>();
+        let host = rows
+            .iter()
+            .map(|&(_, input)| match input {
+                StepInput::Host(token) => token,
+                StepInput::Previous(_) => 0,
+            })
+            .collect::<Vec<_>>();
+        let host = Array::from_slice(&host, &[batch]);
+        let ids = match previous {
+            Some(previous)
+                if rows
+                    .iter()
+                    .any(|(_, input)| matches!(input, StepInput::Previous(_))) =>
+            {
+                let (from, carried): (Vec<i32>, Vec<bool>) = rows
+                    .iter()
+                    .map(|&(_, input)| match input {
+                        StepInput::Previous(row) => as_i32(row).map(|row| (row, true)),
+                        StepInput::Host(_) => Ok((0, false)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .unzip();
+                let carried_tokens = previous
+                    .picks
+                    .tokens
+                    .as_type_device::<i32>(&stream)?
+                    .take_axis_device(Array::from_slice(&from, &[batch]), 0, &stream)?;
+                ops::r#where_device(
+                    Array::from_slice(&carried, &[batch]),
+                    &carried_tokens,
+                    &host,
+                    &stream,
+                )?
+            }
+            _ => host,
+        };
+        let logits = self.batch_logits(&seqs, slots, &ids)?;
+        Ok(QueuedDecode {
+            picks: super::Qwen3TokenPicks::start(&logits, 0)?,
+            rows: seqs,
+            lengths,
+        })
+    }
+
+    /// Waits for a queued step, commits each live row through its step, and
+    /// returns each row's picked token in row order. A row whose next step
+    /// was queued with [`StepInput::Previous`] gets that slot's token
+    /// resolved. Rows freed since queueing (a finished or cancelled turn) are
+    /// skipped; their picks are returned but unused.
+    ///
+    /// On an error rows remain allocated but must not be resumed. The caller
+    /// must finish all outstanding steps referencing them before explicitly
+    /// freeing them; an already queued next step may still write their slots.
+    pub fn finish_decode(&mut self, step: &QueuedDecode) -> Result<Vec<i32>, Qwen3ForwardError> {
+        step.picks.wait().and_then(|tokens| {
+            for ((&seq, &length), &token) in step.rows.iter().zip(&step.lengths).zip(&tokens) {
+                if self.blocks.num_tokens(seq).is_err() {
+                    continue;
+                }
+                self.blocks.commit_through(seq, length)?;
+                if self.blocks.num_unresolved(seq)? > 0 {
+                    self.blocks.resolve(seq, &token_ids(&[token]))?;
+                }
+            }
+            Ok(tokens)
+        })
+    }
+
+    /// Reserves one slot per row and performs any copy-on-write. A row with
+    /// no host token reserves a slot whose input the device holds.
+    fn allocate_rows(
+        &mut self,
+        rows: &[(SequenceId, Option<i32>)],
+    ) -> Result<RowSlots, Qwen3ForwardError> {
         let mut slots = Vec::with_capacity(rows.len());
         let mut positions = Vec::with_capacity(rows.len());
         let mut lengths = Vec::with_capacity(rows.len());
         for &(seq, token) in rows {
-            let allocation = self.blocks.allocate(seq, &token_ids(&[token]))?;
+            let allocation = match token {
+                Some(token) => self.blocks.allocate(seq, &token_ids(&[token]))?,
+                None => self.blocks.allocate_unresolved(seq, 1)?,
+            };
             if let Some(copy) = allocation.copy {
                 self.pool.copy_block(copy)?;
             }
@@ -482,27 +717,51 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     ) -> Result<BatchDecoded, Qwen3ForwardError> {
         #[cfg(test)]
         let started = std::time::Instant::now();
-        let stream = StreamOrDevice::gpu();
         let batch = as_i32(rows.len())?;
+        let host = rows
+            .iter()
+            .map(|&(seq, token)| (seq, Some(token)))
+            .collect::<Vec<_>>();
+        let slots = self.allocate_rows(&host)?;
+        let seqs = rows.iter().map(|&(seq, _)| seq).collect::<Vec<_>>();
+        let ids = Array::from_slice(
+            &rows.iter().map(|&(_, token)| token).collect::<Vec<_>>(),
+            &[batch],
+        );
+        let logits = self.batch_logits(&seqs, slots, &ids)?;
+        #[cfg(test)]
+        let built = std::time::Instant::now();
+        let decoded = read_rows(&logits, self.config.vocab_size, readback);
+        #[cfg(test)]
+        profile::record(built - started, built.elapsed());
+        decoded
+    }
+
+    /// Builds one batched decode step over `seqs`, whose slots are already
+    /// reserved, with `ids` (`[rows]` int32, on the host or the device) as
+    /// each row's input, and returns its `[rows, vocab]` logits, unevaluated.
+    fn batch_logits(
+        &mut self,
+        seqs: &[SequenceId],
+        slots: RowSlots,
+        ids: &Array,
+    ) -> Result<Array, Qwen3ForwardError> {
+        let stream = StreamOrDevice::gpu();
+        let batch = as_i32(seqs.len())?;
         let RowSlots {
             slots,
             positions,
             lengths,
-        } = self.allocate_rows(rows)?;
+        } = slots;
         let writes = WritePlan::new(&slots)?;
-        let seqs = rows.iter().map(|&(seq, _)| seq).collect::<Vec<_>>();
-        let plan = GatherPlan::new(&self.blocks, &seqs, &lengths)?;
+        let plan = GatherPlan::new(&self.blocks, seqs, &lengths)?;
         let longest = lengths.iter().copied().max().unwrap_or(0);
         let mask = length_mask(&lengths, longest)?;
         let offsets = Array::from_slice(&positions, &[batch]);
 
         let hidden = as_i32(self.config.hidden_size)?;
-        let ids = Array::from_slice(
-            &rows.iter().map(|&(_, token)| token).collect::<Vec<_>>(),
-            &[batch],
-        );
         let mut hidden_states = weight(self.weights, "model.embed_tokens.weight")?
-            .take_axis_device(&ids, 0, &stream)?
+            .take_axis_device(ids, 0, &stream)?
             .reshape_device(&[1, batch, hidden], &stream)?;
         for layer in 0..self.config.hidden_layers {
             let base = format!("model.layers.{layer}");
@@ -549,17 +808,11 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
             self.config.rms_norm_eps,
         )?;
         let vocab = as_i32(self.config.vocab_size)?;
-        let logits = linear(
+        Ok(linear(
             &normalized,
             weight(self.weights, self.config.output_weight_name())?,
         )?
-        .reshape_device(&[batch, vocab], &stream)?;
-        #[cfg(test)]
-        let built = std::time::Instant::now();
-        let decoded = read_rows(&logits, self.config.vocab_size, readback);
-        #[cfg(test)]
-        profile::record(built - started, built.elapsed());
-        decoded
+        .reshape_device(&[batch, vocab], &stream)?)
     }
 
     /// Runs the forward for tokens already given slots, then commits them.

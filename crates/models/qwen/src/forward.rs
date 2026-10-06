@@ -33,7 +33,9 @@ mod picks;
 mod snapshot;
 mod verify;
 
-pub use paged::{BatchDecoded, BatchReadback, PagedQwen3Session};
+pub use paged::{
+    BatchDecoded, BatchReadback, PagedPrefill, PagedQwen3Session, QueuedDecode, StepInput,
+};
 pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
 pub use snapshot::Qwen3KvSnapshot;
 pub use verify::Qwen3PositionLogits;

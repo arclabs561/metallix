@@ -405,13 +405,9 @@ fn stop_reason(turn: &AssistantTurn) -> &'static str {
 fn usage(generated: &ChatGeneration) -> Value {
     let prompt = generated.metrics.prompt_tokens;
     let cached = generated.metrics.cached_prompt_tokens.min(prompt);
-    // A stored snapshot includes its already-read prefix; only the extension
-    // is newly created input. Clamp inconsistent metrics to the prompt size.
-    let created = generated
-        .metrics
-        .cache_write_tokens
-        .saturating_sub(cached)
-        .min(prompt - cached);
+    // Producers report newly created positions. Clamp inconsistent metrics
+    // to the remaining prompt positions without subtracting cache hits again.
+    let created = generated.metrics.cache_write_tokens.min(prompt - cached);
     let input = prompt - cached - created;
     json!({"input_tokens":input,"output_tokens":generated.generated_token_ids.len(),"cache_read_input_tokens":cached,"cache_creation_input_tokens":created})
 }
@@ -952,10 +948,10 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
     #[test]
     fn cached_prompt_tokens_are_reported_apart_from_input_tokens() {
         for (cached, written, input, created) in [
-            (4, 9, 1, 5),
+            (4, 5, 1, 5),
             (0, 9, 1, 9),
             (4, 0, 6, 0),
-            (4, 2, 6, 0),
+            (4, 2, 4, 2),
             (4, 99, 0, 6),
         ] {
             for stream in [false, true] {

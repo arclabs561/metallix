@@ -26,6 +26,8 @@ mod commands;
 mod decision_cli;
 mod deepseek_reduced_cli;
 #[cfg(feature = "metal")]
+mod engine_loop;
+#[cfg(feature = "metal")]
 mod generation_routes;
 #[cfg(feature = "metal")]
 mod http_transport;
@@ -96,6 +98,29 @@ use inspect::{
     inspect_qwen, inspect_qwen_checkpoint, inspect_v41, inspect_v41_artifact,
     inspect_v41_embedding_row, inspect_v41_index, inspect_v41_shard,
 };
+
+/// `mx serve`'s paged K/V pool when `--kv-budget-mib` is omitted: 4096 MiB,
+/// or a quarter of physical memory when that is smaller. Each generating
+/// child allocates its whole pool at load, so a small Mac must not be handed
+/// a fixed 4 GiB reservation. If physical memory cannot be read, 512 MiB.
+#[cfg(feature = "metal")]
+fn default_kv_budget_mib() -> u32 {
+    const MIB: u64 = 1 << 20;
+    let physical = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    if let Some(bytes) = physical {
+        u32::try_from((bytes / 4 / MIB).min(4096))
+            .unwrap_or(4096)
+            .max(1)
+    } else {
+        tracing::warn!("could not read physical memory; --kv-budget-mib defaults to 512");
+        512
+    }
+}
 
 #[cfg(feature = "metal")]
 const fn resident_chat_limits(context_tokens: u32, kv_budget_mib: u32) -> ResidentChatLimits {
@@ -274,7 +299,9 @@ fn dispatch(cli: Cli) -> ExitCode {
             generation_timeout_ms,
             queue_depth,
             queue_wait_ms,
+            max_num_seqs,
         } => {
+            let kv_budget_mib = kv_budget_mib.unwrap_or_else(default_kv_budget_mib);
             if let Some(entry) = worker_entry {
                 return match serde_json::from_str(&entry) {
                     Ok(entry) => serving::serve_child(
@@ -282,6 +309,9 @@ fn dispatch(cli: Cli) -> ExitCode {
                         listen,
                         resident_chat_limits(context_tokens, kv_budget_mib)
                             .with_prefix_cache_mib(prefix_cache_mib),
+                        engine_loop::EngineLimits {
+                            max_num_seqs: max_num_seqs as usize,
+                        },
                         Duration::from_millis(u64::from(generation_timeout_ms)),
                         cli.gpu_capture.as_deref(),
                     ),
@@ -299,6 +329,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                         context_tokens,
                         kv_budget_mib,
                         prefix_cache_mib,
+                        max_num_seqs,
                         generation_timeout_ms,
                         trace_out: cli.trace_out,
                         gpu_capture: cli.gpu_capture,
@@ -307,6 +338,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                     admission_queue::QueueSettings {
                         depth: queue_depth as usize,
                         wait: Duration::from_millis(u64::from(queue_wait_ms)),
+                        max_running: max_num_seqs as usize,
                     },
                 ),
                 Err(error) => {
@@ -645,6 +677,16 @@ mod tests {
                 matches!(cli.command, super::Command::InspectV41 { execution_shape, .. } if execution_shape == expected)
             );
         }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn serve_defaults_to_one_sequence_at_a_time() {
+        let cli = Cli::try_parse_from(["mx", "serve", "--model", "model"]).expect("serve defaults");
+        let super::Command::Serve { max_num_seqs, .. } = cli.command else {
+            panic!("parsed as serve");
+        };
+        assert_eq!(max_num_seqs, 1, "batching stays opt-in");
     }
 
     #[cfg(feature = "metal")]

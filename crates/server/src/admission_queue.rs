@@ -23,9 +23,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Requests one model runs at once. A child serves one request at a time
-/// today; continuous batching would raise this, not restructure the queue.
-const MAX_RUNNING: usize = 1;
 /// How often a waiting request checks whether its client is still there.
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_RETRY_AFTER_SECS: u64 = 60;
@@ -37,6 +34,9 @@ pub(crate) struct QueueSettings {
     pub(crate) depth: usize,
     /// Longest a request waits for its turn before it is refused.
     pub(crate) wait: Duration,
+    /// Requests the model runs at once: its batch size for a batching model,
+    /// one otherwise.
+    pub(crate) max_running: usize,
 }
 
 impl Default for QueueSettings {
@@ -44,6 +44,7 @@ impl Default for QueueSettings {
         Self {
             depth: 8,
             wait: Duration::from_secs(60),
+            max_running: 1,
         }
     }
 }
@@ -99,6 +100,7 @@ struct Waiting {
 struct Scheduler {
     waiting: VecDeque<Waiting>,
     running: usize,
+    max_running: usize,
     next_ticket: u64,
     /// Moving average of how long started requests ran.
     service: Option<Duration>,
@@ -106,10 +108,11 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    const fn new() -> Self {
+    const fn new(max_running: usize) -> Self {
         Self {
             waiting: VecDeque::new(),
             running: 0,
+            max_running,
             next_ticket: 0,
             service: None,
             metrics: QueueMetrics {
@@ -126,7 +129,7 @@ impl Scheduler {
 
     /// Starts a request at once when nothing waits and a slot is free.
     fn start_now(&mut self) -> bool {
-        let free = self.waiting.is_empty() && self.running < MAX_RUNNING;
+        let free = self.waiting.is_empty() && self.running < self.max_running;
         if free {
             self.started(Duration::ZERO);
         }
@@ -151,7 +154,7 @@ impl Scheduler {
         let Some(first) = self.waiting.front() else {
             return false;
         };
-        if first.ticket != ticket || self.running >= MAX_RUNNING {
+        if first.ticket != ticket || self.running >= self.max_running {
             return false;
         }
         let waited = first.arrived.elapsed();
@@ -182,10 +185,13 @@ impl Scheduler {
         self.service = Some(self.service.map_or(held, |old| (old * 3 + held) / 4));
     }
 
+    /// The average service time shared by the running slots: with several
+    /// requests running, one slot frees that much sooner.
     fn retry_after_secs(&self) -> u64 {
+        let slots = u128::try_from(self.max_running).unwrap_or(u128::MAX);
         self.service
             .map_or(1, |service| {
-                u64::try_from(service.as_millis().div_ceil(1000)).unwrap_or(u64::MAX)
+                u64::try_from(service.as_millis().div_ceil(1000 * slots)).unwrap_or(u64::MAX)
             })
             .clamp(1, MAX_RETRY_AFTER_SECS)
     }
@@ -227,7 +233,7 @@ impl ModelQueue {
     pub(crate) fn new(settings: QueueSettings) -> Self {
         Self {
             settings,
-            scheduler: Mutex::new(Scheduler::new()),
+            scheduler: Mutex::new(Scheduler::new(settings.max_running.max(1))),
             turn: Condvar::new(),
         }
     }
@@ -323,7 +329,28 @@ mod tests {
         Arc::new(ModelQueue::new(QueueSettings {
             depth,
             wait: Duration::from_millis(wait_ms),
+            max_running: 1,
         }))
+    }
+
+    #[test]
+    fn a_batching_model_runs_its_limit_at_once_and_queues_the_rest() {
+        let mut scheduler = Scheduler::new(3);
+        let now = Instant::now();
+        for _ in 0..3 {
+            assert!(scheduler.start_now(), "a free batch slot starts at once");
+        }
+        assert!(!scheduler.start_now(), "the fourth request must wait");
+        let (ticket, depth) = scheduler.enqueue(8, now).expect("room to wait");
+        assert_eq!(depth, 1);
+        assert!(!scheduler.try_start(ticket));
+        scheduler.finish(Duration::from_secs(6));
+        assert!(
+            scheduler.try_start(ticket),
+            "a finished slot frees the waiter"
+        );
+        // Six seconds of service shared by three slots: retry in two.
+        assert_eq!(scheduler.retry_after_secs(), 2);
     }
 
     /// Waits until `count` requests are queued, so arrival order is fixed.

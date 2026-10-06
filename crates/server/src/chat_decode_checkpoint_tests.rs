@@ -182,3 +182,67 @@ fn per_token_cost_by_decode_mode() {
         }
     }
 }
+
+/// The pipelined driver's GPU draws agree with the host's at these settings,
+/// since a rejected draw costs a truncate and a requeue. A test-only skew of
+/// the queued step's variate offset (the off-by-one this guards against) must
+/// produce rejections and still give the same tokens and receipts: the host
+/// re-derives every token, and a rejection truncates only a queued step.
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
+fn pipelined_draws_are_not_rejected_and_forced_rejections_stay_exact() {
+    use super::draw_checks;
+
+    let model = env::var_os("METALLIX_QWEN_MODEL")
+        .map(PathBuf::from)
+        .expect("METALLIX_QWEN_MODEL is required for these ignored checkpoint tests");
+    // No prefix cache, so repeated turns prefill identically.
+    let mut session = ChatSession::load(
+        &model,
+        ResidentChatLimits::from_mib(4_096, 2_048).with_prefix_cache_mib(0),
+    )
+    .expect("session load");
+    let messages = messages();
+    let cases = [
+        ("greedy_top5", SamplingRequest::GREEDY, Some(5)),
+        ("defaults", seeded(None, None, None), None),
+        ("defaults_top3", seeded(None, None, None), Some(3)),
+        ("hot_narrow", seeded(Some(1.2), Some(0.9), Some(5)), Some(0)),
+    ];
+    for (name, sampling, top_logprobs) in cases {
+        let mut generate = |skew: usize| {
+            draw_checks::set_skew(skew);
+            draw_checks::take_rejected();
+            let mut request = ChatRequest::new(&messages, 64);
+            request.sampling = sampling;
+            request.top_logprobs = top_logprobs;
+            let generation = session.generate(request, &mut |_| Ok(()));
+            draw_checks::set_skew(0);
+            (
+                generation.expect("generation"),
+                draw_checks::take_rejected(),
+            )
+        };
+        let (exact, rejected) = generate(0);
+        assert_eq!(
+            rejected, 0,
+            "{name}: GPU draws rejected at default settings"
+        );
+        if sampling.temperature == Some(0.0) {
+            // Greedy draws use no variate, so a skew cannot reject them.
+            continue;
+        }
+        let (skewed, forced) = generate(1);
+        println!("decode_checkpoint case={name} forced_rejections={forced}");
+        assert!(forced > 0, "{name}: the skewed offset forced no rejection");
+        assert_eq!(
+            skewed.generated_token_ids, exact.generated_token_ids,
+            "{name}"
+        );
+        assert_eq!(skewed.logprobs.len(), exact.logprobs.len(), "{name}");
+        for (actual, expected) in skewed.logprobs.iter().zip(&exact.logprobs) {
+            assert_eq!(actual.token, expected.token, "{name}");
+            assert!((actual.logprob - expected.logprob).abs() < LOGPROB_TOLERANCE);
+        }
+    }
+}

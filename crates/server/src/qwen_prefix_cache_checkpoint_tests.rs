@@ -99,6 +99,52 @@ fn checkpoint_cache_write_tokens_count_only_accepted_prefixes() {
 
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+fn checkpoint_cache_creation_counts_only_new_prompt_positions_after_a_hit() {
+    let model = env::var_os("METALLIX_QWEN_MODEL")
+        .map(PathBuf::from)
+        .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+    let limits = ResidentChatLimits::from_mib(256, 64).with_prefix_cache_mib(64);
+    let mut session = ChatSession::load(&model, limits).expect("load");
+    let first = conversation("Answer briefly and accurately.", "Say hello.");
+    let mut request = ChatRequest::new(&first, 1);
+    request.sampling = crate::chat_generation::SamplingRequest::GREEDY;
+    session
+        .generate(request, &mut |_| Ok(()))
+        .expect("seed cache");
+    let extended = conversation(
+        "Answer briefly and accurately.",
+        "Name three common colors, then say hello politely.",
+    );
+    let mut request = ChatRequest::new(&extended, 1);
+    request.sampling = crate::chat_generation::SamplingRequest::GREEDY;
+    let full = session.render(request).expect("render").ids;
+    let accepted_prefix = session
+        .format
+        .prompt(request.conversation(), false)
+        .expect("prefix")
+        .ids;
+    assert!(full.starts_with(&accepted_prefix));
+    let hit = session
+        .generate(request, &mut |_| Ok(()))
+        .expect("hit and extend");
+    let metrics = &hit.metrics;
+    assert!(metrics.cached_prompt_tokens > 0);
+    assert!(metrics.cache_write_tokens > 0);
+    assert_eq!(
+        metrics.cache_write_tokens,
+        accepted_prefix.len() - metrics.cached_prompt_tokens
+    );
+    assert!(metrics.cached_prompt_tokens + metrics.cache_write_tokens <= metrics.prompt_tokens);
+    session.reset_prefix_cache(0);
+    let fresh = session
+        .generate(request, &mut |_| Ok(()))
+        .expect("uncached oracle");
+    assert_eq!(fresh.metrics.cache_write_tokens, 0);
+    assert_eq!(fresh.generated_token_ids, hit.generated_token_ids);
+}
+
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
 fn checkpoint_prefix_hits_are_greedy_identical_and_changed_preambles_miss() {
     let Some(mut session) = load_session() else {
         return;
