@@ -14,6 +14,20 @@ use super::{
 };
 
 const MAX_TOKENS: u32 = 160;
+/// MLX active plus cached memory allowed after any turn: Qwen3-0.6B BF16
+/// weights (~1.2 GiB), K/V at a 4,096-token context and the 2,048 MiB prefix
+/// cache fit well inside it.
+const MLX_BOUND_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Fails the test when MLX holds more than [`MLX_BOUND_BYTES`], so an opt-in
+/// run stops itself instead of filling the GPU.
+fn assert_mlx_within_bound() {
+    let held = crate::gpu::held_bytes().expect("MLX reports its memory");
+    assert!(
+        held <= MLX_BOUND_BYTES,
+        "MLX holds {held} bytes after a speculation checkpoint turn, above the {MLX_BOUND_BYTES}-byte bound"
+    );
+}
 
 const EDIT: &str = r#"Rename the function `parse_header` to `read_header` everywhere in this file and return the complete file, unchanged otherwise.
 
@@ -77,7 +91,9 @@ fn speculation_accepts_edit_drafts_in_every_decode_mode() {
             request.speculation = speculation;
             // Warm the graph caches, then measure.
             let _ = session.generate(request, &mut |_| Ok(())).expect("warmup");
+            assert_mlx_within_bound();
             let turn = session.generate(request, &mut |_| Ok(())).expect("turn");
+            assert_mlx_within_bound();
             let tokens = turn.generated_token_ids.len();
             #[allow(clippy::cast_precision_loss, reason = "small token counts")]
             let rate = (tokens.saturating_sub(1)) as f64 / turn.metrics.decode_total_ms * 1e3;
@@ -138,6 +154,7 @@ fn speculation_on_original_writing_reports_its_cost() {
             let mut request = ChatRequest::new(&messages, MAX_TOKENS);
             request.speculation = speculation;
             let turn = session.generate(request, &mut |_| Ok(())).expect("turn");
+            assert_mlx_within_bound();
             // The first round warms the graph caches.
             if repeat > 0 {
                 #[allow(clippy::cast_precision_loss, reason = "small token counts")]
@@ -174,6 +191,7 @@ fn speculation_runs_to_the_limit_under_ignore_eos() {
         request.ignore_eos = true;
         request.speculation = speculation;
         let turn = session.generate(request, &mut |_| Ok(())).expect("turn");
+        assert_mlx_within_bound();
         assert_eq!(turn.generated_token_ids.len(), 400, "{speculation:?}");
         assert_eq!(
             turn.finish_reason,
