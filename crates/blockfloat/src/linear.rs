@@ -114,7 +114,45 @@ pub enum Fp4LinearError {
 /// checkpoint file, nor establishes CUDA reduction order or BF16 output parity.
 ///
 /// All validation and overflow checks finish before output writes begin, so an
-/// error leaves `output` unchanged.
+/// error leaves `output` unchanged. That costs one FP32 scratch buffer the size
+/// of `output`.
+///
+/// # Errors
+///
+/// `output` is unchanged on every error.
+///
+/// * [`Fp4LinearError::EmptyDimension`] when any dimension is 0.
+/// * [`Fp4LinearError::IncompleteActivationGroup`] when `reduction` is not a
+///   multiple of the activation group width.
+/// * [`Fp4LinearError::Length`] when a buffer does not match its shape, and
+///   [`Fp4LinearError::ShapeOverflow`] when that shape does not fit in `usize`.
+/// * [`Fp4LinearError::NonFiniteActivation`],
+///   [`Fp4LinearError::NonFiniteActivationScale`] and
+///   [`Fp4LinearError::NonFiniteWeightScale`] for a NaN code. E2M1 weights
+///   have no NaN code.
+/// * [`Fp4LinearError::ValueOverflow`] when a scaled block or the running sum
+///   is not finite in FP32.
+///
+/// # Example
+///
+/// One row of 32 activations equal to 1.0 against one output of 32 weights
+/// equal to 1.0, with weight scale 2.0, gives `32 * 1.0 * 2.0`.
+///
+/// ```
+/// use blockfloat::{ActivationGroup, fp4_linear_runtime_f32};
+///
+/// let activation_codes = [0x38_u8; 32]; // E4M3FN 1.0
+/// let activation_scales = [127_u8]; // E8M0 1.0
+/// let weight_codes = [0x22_u8; 16]; // two E2M1 1.0 values per byte
+/// let weight_scales = [128_u8]; // E8M0 2.0
+/// let mut output = [0.0_f32; 1];
+/// fp4_linear_runtime_f32(
+///     &activation_codes, &activation_scales, &weight_codes, &weight_scales,
+///     1, 32, 1, ActivationGroup::Elements32, &mut output,
+/// )?;
+/// assert_eq!(output, [64.0]);
+/// # Ok::<(), blockfloat::Fp4LinearError>(())
+/// ```
 #[allow(
     clippy::too_many_arguments,
     reason = "the direct runtime-buffer contract keeps each shape and scale role explicit"
@@ -156,10 +194,29 @@ pub fn fp4_linear_runtime_f32(
 
 /// Computes one checked FP32 FP4 linear result into owned staging storage.
 ///
-/// This crate-private leaf shares the direct-runtime validation and scalar
-/// block order with [`fp4_linear_runtime_f32`], but retains no caller buffer.
-/// It permits composed leaves that do not expose partial output to compute each
-/// scalar result only once.
+/// This shares the direct-runtime validation and scalar block order with
+/// [`fp4_linear_runtime_f32`], but returns a new `[rows, outputs]` vector
+/// instead of writing a caller buffer. It permits composed leaves that do not
+/// expose partial output to compute each scalar result only once.
+///
+/// # Errors
+///
+/// The same conditions as [`fp4_linear_runtime_f32`], except that there is no
+/// `output` length to check, plus [`Fp4LinearError::AllocationFailed`] when
+/// the result vector cannot be reserved.
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::{ActivationGroup, fp4_linear_runtime_f32_owned};
+///
+/// let output = fp4_linear_runtime_f32_owned(
+///     &[0x38; 32], &[127], &[0x22; 16], &[128],
+///     1, 32, 1, ActivationGroup::Elements32,
+/// )?;
+/// assert_eq!(output, [64.0]);
+/// # Ok::<(), blockfloat::Fp4LinearError>(())
+/// ```
 #[allow(
     clippy::too_many_arguments,
     reason = "the direct runtime-buffer contract keeps each shape and scale role explicit"

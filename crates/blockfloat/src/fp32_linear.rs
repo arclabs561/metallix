@@ -91,8 +91,29 @@ pub enum Fp32LinearError {
 /// result is staged before copying to `output`, so every error leaves the
 /// caller's output untouched.
 ///
+/// # Errors
+///
+/// `output` is unchanged on every error.
+///
+/// * [`Fp32LinearError::EmptyDimension`] when any dimension is 0.
+/// * [`Fp32LinearError::ShapeOverflow`] when a buffer size or the work count
+///   does not fit in `usize`.
+/// * [`Fp32LinearError::ElementLimit`] when a buffer exceeds
+///   [`MAX_FP32_LINEAR_ELEMENTS`], and [`Fp32LinearError::WorkLimit`] when
+///   `rows * outputs * reduction` exceeds 2^29.
+/// * [`Fp32LinearError::Length`] when a buffer does not match its shape.
+/// * [`Fp32LinearError::NonFiniteActivation`] and
+///   [`Fp32LinearError::NonFiniteWeight`] for a NaN or infinite input.
+/// * [`Fp32LinearError::AllocationFailed`] when the staged result cannot be
+///   reserved.
+/// * [`Fp32LinearError::ValueOverflow`] when a product or a running sum is not
+///   finite.
+///
+/// # Example
+///
 /// ```
 /// use blockfloat::fp32_linear_reference;
+///
 /// let mut output = [0.0; 4];
 /// fp32_linear_reference(
 ///     &[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0],

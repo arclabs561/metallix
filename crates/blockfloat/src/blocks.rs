@@ -19,18 +19,25 @@ pub enum BlockDecodeError {
     OutputLength,
     /// The E8M0 code denotes NaN.
     #[error("nonfinite E8M0 scale in block {block}")]
-    NonFiniteScale { block: usize },
+    NonFiniteScale {
+        /// Index of the block, which is also the index into `scales`.
+        block: usize,
+    },
     /// Applying a finite scale exceeds the FP32 output range.
     #[error("scaled FP4 value exceeds FP32 range at element {element}")]
-    ValueOverflow { element: usize },
+    ValueOverflow {
+        /// Index into the output of the first element that overflowed.
+        element: usize,
+    },
 }
 
 /// Expands contiguous 32-element `E2M1x2` runtime blocks with E8M0 scales.
 ///
 /// Each 16-byte block uses the corresponding scale; low nibbles precede high
 /// nibbles. This matches the pinned V4.1 FP4 linear runtime for complete K
-/// groups. Callers still establish tensor shape, row boundaries, scale order,
-/// and file-to-runtime transformations. No padding or swizzle is inferred.
+/// (reduction) groups. Callers still establish tensor shape, row boundaries,
+/// scale order, and file-to-runtime transformations. No padding or swizzle is
+/// inferred.
 ///
 /// Allocates nothing. The caller owns the output buffer and its memory budget.
 /// All input and range checks complete before any output is changed.
@@ -38,8 +45,28 @@ pub enum BlockDecodeError {
 ///
 /// # Errors
 ///
-/// Returns [`BlockDecodeError`] for incomplete blocks, mismatched buffers,
-/// nonfinite scales or scaled-value overflow. Output is unchanged on error.
+/// Output is unchanged on every error.
+///
+/// * [`BlockDecodeError::PackedLength`] when `packed` is empty or not a
+///   multiple of 16 bytes.
+/// * [`BlockDecodeError::ScaleLength`] unless `scales` has one code per
+///   16 packed bytes.
+/// * [`BlockDecodeError::OutputLength`] unless `output` has two elements per
+///   packed byte.
+/// * [`BlockDecodeError::NonFiniteScale`] for the NaN scale code `0xff`.
+/// * [`BlockDecodeError::ValueOverflow`] when a value times its scale is not
+///   finite in FP32.
+///
+/// # Example: an error leaves the output alone
+///
+/// ```
+/// use blockfloat::{BlockDecodeError, expand_e2m1x2_blocks32};
+///
+/// let mut output = [7.0_f32; 32];
+/// let error = expand_e2m1x2_blocks32(&[0; 16], &[0xff], &mut output);
+/// assert_eq!(error, Err(BlockDecodeError::NonFiniteScale { block: 0 }));
+/// assert_eq!(output, [7.0; 32]);
+/// ```
 pub fn expand_e2m1x2_blocks32(
     packed: &[u8],
     scales: &[u8],

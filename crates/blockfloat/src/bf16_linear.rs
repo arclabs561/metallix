@@ -21,38 +21,64 @@ pub enum Bf16LinearError {
     EmptyDimension,
     /// A derived buffer or work count overflowed `usize`.
     #[error("BF16 linear shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count that overflowed: a buffer name or `"work"`.
+        field: &'static str,
+    },
     /// One bounded buffer exceeds this scalar reference's fixed limit.
     #[error("BF16 linear {field} has {elements} elements, maximum is {maximum}")]
     ElementLimit {
+        /// The bounded buffer name.
         field: &'static str,
+        /// The requested element count.
         elements: usize,
+        /// The fixed maximum, [`MAX_BF16_LINEAR_ELEMENTS`].
         maximum: usize,
     },
     /// The scalar multiply-accumulate count exceeds this reference's fixed limit.
     #[error("BF16 linear work estimate {elements} exceeds maximum {maximum}")]
-    WorkLimit { elements: usize, maximum: usize },
+    WorkLimit {
+        /// The requested multiply-accumulate count, `rows * outputs * reduction`.
+        elements: usize,
+        /// The fixed maximum work count.
+        maximum: usize,
+    },
     /// A bounded result vector could not be reserved.
     #[error("could not allocate {elements} BF16 linear result elements")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// The result element count that could not be reserved.
+        elements: usize,
+    },
     /// A direct-runtime buffer has an unexpected exact length.
     #[error("BF16 linear {field} length is {actual}, expected {expected}")]
     Length {
+        /// The caller buffer name.
         field: &'static str,
+        /// The supplied element count.
         actual: usize,
+        /// The shape-derived required element count.
         expected: usize,
     },
     /// A BF16 activation denotes NaN or infinity.
     #[error("nonfinite BF16 activation at element {element}")]
-    NonFiniteActivation { element: usize },
+    NonFiniteActivation {
+        /// Flat index into `activations`.
+        element: usize,
+    },
     /// A BF16 weight denotes NaN or infinity.
     #[error("nonfinite BF16 weight at element {element}")]
-    NonFiniteWeight { element: usize },
+    NonFiniteWeight {
+        /// Flat index into `weights`.
+        element: usize,
+    },
     /// A scalar FP32 intermediate or the final BF16 narrowing was nonfinite.
     #[error("BF16 linear overflowed at {stage}, row {row}, output {output}")]
     ValueOverflow {
+        /// `"product"`, `"sum"` or `"BF16 output"`.
         stage: &'static str,
+        /// The activation row being calculated.
         row: usize,
+        /// The output column being calculated.
         output: usize,
     },
 }
@@ -67,6 +93,36 @@ pub enum Bf16LinearError {
 ///
 /// This is a precision staging reference used by V4.1 composition tests; it
 /// does not qualify hardware GEMM reduction order or throughput.
+///
+/// # Errors
+///
+/// `output` is unchanged on every error.
+///
+/// * [`Bf16LinearError::EmptyDimension`] when any dimension is 0.
+/// * [`Bf16LinearError::ShapeOverflow`] when a buffer size or the work count
+///   does not fit in `usize`.
+/// * [`Bf16LinearError::ElementLimit`] when a buffer exceeds
+///   [`MAX_BF16_LINEAR_ELEMENTS`], and [`Bf16LinearError::WorkLimit`] when
+///   `rows * outputs * reduction` exceeds 2^30.
+/// * [`Bf16LinearError::Length`] when a buffer does not match its shape.
+/// * [`Bf16LinearError::NonFiniteActivation`] and
+///   [`Bf16LinearError::NonFiniteWeight`] for a NaN or infinite input.
+/// * [`Bf16LinearError::AllocationFailed`] when the staged result cannot be
+///   reserved.
+/// * [`Bf16LinearError::ValueOverflow`] when a product, a running sum or the
+///   rounded BF16 result is not finite.
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::{bf16_linear_reference, bf16_to_f32};
+///
+/// // [1, 2] dotted with [3, 4] is 11.
+/// let mut output = [0_u16; 1];
+/// bf16_linear_reference(&[0x3f80, 0x4000], &[0x4040, 0x4080], 1, 2, 1, &mut output)?;
+/// assert_eq!(bf16_to_f32(output[0]), 11.0);
+/// # Ok::<(), blockfloat::Bf16LinearError>(())
+/// ```
 pub fn bf16_linear_reference(
     activations: &[u16],
     weights: &[u16],
@@ -205,6 +261,15 @@ fn checked_product(
 }
 
 /// Widens BF16 storage bits to FP32 exactly.
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::bf16_to_f32;
+///
+/// assert_eq!(bf16_to_f32(0x3f80), 1.0);
+/// assert_eq!(bf16_to_f32(0xc000), -2.0);
+/// ```
 #[must_use]
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
@@ -212,9 +277,27 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
 
 /// Rounds FP32 to BF16 storage bits, nearest with ties to even.
 ///
+/// Finite values can round to infinity at the BF16 range boundary; callers
+/// that need a finite result check it, as [`bf16_linear_reference`] does.
+///
 /// # Panics
 ///
 /// Never: the high half of an FP32 word always fits in `u16`.
+///
+/// # Example
+///
+/// Values halfway between two BF16 neighbors round to the one with an even
+/// last bit.
+///
+/// ```
+/// use blockfloat::f32_to_bf16_rne;
+///
+/// assert_eq!(f32_to_bf16_rne(1.0), 0x3f80);
+/// // 1 + 2^-8 lies halfway between 0x3f80 and 0x3f81: round down to even.
+/// assert_eq!(f32_to_bf16_rne(1.0 + 2.0_f32.powi(-8)), 0x3f80);
+/// // 1 + 3 * 2^-8 lies halfway between 0x3f81 and 0x3f82: round up to even.
+/// assert_eq!(f32_to_bf16_rne(1.0 + 3.0 * 2.0_f32.powi(-8)), 0x3f82);
+/// ```
 #[must_use]
 pub fn f32_to_bf16_rne(value: f32) -> u16 {
     let bits = value.to_bits();

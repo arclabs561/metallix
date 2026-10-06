@@ -88,7 +88,42 @@ pub enum Fp8LinearError {
 ///
 /// The result is explicitly scalar FP32. This makes no hardware reduction or
 /// BF16 cast claim. Validation and numerical checks complete before output
-/// writes, so errors leave `output` unchanged.
+/// writes, so errors leave `output` unchanged. That costs one FP32 scratch
+/// buffer the size of `output`.
+///
+/// # Errors
+///
+/// `output` is unchanged on every error.
+///
+/// * [`Fp8LinearError::EmptyDimension`] when any dimension is 0.
+/// * [`Fp8LinearError::IncompleteActivationGroup`] when `reduction` is not a
+///   multiple of the activation group width.
+/// * [`Fp8LinearError::Length`] when a buffer does not match its shape, and
+///   [`Fp8LinearError::ShapeOverflow`] when that shape does not fit in `usize`.
+/// * [`Fp8LinearError::NonFiniteActivation`],
+///   [`Fp8LinearError::NonFiniteWeight`],
+///   [`Fp8LinearError::NonFiniteActivationScale`] and
+///   [`Fp8LinearError::NonFiniteWeightScale`] for a NaN code.
+/// * [`Fp8LinearError::ValueOverflow`] when a scaled group or the running sum
+///   is not finite in FP32.
+///
+/// # Example
+///
+/// One output needs `ceil(1 / 32)` = 1 row of weight scales.
+///
+/// ```
+/// use blockfloat::{ActivationGroup, fp8_linear_runtime_f32};
+///
+/// let activation_codes = [0x38_u8; 32]; // E4M3FN 1.0
+/// let weight_codes = [0x40_u8; 32]; // E4M3FN 2.0
+/// let mut output = [0.0_f32; 1];
+/// fp8_linear_runtime_f32(
+///     &activation_codes, &[127], &weight_codes, &[126], // scales 1.0 and 0.5
+///     1, 32, 1, ActivationGroup::Elements32, &mut output,
+/// )?;
+/// assert_eq!(output, [32.0]); // 32 * 1.0 * 2.0 * 1.0 * 0.5
+/// # Ok::<(), blockfloat::Fp8LinearError>(())
+/// ```
 #[allow(
     clippy::too_many_arguments,
     reason = "the direct runtime-buffer contract keeps each shape and scale role explicit"

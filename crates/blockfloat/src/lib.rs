@@ -8,6 +8,67 @@
 //! Scalar decoders return NaNs; block expansion and linear arithmetic reject
 //! non-finite results. Linear references preserve their specified per-group
 //! dot/scale placement, not hardware reduction or BF16 output rounding.
+//!
+//! Everything here is scalar CPU code with no model or GPU dependency. It is
+//! an independent oracle that faster kernels are tested against, so it keeps a
+//! stated evaluation order rather than the fastest one.
+//!
+//! # Overview
+//!
+//! * Scalar codes: [`decode_e2m1`], [`decode_e2m1x2`], [`decode_e4m3fn`] and
+//!   [`decode_e8m0`] expand one code to FP32. [`bf16_to_f32`] and
+//!   [`f32_to_bf16_rne`] convert BF16 storage bits.
+//! * Scaled blocks: [`expand_e2m1x2_blocks32`] expands packed FP4 values with
+//!   one E8M0 scale per 32 elements.
+//! * Activation quantization: [`quantize_bf16_activations_e4m3fn`] produces
+//!   E4M3FN codes and E8M0 scales. [`requantize_bf16_activations_e4m3fn`] and
+//!   [`requantize_bf16_activations_e2m1`] quantize and reconstruct BF16 in one
+//!   call, which models the precision an in-place quantization keeps.
+//! * Linear layers: [`fp4_linear_runtime_f32`] (FP8 activations, FP4 weights)
+//!   and [`fp8_linear_runtime_f32`] (FP8 both) evaluate the runtime's grouped
+//!   equations. [`bf16_linear_reference`] and [`fp32_linear_reference`] are
+//!   plain matrix products in a fixed scalar order.
+//!
+//! # Example: expanding one FP4 block
+//!
+//! A runtime FP4 block is 16 bytes holding 32 E2M1 values, low nibble first,
+//! with one E8M0 scale. Scale code 128 is 2.0.
+//!
+//! ```
+//! use blockfloat::expand_e2m1x2_blocks32;
+//!
+//! // Low nibble 1 is 0.5 and high nibble 2 is 1.0, before scaling.
+//! let packed = [0x21_u8; 16];
+//! let mut output = [0.0_f32; 32];
+//! expand_e2m1x2_blocks32(&packed, &[128], &mut output)?;
+//! assert_eq!(&output[..4], &[1.0, 2.0, 1.0, 2.0]);
+//! # Ok::<(), blockfloat::BlockDecodeError>(())
+//! ```
+//!
+//! # Conventions
+//!
+//! These hold for every function in the crate and are not repeated on each:
+//!
+//! * Matrices are flat row-major slices, with shapes written `[rows, columns]`.
+//!   Linear weights are `[outputs, reduction]`, and a linear result is
+//!   `activations @ weights.transpose()`, shaped `[rows, outputs]`.
+//! * Encoded values travel as raw storage: `u8` codes for E2M1 pairs, E4M3FN
+//!   and E8M0, and `u16` bits for BF16.
+//! * A fallible function validates its input and computes its whole result
+//!   before it writes a caller buffer, so an error leaves every output buffer
+//!   unchanged. An error that points at an element carries its flat index.
+//! * The BF16, FP32 and requantization references bound their buffers with a
+//!   `MAX_*` constant and return an error past it rather than run unbounded.
+//! * Rounding to E4M3FN, E2M1 and BF16 is software round-to-nearest, ties to
+//!   even. That is a reference choice, not a claim of parity with a GPU cast.
+//!
+//! "Pinned" in item docs refers to the
+//! [DeepSeek-V4.1 inference kernels](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/dba1be0a40aa45a94ad051997016db3960a90277/inference/kernel.py)
+//! at that commit.
+
+#![deny(missing_docs)]
+// The workspace allows this lint; crates opt in once their docs are complete.
+#![warn(clippy::missing_errors_doc)]
 
 mod blocks;
 pub use blocks::{BlockDecodeError, expand_e2m1x2_blocks32};
@@ -39,6 +100,16 @@ pub use fp4_activation::{
 ///
 /// Returns `None` if any upper four bits are set. This function deliberately
 /// does not choose which nibble of a packed checkpoint byte comes first.
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::decode_e2m1;
+///
+/// assert_eq!(decode_e2m1(0b0111), Some(6.0));
+/// assert_eq!(decode_e2m1(0b1000).map(f32::to_bits), Some((-0.0_f32).to_bits()));
+/// assert_eq!(decode_e2m1(0x10), None);
+/// ```
 #[must_use]
 pub fn decode_e2m1(nibble: u8) -> Option<f32> {
     if nibble > 0x0f {
@@ -61,6 +132,15 @@ fn decode_nibble(nibble: u8) -> f32 {
 /// The low nibble is the first element, the high nibble the second. This
 /// describes the typed runtime representation, not an uninspected checkpoint.
 /// See [PyTorch's pinned encoding definition](https://github.com/pytorch/pytorch/blob/84e524623ea4754a748936bf1ba6ecaaa92c3ae6/torch/headeronly/util/Float4_e2m1fn_x2.h).
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::decode_e2m1x2;
+///
+/// // Low nibble 2 is 1.0; high nibble 7 is 6.0.
+/// assert_eq!(decode_e2m1x2(0x72), [1.0, 6.0]);
+/// ```
 #[must_use]
 pub fn decode_e2m1x2(byte: u8) -> [f32; 2] {
     [decode_nibble(byte & 15), decode_nibble(byte >> 4)]
@@ -70,6 +150,17 @@ pub fn decode_e2m1x2(byte: u8) -> [f32; 2] {
 ///
 /// Bytes `0x7f` and `0xff` produce NaN. No encoding represents infinity.
 /// NaN payload and sign are unspecified.
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::decode_e4m3fn;
+///
+/// assert_eq!(decode_e4m3fn(0x38), 1.0);
+/// assert_eq!(decode_e4m3fn(0x7e), 448.0); // the largest finite value
+/// assert_eq!(decode_e4m3fn(0x01), 1.0 / 512.0); // the smallest subnormal
+/// assert!(decode_e4m3fn(0xff).is_nan());
+/// ```
 #[must_use]
 pub fn decode_e4m3fn(byte: u8) -> f32 {
     let magnitude = byte & 0x7f;
@@ -91,6 +182,17 @@ pub fn decode_e4m3fn(byte: u8) -> f32 {
 ///
 /// Byte zero means 2^-127, not zero; `0xff` means NaN. All other codes
 /// represent positive powers of two, including `0xfe` = 2^127.
+///
+/// # Example
+///
+/// ```
+/// use blockfloat::decode_e8m0;
+///
+/// assert_eq!(decode_e8m0(127), 1.0);
+/// assert_eq!(decode_e8m0(128), 2.0);
+/// assert_eq!(decode_e8m0(0), f32::MIN_POSITIVE / 2.0); // 2^-127, a subnormal
+/// assert!(decode_e8m0(0xff).is_nan());
+/// ```
 #[must_use]
 pub fn decode_e8m0(byte: u8) -> f32 {
     match byte {

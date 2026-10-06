@@ -66,6 +66,37 @@ pub enum ActivationQuantError {
 /// E4M3FN encoding is software round-to-nearest, ties-to-even. The pinned
 /// `TileLang` source does not itself establish that this is hardware cast parity.
 /// All validation completes before either output buffer is written.
+///
+/// # Errors
+///
+/// Both output buffers are unchanged on every error.
+///
+/// * [`ActivationQuantError::EmptyDimension`] when `rows` or `reduction` is 0.
+/// * [`ActivationQuantError::IncompleteActivationGroup`] when `reduction` is
+///   not a multiple of the group width.
+/// * [`ActivationQuantError::Length`] when a buffer does not match its shape,
+///   and [`ActivationQuantError::ShapeOverflow`] when that shape does not fit
+///   in `usize`.
+/// * [`ActivationQuantError::NonFiniteInput`] for a NaN or infinite input.
+///
+/// # Example
+///
+/// A group of 1.0 values has `amax` 1.0, so its scale is
+/// `2^ceil(log2(1 / 448))` = 2^-8 (E8M0 code 119) and each value encodes as
+/// 256 (E4M3FN code `0x78`).
+///
+/// ```
+/// use blockfloat::{ActivationGroup, quantize_bf16_activations_e4m3fn};
+///
+/// let input = [0x3f80_u16; 32]; // BF16 1.0
+/// let (mut codes, mut scales) = ([0_u8; 32], [0_u8; 1]);
+/// quantize_bf16_activations_e4m3fn(
+///     &input, 1, 32, ActivationGroup::Elements32, &mut codes, &mut scales,
+/// )?;
+/// assert_eq!(scales, [119]);
+/// assert_eq!(codes, [0x78; 32]);
+/// # Ok::<(), blockfloat::ActivationQuantError>(())
+/// ```
 pub fn quantize_bf16_activations_e4m3fn(
     input_bf16: &[u16],
     rows: usize,

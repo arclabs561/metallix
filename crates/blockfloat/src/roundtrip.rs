@@ -56,6 +56,23 @@ pub enum ActivationRoundtripError {
 ///
 /// Returns [`ActivationRoundtripError`] for invalid shapes, nonfinite input,
 /// an oversized request, or reconstruction overflow; output remains unchanged.
+///
+/// # Example
+///
+/// The group's scale is 2^-8, so its values scale to about 256, where
+/// neighboring E4M3FN values are 32 apart. BF16 1.0078125 scales to 258,
+/// rounds to 256 and reconstructs as 1.0.
+///
+/// ```
+/// use blockfloat::{ActivationGroup, requantize_bf16_activations_e4m3fn};
+///
+/// let mut input = [0x3f80_u16; 32]; // BF16 1.0
+/// input[0] = 0x3f81; // BF16 1.0078125
+/// let mut output = [0_u16; 32];
+/// requantize_bf16_activations_e4m3fn(&input, 1, 32, ActivationGroup::Elements32, &mut output)?;
+/// assert_eq!(output, [0x3f80; 32]);
+/// # Ok::<(), blockfloat::ActivationRoundtripError>(())
+/// ```
 pub fn requantize_bf16_activations_e4m3fn(
     input: &[u16],
     rows: usize,
