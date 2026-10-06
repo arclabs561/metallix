@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source": {
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "files": {
+      "config.json": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+    },
+    "note": "No generation_config.json; text_config.eos_token_id is 248044 (<|endoftext|>) and tokenizer_config eos_token is <|im_end|> (248046)."
+  }
+}

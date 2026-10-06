@@ -119,11 +119,13 @@ enum TokenIds {
 
 impl StopTokens {
     /// The union, in order, of `eos_token_id` from `config.json` and from
-    /// `generation_config.json` (which `generate` in transformers uses).
-    /// Listed IDs in `tool_end` end a tool-calling turn; the rest end a turn.
+    /// `generation_config.json` (which `generate` in transformers uses), then
+    /// the tokenizer's special `eos_token`. Listed IDs in `tool_end` end a
+    /// tool-calling turn; the rest end a turn.
     fn from_configs(
         config: &Value,
         generation_config: Option<&Value>,
+        eos_token: Option<TokenId>,
         tool_end: &[TokenId],
     ) -> Result<Self, String> {
         let mut ids = Vec::new();
@@ -149,6 +151,9 @@ impl StopTokens {
                     ids.push(id);
                 }
             }
+        }
+        if let Some(id) = eos_token.filter(|id| !ids.contains(id)) {
+            ids.push(id);
         }
         let (tool_end, end_turn): (Vec<_>, Vec<_>) =
             ids.into_iter().partition(|id| tool_end.contains(id));
@@ -206,7 +211,10 @@ impl StopTokens {
     /// listed ID ends a turn.
     pub fn load(model: &Path) -> Result<Self, String> {
         let (config, generation_config) = read_configs(model)?;
-        Self::from_configs(&config, generation_config.as_ref(), &[])
+        let tokenizer = QwenTokenizer::load(model)?;
+        let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
+        let eos_token = eos_token(&tokenizer_config, &tokenizer)?;
+        Self::from_configs(&config, generation_config.as_ref(), eos_token, &[])
     }
 
     /// One end-of-turn ID, the first listed, for a consumer that accepts a
@@ -392,7 +400,12 @@ impl ChatFormat {
             .map(TokenId::new)
             .into_iter()
             .collect();
-        let stops = StopTokens::from_configs(&config, generation_config.as_ref(), &tool_end)?;
+        let stops = StopTokens::from_configs(
+            &config,
+            generation_config.as_ref(),
+            eos_token(&tokenizer_config, &tokenizer)?,
+            &tool_end,
+        )?;
         let suppress = suppress_tokens(generation_config.as_ref(), vocabulary_size)?;
         for id in stops.iter() {
             let id = i32::try_from(id.get())
@@ -717,6 +730,25 @@ fn suppress_tokens(
     Ok(ids.into_iter().map(TokenId::new).collect())
 }
 
+/// The ID of `tokenizer_config.json`'s `eos_token`, the token chat templates
+/// end a turn with (Qwen3.5-0.8B's `<|im_end|>`, which its configs do not
+/// list). `None` when the token is not special, so ordinary text never stops
+/// a turn; a missing or unknown `eos_token` is an error.
+fn eos_token(
+    tokenizer_config: &Value,
+    tokenizer: &QwenTokenizer,
+) -> Result<Option<TokenId>, String> {
+    let entry = &tokenizer_config["eos_token"];
+    let text = entry
+        .as_str()
+        .or_else(|| entry["content"].as_str())
+        .ok_or("local tokenizer_config.json has no eos_token")?;
+    let id = tokenizer.token_id(text).ok_or_else(|| {
+        format!("tokenizer_config.json eos_token {text:?} is not a tokenizer token")
+    })?;
+    Ok(tokenizer.is_special(id).then_some(TokenId::new(id)))
+}
+
 /// `config.json` and, when present, `generation_config.json`.
 fn read_configs(model: &Path) -> Result<(Value, Option<Value>), String> {
     let config = read_json(model, "config.json", MAX_MODEL_CONFIG_BYTES)?;
@@ -804,6 +836,11 @@ pub mod test_model {
             ));
             fs::create_dir_all(&root).expect("model directory");
             fs::write(root.join("tokenizer.json"), tokenizer().to_string()).expect("tokenizer");
+            // Every checkpoint names an end-of-turn token; default to `</s>`.
+            let mut tokenizer_config = tokenizer_config.clone();
+            if tokenizer_config.get("eos_token").is_none() {
+                tokenizer_config["eos_token"] = Value::from("</s>");
+            }
             fs::write(
                 root.join("tokenizer_config.json"),
                 tokenizer_config.to_string(),
@@ -1085,12 +1122,87 @@ mod tests {
         }
     }
 
+    /// Qwen3.5-0.8B lists only `<|endoftext|>` (248044) under `text_config`
+    /// and ships no `generation_config.json`; its turns end with the
+    /// tokenizer's `eos_token`, `<|im_end|>` (248046). Without it the turn ran
+    /// one token past its end and streamed `<|im_end|>` as text.
+    #[test]
+    fn tokenizer_config_eos_token_ends_a_turn() {
+        const CONFIG: &str = include_str!("../../../fixtures/qwen3.5-0.8b/config.json");
+        const TOKENIZER_CONFIG: &str =
+            include_str!("../../../fixtures/qwen3.5-0.8b/tokenizer_config.json");
+        let tokenizer_config: Value = serde_json::from_str(TOKENIZER_CONFIG).expect("JSON");
+        let model = ModelDir::new(
+            &tokenizer_config,
+            &serde_json::from_str(CONFIG).expect("JSON"),
+            None,
+        );
+        // The checkpoint's added tokens, at their IDs, over a word-level
+        // model; the 12.8 MB tokenizer.json is not a fixture.
+        let mut vocab = serde_json::Map::new();
+        vocab.insert(String::from("<unk>"), json!(0));
+        let mut added = Vec::new();
+        for (id, token) in tokenizer_config["added_tokens_decoder"]
+            .as_object()
+            .expect("added tokens")
+        {
+            let id: u32 = id.parse().expect("ID");
+            vocab.insert(
+                token["content"].as_str().expect("content").to_owned(),
+                json!(id),
+            );
+            added.push(
+                json!({"id": id, "content": token["content"], "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": false,
+                "special": token["special"]}),
+            );
+        }
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": added,
+            "normalizer": null, "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null, "decoder": null,
+            "model": {"type": "WordLevel", "unk_token": "<unk>", "vocab": vocab}
+        });
+        fs::write(model.path().join("tokenizer.json"), tokenizer.to_string()).expect("tokenizer");
+        let format = ChatFormat::load(model.path(), 248_320).expect("Qwen3.5 loads");
+        assert_eq!(
+            format.stops().classify(TokenId::new(248_046)),
+            TokenClass::EndTurn,
+            "<|im_end|> ends a turn"
+        );
+        assert_eq!(
+            format.stops().classify(TokenId::new(248_044)),
+            TokenClass::EndTurn
+        );
+        // A missing eos_token fails the load; an ordinary word never stops.
+        let small = |eos_token: Value| {
+            let model = ModelDir::new(
+                &json!({"chat_template": "{{ messages[0].content }}", "eos_token": eos_token}),
+                &json!({"eos_token_id": 2}),
+                None,
+            );
+            ChatFormat::load(model.path(), VOCABULARY_SIZE)
+        };
+        assert!(small(Value::Null).is_err());
+        assert!(small(json!("<absent>")).is_err());
+        let ordinary = small(json!("Hello")).expect("ordinary eos_token loads");
+        assert_eq!(
+            ordinary.stops().classify(TokenId::new(4)),
+            TokenClass::Normal
+        );
+        let special = small(json!({"content": "<|im_end|>"})).expect("object eos_token loads");
+        assert_eq!(
+            special.stops().classify(TokenId::new(3)),
+            TokenClass::EndTurn
+        );
+    }
+
     /// `MiniCPM5` lists `eos_token_id: [1, 130073]` and Gemma 4 `[1, 106, 50]`;
     /// a scalar field rejected both checkpoints at load.
     #[test]
     fn stop_tokens_are_every_listed_eos_from_both_configs() {
         let stops = |config: Value, generation: Option<Value>| {
-            StopTokens::from_configs(&config, generation.as_ref(), &[])
+            StopTokens::from_configs(&config, generation.as_ref(), None, &[])
         };
         let minicpm = stops(json!({"eos_token_id": [1, 130_073]}), None).expect("list");
         for id in [1, 130_073] {
@@ -1136,6 +1248,7 @@ mod tests {
         let gemma = StopTokens::from_configs(
             &json!({"eos_token_id": [1, 106]}),
             Some(&json!({"eos_token_id": [1, 106, 50]})),
+            None,
             &[TokenId::new(50)],
         )
         .expect("gemma stops");
@@ -1151,8 +1264,13 @@ mod tests {
             assert_eq!(gemma.classify_turn(token, true), ignoring, "{id}");
         }
         assert!(
-            StopTokens::from_configs(&json!({"eos_token_id": 50}), None, &[TokenId::new(50)])
-                .is_err()
+            StopTokens::from_configs(
+                &json!({"eos_token_id": 50}),
+                None,
+                None,
+                &[TokenId::new(50)]
+            )
+            .is_err()
         );
     }
 

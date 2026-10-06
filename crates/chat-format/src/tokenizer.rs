@@ -90,6 +90,16 @@ impl QwenTokenizer {
         Ok(())
     }
 
+    /// Whether `id` is an added token marked special, as end-of-turn
+    /// markers are.
+    #[must_use]
+    pub fn is_special(&self, id: u32) -> bool {
+        self.tokenizer
+            .get_added_tokens_decoder()
+            .get(&id)
+            .is_some_and(|token| token.special)
+    }
+
     /// The ID of a token spelled exactly `text`, such as a special token.
     #[must_use]
     pub fn token_id(&self, text: &str) -> Option<u32> {
