@@ -850,7 +850,7 @@ def server_spec(
 
 
 # Model-free servers for dry runs of the harness, at two fixed speeds.
-STUB_TPOT_MS = {"stub": 2.0, "stub-slow": 4.0}
+STUB_TPOT_MS = {"stub": 2.0, "stub-slow": 10.0}
 SERVERS = ("metallix", "vllm-metal", "mtplx", "mlx-lm", *STUB_TPOT_MS)
 
 # Flags that force each server's prompt-prefix cache on or off, so shared-prefix

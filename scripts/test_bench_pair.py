@@ -112,7 +112,7 @@ class Drift(unittest.TestCase):
 
 class StubServers(unittest.TestCase):
     def test_drifting_stub_servers_end_to_end(self) -> None:
-        # Arm A is the 2 ms/token stub and arm B the 4 ms/token one; both slow
+        # Arm A is the 2 ms/token stub and arm B the 10 ms/token one; both slow
         # down from the same moment, as on a machine growing busier.
         logs = tempfile.TemporaryDirectory()
         self.addCleanup(logs.cleanup)
@@ -140,7 +140,9 @@ class StubServers(unittest.TestCase):
         summary = bench_pair.summarize_pairs(pairs, random.Random(0))
         self.assertEqual(summary["kept"], 4)
         tput = summary["metrics"]["output_tok_s"]
-        # Half the token rate, diluted by the fixed 20 ms first-token delay.
+        # A fifth of the token rate, diluted by the fixed 20 ms first-token
+        # delay. The wider gap tolerates more shared scheduler delay, though
+        # sufficiently large overhead or asymmetric drift can still fail it.
         self.assertLess(tput["ci95"][1], 0.9)
         self.assertEqual(tput["verdict"], "A better")
 
