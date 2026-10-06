@@ -1132,9 +1132,17 @@ def failure_warnings(cells: dict[tuple, dict[str, list[dict]]]) -> list[str]:
         for engine, records in by_engine.items():
             failed = [r for r in records if r["outcome"] != "ok"]
             if failed:
+                # Synthetic sets give every prompt the set's label, so repeats
+                # are counted rather than listed.
+                groups: dict[tuple[str, str], int] = {}
+                for r in sorted(failed, key=lambda r: r["index"]):
+                    key = (r["label"], r["outcome"])
+                    groups[key] = groups.get(key, 0) + 1
                 listed = ", ".join(
-                    f"{r['label']} ({r['outcome']})"
-                    for r in sorted(failed, key=lambda r: r["index"])
+                    f"{count} x {label} ({outcome})"
+                    if count > 1
+                    else f"{label} ({outcome})"
+                    for (label, outcome), count in groups.items()
                 )
                 warnings.append(
                     f"{engine} {set_name} {mode}={value:g}: "

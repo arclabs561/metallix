@@ -535,6 +535,16 @@ class TokenCounts(unittest.TestCase):
             ],
         )
 
+    def test_repeated_failures_are_counted_not_listed(self) -> None:
+        records = self.records([None, 128, None, None])
+        for r in records:
+            r["label"] = "short"
+        records[3]["outcome"] = "error"
+        (warning,) = bench_load.failure_warnings({("short", "c", 16): {"m": records}})
+        self.assertEqual(
+            warning, "m short c=16: 3/4 failed: 2 x short (http_503), short (error)"
+        )
+
     def test_cells_come_from_measured_levels_only(self) -> None:
         run = {"concurrency": 2, "summary": {}, "records": self.records([1])}
         servers = [
