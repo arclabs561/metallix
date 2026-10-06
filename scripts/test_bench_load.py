@@ -394,6 +394,11 @@ class Levels(unittest.TestCase):
             mock.patch.object(bench_load.bench_serve, "free_address", lambda: "h:1"),
             mock.patch.object(
                 bench_load.bench_system,
+                "probe",
+                lambda pgid: {"gpu_in_use_bytes": 20 * 2**30, "load_1m": load},
+            ),
+            mock.patch.object(
+                bench_load.bench_system,
                 "Sampler",
                 lambda **kw: sampler(probe=fake_probe, **kw),
             ),
@@ -426,6 +431,9 @@ class Levels(unittest.TestCase):
             "concurrency"
         ][0]
         self.assertIn("rose above 4", run["aborted"])
+        # Another job's GPU memory is visible in the reason and the record.
+        self.assertIn("(20.0 GiB in use before the server started)", run["aborted"])
+        self.assertEqual(run["baseline"]["gpu_in_use_bytes"], 20 * 2**30)
         self.assertNotIn("summary", run)  # Cut-off requests are not engine failures.
         self.assertEqual(started.count("stopped"), 2)  # The abort, then cleanup.
 

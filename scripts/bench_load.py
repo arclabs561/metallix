@@ -1010,6 +1010,13 @@ def measure_level(
         else:
             address = bench_serve.free_address()
         spec = with_level(level_spec(name, address, args), kind, value, args)
+        # The GPU-memory abort reads a machine-wide total, so record what was
+        # already in use (other jobs) before this level's server started.
+        baseline = bench_system.probe(None)
+        result["baseline"] = {
+            key: baseline.get(key)
+            for key in ("gpu_in_use_bytes", "system_used_bytes", "load_1m")
+        }
         if not args.url:
             log = args.log_dir / f"{name}-{set_name}-{kind}{value:g}.log"
             server = ManagedServer(spec, address, log)
@@ -1059,10 +1066,15 @@ def measure_level(
         }
         if sampler.aborted:
             # Requests cut off by the abort would read as engine failures.
-            result["aborted"] = sampler.aborted
+            before_gib = gib(result["baseline"]["gpu_in_use_bytes"])
+            result["aborted"] = sampler.aborted + (
+                f" ({before_gib:.1f} GiB in use before the server started)"
+                if before_gib is not None
+                else ""
+            )
             del result["summary"]
             print(
-                f"  {set_name} {kind}={value}: aborted: {sampler.aborted}", flush=True
+                f"  {set_name} {kind}={value}: aborted: {result['aborted']}", flush=True
             )
         else:
             print(

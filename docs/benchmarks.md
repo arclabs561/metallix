@@ -53,7 +53,10 @@ tokens. It is used unchanged from that commit (SHA-256
    and GPU utilization at most 5% over five one-second samples
    (`ioreg -r -c AGXAccelerator -d 1`). An arm that cannot pass within 30
    minutes is skipped and reported.
-2. A load average above 4 during an arm aborts it. Aborted arms report no
+2. A load average above 4 during an arm aborts it, and so does machine-wide
+   GPU memory in use above a cap sized to the model (24 GiB for Qwen3-0.6B,
+   where the largest engine peaked at 12.6 GiB). Each arm records the GPU
+   memory already in use before its server started. Aborted arms report no
    numbers.
 3. A fresh server for every engine at every concurrency level, so no level
    inherits another level's prefix cache or allocator state.
@@ -123,7 +126,7 @@ uv run scripts/bench_campaign.py \
   --server metallix,vllm-metal,mlx-lm --model-path MODEL_DIR --envs ENVS_DIR \
   --sets shared-prefix,file --prompts-file agent_benchmark_prompts.json \
   --concurrency 1,4,8,16 --cache-arms on,off --context-tokens 16384 \
-  --json campaign.json
+  --abort-gpu-gib 24 --json campaign.json
 
 # A hand-started server, once per pass, then one summary for everything.
 uv run scripts/bench_load.py --url http://127.0.0.1:8080 --label llama.cpp \
