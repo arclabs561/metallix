@@ -17,6 +17,10 @@ Phases, each reading and writing one run directory:
   check    run `mx inspect supports --json` over the cached files
   report   write report.md: supported shares, blockers and the unsupported
            families ranked by summed trending score
+  components
+           for the top families by trending weight, inventory the building
+           blocks (config plus modeling file) and grep crates/models for each;
+           write components.md (see hub_components.py)
   all      every phase in order (check only with --mx)
 
 The parsers and classifiers take decoded data so tests feed recorded Hub
@@ -46,6 +50,8 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+import hub_components
 
 ROOT = Path(__file__).resolve().parent.parent
 HUB = "https://huggingface.co"
@@ -886,9 +892,177 @@ def phase_report(run: Path, args) -> None:
     print(text)
 
 
+TRANSFORMERS_RAW = "https://raw.githubusercontent.com/huggingface/transformers"
+
+
+def local_transformers(version: str) -> Path | None:
+    """A transformers package of exactly `version` in the uv cache."""
+    cache = Path.home() / ".cache/uv"
+    patterns = (
+        f"environments-v2/*/lib/python3*/site-packages/transformers-{version}.dist-info",
+        f"archive-v0/*/transformers-{version}.dist-info",
+    )
+    for pattern in patterns:
+        for info in sorted(cache.glob(pattern)):
+            package = info.parent / "transformers"
+            if (package / "models").is_dir():
+                return package
+    return None
+
+
+def modeling_source(model_type, config, repo, sha, args, fetcher):
+    """(source text, public origin) of the modeling file, or (None, why).
+
+    Transformers at the pinned version first (uv cache, else GitHub at the
+    release tag), then the repo's own auto_map file at the listed commit.
+    Source is only read as text, never imported or executed.
+    """
+    version = args.transformers_version
+    package = local_transformers(version)
+    for name in hub_components.modeling_dirs(model_type):
+        relative = f"models/{name}/modeling_{name}.py"
+        origin = f"transformers v{version} {relative}"
+        if package is not None:
+            if (package / relative).exists():
+                return (package / relative).read_text(), origin
+            continue
+        cached = args.cache / f"transformers-{version}" / relative
+        if not cached.exists():
+            status, _, body = fetcher(
+                f"{TRANSFORMERS_RAW}/v{version}/src/transformers/{relative}"
+            )
+            if status != 200:
+                continue
+            cached.parent.mkdir(parents=True, exist_ok=True)
+            cached.write_bytes(body)
+        return cached.read_text(), origin
+    remote = hub_components.remote_modeling_file(config)
+    if remote is None:
+        return None, f"no modeling file for {model_type} in transformers v{version}"
+    cached = cache_path(args.cache, repo, sha, remote)
+    if not cached.exists():
+        status, _, body = fetcher(f"{HUB}/{repo}/resolve/{sha or 'main'}/{remote}")
+        if status != 200:
+            return None, f"{repo}/{remote}: HTTP {status}"
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(body)
+    return cached.read_text(), f"{repo}@{(sha or 'main')[:7]} {remote}"
+
+
+def chat_template(model: dict, cache: Path, fetcher) -> tuple[str, str] | None:
+    """(template text, public origin) from chat_template.jinja or
+    tokenizer_config.json at the listed commit."""
+    repo, sha = model["id"], model.get("sha")
+    for name in ("chat_template.jinja", "tokenizer_config.json"):
+        if name not in model.get("files", []):
+            continue
+        path = cache_path(cache, repo, sha, name)
+        if not path.exists():
+            status, _, body = fetcher(f"{HUB}/{repo}/resolve/{sha or 'main'}/{name}")
+            if status != 200:
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        text = path.read_text()
+        if name == "tokenizer_config.json":
+            try:
+                text = hub_components.template_from_tokenizer_config(text)
+            except ValueError:
+                text = None
+        if text:
+            return text, f"{repo}@{(sha or 'main')[:7]} {name}"
+    return None
+
+
+def phase_components(run: Path, args) -> None:
+    models, _, table, fetched, has_verdicts, head = load_table(run)
+    listing = {m["id"]: m for m in models}
+    text_rows = [r for r in table if r["kind"] == "text"]
+    total = sum(r["score"] for r in text_rows)
+    by = collections.defaultdict(list)
+    for r in text_rows:
+        if r["family"] and not r["family"].startswith("base:"):
+            by[r["family"]].append(r)
+    ranked = sorted(by, key=lambda f: -sum(r["score"] for r in by[f]))
+    adapters = {
+        f: collections.Counter(r["adapter"] for r in by[f] if r["adapter"]).most_common(
+            1
+        )
+        for f in by
+    }
+    adapters = {f: c[0][0] for f, c in adapters.items() if c}
+    chosen = list(dict.fromkeys(ranked[: args.families] + sorted(adapters)))
+    fetcher = make_fetcher(hub_token(), "modeling")
+    families: list[dict] = []
+    for name in chosen:
+        members = by[name]
+        entry: dict = {
+            "family": name,
+            "weight": sum(r["score"] for r in members),
+            "repos": len(members),
+            "adapter": adapters.get(name),
+        }
+        with_config = [
+            r for r in members if (fetched.get(r["id"]) or {}).get("status") == "ok"
+        ]
+        if not with_config:
+            families.append(entry | {"modeling": "no config in snapshot"})
+            continue
+        rep = max(with_config, key=lambda r: r["score"])
+        record = fetched[rep["id"]]
+        config = json.loads(Path(record["path"]).read_text())
+        text, _ = hub_components.text_config(config)
+        model_type = text.get("model_type") or config.get("model_type") or ""
+        source, origin = modeling_source(
+            model_type, config, rep["id"], record.get("sha"), args, fetcher
+        )
+        components = hub_components.config_components(config)
+        if source is not None:
+            components = hub_components.merge(
+                components, hub_components.code_components(source, origin)
+            )
+        template = chat_template(listing[rep["id"]], args.cache, fetcher)
+        if template is not None:
+            components |= hub_components.template_components(*template)
+        entry |= {
+            "representative": rep["id"],
+            "modeling": origin,
+            "components": components,
+            "unrecognized": hub_components.unrecognized_keys(config),
+        }
+        families.append(entry)
+    names = {n for f in families for n in f.get("components", {})}
+    evidence = hub_components.metallix_evidence(
+        hub_components.rust_sources(ROOT), names
+    )
+    known = {
+        f["family"]: hub_components.signature(f["components"])
+        for f in families
+        if f.get("adapter") and f.get("components")
+    }
+    for f in families:
+        if not f.get("components"):
+            continue
+        f["gaps"] = hub_components.gaps(f["components"], evidence)
+        others = {k: v for k, v in known.items() if k != f["family"]}
+        if others:
+            sig = hub_components.signature(f["components"])
+            f["nearest"] = hub_components.nearest_family(sig, others)
+    shown = [f for f in families if f["family"] in ranked[: args.families]]
+    write_jsonl(run / "components.jsonl", families)
+    text = hub_components.render(shown, evidence, total)
+    text = text.replace("\n", f"\n\nFamilies from the {head_note(head or {})}.\n", 1)
+    if not has_verdicts:
+        text = "Check phase not run: adapter columns are empty.\n\n" + text
+    (run / "components.md").write_text(text)
+    print(f"components: {len(shown)} families -> {run / 'components.md'}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("phase", choices=("list", "configs", "check", "report", "all"))
+    parser.add_argument(
+        "phase", choices=("list", "configs", "check", "report", "components", "all")
+    )
     parser.add_argument(
         "--out-root", type=Path, default=ROOT / "artifacts/hub-trending"
     )
@@ -920,6 +1094,14 @@ def main() -> int:
     parser.add_argument(
         "--config-workers", type=int, default=4, help="parallel config downloads"
     )
+    parser.add_argument(
+        "--families", type=int, default=20, help="families in the components phase"
+    )
+    parser.add_argument(
+        "--transformers-version",
+        default="5.18.0",
+        help="Transformers release whose modeling files the components phase reads",
+    )
     parser.add_argument("--mx", help="mx binary for the check phase")
     parser.add_argument(
         "--top", type=int, default=25, help="families in the ranked table"
@@ -942,6 +1124,8 @@ def main() -> int:
             return 3
     if args.phase in ("report", "all"):
         phase_report(run, args)
+    if args.phase in ("components", "all"):
+        phase_components(run, args)
     return 0
 
 
