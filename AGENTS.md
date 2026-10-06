@@ -33,9 +33,22 @@ Preserve concurrent work. A shared or unowned checkout is observation-only;
 perform changes in an explicitly owned checkout. Stage exact owned paths.
 
 Use `just check` or `just check-metal` as the canonical gate, with focused checks
-for the changed boundary. Serialize Cargo builds and device probes. Preserve
-the configured `RUSTC_WRAPPER`. Report a failing gate accurately rather than
-weakening it or hiding it behind unrelated passing tests.
+for the changed boundary. Both run `uv run scripts/check.py`; call the script
+directly to pass options such as `--timeout-seconds` on a loaded machine.
+Serialize Cargo builds and device probes. Preserve the configured
+`RUSTC_WRAPPER`. Report a failing gate accurately rather than weakening it or
+hiding it behind unrelated passing tests.
+
+Before profiling or guessing at a cost, use the instruments in
+[DEVELOPMENT.md](DEVELOPMENT.md#observability): `METALLIX_LOG` spans with
+timings and MLX active and peak bytes, the `timeline` feature for Perfetto,
+Metal captures, and CPU sampling. A performance claim names the instrument
+that located the cost.
+
+Size GPU jobs by process footprint (`footprint <pid>`) or GPU-resident memory
+(`ioreg -r -c AGXAccelerator`), not RSS: Metal buffers do not show in RSS. A
+job that runs `mx` should stop itself past a stated GPU memory cap, as
+`scripts/bench_load.py --abort-gpu-gib` does.
 
 Synthetic reduced graphs, isolated Metal kernels and protocol tests qualify
 their stated scope only. They do not establish real checkpoint generation,
