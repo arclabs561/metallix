@@ -295,3 +295,55 @@ fn json_lines_follow_the_contract_and_io_errors_exit_2() {
     assert!(human.contains("supported (qwen3)"), "{human}");
     std::fs::remove_dir_all(&dir).expect("remove temp dir");
 }
+
+/// Adds a config field after the opening brace.
+fn with_field(json: &str, field: &str) -> String {
+    json.replacen('{', &format!("{{ {field},"), 1)
+}
+
+#[test]
+fn quantized_configs_are_refused_while_the_gate_ignores_quantization() {
+    // mlx-community/Qwen3-0.6B-4bit writes both fields.
+    let mlx = with_field(
+        &with_field(
+            QWEN3_06B,
+            r#""quantization": {"group_size": 64, "bits": 4}"#,
+        ),
+        r#""quantization_config": {"group_size": 64, "bits": 4}"#,
+    );
+    let verdict = assert_classified(&mlx, Some(Adapter::Qwen3), false);
+    let reason = verdict.reason();
+    assert!(
+        reason.contains("4-bit") && reason.contains("group size 64"),
+        "{reason}"
+    );
+
+    // Qwen/Qwen3-4B-FP8's quantization_config.
+    let fp8 = with_field(
+        QWEN3_06B,
+        r#""quantization_config": {"activation_scheme": "dynamic", "modules_to_not_convert": ["lm_head"], "quant_method": "fp8", "weight_block_size": [128, 128]}"#,
+    );
+    let verdict = assert_classified(&fp8, Some(Adapter::Qwen3), false);
+    assert!(
+        verdict.reason().contains(r#""fp8""#),
+        "{}",
+        verdict.reason()
+    );
+
+    let llama = with_field(
+        MINICPM5_2B,
+        r#""quantization": {"group_size": 64, "bits": 4, "mode": "affine"}"#,
+    );
+    assert_classified(&llama, Some(Adapter::Llama), false);
+
+    let unquantized = with_field(QWEN3_06B, r#""quantization_config": null"#);
+    assert_classified(&unquantized, Some(Adapter::Qwen3), true);
+}
+
+#[test]
+fn a_gate_that_reads_quantization_keeps_its_own_verdict() {
+    assert_eq!(
+        verdict(DEEPSEEK_V41),
+        Verdict::Accepted(Adapter::DeepseekV41)
+    );
+}

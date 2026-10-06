@@ -5,10 +5,12 @@
 //! before reading weights, so this answer moves with the loaders instead of
 //! a separate list. It reads no weights, tokenizer or template, and does not
 //! apply the context and K/V admission limits `mx serve` checks after the
-//! configuration.
+//! configuration. A gate that ignores a declared quantization would pass a
+//! config whose weights its loader cannot run, so such configs are refused
+//! here until that gate reads the field.
 
 use std::{
-    fs,
+    fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -63,6 +65,25 @@ impl Adapter {
         }
     }
 
+    /// Whether this adapter's configuration gate validates a declared
+    /// `quantization` or `quantization_config` itself. A gate that does not
+    /// would accept the config and leave the loader to fail on the weights,
+    /// so such a config is refused here instead.
+    const fn gate_reads_quantization(self) -> bool {
+        match self {
+            // V41TextContract requires the official fp8/fp4 block layout.
+            Self::DeepseekV41 => true,
+            // Qwen3ForwardConfig ignores the field today; once it parses a
+            // typed quantization, return true for its three adapters.
+            Self::Qwen3
+            | Self::Llama
+            | Self::PplxQwen3
+            | Self::Julia
+            | Self::Qwen35
+            | Self::Gemma4 => false,
+        }
+    }
+
     fn qwen(family: qwen::DecoderFamily, attention: qwen::Qwen3Attention) -> Self {
         match (family, attention) {
             (qwen::DecoderFamily::Llama, _) => Self::Llama,
@@ -85,6 +106,12 @@ pub(crate) enum Verdict {
     Accepted(Adapter),
     /// The adapter owns this architecture but refused this variant.
     Rejected { adapter: Adapter, reason: String },
+    /// The adapter's gate accepted a quantized config without reading its
+    /// quantization, so its loader cannot run the weights.
+    QuantizationNotRead {
+        adapter: Adapter,
+        quantization: DeclaredQuantization,
+    },
     /// A diffusers `model_index.json`, which no adapter loads.
     DiffusersPipeline { class_name: String },
     /// No adapter recognizes the architecture.
@@ -113,7 +140,17 @@ impl Verdict {
         ];
         for claim in claims {
             match claim {
-                Claim::Accepted(adapter) => return Self::Accepted(adapter),
+                Claim::Accepted(adapter) => {
+                    return match DeclaredQuantization::of(document) {
+                        Some(quantization) if !adapter.gate_reads_quantization() => {
+                            Self::QuantizationNotRead {
+                                adapter,
+                                quantization,
+                            }
+                        }
+                        _ => Self::Accepted(adapter),
+                    };
+                }
                 Claim::Rejected(adapter, reason) => return Self::Rejected { adapter, reason },
                 Claim::NotMine => {}
             }
@@ -130,7 +167,9 @@ impl Verdict {
 
     pub(crate) const fn adapter(&self) -> Option<Adapter> {
         match self {
-            Self::Accepted(adapter) | Self::Rejected { adapter, .. } => Some(*adapter),
+            Self::Accepted(adapter)
+            | Self::Rejected { adapter, .. }
+            | Self::QuantizationNotRead { adapter, .. } => Some(*adapter),
             Self::DiffusersPipeline { .. } | Self::Unrecognized { .. } => None,
         }
     }
@@ -157,6 +196,13 @@ impl Verdict {
                 )
             }
             Self::Rejected { reason, .. } => reason.clone(),
+            Self::QuantizationNotRead {
+                adapter,
+                quantization,
+            } => format!(
+                "config declares {quantization}, and the {} loader does not read quantized weights",
+                adapter.name()
+            ),
             Self::DiffusersPipeline { class_name } => {
                 format!("diffusers pipeline {class_name}; no adapter loads diffusers pipelines")
             }
@@ -167,6 +213,53 @@ impl Verdict {
                 String::from("no adapter recognizes this config; it names no model_type")
             }
         }
+    }
+}
+
+/// A `quantization` or `quantization_config` object in a config. MLX writes
+/// `{"group_size": 64, "bits": 4}` (sometimes with `"mode": "affine"`);
+/// Hugging Face writes `quant_method`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DeclaredQuantization {
+    field: &'static str,
+    method: Option<String>,
+    bits: Option<u64>,
+    group_size: Option<u64>,
+}
+
+impl DeclaredQuantization {
+    fn of(document: &Value) -> Option<Self> {
+        ["quantization_config", "quantization"]
+            .into_iter()
+            .find_map(|field| {
+                let declared = document.get(field).filter(|value| !value.is_null())?;
+                let text = |key: &str| declared.get(key).and_then(Value::as_str).map(str::to_owned);
+                Some(Self {
+                    field,
+                    method: text("quant_method")
+                        .or_else(|| text("method"))
+                        .or_else(|| text("mode")),
+                    bits: declared.get("bits").and_then(Value::as_u64),
+                    group_size: declared.get("group_size").and_then(Value::as_u64),
+                })
+            })
+    }
+}
+
+impl fmt::Display for DeclaredQuantization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (", self.field)?;
+        match &self.method {
+            Some(method) => write!(f, "method {method:?}")?,
+            None => write!(f, "no method stated")?,
+        }
+        if let Some(bits) = self.bits {
+            write!(f, ", {bits}-bit")?;
+        }
+        if let Some(group_size) = self.group_size {
+            write!(f, ", group size {group_size}")?;
+        }
+        write!(f, ")")
     }
 }
 
