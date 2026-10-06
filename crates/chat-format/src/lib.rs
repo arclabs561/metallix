@@ -12,6 +12,7 @@
 //! The crate has no model or MLX dependency, so its tests run anywhere.
 
 mod messages;
+mod stream;
 mod template_json;
 mod tokenizer;
 mod tools;
@@ -27,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 pub use crate::{
     messages::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation},
+    stream::{TurnDelta, TurnStream},
     tokenizer::{QwenIncrementalDecode, QwenTokenizer, read_regular_file},
     tools::validator,
     turn::{

@@ -128,7 +128,7 @@ impl ToolDialect {
 }
 
 impl ReasoningDialect {
-    const fn markers(self) -> Option<(&'static str, &'static str)> {
+    pub(crate) const fn markers(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::ThinkTags => Some(("<think>", "</think>")),
             Self::GemmaChannel => Some(("<|channel>thought", "<channel|>")),

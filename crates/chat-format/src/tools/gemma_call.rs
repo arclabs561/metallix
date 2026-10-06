@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use super::{MAX_CALLS, ParsedTurn, ToolCall};
 
-const OPEN: &str = "<|tool_call>";
+pub(crate) const OPEN: &str = "<|tool_call>";
 const CLOSE: &str = "<tool_call|>";
 const QUOTE: &str = "<|\"|>";
 

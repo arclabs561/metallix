@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::{MAX_CALLS, ParsedTurn, ToolCall, typed_parameter};
 
-const OPEN: &str = "<function name=";
+pub(crate) const OPEN: &str = "<function name=";
 const CLOSE: &str = "</function>";
 
 /// Parses complete calls while preserving surrounding text.

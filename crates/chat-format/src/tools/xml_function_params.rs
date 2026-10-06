@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::{MAX_CALLS, ParsedTurn, ToolCall, typed_parameter};
 
-const OPEN: &str = "<tool_call>";
+pub(crate) const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
 
 /// Parses complete calls while preserving surrounding text. The template
