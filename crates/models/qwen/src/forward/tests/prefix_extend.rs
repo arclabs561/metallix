@@ -278,6 +278,68 @@ fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
     }
 }
 
+/// A prefix snapshot keeps only its compact rows alive. MLX's active bytes
+/// after the source executors are gone exceed the starting level by about
+/// the live snapshot's `kv_bytes`, not by any executor's stepped storage or
+/// by an older snapshot it was restored from. The serial prefix cache budgets
+/// entries by `kv_bytes`, so anything more held here escapes that budget.
+#[test]
+fn snapshots_pin_only_their_compact_rows() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = fused_kernel_config();
+    let weights = fused_kernel_weights();
+    let plan = config
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
+        .expect("tiny resident plan");
+    let prompt = (0..300)
+        .map(|index| (index * 5 + 3) % 16)
+        .collect::<Vec<i32>>();
+    // Allocator rounding on each of the 8 small arrays.
+    let slack = 8 * (16 << 10);
+    // Command buffers release the buffers they retained when they complete,
+    // asynchronously; settle before reading.
+    let active = || {
+        mlx_rs::transforms::eval([&Array::from_int(1)]).expect("sync");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        mlx_rs::memory::active_memory().expect("active")
+    };
+    // Settle one-time allocations (kernels, constants) before measuring.
+    let mut warm = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+    warm.prefill_last_logits(&prompt).expect("warm prefill");
+    drop(warm.snapshot_prefix(200, 7).expect("warm snapshot"));
+    drop(warm);
+
+    let start = active();
+    let first = {
+        let mut source = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+        source.prefill_last_logits(&prompt).expect("source prefill");
+        source.snapshot_prefix(200, 7).expect("prefix snapshot")
+    };
+    let held = active() - start;
+    assert!(
+        held <= first.kv_bytes() + slack,
+        "a {}-byte snapshot keeps {held} bytes alive",
+        first.kv_bytes()
+    );
+
+    // The serial path's next turn: restore, extend, snapshot the longer
+    // prefix, then drop the executor and evict the older snapshot.
+    let second = {
+        let mut restored = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &first);
+        restored
+            .extend_last_logits(&prompt[200..280])
+            .expect("suffix");
+        restored.snapshot_prefix(280, 7).expect("longer snapshot")
+    };
+    drop(first);
+    let held = active() - start;
+    assert!(
+        held <= second.kv_bytes() + slack,
+        "a {}-byte snapshot restored from an evicted one keeps {held} bytes alive",
+        second.kv_bytes()
+    );
+}
+
 #[test]
 fn snapshot_refuses_unsteerable_or_out_of_range_prefixes() {
     let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");

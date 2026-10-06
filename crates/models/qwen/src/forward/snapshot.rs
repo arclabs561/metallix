@@ -8,10 +8,7 @@
 
 use std::hash::BuildHasher;
 
-use mlx_rs::{
-    Array, StreamOrDevice, ops,
-    ops::indexing::{IndexMutOp, IndexOp},
-};
+use mlx_rs::{Array, StreamOrDevice};
 
 use super::{
     Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3LayerKv,
@@ -77,19 +74,12 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         }
         let stream = StreamOrDevice::gpu();
         let rows = as_i32(tokens)?;
-        let shape = [
-            1,
-            as_i32(self.config.key_value_heads)?,
-            rows,
-            as_i32(self.config.head_dim)?,
-        ];
+        // A gather writes fresh rows. A slice written into a new array still
+        // kept the whole stepped storage alive after evaluation, so each
+        // snapshot held several times its `kv_bytes`.
+        let positions = Array::arange_device::<i32, i32>(0, rows, None, &stream)?;
         let compact = |storage: &Array| -> Result<Array, Qwen3ForwardError> {
-            let mut copy = ops::zeros_dtype_device(&shape, storage.dtype(), &stream)?;
-            copy.index_mut_device(
-                (.., .., 0..rows, ..),
-                storage.index_device((.., .., 0..rows, ..), &stream),
-                &stream,
-            );
+            let copy = storage.take_axis_device(&positions, 2, &stream)?;
             copy.eval()?;
             Ok(copy)
         };
