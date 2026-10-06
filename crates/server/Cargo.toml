@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys"]
+metal = ["qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "dep:qwen35"]
 structured-output = ["dep:engine", "engine/structured-output"]
 # Chrome/Perfetto JSON timeline behind `--trace-out`.
 timeline = ["dep:tracing-chrome"]
@@ -28,6 +28,8 @@ serde_json.workspace = true
 sha2.workspace = true
 deepseek = { path = "../models/deepseek" }
 julia = { path = "../models/julia" }
+gemma = { path = "../models/gemma", optional = true }
+qwen35 = { path = "../models/qwen35", optional = true }
 qwen = { path = "../models/qwen" }
 chat-format = { path = "../chat-format", optional = true }
 engine = { path = "../engine", optional = true }

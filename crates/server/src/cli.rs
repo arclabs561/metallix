@@ -496,6 +496,19 @@ pub(crate) enum InspectCommand {
         #[command(subcommand)]
         command: QwenInspectCommand,
     },
+    /// Report whether an adapter loads each `config.json` (or diffusers `model_index.json`).
+    ///
+    /// Each file goes through the configuration gates the loaders run before
+    /// reading weights. Exits 2 when a file cannot be read or is not JSON.
+    #[cfg(feature = "metal")]
+    Supports {
+        /// Hugging Face `config.json` or diffusers `model_index.json` files.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        /// Print one JSON object per line: `path`, `supported`, `adapter`, `model_type`, `architectures`, `reason`.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

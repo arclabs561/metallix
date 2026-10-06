@@ -24,6 +24,9 @@ const VOCAB: usize = 256_000;
 const ENCODER_LAYERS: usize = 22;
 const MAX_HEADER_BYTES: u64 = 1024 * 1024;
 
+/// The `architecture` named by a Julia checkpoint's configuration documents.
+pub const ARCHITECTURE: &str = "JuliaDecisionModel";
+
 #[derive(Debug, Error)]
 pub enum JuliaCheckpointError {
     #[error("Julia checkpoint {path} could not be read: {source}")]
@@ -211,6 +214,25 @@ pub struct JuliaCheckpoint {
 }
 
 impl JuliaCheckpoint {
+    /// Checks one parsed configuration document, `config.json` or
+    /// `julia_config.json` by `name`, as [`JuliaCheckpoint::load`] does before
+    /// reading weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JuliaCheckpointError::Format`] when the document does not
+    /// name format 1 of [`ARCHITECTURE`], or `julia_config.json` states
+    /// another head depth.
+    pub fn check_config(name: &str, value: &Value) -> Result<(), JuliaCheckpointError> {
+        if value["architecture"] != ARCHITECTURE || value["format_version"] != 1 {
+            return format_error(format!("{name} is not a format-1 {ARCHITECTURE}"));
+        }
+        if name == "julia_config.json" && value["head_layers"] != HEAD_LAYERS {
+            return format_error("julia_config.json head_layers must be 2");
+        }
+        Ok(())
+    }
+
     /// Loads `dir` after requiring the published artifact layout.
     #[tracing::instrument(
         name = "julia.checkpoint.load",
@@ -227,12 +249,7 @@ impl JuliaCheckpoint {
             })?;
             let value: Value = serde_json::from_slice(&text)
                 .map_err(|error| JuliaCheckpointError::Format(format!("{config}: {error}")))?;
-            if value["architecture"] != "JuliaDecisionModel" || value["format_version"] != 1 {
-                return format_error(format!("{config} is not a format-1 JuliaDecisionModel"));
-            }
-            if config == "julia_config.json" && value["head_layers"] != HEAD_LAYERS {
-                return format_error("julia_config.json head_layers must be 2");
-            }
+            Self::check_config(config, &value)?;
         }
         for required in ["encoder/config.json", "tokenizer/tokenizer.json"] {
             if !dir.join(required).is_file() {

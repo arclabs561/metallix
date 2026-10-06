@@ -52,6 +52,8 @@ mod serve_registry;
 mod serving;
 #[cfg(feature = "metal")]
 mod sse;
+#[cfg(feature = "metal")]
+mod supports;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
@@ -513,6 +515,8 @@ fn dispatch(cli: Cli) -> ExitCode {
             InspectCommand::Qwen {
                 command: QwenInspectCommand::Checkpoint { model },
             } => inspect_qwen_checkpoint(&model),
+            #[cfg(feature = "metal")]
+            InspectCommand::Supports { paths, json } => supports::inspect_supports(&paths, json),
         },
         Command::InspectV41EmbeddingRow {
             shard,
