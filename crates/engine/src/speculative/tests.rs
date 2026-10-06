@@ -1,9 +1,10 @@
 use std::convert::Infallible;
 
 use super::{
-    ConfigError, DraftLength, GreedySpeculativeTarget, Pick, PositionLogits, PromptLookup,
-    SpeculationError, SpeculationRequest, SpeculationStats, SpeculativeTarget, StepOutcome,
-    Verdict, VerifyCost, accept_or_resample, greedy_speculative_step, speculative_step,
+    CalibratedDraftLength, ConfigError, DraftLength, GreedySpeculativeTarget, Pick, PositionLogits,
+    PromptLookup, SpeculationError, SpeculationRequest, SpeculationStats, SpeculativeTarget,
+    StepOutcome, Verdict, VerifyCost, accept_or_resample, greedy_speculative_step,
+    speculative_step,
 };
 use crate::sampling::sample_categorical;
 
@@ -661,6 +662,99 @@ fn rejected_drafts_switch_drafting_off_for_long_stretches() {
     assert!(verifies_started(2_000, false) > wasted);
     // Copyable text keeps verifying.
     assert!(verifies_started(160, true) > 150);
+}
+
+/// Verifies started during the strong phase of a turn whose first two drafts
+/// are weak guesses that the target rejects and whose next 58 are certain
+/// copies it accepts, with a pipelined step always queued (overhead 1). The
+/// server's draft-length choice is either the turn-wide acceptance rate or the
+/// per-draft calibrated choice.
+fn strong_phase_verifies(calibrated: bool) -> usize {
+    let cost = VerifyCost::new(0.2, 0.055).expect("server cost terms");
+    let mut turn_wide = DraftLength::new(7, cost).expect("valid");
+    let mut per_draft = CalibratedDraftLength::new(7, cost).expect("valid");
+    let weak = [0.4, 0.2, 0.1];
+    let certain = [1.0; 7];
+    let mut verifies = 0;
+    for step in 0..60 {
+        let (probabilities, accepted_all) = if step < 2 {
+            (&weak[..], false)
+        } else {
+            (&certain[..], true)
+        };
+        let length = if calibrated {
+            per_draft.choose(probabilities, 1.0)
+        } else {
+            turn_wide.next_with_overhead(1.0).min(probabilities.len())
+        };
+        if length == 0 {
+            turn_wide.idle();
+            per_draft.idle();
+            continue;
+        }
+        let accepted = if accepted_all { length } else { 0 };
+        turn_wide.observe(length, accepted);
+        per_draft.observe(&probabilities[..length], accepted);
+        if step >= 2 {
+            verifies += 1;
+        }
+    }
+    verifies
+}
+
+#[test]
+fn a_weak_early_draft_does_not_switch_drafting_off() {
+    // The turn-wide rate verifies the first weak guess, drops below the
+    // drafting threshold, and recovers only after skipping most of the
+    // copies that follow (it resumes at step 50, verifying 10 of 58): the
+    // failure a suffix drafter's unigram matches hit on an edit turn.
+    let turn_wide = strong_phase_verifies(false);
+    assert!(
+        turn_wide <= 18,
+        "turn-wide rate verified {turn_wide} of 58 copies"
+    );
+    // Sizing each verify from its own draft's probabilities skips the weak
+    // guesses and verifies every certain copy.
+    assert_eq!(strong_phase_verifies(true), 58);
+}
+
+#[test]
+fn calibrated_length_verifies_only_prefixes_that_pay() {
+    let cost = VerifyCost::new(0.2, 0.055).expect("server cost terms");
+    let mut chooser = CalibratedDraftLength::new(7, cost).expect("valid");
+    // A verbatim copy: every token certain, worth the whole cap even after
+    // discarding a queued step.
+    assert_eq!(chooser.choose(&[1.0; 9], 1.0), 7);
+    // A weak one-token guess pays only when no queued step is discarded.
+    assert_eq!(chooser.choose(&[0.5], 1.0), 0);
+    assert_eq!(chooser.choose(&[0.5], 0.0), 1);
+    // The likely head of a draft is verified, its unlikely tail is not:
+    // 1.9/1.255, 2.7/1.31, 2.8/1.365, 2.85/1.42 peaks at two tokens.
+    assert_eq!(chooser.choose(&[0.9, 0.8, 0.1, 0.05], 0.0), 2);
+    assert_eq!(chooser.choose(&[], 0.0), 0);
+
+    // Confident drafts that keep failing lose the drafter's trust...
+    for _ in 0..20 {
+        chooser.observe(&[1.0; 4], 0);
+    }
+    assert!(chooser.calibration() < 0.1, "{}", chooser.calibration());
+    assert_eq!(chooser.choose(&[1.0; 7], 1.0), 0);
+    // ...and regain it slowly over steps decoded without a verify.
+    for _ in 0..1_000 {
+        chooser.idle();
+    }
+    assert_eq!(chooser.choose(&[1.0; 7], 1.0), 7);
+    // Accurate drafts keep it near one.
+    let mut accurate = CalibratedDraftLength::new(7, cost).expect("valid");
+    for _ in 0..50 {
+        accurate.observe(&[0.9, 0.8], 2);
+        accurate.observe(&[0.9, 0.8], 1);
+    }
+    assert!((accurate.calibration() - 1.5 / 1.7).abs() < 0.05);
+    assert_eq!(
+        CalibratedDraftLength::new(0, cost),
+        Err(ConfigError::DraftRange)
+    );
 }
 
 #[test]

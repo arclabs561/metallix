@@ -20,6 +20,45 @@
 
 use thiserror::Error;
 
+/// Tokens a [`Drafter`] proposes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Draft {
+    /// Draft tokens, in order.
+    pub tokens: Vec<i32>,
+    /// For each token, the drafter's estimate that it and every token before
+    /// it are accepted, or empty when the drafter has none.
+    pub probabilities: Vec<f64>,
+}
+
+/// A source of draft tokens for [`speculative_step`] or
+/// [`greedy_speculative_step`]: an n-gram index or a model head such as MTP.
+pub trait Drafter {
+    /// Up to `limit` draft tokens to verify after `history` (the prompt plus
+    /// every emitted token). An empty draft means decode one token.
+    fn propose(&mut self, history: &[i32], limit: usize) -> Draft;
+
+    /// The last proposal's outcome: `drafted` tokens were scored and the
+    /// leading `accepted` of them kept. Called after the target truncated.
+    fn accepted(&mut self, drafted: usize, accepted: usize) {
+        let _ = (drafted, accepted);
+    }
+
+    /// Cost of drafting one token, in units of one target decode step
+    /// (Leviathan et al.'s `c`).
+    fn cost_per_token(&self) -> f64 {
+        0.0
+    }
+}
+
+impl Drafter for PromptLookup {
+    fn propose(&mut self, history: &[i32], limit: usize) -> Draft {
+        Draft {
+            tokens: PromptLookup::propose(self, history, limit).to_vec(),
+            probabilities: Vec::new(),
+        }
+    }
+}
+
 /// A model whose cached sequence can be scored in one chunk and rolled back.
 ///
 /// This is the capability an adapter declares to take part in speculative
@@ -585,6 +624,104 @@ impl DraftLength {
         let keep = IDLE_DECAY;
         self.accepted = self.accepted.mul_add(keep, PRIOR_ACCEPTED * (1.0 - keep));
         self.rejected = self.rejected.mul_add(keep, PRIOR_REJECTED * (1.0 - keep));
+    }
+}
+
+/// Chooses how much of a draft to verify from the drafter's own estimate of
+/// each token's chance to be accepted, scaled by how those estimates have
+/// held up in this turn.
+///
+/// A draft whose token `i` survives with probability `p_i` (cumulative, so
+/// non-increasing) emits `1 + c * (p_1 + ... + p_j)` tokens on average when
+/// its first `j` tokens are verified, where `c` corrects the drafter's
+/// calibration. Plain decoding emits one token per step, so the length that
+/// maximizes emitted tokens per unit of [`VerifyCost`] wins, and zero (no
+/// verify) wins whenever no prefix pays for its cost. This is Leviathan et
+/// al.'s walltime trade-off evaluated per draft rather than from one
+/// turn-wide acceptance rate, so a weak early draft does not switch drafting
+/// off for the turn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalibratedDraftLength {
+    max: usize,
+    cost: VerifyCost,
+    predicted: f64,
+    accepted: f64,
+}
+
+/// Prior weight of the calibration, as pseudo-tokens predicted and accepted:
+/// enough that one missed long draft lowers trust without erasing it.
+const CALIBRATION_PRIOR: f64 = 6.0;
+
+impl CalibratedDraftLength {
+    /// Creates a chooser of at most `max` tokens, trusting the drafter's
+    /// estimates until verifies say otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::DraftRange`] when `max` is zero.
+    pub const fn new(max: usize, cost: VerifyCost) -> Result<Self, ConfigError> {
+        if max == 0 {
+            return Err(ConfigError::DraftRange);
+        }
+        Ok(Self {
+            max,
+            cost,
+            predicted: CALIBRATION_PRIOR,
+            accepted: CALIBRATION_PRIOR,
+        })
+    }
+
+    /// Observed accepted tokens per predicted accepted token.
+    #[must_use]
+    pub fn calibration(&self) -> f64 {
+        self.accepted / self.predicted
+    }
+
+    /// How many leading tokens of a draft with these cumulative acceptance
+    /// probabilities to verify, when starting a verify also costs `overhead`
+    /// decode steps; zero means decode one token instead.
+    #[must_use]
+    pub fn choose(&self, probabilities: &[f64], overhead: f64) -> usize {
+        let calibration = self.calibration();
+        let mut best = (0, 1.0 / self.cost.relative(0));
+        let mut expected = 0.0;
+        for (index, &probability) in probabilities.iter().take(self.max).enumerate() {
+            expected += calibration * probability.clamp(0.0, 1.0);
+            let length = index + 1;
+            let value = (1.0 + expected) / (self.cost.relative(length) + overhead.max(0.0));
+            if value > best.1 {
+                best = (length, value);
+            }
+        }
+        best.0
+    }
+
+    /// Records a verify of the leading tokens of a draft with these
+    /// probabilities, of which `accepted` were kept.
+    pub fn observe(&mut self, verified: &[f64], accepted: usize) {
+        if verified.is_empty() {
+            return;
+        }
+        let predicted: f64 = verified
+            .iter()
+            .map(|probability| probability.clamp(0.0, 1.0))
+            .sum();
+        #[allow(clippy::cast_precision_loss, reason = "draft lengths are small")]
+        let accepted = accepted.min(verified.len()) as f64;
+        self.predicted = self.predicted.mul_add(ACCEPTANCE_DECAY, predicted);
+        self.accepted = self.accepted.mul_add(ACCEPTANCE_DECAY, accepted);
+    }
+
+    /// Records a step decoded without a verify: the calibration relaxes
+    /// slowly back toward trusting the drafter, as in [`DraftLength::idle`].
+    pub fn idle(&mut self) {
+        let keep = IDLE_DECAY;
+        self.predicted = self
+            .predicted
+            .mul_add(keep, CALIBRATION_PRIOR * (1.0 - keep));
+        self.accepted = self
+            .accepted
+            .mul_add(keep, CALIBRATION_PRIOR * (1.0 - keep));
     }
 }
 
