@@ -56,6 +56,25 @@ passed three fresh synthetic-fact trials against the 4B server at the expanded
 resident limits. It relied on fallback model metadata and does not broaden those
 claims to general coding or complete tool grammar support.
 
+Decode can score several tokens per forward pass (speculative decoding). A
+drafter proposes a continuation by matching the newest tokens of the prompt
+and output against earlier text; one pass scores the draft, and the turn's own
+picker accepts the longest prefix it would have produced token by token, so
+stop tokens, logprobs and a seed's random draws apply as without speculation.
+The `speculation` request field (`auto`, the default, `on` or `off`) sets it
+per request: `auto` speculates while the worker decodes no other request, which
+the single-request worker always satisfies, and skips JSON-schema turns.
+Receipts report verify steps and accepted draft tokens under
+`metallix.metrics.speculation`. Greedy output matches speculation off up to
+BF16 near-ties: scoring several positions in one pass can round a logit
+differently from a one-token decode and so break an exact tie the other way.
+On Qwen3-0.6B with BF16 weights, over 30 agent-style prompts (20 from the
+[SiliconBench agent split](https://github.com/WindChimeRan/SiliconBench/blob/616aa51c450383ee9309d2149d6765f9bd117119/prompts/agent_benchmark_prompts.json)
+and 10 file-edit requests), 9 greedy outputs differed from speculation off,
+each first at a token whose two most likely logits were equal or one
+BF16 step (0.125) apart. Sampled turns keep their sampling distribution up
+to the same rounding.
+
 Agent JSON receipts record ordered executed calls and per-turn generation
 metrics without retaining raw tool-result payloads. Their completion status
 describes the loop ending at EOS; independent task checks establish whether
