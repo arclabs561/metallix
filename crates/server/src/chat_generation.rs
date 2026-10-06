@@ -899,7 +899,7 @@ impl ChatSession {
         let speculating = request.speculation.allows(0, 0) && request.json_schema.is_none();
         let gpu_verify = turn.verifies_with_gpu_greedy(&self.format);
         let lookup = engine::speculative::PromptLookup::default();
-        let mut draft_length = speculation::draft_length();
+        let mut draft_length = speculation::draft_length(SERVING_PRECISION);
         let mut speculation_stats = SpeculationStats::default();
 
         'decode: for step in 0..max_tokens {
