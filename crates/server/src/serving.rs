@@ -19,7 +19,7 @@ use tracing::field::Empty;
 
 use crate::{
     chat_generation::ResidentChatLimits,
-    generation_routes::Generation,
+    generation_routes::{Generation, error_body, error_response},
     gpu,
     http_transport::{Connection, TransportLimits},
     responses::{echo_request_id, json_response},
@@ -31,18 +31,20 @@ use crate::{
 use crate::chat_generation::{ChatBackend, ChatSession};
 
 fn busy_response(connection: Connection) {
-    json_response(
+    error_response(
         connection,
         503,
-        &json!({"error":{"code":"server_busy","message":"one generation is already active"}}),
+        Some("server_busy"),
+        "one generation is already active",
     );
 }
 
 fn unavailable_response(connection: Connection) {
-    json_response(
+    error_response(
         connection,
         503,
-        &json!({"error":{"code":"model_worker_unavailable","message":"the model worker is unavailable"}}),
+        Some("model_worker_unavailable"),
+        "the model worker is unavailable",
     );
 }
 
@@ -272,16 +274,17 @@ fn staged(
 fn body_response(connection: Connection, outcome: Option<Result<Value, String>>, capability: &str) {
     match outcome {
         Some(Ok(value)) => json_response(connection, 200, &value),
-        Some(Err(error)) => json_response(connection, 400, &json!({"error":{"message":error}})),
+        Some(Err(error)) => error_response(connection, 400, None, &error),
         None => unsupported_response(connection, capability),
     }
 }
 
 fn unsupported_response(connection: Connection, capability: &str) {
-    json_response(
+    error_response(
         connection,
         400,
-        &json!({"error":{"code":"unsupported_capability","message":format!("model does not support {capability}")}}),
+        Some("unsupported_capability"),
+        &format!("model does not support {capability}"),
     );
 }
 
@@ -538,11 +541,7 @@ fn serve_models(
         let request = match connection.read_request() {
             Ok(request) => request,
             Err(error) => {
-                json_response(
-                    connection,
-                    error.status,
-                    &json!({"error":{"message":error.message}}),
-                );
+                error_response(connection, error.status, None, error.message);
                 continue;
             }
         };
@@ -586,11 +585,7 @@ fn serve_models(
             ("POST", "/v1/embeddings") => "embed",
             ("POST", "/v1/rerank") => "rerank",
             _ => {
-                json_response(
-                    connection,
-                    404,
-                    &json!({"error":{"message":"unknown endpoint"}}),
-                );
+                error_response(connection, 404, None, "unknown endpoint");
                 continue;
             }
         };
@@ -609,7 +604,15 @@ fn serve_models(
         } else {
             serde_json::from_slice::<DecisionTarget>(&request.body)
                 .map(|target| (target.model, None))
-                .map_err(|error| json!({"error":{"message":error.to_string()}}))
+                .map_err(|error| {
+                    error_body(
+                        Some(request.path.as_str()),
+                        400,
+                        None,
+                        &error.to_string(),
+                        None,
+                    )
+                })
         };
         let (model_id, parsed) = match parsed {
             Ok(parsed) => parsed,
@@ -620,11 +623,7 @@ fn serve_models(
         };
         span.record("gen_ai.request.model", model_id.as_str());
         let Some(model) = models.iter().find(|model| model.id == model_id) else {
-            json_response(
-                connection,
-                404,
-                &json!({"error":{"message":"model is not loaded"}}),
-            );
+            error_response(connection, 404, None, "model is not loaded");
             continue;
         };
         let work = if let Some(parsed) = parsed {
@@ -655,10 +654,11 @@ fn serve_models(
             if generation {
                 busy_response(connection);
             } else {
-                json_response(
+                error_response(
                     connection,
                     503,
-                    &json!({"error":{"code":"server_busy","message":"the model is busy with another request"}}),
+                    Some("server_busy"),
+                    "the model is busy with another request",
                 );
             }
             continue;
@@ -1184,7 +1184,7 @@ stream.close()
         assert_eq!(busy_status, 503);
         assert_eq!(
             serde_json::from_slice::<Value>(&busy_body).expect("busy response JSON"),
-            json!({"error":{"code":"server_busy","message":"one generation is already active"}})
+            json!({"error":{"message":"one generation is already active","type":"server_error","param":null,"code":"server_busy"}})
         );
 
         release_sender.send(()).expect("release worker");
@@ -2342,7 +2342,7 @@ raise RuntimeError("stream exceeded 65536 bytes before a generated text delta")
             assert_eq!(busy_status, 503);
             assert_eq!(
                 serde_json::from_slice::<Value>(&busy_body).expect("busy response JSON"),
-                json!({"error":{"code":"server_busy","message":"one generation is already active"}})
+                json!({"error":{"message":"one generation is already active","type":"server_error","param":null,"code":"server_busy"}})
             );
 
             release

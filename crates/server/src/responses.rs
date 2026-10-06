@@ -17,6 +17,7 @@ use crate::{
         ChatBackend, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatToolCall,
         GenerationControls, SamplingRequest, TokenLogprob,
     },
+    generation_routes,
     http_transport::Connection,
 };
 
@@ -500,13 +501,14 @@ impl EventStream<'_> {
 
 fn error_response(connection: Connection, error: &ChatGenerationError) {
     match error {
-        ChatGenerationError::DeadlineExceeded => json_response(
+        ChatGenerationError::DeadlineExceeded => generation_routes::error_response(
             connection,
             408,
-            &json!({"error":{"code":"generation_timeout","message":"generation time budget exceeded"}}),
+            Some("generation_timeout"),
+            "generation time budget exceeded",
         ),
         ChatGenerationError::Message(message) => {
-            json_response(connection, 400, &json!({"error":{"message":message}}));
+            generation_routes::error_response(connection, 400, None, message);
         }
     }
 }
@@ -527,7 +529,7 @@ pub(crate) fn respond(
     let controls = match controls(parsed) {
         Ok(controls) => controls,
         Err(error) => {
-            json_response(request, 400, &json!({"error":{"message":error}}));
+            generation_routes::error_response(request, 400, None, &error);
             return Ok(());
         }
     };

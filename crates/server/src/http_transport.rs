@@ -95,6 +95,8 @@ pub(crate) struct Connection {
     response_deadline: Option<Instant>,
     request_id: Option<String>,
     cache_salt: Option<String>,
+    /// The request path, once the head is read; it picks the error shape.
+    path: Option<String>,
     /// HTTP minor version of the request read, once one is read.
     minor_version: Option<u8>,
     /// Whether [`Connection::client_gone`] has sent its one probe.
@@ -112,6 +114,7 @@ impl Connection {
             response_deadline: None,
             request_id: None,
             cache_salt: None,
+            path: None,
             minor_version: None,
             probed: false,
         }
@@ -122,6 +125,7 @@ impl Connection {
         let deadline = self.read_deadline;
         let (mut received, header_end, method, path, body_length, trace) =
             self.read_head(deadline)?;
+        self.path = Some(path.clone());
         let prefix = received.split_off(header_end);
         if prefix.len() > body_length {
             return Err(HttpError::bad_request("pipelined requests are unsupported"));
@@ -164,6 +168,11 @@ impl Connection {
 
     pub(crate) fn cache_salt(&self) -> Option<&str> {
         self.cache_salt.as_deref()
+    }
+
+    /// The path of the request read, once its head is read.
+    pub(crate) fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
     /// The `X-Request-Id` response header line, or nothing before an id is set.

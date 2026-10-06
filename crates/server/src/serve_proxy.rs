@@ -31,6 +31,7 @@ use tracing::field::Empty;
 
 use crate::{
     admission_queue::{ModelQueue, QueueSettings, Refusal, Refused},
+    generation_routes::{error_body, error_response},
     http_transport::{Connection, Request, TransportLimits},
     responses::json_response,
     serve_registry::{Residency, ServedEntry},
@@ -462,11 +463,7 @@ fn proxy_models(
         let request = match connection.read_request() {
             Ok(request) => request,
             Err(error) => {
-                json_response(
-                    connection,
-                    error.status,
-                    &json!({"error":{"message":error.message}}),
-                );
+                error_response(connection, error.status, None, error.message);
                 continue;
             }
         };
@@ -512,41 +509,30 @@ fn proxy_models(
                 | "/v1/rerank",
             ) => {}
             _ => {
-                json_response(
-                    connection,
-                    404,
-                    &json!({"error":{"message":"unknown endpoint"}}),
-                );
+                error_response(connection, 404, None, "unknown endpoint");
                 continue;
             }
         }
         let target = match serde_json::from_slice::<Target>(&request.body) {
             Ok(target) => target.model,
             Err(error) => {
-                json_response(
-                    connection,
-                    400,
-                    &json!({"error":{"message":error.to_string()}}),
-                );
+                error_response(connection, 400, None, &error.to_string());
                 continue;
             }
         };
         span.record("gen_ai.request.model", target.as_str());
         let Some(model) = pool.models.iter().find(|model| model.entry.id == target) else {
-            json_response(
-                connection,
-                404,
-                &json!({"error":{"message":"model is not loaded"}}),
-            );
+            error_response(connection, 404, None, "model is not loaded");
             continue;
         };
         if in_flight.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
             in_flight.fetch_sub(1, Ordering::AcqRel);
             span.record("error.type", "server_busy");
-            json_response(
+            error_response(
                 connection,
                 503,
-                &json!({"error":{"code":"server_busy","message":"too many requests in flight"}}),
+                Some("server_busy"),
+                "too many requests in flight",
             );
             continue;
         }
@@ -622,10 +608,11 @@ fn forward(
     );
     let unavailable = |connection, reason: String| {
         tracing::Span::current().record("error.type", "model_worker_unavailable");
-        json_response(
+        error_response(
             connection,
             503,
-            &json!({"error":{"code":"model_worker_unavailable","message":format!("model {} is unavailable: {reason}", model.entry.id)}}),
+            Some("model_worker_unavailable"),
+            &format!("model {} is unavailable: {reason}", model.entry.id),
         );
     };
     let address = match pool.acquire(model) {
@@ -742,7 +729,14 @@ fn refuse(mut connection: Connection, model: &ChildModel, refused: Refused) {
         Refusal::Gone => return,
     };
     tracing::Span::current().record("error.type", code);
-    let body = json!({"error":{"code":code,"message":message}}).to_string();
+    let body = error_body(
+        connection.path(),
+        503,
+        Some(code),
+        &message,
+        connection.request_id(),
+    )
+    .to_string();
     connection.begin_response();
     let request_id = connection.request_id_header();
     let _ = write!(
