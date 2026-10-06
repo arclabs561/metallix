@@ -24,7 +24,7 @@ use mlx_rs::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Qwen35Config, Qwen35ConfigError, Qwen35LayerKind};
+use crate::{Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp};
 
 /// Tokens per prefill graph. The recurrence unrolls one step per token, so
 /// this bounds graph size; longer prompts are evaluated chunk by chunk.
@@ -618,19 +618,128 @@ fn gated_attention(
 }
 
 fn mlp(weights: &Qwen35Weights, base: &str, input: &Array) -> Result<Array, Qwen35Error> {
+    let tensor = |name: &str| weights.tensor(&format!("{base}.mlp.{name}"));
+    match weights.config.mlp {
+        Qwen35Mlp::Dense { .. } => swiglu(
+            input,
+            tensor("gate_proj.weight")?,
+            tensor("up_proj.weight")?,
+            tensor("down_proj.weight")?,
+        ),
+        Qwen35Mlp::Experts { top_k, .. } => {
+            let gpu = StreamOrDevice::gpu();
+            let shape = input.shape().to_vec();
+            let tokens = input.reshape_device(&[-1, shape[shape.len() - 1]], &gpu)?;
+            let block = MoeTensors {
+                router: tensor("gate.weight")?,
+                gate_up: tensor("experts.gate_up_proj")?,
+                down: tensor("experts.down_proj")?,
+                shared_gate: tensor("shared_expert.gate_proj.weight")?,
+                shared_up: tensor("shared_expert.up_proj.weight")?,
+                shared_down: tensor("shared_expert.down_proj.weight")?,
+                shared_scale: tensor("shared_expert_gate.weight")?,
+            };
+            Ok(moe_block(&tokens, &block, top_k)?.reshape_device(&shape, &gpu)?)
+        }
+    }
+}
+
+/// One layer's `MoE` weights, as stored.
+struct MoeTensors<'a> {
+    /// `[E, H]`.
+    router: &'a Array,
+    /// `[E, 2I, H]`, gate rows then up rows.
+    gate_up: &'a Array,
+    /// `[E, H, I]`.
+    down: &'a Array,
+    shared_gate: &'a Array,
+    shared_up: &'a Array,
+    shared_down: &'a Array,
+    /// `[1, H]`; `sigmoid` of its product scales the shared expert.
+    shared_scale: &'a Array,
+}
+
+/// The routed experts plus the gated shared expert over `tokens` `[n, H]`.
+fn moe_block(tokens: &Array, block: &MoeTensors<'_>, top_k: usize) -> Result<Array, Qwen35Error> {
     let gpu = StreamOrDevice::gpu();
-    let gate = linear(
-        input,
-        weights.tensor(&format!("{base}.mlp.gate_proj.weight"))?,
+    let routed = routed_experts(tokens, block.router, block.gate_up, block.down, top_k)?;
+    let shared = swiglu(
+        tokens,
+        block.shared_gate,
+        block.shared_up,
+        block.shared_down,
+    )?
+    .multiply_device(
+        ops::sigmoid_device(linear(tokens, block.shared_scale)?, &gpu)?,
+        &gpu,
     )?;
-    let up = linear(
-        input,
-        weights.tensor(&format!("{base}.mlp.up_proj.weight"))?,
-    )?;
+    Ok(routed.add_device(&shared, &gpu)?)
+}
+
+fn swiglu(input: &Array, gate: &Array, up: &Array, down: &Array) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
     linear(
-        &silu(&gate)?.multiply_device(&up, &gpu)?,
-        weights.tensor(&format!("{base}.mlp.down_proj.weight"))?,
+        &silu(&linear(input, gate)?)?.multiply_device(linear(input, up)?, &gpu)?,
+        down,
     )
+}
+
+/// The routed half of an `MoE` block over `tokens` `[n, H]`: the router
+/// `[E, H]` picks `top_k` experts per token by softmax probability (in f32),
+/// renormalized to sum to 1; each expert applies `SwiGLU` with its slice of
+/// `gate_up` `[E, 2I, H]` (gate rows, then up rows) and `down` `[E, H, I]`.
+/// Returns the probability-weighted sum, `[n, H]`.
+fn routed_experts(
+    tokens: &Array,
+    router: &Array,
+    gate_up: &Array,
+    down: &Array,
+    top_k: usize,
+) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let compute = tokens.dtype();
+    let experts = router.shape()[0];
+    let top_k = dim(top_k)?;
+    let width = down.shape()[2];
+    let probabilities = ops::softmax_axis_device(
+        linear(tokens, router)?.as_type_device::<f32>(&gpu)?,
+        -1,
+        true,
+        &gpu,
+    )?;
+    // After partitioning at `experts - top_k`, the last `top_k` positions
+    // hold the largest probabilities, in no particular order.
+    let kth = experts - top_k;
+    let chosen = ops::argpartition_axis_device(&probabilities, kth, -1, &gpu)?.index((.., kth..));
+    let weights = probabilities.take_along_axis_device(&chosen, -1, &gpu)?;
+    let weights = weights
+        .divide_device(weights.sum_axis_device(-1, true, &gpu)?, &gpu)?
+        .as_dtype_device(compute, &gpu)?;
+
+    // [n, 1, 1, H] against [E, H, 2I] gathered by `chosen` [n, k]: [n, k, 1, 2I].
+    let rows = tokens.expand_dims_axes_device(&[-2, -3], &gpu)?;
+    let projected = ops::gather_mm_device(
+        &rows,
+        gate_up.swap_axes_device(-1, -2, &gpu)?,
+        None,
+        &chosen,
+        None,
+        &gpu,
+    )?;
+    let halves = ops::split_sections_device(&projected, &[width], -1, &gpu)?;
+    let hidden = silu(&halves[0])?.multiply_device(&halves[1], &gpu)?;
+    let outputs = ops::gather_mm_device(
+        &hidden,
+        down.swap_axes_device(-1, -2, &gpu)?,
+        None,
+        &chosen,
+        None,
+        &gpu,
+    )?
+    .squeeze_axes_device(&[-2], &gpu)?;
+    Ok(outputs
+        .multiply_device(weights.expand_dims_device(-1, &gpu)?, &gpu)?
+        .sum_axis_device(1, false, &gpu)?)
 }
 
 /// `x / sqrt(sum(x^2) + eps)` over the last axis, matching the source's FLA
@@ -680,11 +789,44 @@ fn is_zero_centered_norm(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+/// The stored shapes of one layer's `MoE` tensors under `mlp`, from the
+/// expert count and the routed and shared expert widths.
+fn expert_shapes(
+    put: &mut impl FnMut(String, &[i32]),
+    mlp: &str,
+    hidden: i32,
+    [experts, expert, shared]: [usize; 3],
+) -> Result<(), Qwen35Error> {
+    let (experts, expert, shared) = (dim(experts)?, dim(expert)?, dim(shared)?);
+    put(format!("{mlp}.gate.weight"), &[experts, hidden]);
+    put(
+        format!("{mlp}.experts.gate_up_proj"),
+        &[experts, 2 * expert, hidden],
+    );
+    put(
+        format!("{mlp}.experts.down_proj"),
+        &[experts, hidden, expert],
+    );
+    put(
+        format!("{mlp}.shared_expert.gate_proj.weight"),
+        &[shared, hidden],
+    );
+    put(
+        format!("{mlp}.shared_expert.up_proj.weight"),
+        &[shared, hidden],
+    );
+    put(
+        format!("{mlp}.shared_expert.down_proj.weight"),
+        &[hidden, shared],
+    );
+    put(format!("{mlp}.shared_expert_gate.weight"), &[1, hidden]);
+    Ok(())
+}
+
 /// Every decoder tensor this implementation reads, with its stored shape.
 fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Qwen35Error> {
     let hidden = dim(config.hidden_size)?;
     let vocab = dim(config.vocab_size)?;
-    let intermediate = dim(config.intermediate_size)?;
     let heads = dim(config.attention_heads)?;
     let kv_heads = dim(config.key_value_heads)?;
     let head_dim = dim(config.head_dim)?;
@@ -706,18 +848,26 @@ fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Q
         let base = format!("layers.{index}");
         put(format!("{base}.input_layernorm.weight"), &[hidden]);
         put(format!("{base}.post_attention_layernorm.weight"), &[hidden]);
-        put(
-            format!("{base}.mlp.gate_proj.weight"),
-            &[intermediate, hidden],
-        );
-        put(
-            format!("{base}.mlp.up_proj.weight"),
-            &[intermediate, hidden],
-        );
-        put(
-            format!("{base}.mlp.down_proj.weight"),
-            &[hidden, intermediate],
-        );
+        let mlp = format!("{base}.mlp");
+        match config.mlp {
+            Qwen35Mlp::Dense { intermediate_size } => {
+                let intermediate = dim(intermediate_size)?;
+                put(format!("{mlp}.gate_proj.weight"), &[intermediate, hidden]);
+                put(format!("{mlp}.up_proj.weight"), &[intermediate, hidden]);
+                put(format!("{mlp}.down_proj.weight"), &[hidden, intermediate]);
+            }
+            Qwen35Mlp::Experts {
+                experts,
+                expert_intermediate_size,
+                shared_intermediate_size,
+                ..
+            } => expert_shapes(
+                &mut put,
+                &mlp,
+                hidden,
+                [experts, expert_intermediate_size, shared_intermediate_size],
+            )?,
+        }
         match kind {
             Qwen35LayerKind::LinearAttention => {
                 let attn = format!("{base}.linear_attn");
@@ -869,4 +1019,217 @@ pub enum Qwen35Error {
     /// MLX failed to construct or evaluate a graph.
     #[error("MLX evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
+}
+
+#[cfg(test)]
+mod tests {
+    use mlx_rs::Array;
+
+    use super::{MoeTensors, moe_block};
+
+    /// Deterministic values in [-1, 1) (xorshift64), so failures reproduce.
+    fn values(seed: u64, count: usize) -> Vec<f32> {
+        let mut state = seed.max(1);
+        (0..count)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "24 high bits fit an f32 mantissa exactly"
+                )]
+                let unit = (state >> 40) as f32 / (1_u64 << 24) as f32;
+                2.0 * unit - 1.0
+            })
+            .collect()
+    }
+
+    struct Block {
+        tokens: usize,
+        experts: usize,
+        hidden: usize,
+        width: usize,
+        x: Vec<f32>,
+        router: Vec<f32>,
+        gate_up: Vec<f32>,
+        down: Vec<f32>,
+        shared_gate: Vec<f32>,
+        shared_up: Vec<f32>,
+        shared_down: Vec<f32>,
+        shared_scale: Vec<f32>,
+    }
+
+    impl Block {
+        /// Inputs in [-1, 1); each weight matrix scaled by `1 / sqrt(fan_in)`,
+        /// as real initializations are, so activations and outputs stay O(1).
+        fn random(tokens: usize, experts: usize, hidden: usize, width: usize) -> Self {
+            #[allow(clippy::cast_precision_loss, reason = "small test widths")]
+            let scaled = |seed, count, fan_in: usize| -> Vec<f32> {
+                let scale = (fan_in as f32).sqrt().recip();
+                values(seed, count).iter().map(|v| v * scale).collect()
+            };
+            Self {
+                tokens,
+                experts,
+                hidden,
+                width,
+                x: values(1, tokens * hidden),
+                router: scaled(2, experts * hidden, hidden),
+                gate_up: scaled(3, experts * 2 * width * hidden, hidden),
+                down: scaled(4, experts * hidden * width, width),
+                shared_gate: scaled(5, width * hidden, hidden),
+                shared_up: scaled(6, width * hidden, hidden),
+                shared_down: scaled(7, hidden * width, width),
+                shared_scale: scaled(8, hidden, hidden),
+            }
+        }
+
+        /// Makes `copy` an exact duplicate of `expert`, router row included,
+        /// so the two tie and either choice gives the same output.
+        fn duplicate(mut self, expert: usize, copy: usize) -> Self {
+            let (hidden, width) = (self.hidden, self.width);
+            let router = hidden;
+            self.router
+                .copy_within(expert * router..(expert + 1) * router, copy * router);
+            let gate_up = 2 * width * hidden;
+            self.gate_up
+                .copy_within(expert * gate_up..(expert + 1) * gate_up, copy * gate_up);
+            let down = hidden * width;
+            self.down
+                .copy_within(expert * down..(expert + 1) * down, copy * down);
+            self
+        }
+
+        fn native(&self, top_k: usize) -> Vec<f32> {
+            let shape = |dims: &[usize]| -> Vec<i32> {
+                dims.iter()
+                    .map(|&dim| i32::try_from(dim).expect("small"))
+                    .collect()
+            };
+            let array = |values: &[f32], dims: &[usize]| Array::from_slice(values, &shape(dims));
+            let (tokens, experts, hidden, width) =
+                (self.tokens, self.experts, self.hidden, self.width);
+            let (router, gate_up, down) = (
+                array(&self.router, &[experts, hidden]),
+                array(&self.gate_up, &[experts, 2 * width, hidden]),
+                array(&self.down, &[experts, hidden, width]),
+            );
+            let (shared_gate, shared_up, shared_down, shared_scale) = (
+                array(&self.shared_gate, &[width, hidden]),
+                array(&self.shared_up, &[width, hidden]),
+                array(&self.shared_down, &[hidden, width]),
+                array(&self.shared_scale, &[1, hidden]),
+            );
+            let block = MoeTensors {
+                router: &router,
+                gate_up: &gate_up,
+                down: &down,
+                shared_gate: &shared_gate,
+                shared_up: &shared_up,
+                shared_down: &shared_down,
+                shared_scale: &shared_scale,
+            };
+            let out =
+                moe_block(&array(&self.x, &[tokens, hidden]), &block, top_k).expect("moe block");
+            out.eval().expect("eval");
+            assert_eq!(out.shape(), shape(&[tokens, hidden]).as_slice());
+            out.as_slice::<f32>().to_vec()
+        }
+
+        /// Softmax over every expert, the `top_k` largest (lower index first
+        /// on ties) renormalized, each expert's `SwiGLU`, plus the shared
+        /// `SwiGLU` scaled by `sigmoid(shared_scale . input)`, in f64.
+        fn host(&self, top_k: usize) -> Vec<f32> {
+            let (hidden, width) = (self.hidden, self.width);
+            let mut out = Vec::with_capacity(self.tokens * hidden);
+            for token in 0..self.tokens {
+                let input: Vec<f64> = self.x[token * hidden..(token + 1) * hidden]
+                    .iter()
+                    .map(|value| f64::from(*value))
+                    .collect();
+                let dot = |row: &[f32], with: &[f64]| -> f64 {
+                    row.iter().zip(with).map(|(a, b)| f64::from(*a) * b).sum()
+                };
+                // `SwiGLU` of `input` through `width` gate rows and `width` up rows.
+                let swiglu = |gate: &[f32], up: &[f32]| -> Vec<f64> {
+                    (0..width)
+                        .map(|row| {
+                            let rows = row * hidden..(row + 1) * hidden;
+                            let g = dot(&gate[rows.clone()], &input);
+                            g / (1.0 + (-g).exp()) * dot(&up[rows], &input)
+                        })
+                        .collect()
+                };
+                let project = |down: &[f32], activation: &[f64], scale: f64, into: &mut [f64]| {
+                    for (row, value) in into.iter_mut().enumerate() {
+                        *value += scale * dot(&down[row * width..(row + 1) * width], activation);
+                    }
+                };
+                let exps: Vec<f64> = {
+                    let logits: Vec<f64> = (0..self.experts)
+                        .map(|expert| {
+                            dot(&self.router[expert * hidden..(expert + 1) * hidden], &input)
+                        })
+                        .collect();
+                    let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    logits.iter().map(|logit| (logit - max).exp()).collect()
+                };
+                let mut order: Vec<usize> = (0..self.experts).collect();
+                order.sort_by(|a, b| exps[*b].total_cmp(&exps[*a]).then(a.cmp(b)));
+                let chosen = &order[..top_k];
+                let mass: f64 = chosen.iter().map(|expert| exps[*expert]).sum();
+                let mut output = vec![0.0_f64; hidden];
+                for &expert in chosen {
+                    let block = 2 * width * hidden;
+                    let rows = &self.gate_up[expert * block..(expert + 1) * block];
+                    let (gate, up) = rows.split_at(width * hidden);
+                    let activation = swiglu(gate, up);
+                    let down = &self.down[expert * hidden * width..(expert + 1) * hidden * width];
+                    project(down, &activation, exps[expert] / mass, &mut output);
+                }
+                let shared = swiglu(&self.shared_gate, &self.shared_up);
+                let scale = 1.0 / (1.0 + (-dot(&self.shared_scale, &input)).exp());
+                project(&self.shared_down, &shared, scale, &mut output);
+                #[allow(clippy::cast_possible_truncation, reason = "f32 comparison")]
+                out.extend(output.iter().map(|value| *value as f32));
+            }
+            out
+        }
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// f32 against the f64 host loop; outputs are O(1) (checked) and sums
+    /// run over at most 64 terms, so 1e-5 leaves room only for f32 rounding.
+    const TOLERANCE: f32 = 1e-5;
+
+    #[test]
+    fn moe_block_matches_a_host_loop() {
+        let cases = [
+            ("top 4 of 16", Block::random(5, 16, 64, 32), 4),
+            // Experts 2 and 3 tie wherever either is chosen.
+            (
+                "tied duplicate",
+                Block::random(5, 16, 64, 32).duplicate(2, 3),
+                4,
+            ),
+            ("every expert", Block::random(3, 6, 64, 32), 6),
+            ("one expert", Block::random(3, 6, 64, 32), 1),
+        ];
+        for (name, block, top_k) in cases {
+            let host = block.host(top_k);
+            let diff = max_abs_diff(&block.native(top_k), &host);
+            let largest = host.iter().fold(0.0_f32, |max, value| max.max(value.abs()));
+            eprintln!("{name}: max |diff| {diff:.3e}, largest |output| {largest:.3}");
+            assert!(largest < 8.0, "{name}: outputs are not O(1): {largest}");
+            assert!(diff <= TOLERANCE, "{name}: max |diff| {diff}");
+        }
+    }
 }

@@ -206,7 +206,10 @@ fn unknown_architectures_are_unsupported_without_an_adapter() {
             r#""model_type": "qwen3_5_text""#,
             r#""model_type": "qwen3_5_moe_text""#,
         );
-    assert_classified(&moe, None, false);
+    // The qwen35 adapter reads qwen3_5_moe too; a dense config relabelled as
+    // MoE lacks the expert fields its loader requires.
+    let moe = assert_classified(&moe, Some(Adapter::Qwen35), false);
+    assert!(moe.reason().contains("num_experts"), "{moe:?}");
 
     let gemma3 = assert_classified(GEMMA3_4B, None, false);
     assert!(gemma3.reason().contains("\"gemma3\""));

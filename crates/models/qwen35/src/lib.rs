@@ -52,6 +52,20 @@
 //!
 //! Every RMS norm except the `GatedDeltaNet` output norm scales by
 //! `1 + weight`, computed in f32.
+//!
+//! # Mixture-of-experts feed-forward (`qwen3_5_moe`)
+//!
+//! The `MoE` checkpoints (Qwen3.5-35B-A3B, Qwen3.6-35B-A3B and larger) keep the
+//! token mixers above and replace every layer's `SwiGLU` with:
+//!
+//! 1. Router: `p = softmax(W_gate x)` over all experts, in f32; keep the
+//!    `top_k` largest and divide them by their sum.
+//! 2. Each kept expert `e`: `[g, u] = W_gate_up[e] x` (gate rows first),
+//!    `y_e = W_down[e] (silu(g) * u)`; the block sums `w_e y_e`.
+//! 3. A shared `SwiGLU` expert, scaled per token by
+//!    `sigmoid(W_shared_gate x)`, is added to the sum.
+//!
+//! Experts are stored fused per layer as `[E, 2I, H]` and `[E, H, I]`.
 
 #[cfg(feature = "metal")]
 pub mod forward;
@@ -68,12 +82,34 @@ pub enum Qwen35LayerKind {
     FullAttention,
 }
 
-/// The validated text-decoder configuration of a `qwen3_5` checkpoint.
+/// The feed-forward block every decoder layer uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen35Mlp {
+    /// `SwiGLU` with one hidden width (`qwen3_5`).
+    Dense {
+        /// Hidden width of the gate and up projections.
+        intermediate_size: usize,
+    },
+    /// Routed experts plus one gated shared expert (`qwen3_5_moe`).
+    Experts {
+        /// Routed experts per layer.
+        experts: usize,
+        /// Experts each token is routed to.
+        top_k: usize,
+        /// Hidden width of one routed expert.
+        expert_intermediate_size: usize,
+        /// Hidden width of the shared expert.
+        shared_intermediate_size: usize,
+    },
+}
+
+/// The validated text-decoder configuration of a `qwen3_5` or `qwen3_5_moe`
+/// checkpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Qwen35Config {
     layers: Vec<Qwen35LayerKind>,
     hidden_size: usize,
-    intermediate_size: usize,
+    mlp: Qwen35Mlp,
     vocab_size: usize,
     attention_heads: usize,
     key_value_heads: usize,
@@ -91,32 +127,46 @@ pub struct Qwen35Config {
 }
 
 impl Qwen35Config {
-    /// Parses a `qwen3_5` checkpoint configuration (with a nested
-    /// `text_config`) or a bare `qwen3_5_text` configuration.
+    /// Parses a `qwen3_5` or `qwen3_5_moe` checkpoint configuration (with a
+    /// nested `text_config`) or a bare `qwen3_5_text` or `qwen3_5_moe_text`
+    /// configuration.
     ///
-    /// Layout variants this decoder does not implement (mixture of experts,
-    /// scaled rotary embedding, attention bias, an ungated attention output,
-    /// another gate activation) are refused rather than ignored.
+    /// Layout variants this decoder does not implement (experts in a dense
+    /// checkpoint, dense-only layers in an `MoE` one, scaled rotary embedding,
+    /// attention bias, an ungated attention output, another gate activation)
+    /// are refused rather than ignored.
     pub fn parse(json: &str) -> Result<Self, Qwen35ConfigError> {
         let outer: RawOuterConfig = serde_json::from_str(json).map_err(Qwen35ConfigError::Json)?;
-        let (text, outer_tie) = match (outer.model_type.as_str(), outer.text_config) {
-            ("qwen3_5", Some(text)) => (text, outer.tie_word_embeddings),
-            ("qwen3_5_text", None) => (
+        let (text, outer_tie, text_type) = match (outer.model_type.as_str(), outer.text_config) {
+            ("qwen3_5", Some(text)) => (text, outer.tie_word_embeddings, "qwen3_5_text"),
+            ("qwen3_5_moe", Some(text)) => (text, outer.tie_word_embeddings, "qwen3_5_moe_text"),
+            (bare @ ("qwen3_5_text" | "qwen3_5_moe_text"), None) => (
                 serde_json::from_str::<RawTextConfig>(json).map_err(Qwen35ConfigError::Json)?,
                 None,
+                bare,
             ),
             _ => return Err(Qwen35ConfigError::UnexpectedModelType(outer.model_type)),
         };
-        Self::from_text(text, outer_tie)
+        Self::from_text(text, outer_tie, text_type)
     }
 
-    fn from_text(raw: RawTextConfig, outer_tie: Option<bool>) -> Result<Self, Qwen35ConfigError> {
-        if !matches!(raw.model_type.as_deref(), None | Some("qwen3_5_text")) {
+    fn from_text(
+        raw: RawTextConfig,
+        outer_tie: Option<bool>,
+        text_type: &str,
+    ) -> Result<Self, Qwen35ConfigError> {
+        if raw
+            .model_type
+            .as_deref()
+            .is_some_and(|model_type| model_type != text_type)
+        {
             return Err(Qwen35ConfigError::UnexpectedModelType(
                 raw.model_type.unwrap_or_default(),
             ));
         }
-        check_supported(&raw)?;
+        let experts = text_type == "qwen3_5_moe_text";
+        check_supported(&raw, experts)?;
+        let mlp = mlp(&raw, experts)?;
         let rope = raw
             .rope_parameters
             .ok_or(Qwen35ConfigError::Missing("rope_parameters"))?;
@@ -134,7 +184,6 @@ impl Qwen35Config {
         let fields = [
             ("num_hidden_layers", raw.num_hidden_layers),
             ("hidden_size", raw.hidden_size),
-            ("intermediate_size", raw.intermediate_size),
             ("vocab_size", raw.vocab_size),
             ("num_attention_heads", raw.num_attention_heads),
             ("num_key_value_heads", raw.num_key_value_heads),
@@ -192,7 +241,7 @@ impl Qwen35Config {
         Ok(Self {
             layers,
             hidden_size: raw.hidden_size,
-            intermediate_size: raw.intermediate_size,
+            mlp,
             vocab_size: raw.vocab_size,
             attention_heads: raw.num_attention_heads,
             key_value_heads: raw.num_key_value_heads,
@@ -220,6 +269,12 @@ impl Qwen35Config {
     #[must_use]
     pub const fn hidden_size(&self) -> usize {
         self.hidden_size
+    }
+
+    /// The feed-forward block of every layer.
+    #[must_use]
+    pub const fn mlp(&self) -> Qwen35Mlp {
+        self.mlp
     }
 
     /// Output vocabulary size.
@@ -301,10 +356,10 @@ impl Qwen35Config {
 }
 
 /// Refuses layout variants the decoder does not implement.
-fn check_supported(raw: &RawTextConfig) -> Result<(), Qwen35ConfigError> {
+fn check_supported(raw: &RawTextConfig, experts: bool) -> Result<(), Qwen35ConfigError> {
     let unsupported = |what: &'static str| Err(Qwen35ConfigError::Unsupported(what));
-    if raw.num_experts.unwrap_or(0) != 0 {
-        return unsupported("mixture-of-experts layers");
+    if !experts && raw.num_experts.unwrap_or(0) != 0 {
+        return unsupported("mixture-of-experts layers in a dense qwen3_5 checkpoint");
     }
     if raw
         .mlp_only_layers
@@ -334,6 +389,36 @@ fn check_supported(raw: &RawTextConfig) -> Result<(), Qwen35ConfigError> {
         return unsupported("a recurrent state dtype other than float32");
     }
     Ok(())
+}
+
+/// The dense width, or every expert field nonzero with `top_k` at most the
+/// expert count.
+fn mlp(raw: &RawTextConfig, experts: bool) -> Result<Qwen35Mlp, Qwen35ConfigError> {
+    let required = |name: &'static str, value: Option<usize>| {
+        value
+            .filter(|value| *value != 0)
+            .ok_or(Qwen35ConfigError::Missing(name))
+    };
+    if !experts {
+        return Ok(Qwen35Mlp::Dense {
+            intermediate_size: required("intermediate_size", raw.intermediate_size)?,
+        });
+    }
+    let mlp = Qwen35Mlp::Experts {
+        experts: required("num_experts", raw.num_experts)?,
+        top_k: required("num_experts_per_tok", raw.num_experts_per_tok)?,
+        expert_intermediate_size: required("moe_intermediate_size", raw.moe_intermediate_size)?,
+        shared_intermediate_size: required(
+            "shared_expert_intermediate_size",
+            raw.shared_expert_intermediate_size,
+        )?,
+    };
+    match mlp {
+        Qwen35Mlp::Experts { experts, top_k, .. } if top_k > experts => {
+            Err(Qwen35ConfigError::Invalid("num_experts_per_tok"))
+        }
+        _ => Ok(mlp),
+    }
 }
 
 fn rotary_dim(head_dim: usize, factor: f64) -> Result<usize, Qwen35ConfigError> {
@@ -378,8 +463,7 @@ struct RawTextConfig {
     num_hidden_layers: usize,
     #[serde(default)]
     hidden_size: usize,
-    #[serde(default)]
-    intermediate_size: usize,
+    intermediate_size: Option<usize>,
     #[serde(default)]
     vocab_size: usize,
     #[serde(default)]
@@ -414,6 +498,9 @@ struct RawTextConfig {
     mamba_ssm_dtype: Option<String>,
     tie_word_embeddings: Option<bool>,
     num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
     mlp_only_layers: Option<Vec<usize>>,
 }
 
@@ -444,7 +531,9 @@ pub enum Qwen35ConfigError {
     #[error("invalid configuration JSON: {0}")]
     Json(serde_json::Error),
     /// The configuration is another architecture.
-    #[error("expected model_type qwen3_5 with text_config, or qwen3_5_text, got {0:?}")]
+    #[error(
+        "expected model_type qwen3_5 or qwen3_5_moe with text_config, or qwen3_5_text or qwen3_5_moe_text, got {0:?}"
+    )]
     UnexpectedModelType(String),
     /// A layout variant this decoder does not implement.
     #[error("unsupported qwen3_5 layout: {0}")]
@@ -479,7 +568,7 @@ pub enum Qwen35ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen35Config, Qwen35ConfigError, Qwen35LayerKind};
+    use super::{Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp};
 
     /// The text fields of Qwen/Qwen3.8-27B@1d4bf0f2, with its 64-entry
     /// `layer_types` generated from the published 3-linear-then-1-full pattern.
@@ -605,6 +694,125 @@ mod tests {
         assert!(matches!(
             Qwen35Config::parse(&config),
             Err(Qwen35ConfigError::UnknownLayerType(_))
+        ));
+    }
+
+    /// The text fields of Qwen/Qwen3.6-35B-A3B@995ad96e, with its 40-entry
+    /// `layer_types` generated from the published 3-linear-then-1-full pattern.
+    fn qwen36_35b_a3b() -> String {
+        let layer_types = (0..40)
+            .map(|layer| {
+                if layer % 4 == 3 {
+                    "\"full_attention\""
+                } else {
+                    "\"linear_attention\""
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{
+              "model_type": "qwen3_5_moe",
+              "tie_word_embeddings": false,
+              "text_config": {{
+                "model_type": "qwen3_5_moe_text",
+                "attention_bias": false,
+                "attn_output_gate": true,
+                "head_dim": 256,
+                "hidden_act": "silu",
+                "hidden_size": 2048,
+                "layer_types": [{layer_types}],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_value_head_dim": 128,
+                "mamba_ssm_dtype": "float32",
+                "max_position_embeddings": 262144,
+                "moe_intermediate_size": 512,
+                "mtp_num_hidden_layers": 1,
+                "num_attention_heads": 16,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "num_hidden_layers": 40,
+                "num_key_value_heads": 2,
+                "partial_rotary_factor": 0.25,
+                "rms_norm_eps": 1e-06,
+                "rope_parameters": {{
+                  "mrope_interleaved": true,
+                  "mrope_section": [11, 11, 10],
+                  "partial_rotary_factor": 0.25,
+                  "rope_theta": 10000000,
+                  "rope_type": "default"
+                }},
+                "router_aux_loss_coef": 0.001,
+                "shared_expert_intermediate_size": 512,
+                "tie_word_embeddings": false,
+                "vocab_size": 248320
+              }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn parses_the_qwen36_35b_a3b_experts() {
+        let config = Qwen35Config::parse(&qwen36_35b_a3b()).expect("valid config");
+        assert_eq!(config.layers().len(), 40);
+        assert_eq!(
+            config.mlp(),
+            Qwen35Mlp::Experts {
+                experts: 256,
+                top_k: 8,
+                expert_intermediate_size: 512,
+                shared_intermediate_size: 512,
+            }
+        );
+        assert_eq!(config.conv_dim(), 2 * 16 * 128 + 32 * 128);
+        assert!(matches!(
+            Qwen35Config::parse(&qwen38_27b())
+                .expect("valid config")
+                .mlp(),
+            Qwen35Mlp::Dense {
+                intermediate_size: 17408
+            }
+        ));
+    }
+
+    #[test]
+    fn refuses_incomplete_or_mixed_expert_layouts() {
+        let moe = qwen36_35b_a3b();
+        for (from, to) in [
+            (
+                r#""num_experts_per_tok": 8"#,
+                r#""num_experts_per_tok": 257"#,
+            ),
+            (r#""moe_intermediate_size": 512,"#, ""),
+            (r#""shared_expert_intermediate_size": 512,"#, ""),
+            (r#""num_experts": 256,"#, ""),
+            (
+                r#""router_aux_loss_coef": 0.001,"#,
+                r#""mlp_only_layers": [3],"#,
+            ),
+            (
+                r#""model_type": "qwen3_5_moe_text""#,
+                r#""model_type": "qwen3_5_text""#,
+            ),
+        ] {
+            assert!(moe.contains(from), "fixture lacks {from}");
+            assert!(
+                Qwen35Config::parse(&moe.replacen(from, to, 1)).is_err(),
+                "accepted {to}"
+            );
+        }
+        // Experts in a dense checkpoint are refused, not ignored.
+        let dense = qwen38_27b().replacen(
+            r#""head_dim": 256,"#,
+            r#""head_dim": 256, "num_experts": 4,"#,
+            1,
+        );
+        assert!(matches!(
+            Qwen35Config::parse(&dense),
+            Err(Qwen35ConfigError::Unsupported(_))
         ));
     }
 
