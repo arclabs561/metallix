@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import http.client
 import itertools
@@ -40,6 +41,7 @@ import math
 import os
 import platform
 import random
+import re
 import shlex
 import signal
 import subprocess
@@ -955,6 +957,38 @@ def level_spec(name: str, address: str, args) -> ServerSpec:
     return with_prefix_cache(spec, args.prefix_cache)
 
 
+@functools.cache
+def mx_serve_flags(mx: Path) -> frozenset[str]:
+    """Long options this `mx serve` build lists in its help."""
+    help_text = bench_system.command_output([str(mx), "serve", "--help"])
+    return frozenset(re.findall(r"--[a-z][a-z0-9-]*", help_text))
+
+
+def metallix_level_flags(supported: frozenset[str], in_flight: int) -> list[str]:
+    """Admission flags sized to a level, limited to those the build accepts.
+
+    `mx serve` refuses requests beyond its queue depth (default 8), so a level
+    above that would measure rejections instead of serving; a batching build
+    also caps its running sequences.
+    """
+    flags = []
+    if "--queue-depth" in supported:
+        flags += ["--queue-depth", str(max(in_flight, 8))]
+    if "--max-num-seqs" in supported:
+        flags += ["--max-num-seqs", str(in_flight)]
+    return flags
+
+
+def with_level(spec: ServerSpec, kind: str, value: float, args) -> ServerSpec:
+    """A spec sized to one level: requests in flight at a concurrency, or every
+    request of a rate run in the worst case."""
+    if spec.name != "metallix" or args.url:
+        return spec
+    in_flight = int(value) if kind == "concurrency" else args.rate_requests
+    flags = metallix_level_flags(mx_serve_flags(args.mx.resolve()), in_flight)
+    return replace(spec, argv=spec.argv + flags)
+
+
 def measure_level(
     name: str, set_name: str, kind: str, value: float, count: int, args, count_tokens
 ) -> dict:
@@ -975,7 +1009,7 @@ def measure_level(
             address = args.url.removeprefix("http://").rstrip("/")
         else:
             address = bench_serve.free_address()
-        spec = level_spec(name, address, args)
+        spec = with_level(level_spec(name, address, args), kind, value, args)
         if not args.url:
             log = args.log_dir / f"{name}-{set_name}-{kind}{value:g}.log"
             server = ManagedServer(spec, address, log)

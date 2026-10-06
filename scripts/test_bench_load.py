@@ -357,7 +357,7 @@ class Levels(unittest.TestCase):
         }
         return argparse.Namespace(**(values | overrides))
 
-    def fakes(self, load: float) -> tuple[list, list]:
+    def fakes(self, load: float, name: str = "vllm-metal") -> tuple[list, list]:
         """Patch servers, requests and machine probes; return (starts, warmups)."""
         started, warmups = [], []
 
@@ -386,7 +386,7 @@ class Levels(unittest.TestCase):
 
         sampler = bench_load.bench_system.Sampler
 
-        spec = bench_load.ServerSpec("vllm-metal", "chat", ["vllm"], {}, {})
+        spec = bench_load.ServerSpec(name, "chat", ["vllm"], {}, {})
         patches = [
             mock.patch.object(bench_load, "ManagedServer", FakeServer),
             mock.patch.object(bench_load, "run_load", fake_run_load),
@@ -428,6 +428,37 @@ class Levels(unittest.TestCase):
         self.assertIn("rose above 4", run["aborted"])
         self.assertNotIn("summary", run)  # Cut-off requests are not engine failures.
         self.assertEqual(started.count("stopped"), 2)  # The abort, then cleanup.
+
+    def test_metallix_levels_admit_every_request_in_flight(self) -> None:
+        started, _ = self.fakes(load=1.0, name="metallix")
+        args = self.args(
+            concurrency=[2, 16], rates=[], prefix_cache="default", mx=pathlib.Path("mx")
+        )
+        flags = frozenset({"--queue-depth", "--prefix-cache-mib"})
+        with mock.patch.object(bench_load, "mx_serve_flags", lambda mx: flags):
+            bench_load.measure_set("metallix", "short", args, str.split)
+        argvs = [argv for argv in started if argv != "stopped"]
+        self.assertEqual(
+            argvs, [["vllm", "--queue-depth", "8"], ["vllm", "--queue-depth", "16"]]
+        )
+
+    def test_metallix_level_flags_follow_what_the_build_accepts(self) -> None:
+        both = frozenset({"--queue-depth", "--max-num-seqs"})
+        self.assertEqual(
+            bench_load.metallix_level_flags(both, 16),
+            ["--queue-depth", "16", "--max-num-seqs", "16"],
+        )
+        self.assertEqual(bench_load.metallix_level_flags(frozenset(), 16), [])
+        help_text = "  --queue-depth <QUEUE_DEPTH>\n  --kv-budget-mib <MIB>\n"
+        with mock.patch.object(
+            bench_load.bench_system, "command_output", lambda argv: help_text
+        ):
+            bench_load.mx_serve_flags.cache_clear()
+            self.assertEqual(
+                bench_load.mx_serve_flags(pathlib.Path("/x/mx")),
+                {"--queue-depth", "--kv-budget-mib"},
+            )
+        bench_load.mx_serve_flags.cache_clear()
 
     def test_every_managed_engine_is_measured_on_chat_completions(self) -> None:
         args = bench_load.build_parser().parse_args(
