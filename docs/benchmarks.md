@@ -108,6 +108,22 @@ Each engine runs with settings that make the comparison fair to it.
   through `--url`, with their command line and version recorded. llama.cpp
   needs one slot per concurrent request (`-np`) and a context of slots times
   the per-request context.
+- Ollama: one `ollama serve` per level with `OLLAMA_NUM_PARALLEL` set to the
+  concurrency, not the background service. Requests carry
+  `--request-extra '{"reasoning_effort": "none"}'` to turn Qwen3 thinking off.
+  Ollama's library has no BF16 build of Qwen3-0.6B, so its rows use the F16
+  build and say so with `--note`.
+
+Engines and versions used to prepare the protocol (each report records the
+versions it ran):
+
+| Engine | Version | Install | Weights |
+|---|---|---|---|
+| vllm-metal | 0.30.0 (vllm 0.30.0+cpu, mlx 0.32.1) | release wheels of vllm and vllm-metal v0.30.0 | Hugging Face Qwen3-0.6B, BF16 |
+| mlx-lm | 0.32.0 (mlx 0.32.3) | `uv pip install mlx-lm==0.32.0` | Hugging Face Qwen3-0.6B, BF16 |
+| MTPLX | 2.12.2 (mlx 0.32.2) | `uv pip install mtplx==2.12.2` | Hugging Face Qwen3-0.6B, BF16 |
+| llama.cpp | b11146 (commit 7fe450e19) | `brew install llama.cpp` | BF16 GGUF from the same checkpoint, `convert_hf_to_gguf.py --outtype bf16` at that commit |
+| Ollama | 0.35.1 | `brew install ollama` | `ollama pull qwen3:0.6b-fp16` (digest `626c9556a80f`), GGUF F16, not BF16 |
 
 ## Reproducing
 

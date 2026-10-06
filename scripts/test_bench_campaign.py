@@ -221,6 +221,13 @@ class Summaries(unittest.TestCase):
             ("llama.cpp", 8, "run1.json"),
         )
         self.assertTrue(only["claim_grade"])
+        report["servers"][0]["note"] = "qwen3:0.6b-fp16 GGUF F16, not BF16"
+        rows = bench_campaign.rows_from_load_report(report, "run1.json")
+        summary = bench_campaign.summarize_rows(rows)
+        self.assertIn(
+            "note: llama.cpp: qwen3:0.6b-fp16 GGUF F16, not BF16",
+            bench_campaign.render(summary),
+        )
         del report["idle_gate"]
         self.assertFalse(
             bench_campaign.rows_from_load_report(report, "r")[0]["claim_grade"]

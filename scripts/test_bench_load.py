@@ -355,6 +355,7 @@ class Levels(unittest.TestCase):
             "abort_load": None,
             "abort_gpu_gib": None,
             "server_args": [],
+            "request_extra": {},
         }
         return argparse.Namespace(**(values | overrides))
 
@@ -581,6 +582,37 @@ class TokenCounts(unittest.TestCase):
         self.assertEqual(
             bench_load.report_cells(servers), {("short", "c", 2): {"a": run["records"]}}
         )
+
+
+class UrlEngines(unittest.TestCase):
+    def test_request_extra_reaches_url_and_managed_requests(self) -> None:
+        extra = '{"reasoning_effort": "none"}'
+        args = bench_load.build_parser().parse_args(
+            ["--url", "http://h:1", "--model-path", "m", "--request-extra", extra]
+        )
+        spec = bench_load.level_spec("ollama", "h:1", args)
+        self.assertEqual(spec.extra, {"reasoning_effort": "none"})
+        _, body = bench_load.request_body(
+            spec.api, "m", bench_load.Prompt("x", None, "hi"), 8, spec.extra
+        )
+        self.assertEqual(body["reasoning_effort"], "none")
+        # A managed engine keeps its own fields; the option wins on a clash.
+        args = bench_load.build_parser().parse_args(
+            [
+                "--server", "vllm-metal", "--model-path", "m",
+                "--request-extra", '{"ignore_eos": false, "seed": 1}',
+            ]
+        )  # fmt: skip
+        with mock.patch.object(bench_load, "env_python_versions", lambda *a: {}):
+            spec = bench_load.level_spec("vllm-metal", "h:1", args)
+        self.assertEqual(spec.extra["ignore_eos"], False)
+        self.assertEqual(spec.extra["seed"], 1)
+        self.assertIn("chat_template_kwargs", spec.extra)
+
+    def test_request_extra_must_be_a_json_object(self) -> None:
+        for bad in ("[1]", "{not json"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                bench_load.json_object(bad)
 
 
 class Metadata(unittest.TestCase):

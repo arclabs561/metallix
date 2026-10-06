@@ -953,12 +953,26 @@ def load_average() -> list[float]:
 def level_spec(name: str, address: str, args) -> ServerSpec:
     """The spec for one engine; an empty argv for an already running --url server."""
     if args.url:
-        return ServerSpec(name, args.api, [], {}, {})
+        return ServerSpec(name, args.api, [], dict(args.request_extra), {})
     spec = with_prefix_cache(
         server_spec(name, args.model_path, args.model_id, address, args),
         args.prefix_cache,
     )
-    return replace(spec, argv=spec.argv + args.server_args)
+    return replace(
+        spec,
+        argv=spec.argv + args.server_args,
+        extra=spec.extra | args.request_extra,
+    )
+
+
+def json_object(text: str) -> dict:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"not JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return value
 
 
 @functools.cache
@@ -1327,6 +1341,19 @@ def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.Argumen
         "--label", default="external", help="engine name for a --url server"
     )
     parser.add_argument(
+        "--request-extra",
+        type=json_object,
+        default={},
+        metavar="JSON",
+        help="fields merged into every request body, over the engine's own "
+        """(for example '{"reasoning_effort": "none"}' to turn Qwen3 thinking """
+        "off on Ollama)",
+    )
+    parser.add_argument(
+        "--note",
+        help="shown with the engine in reports, for example a different weight format",
+    )
+    parser.add_argument(
         "--launch-argv",
         type=shlex.split,
         help="how the --url server was started, as one shell-quoted string",
@@ -1473,6 +1500,8 @@ def main() -> int:
     for name in names:
         print(f"{name}:", flush=True)
         entry: dict = {"name": name, "prefix_cache": args.prefix_cache}
+        if args.note:
+            entry["note"] = args.note
         report["servers"].append(entry)
         try:
             spec = level_spec(name, "127.0.0.1:0", args)

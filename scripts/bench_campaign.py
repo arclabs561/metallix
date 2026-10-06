@@ -295,6 +295,7 @@ def rows_from_load_report(report: dict, name: str) -> list[dict]:
                         "summary": run["summary"],
                         "records": run["records"],
                         "claim_grade": grade,
+                        "note": server.get("note"),
                     }
                 )
     return rows
@@ -325,6 +326,7 @@ def summarize_rows(rows: list[dict], subject: str = SUBJECT) -> dict:
         key = (row["set"], row["cache"], row["concurrency"])
         cells.setdefault(key, {}).setdefault(row["engine"], []).append(row)
     table, warnings, ungated = [], [], 0
+    notes = {row["engine"]: row["note"] for row in rows if row.get("note")}
     for (set_name, cache, level), by_engine in sorted(cells.items()):
         stats = {}
         for engine, engine_rows in by_engine.items():
@@ -390,7 +392,12 @@ def summarize_rows(rows: list[dict], subject: str = SUBJECT) -> dict:
             f"{ungated} engine cells include passes without a passed idle gate; "
             "they are not claim-grade"
         )
-    return {"subject": subject, "cells": table, "warnings": warnings}
+    return {
+        "subject": subject,
+        "cells": table,
+        "notes": notes,
+        "warnings": warnings,
+    }
 
 
 def render(summary: dict) -> str:
@@ -427,6 +434,9 @@ def render(summary: dict) -> str:
                 if name in METRICS
             ) + ("" if claims["claim_grade"] else "; NOT CLAIM-GRADE")
             lines.append(f"{'':<23} {summary['subject']} vs {engine}: {verdicts}")
+    lines += [
+        f"note: {engine}: {note}" for engine, note in summary.get("notes", {}).items()
+    ]
     lines += [f"no numbers: {line}" for line in summary.get("unmeasured", [])]
     lines += [f"warning: {warning}" for warning in summary["warnings"]]
     return "\n".join(lines)
