@@ -55,6 +55,7 @@ from pathlib import Path
 
 import bench_serve
 import bench_system
+import mx_spans
 
 ROOT = Path(__file__).resolve().parent.parent
 ENVS = ROOT / ".agents" / "bench-envs"
@@ -1019,6 +1020,9 @@ def measure_level(
         }
         if not args.url:
             log = args.log_dir / f"{name}-{set_name}-{kind}{value:g}.log"
+            spec, trace = with_spans(spec, log, args)
+            if trace:
+                result["trace"] = str(trace)
             server = ManagedServer(spec, address, log)
             server.wait_ready(args.start_timeout)
             result |= {"ready_s": server.ready_s, "argv": spec.argv, "log": str(log)}
@@ -1087,7 +1091,42 @@ def measure_level(
     finally:
         if server:
             server.stop()
+    # The timelines are complete only once the server has exited.
+    if result.get("trace") and "summary" in result:
+        add_server_spans(result, Path(result["trace"]), args.model_id, args.warmup)
     return result
+
+
+def with_spans(spec: ServerSpec, log: Path, args) -> tuple[ServerSpec, Path | None]:
+    """With --mx-spans, have metallix write its span timeline beside its log."""
+    if spec.name != "metallix" or not getattr(args, "mx_spans", False):
+        return spec, None
+    if "--trace-out" not in mx_serve_flags(args.mx.resolve()):
+        print("  warning: this mx build has no --trace-out (features: timeline)")
+        return spec, None
+    trace = log.with_suffix(".trace.json")
+    return (
+        replace(
+            spec,
+            argv=spec.argv + ["--trace-out", str(trace)],
+            environment=spec.environment | {"METALLIX_LOG": "info"},
+        ),
+        trace,
+    )
+
+
+def add_server_spans(result: dict, trace: Path, model_id: str, warmup: int) -> None:
+    """Server-side request timings next to the client's, and any disagreement."""
+    try:
+        server = mx_spans.summarize_files(trace, model_id, skip=warmup)
+    except (OSError, ValueError) as error:
+        result["server_spans"] = {"error": str(error)}
+        return
+    result["server_spans"] = server
+    result["span_mismatches"] = mx_spans.compare(server, result["summary"])
+    print(f"    {mx_spans.one_line(server)}", flush=True)
+    for mismatch in result["span_mismatches"]:
+        print(f"    mismatch: {mismatch}", flush=True)
 
 
 def measure_set(name: str, set_name: str, args, count_tokens) -> dict:
@@ -1351,6 +1390,13 @@ def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.Argumen
         "--mx-revision", default="unknown", help="source revision of --mx"
     )
     parser.add_argument("--mx-kv-budget-mib", type=int, default=4096)
+    parser.add_argument(
+        "--mx-spans",
+        action="store_true",
+        help="have metallix write a span timeline per level (METALLIX_LOG=info, "
+        "--trace-out) and compare its timings with the client's; tracing adds "
+        "work to the server, so use it on a separate pass, not a measured one",
+    )
     parser.add_argument("--mtplx-scheduler", default="ar_batch")
     parser.add_argument("--mtplx-preset", default="throughput")
     parser.add_argument("--vllm-memory-fraction", type=float, default=0.1)
