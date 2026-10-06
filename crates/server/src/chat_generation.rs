@@ -796,6 +796,38 @@ impl ChatSession {
         }
     }
 
+    /// Prefills a short fixed prompt and decodes a few pipelined greedy steps
+    /// on a throwaway executor, so the first request does not pay Metal
+    /// pipeline creation and allocator growth for the prefill and decode
+    /// kernels. The prefix cache is not touched.
+    pub(crate) fn warm(&mut self) -> Result<(), String> {
+        const DECODE_STEPS: usize = 4;
+        let ids = self
+            .format
+            .tokenizer()
+            .encode_prompt("Warm up the prefill and decode kernels.")?;
+        let Some(&last) = ids.last() else {
+            return Ok(());
+        };
+        if ids.len() + DECODE_STEPS + 1 > self.context_limit {
+            return Ok(());
+        }
+        let error = |error: qwen::forward::Qwen3ForwardError| error.to_string();
+        let mut executor = self
+            .weights
+            .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
+            .map_err(error)?;
+        executor.prefill_last_logits(&ids).map_err(error)?;
+        let mut pending = executor.decode_greedy(last).map_err(error)?;
+        for _ in 0..DECODE_STEPS {
+            let next = executor.decode_greedy_after(&pending).map_err(error)?;
+            pending.wait_one().map_err(error)?;
+            pending = next;
+        }
+        pending.wait_one().map_err(error)?;
+        Ok(())
+    }
+
     /// Renders and pre-fills one fresh chat prompt without selecting or decoding
     /// any output token. Each call creates a separate resident executor, so no
     /// question can contribute K/V state to another question.

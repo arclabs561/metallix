@@ -216,11 +216,21 @@ pub(crate) trait ModelWorker {
     fn rerank(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
         None
     }
+
+    /// Runs throwaway work once after load so the first request does not pay
+    /// first-use costs; models without such costs do nothing.
+    fn warm(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl ModelWorker for ChatSession {
     fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
         Some(self)
+    }
+
+    fn warm(&mut self) -> Result<(), String> {
+        ChatSession::warm(self)
     }
 
     fn decide(&mut self, body: &[u8], model: &str) -> Option<Result<Value, String>> {

@@ -397,6 +397,13 @@ fn serve_inner(
                 load.record("load_ms", load_ms);
                 gpu::Memory::record_on(&load);
                 tracing::info!("model loaded");
+                // Before the child announces itself, so the first request
+                // does not wait on first-use kernel builds.
+                if let Err(error) = worker.warm() {
+                    load.record("error.type", "warmup_failed");
+                    let _ = startup_sender.send(Err(format!("warmup failed: {error}")));
+                    return;
+                }
                 // Before any request, since MLX must not change the wired
                 // limit while an asynchronous evaluation runs.
                 if worker.chat().is_some() {
