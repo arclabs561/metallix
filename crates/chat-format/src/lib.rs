@@ -158,6 +158,32 @@ impl StopTokens {
         Ok(Self { end_turn, tool_end })
     }
 
+    /// [`Self::classify`] for one turn. Under `ignore_eos` (vLLM's request
+    /// field, for equal-length benchmarks) end-of-turn is an ordinary token,
+    /// so the turn runs to its output limit and keeps it as text; a tool end
+    /// still stops.
+    #[must_use]
+    pub fn classify_turn(&self, token: TokenId, ignore_eos: bool) -> TokenClass {
+        match self.classify(token) {
+            TokenClass::EndTurn if ignore_eos => TokenClass::Normal,
+            class => class,
+        }
+    }
+
+    /// One end-of-turn token and no tool end, for dependents' scripted
+    /// backends.
+    #[cfg(any(test, feature = "test-model"))]
+    #[must_use]
+    pub fn end_turn_only(token: TokenId) -> Self {
+        Self {
+            end_turn: NonEmpty {
+                first: token,
+                rest: Vec::new(),
+            },
+            tool_end: Vec::new(),
+        }
+    }
+
     #[must_use]
     pub fn classify(&self, token: TokenId) -> TokenClass {
         if self.end_turn.iter().any(|&id| id == token) {
@@ -1084,6 +1110,15 @@ mod tests {
         .expect("gemma stops");
         assert_eq!(gemma.classify(TokenId::new(50)), TokenClass::ToolEnd);
         assert_eq!(gemma.classify(TokenId::new(106)), TokenClass::EndTurn);
+        for (id, ignoring) in [
+            (106, TokenClass::Normal),
+            (50, TokenClass::ToolEnd),
+            (7, TokenClass::Normal),
+        ] {
+            let token = TokenId::new(id);
+            assert_eq!(gemma.classify_turn(token, false), gemma.classify(token));
+            assert_eq!(gemma.classify_turn(token, true), ignoring, "{id}");
+        }
         assert!(
             StopTokens::from_configs(&json!({"eos_token_id": 50}), None, &[TokenId::new(50)])
                 .is_err()

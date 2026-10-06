@@ -145,6 +145,9 @@ pub(crate) struct ChatRequest<'a> {
     /// with different salts never reuse each other's cached K/V; `None`
     /// shares the default namespace.
     pub(crate) cache_salt: Option<&'a str>,
+    /// Treats end-of-turn as an ordinary token, so the turn runs to
+    /// `max_tokens` (vLLM's `ignore_eos`, for equal-length benchmarks).
+    pub(crate) ignore_eos: bool,
 }
 
 impl<'a> ChatRequest<'a> {
@@ -161,6 +164,7 @@ impl<'a> ChatRequest<'a> {
             top_logprobs: None,
             json_schema: None,
             cache_salt: None,
+            ignore_eos: false,
         }
     }
 
@@ -308,6 +312,8 @@ pub(crate) struct GenerationControls {
     pub(crate) enable_thinking: bool,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) json_schema: Option<Value>,
+    /// See [`ChatRequest::ignore_eos`].
+    pub(crate) ignore_eos: bool,
 }
 
 impl GenerationControls {
@@ -352,6 +358,11 @@ impl GenerationControls {
             if has_tools || self.enable_thinking {
                 return Err("JSON schema output cannot be combined with tools or reasoning".into());
             }
+            // A completed grammar admits only end-of-turn; there is nothing
+            // valid to generate past it.
+            if self.ignore_eos {
+                return Err("JSON schema output cannot be combined with ignore_eos".into());
+            }
             let greedy = self.sampling.temperature == Some(0.0);
             if !greedy && self.sampling.top_p.is_some_and(|top_p| top_p < 1.0) {
                 return Err("JSON schema output cannot be combined with top_p below 1".into());
@@ -380,6 +391,7 @@ impl GenerationControls {
             top_logprobs: self.top_logprobs,
             json_schema: self.json_schema.as_ref(),
             cache_salt: None,
+            ignore_eos: self.ignore_eos,
         }
     }
 }
@@ -1230,12 +1242,12 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession, ChatToolCall,
-        ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, ResidentChatLimits,
-        render_generation_prompt,
+        ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession,
+        ChatToolCall, ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, ResidentChatLimits,
+        SamplingDefaults, TurnModel, TurnStart, TurnStep, render_generation_prompt,
     };
     use chat_format::{
-        ChatTemplate, SpecialTokens,
+        ChatFormat, ChatTemplate, SpecialTokens,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
 
@@ -1271,6 +1283,71 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(TEMPLATE.as_bytes()));
         assert_eq!(digest, TEMPLATE_SHA256);
         assert_eq!(manifest["source"]["template_sha256"], TEMPLATE_SHA256);
+    }
+
+    /// A model that always picks end-of-turn: without `ignore_eos` the first
+    /// pick ends the turn; with it every pick is visible text and the turn
+    /// ends at its output limit, with the final text agreeing with the
+    /// streamed text.
+    #[test]
+    fn ignore_eos_runs_the_turn_loop_to_its_output_limit() {
+        const EOS: usize = 3;
+        let model = ModelDir::new(
+            &json!({"chat_template": "{{ messages[0].content }}"}),
+            &json!({"eos_token_id": EOS, "vocab_size": VOCABULARY_SIZE}),
+            None,
+        );
+        let format = ChatFormat::load(model.path(), VOCABULARY_SIZE).expect("test format");
+        let messages = [ChatMessage::text(ChatRole::User, "hi")];
+        for ignore_eos in [false, true] {
+            let mut request = ChatRequest::new(&messages, 4);
+            request.ignore_eos = ignore_eos;
+            let turn_model = TurnModel {
+                format: &format,
+                sampling_defaults: SamplingDefaults::default(),
+                model: model.path(),
+                vocabulary_size: VOCABULARY_SIZE,
+                context_limit: 64,
+            };
+            let (_, mut turn, mut text) =
+                TurnStart::prepare(turn_model, request, GenerationDeadline::unlimited())
+                    .expect("prepare")
+                    .into_parts();
+            let mut steps = Vec::new();
+            let mut streamed = String::new();
+            loop {
+                let mut logits = vec![0.0_f32; VOCABULARY_SIZE];
+                logits[EOS] = 1.0;
+                let accepted = turn.pick(&format, &mut logits).expect("pick");
+                if accepted.visible {
+                    text.push(&format, accepted.token, &mut |delta| {
+                        streamed.push_str(delta);
+                        Ok(())
+                    })
+                    .expect("push");
+                }
+                steps.push((accepted.visible, accepted.step));
+                if accepted.step != TurnStep::Continue {
+                    break;
+                }
+            }
+            let (final_text, _) = text
+                .finish(&format, turn.generated(), &mut |delta| {
+                    streamed.push_str(delta);
+                    Ok(())
+                })
+                .expect("final text agrees with the streamed text");
+            assert_eq!(final_text, streamed);
+            if ignore_eos {
+                let continued = (true, TurnStep::Continue);
+                let last = (true, TurnStep::Stop(ChatFinishReason::Length));
+                assert_eq!(steps, [continued, continued, continued, last]);
+                assert_eq!(final_text.matches("<|im_end|>").count(), 4);
+            } else {
+                assert_eq!(steps, [(false, TurnStep::Stop(ChatFinishReason::Eos))]);
+                assert_eq!(final_text, "");
+            }
+        }
     }
 
     #[test]

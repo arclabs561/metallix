@@ -81,6 +81,7 @@ pub(crate) mod test_support {
         time::Duration,
     };
 
+    use chat_format::{StopTokens, TokenClass, TokenId};
     use serde_json::Value;
 
     use crate::{
@@ -162,9 +163,15 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// End-of-turn for [`Scripted::emitting`], spelled `<eos>` in text.
+    pub(crate) const SCRIPTED_EOS: i32 = 0;
+
     /// Streams fixed text in two-character deltas, or fails before output.
     pub(crate) struct Scripted {
         text: String,
+        /// Token IDs a model would pick, repeated, decoded one per step under
+        /// the server's stop rule instead of `text`.
+        tokens: Option<Vec<i32>>,
         failure: Option<String>,
         pub(crate) deltas: usize,
         /// Whether the last request carried tools and enabled thinking.
@@ -180,12 +187,22 @@ pub(crate) mod test_support {
         pub(crate) fn new(text: &str) -> Self {
             Self {
                 text: text.into(),
+                tokens: None,
                 failure: None,
                 deltas: 0,
                 seen: None,
                 salt: None,
                 prompt_tokens: 1,
                 cached_prompt_tokens: 0,
+            }
+        }
+
+        /// Picks `tokens` in a loop; any other ID than [`SCRIPTED_EOS`]
+        /// decodes as `a`.
+        pub(crate) fn emitting(tokens: &[i32]) -> Self {
+            Self {
+                tokens: Some(tokens.to_vec()),
+                ..Self::new("")
             }
         }
 
@@ -213,16 +230,46 @@ pub(crate) mod test_support {
             if let Some(failure) = &self.failure {
                 return Err(ChatGenerationError::Message(failure.clone()));
             }
-            let characters: Vec<char> = self.text.chars().collect();
-            for piece in characters.chunks(2) {
-                self.deltas += 1;
-                on_token(&piece.iter().collect::<String>())
-                    .map_err(ChatGenerationError::Message)?;
-            }
+            let (text, generated_token_ids, finish_reason) = if let Some(tokens) = &self.tokens {
+                let spell = |token: i32| if token == SCRIPTED_EOS { "<eos>" } else { "a" };
+                let limit = request.max_tokens.expect("scripted tokens need max_tokens");
+                // The session's stop rule: classify each token for this turn,
+                // stop at anything but Normal and hide that final token.
+                let stops = StopTokens::end_turn_only(TokenId::from_model(SCRIPTED_EOS).unwrap());
+                let class = |token: i32| {
+                    stops.classify_turn(TokenId::from_model(token).unwrap(), request.ignore_eos)
+                };
+                let mut generated = Vec::new();
+                let mut finish = ChatFinishReason::Length;
+                for &token in tokens.iter().cycle().take(limit as usize) {
+                    generated.push(token);
+                    if class(token) != TokenClass::Normal {
+                        finish = ChatFinishReason::Eos;
+                        break;
+                    }
+                    self.deltas += 1;
+                    on_token(spell(token)).map_err(ChatGenerationError::Message)?;
+                }
+                let visible = match generated.split_last() {
+                    Some((&last, visible)) if class(last) != TokenClass::Normal => visible,
+                    _ => &generated[..],
+                };
+                let text: String = visible.iter().map(|&token| spell(token)).collect();
+                (text, generated, finish)
+            } else {
+                let characters: Vec<char> = self.text.chars().collect();
+                for piece in characters.chunks(2) {
+                    self.deltas += 1;
+                    on_token(&piece.iter().collect::<String>())
+                        .map_err(ChatGenerationError::Message)?;
+                }
+                (self.text.clone(), vec![1, 2], ChatFinishReason::Eos)
+            };
+            let generated_tokens = generated_token_ids.len();
             Ok(ChatGeneration {
-                text: self.text.clone(),
-                generated_token_ids: vec![1, 2],
-                finish_reason: ChatFinishReason::Eos,
+                text,
+                generated_token_ids,
+                finish_reason,
                 metrics: ChatGenerationMetrics {
                     context_tokens: 2048,
                     planned_kv_bytes: 0,
@@ -234,7 +281,7 @@ pub(crate) mod test_support {
                     decode_total_ms: 0.0,
                     prompt_tokens: self.prompt_tokens,
                     cached_prompt_tokens: self.cached_prompt_tokens,
-                    generated_tokens: 2,
+                    generated_tokens,
                 },
                 logprobs: Vec::new(),
                 sampling: None,

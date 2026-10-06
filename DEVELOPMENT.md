@@ -404,6 +404,10 @@ history, validated function definitions and function-call outputs, greedy
 sampling, and optional SSE. It rejects response storage, response-ID chaining,
 images, nondefault sampling controls, and forced tool choice. Treat it as a
 small Responses compatibility target, not a complete OpenAI or Codex service.
+As in vLLM, `/v1/responses`, `/v1/chat/completions` and `/v1/messages` accept
+`"ignore_eos": true`, a metallix extension that keeps generating past
+end-of-turn until the output limit, so benchmark runs produce equal-length
+replies. It cannot be combined with a JSON schema.
 The serial HTTP transport accepts one request per connection and closes it
 following the response. Header and body intake share a five-second absolute
 deadline, with 16 KiB of headers, at most 64 headers, and at most 1 MiB of body.

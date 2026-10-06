@@ -49,6 +49,10 @@ pub(crate) struct Request {
     top_p: Option<f64>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Metallix extension, as in vLLM: generate past end-of-turn up to the
+    /// output limit, for equal-length benchmark runs.
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(default)]
     logprobs: Option<bool>,
     #[serde(default)]
@@ -239,6 +243,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         enable_thinking,
         reasoning_effort,
         json_schema,
+        ignore_eos: request.ignore_eos,
     };
     controls.validate(has_tools)?;
     Ok(controls)
@@ -638,7 +643,9 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse::test_support::{Scripted, events, exchange, exchange_with, json_body};
+    use crate::sse::test_support::{
+        SCRIPTED_EOS, Scripted, events, exchange, exchange_with, json_body,
+    };
 
     fn prepare_body(body: &Value) -> Result<Prepared, Value> {
         prepare(body.to_string().as_bytes()).map(|(_, prepared)| prepared)
@@ -661,6 +668,7 @@ mod tests {
             json!({"frobnicate":1}),
             json!({"stream_options":{"include_usage":true,"chunk_size":4}}),
             json!({"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{},"extra":1}}}),
+            json!({"ignore_eos":true,"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}}),
             json!({"n":2}),
             json!({"stop":["\n"]}),
             json!({"stop":"END"}),
@@ -904,6 +912,40 @@ mod tests {
     }
 
     #[test]
+    fn ignore_eos_runs_to_max_tokens_past_an_early_eos() {
+        let early = [7, SCRIPTED_EOS];
+        let mut backend = Scripted::emitting(&early);
+        let (_, body) = json_body(&run(&with(&json!({"max_tokens":8})), &mut backend));
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["choices"][0]["message"]["content"], "a");
+        assert_eq!(body["usage"]["completion_tokens"], 2);
+
+        let mut backend = Scripted::emitting(&early);
+        let ignoring = with(&json!({"max_tokens":8,"ignore_eos":true}));
+        let (_, body) = json_body(&run(&ignoring, &mut backend));
+        assert_eq!(body["choices"][0]["finish_reason"], "length");
+        assert_eq!(body["choices"][0]["message"]["content"], "a<eos>".repeat(4));
+        assert_eq!(body["usage"]["completion_tokens"], 8);
+
+        let mut streamed = ignoring;
+        streamed["stream"] = json!(true);
+        let mut backend = Scripted::emitting(&early);
+        let chunks: Vec<Value> = events(&run(&streamed, &mut backend))
+            .into_iter()
+            .filter_map(|(_, data)| serde_json::from_str(&data).ok())
+            .collect();
+        let text: String = chunks
+            .iter()
+            .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(text, "a<eos>".repeat(4));
+        assert_eq!(
+            chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "length"
+        );
+    }
+
+    #[test]
     fn cached_prompt_tokens_are_a_subset_of_prompt_tokens() {
         for stream in [false, true] {
             let mut backend = Scripted::new("hi");
@@ -987,35 +1029,92 @@ mod tests {
         }
     }
 
+    fn real_session() -> crate::chat_generation::ChatSession {
+        use crate::chat_generation::{ChatSession, ResidentChatLimits};
+        let model = std::env::var_os("METALLIX_QWEN_MODEL").expect("set METALLIX_QWEN_MODEL");
+        ChatSession::load(
+            std::path::Path::new(&model),
+            ResidentChatLimits::from_mib(16_384, 8_192),
+        )
+        .expect("load local Qwen checkpoint")
+    }
+
+    fn real_run(body: &Value, session: &mut crate::chat_generation::ChatSession) -> String {
+        exchange(
+            "/v1/chat/completions",
+            &body.to_string(),
+            |connection, body| {
+                let (_, prepared) = prepare(body).unwrap();
+                respond(
+                    connection,
+                    &prepared,
+                    session,
+                    "q",
+                    Duration::from_secs(600),
+                )
+                .unwrap();
+            },
+        )
+    }
+
+    /// Opt-in: `ignore_eos` on every decode path of a real local Qwen3
+    /// checkpoint named by `METALLIX_QWEN_MODEL`.
+    #[test]
+    #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+    fn real_qwen_ignore_eos_reaches_max_tokens_on_every_decode_path() {
+        let mut session = real_session();
+        let run = real_run;
+        let body = json!({"model":"q","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_completion_tokens":16});
+        let (_, plain) = json_body(&run(&body, &mut session));
+        let text = plain["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // ignore_eos runs the short greedy answer out to the full output
+        // limit, on the pipelined GPU-pick path and, with logprobs, on the
+        // host path; both continue past the same end-of-turn identically.
+        assert_eq!(plain["choices"][0]["finish_reason"], "stop", "{plain}");
+        assert!(plain["usage"]["completion_tokens"].as_u64().unwrap() < 16);
+        let mut ignoring = body.clone();
+        ignoring["ignore_eos"] = json!(true);
+        let (_, pipelined) = json_body(&run(&ignoring, &mut session));
+        ignoring["logprobs"] = json!(true);
+        let (_, host) = json_body(&run(&ignoring, &mut session));
+        for long in [&pipelined, &host] {
+            assert_eq!(long["choices"][0]["finish_reason"], "length", "{long}");
+            assert_eq!(long["usage"]["completion_tokens"], 16, "{long}");
+            let content = long["choices"][0]["message"]["content"].as_str().unwrap();
+            assert!(content.starts_with(&text), "{content:?} extends {text:?}");
+            assert!(content.contains("<|im_end|>"), "{content:?}");
+        }
+        assert_eq!(
+            host["choices"][0]["logprobs"]["content"]
+                .as_array()
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            pipelined["choices"][0]["message"]["content"],
+            host["choices"][0]["message"]["content"]
+        );
+        // Seeded sampling with the checkpoint's top_k also picks on the GPU.
+        let sampled = json!({"model":"q","messages":[{"role":"user","content":"Say hello."}],"seed":7,"max_completion_tokens":16,"ignore_eos":true});
+        let (_, sampled) = json_body(&run(&sampled, &mut session));
+        assert_eq!(
+            sampled["choices"][0]["finish_reason"], "length",
+            "{sampled}"
+        );
+        assert_eq!(sampled["usage"]["completion_tokens"], 16, "{sampled}");
+    }
+
     /// Opt-in against a real local Qwen3 checkpoint named by
     /// `METALLIX_QWEN_MODEL`.
     #[test]
     #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
     fn real_qwen_answers_streams_and_calls_tools() {
-        use crate::chat_generation::{ChatSession, ResidentChatLimits};
-        let model = std::env::var_os("METALLIX_QWEN_MODEL").expect("set METALLIX_QWEN_MODEL");
-        let mut session = ChatSession::load(
-            std::path::Path::new(&model),
-            ResidentChatLimits::from_mib(16_384, 8_192),
-        )
-        .expect("load local Qwen checkpoint");
-        let run = |body: &Value, session: &mut ChatSession| {
-            exchange(
-                "/v1/chat/completions",
-                &body.to_string(),
-                |connection, body| {
-                    let (_, prepared) = prepare(body).unwrap();
-                    respond(
-                        connection,
-                        &prepared,
-                        session,
-                        "q",
-                        Duration::from_secs(600),
-                    )
-                    .unwrap();
-                },
-            )
-        };
+        let mut session = real_session();
+        let run = real_run;
         let body = json!({"model":"q","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_completion_tokens":16});
         let (status, plain) = json_body(&run(&body, &mut session));
         assert_eq!(status, "HTTP/1.1 200 OK", "{plain}");

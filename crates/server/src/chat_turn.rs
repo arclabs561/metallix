@@ -37,6 +37,7 @@ pub(crate) struct TurnStart {
     pub(crate) started: Instant,
     picker: TokenPicker,
     top_logprobs: Option<u8>,
+    ignore_eos: bool,
     vocabulary_size: usize,
 }
 
@@ -83,6 +84,7 @@ impl TurnStart {
             started,
             picker,
             top_logprobs: request.top_logprobs,
+            ignore_eos: request.ignore_eos,
             vocabulary_size: model.vocabulary_size,
         })
     }
@@ -92,12 +94,14 @@ impl TurnStart {
         let turn_loop = TurnLoop {
             picker: self.picker,
             top_logprobs: self.top_logprobs,
+            ignore_eos: self.ignore_eos,
             vocabulary_size: self.vocabulary_size,
             max_tokens: self.max_tokens,
             generated: Vec::with_capacity(self.max_tokens.min(4096) as usize),
             logprobs: Vec::new(),
         };
-        (self.input_ids, turn_loop, TurnText::new(self.started))
+        let text = TurnText::new(self.started, self.ignore_eos);
+        (self.input_ids, turn_loop, text)
     }
 }
 
@@ -150,6 +154,8 @@ pub(crate) struct Accepted {
 pub(crate) struct TurnLoop {
     picker: TokenPicker,
     top_logprobs: Option<u8>,
+    /// Classify end-of-turn as an ordinary token (`ChatRequest::ignore_eos`).
+    ignore_eos: bool,
     vocabulary_size: usize,
     max_tokens: u32,
     generated: Vec<i32>,
@@ -243,7 +249,9 @@ impl TurnLoop {
     /// The `top_logprobs` to record for `token`: only ordinary text tokens
     /// carry receipts.
     fn receipt_wanted(&self, format: &ChatFormat, token: i32) -> Result<Option<u8>, String> {
-        let class = format.stops().classify(TokenId::from_model(token)?);
+        let class = format
+            .stops()
+            .classify_turn(TokenId::from_model(token)?, self.ignore_eos);
         Ok(self.top_logprobs.filter(|_| class == TokenClass::Normal))
     }
 
@@ -254,7 +262,9 @@ impl TurnLoop {
         grammar_complete: bool,
         receipt: Option<TokenLogprob>,
     ) -> Result<Accepted, String> {
-        let class = format.stops().classify(TokenId::from_model(token)?);
+        let class = format
+            .stops()
+            .classify_turn(TokenId::from_model(token)?, self.ignore_eos);
         if class == TokenClass::Normal && self.top_logprobs.is_some() {
             self.logprobs
                 .push(receipt.ok_or("a log probability was requested but not computed")?);
@@ -396,15 +406,18 @@ pub(crate) struct TurnText {
     emitted: String,
     time_to_first_token_ms: Option<f64>,
     started: Instant,
+    /// Keeps a final end-of-turn token as text, as [`TurnLoop`] streamed it.
+    ignore_eos: bool,
 }
 
 impl TurnText {
-    pub(crate) fn new(started: Instant) -> Self {
+    pub(crate) fn new(started: Instant, ignore_eos: bool) -> Self {
         Self {
             decoder: chat_format::QwenTokenizer::generated_decoder(),
             emitted: String::new(),
             time_to_first_token_ms: None,
             started,
+            ignore_eos,
         }
     }
 
@@ -435,7 +448,10 @@ impl TurnText {
     ) -> Result<(String, Option<f64>), ChatGenerationError> {
         let visible = match generated.split_last() {
             Some((&last, visible))
-                if format.stops().classify(TokenId::from_model(last)?) != TokenClass::Normal =>
+                if format
+                    .stops()
+                    .classify_turn(TokenId::from_model(last)?, self.ignore_eos)
+                    != TokenClass::Normal =>
             {
                 visible
             }

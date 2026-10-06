@@ -43,6 +43,10 @@ pub(crate) struct Request {
     top_p: Option<f64>,
     #[serde(default)]
     top_k: Option<u32>,
+    /// Metallix extension, as in vLLM: generate past end-of-turn up to the
+    /// output limit, for equal-length benchmark runs.
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(default)]
     stop_sequences: Vec<String>,
     #[serde(default)]
@@ -210,6 +214,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         enable_thinking,
         reasoning_effort,
         json_schema,
+        ignore_eos: request.ignore_eos,
     };
     controls.validate(has_tools)?;
     Ok(controls)
@@ -602,7 +607,9 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse::test_support::{Scripted, events, exchange, exchange_with, json_body};
+    use crate::sse::test_support::{
+        SCRIPTED_EOS, Scripted, events, exchange, exchange_with, json_body,
+    };
 
     fn prepare_body(body: &Value) -> Result<Prepared, Value> {
         prepare(body.to_string().as_bytes()).map(|(_, prepared)| prepared)
@@ -855,6 +862,22 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         assert_eq!(partial, json!({"path":"README.md"}));
         assert_eq!(data[10]["delta"]["stop_reason"], "tool_use");
         assert_eq!(data[10]["usage"]["input_tokens"], 1);
+    }
+
+    #[test]
+    fn ignore_eos_runs_to_max_tokens_past_an_early_eos() {
+        let early = [7, SCRIPTED_EOS];
+        let mut backend = Scripted::emitting(&early);
+        let (_, body) = json_body(&run(&with(&json!({"max_tokens":8})), &mut backend));
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(body["usage"]["output_tokens"], 2);
+
+        let mut backend = Scripted::emitting(&early);
+        let ignoring = with(&json!({"max_tokens":8,"ignore_eos":true}));
+        let (_, body) = json_body(&run(&ignoring, &mut backend));
+        assert_eq!(body["stop_reason"], "max_tokens");
+        assert_eq!(body["content"][0]["text"], "a<eos>".repeat(4));
+        assert_eq!(body["usage"]["output_tokens"], 8);
     }
 
     #[test]

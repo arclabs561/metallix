@@ -47,6 +47,10 @@ pub(crate) struct Request {
     /// Not part of the `OpenAI` Responses schema; vLLM and llama.cpp accept it.
     #[serde(default)]
     seed: Option<u64>,
+    /// Metallix extension, as in vLLM: generate past end-of-turn up to the
+    /// output limit, for equal-length benchmark runs.
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(default)]
     store: Option<bool>,
     #[serde(default)]
@@ -218,6 +222,7 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         enable_thinking,
         reasoning_effort,
         json_schema,
+        ignore_eos: request.ignore_eos,
     };
     controls.validate(!request.tools.is_empty())?;
     Ok(controls)
@@ -909,6 +914,9 @@ mod tests {
             }
         );
         assert_eq!(sampled.max_tokens, Some(4096));
+        assert!(!sampled.ignore_eos);
+        let ignoring = controls(&request_with(&json!({"ignore_eos":true})).unwrap()).unwrap();
+        assert!(ignoring.ignore_eos);
         // Omitted fields stay omitted, for the model's defaults to fill.
         assert_eq!(
             controls(&request_with(&json!({})).unwrap())
