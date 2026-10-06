@@ -134,14 +134,15 @@ fn model_worker_loop(worker: &mut dyn ModelWorker, jobs: Receiver<GenerationJob>
     serve_jobs(worker, jobs, None);
 }
 
-/// Runs admitted jobs in order. `capture` wraps the first job in a Metal
-/// capture.
+/// Runs admitted jobs in order, keeping wired model memory resident between
+/// them (see [`gpu::keep_resident`]). `capture` wraps the first job in a
+/// Metal capture.
 fn serve_jobs(
     worker: &mut dyn ModelWorker,
     jobs: Receiver<GenerationJob>,
     mut capture: Option<PathBuf>,
 ) {
-    for job in jobs {
+    for job in gpu::keep_resident(jobs) {
         let GenerationJob {
             connection,
             work,
@@ -396,6 +397,16 @@ fn serve_inner(
                 load.record("load_ms", load_ms);
                 gpu::Memory::record_on(&load);
                 tracing::info!("model loaded");
+                // Before any request, since MLX must not change the wired
+                // limit while an asynchronous evaluation runs.
+                if worker.chat().is_some() {
+                    let wired_bytes = gpu::wire_resident(
+                        limits
+                            .kv_budget_bytes()
+                            .saturating_add(limits.prefix_cache_bytes()),
+                    );
+                    tracing::info!(wired_bytes = ?wired_bytes, "model memory wired");
+                }
                 drop(entered);
                 drop(load);
                 if startup_sender.send(Ok(())).is_ok() {

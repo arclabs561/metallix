@@ -1,17 +1,40 @@
-//! MLX memory figures and Metal frame capture for diagnostics.
+//! MLX memory figures, Metal frame capture, and keeping a served model's GPU
+//! memory resident between requests.
 //!
-//! The pinned `mlx-rs` does not wrap MLX-C's memory and capture functions, so
-//! this module calls them directly. It is the server's only module allowed
-//! `unsafe`; each call passes either no arguments, a pointer to a local, or a
-//! checked C string.
+//! The pinned `mlx-rs` does not wrap MLX-C's memory, capture and device-info
+//! functions, so this module calls them directly. It is the server's only
+//! module allowed `unsafe`; each call passes either no arguments, a pointer to
+//! a local, a checked C string, or a handle created and freed in the same
+//! block.
 #![allow(unsafe_code)]
 
 use std::{
     ffi::CString,
     path::{Path, PathBuf},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError},
+    },
+    time::{Duration, Instant},
 };
 
 use mlx_sys as sys;
+
+/// Seconds after its last request that a model process keeps its GPU memory
+/// wired and resident; `0` turns off both the wiring and the keepalive.
+const KEEPALIVE_ENV: &str = "METALLIX_GPU_KEEPALIVE_S";
+/// Long enough to cover the pauses of an agent between turns, short enough
+/// that an idle server stops issuing GPU work (llama.cpp's default too).
+const DEFAULT_KEEPALIVE: Duration = Duration::from_secs(180);
+/// macOS stops treating a process's GPU memory as resident about 2 s after
+/// its last GPU command, and the next command that reads it pays roughly
+/// 20-30 ms per GiB to make it resident again. A command every 0.5 s keeps
+/// wired memory resident; unwired memory is released either way.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Set once [`wire_resident`] wires memory; the keepalive only helps then.
+static WIRED: AtomicBool = AtomicBool::new(false);
 
 /// MLX's active, cached and peak allocation in bytes, or `None` when MLX
 /// reports an error.
@@ -108,6 +131,129 @@ pub(crate) fn reset_peak_memory() {
     let _ = unsafe { sys::mlx_reset_peak_memory() };
 }
 
+/// The keepalive window from `METALLIX_GPU_KEEPALIVE_S`, read once.
+fn keepalive_window() -> Duration {
+    static WINDOW: OnceLock<Duration> = OnceLock::new();
+    *WINDOW.get_or_init(|| match std::env::var(KEEPALIVE_ENV) {
+        Err(_) => DEFAULT_KEEPALIVE,
+        Ok(text) => text.parse().map_or_else(
+            |_| {
+                tracing::warn!(
+                    value = %text,
+                    "{KEEPALIVE_ENV} is not a whole number of seconds; using {}",
+                    DEFAULT_KEEPALIVE.as_secs()
+                );
+                DEFAULT_KEEPALIVE
+            },
+            Duration::from_secs,
+        ),
+    })
+}
+
+/// Metal's recommended working-set size for the default GPU, which MLX
+/// refuses to wire beyond.
+fn recommended_working_set() -> Option<u64> {
+    let mut size = 0_usize;
+    // SAFETY: the device and info handles are created, read and freed inside
+    // this block; `size` is a local and the key is a NUL-terminated literal.
+    // The caller has already run an `mlx-rs` operation, so an MLX-C failure
+    // returns a status instead of exiting.
+    let status = unsafe {
+        let device = sys::mlx_device_new_type(sys::mlx_device_type__MLX_GPU, 0);
+        let mut info = sys::mlx_device_info_new();
+        let mut status = sys::mlx_device_info_get(&raw mut info, device);
+        if status == 0 {
+            status = sys::mlx_device_info_get_size(
+                &raw mut size,
+                info,
+                c"max_recommended_working_set_size".as_ptr(),
+            );
+        }
+        sys::mlx_device_info_free(info);
+        sys::mlx_device_free(device);
+        status
+    };
+    (status == 0 && size > 0).then_some(size as u64)
+}
+
+/// Wires the loaded model's memory so it can stay resident between requests:
+/// MLX's active bytes now (the weights) plus `planned_bytes` (K/V and prefix
+/// cache budgets) and the allocator cache cap ([`cache_limit_bytes`], whose
+/// buffers the next request reuses), capped at Metal's recommended working
+/// set. Returns the wired limit, or `None` when the keepalive is off or MLX
+/// refuses. Call once, after load and before any request is queued, since
+/// MLX must not change the limit while an asynchronous evaluation runs.
+pub(crate) fn wire_resident(planned_bytes: u64) -> Option<u64> {
+    if keepalive_window().is_zero() {
+        return None;
+    }
+    let active = mlx_rs::memory::active_memory().ok()? as u64;
+    let limit = active
+        .saturating_add(planned_bytes)
+        .saturating_add(cache_limit_bytes() as u64)
+        .min(recommended_working_set()?);
+    match mlx_rs::memory::set_wired_limit(usize::try_from(limit).ok()?) {
+        Ok(_previous) => {
+            WIRED.store(true, Ordering::Release);
+            Some(limit)
+        }
+        Err(error) => {
+            tracing::warn!(%error, limit, "MLX refused the wired-memory limit");
+            None
+        }
+    }
+}
+
+/// Iterates over `jobs` like the receiver itself, but while memory is wired
+/// and the keepalive window after the previous job is open, it issues a
+/// trivial GPU command every [`KEEPALIVE_INTERVAL`] so the next request does
+/// not pay to make the model resident again; after the window it blocks
+/// without GPU work. Ends once every sender is gone. Create it after
+/// [`wire_resident`].
+pub(crate) fn keep_resident<T>(jobs: Receiver<T>) -> ResidentJobs<T> {
+    let window = if WIRED.load(Ordering::Acquire) {
+        keepalive_window()
+    } else {
+        Duration::ZERO
+    };
+    ResidentJobs { jobs, window }
+}
+
+/// See [`keep_resident`].
+pub(crate) struct ResidentJobs<T> {
+    jobs: Receiver<T>,
+    window: Duration,
+}
+
+impl<T> Iterator for ResidentJobs<T> {
+    type Item = T;
+
+    /// The caller asks for the next job when the previous one has finished,
+    /// so the window starts now.
+    fn next(&mut self) -> Option<T> {
+        next_job_within(&self.jobs, Instant::now(), self.window)
+    }
+}
+
+fn next_job_within<T>(jobs: &Receiver<T>, last_job: Instant, window: Duration) -> Option<T> {
+    while last_job.elapsed() < window {
+        match jobs.recv_timeout(KEEPALIVE_INTERVAL) {
+            Ok(job) => return Some(job),
+            Err(RecvTimeoutError::Timeout) => touch_gpu(),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+    jobs.recv().ok()
+}
+
+/// Evaluates a one-element sum on the GPU stream of the calling thread.
+fn touch_gpu() {
+    let one = mlx_rs::Array::from_int(1);
+    if let Err(error) = mlx_rs::ops::add(&one, &one).and_then(|sum| sum.eval()) {
+        tracing::warn!(%error, "GPU keepalive command failed");
+    }
+}
+
 /// Checks what Metal and MLX need before a capture can start, so a bad
 /// `--gpu-capture` is rejected before any model loads.
 pub(crate) fn check_capture_path(path: &Path) -> Result<(), String> {
@@ -195,6 +341,46 @@ mod tests {
     fn memory_figures_are_readable() {
         let memory = Memory::read().expect("MLX memory figures");
         assert!(memory.peak >= memory.active);
+    }
+
+    #[test]
+    fn keepalive_wait_ends_promptly_when_the_senders_are_gone() {
+        // A sender that hangs up mid-window, after at least one keepalive
+        // tick, must end the wait at the next tick rather than at the end of
+        // a 60 s window. The first GPU command of a process can take seconds
+        // on a loaded machine (Metal setup, kernel builds), so it runs before
+        // the clock starts, and the bound stays far below the window.
+        touch_gpu();
+        let (sender, jobs) = std::sync::mpsc::channel::<u8>();
+        let hang_up = std::thread::spawn(move || {
+            std::thread::sleep(KEEPALIVE_INTERVAL + Duration::from_millis(100));
+            drop(sender);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            next_job_within(&jobs, Instant::now(), Duration::from_secs(60)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        hang_up.join().expect("sender thread");
+    }
+
+    #[test]
+    fn keepalive_wait_hands_over_jobs_inside_and_after_the_window() {
+        let (sender, jobs) = std::sync::mpsc::channel();
+        sender.send(1).expect("queued");
+        assert_eq!(
+            next_job_within(&jobs, Instant::now(), Duration::from_secs(60)),
+            Some(1)
+        );
+        // Past the window the wait is a plain blocking receive.
+        sender.send(2).expect("queued");
+        assert_eq!(
+            next_job_within(&jobs, Instant::now(), Duration::ZERO),
+            Some(2)
+        );
+        drop(sender);
+        assert_eq!(next_job_within(&jobs, Instant::now(), Duration::ZERO), None);
     }
 
     #[test]
