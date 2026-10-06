@@ -166,10 +166,9 @@ impl ConstraintRun {
         let started = Instant::now();
         let schema = schema_source.read()?;
         let config = read_json(&model.join("config.json"), MAX_SCHEMA_BYTES)?;
-        let eos = config["eos_token_id"]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or("configuration requires a numeric EOS token ID")?;
+        // The grammar ends output on one ID; any other stop the checkpoint
+        // lists still ends the turn when the decode loop samples it.
+        let eos = chat_format::StopTokens::load(model)?.end_turn().get();
         let vocab = config["vocab_size"]
             .as_u64()
             .and_then(|value| usize::try_from(value).ok())

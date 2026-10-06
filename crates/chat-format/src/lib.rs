@@ -172,6 +172,22 @@ impl StopTokens {
     pub fn iter(&self) -> impl Iterator<Item = TokenId> + '_ {
         self.end_turn.iter().chain(&self.tool_end).copied()
     }
+
+    /// The stop set of a checkpoint directory, for callers that render no
+    /// template (raw-prompt diagnostics); with no dialect known, every
+    /// listed ID ends a turn.
+    pub fn load(model: &Path) -> Result<Self, String> {
+        let (config, generation_config) = read_configs(model)?;
+        Self::from_configs(&config, generation_config.as_ref(), &[])
+    }
+
+    /// One end-of-turn ID, the first listed, for a consumer that accepts a
+    /// single end token (a JSON-schema grammar); every other stop still
+    /// ends the turn when sampled.
+    #[must_use]
+    pub fn end_turn(&self) -> TokenId {
+        self.end_turn.first
+    }
 }
 
 /// A special token's spelling and the ID the tokenizer gives it.
@@ -336,16 +352,7 @@ impl ChatFormat {
     /// Loads the format from a checkpoint directory. `vocabulary_size` is the
     /// model's logit width, which every stop and prompt ID must fit.
     pub fn load(model: &Path, vocabulary_size: usize) -> Result<Self, String> {
-        let config = read_json(model, "config.json", MAX_MODEL_CONFIG_BYTES)?;
-        let generation_config = if model.join("generation_config.json").exists() {
-            Some(read_json(
-                model,
-                "generation_config.json",
-                MAX_GENERATION_CONFIG_BYTES,
-            )?)
-        } else {
-            None
-        };
+        let (config, generation_config) = read_configs(model)?;
         let tokenizer = QwenTokenizer::load(model)?;
         let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
         let source = load_template(model, &tokenizer_config)?;
@@ -498,6 +505,21 @@ fn suppress_tokens(
         ));
     }
     Ok(ids.into_iter().map(TokenId::new).collect())
+}
+
+/// `config.json` and, when present, `generation_config.json`.
+fn read_configs(model: &Path) -> Result<(Value, Option<Value>), String> {
+    let config = read_json(model, "config.json", MAX_MODEL_CONFIG_BYTES)?;
+    let generation_config = if model.join("generation_config.json").exists() {
+        Some(read_json(
+            model,
+            "generation_config.json",
+            MAX_GENERATION_CONFIG_BYTES,
+        )?)
+    } else {
+        None
+    };
+    Ok((config, generation_config))
 }
 
 fn read_json(model: &Path, file: &str, maximum_bytes: usize) -> Result<Value, String> {
@@ -848,6 +870,19 @@ mod tests {
         assert!(stops(json!({"eos_token_id": -1}), None).is_err());
         assert!(stops(json!({"eos_token_id": "2"}), None).is_err());
 
+        // Without a template, from the directory: every ID ends a turn, and
+        // the first is the one a single-end-token grammar gets.
+        let model = ModelDir::new(
+            &json!({}),
+            &json!({"eos_token_id": [3, 2]}),
+            Some(&json!({"eos_token_id": 1})),
+        );
+        let loaded = StopTokens::load(model.path()).expect("directory stops");
+        assert_eq!(
+            loaded.iter().map(TokenId::get).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        assert_eq!(loaded.end_turn(), TokenId::new(3));
         // Gemma 4: `<|tool_response>` (50) ends a turn that issued calls.
         let gemma = StopTokens::from_configs(
             &json!({"eos_token_id": [1, 106]}),

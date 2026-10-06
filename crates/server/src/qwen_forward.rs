@@ -11,16 +11,21 @@ use rand_core::{RngCore, SeedableRng};
 use serde_json::json;
 
 use crate::parity::{compare_logits, read_reference};
+use chat_format::{StopTokens, TokenClass, TokenId};
 
 #[derive(serde::Deserialize)]
 struct GenerationConfig {
-    eos_token_id: i32,
     vocab_size: usize,
     max_position_embeddings: usize,
 }
 
 impl GenerationConfig {
-    fn validate(&self, input_ids: &[i32], max_tokens: u32) -> Result<(), String> {
+    fn validate(
+        &self,
+        input_ids: &[i32],
+        stops: &StopTokens,
+        max_tokens: u32,
+    ) -> Result<(), String> {
         let maximum = self
             .max_position_embeddings
             .min(qwen::forward::MAX_DENSE_DEBUG_TOKENS);
@@ -36,14 +41,13 @@ impl GenerationConfig {
                 input_ids.len(),
             ));
         }
+        let outside = |id: usize| id >= self.vocab_size;
         if input_ids
             .iter()
-            .chain(std::iter::once(&self.eos_token_id))
-            .any(|&id| {
-                usize::try_from(id)
-                    .ok()
-                    .is_none_or(|id| id >= self.vocab_size)
-            })
+            .any(|&id| usize::try_from(id).ok().is_none_or(outside))
+            || stops
+                .iter()
+                .any(|id| usize::try_from(id.get()).ok().is_none_or(outside))
         {
             return Err(String::from(
                 "prompt or EOS token ID is outside model vocabulary",
@@ -601,9 +605,12 @@ fn generate_inner(
     }
     let raw = fs::read_to_string(model.join("config.json"))?;
     let generation: GenerationConfig = serde_json::from_str(&raw)?;
-    generation.validate(input_ids, max_tokens)?;
+    let stops = StopTokens::load(model)?;
+    generation.validate(input_ids, &stops, max_tokens)?;
     if let Some(tokenizer) = tokenizer {
-        tokenizer.check_model_vocabulary(generation.vocab_size, generation.eos_token_id)?;
+        for id in stops.iter() {
+            tokenizer.check_model_vocabulary(generation.vocab_size, i32::try_from(id.get())?)?;
+        }
     }
     let request_started = Instant::now();
     let resident_weights = if streamed.is_none() {
@@ -755,9 +762,12 @@ fn generate_inner(
             finish_reason = "grammar_complete";
             break;
         }
-        if token == generation.eos_token_id {
-            finish_reason = "eos";
-            break;
+        match stops.classify(TokenId::from_model(token)?) {
+            TokenClass::Normal => {}
+            TokenClass::EndTurn | TokenClass::ToolEnd => {
+                finish_reason = "eos";
+                break;
+            }
         }
         if step + 1 < max_tokens {
             prefix.push(token);
@@ -1914,21 +1924,33 @@ mod tests {
     #[test]
     fn generation_preflight_enforces_the_model_limit_before_loading_weights() {
         let config = super::GenerationConfig {
-            eos_token_id: 7,
             vocab_size: 8,
             max_position_embeddings: 16,
         };
-        assert!(config.validate(&[1, 2], 14).is_ok());
+        let stops = |config: serde_json::Value| {
+            let model = chat_format::test_model::ModelDir::new(&json!({}), &config, None);
+            chat_format::StopTokens::load(model.path()).expect("stops")
+        };
+        let stops_in_vocabulary = stops(json!({"eos_token_id": [7, 2]}));
+        let validate =
+            |input: &[i32], max_tokens| config.validate(input, &stops_in_vocabulary, max_tokens);
+        assert!(validate(&[1, 2], 14).is_ok());
         assert_eq!(
-            config.validate(&[1, 2], 15),
+            validate(&[1, 2], 15),
             Err(String::from(
                 "model diagnostic requires prompt_tokens + max_tokens <= 16; received 2 + 15 = 17"
             ))
         );
-        assert!(config.validate(&[], 1).is_err());
-        assert!(config.validate(&[-1], 1).is_err());
-        assert!(config.validate(&[8], 1).is_err());
-        assert!(config.validate(&[1], 0).is_err());
+        assert!(validate(&[], 1).is_err());
+        assert!(validate(&[-1], 1).is_err());
+        assert!(validate(&[8], 1).is_err());
+        assert!(validate(&[1], 0).is_err());
+        // Every listed stop must fit the logit width, not only the first.
+        assert!(
+            config
+                .validate(&[1], &stops(json!({"eos_token_id": [7, 8]})), 1)
+                .is_err()
+        );
     }
 
     #[test]
