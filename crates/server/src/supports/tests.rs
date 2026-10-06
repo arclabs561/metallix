@@ -347,3 +347,42 @@ fn a_gate_that_reads_quantization_keeps_its_own_verdict() {
         Verdict::Accepted(Adapter::DeepseekV41)
     );
 }
+
+/// The published pplx-embed `config.json` files, with the reference fixture
+/// that pins each checkpoint's file hashes.
+const PUBLISHED_PPLX: [(&str, &str, &str); 2] = [
+    (
+        "pplx-embed-context-v1-0.6b",
+        include_str!("../../../../fixtures/pplx-embed-context-v1-0.6b/config.json"),
+        include_str!("../../../../fixtures/pplx-embed-context-v1-0.6b/context-reference.json"),
+    ),
+    (
+        "pplx-embed-v1-late-0.6b",
+        include_str!("../../../../fixtures/pplx-embed-v1-late-0.6b/config.json"),
+        include_str!("../../../../fixtures/pplx-embed-v1-late-0.6b/late-reference.json"),
+    ),
+];
+
+/// Both configs carry `rope_theta` and a default `rope_parameters`; the
+/// Qwen gate refused the latter for a day, so `mx serve` could not load them.
+#[test]
+fn published_pplx_configs_pass_the_loader_gate() {
+    use sha2::{Digest, Sha256};
+    for (name, config, reference) in PUBLISHED_PPLX {
+        let reference: Value = serde_json::from_str(reference).expect("reference JSON");
+        assert_eq!(
+            reference["files_sha256"]["config.json"],
+            format!("{:x}", Sha256::digest(config.as_bytes())),
+            "{name}: fixture differs from the pinned checkpoint config"
+        );
+        if let Err(error) = qwen::forward::Qwen3ForwardConfig::parse(config) {
+            panic!("{name}: the loader gate refuses the published config: {error}");
+        }
+        let verdict = assert_classified(config, Some(Adapter::PplxQwen3), true);
+        assert!(
+            verdict.reason().contains("pplx_context"),
+            "{name}: {}",
+            verdict.reason()
+        );
+    }
+}

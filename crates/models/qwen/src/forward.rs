@@ -353,10 +353,29 @@ impl Qwen3ForwardConfig {
         if raw.hidden_act != "silu" {
             return Err(Qwen3ForwardError::UnsupportedActivation(raw.hidden_act));
         }
-        // transformers 5 may write `rope_parameters` in place of
-        // `rope_theta` and `rope_scaling`; neither form is read here.
-        if raw.rope_scaling.is_some() || raw.rope_parameters.is_some() {
+        if raw.rope_scaling.is_some() {
             return Err(Qwen3ForwardError::UnsupportedRopeScaling);
+        }
+        // transformers 5 writes `rope_parameters` in place of, or beside,
+        // `rope_theta` and `rope_scaling` (pplx-embed has both). Only the
+        // unscaled default form is read, and its theta must agree with a
+        // stated `rope_theta`.
+        if let Some(parameters) = raw.rope_parameters.take() {
+            if parameters.rope_type != "default" || !parameters.other.is_empty() {
+                return Err(Qwen3ForwardError::UnsupportedRopeScaling);
+            }
+            // Both bases are parsed from JSON numbers, so the same base is
+            // bit-identical.
+            match (raw.rope_theta, parameters.rope_theta) {
+                (Some(rope_theta), Some(nested)) if rope_theta.to_bits() != nested.to_bits() => {
+                    return Err(Qwen3ForwardError::ConflictingRopeTheta {
+                        rope_theta,
+                        rope_parameters: nested,
+                    });
+                }
+                (None, nested) => raw.rope_theta = nested,
+                (Some(_), _) => {}
+            }
         }
         // Llama's documented default theta has changed across transformers
         // releases, so a Llama checkpoint must state it.
@@ -2043,10 +2062,22 @@ struct RawForwardConfig {
     #[serde(default)]
     tie_word_embeddings: bool,
     rope_scaling: Option<serde_json::Value>,
-    rope_parameters: Option<serde_json::Value>,
+    rope_parameters: Option<RawRopeParameters>,
     sliding_window: Option<usize>,
     #[serde(default)]
     use_sliding_window: bool,
+}
+
+/// transformers 5 `rope_parameters`. Any key besides these two (`factor`,
+/// `partial_rotary_factor`, ...) changes the rotation, so it is kept to be
+/// refused.
+#[derive(Debug, Deserialize)]
+struct RawRopeParameters {
+    #[serde(default)]
+    rope_type: String,
+    rope_theta: Option<f32>,
+    #[serde(flatten)]
+    other: serde_json::Map<String, serde_json::Value>,
 }
 
 const fn default_eps() -> f32 {
@@ -2189,6 +2220,14 @@ pub enum Qwen3ForwardError {
     /// A Llama configuration omitted `rope_theta`.
     #[error("Llama configuration must state rope_theta")]
     MissingRopeTheta,
+    /// `rope_theta` and `rope_parameters.rope_theta` name different bases.
+    #[error("rope_theta {rope_theta} disagrees with rope_parameters.rope_theta {rope_parameters}")]
+    ConflictingRopeTheta {
+        /// Top-level `rope_theta`.
+        rope_theta: f32,
+        /// `rope_parameters.rope_theta`.
+        rope_parameters: f32,
+    },
     /// The adapter has no reference vectors for a RoPE-scaling variant.
     #[error("Qwen3 rope_scaling requires a dedicated qualification path")]
     UnsupportedRopeScaling,
@@ -2592,14 +2631,36 @@ mod tests {
         let untied = Qwen3ForwardConfig::parse(&untied).expect("untied projects through lm_head");
         assert!(!untied.tied_output_embedding());
         assert_eq!(untied.output_weight_name(), "lm_head.weight");
-        let parameters = QWEN3_06B.replace(
+        let rope = |parameters: &str| {
+            Qwen3ForwardConfig::parse(&QWEN3_06B.replace(
+                "\"rope_theta\":1000000,",
+                &format!("\"rope_theta\":1000000,\"rope_parameters\":{parameters},"),
+            ))
+        };
+        let parameters_only = QWEN3_06B.replace(
             "\"rope_theta\":1000000,",
-            "\"rope_parameters\":{\"rope_type\":\"default\",\"rope_theta\":1000000},",
+            "\"rope_parameters\":{\"rope_type\":\"default\",\"rope_theta\":5000000},",
         );
+        let supplied = Qwen3ForwardConfig::parse(&parameters_only).expect("default supplies theta");
+        assert!((supplied.rope_theta - 5_000_000.0).abs() < f32::EPSILON);
+        // pplx-embed states the same theta in both places.
+        let same = rope(r#"{"rope_type":"default","rope_theta":1000000}"#).expect("same theta");
+        assert!((same.rope_theta - 1_000_000.0).abs() < f32::EPSILON);
         assert!(matches!(
-            Qwen3ForwardConfig::parse(&parameters),
-            Err(Qwen3ForwardError::UnsupportedRopeScaling)
+            rope(r#"{"rope_type":"default","rope_theta":10000}"#),
+            Err(Qwen3ForwardError::ConflictingRopeTheta { .. })
         ));
+        for scaled in [
+            r#"{"rope_type":"linear","factor":8.0,"rope_theta":1000000}"#,
+            r#"{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768,"rope_theta":1000000}"#,
+            r#"{"rope_type":"default","factor":2.0,"rope_theta":1000000}"#,
+            r#"{"rope_type":"default","partial_rotary_factor":0.5,"rope_theta":1000000}"#,
+        ] {
+            assert!(
+                matches!(rope(scaled), Err(Qwen3ForwardError::UnsupportedRopeScaling)),
+                "{scaled}"
+            );
+        }
         let llama = QWEN3_06B.replace("\"model_type\":\"qwen3\"", "\"model_type\":\"llama\"");
         assert_eq!(
             Qwen3ForwardConfig::parse(&llama).expect("llama").family(),
