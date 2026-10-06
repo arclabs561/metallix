@@ -8,6 +8,9 @@
 # ///
 """Capture a deterministic CPU Qwen3.5-family hybrid reference with cached decode.
 
+Dense (``qwen3_5``) and mixture-of-experts (``qwen3_5_moe``) checkpoints are
+both accepted; the model class follows the configuration's ``model_type``.
+
 Each case runs one uncached-to-cached prefill and then single-token decode
 steps through the source cache, so the reference covers Transformers' chunked
 gated-delta prefill and its recurrent decode update (plus the short-convolution
@@ -120,7 +123,11 @@ def capture(
     config = transformers.AutoConfig.from_pretrained(
         model_dir, local_files_only=True, trust_remote_code=False
     )
-    model = transformers.Qwen3_5ForConditionalGeneration.from_pretrained(
+    model_class = {
+        "qwen3_5": transformers.Qwen3_5ForConditionalGeneration,
+        "qwen3_5_moe": transformers.Qwen3_5MoeForConditionalGeneration,
+    }[config.model_type]
+    model = model_class.from_pretrained(
         model_dir,
         attn_implementation="eager",
         local_files_only=True,
