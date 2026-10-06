@@ -14,6 +14,9 @@ just check-metal      # the same gate including Metal features on Apple Silicon
 not download model checkpoints. Build and Python tooling must be installed;
 dependency resolution may still access registries.
 
+The rustdoc step fails on warnings. What item docs, examples and comments
+should contain is in [code documentation](code-documentation.md).
+
 Fixture checks cover the Engram hash and preprojected residual-gate captures,
 plus the unified reduced V4.1 source bundle. They check tensor names, shapes,
 encodings, value ranges, little-endian payload hashes, source provenance, and
