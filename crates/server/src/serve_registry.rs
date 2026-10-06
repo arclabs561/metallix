@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::{
     admission_queue::QueueSettings,
     chat_generation::{
-        ChatBackend, ChatDecoderSession, ChatSession, FullRowDecoder, GemmaDecoder,
+        ChatBackend, ChatDecoderSession, ChatSession, FullRowDecoder, GemmaDecoder, Qwen35Decoder,
         ResidentChatLimits,
     },
     julia_decisions::JuliaDecider,
@@ -34,6 +34,9 @@ pub(crate) enum ModelKind {
     Qwen,
     /// Gemma 4 dense text checkpoint (12B or 31B): generation only.
     Gemma4,
+    /// `qwen3_5` hybrid checkpoint (Qwen3.5, Qwen3.6, Qwen3.8), text only:
+    /// generation only.
+    Qwen35,
     /// Julia-1 checkpoint on the native CPU path: `/v1/decisions` only.
     Julia,
     /// Qwen3-Embedding checkpoint: `/v1/embeddings` only.
@@ -48,13 +51,13 @@ pub(crate) enum ModelKind {
 
 impl ModelKind {
     pub(crate) fn generates(self) -> bool {
-        matches!(self, Self::Qwen | Self::Gemma4)
+        matches!(self, Self::Qwen | Self::Gemma4 | Self::Qwen35)
     }
 
     pub(crate) fn capabilities(self) -> &'static [&'static str] {
         match self {
             Self::Qwen => &["generate", "decide"],
-            Self::Gemma4 => &["generate"],
+            Self::Gemma4 | Self::Qwen35 => &["generate"],
             Self::Julia => &["decide"],
             Self::QwenEmbedding | Self::PplxContext => &["embed"],
             Self::PplxLate => &["embed", "rerank"],
@@ -301,6 +304,10 @@ pub(crate) fn load(
             &entry.path,
             limits,
         )?),
+        ModelKind::Qwen35 => Box::new(ChatDecoderSession::<Qwen35Decoder>::load(
+            &entry.path,
+            limits,
+        )?),
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
         ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
         ModelKind::PplxContext => Box::new(PplxContextEmbedder::load(&entry.path)?),
@@ -346,6 +353,12 @@ mod tests {
         assert_eq!(gemma[0].kind, ModelKind::Gemma4);
         assert_eq!(gemma[0].kind.capabilities(), ["generate"]);
         assert!(gemma[0].kind.generates());
+        let hybrid =
+            parse_manifest(br#"{"models": [{"id": "h", "kind": "qwen35", "path": "/h"}]}"#)
+                .unwrap();
+        assert_eq!(hybrid[0].kind, ModelKind::Qwen35);
+        assert_eq!(hybrid[0].kind.capabilities(), ["generate"]);
+        assert!(hybrid[0].kind.generates());
 
         let shorthand = entries(None, Some(Path::new("/q")), "qwen").unwrap();
         assert_eq!(shorthand[0].kind, ModelKind::Qwen);

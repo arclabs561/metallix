@@ -165,13 +165,13 @@ fn served_adapters_accept_their_published_configs() {
     assert_classified(JULIA_1, Some(Adapter::Julia), true);
     let gemma4 = assert_classified(GEMMA4_12B, Some(Adapter::Gemma4), true);
     assert!(gemma4.reason().contains("gemma4"), "{gemma4:?}");
+    let qwen35 = assert_classified(QWEN35_08B, Some(Adapter::Qwen35), true);
+    assert!(qwen35.reason().contains("qwen35"), "{qwen35:?}");
     assert!(gemma4.reason().contains("vision encoder not loaded"));
 }
 
 #[test]
 fn unserved_adapters_name_themselves_but_are_not_supported() {
-    let qwen35 = assert_classified(QWEN35_08B, Some(Adapter::Qwen35), false);
-    assert!(qwen35.reason().contains("no mx serve kind loads it"));
     assert_classified(DEEPSEEK_V41, Some(Adapter::DeepseekV41), false);
 }
 

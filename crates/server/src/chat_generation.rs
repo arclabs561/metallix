@@ -34,6 +34,8 @@ pub(crate) mod decoder;
 mod gemma;
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
+#[path = "qwen35_chat.rs"]
+mod qwen35_decoder;
 #[path = "qwen_speculation.rs"]
 mod speculation;
 #[path = "chat_turn.rs"]
@@ -41,6 +43,7 @@ mod turn;
 
 pub(crate) use decoder::{ChatDecoderSession, FullRowDecoder};
 pub(crate) use gemma::GemmaDecoder;
+pub(crate) use qwen35_decoder::Qwen35Decoder;
 pub(crate) use turn::{TurnModel, TurnStart, TurnStep};
 
 #[cfg(test)]

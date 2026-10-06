@@ -62,7 +62,8 @@ impl Adapter {
             Self::PplxQwen3 => &[ModelKind::PplxContext, ModelKind::PplxLate],
             Self::Julia => &[ModelKind::Julia],
             Self::Gemma4 => &[ModelKind::Gemma4],
-            Self::Qwen35 | Self::DeepseekV41 => &[],
+            Self::Qwen35 => &[ModelKind::Qwen35],
+            Self::DeepseekV41 => &[],
         }
     }
 
@@ -265,10 +266,12 @@ impl fmt::Display for DeclaredQuantization {
 }
 
 fn note(adapter: Adapter) -> &'static str {
-    if adapter == Adapter::Gemma4 {
-        " (text tower only; vision encoder not loaded)"
-    } else {
-        ""
+    match adapter {
+        Adapter::Gemma4 => " (text tower only; vision encoder not loaded)",
+        Adapter::Qwen35 => {
+            " (text only; vision encoder not loaded; at most 16,384 context tokens; no prompt-prefix cache)"
+        }
+        _ => "",
     }
 }
 
