@@ -167,6 +167,13 @@ pub fn run() -> ExitCode {
         eprintln!("{error}");
         return ExitCode::FAILURE;
     }
+    // Before any command touches MLX: every mx process, serve children
+    // included, shares this cap.
+    #[cfg(feature = "metal")]
+    if let Err(error) = gpu::cap_cache() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
     let code = with_capture(cli);
     telemetry::finish();
     code

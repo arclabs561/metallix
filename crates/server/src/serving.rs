@@ -363,6 +363,7 @@ fn serve_inner(
                     kind = ?worker_entry.kind,
                     load_ms = Empty,
                     mlx.active_bytes = Empty,
+                    mlx.cache_bytes = Empty,
                     mlx.peak_bytes = Empty,
                     "error.type" = Empty,
                 );
@@ -563,6 +564,7 @@ fn serve_models(
             gen_ai.usage.input_tokens = Empty,
             gen_ai.usage.output_tokens = Empty,
             mlx.active_bytes = Empty,
+            mlx.cache_bytes = Empty,
             mlx.peak_bytes = Empty,
             "error.type" = Empty,
         );

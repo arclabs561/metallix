@@ -48,6 +48,10 @@ mod decode_checkpoint;
 #[path = "chat_speculation_checkpoint_tests.rs"]
 mod speculation_checkpoint;
 
+#[cfg(test)]
+#[path = "chat_memory_checkpoint_tests.rs"]
+mod memory_checkpoint;
+
 const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
 const MAX_CHAT_TOOLS: usize = 64;
