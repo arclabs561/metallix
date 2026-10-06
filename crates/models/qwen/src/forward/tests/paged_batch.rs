@@ -181,7 +181,9 @@ fn mixed_prompts(rows: usize, seed: usize) -> Vec<Vec<i32>> {
 
 #[test]
 fn one_row_batch_is_bit_identical_to_single_decode() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(1)).expect("paged");
@@ -210,7 +212,9 @@ fn one_row_batch_is_bit_identical_to_single_decode() {
 
 #[test]
 fn batched_decode_agrees_with_single_sequences() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     for (batch, fork) in [(2, false), (3, true), (5, false), (8, true), (16, false)] {
@@ -247,7 +251,9 @@ fn batched_decode_agrees_with_single_sequences() {
 
 #[test]
 fn equal_length_rows_need_no_mask_and_agree() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(1)).expect("paged");
@@ -268,7 +274,9 @@ fn equal_length_rows_need_no_mask_and_agree() {
 
 #[test]
 fn greedy_readback_matches_the_logits_argmax() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let prompts = mixed_prompts(6, 3);
@@ -303,7 +311,9 @@ fn greedy_readback_matches_the_logits_argmax() {
 
 #[test]
 fn batch_refusals_change_nothing() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(1)).expect("paged");
@@ -351,7 +361,9 @@ fn paged_batch_qwen3_06b_agrees_and_reports_throughput() {
     let model = std::env::var_os("METALLIX_QWEN_MODEL")
         .map(std::path::PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored test");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut checkpoint = Qwen3MlxWeights::load(model).expect("checkpoint load");
     checkpoint.prepare_float32().expect("float32 weights");
     let layout = checkpoint
@@ -449,7 +461,9 @@ fn paged_batch_qwen3_06b_profile() {
     let model = std::env::var_os("METALLIX_QWEN_MODEL")
         .map(std::path::PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored test");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut checkpoint = Qwen3MlxWeights::load(model).expect("checkpoint load");
     for (dtype, precision) in [
         ("bf16", Qwen3WeightPrecision::BFloat16),

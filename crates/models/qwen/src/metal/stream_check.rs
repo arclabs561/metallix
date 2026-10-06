@@ -1200,7 +1200,9 @@ mod tests {
 
     #[test]
     fn detached_transposed_kv_preserves_logical_sequence_order() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_values = (0_u16..24).map(f32::from).collect::<Vec<_>>();
         let original = Array::from_slice(&original_values, &[1, 3, 2, 4]);
         let stream = StreamOrDevice::gpu();

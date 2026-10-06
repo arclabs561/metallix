@@ -2497,7 +2497,9 @@ mod tests {
 
     #[test]
     fn plan_precision_follows_the_cache_the_weights_store() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = long_small_config();
         for precision in [
             super::Qwen3WeightPrecision::BFloat16,
@@ -2630,7 +2632,9 @@ mod tests {
 
     #[test]
     fn cached_decode_matches_full_causal_forward_for_nonzero_weights() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = Qwen3ForwardConfig::parse(
             r#"{
               "model_type":"qwen3",
@@ -2714,7 +2718,9 @@ mod tests {
 
     #[test]
     fn gpu_greedy_breaks_ties_low_and_refuses_non_finite_rows() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tied = Array::from_slice(
             &[1.0_f32, 3.0, -2.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             &[2, 5],
@@ -2737,7 +2743,9 @@ mod tests {
 
     #[test]
     fn truncating_restored_snapshot_storage_keeps_it_compact() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = long_small_config();
         let weights = deterministic_weights();
         let plan = config.resident_chat_plan(256, u64::MAX, F32).expect("plan");
@@ -2763,7 +2771,9 @@ mod tests {
 
     #[test]
     fn pipelined_gpu_greedy_matches_host_greedy_and_discards_the_stop_token() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = long_small_config();
         let weights = deterministic_weights();
         let prompt = [1, 2, 3];
@@ -2902,7 +2912,9 @@ mod tests {
 
     #[test]
     fn residual_steering_disabled_zero_and_chunked_paths_are_qualified() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = small_dense_config();
         let weights = deterministic_weights();
         let prompt = [1_i32, 2, 3];
@@ -2945,7 +2957,9 @@ mod tests {
 
     #[test]
     fn residual_steering_fork_inherits_without_mutating_parent_state() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = small_dense_config();
         let weights = deterministic_weights();
         let steering = residual_steering(&config, 1.5, 0, 4);
@@ -3004,7 +3018,9 @@ mod tests {
 
     #[test]
     fn resident_chat_cached_decode_matches_fresh_prefill_beyond_512_tokens() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = long_small_config();
         let weights = deterministic_weights();
         let plan = config
@@ -3030,7 +3046,9 @@ mod tests {
 
     #[test]
     fn resident_chat_context_error_resets_cached_kv() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = long_small_config();
         let weights = deterministic_weights();
         let plan = config
@@ -3053,7 +3071,9 @@ mod tests {
 
     #[test]
     fn composed_nonzero_layer_matches_independent_cached_prefill() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = Qwen3ForwardConfig::parse(
             r#"{
               "model_type":"qwen3",
@@ -3148,7 +3168,9 @@ mod tests {
     /// `lm_head`; cached decode must still match the full forward.
     #[test]
     fn llama_layout_skips_qk_norms_and_projects_through_lm_head() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = Qwen3ForwardConfig::parse(
             r#"{
               "model_type":"llama",
@@ -3304,7 +3326,9 @@ mod tests {
 
     #[test]
     fn last_hidden_is_the_input_of_the_tied_output_projection() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = small_dense_config();
         let weights = deterministic_weights();
         let prompt = [1_i32, 2, 3];
@@ -3350,7 +3374,9 @@ mod tests {
 
     #[test]
     fn bidirectional_attention_lets_early_positions_see_later_tokens() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let weights = deterministic_weights();
         let causal = small_dense_config();
         let bidirectional = bidirectional_config();
@@ -3383,7 +3409,9 @@ mod tests {
 
     #[test]
     fn per_token_states_end_with_the_last_hidden_state() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = small_dense_config();
         let weights = deterministic_weights();
         let all = forward_hidden_states(&weights, &config, &[1, 2, 3]).expect("all positions");
@@ -3396,7 +3424,9 @@ mod tests {
 
     #[test]
     fn batched_last_hidden_matches_each_sequence_run_alone() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = small_dense_config();
         let weights = deterministic_weights();
         // Different lengths, so the shorter rows are padded and must be read
@@ -3432,7 +3462,9 @@ mod tests {
 
     #[test]
     fn kv_cache_executor_refuses_bidirectional_attention() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = bidirectional_config();
         let weights = deterministic_weights();
         assert!(matches!(

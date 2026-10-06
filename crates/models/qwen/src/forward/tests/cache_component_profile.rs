@@ -287,7 +287,9 @@ fn cache_component_graphs_are_repeatable_without_mutating_resident_kv() {
     let model = env::var_os("METALLIX_QWEN_MODEL")
         .map(PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored checkpoint qualification");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_float32().expect("resident float32 weights");
     println!(

@@ -105,7 +105,9 @@ fn checkpoint_qwen_smc_resampling_composes_weights_and_replays_cache_ancestry() 
         eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
         return;
     };
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     // Match the existing resident-chat and cache-fork qualification precision.
     weights.prepare_float32().expect("resident float32 weights");
@@ -251,7 +253,9 @@ fn checkpoint_qwen_temperature_proposal_corrects_raw_model_weights_and_replays_a
         eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
         return;
     };
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_float32().expect("resident float32 weights");
 

@@ -40,7 +40,9 @@ fn cache_snapshot(
 
 #[test]
 fn forked_particle_ancestry_replays_live_prefixes_and_retains_eos_snapshot() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = small_dense_config();
     let weights = deterministic_weights();
     let prompt = [1_i32, 2];
@@ -143,7 +145,7 @@ proptest! {
         first_parent in 0_usize..2,
         second_parent in 0_usize..2,
     ) {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = small_dense_config();
         let weights = deterministic_weights();
         let prompt = [prompt_a, prompt_b];
@@ -215,7 +217,9 @@ fn checkpoint_particle_ancestry_fork_replays_next_logits() {
         eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
         return;
     };
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = crate::metal::Qwen3MlxWeights::load(model).expect("checkpoint load");
     // Match the qualified resident-chat precision path. BF16 full-prefill and
     // incremental reductions are a separate numerical qualification.
@@ -293,7 +297,9 @@ fn fork_rejects_empty_missing_and_wrongly_shaped_kv() {
         Err(Qwen3ForwardError::DecodeWithoutPrefill)
     ));
 
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut missing = Qwen3ForwardExecutor::new(&config, &weights);
     missing.prefill_last_logits(&[1, 2]).expect("prefill");
     missing.cache[0] = None;

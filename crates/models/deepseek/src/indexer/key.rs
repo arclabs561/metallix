@@ -835,7 +835,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_rotary_preserves_simple_staged_key_boundaries() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wk = vec![0_u16; 32 * 16];
         wk[30 * 16] = bf16(2.0);
         wk[31 * 16 + 1] = bf16(3.0);
@@ -884,7 +886,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_key_candidate_preserves_simple_staged_key_boundaries() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wk = vec![0_u16; 32 * 16];
         wk[30 * 16] = bf16(2.0);
         wk[31 * 16 + 1] = bf16(3.0);
@@ -913,7 +917,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_pre_fp4_preserves_preflight_and_reports_staged_overflow() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(matches!(
             prepare_index_keys_with_execution(
                 &[0; 15],
@@ -1039,7 +1045,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_key_candidate_matches_source_key_cache_and_scalar_stages() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture: SourceKeyFixture = serde_json::from_str(include_str!(
             "../../../../../fixtures/deepseek-v41/forward-index-key-reference.json"
         ))

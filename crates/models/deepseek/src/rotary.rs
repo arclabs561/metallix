@@ -615,7 +615,9 @@ mod tests {
     #[test]
     fn generates_and_applies_pinned_rope_frequency_fixture() {
         #[cfg(feature = "metal")]
-        let _guard = crate::GPU_TEST_LOCK.lock().unwrap();
+        let _guard = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = pinned_frequency_fixture();
         for case in fixture.cases {
             let parameters = RotaryFrequencyParameters::new(

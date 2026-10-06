@@ -848,7 +848,9 @@ mod tests {
 
     #[test]
     fn bare_and_prefixed_checkpoints_load_to_the_same_decoder() {
-        let _guard = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _guard = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root =
             std::env::temp_dir().join(format!("metallix-qwen-naming-{}", std::process::id()));
         write_tiny_checkpoint(&root.join("prefixed"), "model.");
@@ -875,7 +877,9 @@ mod tests {
 
     #[test]
     fn evaluates_a_known_gpu_matrix_product() {
-        let _guard = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _guard = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let smoke = run_metal_smoke().expect("MLX Metal must evaluate the smoke graph");
         assert!((smoke.product() - 6.0).abs() <= f32::EPSILON);
     }

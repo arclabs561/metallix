@@ -86,7 +86,9 @@ fn checkpoint_residual_steering_preserves_decode_and_fork_mechanics() {
         eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
         return;
     };
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = crate::metal::Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_float32().expect("resident float32 weights");
 

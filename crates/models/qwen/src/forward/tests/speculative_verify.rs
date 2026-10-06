@@ -28,7 +28,9 @@ fn resident<'a>(
 
 #[test]
 fn every_chunk_row_matches_the_last_logits_of_its_prefix() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let chunk = [4, 2, 7, 0, 5];
@@ -58,7 +60,9 @@ fn every_chunk_row_matches_the_last_logits_of_its_prefix() {
 
 #[test]
 fn prefill_rows_score_every_prompt_position() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let mut scorer = resident(&config, &weights);
@@ -74,7 +78,9 @@ fn prefill_rows_score_every_prompt_position() {
 
 #[test]
 fn truncated_cache_continues_like_a_fresh_prefill() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let long: Vec<i32> = (0..140).map(|index| (index * 5 + 3) % 8).collect();
@@ -115,7 +121,9 @@ fn truncated_cache_continues_like_a_fresh_prefill() {
 
 #[test]
 fn truncation_keeps_between_one_token_and_the_whole_cache() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let mut executor = resident(&config, &weights);
@@ -172,7 +180,9 @@ impl GreedySpeculativeTarget for Target<'_, '_> {
 
 #[test]
 fn gpu_greedy_verify_matches_host_argmax_of_every_row() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let chunk = [4, 2, 7, 0, 5];
@@ -199,7 +209,9 @@ fn gpu_greedy_verify_matches_host_argmax_of_every_row() {
 
 #[test]
 fn gpu_greedy_speculation_reproduces_plain_greedy_decoding() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let length = 40;
@@ -292,7 +304,9 @@ fn decode_plain(
 
 #[test]
 fn speculation_reproduces_plain_decoding_on_the_executor() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let length = 48;

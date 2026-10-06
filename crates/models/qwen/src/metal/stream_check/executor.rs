@@ -368,7 +368,9 @@ mod tests {
             eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
             return;
         };
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (request, prompt_ids, maximum_total_tokens, decode_ids) in [
             (0, &[9_707, 11][..], 4_usize, &[13, 13][..]),
             (1, &[9_707, 11, 1_879][..], 6_usize, &[13, 13, 13][..]),

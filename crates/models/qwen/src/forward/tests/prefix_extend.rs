@@ -48,7 +48,9 @@ fn concatenated(suffix: &[i32]) -> Vec<i32> {
 
 #[test]
 fn forked_prefix_extension_matches_fresh_prefill_for_each_suffix() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = config
@@ -77,7 +79,9 @@ fn forked_prefix_extension_matches_fresh_prefill_for_each_suffix() {
 
 #[test]
 fn chunk_crossing_a_capacity_step_matches_fresh_prefill() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = config
@@ -102,7 +106,9 @@ fn chunk_crossing_a_capacity_step_matches_fresh_prefill() {
 
 #[test]
 fn diagnostic_executor_extension_matches_fresh_prefill() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let suffix = SUFFIXES[2];
@@ -120,7 +126,9 @@ fn diagnostic_executor_extension_matches_fresh_prefill() {
 
 #[test]
 fn extension_requires_a_prefilled_sequence() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let mut executor = Qwen3ForwardExecutor::new(&config, &weights);
@@ -207,7 +215,9 @@ fn fused_kernel_weights() -> HashMap<String, Array> {
 
 #[test]
 fn fused_kernel_chunk_with_unaligned_offset_matches_fresh_prefill() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config
@@ -236,7 +246,9 @@ fn fused_kernel_chunk_with_unaligned_offset_matches_fresh_prefill() {
 
 #[test]
 fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config
@@ -285,7 +297,9 @@ fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
 /// entries by `kv_bytes`, so anything more held here escapes that budget.
 #[test]
 fn snapshots_pin_only_their_compact_rows() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config
@@ -342,7 +356,9 @@ fn snapshots_pin_only_their_compact_rows() {
 
 #[test]
 fn snapshot_refuses_unsteerable_or_out_of_range_prefixes() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = fused_kernel_config();
     let weights = fused_kernel_weights();
     let plan = config

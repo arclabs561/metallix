@@ -198,7 +198,9 @@ fn check_fp8(
 
 #[test]
 fn fp8_linear_routes_to_the_device_and_matches_the_scalar_reference() {
-    let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (reduction, outputs) = (256, 96);
     let mut seed = 7_u64;
     let codes = bytes(&mut seed, outputs * reduction, |byte| {
@@ -214,7 +216,9 @@ fn fp8_linear_routes_to_the_device_and_matches_the_scalar_reference() {
 
 #[test]
 fn a_device_rejection_is_returned_not_rerun_on_the_scalar_path() {
-    let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (codes, scales) = quantize(&activations(1, 32), 1, 32);
     // A NaN weight code is refused by the device upload and by the scalar reference.
     let weights = [0x7f_u8; 32];
@@ -330,7 +334,9 @@ fn check_fp4_expert(
 
 #[test]
 fn fp4_expert_routes_to_the_device_and_matches_the_scalar_expert() {
-    let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (dim, inter) = (128, 96);
     let mut seed = 11_u64;
     let w1 = bytes(&mut seed, inter * dim / 2, |b| b);
@@ -388,7 +394,9 @@ fn real(name: &str) -> Vec<u8> {
 #[test]
 #[ignore = "needs real V4.1 tensors under .agents/receipts/route-trace/weights"]
 fn real_shapes_match_the_scalar_references() {
-    let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for (name, outputs, reduction) in [
         ("attn.wq_a", 1_280, 5_120),
         ("attn.wq_b", 32_768, 1_280),

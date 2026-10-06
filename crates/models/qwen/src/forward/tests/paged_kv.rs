@@ -189,7 +189,9 @@ fn decode_both(
 
 #[test]
 fn paged_greedy_decode_matches_the_contiguous_executor() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(1)).expect("paged session");
@@ -227,7 +229,9 @@ fn paged_greedy_decode_matches_the_contiguous_executor() {
 
 #[test]
 fn paged_chunked_prefill_across_blocks_and_slabs_matches_contiguous_chunks() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged session");
@@ -267,7 +271,9 @@ fn paged_chunked_prefill_across_blocks_and_slabs_matches_contiguous_chunks() {
 
 #[test]
 fn paged_fork_copies_the_shared_tail_and_both_branches_match() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(1)).expect("paged session");
@@ -330,7 +336,9 @@ fn paged_fork_copies_the_shared_tail_and_both_branches_match() {
 
 #[test]
 fn paged_out_of_blocks_leaves_the_sequence_usable() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(1)).expect("paged session");
@@ -371,7 +379,9 @@ fn buffer_address(array: &Array) -> usize {
 
 #[test]
 fn paged_writes_reuse_the_pool_buffer() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut paged = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged session");
@@ -442,7 +452,9 @@ fn paged_qwen3_06b_matches_resident_chat_and_writes_in_place() {
     let model = std::env::var_os("METALLIX_QWEN_MODEL")
         .map(std::path::PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored test");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut checkpoint = Qwen3MlxWeights::load(model).expect("checkpoint load");
     checkpoint.prepare_float32().expect("float32 weights");
     let mut resident = checkpoint

@@ -1098,7 +1098,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_wkv_matches_the_scalar_projection() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // V4.1 hash geometry (24 columns) at embedding width 32: reduction
         // 768. Two copies of width 40 give 120 outputs, so the last weight
         // scale block covers a partial 32-row tile.
@@ -1196,7 +1198,9 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn an_overflowing_wkv_is_the_same_error_on_both_paths() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // One position, one 32-wide reduction group, two copies of width 16:
         // 48 outputs. The largest codes and scales overflow FP32 only in
         // output 37 (row 1 of the second weight scale tile).
@@ -1255,7 +1259,9 @@ mod tests {
     fn metal_wkv_matches_scalar_on_the_real_layer_one_projection() {
         use crate::engram::embedding::{EngramEmbeddingLayout, engram_embedding_bf16_reference};
 
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let trace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../.agents/receipts/route-trace");
         let read = |name: &str| {

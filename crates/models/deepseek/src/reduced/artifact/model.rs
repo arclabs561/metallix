@@ -1145,7 +1145,9 @@ mod tests {
             config.norm_epsilon,
         )
         .unwrap();
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let metal = MetalBf16Head::new(&weights, config.vocabulary, config.width).unwrap();
         let short = MetalBf16Head::new(
             &weights[..(config.vocabulary - 1) * config.width],

@@ -985,7 +985,9 @@ mod tests {
 
     #[test]
     fn matches_scalar_fp8_linear_on_random_finite_codes() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (rows, reduction, outputs): (usize, usize, usize) = (3, 256, 96);
         let mut seed = 17_u64;
         let mut finite_code = || loop {
@@ -1048,7 +1050,9 @@ mod tests {
 
     #[test]
     fn fp4_matches_scalar_fp4_linear_on_every_code() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (rows, reduction, outputs): (usize, usize, usize) = (3, 256, 40);
         let mut seed = 5_u64;
         // Every byte value appears, so every nibble pair is exercised in both positions.
@@ -1131,7 +1135,9 @@ mod tests {
 
     #[test]
     fn whole_experts_match_the_scalar_expert_on_bf16_outputs() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (dim, inter) = (128_usize, 96_usize);
         let mut seed = 23_u64;
         let mut bytes = |count: usize| -> Vec<u8> {
@@ -1259,7 +1265,9 @@ mod tests {
     // installed the handler yet; without the install this exits with status 255.
     #[test]
     fn rejected_kernel_launch_returns_an_error_instead_of_exiting() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let kernel = KernelHandle::new(
             "metallix_two_input_probe",
             &["left", "right"],

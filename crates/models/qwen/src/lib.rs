@@ -14,6 +14,8 @@ pub mod preflight;
 
 // MLX's native test operations share process-global device initialization.
 // Serialize GPU tests; pure config/header tests remain parallel.
+// Tests take it through `PoisonError::into_inner`, so one failing GPU test
+// reports as one failure instead of failing every later test on the lock.
 #[cfg(all(test, feature = "metal"))]
 pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

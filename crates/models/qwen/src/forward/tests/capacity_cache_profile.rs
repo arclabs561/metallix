@@ -721,7 +721,9 @@ fn run_row(
 
 #[test]
 fn capacity_executor_matches_concat_rejects_overflow_and_isolates_forks() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = super::small_dense_config();
     let weights = super::deterministic_weights();
     let mut capacity = CapacityExecutor::new(&config, &weights, 4);
@@ -812,7 +814,7 @@ proptest! {
         tail in 0_i32..8,
         branch_token in 0_i32..8,
     ) {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = super::small_dense_config();
         let weights = super::deterministic_weights();
         let prompt = [prompt_a, prompt_b];
@@ -853,7 +855,7 @@ proptest! {
         next in 0_i32..8,
         branch_token in 0_i32..8,
     ) {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = super::long_small_config();
         let weights = super::deterministic_weights();
         let plan = config
@@ -932,7 +934,9 @@ proptest! {
 #[test]
 fn stepped_capacity_decode_overflow_preserves_allocation_and_malformed_prefill_resets_like_production()
  {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let config = super::long_small_config();
     let weights = super::deterministic_weights();
     let plan = config
@@ -985,7 +989,9 @@ fn stepped_capacity_decode_overflow_preserves_allocation_and_malformed_prefill_r
 
 #[test]
 fn stepped_capacity_late_layer_failure_clears_partial_kv_like_production() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut config = super::small_dense_config();
     config.hidden_layers = 2;
     let mut weights = super::deterministic_weights_for_layers(2);
@@ -1058,7 +1064,9 @@ fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
     let mode = memory_mode();
     let prompt_tokens = memory_prompt_tokens();
     let prompt = fixed_tokens(prompt_tokens, 97);
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_float32().expect("resident float32 weights");
     let mut concat = weights
@@ -1131,7 +1139,9 @@ fn fixed_capacity_slice_update_matches_concat_and_preserves_fork_ancestry() {
     let model = env::var_os("METALLIX_QWEN_MODEL")
         .map(PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored feasibility test");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_float32().expect("resident float32 weights");
     let layout = weights

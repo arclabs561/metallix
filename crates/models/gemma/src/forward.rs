@@ -587,7 +587,9 @@ mod tests {
 
     #[test]
     fn cached_decode_and_chunked_prefill_match_one_prefill() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let weights = weights(false);
         let mut whole = weights.executor(32).expect("executor");
         let expected = whole.prefill_last_logits(&IDS).expect("prefill");
@@ -611,7 +613,9 @@ mod tests {
 
     #[test]
     fn sliding_layers_retain_only_what_the_next_query_sees() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let weights = weights(false);
         let mut executor = weights.executor(32).expect("executor");
         executor.prefill_last_logits(&IDS).expect("prefill");
@@ -628,7 +632,9 @@ mod tests {
     /// only the sliding window: `q - window < k <= q` in the source mask.
     #[test]
     fn a_token_leaves_the_receptive_field_exactly_window_positions_later() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let weights = weights(true);
         let mut executor = weights.executor(32).expect("executor");
         let mut logits = |ids: &[i32]| executor.prefill_last_logits(ids).expect("prefill");
@@ -655,7 +661,9 @@ mod tests {
 
     #[test]
     fn masks_follow_the_source_window_predicate() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stream = StreamOrDevice::gpu();
         // Queries 6..9 over a cache that starts at 4.
         let (start, position, queries) = (4_i32, 6_i32, 3_i32);
@@ -691,7 +699,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_input_and_clears_the_sequence() {
-        let _gpu = crate::GPU_TEST_LOCK.lock().expect("GPU lock");
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let weights = weights(false);
         let mut executor = weights.executor(8).expect("executor");
         assert!(matches!(

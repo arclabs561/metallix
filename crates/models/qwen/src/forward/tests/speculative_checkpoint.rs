@@ -357,7 +357,9 @@ fn prompt_lookup_speculation_matches_greedy_and_reports_speed() {
     let model = env::var_os("METALLIX_QWEN_MODEL")
         .map(PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored checkpoint probe");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tokenizer =
         tokenizers::Tokenizer::from_file(model.join("tokenizer.json")).expect("tokenizer");
     let mut weights = Qwen3MlxWeights::load(&model).expect("checkpoint load");

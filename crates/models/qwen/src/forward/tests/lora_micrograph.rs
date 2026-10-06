@@ -114,7 +114,7 @@ fn temporary_adapter_path() -> PathBuf {
 
 #[test]
 fn lora_value_and_grad_matches_independent_gradient_and_updates_only_adapter() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (inputs, targets) = arrays();
     let mut model = LoraProjection::new();
     let base_before = model.base.clone();
@@ -171,7 +171,7 @@ fn lora_value_and_grad_matches_independent_gradient_and_updates_only_adapter() {
 
 #[test]
 fn lora_adapter_export_resume_preserves_metadata_and_output() {
-    let _guard = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (inputs, targets) = arrays();
     let mut source = LoraProjection::new();
     let mut value_and_grad = nn::value_and_grad(loss);

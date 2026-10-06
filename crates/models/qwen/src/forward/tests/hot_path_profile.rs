@@ -135,7 +135,9 @@ fn greedy_decode_hot_path_variants() {
     let model = env::var_os("METALLIX_QWEN_MODEL")
         .map(PathBuf::from)
         .expect("METALLIX_QWEN_MODEL is required for this ignored checkpoint probe");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     println!(
         "hot_path scope=host_wall_per_generated_token generated={GENERATED_TOKENS} \
          context_tokens={MAXIMUM_CONTEXT_TOKENS}"

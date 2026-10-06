@@ -456,7 +456,9 @@ mod tests {
 
     #[test]
     fn candidates_match_a_host_pass_over_the_full_row() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let logits = vec![row(5_000, 1), row(5_000, 2)];
         let rule = Qwen3PickRule {
             selection: Qwen3Selection::Greedy,
@@ -548,7 +550,9 @@ mod tests {
 
     #[test]
     fn gpu_sampler_matches_an_f64_oracle_away_from_cumulative_boundaries() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut checked = 0;
         for salt in 0..6 {
             let logits = row(3_000, salt);
@@ -589,7 +593,9 @@ mod tests {
 
     #[test]
     fn pick_rules_are_validated() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let logits = rows_array(&[row(100, 0)]);
         let sampled = |top_k: usize, candidates: usize, uniforms: Vec<f64>| Qwen3PickRule {
             selection: Qwen3Selection::TopKNucleus {
