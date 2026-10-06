@@ -89,10 +89,10 @@ pub(super) fn remember(
             messages,
             ..request
         };
-        let Ok(rendered) = format.template().render(prefix.conversation(), false) else {
-            continue;
-        };
-        let Ok(ids) = format.tokenizer().encode_prompt(&rendered) else {
+        let Ok(ids) = format
+            .prompt(prefix.conversation(), false)
+            .map(|prompt| prompt.ids)
+        else {
             continue;
         };
         if ids.is_empty()

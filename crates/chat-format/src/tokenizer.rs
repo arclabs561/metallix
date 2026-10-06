@@ -1,6 +1,6 @@
 //! Bounded local tokenizer access for Qwen prompt and result text.
 
-use std::{fs::File, io::Read, path::Path};
+use std::{fs::File, io::Read, ops::Range, path::Path};
 
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
@@ -12,6 +12,9 @@ const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 /// truncation policies have been explicitly disabled for CLI generation.
 pub struct QwenTokenizer {
     tokenizer: Tokenizer,
+    /// The same tokenizer without its added vocabulary, which encodes an
+    /// added token's spelling as ordinary text.
+    plain: Tokenizer,
     source_sha256: String,
 }
 
@@ -36,16 +39,28 @@ impl QwenTokenizer {
 
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
         let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
-        let mut tokenizer = Tokenizer::from_bytes(bytes)
-            .map_err(|_| String::from("local tokenizer.json could not be parsed"))?;
+        let parse_error = || String::from("local tokenizer.json could not be parsed");
+        let mut plain: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| parse_error())?;
+        plain["added_tokens"] = serde_json::Value::Array(Vec::new());
+        let plain = Self::unbounded(
+            Tokenizer::from_bytes(serde_json::to_vec(&plain).map_err(|_| parse_error())?)
+                .map_err(|_| parse_error())?,
+        )?;
+        let tokenizer = Self::unbounded(Tokenizer::from_bytes(bytes).map_err(|_| parse_error())?)?;
+        Ok(Self {
+            tokenizer,
+            plain,
+            source_sha256,
+        })
+    }
+
+    fn unbounded(mut tokenizer: Tokenizer) -> Result<Tokenizer, String> {
         tokenizer
             .with_truncation(None)
             .map_err(|_| String::from("local tokenizer could not disable truncation"))?;
         tokenizer.with_padding(None);
-        Ok(Self {
-            tokenizer,
-            source_sha256,
-        })
+        Ok(tokenizer)
     }
 
     /// SHA-256 of the exact tokenizer.json bytes parsed for this tokenizer.
@@ -95,6 +110,44 @@ impl QwenTokenizer {
             .get_ids()
             .iter()
             .find_map(|id| added.get(id).map(|token| token.content.clone())))
+    }
+
+    /// Byte ranges of `text` that encode as added tokens.
+    pub fn added_token_spans(&self, text: &str) -> Result<Vec<Range<usize>>, String> {
+        let encoding = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|_| String::from("chat input could not be encoded by local tokenizer"))?;
+        let added = self.tokenizer.get_added_tokens_decoder();
+        Ok(encoding
+            .get_ids()
+            .iter()
+            .zip(encoding.get_offsets())
+            .filter(|(id, _)| added.contains_key(id))
+            .map(|(_, &(start, end))| start..end)
+            .collect())
+    }
+
+    /// Encodes one piece of a prompt; added-token spellings become their
+    /// tokens. Empty text has no IDs.
+    pub fn encode_piece(&self, text: &str) -> Result<Vec<i32>, String> {
+        token_ids(&self.tokenizer, text)
+    }
+
+    /// Encodes `text` as ordinary text, so an added token's spelling never
+    /// becomes that token.
+    pub fn encode_literal(&self, text: &str) -> Result<Vec<i32>, String> {
+        let ids = token_ids(&self.plain, text)?;
+        let added = self.tokenizer.get_added_tokens_decoder();
+        if ids
+            .iter()
+            .any(|&id| u32::try_from(id).is_ok_and(|id| added.contains_key(&id)))
+        {
+            return Err(String::from(
+                "local tokenizer encodes a control-token spelling as the control token without its added vocabulary",
+            ));
+        }
+        Ok(ids)
     }
 
     /// Encodes prompt bytes exactly as supplied: no chat template or special
@@ -197,6 +250,22 @@ impl QwenTokenizer {
         )
         .map_err(|_| String::from("generated token IDs could not be decoded by local tokenizer"))
     }
+}
+
+fn token_ids(tokenizer: &Tokenizer, text: &str) -> Result<Vec<i32>, String> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    tokenizer
+        .encode(text, false)
+        .map_err(|_| String::from("prompt could not be encoded by local tokenizer"))?
+        .get_ids()
+        .iter()
+        .map(|&token_id| {
+            i32::try_from(token_id)
+                .map_err(|_| String::from("tokenizer token ID does not fit server token IDs"))
+        })
+        .collect()
 }
 
 /// Inverts GPT-2's byte-to-character table: printable Latin-1 bytes stand for
@@ -361,22 +430,24 @@ mod tests {
             (String::from("<0xC3>"), 1),
             (String::from("<0xA9>"), 2),
         ]);
+        let streaming: tokenizers::Tokenizer = TokenizerBuilder::default()
+            .with_model(
+                BPE::builder()
+                    .vocab_and_merges(vocab, Vec::new())
+                    .byte_fallback(true)
+                    .build()
+                    .expect("small byte fallback BPE"),
+            )
+            .with_decoder(Some(ByteFallback::default()))
+            .with_normalizer(Some(NFC))
+            .with_pre_tokenizer(Some(ByteLevel::default()))
+            .with_post_processor(Some(ByteLevel::default()))
+            .build()
+            .expect("small streaming tokenizer")
+            .into();
         let tokenizer = QwenTokenizer {
-            tokenizer: TokenizerBuilder::default()
-                .with_model(
-                    BPE::builder()
-                        .vocab_and_merges(vocab, Vec::new())
-                        .byte_fallback(true)
-                        .build()
-                        .expect("small byte fallback BPE"),
-                )
-                .with_decoder(Some(ByteFallback::default()))
-                .with_normalizer(Some(NFC))
-                .with_pre_tokenizer(Some(ByteLevel::default()))
-                .with_post_processor(Some(ByteLevel::default()))
-                .build()
-                .expect("small streaming tokenizer")
-                .into(),
+            tokenizer: streaming.clone(),
+            plain: streaming,
             source_sha256: String::from("test-only"),
         };
         let mut stream = QwenTokenizer::generated_decoder();

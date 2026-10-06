@@ -212,8 +212,7 @@ fn checkpoint_prefix_snapshot_copy_time() {
     for round in 0..3 {
         session.reset_prefix_cache(1 << 32);
         let request = ChatRequest::new(&messages, MAX_TOKENS);
-        let prompt = session.render(request).expect("render");
-        let input_ids = session.format.encode(&prompt).expect("tokens");
+        let input_ids = session.render(request).expect("render").ids;
         let (executor, _, _) = super::prefill(
             &session.weights,
             &mut session.prefix_cache,

@@ -63,12 +63,12 @@ impl TurnStart {
         validate_request(request)?;
         let started = Instant::now();
         let render = tracing::info_span!("chat.render", render_ms = tracing::field::Empty);
+        // Renders and encodes; the render span covers both.
         let (prompt, render_ms) = timed(&render, "render_ms", || {
             model.format.check_untrusted(request.conversation())?;
-            model.format.template().render(request.conversation(), true)
+            model.format.prompt(request.conversation(), true)
         })?;
-        deadline.check()?;
-        let input_ids = model.format.encode(&prompt)?;
+        let input_ids = prompt.ids;
         deadline.check()?;
         let max_tokens = output_budget(model.context_limit, request.max_tokens, input_ids.len())?;
         let picker = TokenPicker::new(

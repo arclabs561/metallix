@@ -20,7 +20,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
-use chat_format::{ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, TurnFormat};
+use chat_format::{ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TurnFormat};
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
 use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
@@ -665,7 +665,7 @@ impl ChatSession {
         validate_request(request)?;
         let render = tracing::info_span!("chat.render", render_ms = Empty);
         let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
-        let input_ids = self.format.encode(&prompt)?;
+        let input_ids = prompt.ids;
         if input_ids.len() > self.context_limit {
             return Err(format!(
                 "decision requires prompt_tokens <= {}; received {}",
@@ -896,9 +896,10 @@ impl ChatSession {
         }
     }
 
-    fn render(&self, request: ChatRequest<'_>) -> Result<String, String> {
+    /// Renders and encodes one turn; the render span covers both.
+    fn render(&self, request: ChatRequest<'_>) -> Result<Prompt, String> {
         self.format.check_untrusted(request.conversation())?;
-        self.format.template().render(request.conversation(), true)
+        self.format.prompt(request.conversation(), true)
     }
 }
 
