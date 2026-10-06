@@ -129,6 +129,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_inspect_julia.py"], False),
         ([sys.executable, "scripts/test_qualify_codex.py"], False),
         ([sys.executable, "scripts/test_qualify_responses_tools.py"], False),
+        ([sys.executable, "scripts/test_sdk_conformance.py"], False),
         (["node", "--test", "scripts/benchmark-openai.test.mjs"], False),
         (["ruff", "check", "scripts"], False),
         (["ruff", "format", "--check", "scripts"], False),
