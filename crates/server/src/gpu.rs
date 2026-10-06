@@ -44,6 +44,19 @@ impl Memory {
     }
 }
 
+/// MLX's active plus cached bytes: cached buffers are freed by MLX but still
+/// held from Metal, so both count toward the process's GPU footprint.
+#[cfg(test)]
+pub(crate) fn held_bytes() -> Option<u64> {
+    let mut active = 0_usize;
+    let mut cache = 0_usize;
+    // SAFETY: both functions only write one `size_t` through the pointer.
+    let status = unsafe {
+        sys::mlx_get_active_memory(&raw mut active) | sys::mlx_get_cache_memory(&raw mut cache)
+    };
+    (status == 0).then_some(active as u64 + cache as u64)
+}
+
 /// Starts a new peak-memory window, so the next [`Memory::read`] reports the
 /// peak since this call. The peak is process-wide; `mx serve` runs one model
 /// per child process and one request per model, so a window is one request.

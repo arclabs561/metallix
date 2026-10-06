@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::{
     admission_queue::QueueSettings,
-    chat_generation::{ChatBackend, ChatSession, ResidentChatLimits},
+    chat_generation::{ChatBackend, ChatSession, GemmaChatSession, ResidentChatLimits},
     julia_decisions::JuliaDecider,
     pplx_context_embeddings::PplxContextEmbedder,
     pplx_late_embeddings::PplxLateEmbedder,
@@ -29,6 +29,8 @@ pub(crate) const MAX_QUEUE_WAIT_MS: u64 = 600_000;
 pub(crate) enum ModelKind {
     /// Qwen3 checkpoint: `/v1/responses` generation and `/v1/decisions`.
     Qwen,
+    /// Gemma 4 dense text checkpoint (12B or 31B): generation only.
+    Gemma4,
     /// Julia-1 checkpoint on the native CPU path: `/v1/decisions` only.
     Julia,
     /// Qwen3-Embedding checkpoint: `/v1/embeddings` only.
@@ -43,12 +45,13 @@ pub(crate) enum ModelKind {
 
 impl ModelKind {
     pub(crate) fn generates(self) -> bool {
-        self == Self::Qwen
+        matches!(self, Self::Qwen | Self::Gemma4)
     }
 
     pub(crate) fn capabilities(self) -> &'static [&'static str] {
         match self {
             Self::Qwen => &["generate", "decide"],
+            Self::Gemma4 => &["generate"],
             Self::Julia => &["decide"],
             Self::QwenEmbedding | Self::PplxContext => &["embed"],
             Self::PplxLate => &["embed", "rerank"],
@@ -219,6 +222,16 @@ impl ModelWorker for ChatSession {
     }
 }
 
+impl ModelWorker for GemmaChatSession {
+    fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+        Some(self)
+    }
+
+    fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
+}
+
 impl ModelWorker for JuliaDecider {
     fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
         None
@@ -281,6 +294,7 @@ pub(crate) fn load(
 ) -> Result<Box<dyn ModelWorker>, String> {
     Ok(match entry.kind {
         ModelKind::Qwen => Box::new(ChatSession::load(&entry.path, limits)?),
+        ModelKind::Gemma4 => Box::new(GemmaChatSession::load(&entry.path, limits)?),
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
         ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
         ModelKind::PplxContext => Box::new(PplxContextEmbedder::load(&entry.path)?),
@@ -321,6 +335,11 @@ mod tests {
                 .unwrap();
         assert_eq!(late[0].kind, ModelKind::PplxLate);
         assert_eq!(late[0].kind.capabilities(), ["embed", "rerank"]);
+        let gemma = parse_manifest(br#"{"models": [{"id": "g", "kind": "gemma4", "path": "/g"}]}"#)
+            .unwrap();
+        assert_eq!(gemma[0].kind, ModelKind::Gemma4);
+        assert_eq!(gemma[0].kind.capabilities(), ["generate"]);
+        assert!(gemma[0].kind.generates());
 
         let shorthand = entries(None, Some(Path::new("/q")), "qwen").unwrap();
         assert_eq!(shorthand[0].kind, ModelKind::Qwen);
