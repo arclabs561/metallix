@@ -102,6 +102,26 @@ pub(crate) mod test_support {
         exchange_with(path, "", body, handle)
     }
 
+    /// Sends one body, then closes the socket without reading a reply, and
+    /// hands the request to `handle` once the client has gone.
+    pub(crate) fn abandon(path: &str, body: &str, handle: impl FnOnce(Connection, &[u8])) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(request.as_bytes()).unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut connection = Connection::accept(stream, TransportLimits::default());
+        let wire = connection.read_request().unwrap();
+        client.join().unwrap();
+        handle(connection, &wire.body);
+    }
+
     /// [`exchange`] with extra header lines, each ending in CRLF.
     pub(crate) fn exchange_with(
         path: &str,
@@ -131,8 +151,13 @@ pub(crate) mod test_support {
         client.join().unwrap()
     }
 
-    /// The status line and JSON body of a non-streamed response.
+    /// The status line and JSON body of a non-streamed response, after any
+    /// interim `100 Continue` a half-closed client is probed with.
     pub(crate) fn json_body(wire: &str) -> (String, Value) {
+        let mut wire = wire;
+        while let Some(rest) = wire.strip_prefix("HTTP/1.1 100 Continue\r\n\r\n") {
+            wire = rest;
+        }
         let (head, body) = wire.split_once("\r\n\r\n").unwrap();
         (
             head.lines().next().unwrap().to_owned(),
@@ -181,6 +206,8 @@ pub(crate) mod test_support {
         /// Prompt tokens to report, and how many of them the cache served.
         pub(crate) prompt_tokens: usize,
         pub(crate) cached_prompt_tokens: usize,
+        /// A pause before each text piece, as a model spends per token.
+        pub(crate) piece_delay: Duration,
     }
 
     impl Scripted {
@@ -194,6 +221,7 @@ pub(crate) mod test_support {
                 salt: None,
                 prompt_tokens: 1,
                 cached_prompt_tokens: 0,
+                piece_delay: Duration::ZERO,
             }
         }
 
@@ -265,6 +293,7 @@ pub(crate) mod test_support {
                 );
                 let characters: Vec<char> = self.text.chars().collect();
                 for piece in characters.chunks(2) {
+                    thread::sleep(self.piece_delay);
                     self.deltas += 1;
                     let mut deltas = stream.push(&piece.iter().collect::<String>());
                     if deltas.is_empty() {

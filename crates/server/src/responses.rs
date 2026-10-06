@@ -663,7 +663,7 @@ pub(crate) fn respond(
     reason = "the connection, parsed request and its derived parts are one call"
 )]
 fn respond_json(
-    request: Connection,
+    mut request: Connection,
     parsed: &Request,
     controls: &GenerationControls,
     messages: &[ChatMessage],
@@ -673,14 +673,15 @@ fn respond_json(
     generation_timeout: Duration,
 ) {
     let request_id = request.request_id().map(str::to_owned);
+    let cache_salt = request.cache_salt().map(str::to_owned);
     let result = session
         .generate_with_timeout(
             ChatRequest {
-                cache_salt: request.cache_salt(),
+                cache_salt: cache_salt.as_deref(),
                 ..controls.request(messages, tools)
             },
             generation_timeout,
-            &mut |_| Ok(()),
+            &mut request.stop_when_gone(),
         )
         .and_then(|generated| {
             record_usage(&generated);
@@ -1258,11 +1259,36 @@ mod tests {
 
         /// The JSON body of a non-streamed response, with its status line.
         pub(super) fn json_body(wire: &str) -> (String, Value) {
-            let (head, body) = wire.split_once("\r\n\r\n").unwrap();
-            (
-                head.lines().next().unwrap().to_owned(),
-                serde_json::from_str(body).unwrap(),
-            )
+            crate::sse::test_support::json_body(wire)
+        }
+
+        /// A reply written only at the end still notices a client that
+        /// left: generation stops within two client checks.
+        #[test]
+        fn a_client_that_leaves_stops_a_non_streamed_generation() {
+            let mut backend = crate::sse::test_support::Scripted::new(&"word ".repeat(400));
+            backend.piece_delay = Duration::from_millis(1);
+            let body = r#"{"model":"control","input":"hello"}"#;
+            crate::sse::test_support::abandon("/v1/responses", body, |connection, body| {
+                let request: Request = serde_json::from_slice(body).unwrap();
+                let messages = messages(&request).unwrap();
+                let tools = tools(&request).unwrap();
+                respond(
+                    connection,
+                    &request,
+                    &messages,
+                    &tools,
+                    &mut backend,
+                    "t",
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            });
+            assert!(
+                backend.deltas <= 2 * crate::http_transport::CLIENT_POLL_DELTAS,
+                "{} pieces generated after the client left",
+                backend.deltas
+            );
         }
 
         /// The `data` payloads of a streamed response.

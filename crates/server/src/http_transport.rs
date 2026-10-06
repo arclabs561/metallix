@@ -87,6 +87,10 @@ impl HttpError {
     }
 }
 
+/// Generated deltas between client checks on a reply written only at the
+/// end. A check is a nonblocking peek, cheap next to a decode step.
+pub(crate) const CLIENT_POLL_DELTAS: usize = 16;
+
 /// One accepted loopback connection with bounded read and response-write time.
 pub(crate) struct Connection {
     stream: TcpStream,
@@ -101,6 +105,9 @@ pub(crate) struct Connection {
     minor_version: Option<u8>,
     /// Whether [`Connection::client_gone`] has sent its one probe.
     probed: bool,
+    /// Internal forwards reserve write EOF for cancellation, while retaining
+    /// the read half to wait for the worker to release admission.
+    cancel_on_eof: bool,
 }
 
 impl Connection {
@@ -117,6 +124,7 @@ impl Connection {
             path: None,
             minor_version: None,
             probed: false,
+            cancel_on_eof: false,
         }
     }
 
@@ -196,6 +204,7 @@ impl Connection {
             return true;
         }
         match peeked {
+            Ok(0) if self.cancel_on_eof => true,
             Ok(0) if !self.probed && self.minor_version == Some(1) => {
                 self.probed = true;
                 self.stream
@@ -204,6 +213,21 @@ impl Connection {
             }
             Ok(_) => false,
             Err(error) => error.kind() != io::ErrorKind::WouldBlock,
+        }
+    }
+
+    /// An `on_token` for a reply written only when generation ends: every
+    /// [`CLIENT_POLL_DELTAS`] deltas it checks [`Self::client_gone`] and stops
+    /// the generation once the client has left, so a dropped request stops
+    /// costing model time. A streamed reply learns the same from its writes.
+    pub(crate) fn stop_when_gone<T>(&mut self) -> impl FnMut(T) -> Result<(), String> + '_ {
+        let mut deltas = 0_usize;
+        move |_| {
+            deltas += 1;
+            if deltas.is_multiple_of(CLIENT_POLL_DELTAS) && self.client_gone() {
+                return Err(String::from("the client disconnected"));
+            }
+            Ok(())
         }
     }
 
@@ -252,6 +276,12 @@ impl Connection {
                     }
                     let body_length = validate_headers(&request, &method, version, self.limits)?;
                     self.minor_version = Some(version);
+                    // This opt-in affects only this connection's cancellation
+                    // semantics; ordinary clients retain half-close support.
+                    self.cancel_on_eof = request.headers.iter().any(|header| {
+                        header.name.eq_ignore_ascii_case("x-metallix-cancel-on-eof")
+                            && header.value == b"1"
+                    });
                     let trace = trace_headers(&request);
                     if trace.cache_salt.as_deref().is_some_and(|salt| {
                         salt.is_empty()
@@ -906,10 +936,39 @@ mod tests {
             assert!(!half_closed.client_gone());
             thread::sleep(Duration::from_millis(10));
         }
+        half_closed.begin_response();
+        half_closed
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap();
         drop(half_closed);
         let mut received = Vec::new();
-        half.read_to_end(&mut received).expect("probe arrives");
-        assert_eq!(received, b"HTTP/1.1 100 Continue\r\n\r\n");
+        half.read_to_end(&mut received).expect("response arrives");
+        assert_eq!(
+            received,
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+        );
+
+        // Internal forwards opt in: write EOF cancels while the read half
+        // stays open to receive the response and final socket close.
+        let mut forward = TcpStream::connect(address).expect("connect");
+        forward
+            .write_all(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nx-metallix-cancel-on-eof: 1\r\n\r\n{}")
+            .expect("request");
+        let mut forwarded = request_at(&listener);
+        forwarded.read_request().expect("request reads");
+        assert!(!forwarded.client_gone());
+        forward.shutdown(Shutdown::Write).expect("cancel");
+        probe_until(&mut forwarded, true);
+        forwarded.begin_response();
+        forwarded
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            .unwrap();
+        drop(forwarded);
+        let mut response = Vec::new();
+        forward
+            .read_to_end(&mut response)
+            .expect("response and close");
+        assert_eq!(response, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
 
         // Fully closed: gone once its reset to the probe arrives.
         let mut closed = TcpStream::connect(address).expect("connect");

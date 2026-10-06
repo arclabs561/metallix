@@ -469,7 +469,7 @@ fn generation_error(connection: Connection, error: &ChatGenerationError) {
 
 /// Answers one prepared request, as JSON or as a chunk stream.
 pub(crate) fn respond(
-    connection: Connection,
+    mut connection: Connection,
     prepared: &Prepared,
     session: &mut dyn ChatBackend,
     id: &str,
@@ -486,7 +486,11 @@ pub(crate) fn respond(
     let request_id = connection.request_id().map(str::to_owned);
     if !prepared.request.stream {
         let result = session
-            .generate_with_timeout(request, generation_timeout, &mut |_| Ok(()))
+            .generate_with_timeout(
+                request,
+                generation_timeout,
+                &mut connection.stop_when_gone(),
+            )
             .and_then(|generated| {
                 record_usage(&generated);
                 let mut value = completion_value(prepared, &generated, id)
@@ -624,8 +628,11 @@ fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse::test_support::{
-        SCRIPTED_EOS, Scripted, events, exchange, exchange_with, json_body,
+    use crate::{
+        http_transport::CLIENT_POLL_DELTAS,
+        sse::test_support::{
+            SCRIPTED_EOS, Scripted, abandon, events, exchange, exchange_with, json_body,
+        },
     };
 
     fn prepare_body(body: &Value) -> Result<Prepared, Value> {
@@ -955,6 +962,34 @@ mod tests {
             );
             assert_eq!(usage["total_tokens"], 12, "stream={stream}");
         }
+    }
+
+    /// A reply written only at the end still notices a client that left:
+    /// generation stops within two client checks instead of running out.
+    #[test]
+    fn a_client_that_leaves_stops_a_non_streamed_generation() {
+        let mut backend = Scripted::new(&"word ".repeat(400));
+        backend.piece_delay = Duration::from_millis(1);
+        abandon(
+            "/v1/chat/completions",
+            &with(&json!({})).to_string(),
+            |connection, body| {
+                let (_, prepared) = prepare(body).unwrap();
+                respond(
+                    connection,
+                    &prepared,
+                    &mut backend,
+                    "t",
+                    Duration::from_secs(60),
+                )
+                .unwrap();
+            },
+        );
+        assert!(
+            backend.deltas <= 2 * CLIENT_POLL_DELTAS,
+            "{} pieces generated after the client left",
+            backend.deltas
+        );
     }
 
     #[test]
