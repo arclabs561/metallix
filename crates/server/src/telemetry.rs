@@ -95,6 +95,27 @@ pub(crate) fn flush() {
     }
 }
 
+/// On SIGTERM or SIGINT, completes the timeline and exits 0. `mx serve` ends
+/// by signal, and the default action would drop entries still buffered on
+/// the timeline's writer thread: [`flush`] only asks that thread to write,
+/// while [`finish`] waits for it.
+#[cfg(feature = "metal")]
+pub(crate) fn finish_on_signal() -> Result<(), String> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT])
+        .map_err(|error| format!("could not watch for SIGTERM: {error}"))?;
+    std::thread::Builder::new()
+        .name(String::from("signals"))
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                finish();
+                std::process::exit(0);
+            }
+        })
+        .map_err(|error| format!("could not start the signal thread: {error}"))?;
+    Ok(())
+}
+
 /// Completes the timeline file. Call before `std::process::exit`, which skips
 /// destructors.
 pub(crate) fn finish() {

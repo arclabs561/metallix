@@ -278,6 +278,10 @@ pub(crate) fn serve(
     budget_mib: Option<u64>,
     queue: QueueSettings,
 ) -> ExitCode {
+    if let Err(error) = telemetry::finish_on_signal() {
+        tracing::error!("mx serve: {error}");
+        return ExitCode::FAILURE;
+    }
     match serve_inner(entries, address, settings, budget_mib, queue) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -548,10 +552,10 @@ fn proxy_models(
         let spawned = thread::Builder::new()
             .name(String::from("forward"))
             .spawn(move || {
-                let _entered = span.enter();
-                forward(&pool, &model, connection, &request, &context, limits);
+                span.in_scope(|| forward(&pool, &model, connection, &request, &context, limits));
                 model.in_flight.fetch_sub(1, Ordering::AcqRel);
                 in_flight.fetch_sub(1, Ordering::AcqRel);
+                // The request span has exited, so its end is in this flush.
                 telemetry::flush();
             })
             .map_err(|error| format!("could not start a forwarding thread: {error}"))?;

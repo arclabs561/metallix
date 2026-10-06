@@ -148,21 +148,23 @@ fn serve_jobs(
             _admission: admission,
             span,
         } = job;
-        let _entered = span.enter();
-        let started = Instant::now();
-        let capturing = capture.take().and_then(|path| {
-            gpu::Capture::start(&path)
-                .inspect_err(|error| tracing::error!("{error}"))
-                .ok()
+        span.in_scope(|| {
+            let started = Instant::now();
+            let capturing = capture.take().and_then(|path| {
+                gpu::Capture::start(&path)
+                    .inspect_err(|error| tracing::error!("{error}"))
+                    .ok()
+            });
+            gpu::reset_peak_memory();
+            run_job(worker, connection, work, admission, &span);
+            gpu::Memory::record_on(&span);
+            drop(capturing);
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "request finished"
+            );
         });
-        gpu::reset_peak_memory();
-        run_job(worker, connection, work, admission, &span);
-        gpu::Memory::record_on(&span);
-        drop(capturing);
-        tracing::info!(
-            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "request finished"
-        );
+        // The request span has exited, so its end is in this flush.
         crate::telemetry::flush();
     }
 }
@@ -298,6 +300,10 @@ pub(crate) fn serve_child(
     generation_timeout: Duration,
     capture: Option<&Path>,
 ) -> ExitCode {
+    if let Err(error) = crate::telemetry::finish_on_signal() {
+        tracing::error!("mx serve: {error}");
+        return ExitCode::FAILURE;
+    }
     if let Some(path) = capture {
         if let Err(error) = gpu::check_capture_path(path) {
             tracing::error!("mx serve: {error}");
