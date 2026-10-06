@@ -601,6 +601,19 @@ fn draft_length_follows_acceptance_and_verify_cost() {
     assert_eq!(costly.next(), 0);
     assert_eq!(cheap.next(), 8);
 
+    // Discarding a queued step makes a short draft a loss: at a = 2/3 one
+    // extra decode step of overhead outweighs one drafted token.
+    assert_eq!(cheap.next_with_overhead(0.0), cheap.next());
+    assert!(cheap.next_with_overhead(1.0) > 0);
+    let mut short = DraftLength::new(1, VerifyCost::new(0.2, 0.05).expect("valid")).expect("valid");
+    for _ in 0..30 {
+        short.observe(1, 0);
+        short.observe(1, 1);
+        short.observe(1, 1);
+    }
+    assert_eq!(short.next(), 1);
+    assert_eq!(short.next_with_overhead(1.0), 0);
+
     // A free verifier always drafts the maximum, even at low acceptance.
     let mut free = DraftLength::new(4, VerifyCost::new(0.0, 0.0).expect("valid")).expect("valid");
     free.observe(4, 0);

@@ -538,12 +538,19 @@ impl DraftLength {
     /// Draft length to request next; zero means decode without drafting.
     #[must_use]
     pub fn next(&self) -> usize {
+        self.next_with_overhead(0.0)
+    }
+
+    /// [`Self::next`] when starting a verify also costs `overhead` decode
+    /// steps, such as discarding a decode step already queued ahead.
+    #[must_use]
+    pub fn next_with_overhead(&self, overhead: f64) -> usize {
         let rate = self.acceptance_rate().min(1.0 - 1e-9);
         let mut best = (0, 1.0 / self.cost.relative(0));
         for k in 1..=self.max {
             let exponent = i32::try_from(k + 1).unwrap_or(i32::MAX);
             let tokens = (1.0 - rate.powi(exponent)) / (1.0 - rate);
-            let value = tokens / self.cost.relative(k);
+            let value = tokens / (self.cost.relative(k) + overhead.max(0.0));
             if value > best.1 {
                 best = (k, value);
             }
