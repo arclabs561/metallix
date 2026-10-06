@@ -70,8 +70,8 @@ Write a registry, `models.json`:
 ]}
 ```
 
-`kind` is one of `qwen`, `julia`, `qwen_embedding`, `pplx_context` or
-`pplx_late`. `residency` defaults to `resident`. Under `--memory-budget-mib`
+`kind` is one of `qwen`, `gemma4`, `julia`, `qwen_embedding`, `pplx_context`
+or `pplx_late`. `residency` defaults to `resident`. Under `--memory-budget-mib`
 every entry must declare `memory_mib`. `mx serve --model PATH` is shorthand for
 a one-entry Qwen registry.
 

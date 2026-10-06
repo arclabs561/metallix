@@ -5,7 +5,8 @@ interleaved sliding-window and full-attention decoder layers with a cached
 decoder. It is an adapter-owned crate like `qwen`, `deepseek` and `julia`:
 Gemma shares no tensors, cache layout or quirks with Qwen3, and keeping it
 separate lets each adapter change its graph without touching the other's
-qualified path. Serving is not wired yet; see [follow-ups](#follow-ups).
+qualified path. `mx serve` loads it as the registry kind `gemma4`; see
+[serving](#serving).
 
 ## Checkpoints
 
@@ -136,13 +137,34 @@ the checkpoint. The tokenizer reproduces the source token IDs. Its
 post-processor adds no special tokens, so a prompt rendered without
 `bos_token` starts at `<|turn>` whichever way it is encoded.
 
+## Serving
+
+A registry entry `{"id": "gemma", "kind": "gemma4", "path": "<checkpoint>"}`
+serves generation through the same protocol code as Qwen (`/v1/responses`,
+`/v1/chat/completions`, `/v1/messages`); it does not serve `/v1/decisions`. Weights and K/V are bf16. The session checks the
+configuration and the K/V plan (sliding layers counted at their window)
+against `--context-tokens` and `--kv-budget-mib` before loading any weights.
+
+The checkpoint's chat format supplies the rest: the template, with
+`bos_token` in its context; the stop set `<eos>`, `<turn|>` and
+`<|tool_response>`, the last ending a turn that called tools; the
+checkpoint's suppressed tokens (the 12B lists `<audio|>` and `<image|>`, the
+31B none); tool calls in Gemma's own syntax,
+`<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`; and reasoning in
+`<|channel>thought ...<channel|>`, which is stripped from the answer even
+with thinking off, since the model writes an empty channel after tool
+results.
+
+An ignored server test checks one 12B session end to end over
+`/v1/chat/completions`: a greedy answer, the same text streamed, and a tool
+call whose arguments equal the transformers float32 greedy call for the same
+prompt and tool. Thinking mode and the other two protocols are not exercised
+against the checkpoint.
+
 ## Follow-ups
 
-- Serving: a `gemma` registry kind needs a stop-token set
-  (`<eos>`, `<turn|>`, `<|tool_response>`), the checkpoint's suppressed tokens
-  (the 12B lists `<audio|>` and `<image|>`, the 31B none),
-  `bos_token` in the template context (the template prints it and the server
-  encodes without special tokens), and a parser for Gemma's tool-call syntax,
-  `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`, which is not JSON.
+- Prompt-prefix reuse across turns and GPU-side token picks, which the Qwen
+  session has: every Gemma turn prefills its whole prompt and reads each
+  step's full logit row.
 - Replace per-step concatenation with preallocated capacity, as the Qwen
   resident cache does, before long-context decode measurements.
