@@ -986,6 +986,9 @@ def measure_level(
         sampler = bench_system.Sampler(
             pgid=server.process.pid if server else None,
             abort_load=args.abort_load,
+            abort_gpu_bytes=(
+                int(args.abort_gpu_gib * 2**30) if args.abort_gpu_gib else None
+            ),
             on_abort=lambda reason: server.stop() if server else None,
         )
         with sampler:
@@ -1245,6 +1248,13 @@ def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.Argumen
         "--abort-load",
         type=float,
         help="abort a level when the 1-min load average rises above this",
+    )
+    parser.add_argument(
+        "--abort-gpu-gib",
+        type=float,
+        default=64.0,
+        help="abort a level when GPU-resident memory rises above this many GiB "
+        "(a leaking server otherwise swaps the machine to a halt; 0 disables)",
     )
     parser.add_argument("--api", choices=("chat", "responses"), default="chat")
     parser.add_argument("--model-path", type=Path, required=True)

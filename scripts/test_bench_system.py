@@ -102,6 +102,21 @@ class SamplerPeaks(unittest.TestCase):
         self.assertEqual(len(aborts), 1)  # The second excursion does not re-fire.
         self.assertIn("5.00 rose above 4", summary["aborted"])
 
+    def test_gpu_memory_above_the_cap_aborts_once(self) -> None:
+        gpu = iter([10 * 2**30, 70 * 2**30, 80 * 2**30])
+        aborts = []
+        sampler = bench_system.Sampler(
+            abort_gpu_bytes=64 * 2**30,
+            on_abort=aborts.append,
+            probe=lambda pgid: {"load_1m": 1.0, "gpu_in_use_bytes": next(gpu)},
+        )
+        sampler.take()
+        self.assertIsNone(sampler.aborted)
+        sampler.take()
+        sampler.take()
+        self.assertEqual(aborts, ["GPU memory 70.0 GiB rose above 64 GiB"])
+        self.assertEqual(sampler.summary()["peak_gpu_in_use_bytes"], 80 * 2**30)
+
     def test_no_threshold_never_aborts(self) -> None:
         sampler = bench_system.Sampler(probe=lambda pgid: {"load_1m": 99.0})
         sampler.take()

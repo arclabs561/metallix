@@ -171,8 +171,10 @@ PEAKS = ("load_1m", "system_used_bytes", "gpu_in_use_bytes", "server_rss_bytes")
 class Sampler:
     """Samples memory, GPU memory and load every `interval` seconds on a thread.
 
-    Keeps the peak of each quantity. When `abort_load` is set and the 1-minute
-    load average rises above it, records the reason and calls `on_abort` once.
+    Keeps the peak of each quantity. When the 1-minute load average rises above
+    `abort_load`, or GPU-resident memory above `abort_gpu_bytes`, records the
+    reason and calls `on_abort` once. GPU memory is the guard that matters for
+    a leak: Metal buffers count there but not in the server's RSS.
     """
 
     def __init__(
@@ -180,12 +182,14 @@ class Sampler:
         pgid: int | None = None,
         interval: float = 1.0,
         abort_load: float | None = None,
+        abort_gpu_bytes: int | None = None,
         on_abort: Callable[[str], None] | None = None,
         probe: Callable[[int | None], dict] = probe,
     ):
         self.pgid = pgid
         self.interval = interval
         self.abort_load = abort_load
+        self.abort_gpu_bytes = abort_gpu_bytes
         self.on_abort = on_abort
         self.probe = probe
         self.samples = 0
@@ -203,16 +207,23 @@ class Sampler:
                 self.peaks[key] is None or value > self.peaks[key]
             ):
                 self.peaks[key] = value
+        if self.aborted is not None:
+            return
         load = sample.get("load_1m")
-        if (
-            self.abort_load is not None
-            and self.aborted is None
-            and load is not None
-            and load > self.abort_load
-        ):
+        gpu = sample.get("gpu_in_use_bytes")
+        if self.abort_load is not None and load is not None and load > self.abort_load:
             self.aborted = f"1-min load {load:.2f} rose above {self.abort_load:g}"
-            if self.on_abort:
-                self.on_abort(self.aborted)
+        elif (
+            self.abort_gpu_bytes is not None
+            and gpu is not None
+            and gpu > self.abort_gpu_bytes
+        ):
+            self.aborted = (
+                f"GPU memory {gpu / 2**30:.1f} GiB rose above "
+                f"{self.abort_gpu_bytes / 2**30:g} GiB"
+            )
+        if self.aborted and self.on_abort:
+            self.on_abort(self.aborted)
 
     def _run(self) -> None:
         while True:

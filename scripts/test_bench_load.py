@@ -353,6 +353,7 @@ class Levels(unittest.TestCase):
             "requests_per_slot": 1,
             "rate_requests": 2,
             "abort_load": None,
+            "abort_gpu_gib": None,
         }
         return argparse.Namespace(**(values | overrides))
 
