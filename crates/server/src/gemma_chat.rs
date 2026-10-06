@@ -107,7 +107,7 @@ mod tests {
     use crate::{
         chat_generation::{
             ChatDecoderSession,
-            decoder::test_support::{GpuCap, chat_completion},
+            decoder::test_support::{GpuCap, chat_completion, messages, responses},
         },
         sse::test_support::{events, json_body},
     };
@@ -170,18 +170,42 @@ mod tests {
         }
     }
 
-    /// Opt-in against google/gemma-4-12B-it named by `METALLIX_GEMMA4_MODEL`
-    /// (about 22 GiB of bf16 weights; take the heavy lease).
-    #[test]
-    #[ignore = "requires METALLIX_GEMMA4_MODEL (google/gemma-4-12B-it) on Apple-Silicon Metal"]
-    fn real_gemma4_answers_streams_and_calls_a_tool() {
-        let _cap = GpuCap::start(40);
+    /// The real-checkpoint tests load about 22 GiB of bf16 weights each, so
+    /// they run one at a time under the GPU cap.
+    static REAL_CHECKPOINT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// google/gemma-4-12B-it named by `METALLIX_GEMMA4_MODEL`; take the heavy
+    /// lease.
+    fn real_session() -> ChatDecoderSession<GemmaDecoder> {
         let model = std::env::var_os("METALLIX_GEMMA4_MODEL").expect("set METALLIX_GEMMA4_MODEL");
-        let mut session = ChatDecoderSession::<GemmaDecoder>::load(
+        ChatDecoderSession::<GemmaDecoder>::load(
             std::path::Path::new(&model),
             ResidentChatLimits::from_mib(16_384, 1_024),
         )
-        .expect("load local Gemma 4 checkpoint");
+        .expect("load local Gemma 4 checkpoint")
+    }
+
+    /// The tool and prompt of the `tool_declaration` case in
+    /// fixtures/gemma-4-12b/reference.json, as an `OpenAI` function schema.
+    fn weather_parameters() -> Value {
+        json!({"type":"object","properties":{"city":{"type":"string","description":"City name."},"unit":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["city"]})
+    }
+
+    fn assert_no_channel_markers(text: &str) {
+        assert!(
+            !text.contains("<|channel>") && !text.contains("<channel|>"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires METALLIX_GEMMA4_MODEL (google/gemma-4-12B-it) on Apple-Silicon Metal"]
+    fn real_gemma4_answers_streams_and_calls_a_tool() {
+        let _serial = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cap = GpuCap::start(40);
+        let mut session = real_session();
 
         let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":32});
         let (status, plain) = json_body(&chat_completion(&body, &mut session));
@@ -211,9 +235,7 @@ mod tests {
             .collect();
         assert_eq!(joined, text);
 
-        // The tool and prompt of the `tool_declaration` case in
-        // fixtures/gemma-4-12b/reference.json.
-        let tools = json!([{"type":"function","function":{"name":"get_weather","description":"Current weather for a city.","parameters":{"type":"object","properties":{"city":{"type":"string","description":"City name."},"unit":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["city"]}}}]);
+        let tools = json!([{"type":"function","function":{"name":"get_weather","description":"Current weather for a city.","parameters":weather_parameters()}}]);
         let body = json!({"model":"m","messages":[{"role":"user","content":"Weather in Paris?"}],"tools":tools,"temperature":0,"max_completion_tokens":64});
         let (_, called) = json_body(&chat_completion(&body, &mut session));
         assert_eq!(
@@ -228,6 +250,157 @@ mod tests {
         assert_eq!(arguments, json!({"city":"Paris"}), "{called}");
         eprintln!(
             "answer {text:?}; call {arguments}; MLX held {:?} bytes",
+            crate::gpu::held_bytes()
+        );
+    }
+
+    /// Over `/v1/messages`: an answer, the same text streamed, a tool call,
+    /// and an answer from its result.
+    #[test]
+    #[ignore = "requires METALLIX_GEMMA4_MODEL (google/gemma-4-12B-it) on Apple-Silicon Metal"]
+    fn real_gemma4_messages_answer_stream_and_round_trip_a_tool() {
+        let _serial = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cap = GpuCap::start(40);
+        let mut session = real_session();
+
+        // Messages: answer, the same text streamed, a tool call and its result.
+        let body = json!({"model":"m","max_tokens":32,"temperature":0,"messages":[{"role":"user","content":"Name three primary colors."}]});
+        let (status, plain) = json_body(&messages(&body, &mut session));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{plain}");
+        let text = plain["content"][0]["text"].as_str().unwrap().to_owned();
+        assert!(!text.is_empty(), "{plain}");
+        assert_no_channel_markers(&text);
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        let joined: String = events(&messages(&streamed, &mut session))
+            .iter()
+            .filter_map(|(_, data)| serde_json::from_str::<Value>(data).ok())
+            .filter(|event| event["type"] == "content_block_delta")
+            .filter_map(|event| event["delta"]["text"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(joined, text);
+
+        let tools = json!([{"name":"get_weather","description":"Current weather for a city.","input_schema":weather_parameters()}]);
+        let body = json!({"model":"m","max_tokens":64,"temperature":0,"tools":tools,"messages":[{"role":"user","content":"Weather in Paris?"}]});
+        let (_, called) = json_body(&messages(&body, &mut session));
+        assert_eq!(called["stop_reason"], "tool_use", "{called}");
+        let call = called["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .unwrap()
+            .clone();
+        assert_eq!(call["name"], "get_weather", "{called}");
+        assert_eq!(call["input"], json!({"city":"Paris"}), "{called}");
+        // The result renders as Gemma's tool response; the model answers from it.
+        let follow = json!({"model":"m","max_tokens":64,"temperature":0,"tools":tools,"messages":[
+            {"role":"user","content":"Weather in Paris?"},
+            {"role":"assistant","content":called["content"]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":call["id"],"content":"{\"temperature\": 18, \"sky\": \"clear\"}"}]}
+        ]});
+        let (status, answered) = json_body(&messages(&follow, &mut session));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{answered}");
+        assert_eq!(answered["stop_reason"], "end_turn", "{answered}");
+        let answer = answered["content"][0]["text"].as_str().unwrap();
+        assert!(answer.contains("18"), "{answered}");
+        assert_no_channel_markers(answer);
+    }
+
+    /// Over `/v1/responses`: the same answer as chat completions, and a
+    /// function call.
+    #[test]
+    #[ignore = "requires METALLIX_GEMMA4_MODEL (google/gemma-4-12B-it) on Apple-Silicon Metal"]
+    fn real_gemma4_responses_answer_and_call_a_function() {
+        let _serial = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cap = GpuCap::start(40);
+        let mut session = real_session();
+
+        // The chat-completions answer to the same prompt.
+        let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":32});
+        let (_, plain) = json_body(&chat_completion(&body, &mut session));
+        let text = plain["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Responses: an answer and a function call.
+        let body = json!({"model":"m","input":"Name three primary colors.","temperature":0,"max_output_tokens":32});
+        let (status, response) = json_body(&responses(&body, &mut session));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+        let message = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "message")
+            .unwrap();
+        assert_eq!(
+            message["content"][0]["text"].as_str().unwrap(),
+            text,
+            "{response}"
+        );
+        let tools = json!([{"type":"function","name":"get_weather","description":"Current weather for a city.","parameters":weather_parameters()}]);
+        let body = json!({"model":"m","input":"Weather in Paris?","tools":tools,"temperature":0,"max_output_tokens":64});
+        let (_, response) = json_body(&responses(&body, &mut session));
+        let call = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap_or_else(|| panic!("{response}"));
+        assert_eq!(call["name"], "get_weather", "{response}");
+        let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"city":"Paris"}), "{response}");
+    }
+
+    /// Thinking on through `reasoning_effort`.
+    #[test]
+    #[ignore = "requires METALLIX_GEMMA4_MODEL (google/gemma-4-12B-it) on Apple-Silicon Metal"]
+    fn real_gemma4_thinking_streams_reasoning_apart_from_the_answer() {
+        let _serial = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cap = GpuCap::start(40);
+        let mut session = real_session();
+
+        // Thinking: <|think|> in the system turn; the trace streams as
+        // reasoning, never as answer text. 91 = 7 x 13.
+        let body = json!({"model":"m","messages":[{"role":"user","content":"Is 91 prime?"}],"reasoning_effort":"low","temperature":0,"max_completion_tokens":768});
+        let (_, thought) = json_body(&chat_completion(&body, &mut session));
+        assert_eq!(thought["choices"][0]["finish_reason"], "stop", "{thought}");
+        let reasoning = thought["choices"][0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{thought}"))
+            .to_owned();
+        let content = thought["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!reasoning.is_empty(), "{thought}");
+        assert!(content.contains("13"), "{thought}");
+        assert_no_channel_markers(&reasoning);
+        assert_no_channel_markers(&content);
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        let chunks: Vec<Value> = events(&chat_completion(&streamed, &mut session))
+            .iter()
+            .filter_map(|(_, data)| serde_json::from_str::<Value>(data).ok())
+            .collect();
+        let delta = |field: &str| -> String {
+            chunks
+                .iter()
+                .filter_map(|chunk| chunk["choices"][0]["delta"][field].as_str())
+                .collect()
+        };
+        assert_eq!(delta("reasoning_content"), reasoning);
+        assert_eq!(delta("content"), content);
+        eprintln!(
+            "thinking: {} reasoning chars, answer {content:?}; MLX held {:?} bytes",
+            reasoning.len(),
             crate::gpu::held_bytes()
         );
     }

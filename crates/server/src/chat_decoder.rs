@@ -292,6 +292,41 @@ pub(crate) mod test_support {
         }
     }
 
+    /// One `/v1/messages` exchange against `session`.
+    pub(crate) fn messages(body: &Value, session: &mut dyn ChatBackend) -> String {
+        exchange("/v1/messages", &body.to_string(), |connection, body| {
+            let (_, prepared) = crate::anthropic_messages::prepare(body).unwrap();
+            crate::anthropic_messages::respond(
+                connection,
+                &prepared,
+                session,
+                "m",
+                Duration::from_secs(600),
+            )
+            .unwrap();
+        })
+    }
+
+    /// One `/v1/responses` exchange against `session`.
+    pub(crate) fn responses(body: &Value, session: &mut dyn ChatBackend) -> String {
+        use crate::responses::{Request, messages, respond, tools};
+        exchange("/v1/responses", &body.to_string(), |connection, body| {
+            let request: Request = serde_json::from_slice(body).unwrap();
+            let messages = messages(&request).unwrap();
+            let tools = tools(&request).unwrap();
+            respond(
+                connection,
+                &request,
+                &messages,
+                &tools,
+                session,
+                "m",
+                Duration::from_secs(600),
+            )
+            .unwrap();
+        })
+    }
+
     /// One `/v1/chat/completions` exchange against `session`.
     pub(crate) fn chat_completion(body: &Value, session: &mut dyn ChatBackend) -> String {
         exchange(
