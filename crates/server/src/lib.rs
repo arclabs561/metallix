@@ -66,6 +66,7 @@ mod completions;
 #[cfg(feature = "metal")]
 mod decision_cli;
 mod deepseek_reduced_cli;
+mod deepseek_selected_cli;
 #[cfg(feature = "metal")]
 mod engine_loop;
 #[cfg(feature = "metal")]
@@ -287,6 +288,7 @@ fn with_capture(cli: Cli) -> ExitCode {
 fn dispatch(cli: Cli) -> ExitCode {
     match cli.command {
         Command::RunDeepseekReduced(args) => args.run(),
+        Command::RunDeepseekSelected(args) => args.run(),
         #[cfg(feature = "metal")]
         Command::Decide(args) => args.run(),
         #[cfg(feature = "metal")]

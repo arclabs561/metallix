@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::deepseek_reduced_cli;
 #[cfg(feature = "metal")]
 use crate::{decision_cli, julia_decisions};
+use crate::{deepseek_reduced_cli, deepseek_selected_cli};
 
 /// Invalid explicit context input; model-specific admission happens at load.
 #[cfg(feature = "metal")]
@@ -112,6 +112,8 @@ pub(crate) fn parse_temperature(value: &str) -> Result<f64, String> {
 pub(crate) enum Command {
     /// Run a fixed five-block reduced `DeepSeek` model from a synthetic artifact.
     RunDeepseekReduced(deepseek_reduced_cli::ReducedArgs),
+    /// Compare local pinned V4.1 layer-zero `MoE` weights against source captures.
+    RunDeepseekSelected(deepseek_selected_cli::SelectedArgs),
     /// Score typed decision options directly with Qwen3, without generating text.
     #[cfg(feature = "metal")]
     Decide(decision_cli::DecisionArgs),

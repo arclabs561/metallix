@@ -702,3 +702,43 @@ Default and Metal canonical checks passed, including strict Clippy and rustdoc.
 Logs: `artifacts/check-bounded-loader-default.log` and
 `artifacts/check-bounded-loader-metal-r3.log`. Earlier failed check logs remain
 retained alongside them rather than being overwritten.
+
+
+## Local selected V4.1 MoE diagnostic
+
+`mx run-deepseek-selected` connects the local verified range cache to the scalar
+MoE reference for layer zero of revision
+`dba1be0a40aa45a94ad051997016db3960a90277`. It compares one to three captured
+5120-wide BF16 input/output rows and their six selected expert IDs. This is a
+selected-weight arithmetic diagnostic, not full-checkpoint text generation.
+
+```sh
+target/release/mx run-deepseek-selected \
+  --index /path/to/model.safetensors.index.json \
+  --headers-dir /path/to/capture --weights-dir /path/to/capture/weights \
+  --revision dba1be0a40aa45a94ad051997016db3960a90277 \
+  --input-bf16 /path/to/ffn-in.bin --expected-bf16 /path/to/ffn-out.bin \
+  --input-sha256 INPUT_SHA256 --expected-sha256 EXPECTED_SHA256 \
+  --routes /path/to/source-routes.json --tokens 3 \
+  --cache-budget-mib 512 --payload-budget-mib 512
+```
+
+The route capture requires the same revision and one `runs` entry whose
+`routes` contains exactly one layer-zero entry with `ids`, one six-ID row per
+input row. Expected outputs and routes must come from an independent source
+capture. Supplied SHA-256 values establish operator-selected artifact identity,
+not source authenticity. Keep inputs immutable during the run.
+
+The reader performs no network fetch. Index, manifest and aggregate header reads
+are bounded at 16, 1 and 32 MiB respectively; at most 64 shard headers are
+accepted. Both cache and cumulative requested-range admission budgets accept
+1–512 MiB. Payload geometry, local file sizes and selected inventory are checked
+before arithmetic. An unexpected expert outside the captured allowlist fails;
+it is not fetched. Every completed comparison reports exact BF16 mismatches and
+selected IDs; exit zero requires both to match. Missing captures, refusal,
+loading errors or mismatches exit nonzero and cannot count as zero-error evidence.
+
+Cache membership bytes are not retained/process footprint. Source returned-range
+bytes exclude whole-tensor hash and receipt reads; physical read bytes are
+explicitly unavailable. Run under a separate process-memory/deadline supervisor.
+The diagnostic does not establish SSD throughput or useful full-model latency.
