@@ -1574,7 +1574,11 @@ stream.close()
         );
         assert_eq!(events[3]["delta"], "partial");
         assert_eq!(events[4]["response"]["status"], "failed");
-        assert_eq!(events[4]["response"]["error"]["code"], "generation_timeout");
+        assert_eq!(events[4]["response"]["error"]["code"], "server_error");
+        assert_eq!(
+            events[4]["response"]["error"]["metallix_code"],
+            "generation_timeout"
+        );
     }
 
     #[test]
@@ -1870,7 +1874,8 @@ stream.close()
             let wire = request(address);
             assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
             assert!(wire.contains(r#""type":"response.failed""#));
-            assert!(wire.contains(r#""code":"generation_timeout""#));
+            assert!(wire.contains(r#""code":"server_error""#));
+            assert!(wire.contains(r#""metallix_code":"generation_timeout""#));
         }
         server
             .join()

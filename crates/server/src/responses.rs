@@ -771,11 +771,16 @@ fn envelope(request: &Request, id: &str, created_at: u64) -> Value {
     })
 }
 
-/// `envelope` for a failed reply, with a `ResponseError` code and message.
-fn failed(envelope: &Value, code: &str, message: &str) -> Value {
+/// `envelope` for a failed reply. `ResponseError.code` must be one of the
+/// spec's `ResponseErrorCode` values (openai-openapi 8f5077ae); every
+/// failure here happens on the server mid-generation (an expired budget,
+/// a failed decode, output the turn parser refused), so it is
+/// `server_error`. The finer metallix reason goes in `metallix_code`.
+fn failed(envelope: &Value, metallix_code: &str, message: &str) -> Value {
     let mut response = envelope.clone();
     response["status"] = json!("failed");
-    response["error"] = json!({"code": code, "message": message});
+    response["error"] =
+        json!({"code": "server_error", "message": message, "metallix_code": metallix_code});
     json!({"type": "response.failed", "response": response})
 }
 
@@ -1199,11 +1204,11 @@ mod tests {
             );
         }
         assert_eq!(envelope["tools"], json!([]));
-        let failure = failed(&envelope, "server_error", "boom");
+        let failure = failed(&envelope, "generation_timeout", "boom");
         assert_eq!(failure["response"]["status"], "failed");
         assert_eq!(
             failure["response"]["error"],
-            json!({"code": "server_error", "message": "boom"})
+            json!({"code": "server_error", "message": "boom", "metallix_code": "generation_timeout"})
         );
     }
 
