@@ -183,16 +183,27 @@ fn recommended_working_set() -> Option<u64> {
 /// set. Returns the wired limit, or `None` when the keepalive is off or MLX
 /// refuses. Call once, after load and before any request is queued, since
 /// MLX must not change the limit while an asynchronous evaluation runs.
+#[tracing::instrument(
+    name = "model.wire",
+    level = "info",
+    skip_all,
+    fields(planned_bytes = planned_bytes, limit = tracing::field::Empty)
+)]
 pub(crate) fn wire_resident(planned_bytes: u64) -> Option<u64> {
     if keepalive_window().is_zero() {
         return None;
     }
     let active = mlx_rs::memory::active_memory().ok()? as u64;
+    let working_set = tracing::info_span!("wire.working_set").in_scope(recommended_working_set)?;
     let limit = active
         .saturating_add(planned_bytes)
         .saturating_add(cache_limit_bytes() as u64)
-        .min(recommended_working_set()?);
-    match mlx_rs::memory::set_wired_limit(usize::try_from(limit).ok()?) {
+        .min(working_set);
+    tracing::Span::current().record("limit", limit);
+    let limit_bytes = usize::try_from(limit).ok()?;
+    let applied = tracing::info_span!("wire.set_limit")
+        .in_scope(|| mlx_rs::memory::set_wired_limit(limit_bytes));
+    match applied {
         Ok(_previous) => {
             WIRED.store(true, Ordering::Release);
             Some(limit)

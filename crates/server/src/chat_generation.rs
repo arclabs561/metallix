@@ -900,12 +900,17 @@ impl ChatSession {
     /// on a throwaway executor, so the first request does not pay Metal
     /// pipeline creation and allocator growth for the prefill and decode
     /// kernels. The prefix cache is not touched.
+    #[tracing::instrument(name = "model.warm", level = "info", skip_all)]
     pub(crate) fn warm(&mut self) -> Result<(), String> {
         const DECODE_STEPS: usize = 4;
-        let ids = self
-            .format
-            .tokenizer()
-            .encode_prompt("Warm up the prefill and decode kernels.")?;
+        // One span per phase, so a timeline or log shows which one a slow
+        // or stalled startup is in.
+        let phase = |name: &'static str| tracing::info_span!("warm.phase", phase = name);
+        let ids = phase("tokenize").in_scope(|| {
+            self.format
+                .tokenizer()
+                .encode_prompt("Warm up the prefill and decode kernels.")
+        })?;
         let Some(&last) = ids.last() else {
             return Ok(());
         };
@@ -913,18 +918,31 @@ impl ChatSession {
             return Ok(());
         }
         let error = |error: qwen::forward::Qwen3ForwardError| error.to_string();
-        let mut executor = self
-            .weights
-            .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
+        let mut executor = phase("executor")
+            .in_scope(|| {
+                self.weights
+                    .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
+            })
             .map_err(error)?;
-        executor.prefill_last_logits(&ids).map_err(error)?;
-        let mut pending = executor.decode_greedy(last).map_err(error)?;
-        for _ in 0..DECODE_STEPS {
-            let next = executor.decode_greedy_after(&pending).map_err(error)?;
-            pending.wait_one().map_err(error)?;
-            pending = next;
+        phase("prefill")
+            .in_scope(|| executor.prefill_last_logits(&ids))
+            .map_err(error)?;
+        let mut pending = phase("decode_first")
+            .in_scope(|| executor.decode_greedy(last))
+            .map_err(error)?;
+        for step in 0..DECODE_STEPS {
+            let span = tracing::info_span!("warm.phase", phase = "decode_step", step);
+            pending = span
+                .in_scope(|| -> Result<_, qwen::forward::Qwen3ForwardError> {
+                    let next = executor.decode_greedy_after(&pending)?;
+                    pending.wait_one()?;
+                    Ok(next)
+                })
+                .map_err(error)?;
         }
-        pending.wait_one().map_err(error)?;
+        phase("final_wait")
+            .in_scope(|| pending.wait_one())
+            .map_err(error)?;
         Ok(())
     }
 
