@@ -48,7 +48,7 @@ use crate::chat_generation::{
 /// not implement it and stay on the serial path.
 pub(crate) trait TextDecoder {
     /// Free blocks admitting `input_ids` under `keys` would consume now.
-    fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> usize;
+    fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> Result<usize, DecodeError>;
     /// Free blocks in the pool, cached ones included.
     fn free_blocks(&self) -> usize;
     /// Starts `seq` and returns its last prompt token's logits.
@@ -123,8 +123,8 @@ impl From<Qwen3ForwardError> for DecodeError {
 }
 
 impl<S: std::hash::BuildHasher> TextDecoder for qwen::forward::PagedQwen3Session<'_, S> {
-    fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> usize {
-        Self::prefill_cost(self, input_ids, keys.clone())
+    fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> Result<usize, DecodeError> {
+        Self::prefill_cost(self, input_ids, keys.clone()).map_err(DecodeError::from)
     }
 
     fn free_blocks(&self) -> usize {
@@ -181,7 +181,7 @@ impl<S: std::hash::BuildHasher> TextDecoder for qwen::forward::PagedQwen3Session
 }
 
 impl<T: TextDecoder> TextDecoder for &mut T {
-    fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> usize {
+    fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> Result<usize, DecodeError> {
         T::prefill_cost(self, input_ids, keys)
     }
 
@@ -519,9 +519,25 @@ impl<D: TextDecoder> Engine<'_, D> {
             };
             // Keep one block of headroom per running sequence, so admitting
             // does not immediately force a preemption on the next decode.
-            let cost = self
+            let cost = match self
                 .decoder
-                .prefill_cost(sequence.prefill_ids(), &sequence.keys);
+                .prefill_cost(sequence.prefill_ids(), &sequence.keys)
+            {
+                Ok(cost) => cost,
+                Err(error) => {
+                    if let Some(sequence) = self.waiting.pop_front() {
+                        self.release_sequence(&sequence);
+                        let message = match error {
+                            DecodeError::OutOfBlocks => {
+                                "the prompt does not fit the KV pool".to_owned()
+                            }
+                            DecodeError::Failed(message) => message,
+                        };
+                        sequence.fail(ChatGenerationError::Message(message));
+                    }
+                    continue;
+                }
+            };
             if cost + self.running.len() > self.decoder.free_blocks() && !self.running.is_empty() {
                 return;
             }
@@ -1050,6 +1066,9 @@ mod tests {
     #[derive(Default)]
     struct Observed {
         fail_first_finish: bool,
+        fail_next_cost: bool,
+        rejected_pool: Option<String>,
+        rejected_cleanup_unchanged: Option<bool>,
         live_rows_at_finish_gate: Option<bool>,
         preemptions: usize,
         readbacks: Vec<BatchReadback>,
@@ -1133,11 +1152,21 @@ mod tests {
     }
 
     impl TextDecoder for FakeDecoder {
-        fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> usize {
+        fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> Result<usize, DecodeError> {
+            let mut observed = self.observed.lock().expect("observed");
+            if std::mem::take(&mut observed.fail_next_cost) {
+                observed.rejected_pool = Some(format!("{:?}", self.blocks));
+                return Err(DecodeError::Failed(
+                    "injected prefix validation failure".into(),
+                ));
+            }
+            drop(observed);
             let tokens = Self::ids(input_ids);
             let hit = self.blocks.lookup_prefix(&tokens, keys.clone());
             let cached = hit.cached_tokens();
-            self.blocks.admit_cost(&hit, tokens.len() - cached)
+            self.blocks
+                .admit_cost(&hit, tokens.len() - cached)
+                .map_err(|error| DecodeError::Failed(error.to_string()))
         }
 
         fn free_blocks(&self) -> usize {
@@ -1221,6 +1250,11 @@ mod tests {
                     .expect("release cleanup");
             }
             let _ = self.blocks.free(seq);
+            let mut observed = self.observed.lock().expect("observed");
+            if let Some(before) = observed.rejected_pool.take() {
+                observed.rejected_cleanup_unchanged = Some(before == format!("{:?}", self.blocks));
+            }
+            drop(observed);
             self.tokens.remove(&seq);
             self.last_pick.remove(&seq);
         }
@@ -1434,6 +1468,64 @@ mod tests {
             drop(self.client);
             engine.join().expect("engine thread")
         }
+    }
+
+    #[test]
+    fn prefill_cost_failure_releases_admission_and_next_waiter_progresses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut harness = Harness::paused(64, 2, false);
+        harness.observed.lock().unwrap().fail_next_cost = true;
+        let admitted = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let (intercept, submissions) = sync_channel(2);
+        let mut writers = Vec::new();
+        for (index, counter) in admitted.iter().enumerate() {
+            let mut client = harness.client.clone();
+            client.messages = intercept.clone();
+            let admission = crate::serving::test_engine_admission(counter);
+            writers.push(thread::spawn(move || {
+                let _admission = admission;
+                let messages = [ChatMessage::text(ChatRole::User, prompt(index))];
+                let mut request = ChatRequest::new(&messages, 40);
+                request.sampling = SamplingRequest::GREEDY;
+                client.generate_with_timeout(request, Duration::from_secs(10), &mut |_| Ok(()))
+            }));
+            // Forward each prepared submission in order while the engine is paused.
+            let submission = submissions.recv_timeout(Duration::from_secs(5)).unwrap();
+            harness.client.messages().send(submission).unwrap();
+        }
+        assert!(
+            admitted
+                .iter()
+                .all(|counter| counter.load(Ordering::Acquire) == 1)
+        );
+        harness.release();
+        let results = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+        let observed = Arc::clone(&harness.observed);
+        let decoder = harness.stop();
+        assert!(
+            matches!(&results[0], Err(ChatGenerationError::Message(message))
+                if message == "injected prefix validation failure"),
+            "rejected waiter did not receive its failure"
+        );
+        let generation = results[1].as_ref().expect("next waiter completes");
+        assert!(!generation.generated_token_ids.is_empty());
+        assert_eq!(generation.finish_reason, ChatFinishReason::Eos);
+        assert!(
+            admitted
+                .iter()
+                .all(|counter| counter.load(Ordering::Acquire) == 0)
+        );
+        assert_eq!(
+            observed.lock().unwrap().rejected_cleanup_unchanged,
+            Some(true)
+        );
+        assert_eq!(decoder.blocks.free_blocks(), 64);
+        assert_eq!(decoder.blocks.sequences(), 0);
+        assert!(decoder.tokens.is_empty());
     }
 
     #[test]

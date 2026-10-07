@@ -383,12 +383,20 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
 
     /// Free blocks a [`Self::prefill_with_keys`] of `input_ids` under `keys`
     /// would consume now, counting cached prefix blocks it would pin.
-    #[must_use]
-    pub fn prefill_cost(&self, input_ids: &[i32], keys: HashKeys) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen3ForwardError::KvBlocks`] if the cached prefix cannot
+    /// be validated for this pool.
+    pub fn prefill_cost(
+        &self,
+        input_ids: &[i32],
+        keys: HashKeys,
+    ) -> Result<usize, Qwen3ForwardError> {
         let tokens = token_ids(input_ids);
         let hit = self.blocks.lookup_prefix(&tokens, keys);
         let cached = hit.cached_tokens();
-        self.blocks.admit_cost(&hit, tokens.len() - cached)
+        Ok(self.blocks.admit_cost(&hit, tokens.len() - cached)?)
     }
 
     /// [`Self::prefill_last_logits`] under `keys`: blocks are shared only

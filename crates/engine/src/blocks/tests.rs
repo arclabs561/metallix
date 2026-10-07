@@ -205,7 +205,9 @@ fn admit_in_model(
     }
     let cached = hit.cached_tokens();
     let end = (cached + chunk).min(prompt.len());
-    let cost = manager.admit_cost(&hit, end - cached);
+    let cost = manager
+        .admit_cost(&hit, end - cached)
+        .expect("fresh same-manager hit");
     let free = manager.free_blocks();
     let result = manager.admit(SequenceId(seq), hit, &prompt[cached..end]);
     match &result {
@@ -776,4 +778,95 @@ fn unfinished_positions_are_not_published() {
         Err(BlockError::Unresolved(_))
     ));
     blocks.check_invariants().expect("invariants");
+}
+
+#[test]
+fn budget_rejects_mathematical_slab_overflow() {
+    let tokens = BlockTokens::DEFAULT;
+    let positions_per_slab = u64::from(tokens.get()) * u64::from(SLAB_BLOCKS);
+    // Overflow in the first product, then only in the second product.
+    for per_token in [u64::MAX, u64::MAX / u64::from(tokens.get())] {
+        let mathematical_bytes = u128::from(per_token) * u128::from(positions_per_slab);
+        assert!(mathematical_bytes > u128::from(u64::MAX));
+        assert_eq!(
+            PoolConfig::from_budget(u64::MAX, per_token, tokens),
+            Err(BlockConfigError::SlabBytesOverflow {
+                bytes_per_token: per_token,
+                block_tokens: tokens,
+            }),
+            "an unrepresentable slab cannot fit even the largest byte budget"
+        );
+    }
+    // The adjacent representable case remains valid; no device allocation.
+    let per_token = u64::MAX / positions_per_slab;
+    let slab_bytes = per_token * positions_per_slab;
+    let config = PoolConfig::from_budget(slab_bytes, per_token, tokens).unwrap();
+    assert_eq!(config.slabs(), 1);
+    assert!(PoolConfig::from_budget(slab_bytes - 1, per_token, tokens).is_err());
+}
+
+#[test]
+fn foreign_same_shape_prefix_hit_rejects_without_mutation() {
+    let mut owner = manager(1);
+    let mut recipient = manager(1);
+    let prompt = [11, 12, 13, 14, 15];
+    let keys = HashKeys::new();
+    admit_all(&mut owner, 1, &prompt, keys.clone());
+    admit_all(&mut recipient, 1, &prompt, keys.clone());
+    owner.free(SequenceId(1)).unwrap();
+    recipient.free(SequenceId(1)).unwrap();
+    let foreign = owner.lookup_prefix(&prompt, keys.clone());
+    let local = recipient.lookup_prefix(&prompt, keys);
+    assert_eq!(foreign.cached_tokens(), BLOCK);
+    assert_eq!(
+        foreign.blocks(),
+        local.blocks(),
+        "matching IDs/hashes do not prove pool identity"
+    );
+    let before = fingerprint(&recipient, &BTreeMap::new());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        recipient.admit(SequenceId(2), foreign, &prompt[BLOCK..])
+    }));
+    assert!(
+        result.is_ok(),
+        "foreign prefix hit must be an error, not a panic"
+    );
+    assert!(
+        result.unwrap().is_err(),
+        "foreign owner must be rejected even with identical cached content"
+    );
+    assert_eq!(recipient.sequences(), 0);
+    assert_eq!(fingerprint(&recipient, &BTreeMap::new()), before);
+}
+
+#[test]
+fn foreign_larger_pool_prefix_hit_rejects_without_panic_or_mutation() {
+    let mut owner = manager(2);
+    let mut recipient = manager(1);
+    // Keep the owner's first slab occupied, forcing the tested hit outside
+    // the recipient's block-ID range using only public manager operations.
+    let filler: Vec<u32> = (1000..1000 + SLAB_BLOCKS * BLOCK as u32).collect();
+    admit_all(&mut owner, 1, &filler, HashKeys::new());
+    let prompt = [21, 22, 23, 24, 25];
+    let keys = HashKeys::new();
+    admit_all(&mut owner, 2, &prompt, keys.clone());
+    let foreign = owner.lookup_prefix(&prompt, keys);
+    assert_eq!(foreign.cached_tokens(), BLOCK);
+    assert!(
+        foreign
+            .blocks()
+            .iter()
+            .any(|id| id.index() >= recipient.config().num_blocks())
+    );
+    let before = fingerprint(&recipient, &BTreeMap::new());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        recipient.admit(SequenceId(3), foreign, &prompt[BLOCK..])
+    }));
+    assert!(
+        result.is_ok(),
+        "foreign prefix hit must reject before indexing recipient storage"
+    );
+    assert!(result.unwrap().is_err(), "foreign owner must be rejected");
+    assert_eq!(recipient.sequences(), 0);
+    assert_eq!(fingerprint(&recipient, &BTreeMap::new()), before);
 }

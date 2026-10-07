@@ -50,7 +50,7 @@ mod manager;
 #[cfg(test)]
 mod tests;
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use thiserror::Error;
 
@@ -94,6 +94,32 @@ impl Default for BlockTokens {
     }
 }
 
+/// A positive slab footprint whose complete byte product fits in `u64`.
+struct SlabFootprint(NonZeroU64);
+
+impl SlabFootprint {
+    fn new(bytes_per_token: u64, block_tokens: BlockTokens) -> Result<Self, BlockConfigError> {
+        let per_token =
+            NonZeroU64::new(bytes_per_token).ok_or(BlockConfigError::ZeroBytesPerToken)?;
+        let bytes = per_token
+            .get()
+            .checked_mul(u64::from(block_tokens.get()))
+            .and_then(|bytes| bytes.checked_mul(u64::from(SLAB_BLOCKS)))
+            .ok_or(BlockConfigError::SlabBytesOverflow {
+                bytes_per_token,
+                block_tokens,
+            })?;
+        // Both factors are positive; checked multiplication cannot wrap to zero.
+        NonZeroU64::new(bytes)
+            .map(Self)
+            .ok_or(BlockConfigError::ZeroBytesPerToken)
+    }
+
+    fn get(&self) -> u64 {
+        self.0.get()
+    }
+}
+
 /// The fixed shape of one KV pool.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PoolConfig {
@@ -129,20 +155,16 @@ impl PoolConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`BlockConfigError::ZeroBytesPerToken`], or
-    /// [`BlockConfigError::BudgetBelowOneSlab`] when the budget cannot hold one
-    /// slab.
+    /// Returns [`BlockConfigError::ZeroBytesPerToken`] for zero footprint,
+    /// [`BlockConfigError::SlabBytesOverflow`] if a slab's byte size overflows,
+    /// or [`BlockConfigError::BudgetBelowOneSlab`] when the budget cannot hold
+    /// one slab.
     pub fn from_budget(
         budget_bytes: u64,
         bytes_per_token: u64,
         block_tokens: BlockTokens,
     ) -> Result<Self, BlockConfigError> {
-        if bytes_per_token == 0 {
-            return Err(BlockConfigError::ZeroBytesPerToken);
-        }
-        let slab_bytes = bytes_per_token
-            .saturating_mul(u64::from(block_tokens.get()))
-            .saturating_mul(u64::from(SLAB_BLOCKS));
+        let slab_bytes = SlabFootprint::new(bytes_per_token, block_tokens)?.get();
         let slabs = budget_bytes / slab_bytes;
         if slabs == 0 {
             return Err(BlockConfigError::BudgetBelowOneSlab {
@@ -326,6 +348,16 @@ pub enum BlockConfigError {
     /// A position must occupy memory.
     #[error("KV bytes per token must be greater than zero")]
     ZeroBytesPerToken,
+    /// One slab's complete byte footprint cannot be represented in `u64`.
+    #[error(
+        "KV slab byte size overflows for {bytes_per_token} bytes per token and {block_tokens:?} tokens per block"
+    )]
+    SlabBytesOverflow {
+        /// Requested memory occupied by one token position.
+        bytes_per_token: u64,
+        /// Validated token width of each block.
+        block_tokens: BlockTokens,
+    },
     /// The budget is smaller than one slab.
     #[error("KV budget of {budget_bytes} bytes is below one slab ({slab_bytes} bytes)")]
     BudgetBelowOneSlab {

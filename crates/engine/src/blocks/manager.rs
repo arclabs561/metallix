@@ -1,6 +1,6 @@
 //! The block manager: pool accounting, block tables and the prefix cache.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use super::free_queue::FreeQueue;
 use super::hash::{BlockHash, HashKeys, hash_block};
@@ -44,11 +44,23 @@ impl Slot {
     }
 }
 
+/// Unforgeable identity retained by hits even after their pool is dropped.
+#[derive(Clone, Debug)]
+struct PoolId(Arc<()>);
+
+impl PartialEq for PoolId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for PoolId {}
+
 /// The cached prefix found for a prompt. Pass it to [`BlockManager::admit`]
 /// before any other mutation of the manager, or the admit may fail with
 /// [`BlockError::StalePrefixHit`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefixHit {
+    owner: PoolId,
     keys: HashKeys,
     blocks: Vec<BlockId>,
     hashes: Vec<BlockHash>,
@@ -114,8 +126,9 @@ struct Sequence {
 
 /// Block tables, reference counts, the free queue, and the prefix cache for
 /// one KV pool. See the [module docs](super) for the call sequence.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BlockManager {
+    owner: PoolId,
     config: PoolConfig,
     pool: Pool,
     sequences: HashMap<SequenceId, Sequence>,
@@ -135,12 +148,26 @@ struct Pool {
     published_tokens: usize,
 }
 
+// A manager clone owns independent mutable pool state, so old hits cannot
+// cross into it even while its blocks and hashes happen to be identical.
+impl Clone for BlockManager {
+    fn clone(&self) -> Self {
+        Self {
+            owner: PoolId(Arc::new(())),
+            config: self.config,
+            pool: self.pool.clone(),
+            sequences: self.sequences.clone(),
+        }
+    }
+}
+
 impl BlockManager {
     /// Creates a manager with every block free.
     #[must_use]
     pub fn new(config: PoolConfig) -> Self {
         let blocks = config.num_blocks();
         Self {
+            owner: PoolId(Arc::new(())),
             config,
             pool: Pool {
                 block_tokens: config.block_tokens().get() as usize,
@@ -314,6 +341,7 @@ impl BlockManager {
             }
         }
         PrefixHit {
+            owner: self.owner.clone(),
             keys,
             cached_tokens: blocks.len() * block_tokens,
             blocks,
@@ -325,15 +353,33 @@ impl BlockManager {
     /// Returns how many free blocks [`BlockManager::admit`] would consume for
     /// `hit` plus a first chunk of `chunk_tokens`: new blocks for the chunk
     /// plus hit blocks that are currently free.
-    #[must_use]
-    pub fn admit_cost(&self, hit: &PrefixHit, chunk_tokens: usize) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockError::StalePrefixHit`] when the hit belongs to another
+    /// manager (including a clone), or its blocks were evicted or re-keyed.
+    pub fn admit_cost(&self, hit: &PrefixHit, chunk_tokens: usize) -> Result<usize, BlockError> {
+        self.validate_hit(hit)?;
         let pinned_free = hit
             .blocks
             .iter()
             .filter(|block| self.pool.ref_counts[block.index() as usize] == 0)
             .count();
         let blocks = (hit.cached_tokens + chunk_tokens).div_ceil(self.pool.block_tokens);
-        pinned_free + blocks - hit.blocks.len()
+        Ok(pinned_free + blocks - hit.blocks.len())
+    }
+
+    fn validate_hit(&self, hit: &PrefixHit) -> Result<(), BlockError> {
+        // Check identity before using any block ID as an index.
+        if self.owner != hit.owner
+            || hit.blocks.iter().zip(&hit.hashes).any(|(block, hash)| {
+                self.pool.block_hashes[block.index() as usize] != Some(*hash)
+                    || self.pool.cached.get(hash) != Some(block)
+            })
+        {
+            return Err(BlockError::StalePrefixHit);
+        }
+        Ok(())
     }
 
     /// Admits a sequence: pins the cached prefix in `hit` and allocates slots
@@ -356,15 +402,7 @@ impl BlockManager {
         if self.sequences.contains_key(&seq) {
             return Err(BlockError::SequenceExists(seq));
         }
-        let pool = &mut self.pool;
-        let stale = hit.blocks.iter().zip(&hit.hashes).any(|(block, hash)| {
-            pool.block_hashes[block.index() as usize] != Some(*hash)
-                || pool.cached.get(hash) != Some(block)
-        });
-        if stale {
-            return Err(BlockError::StalePrefixHit);
-        }
-        let needed = self.admit_cost(&hit, chunk.len());
+        let needed = self.admit_cost(&hit, chunk.len())?;
         let pool = &mut self.pool;
         if needed > pool.free.len() {
             return Err(BlockError::OutOfBlocks {
@@ -749,5 +787,52 @@ impl Pool {
                 self.free.push_front(block.index());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::blocks::BlockTokens;
+
+    #[test]
+    fn cloned_manager_rejects_original_hit_and_accepts_own_lookup() {
+        let config = PoolConfig::new(BlockTokens::new(4).unwrap(), 1).unwrap();
+        let mut original = BlockManager::new(config);
+        let prompt = [1, 2, 3, 4, 5];
+        let hit = original.lookup_prefix(&prompt, HashKeys::new());
+        original.admit(SequenceId(1), hit, &prompt).unwrap();
+        original.commit(SequenceId(1)).unwrap();
+        original.free(SequenceId(1)).unwrap();
+        let hit = original.lookup_prefix(&prompt, HashKeys::new());
+        assert_eq!(hit.cached_tokens(), 4);
+
+        let mut cloned = original.clone();
+        let before = format!("{cloned:?}");
+        assert_eq!(cloned.admit_cost(&hit, 1), Err(BlockError::StalePrefixHit));
+        assert_eq!(
+            cloned.admit(SequenceId(2), hit.clone(), &prompt[4..]),
+            Err(BlockError::StalePrefixHit)
+        );
+        assert_eq!(format!("{cloned:?}"), before);
+        assert_eq!(original.admit_cost(&hit, 1), Ok(2));
+        let own = cloned.lookup_prefix(&prompt, HashKeys::new());
+        assert_eq!(own.cached_tokens(), 4);
+        assert_eq!(cloned.admit_cost(&own, 1), Ok(2));
+        cloned.admit(SequenceId(2), own, &prompt[4..]).unwrap();
+        cloned.commit(SequenceId(2)).unwrap();
+        assert_eq!(cloned.num_computed(SequenceId(2)), Ok(prompt.len()));
+        assert_eq!(original.sequences(), 0);
+    }
+
+    #[test]
+    fn admit_cost_rejects_foreign_empty_hit_without_mutation() {
+        let config = PoolConfig::new(BlockTokens::new(4).unwrap(), 1).unwrap();
+        let first = BlockManager::new(config);
+        let second = BlockManager::new(config);
+        let hit = first.lookup_prefix(&[1], HashKeys::new());
+        let before = format!("{second:?}");
+        assert_eq!(second.admit_cost(&hit, 1), Err(BlockError::StalePrefixHit));
+        assert_eq!(format!("{second:?}"), before);
     }
 }
