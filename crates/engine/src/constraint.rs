@@ -12,7 +12,7 @@ use llguidance::{
     Matcher, ParserFactory,
     api::{StopReason, TopLevelGrammar},
     token_bytes_from_tokenizer_json,
-    toktrie::{ApproximateTokEnv, TokEnv, TokRxInfo, TokTrie},
+    toktrie::{ApproximateTokEnv, SimpleVob, TokEnv, TokRxInfo, TokTrie},
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -438,7 +438,7 @@ impl JsonConstraintSession {
     fn first_legal_by_logit(&mut self, logits: &[f32]) -> Result<Option<usize>, ConstraintError> {
         if self.state != SessionState::Active
             || logits.len() != self.model_vocab_size
-            || logits.iter().any(|logit| !logit.is_finite())
+            || !all_finite(logits)
             || self.matcher.is_stopped()
             // With a canonical tokenizer, llguidance's mask allows only the
             // canonical tokenization of forced bytes, while validate_tokens
@@ -560,7 +560,10 @@ impl JsonConstraintSession {
     ///
     /// # Errors
     ///
-    /// The grammar state and decoded bytes advance only on success.
+    /// The grammar state and decoded bytes advance only on success. The mask
+    /// is computed on the live matcher, so an unexpected matcher failure
+    /// there, or while consuming a selected token, can leave the matcher in
+    /// its error state.
     ///
     /// * [`ConstraintError::TerminalSession`] after completion or
     ///   [`JsonConstraintSession::finish`].
@@ -583,8 +586,8 @@ impl JsonConstraintSession {
     /// Samples and consumes one grammar-allowed token from caller-provided entropy.
     ///
     /// The caller owns entropy and commits any RNG advance only after this method
-    /// succeeds. On error, the grammar's semantic state and decoded bytes are not
-    /// advanced.
+    /// succeeds. On error, the grammar's parse and decoded bytes are not
+    /// advanced (see the error-state caveat under Errors).
     ///
     /// The returned receipt distinguishes raw temperature-one model probability,
     /// its current grammar-conditioned form, and the deployed temperature-conditioned
@@ -593,7 +596,10 @@ impl JsonConstraintSession {
     ///
     /// # Errors
     ///
-    /// The grammar state and decoded bytes advance only on success.
+    /// The grammar state and decoded bytes advance only on success. The mask
+    /// is computed on the live matcher, so an unexpected matcher failure
+    /// there, or while consuming a selected token, can leave the matcher in
+    /// its error state.
     ///
     /// * [`ConstraintError::TerminalSession`] after completion or
     ///   [`JsonConstraintSession::finish`].
@@ -613,13 +619,14 @@ impl JsonConstraintSession {
         temperature: f64,
         uniform: f64,
     ) -> Result<(ConstraintStep, SamplingTokenLogProbs), ConstraintError> {
-        let matcher = self.prepare_selection(logits)?;
+        let mask = self.prepare_selection(logits)?;
+        self.fill_legal_mask(&mask);
         let selected = sample_categorical(logits, &self.legal_mask, temperature, uniform)
             .map_err(map_sampling_error)?;
         let selected_index = usize::try_from(selected.token_id)
             .map_err(|_| ConstraintError::TokenizerCompilation)?;
         let probabilities = self.logprobs_for(logits, selected_index, selected.sampling_logprob);
-        let step = self.commit_selection(matcher, selected_index)?;
+        let step = self.commit_in_place(selected_index)?;
         Ok((step, probabilities))
     }
 
@@ -628,92 +635,58 @@ impl JsonConstraintSession {
         logits: &[f32],
         collect_logprobs: bool,
     ) -> Result<(ConstraintStep, Option<TokenLogProbs>), ConstraintError> {
-        let matcher = self.prepare_selection(logits)?;
-        let mut selected = None;
-        let vocabulary_width = u32::try_from(self.tokenizer_vocab_size)
-            .map_err(|_| ConstraintError::TokenizerCompilation)?;
-        for token_id in 0..vocabulary_width {
-            let index =
-                usize::try_from(token_id).map_err(|_| ConstraintError::TokenizerCompilation)?;
-            if self.legal_mask[index]
-                && selected.is_none_or(|current| logits[index] > logits[current])
-            {
-                selected = Some(index);
-            }
-        }
-        let selected_index = selected.ok_or(ConstraintError::NoAllowedToken)?;
-        let logprobs = collect_logprobs.then(|| self.argmax_logprobs_for(logits, selected_index));
-        let step = self.commit_selection(matcher, selected_index)?;
+        let mask = self.prepare_selection(logits)?;
+        let selected_index = masked_argmax(&mask, logits, self.tokenizer_vocab_size)
+            .ok_or(ConstraintError::NoAllowedToken)?;
+        let logprobs = collect_logprobs.then(|| {
+            self.fill_legal_mask(&mask);
+            self.argmax_logprobs_for(logits, selected_index)
+        });
+        let step = self.commit_in_place(selected_index)?;
         Ok((step, logprobs))
     }
 
-    fn prepare_selection(&mut self, logits: &[f32]) -> Result<Matcher, ConstraintError> {
+    /// Checks the logits and computes the grammar mask on the live matcher.
+    ///
+    /// Computing a mask does not advance llguidance's parse; the selected
+    /// token is committed separately by [`Self::commit_in_place`].
+    fn prepare_selection(&mut self, logits: &[f32]) -> Result<SimpleVob, ConstraintError> {
         if self.state != SessionState::Active {
             return Err(ConstraintError::TerminalSession);
         }
         if logits.len() != self.model_vocab_size {
             return Err(ConstraintError::LogitWidth);
         }
-        if logits.iter().any(|logit| !logit.is_finite()) {
+        if !all_finite(logits) {
             return Err(ConstraintError::NonFiniteLogit);
         }
-        let mut matcher = self.matcher.deep_clone();
-        if matcher.is_stopped() {
+        if self.matcher.is_stopped() {
             return Err(ConstraintError::NonAcceptingStop);
         }
-        let mask = matcher
+        let mask = self
+            .matcher
             .compute_mask()
             .map_err(|_| ConstraintError::NonAcceptingStop)?;
-        self.legal_mask.fill(false);
-        let vocabulary_width = u32::try_from(self.tokenizer_vocab_size)
-            .map_err(|_| ConstraintError::TokenizerCompilation)?;
-        for token_id in 0..vocabulary_width {
-            if mask.is_allowed(token_id) {
-                let index =
-                    usize::try_from(token_id).map_err(|_| ConstraintError::TokenizerCompilation)?;
-                self.legal_mask[index] = true;
-            }
-        }
-        self.legal_mask
-            .iter()
-            .any(|allowed| *allowed)
-            .then_some(matcher)
+        mask.first_bit_set()
+            .is_some_and(|index| index < self.tokenizer_vocab_size)
+            .then_some(mask)
             .ok_or(ConstraintError::NoAllowedToken)
     }
 
-    fn commit_selection(
-        &mut self,
-        mut matcher: Matcher,
-        selected_index: usize,
-    ) -> Result<ConstraintStep, ConstraintError> {
-        let token_id =
-            u32::try_from(selected_index).map_err(|_| ConstraintError::TokenizerCompilation)?;
-        let token_bytes = if token_id == self.eos_token_id {
-            Vec::new()
-        } else {
-            self.env.tok_trie().decode(&[token_id])
-        };
-        if self.output.len().saturating_add(token_bytes.len()) > self.limits.max_output_bytes {
-            return Err(ConstraintError::OutputTooLarge);
-        }
-        matcher
-            .consume_token(token_id)
-            .map_err(|_| ConstraintError::NonAcceptingStop)?;
-        let complete = if matcher.is_stopped() {
-            if !is_accepting_terminal(&mut matcher)? {
-                return Err(ConstraintError::NonAcceptingStop);
+    /// Expands the mask into [`Self::legal_mask`] for the receipt and sampling
+    /// helpers, which take one flag per model row.
+    fn fill_legal_mask(&mut self, mask: &SimpleVob) {
+        self.legal_mask.fill(false);
+        for (word_index, &word) in mask.as_slice().iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let index = word_index * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if index >= self.tokenizer_vocab_size {
+                    return;
+                }
+                self.legal_mask[index] = true;
             }
-            true
-        } else {
-            false
-        };
-        self.matcher = matcher;
-        self.output.extend_from_slice(&token_bytes);
-        if complete {
-            self.state = SessionState::Complete;
-            Ok(ConstraintStep::Complete { token_id })
-        } else {
-            Ok(ConstraintStep::Token { token_id })
         }
     }
 
@@ -785,6 +758,57 @@ impl JsonConstraintSession {
             .map_err(|_| ConstraintError::SchemaValidation)?;
         Ok(value)
     }
+}
+
+/// Whether every logit is finite. A fold without early exit compiles to
+/// vector compares; `any` stops at the first hit and stays scalar.
+fn all_finite(logits: &[f32]) -> bool {
+    logits
+        .iter()
+        .fold(true, |finite, logit| finite & logit.is_finite())
+}
+
+/// The highest logit among the mask's tokens below `width`, ties to the lower
+/// ID, read one 32-token mask word at a time. A fully legal word (string
+/// interiors allow most of the vocabulary) takes a vectorizable maximum of
+/// its 32 logits first, and is searched only when it beats the best so far.
+fn masked_argmax(mask: &SimpleVob, logits: &[f32], width: usize) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (word_index, &word) in mask.as_slice().iter().enumerate() {
+        let base = word_index * 32;
+        if base >= width {
+            break;
+        }
+        if word == 0 {
+            continue;
+        }
+        if word == u32::MAX && base + 32 <= width {
+            let chunk = &logits[base..base + 32];
+            let maximum = chunk
+                .iter()
+                .fold(f32::NEG_INFINITY, |left, &right| left.max(right));
+            if best.is_none_or(|(_, current)| maximum > current) {
+                // Exact equality on purpose: `maximum` is one of these logits,
+                // and `==` treats -0.0 and 0.0 as tied, as the row scan's `>` does.
+                #[allow(clippy::float_cmp)]
+                let offset = chunk.iter().position(|&logit| logit == maximum)?;
+                best = Some((base + offset, maximum));
+            }
+            continue;
+        }
+        let mut bits = word;
+        while bits != 0 {
+            let index = base + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if index >= width {
+                break;
+            }
+            if best.is_none_or(|(_, current)| logits[index] > current) {
+                best = Some((index, logits[index]));
+            }
+        }
+    }
+    best.map(|(index, _)| index)
 }
 
 fn logsumexp_parts(values: &[f32]) -> (f64, f64) {
@@ -952,7 +976,7 @@ fn reject_non_202012_dialect(schema: &Value) -> Result<(), ConstraintError> {
 mod tests {
     use super::{
         ConstraintError, ConstraintFinish, ConstraintLimits, ConstraintStep,
-        JsonConstraintCompiler, JsonConstraintSession,
+        JsonConstraintCompiler, JsonConstraintSession, SessionState, is_accepting_terminal,
     };
     use serde_json::{Value, json};
 
@@ -1144,6 +1168,232 @@ mod tests {
             let expected = masked.select_argmax_by_mask(&values);
             assert_eq!(lazy.select_argmax(&values), expected, "favored {favored}");
             assert_eq!(lazy.decoded_bytes(), masked.decoded_bytes());
+        }
+    }
+
+    /// Selection as it was before the mask path read words and stopped
+    /// cloning, kept as an oracle independent of both selection paths: mask
+    /// on a clone of the matcher, a scan over every tokenizer row (higher
+    /// logit, then lower ID), and the commit on that clone. The session is
+    /// never advanced, so repeated calls show what the old path would do
+    /// after an error.
+    fn reference_select(
+        session: &JsonConstraintSession,
+        logits: &[f32],
+    ) -> Result<(ConstraintStep, Vec<u8>), ConstraintError> {
+        if session.state != SessionState::Active {
+            return Err(ConstraintError::TerminalSession);
+        }
+        if logits.len() != session.model_vocab_size {
+            return Err(ConstraintError::LogitWidth);
+        }
+        if logits.iter().any(|logit| !logit.is_finite()) {
+            return Err(ConstraintError::NonFiniteLogit);
+        }
+        let mut matcher = session.matcher.deep_clone();
+        if matcher.is_stopped() {
+            return Err(ConstraintError::NonAcceptingStop);
+        }
+        let mask = matcher
+            .compute_mask()
+            .map_err(|_| ConstraintError::NonAcceptingStop)?;
+        let mut selected: Option<usize> = None;
+        for index in 0..session.tokenizer_vocab_size {
+            let token = u32::try_from(index).expect("small vocabulary");
+            if mask.is_allowed(token)
+                && selected.is_none_or(|current| logits[index] > logits[current])
+            {
+                selected = Some(index);
+            }
+        }
+        let token_id = u32::try_from(selected.ok_or(ConstraintError::NoAllowedToken)?)
+            .expect("small vocabulary");
+        let bytes = if token_id == session.eos_token_id {
+            Vec::new()
+        } else {
+            session.env.tok_trie().decode(&[token_id])
+        };
+        if session.output.len() + bytes.len() > session.limits.max_output_bytes {
+            return Err(ConstraintError::OutputTooLarge);
+        }
+        matcher
+            .consume_token(token_id)
+            .map_err(|_| ConstraintError::NonAcceptingStop)?;
+        let step = if matcher.is_stopped() {
+            if !is_accepting_terminal(&mut matcher)? {
+                return Err(ConstraintError::NonAcceptingStop);
+            }
+            ConstraintStep::Complete { token_id }
+        } else {
+            ConstraintStep::Token { token_id }
+        };
+        let mut output = session.output.clone();
+        output.extend_from_slice(&bytes);
+        Ok((step, output))
+    }
+
+    /// A grammar that dead-ends: after the opening quote it needs `z`, which
+    /// the tokenizer cannot produce, so no token is legal.
+    fn dead_end_session() -> JsonConstraintSession {
+        JsonConstraintSession::new(
+            &tokenizer(),
+            EOS,
+            MODEL_VOCAB,
+            json!({"const": "zz"}),
+            limits(),
+        )
+        .expect("bounded dead-end session")
+    }
+
+    /// Once no token is legal, both selection paths report what the old
+    /// cloned path reported, and keep reporting it on the next call: the
+    /// in-place mask leaves the session where the clone left it.
+    #[test]
+    fn no_legal_token_errors_match_the_cloned_path_and_repeat() {
+        let mut values = vec![0.0; MODEL_VOCAB];
+        values[2] = 5.0;
+        for by_mask in [false, true] {
+            let mut session = dead_end_session();
+            let first = session.select_argmax(&values).expect("opening quote");
+            assert_eq!(first, ConstraintStep::Token { token_id: 2 });
+            for _ in 0..3 {
+                let expected = reference_select(&session, &values).map(|(step, _)| step);
+                assert!(expected.is_err(), "the dead end must leave no legal token");
+                let actual = if by_mask {
+                    session.select_argmax_by_mask(&values)
+                } else {
+                    session.select_argmax(&values)
+                };
+                assert_eq!(actual, expected, "by_mask {by_mask}");
+                assert_eq!(session.decoded_bytes(), b"\"");
+            }
+            let mut sampled = dead_end_session();
+            sampled.select_argmax(&values).expect("opening quote");
+            for _ in 0..2 {
+                let expected = reference_select(&sampled, &values).map(|(step, _)| step);
+                let actual = sampled
+                    .select_categorical_with_logprobs(&values, 1.0, 0.5)
+                    .map(|(step, _)| step);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    /// EOS ranked first before the boolean is complete: every path refuses it
+    /// as the oracle does, picks the next legal token, and once `true`
+    /// completes, a further call is a terminal error with the bytes kept.
+    #[test]
+    fn eos_before_completion_matches_the_oracle_on_every_path() {
+        let eos = usize::try_from(EOS).expect("small");
+        for path in 0..3 {
+            let mut session = boolean_session();
+            for favored in [6, 7, 8, 9, 9] {
+                let mut values = vec![0.0; MODEL_VOCAB];
+                values[eos] = 9.0;
+                values[favored] = 5.0;
+                let before = session.decoded_bytes().to_vec();
+                let expected = reference_select(&session, &values);
+                let actual = match path {
+                    0 => session.select_argmax(&values),
+                    1 => session.select_argmax_by_mask(&values),
+                    _ => session
+                        .select_argmax_with_logprobs(&values)
+                        .map(|(step, _)| step),
+                };
+                assert_eq!(
+                    actual,
+                    expected
+                        .as_ref()
+                        .map(|(step, _)| *step)
+                        .map_err(|error| *error)
+                );
+                let bytes = expected
+                    .as_ref()
+                    .map_or(before.as_slice(), |(_, bytes)| bytes.as_slice());
+                assert_eq!(
+                    session.decoded_bytes(),
+                    bytes,
+                    "path {path} favored {favored}"
+                );
+            }
+            assert_eq!(session.decoded_bytes(), b"true");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// Both selection paths pick what the pre-change oracle picks, step
+        /// for step, errors included and repeated after an error, over five
+        /// grammars (one dead-ends), with ties and padded model rows.
+        #[test]
+        fn selection_matches_the_reference_oracle(
+            kind in 0_usize..5,
+            steps in proptest::collection::vec(
+                proptest::collection::vec(-3_i8..=3, MODEL_VOCAB),
+                1..40,
+            ),
+        ) {
+            let make = || match kind {
+                0 => session(),
+                1 => boolean_session(),
+                2 => number_session(),
+                3 => forced_session(),
+                _ => dead_end_session(),
+            };
+            let (mut lazy, mut masked) = (make(), make());
+            for step in steps {
+                let values: Vec<f32> = step.into_iter().map(f32::from).collect();
+                let before = masked.decoded_bytes().to_vec();
+                let expected = reference_select(&masked, &values);
+                let expected_step = expected.as_ref().map(|(step, _)| *step).map_err(|error| *error);
+                proptest::prop_assert_eq!(lazy.select_argmax(&values), expected_step);
+                proptest::prop_assert_eq!(masked.select_argmax_by_mask(&values), expected_step);
+                // An error, a rolled-back non-accepting stop included, leaves
+                // the bytes where they were.
+                let bytes = expected.as_ref().map_or(before.as_slice(), |(_, bytes)| bytes.as_slice());
+                proptest::prop_assert_eq!(lazy.decoded_bytes(), bytes);
+                proptest::prop_assert_eq!(masked.decoded_bytes(), bytes);
+                if masked.is_complete() {
+                    break;
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// The word-at-a-time argmax picks what a scan over every row picks:
+        /// the highest legal logit below the width, ties to the lower ID,
+        /// across sparse words, fully legal words and a ragged last word.
+        #[test]
+        fn masked_argmax_matches_a_row_scan(
+            width in 1_usize..200,
+            dense_words in proptest::collection::vec(proptest::bool::ANY, 7),
+            sparse in proptest::collection::vec(proptest::bool::ANY, 224),
+            values in proptest::collection::vec(-3_i8..=3, 224),
+        ) {
+            let mut mask = llguidance::toktrie::SimpleVob::alloc(224);
+            for (index, &allowed) in sparse.iter().enumerate() {
+                if allowed || dense_words[index / 32] {
+                    mask.allow_token(u32::try_from(index).expect("small"));
+                }
+            }
+            // Signed zeros tie under `>`; alternate them so a tie between
+            // -0.0 and 0.0 must still go to the lower ID.
+            let logits: Vec<f32> = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| if value == 0 && index % 2 == 0 { -0.0 } else { f32::from(value) })
+                .collect();
+            let mut expected: Option<usize> = None;
+            for index in 0..width {
+                if mask.is_allowed(u32::try_from(index).expect("small"))
+                    && expected.is_none_or(|current| logits[index] > logits[current])
+                {
+                    expected = Some(index);
+                }
+            }
+            proptest::prop_assert_eq!(super::masked_argmax(&mask, &logits, width), expected);
         }
     }
 
