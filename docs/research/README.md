@@ -19,6 +19,7 @@ explicit gaps, not retrospectively pinned evidence.
 | What gates separate categorical sampling, particle control, and calibrated uncertainty? | [Sampling implementation gates](sampling-next-gates.md) |
 | How should multi-slot infilling sample the model's own conditional, and how is that measured? | [Infilling and distribution matching](infilling-distribution-match.md) |
 | How would diffusion text generation differ from the token-step decoder? | [Diffusion text models](diffusion-text.md) |
+| What changes when a model repeats its layers within each token? | [Looped Transformer state and execution](looped-transformers.md) |
 | Which other runtimes offer ideas worth testing? | [Runtime patterns](reusable-runtime-patterns.md) |
 | What have we reproduced for V4.1? | [Sparse-indexer qualification](../experiments/v41-candidates.md) |
 | What runs on Metal, and what improved? | [Qwen qualification ledger](../experiments/qwen-metal.md) |
