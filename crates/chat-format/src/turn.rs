@@ -45,7 +45,9 @@ pub enum ReasoningDialect {
 /// The tool and reasoning dialects of one checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct TurnFormat {
+    /// How the template marks tool calls.
     pub tools: ToolDialect,
+    /// How the template marks reasoning.
     pub reasoning: ReasoningDialect,
 }
 
@@ -169,8 +171,11 @@ impl ReasoningDialect {
 /// checked against their declared schemas. Each protocol only reshapes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssistantTurn {
+    /// The reasoning, empty when thinking was off or the dialect has none.
     pub reasoning: String,
+    /// The visible answer, without reasoning or tool-call markup.
     pub text: String,
+    /// The tool calls, in the order the model wrote them.
     pub calls: Vec<ChatToolCall>,
     /// The model ended its turn; otherwise it hit the output limit.
     pub complete: bool,
@@ -179,6 +184,11 @@ pub struct AssistantTurn {
 /// Parses one generation. `tools` are template-shaped definitions
 /// (`{"type": "function", "function": {...}}`). A truncated tool turn is an
 /// error, never a partial call.
+///
+/// # Errors
+///
+/// Returns a message for any failure of [`parse_turn_unchecked`], or when a
+/// call fails [`check_call`].
 pub fn parse_turn(
     format: TurnFormat,
     text: &str,
@@ -196,6 +206,11 @@ pub fn parse_turn(
 /// [`parse_turn`] without checking calls against their declarations, for
 /// a caller that reports an invalid call back to the model (the agent
 /// loop) through [`check_call`] instead of failing the turn.
+///
+/// # Errors
+///
+/// Returns a message when the dialect cannot parse the tool-call markup,
+/// or when a turn with tool calls is not `complete`.
 pub fn parse_turn_unchecked(
     format: TurnFormat,
     text: &str,
@@ -229,6 +244,12 @@ pub fn parse_turn_unchecked(
 
 /// Checks one call against the declared `tools`: the tool must exist and
 /// its arguments must satisfy the parameter schema.
+///
+/// # Errors
+///
+/// Returns a message when the tool is undeclared, its parameter schema
+/// does not compile under [`crate::validator`], or the arguments do not
+/// satisfy it.
 pub fn check_call(tools: &[Value], call: &ChatToolCall) -> Result<(), String> {
     let definition = tools
         .iter()

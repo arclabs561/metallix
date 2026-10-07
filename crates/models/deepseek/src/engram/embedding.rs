@@ -49,23 +49,37 @@ pub enum EngramEmbeddingError {
     EmptyDimension,
     /// Only the pinned source's complete 32-element scale groups are supported.
     #[error("Engram embedding width {width} is incompatible with group {group}")]
-    InvalidGroup { width: usize, group: usize },
+    InvalidGroup {
+        /// The table width.
+        width: usize,
+        /// The scale group width.
+        group: usize,
+    },
     /// A derived shape overflowed or exceeded the scalar reference cap.
     #[error("Engram embedding shape exceeds the bounded scalar reference")]
     ElementLimit,
     /// A supplied buffer does not match its declared dimensions.
     #[error("Engram embedding {field} length {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
     /// A selected value or its scale is nonfinite, or BF16 narrowing overflows.
     #[error("Engram embedding selected element {element} is nonfinite or overflows BF16")]
-    NonFinite { element: usize },
+    NonFinite {
+        /// Flat index of the selected element.
+        element: usize,
+    },
     /// A row source could not supply a selected row.
     #[error("Engram embedding rows unavailable: {reason}")]
-    RowsUnavailable { reason: String },
+    RowsUnavailable {
+        /// The row source's explanation.
+        reason: String,
+    },
 }
 
 /// Supplies selected rows of one layer's FP8 Engram table on demand.

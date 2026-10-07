@@ -46,29 +46,51 @@ pub enum SparseAttentionMetalError {
     Input(#[from] SparseAttentionError),
     /// The caller's explicit operation-count limit was exceeded.
     #[error("sparse-attention work estimate {required} exceeds maximum {maximum}")]
-    WorkloadTooLarge { required: usize, maximum: usize },
+    WorkloadTooLarge {
+        /// Estimated query-key products.
+        required: usize,
+        /// The caller's `max_work`.
+        maximum: usize,
+    },
     /// A per-row host gather or complete output exceeds this diagnostic limit.
     #[error("sparse-attention {field} has {elements} FP32 elements, maximum {maximum}")]
     ElementLimit {
+        /// The buffer or derived count's role.
         field: &'static str,
+        /// Its FP32 element count.
         elements: usize,
+        /// The fixed cap.
         maximum: usize,
     },
     /// A Metal shape cannot be represented by MLX's signed dimensions.
     #[error("{field} does not fit MLX's shape representation")]
-    DimensionOutOfRange { field: &'static str },
+    DimensionOutOfRange {
+        /// The dimension's role.
+        field: &'static str,
+    },
     /// A host staging allocation could not be reserved.
     #[error("could not reserve {elements} host-gather FP32 elements")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Elements that could not be reserved.
+        elements: usize,
+    },
     /// A finite input would leave the explicitly bounded FP32 logit envelope.
     #[error("{field} at index {index} exceeds the FP32 diagnostic precision envelope")]
-    PrecisionEnvelope { field: &'static str, index: usize },
+    PrecisionEnvelope {
+        /// The input's role.
+        field: &'static str,
+        /// Flat index into it.
+        index: usize,
+    },
     /// MLX could not construct, evaluate, or read back the Metal graph.
     #[error("MLX Metal sparse-attention evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
     /// GPU readback contained a non-finite scalar.
     #[error("GPU sparse-attention output at scalar index {index} is not finite")]
-    NonFiniteOutput { index: usize },
+    NonFiniteOutput {
+        /// Flat index into the output.
+        index: usize,
+    },
 }
 
 /// Runs a bounded FP32 Metal sparse-attention diagnostic.
@@ -88,6 +110,21 @@ pub enum SparseAttentionMetalError {
 /// reduces probabilities against the same gathered KV. All-masked rows remain
 /// zero without submitting an undefined softmax. The precision envelope is
 /// deliberately narrower than the CPU FP64 mathematical reference.
+///
+/// # Errors
+///
+/// * [`SparseAttentionMetalError::Input`] when the inputs break the
+///   sparse-attention contract.
+/// * [`SparseAttentionMetalError::WorkloadTooLarge`] and
+///   [`SparseAttentionMetalError::ElementLimit`] past `max_work` or the fixed
+///   element caps, and [`SparseAttentionMetalError::AllocationFailed`] when
+///   host staging cannot be reserved.
+/// * [`SparseAttentionMetalError::DimensionOutOfRange`] and
+///   [`SparseAttentionMetalError::PrecisionEnvelope`] for inputs the FP32
+///   diagnostic cannot represent faithfully.
+/// * [`SparseAttentionMetalError::Mlx`] and
+///   [`SparseAttentionMetalError::NonFiniteOutput`] when MLX fails or reads
+///   back a non-finite value.
 #[allow(
     clippy::too_many_lines,
     reason = "validation, host gather and the device loop share one lock scope"

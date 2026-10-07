@@ -101,6 +101,15 @@ pub struct MlxSafetensorsIndex {
 
 impl MlxSafetensorsIndex {
     /// Parses the standard MLX weight-map index.
+    ///
+    /// # Errors
+    ///
+    /// * [`CheckpointManifestError::IndexJson`] for malformed JSON.
+    /// * [`CheckpointManifestError::EmptyWeightMap`] for an empty weight map.
+    /// * [`CheckpointManifestError::BlankTensorName`],
+    ///   [`CheckpointManifestError::BlankPath`] and
+    ///   [`CheckpointManifestError::UnsafePath`] for a tensor name or shard
+    ///   path that is blank, absolute or escapes the checkpoint root.
     pub fn parse(json: &str) -> Result<Self, CheckpointManifestError> {
         let index: RawMlxSafetensorsIndex =
             serde_json::from_str(json).map_err(CheckpointManifestError::IndexJson)?;

@@ -16,22 +16,43 @@ pub(crate) const MAX_SELECTION_WIDTH: usize = 1 << 20;
 pub enum SelectionError {
     /// The score row exceeds the helper's explicit work bound.
     #[error("selection width {width} exceeds maximum {max_width}")]
-    WidthTooLarge { width: usize, max_width: usize },
+    WidthTooLarge {
+        /// The score row's width.
+        width: usize,
+        /// The largest accepted width.
+        max_width: usize,
+    },
     /// The reachable compressed length exceeded the supplied score row.
     #[error("reachable length {len} exceeds selection width {width}")]
-    LengthExceedsWidth { len: usize, width: usize },
+    LengthExceedsWidth {
+        /// The supplied `compress_len`.
+        len: usize,
+        /// The score row's width.
+        width: usize,
+    },
     /// A score was not finite or negative infinity.
     #[error("selection logit at position {position} is neither finite nor negative infinity")]
-    InvalidLogit { position: usize },
+    InvalidLogit {
+        /// Index into the score row.
+        position: usize,
+    },
     /// A position outside the reachable prefix was not already masked.
     #[error("unreachable selection position {position} must be negative infinity")]
-    UnmaskedFuturePosition { position: usize },
+    UnmaskedFuturePosition {
+        /// Index into the score row, at or beyond `compress_len`.
+        position: usize,
+    },
     /// A score tie across the cutoff would require inventing a `PyTorch` tie order.
     #[error("equal scores straddle the final Top-K cutoff")]
     AmbiguousCutoffTie,
     /// A reachable selected position cannot be offset into the `i32` API result.
     #[error("offset {offset} plus reachable position {position} does not fit i32")]
-    OffsetOutOfRange { offset: usize, position: usize },
+    OffsetOutOfRange {
+        /// The supplied `offset`.
+        offset: usize,
+        /// The selected reachable position.
+        position: usize,
+    },
 }
 
 /// Selects one final V4.1 index-score row into position-sorted API indices.
@@ -41,6 +62,19 @@ pub enum SelectionError {
 /// `-∞` scores remain valid selected positions; selected future positions map
 /// to `-1`. Cutoff ties are rejected unless every position in the tied group
 /// is causally unreachable, since their observable result is then identical.
+///
+/// # Errors
+///
+/// * [`SelectionError::WidthTooLarge`] for a row wider than the work bound.
+/// * [`SelectionError::LengthExceedsWidth`] when `compress_len` passes the
+///   row's width.
+/// * [`SelectionError::InvalidLogit`] for a NaN or positive infinite score,
+///   and [`SelectionError::UnmaskedFuturePosition`] for a score past
+///   `compress_len` that is not negative infinity.
+/// * [`SelectionError::AmbiguousCutoffTie`] when reachable equal scores
+///   straddle the Top-K cutoff.
+/// * [`SelectionError::OffsetOutOfRange`] when `offset` plus a selected
+///   position does not fit `i32`.
 pub fn select_indices(
     logits: &[f32],
     compress_len: usize,

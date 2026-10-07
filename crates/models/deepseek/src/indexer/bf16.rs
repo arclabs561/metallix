@@ -160,6 +160,22 @@ pub enum Bf16MetalScoreError {
 /// Inputs must be finite; all shape/work checks, including the effective
 /// [`MAX_BF16_LINEAR_ELEMENTS`] per-buffer limit of the reused dot primitive,
 /// complete before any output buffer allocation.
+///
+/// # Errors
+///
+/// * [`Bf16IndexScoreError::EmptyInput`], [`Bf16IndexScoreError::QueryShape`],
+///   [`Bf16IndexScoreError::KeyShape`] and
+///   [`Bf16IndexScoreError::HeadWeightCount`] when the inputs do not form
+///   whole heads and key positions with one weight per head.
+/// * [`Bf16IndexScoreError::ShapeOverflow`],
+///   [`Bf16IndexScoreError::WorkloadTooLarge`] and
+///   [`Bf16IndexScoreError::ScalarWorkloadTooLarge`] past the work caps.
+/// * [`Bf16IndexScoreError::NonFiniteInput`] for a NaN or infinite input.
+/// * [`Bf16IndexScoreError::AllocationFailed`] when staging cannot be
+///   reserved.
+/// * [`Bf16IndexScoreError::Linear`],
+///   [`Bf16IndexScoreError::NonFiniteIntermediate`] and
+///   [`Bf16IndexScoreError::NonFiniteOutput`] when a stage overflows.
 pub fn index_scores_bf16_reference(
     query: &[u16],
     keys: &[u16],
@@ -252,6 +268,13 @@ pub fn index_scores_bf16_reference(
 /// dot, rectification, and signed weighting, promotes only the head reduction
 /// to FP32, and narrows its result back to BF16. The scalar reference remains
 /// the source staging authority.
+///
+/// # Errors
+///
+/// Returns [`Bf16MetalScoreError::Reference`] for any input the scalar
+/// reference rejects, or a non-finite device result, and
+/// [`Bf16MetalScoreError::Mlx`] when MLX cannot build, evaluate or read the
+/// graph.
 #[cfg(feature = "metal")]
 pub fn index_scores_bf16_metal(
     query: &[u16],

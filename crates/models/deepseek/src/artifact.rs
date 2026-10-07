@@ -129,13 +129,22 @@ pub enum V41ArtifactInspectionError {
     InvalidRoot,
     /// A required artifact file is absent, unreadable, or not a regular file.
     #[error("required artifact file {artifact} is not a readable regular file")]
-    RequiredFile { artifact: &'static str },
+    RequiredFile {
+        /// The artifact's path relative to the root.
+        artifact: &'static str,
+    },
     /// A required metadata file exceeds the local inspection budget.
     #[error("artifact file {artifact} exceeds the {MAX_METADATA_BYTES}-byte inspection limit")]
-    MetadataTooLarge { artifact: &'static str },
+    MetadataTooLarge {
+        /// The artifact's path relative to the root.
+        artifact: &'static str,
+    },
     /// A required artifact file was not UTF-8 text.
     #[error("artifact file {artifact} is not UTF-8 text")]
-    InvalidUtf8 { artifact: &'static str },
+    InvalidUtf8 {
+        /// The artifact's path relative to the root.
+        artifact: &'static str,
+    },
     /// The V4.1 configuration failed the existing text-contract validation.
     #[error(transparent)]
     Config(#[from] V41ConfigError),

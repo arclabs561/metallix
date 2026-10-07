@@ -179,6 +179,15 @@ pub struct V41ExpertI8ScalePairs {
 
 impl V41ExpertI8ScalePairs {
     /// Validates all three canonical projection pairs for one routed expert.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41ExpertPayloadError::HeaderIndex`] when the header and the index
+    ///   disagree on `shard`.
+    /// * [`V41ExpertPayloadError::Pair`] when a projection's code and scale
+    ///   pair is malformed or assigned elsewhere.
+    /// * [`V41ExpertPayloadError::ProjectionGeometry`] when the three shapes
+    ///   do not form one expert.
     pub fn parse(
         header: &V41SafetensorsHeader,
         index: &V41SafetensorsIndex,
@@ -233,6 +242,20 @@ impl V41ExpertI8ScalePairs {
     /// before payload allocation or reading. Its regular-file length must equal
     /// the header's declared complete shard length. The selected intervals are
     /// budgeted before allocating any returned buffer.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41ExpertPayloadError::PayloadBudget`] and
+    ///   [`V41ExpertPayloadError::PayloadLengthOverflow`] past the byte limit.
+    /// * [`V41ExpertPayloadError::NotRegularFile`],
+    ///   [`V41ExpertPayloadError::ShardLength`],
+    ///   [`V41ExpertPayloadError::Header`],
+    ///   [`V41ExpertPayloadError::HeaderMismatch`] and
+    ///   [`V41ExpertPayloadError::PairHeaderMismatch`] when the file is not
+    ///   the shard these pairs were parsed from.
+    /// * [`V41ExpertPayloadError::Io`] and [`V41ExpertPayloadError::Allocation`]
+    ///   when reading fails.
+    /// * [`V41ExpertPayloadError::NonFiniteScale`] for a NaN scale code.
     pub fn read_local_shard(
         &self,
         shard: &Path,
@@ -373,7 +396,9 @@ pub enum V41ExpertPayloadError {
         "selected expert payload needs {requested_bytes} bytes, above the {max_bytes}-byte limit"
     )]
     PayloadBudget {
+        /// Bytes the six ranges need.
         requested_bytes: u64,
+        /// The limit that applied.
         max_bytes: u64,
     },
     /// Summing selected ranges overflowed before allocation.
@@ -385,7 +410,9 @@ pub enum V41ExpertPayloadError {
     /// Local shard length differs from supplied header's declared length.
     #[error("selected expert shard length is {actual_bytes}, expected {expected_bytes}")]
     ShardLength {
+        /// The file's size.
         actual_bytes: u64,
+        /// The size the header declares.
         expected_bytes: u64,
     },
     /// Local bounded header differs from the header that selected the ranges.
@@ -409,7 +436,9 @@ pub enum V41ExpertPayloadError {
     /// An E8M0 scale code denotes NaN.
     #[error("selected expert {projection:?} scale {index} is nonfinite")]
     NonFiniteScale {
+        /// The projection.
         projection: V41ExpertProjection,
+        /// Index into its scale bytes.
         index: usize,
     },
 }

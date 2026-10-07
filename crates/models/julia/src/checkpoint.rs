@@ -27,17 +27,26 @@ const MAX_HEADER_BYTES: u64 = 1024 * 1024;
 /// The `architecture` named by a Julia checkpoint's configuration documents.
 pub const ARCHITECTURE: &str = "JuliaDecisionModel";
 
+/// A Julia checkpoint that cannot be read or does not match the published
+/// artifact.
 #[derive(Debug, Error)]
 pub enum JuliaCheckpointError {
+    /// A file could not be opened or read.
     #[error("Julia checkpoint {path} could not be read: {source}")]
     Io {
+        /// The file.
         path: PathBuf,
+        /// The I/O failure.
         source: std::io::Error,
     },
+    /// A configuration document, the safetensors header or the directory
+    /// layout differs from the published artifact.
     #[error("Julia checkpoint is malformed: {0}")]
     Format(String),
+    /// The encoder rejected its weights or a token ID.
     #[error(transparent)]
     Encoder(#[from] JuliaEncoderError),
+    /// The decision head rejected its weights.
     #[error(transparent)]
     Head(#[from] JuliaHeadError),
 }
@@ -234,6 +243,18 @@ impl JuliaCheckpoint {
     }
 
     /// Loads `dir` after requiring the published artifact layout.
+    ///
+    /// `dir` must hold `config.json`, `julia_config.json`,
+    /// `encoder/config.json`, `tokenizer/tokenizer.json` and
+    /// `model.safetensors`. Every tensor is read into memory as F32.
+    ///
+    /// # Errors
+    ///
+    /// * [`JuliaCheckpointError::Io`] when a file cannot be read.
+    /// * [`JuliaCheckpointError::Format`] when a configuration document fails
+    ///   [`JuliaCheckpoint::check_config`], a required file is missing, or the
+    ///   safetensors header differs from the published tensor set.
+    /// * [`JuliaCheckpointError::Head`] when the head weights are not finite.
     #[tracing::instrument(
         name = "julia.checkpoint.load",
         level = "info",
@@ -342,6 +363,11 @@ impl JuliaCheckpoint {
     ///
     /// ponytail: clones the 22 layers (about 156 MB) per call; share them if
     /// per-question latency matters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JuliaCheckpointError::Encoder`] when a token ID is outside the
+    /// vocabulary or `token_ids` holds no IDs or more than 126 distinct ones.
     pub fn encoder(&self, token_ids: &[u64]) -> Result<JuliaEncoder, JuliaCheckpointError> {
         let mut ids = token_ids.to_vec();
         ids.sort_unstable();
@@ -364,6 +390,7 @@ impl JuliaCheckpoint {
         })?)
     }
 
+    /// The decision head, built once at load.
     #[must_use]
     pub fn head(&self) -> &DecisionHead {
         &self.head

@@ -27,8 +27,11 @@ pub const MAX_SHARED_EXPERT_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// One canonical shared-expert projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum V41SharedExpertProjection {
+    /// `w1`, the gate projection `[intermediate, hidden]`.
     W1,
+    /// `w2`, the down projection `[hidden, intermediate]`.
     W2,
+    /// `w3`, the up projection `[intermediate, hidden]`.
     W3,
 }
 
@@ -50,6 +53,20 @@ impl V41SharedExpertFp8ScalePair {
     ///
     /// Layer IDs are syntactic. The caller must bind them to model configuration
     /// and authenticate the checkpoint revision; headers alone do not do either.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41SharedExpertFp8ScalePairError::InvalidWeightName`] for any other
+    ///   name.
+    /// * [`V41SharedExpertFp8ScalePairError::MissingIndexTensor`],
+    ///   [`V41SharedExpertFp8ScalePairError::WrongIndexShard`] and
+    ///   [`V41SharedExpertFp8ScalePairError::MissingHeaderTensor`] when the
+    ///   index or header does not place both tensors in `shard`.
+    /// * [`V41SharedExpertFp8ScalePairError::WeightDtype`],
+    ///   [`V41SharedExpertFp8ScalePairError::ScaleDtype`],
+    ///   [`V41SharedExpertFp8ScalePairError::WeightShape`] and
+    ///   [`V41SharedExpertFp8ScalePairError::ScaleShape`] when the pair's
+    ///   storage is not the source layout.
     pub fn parse(
         header: &V41SafetensorsHeader,
         index: &V41SafetensorsIndex,
@@ -85,34 +102,42 @@ impl V41SharedExpertFp8ScalePair {
             shape,
         })
     }
+    /// The layer index from the weight name.
     #[must_use]
     pub const fn layer(&self) -> u64 {
         self.layer
     }
+    /// Which projection this pair is.
     #[must_use]
     pub const fn projection(&self) -> V41SharedExpertProjection {
         self.projection
     }
+    /// The shard file name that holds both tensors.
     #[must_use]
     pub fn shard(&self) -> &str {
         &self.shard
     }
+    /// The weight tensor's name.
     #[must_use]
     pub fn weight_name(&self) -> &str {
         &self.weight_name
     }
+    /// The scale tensor's name, the weight name with `.scale` for `.weight`.
     #[must_use]
     pub fn scale_name(&self) -> &str {
         &self.scale_name
     }
+    /// The weight's byte range in the shard.
     #[must_use]
     pub fn weight_range(&self) -> &V41TensorRange {
         &self.weight_range
     }
+    /// The scale's byte range in the shard.
     #[must_use]
     pub fn scale_range(&self) -> &V41TensorRange {
         &self.scale_range
     }
+    /// The weight shape `[N, K]`.
     #[must_use]
     pub const fn shape(&self) -> [u64; 2] {
         self.shape
@@ -129,6 +154,15 @@ pub struct V41SharedExpertFp8ScalePairs {
 
 impl V41SharedExpertFp8ScalePairs {
     /// Validates all shared-expert projections assigned to one exact shard.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41SharedExpertPayloadError::HeaderIndex`] when the header and the
+    ///   index disagree on `shard`.
+    /// * [`V41SharedExpertPayloadError::Pair`] when a projection's pair is
+    ///   invalid, as [`V41SharedExpertFp8ScalePair::parse`] describes.
+    /// * [`V41SharedExpertPayloadError::ProjectionGeometry`] when the three
+    ///   shapes do not fit together.
     pub fn parse(
         header: &V41SafetensorsHeader,
         index: &V41SafetensorsIndex,
@@ -160,22 +194,27 @@ impl V41SharedExpertFp8ScalePairs {
         validate_geometry(&w1, &w2, &w3)?;
         Ok(Self { w1, w2, w3 })
     }
+    /// The `w1` pair.
     #[must_use]
     pub const fn w1(&self) -> &V41SharedExpertFp8ScalePair {
         &self.w1
     }
+    /// The `w2` pair.
     #[must_use]
     pub const fn w2(&self) -> &V41SharedExpertFp8ScalePair {
         &self.w2
     }
+    /// The `w3` pair.
     #[must_use]
     pub const fn w3(&self) -> &V41SharedExpertFp8ScalePair {
         &self.w3
     }
+    /// The model's hidden width, `w1`'s `K`.
     #[must_use]
     pub const fn hidden_width(&self) -> u64 {
         self.w1.shape()[1]
     }
+    /// The shared expert's intermediate width, `w1`'s `N`.
     #[must_use]
     pub const fn intermediate_width(&self) -> u64 {
         self.w1.shape()[0]
@@ -185,6 +224,22 @@ impl V41SharedExpertFp8ScalePairs {
     ///
     /// `max_bytes` bounds their aggregate raw size, not process memory. This
     /// revalidates layout and finite storage codes, not a payload digest.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41SharedExpertPayloadError::PayloadBudget`] and
+    ///   [`V41SharedExpertPayloadError::PayloadLengthOverflow`] past the byte
+    ///   limit.
+    /// * [`V41SharedExpertPayloadError::NotRegularFile`],
+    ///   [`V41SharedExpertPayloadError::ShardLength`],
+    ///   [`V41SharedExpertPayloadError::Header`],
+    ///   [`V41SharedExpertPayloadError::HeaderMismatch`] and
+    ///   [`V41SharedExpertPayloadError::PairHeaderMismatch`] when the file is
+    ///   not the shard these pairs were parsed from.
+    /// * [`V41SharedExpertPayloadError::Io`] and
+    ///   [`V41SharedExpertPayloadError::Allocation`] when reading fails.
+    /// * [`V41SharedExpertPayloadError::NonFiniteCode`] and
+    ///   [`V41SharedExpertPayloadError::NonFiniteScale`] for a NaN storage code.
     pub fn read_local_shard(
         &self,
         shard: &Path,
@@ -257,10 +312,12 @@ pub struct V41SharedExpertProjectionPayload {
     scales: Vec<u8>,
 }
 impl V41SharedExpertProjectionPayload {
+    /// The E4M3FN weight bytes.
     #[must_use]
     pub fn codes(&self) -> &[u8] {
         &self.codes
     }
+    /// The E8M0 scale bytes.
     #[must_use]
     pub fn scales(&self) -> &[u8] {
         &self.scales
@@ -274,14 +331,17 @@ pub struct V41SharedExpertFp8ScalePayload {
     w3: V41SharedExpertProjectionPayload,
 }
 impl V41SharedExpertFp8ScalePayload {
+    /// The `w1` bytes.
     #[must_use]
     pub const fn w1(&self) -> &V41SharedExpertProjectionPayload {
         &self.w1
     }
+    /// The `w2` bytes.
     #[must_use]
     pub const fn w2(&self) -> &V41SharedExpertProjectionPayload {
         &self.w2
     }
+    /// The `w3` bytes.
     #[must_use]
     pub const fn w3(&self) -> &V41SharedExpertProjectionPayload {
         &self.w3
@@ -292,73 +352,125 @@ impl V41SharedExpertFp8ScalePayload {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum V41SharedExpertPayloadError {
+    /// The header and the safetensors index disagree on the shard.
     #[error("shared expert header/index identity failed: {0}")]
     HeaderIndex(V41SafetensorsHeaderError),
+    /// One projection's weight and scale pair is invalid.
     #[error("shared expert pair failed: {0}")]
     Pair(#[from] V41SharedExpertFp8ScalePairError),
+    /// `w1` and `w3` differ in shape, or `w2` is not their transpose.
     #[error("shared expert projections do not have w1/w3 equal and w2 transposed geometry")]
     ProjectionGeometry,
+    /// The six ranges together pass the byte limit.
     #[error(
         "shared expert payload needs {requested_bytes} bytes, above the {max_bytes}-byte limit"
     )]
     PayloadBudget {
+        /// Bytes the six ranges need.
         requested_bytes: u64,
+        /// The smaller of the caller's limit and the fixed cap.
         max_bytes: u64,
     },
+    /// The total payload length does not fit in `u64`.
     #[error("shared expert payload length overflowed")]
     PayloadLengthOverflow,
+    /// The shard path is not a regular file.
     #[error("shared expert shard is not a regular file")]
     NotRegularFile,
+    /// The shard's size differs from the header's.
     #[error("shared expert shard length is {actual_bytes}, expected {expected_bytes}")]
     ShardLength {
+        /// The file's size.
         actual_bytes: u64,
+        /// The size the header declares.
         expected_bytes: u64,
     },
+    /// The shard's header differs from the one supplied.
     #[error("shared expert shard header differs from supplied header")]
     HeaderMismatch,
+    /// A cached tensor range differs from the reread header.
     #[error("shared expert cached range differs from revalidated header tensor {tensor}")]
-    PairHeaderMismatch { tensor: String },
+    PairHeaderMismatch {
+        /// The tensor whose range changed.
+        tensor: String,
+    },
+    /// The shard's header does not parse.
     #[error("could not parse shared expert shard header: {0}")]
     Header(#[from] V41SafetensorsHeaderError),
+    /// Reading the shard failed.
     #[error("could not read shared expert payload: {0}")]
     Io(#[source] std::io::Error),
+    /// A payload buffer could not be reserved.
     #[error("could not allocate shared expert payload range")]
     Allocation,
+    /// A weight byte is an E4M3FN NaN code.
     #[error("shared expert {projection:?} E4M3 code {index} is nonfinite")]
     NonFiniteCode {
+        /// The projection.
         projection: V41SharedExpertProjection,
+        /// Index into its weight bytes.
         index: usize,
     },
+    /// A scale byte is the E8M0 NaN code.
     #[error("shared expert {projection:?} E8M0 scale {index} is nonfinite")]
     NonFiniteScale {
+        /// The projection.
         projection: V41SharedExpertProjection,
+        /// Index into its scale bytes.
         index: usize,
     },
 }
 
+/// A shared-expert weight and scale pair that does not match the source layout.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum V41SharedExpertFp8ScalePairError {
+    /// The name is not `layers.<L>.ffn.shared_experts.w{1,2,3}.weight`.
     #[error("unsupported canonical shared expert weight name {weight_name}")]
-    InvalidWeightName { weight_name: String },
+    InvalidWeightName {
+        /// The rejected name.
+        weight_name: String,
+    },
+    /// The safetensors index does not list the tensor.
     #[error("selected tensor {tensor} is absent from the safetensors index")]
-    MissingIndexTensor { tensor: String },
+    MissingIndexTensor {
+        /// The tensor name.
+        tensor: String,
+    },
+    /// The index assigns the tensor to another shard.
     #[error("selected tensor {tensor} is assigned to {indexed_shard}, not {expected_shard}")]
     WrongIndexShard {
+        /// The tensor name.
         tensor: String,
+        /// The shard being parsed.
         expected_shard: String,
+        /// The shard the index names.
         indexed_shard: String,
     },
+    /// The shard header does not list the tensor.
     #[error("selected tensor {tensor} is absent from the safetensors header")]
-    MissingHeaderTensor { tensor: String },
+    MissingHeaderTensor {
+        /// The tensor name.
+        tensor: String,
+    },
+    /// The weight is not stored as E4M3FN.
     #[error("shared expert weight dtype is {actual:?}, expected F8E4M3Fn")]
-    WeightDtype { actual: V41StorageDtype },
+    WeightDtype {
+        /// The stored dtype.
+        actual: V41StorageDtype,
+    },
+    /// The scale is not stored as E8M0.
     #[error("shared expert scale dtype is {actual:?}, expected F8E8M0Fnu")]
-    ScaleDtype { actual: V41StorageDtype },
+    ScaleDtype {
+        /// The stored dtype.
+        actual: V41StorageDtype,
+    },
+    /// The weight is not a nonzero `[N, K]` with both multiples of 32.
     #[error(
         "shared expert weight shape must be nonzero rank-two [N, K] with dimensions divisible by 32"
     )]
     WeightShape,
+    /// The scale is not `[N / 32, K / 32]`.
     #[error("shared expert scale shape must be exactly [N / 32, K / 32]")]
     ScaleShape,
 }

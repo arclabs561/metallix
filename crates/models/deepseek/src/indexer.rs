@@ -46,50 +46,90 @@ pub const MAX_INDEX_REFERENCE_TERMS: usize = 16 * 1024 * 1024;
 pub enum IndexScoreError {
     /// The head dimension cannot be represented in MLX's signed shape type.
     #[error("{field} does not fit MLX's shape representation")]
-    DimensionOutOfRange { field: &'static str },
+    DimensionOutOfRange {
+        /// The dimension's role.
+        field: &'static str,
+    },
     /// The query cannot be divided into complete heads.
     #[error("query length {actual} is not divisible by head dimension {head_dim}")]
-    QueryShape { actual: usize, head_dim: usize },
+    QueryShape {
+        /// Query elements supplied.
+        actual: usize,
+        /// Elements per head.
+        head_dim: usize,
+    },
     /// The key buffer cannot be divided into complete key positions.
     #[error("key length {actual} is not divisible by head dimension {head_dim}")]
-    KeyShape { actual: usize, head_dim: usize },
+    KeyShape {
+        /// Key elements supplied.
+        actual: usize,
+        /// Elements per key position.
+        head_dim: usize,
+    },
     /// There is no query head, key position, or head weight to score.
     #[error("{field} must not be empty")]
-    EmptyInput { field: &'static str },
+    EmptyInput {
+        /// The empty input's role.
+        field: &'static str,
+    },
     /// The supplied weights do not provide one signed weight per query head.
     #[error("head weight count {actual} does not equal query head count {expected}")]
-    HeadWeightCount { expected: usize, actual: usize },
+    HeadWeightCount {
+        /// Query heads.
+        expected: usize,
+        /// Weights supplied.
+        actual: usize,
+    },
     /// The core score matrix would exceed this diagnostic's explicit bound.
     #[error(
         "index-score core matrix {heads} heads × {positions} positions exceeds {max_elements} elements"
     )]
     WorkloadTooLarge {
+        /// Query heads.
         heads: usize,
+        /// Key positions.
         positions: usize,
+        /// The fixed score-matrix cap.
         max_elements: usize,
     },
     /// A caller supplied a non-finite FP32 operand.
     #[error("{field} at position {position} is not finite")]
     NonFiniteInput {
+        /// The input's role.
         field: &'static str,
+        /// Flat index into it.
         position: usize,
     },
     /// The CPU dot products exceed the explicit scalar work budget.
     #[error("CPU index-score dot products exceed {max_terms} scalar terms")]
-    ScalarWorkloadTooLarge { max_terms: usize },
+    ScalarWorkloadTooLarge {
+        /// The fixed scalar-term cap.
+        max_terms: usize,
+    },
     /// The CPU result buffer could not be reserved.
     #[error("could not allocate {elements} CPU index scores")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Scores that could not be reserved.
+        elements: usize,
+    },
     /// A finite input overflowed during the ordered CPU reduction.
     #[error("CPU index-score intermediate for head {head}, position {position} is not finite")]
-    NonFiniteIntermediate { head: usize, position: usize },
+    NonFiniteIntermediate {
+        /// Query head.
+        head: usize,
+        /// Key position.
+        position: usize,
+    },
     /// MLX could not construct, evaluate, or read back the GPU graph.
     #[cfg(feature = "metal")]
     #[error("MLX Metal index-score evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
     /// Evaluation did not produce finite scores.
     #[error("index score at position {position} is not finite")]
-    NonFiniteOutput { position: usize },
+    NonFiniteOutput {
+        /// Key position.
+        position: usize,
+    },
 }
 
 /// Computes one query's V4.1 index scores on the GPU from post-RoPE FP32 inputs.
@@ -98,6 +138,19 @@ pub enum IndexScoreError {
 /// `[positions, head_dim]`; and `head_weights` supplies one signed scalar per
 /// head. The operation is GPU-only after CPU validation: `q @ kᵀ`, `ReLU`,
 /// signed head weighting, and reduction across heads.
+///
+/// # Errors
+///
+/// * [`IndexScoreError::EmptyInput`], [`IndexScoreError::QueryShape`],
+///   [`IndexScoreError::KeyShape`] and [`IndexScoreError::HeadWeightCount`]
+///   when the inputs do not form whole heads and key positions with one
+///   weight per head.
+/// * [`IndexScoreError::DimensionOutOfRange`] and
+///   [`IndexScoreError::WorkloadTooLarge`] for shapes past MLX's range or the
+///   score-matrix cap.
+/// * [`IndexScoreError::NonFiniteInput`] for a NaN or infinite input.
+/// * [`IndexScoreError::Mlx`] and [`IndexScoreError::NonFiniteOutput`] when
+///   MLX fails or produces a non-finite score.
 #[cfg(feature = "metal")]
 pub fn index_scores_f32(
     query: &[f32],

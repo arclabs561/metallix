@@ -30,6 +30,15 @@ pub struct CompressedKvLayout {
 
 impl CompressedKvLayout {
     /// Creates a bounded source-shaped compressed-KV layout.
+    ///
+    /// # Errors
+    ///
+    /// * [`CompressedKvLayoutError::RopeExceedsValue`] and
+    ///   [`CompressedKvLayoutError::UngroupedValueWidth`] for widths the
+    ///   source path cannot use.
+    /// * [`CompressedKvLayoutError::ShapeOverflow`] and
+    ///   [`CompressedKvLayoutError::ElementLimit`] when one position's values
+    ///   do not fit the bound.
     pub fn new(
         batches: NonZeroUsize,
         value_dimension: NonZeroUsize,
@@ -82,54 +91,99 @@ pub struct CompressedKvDiagnostic {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CompressedKvLayoutError {
+    /// A derived shape does not fit in `usize`.
     #[error("compressed-KV shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// The rotary tail is wider than one value row.
     #[error("rope width {rope_width} exceeds compressed-KV value dimension {value_dimension}")]
     RopeExceedsValue {
+        /// Rotary tail width, `2 * rope_pairs`.
         rope_width: usize,
+        /// Value width.
         value_dimension: usize,
     },
+    /// The value width is not a multiple of the FP4 group of 16.
     #[error("compressed-KV value width {width} is not divisible by group 16")]
-    UngroupedValueWidth { width: usize },
+    UngroupedValueWidth {
+        /// Value width.
+        width: usize,
+    },
+    /// One position's values would pass the fixed element cap.
     #[error(
         "compressed-KV one-position buffer has {elements} elements, maximum is {MAX_COMPRESSED_KV_ELEMENTS}"
     )]
-    ElementLimit { elements: usize },
+    ElementLimit {
+        /// `batches * value_dimension`.
+        elements: usize,
+    },
 }
 
 /// Rejected compressed-KV preparation input.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CompressedKvError {
+    /// The layout is invalid.
     #[error(transparent)]
     Layout(#[from] CompressedKvLayoutError),
+    /// The rotary stage rejected its input.
     #[error(transparent)]
     Rotary(#[from] RotaryError),
+    /// FP4 reconstruction rejected its input or overflowed.
     #[error(transparent)]
     Fp4(#[from] Fp4ActivationError),
+    /// The latent is empty or not whole `[batch, position]` rows.
     #[error("compressed-KV latent length is {actual}; expected a nonempty multiple of {stride}")]
-    LatentLength { actual: usize, stride: usize },
+    LatentLength {
+        /// Supplied length.
+        actual: usize,
+        /// Elements per compressed position across all batches.
+        stride: usize,
+    },
+    /// The frequencies do not match the positions and rotary pairs.
     #[error("compressed-KV frequencies length is {actual}, expected {expected}")]
-    FrequencyLength { actual: usize, expected: usize },
+    FrequencyLength {
+        /// Frequencies supplied.
+        actual: usize,
+        /// `positions * rope_pairs`.
+        expected: usize,
+    },
+    /// A staging buffer would pass the fixed element cap.
     #[error(
         "compressed-KV {field} has {elements} elements, maximum is {MAX_COMPRESSED_KV_ELEMENTS}"
     )]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
+    /// A derived shape does not fit in `usize`.
     #[error("compressed-KV shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// A latent value is NaN or infinite.
     #[error("nonfinite BF16 compressed-KV latent at position {position}")]
-    NonFiniteInput { position: usize },
+    NonFiniteInput {
+        /// Flat index into the latent.
+        position: usize,
+    },
+    /// A rotated value narrowed to a non-finite BF16.
     #[error("compressed-KV rotary result could not narrow to finite BF16 at element {element}")]
     NonFiniteRotary {
         /// Flat element in `[batch, compressed_position, value_dimension]` storage.
         element: usize,
     },
+    /// A staging buffer could not be reserved.
     #[error("could not allocate {elements} compressed-KV {field} elements")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
 }
@@ -146,6 +200,19 @@ pub enum CompressedKvError {
 /// This is a bounded CPU scalar precision-staging reference, not packed cache
 /// storage, GPU execution, or a generic tensor operation. All shape, length,
 /// finite-input, and allocation checks happen before a diagnostic can escape.
+///
+/// # Errors
+///
+/// * [`CompressedKvError::LatentLength`] and
+///   [`CompressedKvError::FrequencyLength`] when the inputs do not match the
+///   layout.
+/// * [`CompressedKvError::ShapeOverflow`] and
+///   [`CompressedKvError::ElementLimit`] past the bounds, and
+///   [`CompressedKvError::AllocationFailed`] when staging cannot be reserved.
+/// * [`CompressedKvError::NonFiniteInput`] for a NaN or infinite latent.
+/// * [`CompressedKvError::Rotary`], [`CompressedKvError::NonFiniteRotary`]
+///   and [`CompressedKvError::Fp4`] when the rotary or FP4 stage rejects its
+///   input or overflows.
 pub fn prepare_compressed_kv(
     latent: &[u16],
     frequencies: &[RotaryFrequency],

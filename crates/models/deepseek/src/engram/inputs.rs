@@ -108,6 +108,19 @@ impl EngramHashInputs {
     /// running sum and end at that layer's table rows; multipliers are odd and
     /// within the source's no-overflow bound; and the pad maps through the
     /// token map.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngramInputsError::Truncated`], [`EngramInputsError::BadMagic`],
+    ///   [`EngramInputsError::HeaderTooLarge`], [`EngramInputsError::Header`],
+    ///   [`EngramInputsError::Format`] and [`EngramInputsError::SchemaVersion`]
+    ///   when the bytes are not a supported artifact.
+    /// * [`EngramInputsError::Identity`] when the digest or a provenance field
+    ///   differs from `identity`.
+    /// * [`EngramInputsError::PayloadLength`] and
+    ///   [`EngramInputsError::PayloadDigest`] when the token map payload does
+    ///   not match its header.
+    /// * [`EngramInputsError::Invalid`] when a layout invariant above fails.
     pub fn parse(bytes: &[u8], identity: &EngramInputsIdentity) -> Result<Self, EngramInputsError> {
         if let Some(expected) = identity.artifact_sha256 {
             let actual = format!("{:x}", Sha256::digest(bytes));
@@ -199,6 +212,11 @@ impl EngramHashInputs {
     }
 
     /// Builds the hash layout covering every Engram layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngramHashError`] when [`EngramHashLayout::new`] rejects the
+    /// parsed layout.
     pub fn hash_layout(&self) -> Result<EngramHashLayout, EngramHashError> {
         EngramHashLayout::new(
             self.max_ngram_size,
@@ -212,6 +230,11 @@ impl EngramHashInputs {
     }
 
     /// Maps raw token IDs to live compressed tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngramInputsError::UnknownRawId`] for an ID that is negative
+    /// or past the token map.
     pub fn compress(&self, raw_ids: &[i64]) -> Result<Vec<CompressedToken>, EngramInputsError> {
         raw_ids
             .iter()
@@ -399,7 +422,10 @@ pub enum EngramInputsError {
     BadMagic,
     /// The declared header is larger than the fixed cap.
     #[error("Engram inputs header is {bytes} bytes, maximum is 65536")]
-    HeaderTooLarge { bytes: usize },
+    HeaderTooLarge {
+        /// The declared header length.
+        bytes: usize,
+    },
     /// The header is not the expected JSON object.
     #[error("Engram inputs header is invalid: {0}")]
     Header(String),
@@ -408,7 +434,10 @@ pub enum EngramInputsError {
     Format,
     /// The header uses an unsupported schema version.
     #[error("Engram inputs schema version {version} is unsupported")]
-    SchemaVersion { version: u32 },
+    SchemaVersion {
+        /// The artifact's schema version.
+        version: u32,
+    },
     /// A provenance field differs from the expected identity.
     #[error("Engram inputs {field} is {actual}, expected {expected}")]
     Identity {
@@ -421,7 +450,12 @@ pub enum EngramInputsError {
     },
     /// The token-map payload length differs from its declared count.
     #[error("Engram token map payload is {actual} bytes, expected {expected}")]
-    PayloadLength { expected: usize, actual: usize },
+    PayloadLength {
+        /// Bytes the declared count requires.
+        expected: usize,
+        /// Bytes present.
+        actual: usize,
+    },
     /// The token-map payload digest differs from the header.
     #[error("Engram token map payload digest mismatch")]
     PayloadDigest,
@@ -435,7 +469,12 @@ pub enum EngramInputsError {
     },
     /// A raw token ID is outside the token map.
     #[error("raw token ID {id} at index {index} is outside the Engram token map")]
-    UnknownRawId { index: usize, id: i64 },
+    UnknownRawId {
+        /// Index into the raw IDs.
+        index: usize,
+        /// The raw token ID.
+        id: i64,
+    },
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@
 use crate::head::{ATTENTION_HEADS, HEAD_WIDTH, WIDTH};
 use thiserror::Error;
 
+/// Hidden width of one encoder MLP. Its `Wi` projection produces twice this
+/// width; the first half passes through GELU and multiplies the second.
 pub const ENCODER_FF_WIDTH: usize = 1_152;
 const EPSILON: f32 = 1e-5;
 const ROPE_THETA: f32 = 160_000.0;
@@ -24,11 +26,18 @@ const PUBLISHED_VOCAB_SIZE: u64 = 256_000;
 /// Raw parameters in the same row-major layout as `PyTorch` `nn.Linear` weights.
 #[derive(Clone, Debug)]
 pub struct EncoderBlockWeights {
+    /// Fused query, key and value projection, `[3 * WIDTH, WIDTH]`, no bias.
     pub wqkv_weight: Vec<f32>,
+    /// Attention output projection, `[WIDTH, WIDTH]`.
     pub wo_weight: Vec<f32>,
+    /// MLP input projection, `[2 * ENCODER_FF_WIDTH, WIDTH]`.
     pub wi_weight: Vec<f32>,
+    /// MLP output projection, `[WIDTH, ENCODER_FF_WIDTH]`.
     pub wo_mlp_weight: Vec<f32>,
+    /// Scale of the layer norm before attention, `[WIDTH]`. Layer 0 ignores
+    /// it, because the source uses an identity there.
     pub attn_norm_weight: Vec<f32>,
+    /// Scale of the layer norm before the MLP, `[WIDTH]`.
     pub mlp_norm_weight: Vec<f32>,
 }
 
@@ -39,58 +48,92 @@ pub struct FullEncoderWeights {
     pub token_ids: Vec<u64>,
     /// Row-major F32 embedding rows, one row for every `token_ids` entry.
     pub token_rows: Vec<f32>,
+    /// Scale of the layer norm applied to looked-up embedding rows, `[WIDTH]`.
     pub embedding_norm_weight: Vec<f32>,
+    /// The 22 encoder layers, in order.
     pub layers: Vec<EncoderBlockWeights>,
+    /// Scale of the layer norm after the last layer, `[WIDTH]`.
     pub final_norm_weight: Vec<f32>,
 }
 
 /// Token IDs and a padding mask for one bounded, already serialized sequence.
 #[derive(Clone, Debug)]
 pub struct EncoderInput {
+    /// One token ID per position, at most 126. Every ID must be one of the
+    /// encoder's selected rows.
     pub input_ids: Vec<u64>,
+    /// `true` for each real position and `false` for padding; one entry per
+    /// input ID, at least one `true`.
     pub attention_mask: Vec<bool>,
 }
 
 /// One unbatched encoder sequence.  `layer` selects the pinned global/local regime.
 #[derive(Clone, Debug)]
 pub struct EncoderBlockInput {
+    /// Hidden states, `[positions, WIDTH]` row-major.
     pub hidden: Vec<f32>,
+    /// Sequence length, 1 through 126.
     pub positions: usize,
+    /// `true` for each real position and `false` for padding.
     pub attention_mask: Vec<bool>,
+    /// Layer index, 0 through 21. Layer 0 skips the attention norm, and
+    /// layers divisible by three attend globally.
     pub layer: usize,
 }
 
+/// An invalid encoder input or weight, or a non-finite intermediate value.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum JuliaEncoderError {
+    /// A block's sequence length is 0 or above 126.
     #[error("Julia encoder positions must be 1..={MAX_POSITIONS}, got {0}")]
     Positions(usize),
+    /// A block's layer index is 22 or more.
     #[error("Julia encoder layer must be below 22, got {0}")]
     Layer(usize),
+    /// A buffer does not have the length its shape requires.
     #[error("Julia encoder {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// The supplied length.
         actual: usize,
+        /// The required length.
         expected: usize,
     },
+    /// A weight, an input or an intermediate value is NaN or infinite.
     #[error("Julia encoder {field} contains a non-finite value at {index}")]
-    NonFinite { field: &'static str, index: usize },
+    NonFinite {
+        /// The buffer or computation stage.
+        field: &'static str,
+        /// Flat index into that buffer, or the row for a norm or softmax.
+        index: usize,
+    },
+    /// The attention mask has no `true` entry.
     #[error("Julia encoder has no unmasked key positions")]
     NoKeys,
+    /// One block's multiply-accumulate count passes its fixed bound.
     #[error("Julia encoder affine/attention MAC count exceeds {MAX_WORK}")]
     Work,
+    /// The full encoder was given other than 22 layers.
     #[error("Julia full encoder requires exactly {FULL_ENCODER_LAYERS} layers, got {0}")]
     FullLayers(usize),
+    /// The selected embedding rows number 0 or more than 126.
     #[error("Julia full encoder selected rows must be 1..={MAX_SELECTED_ROWS}, got {0}")]
     SelectedRows(usize),
+    /// The selected token IDs are not strictly increasing.
     #[error("Julia full encoder token IDs must be strictly increasing")]
     TokenIds,
+    /// An input token ID has no selected embedding row.
     #[error("Julia full encoder has no selected row for token ID {0}")]
     TokenId(u64),
+    /// A full-encoder input has 0 or more than 126 positions.
     #[error("Julia full encoder positions must be 1..={MAX_PREFILL_POSITIONS}, got {0}")]
     PrefillPositions(usize),
+    /// The full encoder's multiply-accumulate count passes its fixed bound.
     #[error("Julia full encoder affine/attention MAC count exceeds {MAX_FULL_ENCODER_WORK}")]
     FullWork,
+    /// A token ID is at or above the published vocabulary size, 256,000.
     #[error("Julia full encoder token ID {0} is outside the published vocabulary")]
     VocabularyId(u64),
 }
@@ -118,6 +161,12 @@ pub(crate) struct Layer0Trace {
 }
 
 impl EncoderBlock {
+    /// Validates one layer's weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JuliaEncoderError::Length`] for a weight of the wrong length
+    /// and [`JuliaEncoderError::NonFinite`] for a NaN or infinite weight.
     pub fn new(weights: EncoderBlockWeights) -> Result<Self, JuliaEncoderError> {
         validate_weights(&weights)?;
         Ok(Self { weights })
@@ -127,6 +176,16 @@ impl EncoderBlock {
     ///
     /// Layer zero has the source `Identity` attention norm. Layers divisible by
     /// three use full attention; the rest use the source's symmetric +/-64 window.
+    /// Returns the layer's output hidden states, `[positions, WIDTH]`.
+    ///
+    /// # Errors
+    ///
+    /// * [`JuliaEncoderError::Positions`], [`JuliaEncoderError::Layer`] and
+    ///   [`JuliaEncoderError::Length`] for an input outside its bounds.
+    /// * [`JuliaEncoderError::NoKeys`] when every position is masked.
+    /// * [`JuliaEncoderError::Work`] when the block's work passes its bound.
+    /// * [`JuliaEncoderError::NonFinite`] for a NaN or infinite input or
+    ///   intermediate value.
     pub fn forward(&self, input: &EncoderBlockInput) -> Result<Vec<f32>, JuliaEncoderError> {
         self.forward_inner(input, None)
     }
@@ -278,6 +337,16 @@ pub struct JuliaEncoder {
 }
 
 impl JuliaEncoder {
+    /// Validates the selected embedding rows and all 22 layers.
+    ///
+    /// # Errors
+    ///
+    /// * [`JuliaEncoderError::SelectedRows`], [`JuliaEncoderError::TokenIds`]
+    ///   and [`JuliaEncoderError::VocabularyId`] for an invalid set of
+    ///   selected token IDs.
+    /// * [`JuliaEncoderError::FullLayers`] for other than 22 layers.
+    /// * [`JuliaEncoderError::Length`] and [`JuliaEncoderError::NonFinite`] for
+    ///   a weight or row buffer of the wrong length or with a non-finite value.
     pub fn new(weights: FullEncoderWeights) -> Result<Self, JuliaEncoderError> {
         if weights.token_ids.is_empty() || weights.token_ids.len() > MAX_SELECTED_ROWS {
             return Err(JuliaEncoderError::SelectedRows(weights.token_ids.len()));
@@ -323,6 +392,16 @@ impl JuliaEncoder {
     ///
     /// The MAC bound counts affine projections and both attention reductions;
     /// row lookup and normalization reductions are deliberately outside that count.
+    /// Returns the final-normalized hidden states, `[positions, WIDTH]`.
+    ///
+    /// # Errors
+    ///
+    /// * [`JuliaEncoderError::PrefillPositions`] and
+    ///   [`JuliaEncoderError::Length`] for an input outside its bounds.
+    /// * [`JuliaEncoderError::NoKeys`] when every position is masked.
+    /// * [`JuliaEncoderError::FullWork`] when the total work passes its bound.
+    /// * [`JuliaEncoderError::TokenId`] for an input ID without a selected row.
+    /// * [`JuliaEncoderError::NonFinite`] for a non-finite intermediate value.
     pub fn forward(&self, input: &EncoderInput) -> Result<Vec<f32>, JuliaEncoderError> {
         self.forward_inner(input, None)
     }

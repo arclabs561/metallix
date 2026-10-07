@@ -114,7 +114,12 @@ pub enum RatioOneIndexKeyOwnerError {
     Projection(#[from] Bf16LinearError),
     /// The raw owner input does not match this call's exact `[batch, position, input_dimension]` shape.
     #[error("ratio-one owner input length is {actual}, expected {expected}")]
-    InputLength { actual: usize, expected: usize },
+    InputLength {
+        /// Supplied length.
+        actual: usize,
+        /// `batches * positions * input_dimension`.
+        expected: usize,
+    },
     /// Index-key staging rejected the completed compressor output.
     #[error("ratio-one index-key preparation failed: {0}")]
     Key(#[from] IndexKeyError),
@@ -126,20 +131,34 @@ pub enum RatioOneIndexKeyOwnerError {
     MissingLatent,
     /// An owner projection dimension product overflowed before allocation.
     #[error("ratio-one owner projection shape arithmetic overflowed for {field}")]
-    ProjectionShapeOverflow { field: &'static str },
+    ProjectionShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
     /// An owner projection buffer exceeds the explicit bounded reference limit.
     #[error("ratio-one owner projection {field} has {elements} elements, maximum is {maximum}")]
     ProjectionElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
+        /// The fixed cap.
         maximum: usize,
     },
     /// An owner projection would exceed the scalar multiply-accumulate budget.
     #[error("ratio-one owner projection work {terms} exceeds {maximum} scalar terms")]
-    ProjectionWorkloadTooLarge { terms: usize, maximum: usize },
+    ProjectionWorkloadTooLarge {
+        /// Estimated multiply-accumulate terms.
+        terms: usize,
+        /// The fixed cap.
+        maximum: usize,
+    },
     /// The bounded owner-projection output could not be reserved.
     #[error("could not allocate {elements} BF16 ratio-one owner projection elements")]
-    ProjectionAllocationFailed { elements: usize },
+    ProjectionAllocationFailed {
+        /// Elements that could not be reserved.
+        elements: usize,
+    },
 }
 
 /// Request-local owner for V4.1's qualified ratio-one compressor/key/cache path.
@@ -204,11 +223,21 @@ impl PendingRatioOneCompressedOwner<'_> {
     }
 
     /// Borrows one complete staged index-key prefix, including prior decode rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the owner
+    /// does not have.
     pub fn key_prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         staged_prefix(&self.key_prefixes, batch)
     }
 
     /// Borrows one complete staged compressed-KV prefix, including prior decode rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the owner
+    /// does not have.
     pub fn kv_prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         staged_prefix(&self.kv_prefixes, batch)
     }
@@ -224,6 +253,11 @@ impl PendingRatioOneCompressedOwner<'_> {
     /// Preparation already validated both appends. The repeated validation is
     /// retained at the publication point so the cache owns its invariant; the
     /// transaction's exclusive owner borrow prevents intervening mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioOneCompressedOwnerError::Cache`], with nothing published,
+    /// if a cache rejects the append it already accepted during preparation.
     pub fn commit(self) -> Result<RatioOneCompressedOwnerDiagnostic, RatioOneCompressedOwnerError> {
         let Self {
             owner,
@@ -297,6 +331,15 @@ impl RatioOneCompressedOwner {
     /// before either cache allocates, keeping this narrow adapter tied to the
     /// source's shared compressor latent rather than accepting arbitrary cache
     /// layouts that might later diverge.
+    ///
+    /// # Errors
+    ///
+    /// * [`RatioOneCompressedOwnerError::CompressedKvLayout`] when no valid
+    ///   compressed-KV layout follows from `key_layout`.
+    /// * [`RatioOneCompressedOwnerError::Owner`] when the key owner cannot be
+    ///   built, as [`RatioOneIndexKeyOwner::new`] describes.
+    /// * [`RatioOneCompressedOwnerError::Cache`] when the compressed-KV cache
+    ///   cannot be allocated.
     pub fn new(
         key_layout: IndexKeyLayout,
         input_dimension: NonZeroUsize,
@@ -359,6 +402,20 @@ impl RatioOneCompressedOwner {
     /// successful call. Preparing allocates one bounded contiguous key and KV
     /// prefix per batch for pre-commit consumers; callers without one should
     /// use [`forward`](Self::forward).
+    ///
+    /// # Errors
+    ///
+    /// Both prefixes and the compressor are unchanged on every error.
+    ///
+    /// * [`RatioOneCompressedOwnerError::Owner`] when projection, compression
+    ///   or key preparation fails, as [`RatioOneIndexKeyOwner::forward`]
+    ///   describes.
+    /// * [`RatioOneCompressedOwnerError::CompressedKv`] when compressed-KV
+    ///   preparation fails.
+    /// * [`RatioOneCompressedOwnerError::Cache`] when either cache rejects the
+    ///   publication.
+    /// * [`RatioOneCompressedOwnerError::StagedPrefixAllocation`] when a staged
+    ///   prefix view cannot be reserved.
     pub fn prepare(
         &mut self,
         call: RatioOneOwnerCall<'_>,
@@ -417,6 +474,18 @@ impl RatioOneCompressedOwner {
     ///
     /// This avoids allocating complete staged prefix views for callers that do
     /// not need to score or select before publication.
+    ///
+    /// # Errors
+    ///
+    /// Both prefixes and the compressor are unchanged on every error.
+    ///
+    /// * [`RatioOneCompressedOwnerError::Owner`] when projection, compression
+    ///   or key preparation fails, as [`RatioOneIndexKeyOwner::forward`]
+    ///   describes.
+    /// * [`RatioOneCompressedOwnerError::CompressedKv`] when compressed-KV
+    ///   preparation fails.
+    /// * [`RatioOneCompressedOwnerError::Cache`] when either cache rejects the
+    ///   publication.
     pub fn forward(
         &mut self,
         call: RatioOneOwnerCall<'_>,
@@ -447,6 +516,11 @@ impl RatioOneCompressedOwner {
     }
 
     /// Begins a checked new epoch for both coupled prefixes and the compressor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioOneCompressedOwnerError::Cache`], leaving both prefixes
+    /// and the compressor unchanged, when an epoch counter would overflow.
     pub fn reset(&mut self) -> Result<(), RatioOneCompressedOwnerError> {
         // Clone before any checked cache mutation: a failed allocation cannot
         // leave either prefix reset while compressor state remains old.
@@ -460,11 +534,21 @@ impl RatioOneCompressedOwner {
     }
 
     /// Borrows one batch's valid prepared index-key prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the owner
+    /// does not have.
     pub fn key_prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         self.key_owner.prefix(batch)
     }
 
     /// Borrows one batch's valid prepared compressed-KV prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the owner
+    /// does not have.
     pub fn kv_prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         self.compressed_kv.prefix(batch)
     }
@@ -558,6 +642,13 @@ impl RatioOneIndexKeyOwner {
     /// per [`IndexKeyLayout`] latent feature.  `key_capacity` is expressed in
     /// compressed positions, which equal token positions only for this ratio-one
     /// adapter.
+    ///
+    /// # Errors
+    ///
+    /// * [`RatioOneIndexKeyOwnerError::Compressor`] when the ratio-one
+    ///   compressor rejects `compressor_norm` or `compressor_epsilon`.
+    /// * [`RatioOneIndexKeyOwnerError::Cache`] when the key cache cannot be
+    ///   allocated.
     pub fn new(
         layout: IndexKeyLayout,
         input_dimension: NonZeroUsize,
@@ -623,6 +714,22 @@ impl RatioOneIndexKeyOwner {
     /// reset, but this adapter refuses it when the key prefix is nonempty so
     /// compressor and cache epochs cannot diverge.  Any rejected call leaves
     /// both stream states unchanged and is safe to retry with the same identity.
+    ///
+    /// # Errors
+    ///
+    /// The owner is unchanged on every error.
+    ///
+    /// * [`RatioOneIndexKeyOwnerError::InputLength`] when the input does not
+    ///   match the call's shape.
+    /// * [`RatioOneIndexKeyOwnerError::Projection`] and the
+    ///   `Projection*` variants when the `wkv` projection rejects its operands
+    ///   or passes its bounds.
+    /// * [`RatioOneIndexKeyOwnerError::Compressor`],
+    ///   [`RatioOneIndexKeyOwnerError::MissingLatent`] and
+    ///   [`RatioOneIndexKeyOwnerError::Key`] when compression or key
+    ///   preparation fails.
+    /// * [`RatioOneIndexKeyOwnerError::Cache`] when the key cache rejects the
+    ///   publication's identity, order or values.
     pub fn forward(
         &mut self,
         call: RatioOneOwnerCall<'_>,
@@ -696,6 +803,11 @@ impl RatioOneIndexKeyOwner {
     /// checked step succeeds is the small ratio-one compressor restored; no full
     /// key cache is cloned.  Existing borrowed prefixes must not be retained
     /// across this mutable call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioOneIndexKeyOwnerError::Cache`], leaving the owner
+    /// unchanged, when the epoch counter would overflow.
     pub fn reset(&mut self) -> Result<(), RatioOneIndexKeyOwnerError> {
         // `Vec::clone` may need to reserve the small compressor's fixed norm
         // buffer. Do it before the cache's checked mutation so an allocation
@@ -707,6 +819,11 @@ impl RatioOneIndexKeyOwner {
     }
 
     /// Borrows one batch's exact valid prepared-key prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the owner
+    /// does not have.
     pub fn prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         self.keys.prefix(batch)
     }

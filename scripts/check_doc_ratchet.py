@@ -26,9 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 # that adds its attributes; never add one.
 PENDING = frozenset(
     {
-        "crates/chat-format",
         "crates/models/deepseek",
-        "crates/models/julia",
         "crates/models/qwen",
         "crates/server",
     }

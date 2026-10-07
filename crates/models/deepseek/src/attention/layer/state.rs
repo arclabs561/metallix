@@ -25,13 +25,21 @@ use super::{
 /// Borrowed weights needed by the source-shaped attention path.
 #[derive(Clone, Copy, Debug)]
 pub struct LayerAttentionWeights<'a> {
+    /// Query down-projection to `q_rank`.
     pub wq_a: Fp8Projection<'a>,
+    /// `RMSNorm` weight on the query rank, BF16.
     pub q_norm: &'a [u16],
+    /// Query up-projection to every head.
     pub wq_b: Fp8Projection<'a>,
+    /// Shared key-value projection to one head width.
     pub wkv: Fp8Projection<'a>,
+    /// `RMSNorm` weight on the key-value head, BF16.
     pub kv_norm: &'a [u16],
+    /// Per-head attention sink logit.
     pub attn_sink: &'a [f32],
+    /// Group-local BF16 output projection.
     pub wo_a: &'a [u16],
+    /// FP8 output projection back to the hidden width.
     pub wo_b: Fp8Projection<'a>,
 }
 
@@ -43,8 +51,11 @@ pub struct LayerAttentionWeights<'a> {
 /// indexer chose.
 #[derive(Clone, Copy, Debug)]
 pub struct CompressedAttentionPublication<'a> {
+    /// The layer that produced the compressed keys.
     pub source_layer: u16,
+    /// The consuming state's epoch the producer wrote for.
     pub epoch: u64,
+    /// The consuming state's successful-call ordinal the producer wrote for.
     pub call_id: u64,
     /// Numerical, already-quantized-and-reconstructed BF16 `[batch, key, head_dim]`.
     pub numerical_bf16: &'a [u16],
@@ -55,15 +66,25 @@ pub struct CompressedAttentionPublication<'a> {
 /// Every fixture-visible intermediate produced by [`LayerAttentionState::forward`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LayerAttentionDiagnostic {
+    /// `wq_a` projection output, BF16.
     pub wq_a: Vec<u16>,
+    /// `q_norm` applied to `wq_a`, the indexer's `qr` operand, BF16.
     pub qr: Vec<u16>,
+    /// `wq_b` projection output before rotary embedding, BF16.
     pub wq_b_pre_rope: Vec<u16>,
+    /// Queries after rotary embedding, BF16.
     pub q_after_rope: Vec<u16>,
+    /// This call's key-value rows as written to the window, BF16.
     pub prepared_window: Vec<u16>,
+    /// Window keys read for attention, BF16.
     pub window_read: Vec<u16>,
+    /// Window indices into the concatenated keys.
     pub window_indices: Vec<i32>,
+    /// The window ring after the call, BF16.
     pub ring_after: Vec<u16>,
+    /// Sparse attention output before the output projection, BF16.
     pub sparse_output: Vec<u16>,
+    /// Layer output after the output projection, BF16.
     pub final_output: Vec<u16>,
 }
 
@@ -122,6 +143,11 @@ impl LayerAttentionState {
     }
 
     /// Invalidates all prior borrowed publications and clears cache continuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerAttentionError::EpochOverflow`], leaving the state
+    /// unchanged, when the epoch counter would overflow.
     pub fn reset(&mut self) -> Result<(), LayerAttentionError> {
         self.epoch = self
             .epoch
@@ -137,6 +163,38 @@ impl LayerAttentionState {
     ///
     /// `frequencies` is the call-local `[positions, rope_pairs]` slice beginning
     /// at `start_position`; callers must not pass a full position table here.
+    ///
+    /// # Errors
+    ///
+    /// The state is unchanged on every error.
+    ///
+    /// * [`LayerAttentionError::WindowOnlyLayoutRequiresWindowMethod`] for a
+    ///   window-only layout.
+    /// * [`LayerAttentionError::WrongSourceLayer`],
+    ///   [`LayerAttentionError::WrongEpoch`], [`LayerAttentionError::WrongCallId`],
+    ///   [`LayerAttentionError::CompressedValueLength`],
+    ///   [`LayerAttentionError::CompressedKeyCount`],
+    ///   [`LayerAttentionError::CompressedIndexLength`],
+    ///   [`LayerAttentionError::CompressedSlotsWithoutKeys`],
+    ///   [`LayerAttentionError::InvalidCompressedIndex`],
+    ///   [`LayerAttentionError::DuplicateCompressedIndex`] and
+    ///   [`LayerAttentionError::FutureCompressedIndex`] when the publication
+    ///   is not the one this call expects.
+    /// * [`LayerAttentionError::InputLength`],
+    ///   [`LayerAttentionError::DecodeMustHaveOnePosition`] and
+    ///   [`LayerAttentionError::DiscontinuousPosition`] when the input or its
+    ///   position does not continue the sequence (a call at position 0 starts
+    ///   a new one).
+    /// * [`LayerAttentionError::ShapeOverflow`],
+    ///   [`LayerAttentionError::ElementLimit`], [`LayerAttentionError::NoKeys`]
+    ///   and [`LayerAttentionError::NoSparseSlots`] when the call's shapes do
+    ///   not fit the bounded reference.
+    /// * [`LayerAttentionError::NonFiniteProjection`],
+    ///   [`LayerAttentionError::NonFiniteRotary`] and the wrapped stage errors
+    ///   when a projection, norm, rotary, quantization, window, sparse or
+    ///   output stage rejects its input or overflows.
+    /// * [`LayerAttentionError::EpochOverflow`] and
+    ///   [`LayerAttentionError::CallIdOverflow`] when a counter would overflow.
     #[allow(
         clippy::too_many_arguments,
         reason = "the adapter retains source-visible inputs"
@@ -240,6 +298,28 @@ impl LayerAttentionState {
     /// This path deliberately has no compressed-KV publication, producer
     /// identity, or index concatenation.  It retains the same request-local
     /// ring transition and all query, sparse, and output stages as [`Self::forward`].
+    ///
+    /// # Errors
+    ///
+    /// The state is unchanged on every error.
+    ///
+    /// * [`LayerAttentionError::CompressedLayoutRequiresPublication`] for a
+    ///   compressed layout.
+    /// * [`LayerAttentionError::InputLength`],
+    ///   [`LayerAttentionError::DecodeMustHaveOnePosition`] and
+    ///   [`LayerAttentionError::DiscontinuousPosition`] when the input or its
+    ///   position does not continue the sequence (a call at position 0 starts
+    ///   a new one).
+    /// * [`LayerAttentionError::ShapeOverflow`],
+    ///   [`LayerAttentionError::ElementLimit`], [`LayerAttentionError::NoKeys`]
+    ///   and [`LayerAttentionError::NoSparseSlots`] when the call's shapes do
+    ///   not fit the bounded reference.
+    /// * [`LayerAttentionError::NonFiniteProjection`],
+    ///   [`LayerAttentionError::NonFiniteRotary`] and the wrapped stage errors
+    ///   when a projection, norm, rotary, quantization, window, sparse or
+    ///   output stage rejects its input or overflows.
+    /// * [`LayerAttentionError::EpochOverflow`] and
+    ///   [`LayerAttentionError::CallIdOverflow`] when a counter would overflow.
     pub fn forward_window_only(
         &mut self,
         attention_input: &[u16],

@@ -7,16 +7,25 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
+    /// `system`: instructions ahead of the conversation.
     System,
+    /// `user`: a turn from the person or client.
     User,
+    /// `assistant`: a turn the model produced.
     Assistant,
+    /// `tool`: the result of a tool call.
     Tool,
 }
 
 /// One completed assistant tool call retained in conversation history.
+///
+/// It serializes with `name` and `arguments` at the top level and again
+/// under `function`, because templates read either shape.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ChatToolCall {
+    /// The called tool's name.
     pub name: String,
+    /// The call's arguments as a JSON value.
     pub arguments: Value,
 }
 
@@ -39,9 +48,12 @@ impl Serialize for ChatToolCall {
 /// One tool result which can be converted into a template-ready tool message.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatToolResult {
+    /// The ID of the call this result answers.
     pub tool_call_id: String,
+    /// The tool's name, for templates that print it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The result text.
     pub content: String,
 }
 
@@ -63,14 +75,20 @@ impl ChatToolResult {
 /// One concrete message supplied to the checkpoint's chat template.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
+    /// Who wrote the message.
     pub role: ChatRole,
+    /// The message text.
     pub content: String,
+    /// An assistant turn's reasoning, for templates that render or drop it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Tool calls an assistant turn made.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
+    /// For a tool message, the ID of the call it answers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// For a tool message, the tool's name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -93,9 +111,12 @@ impl ChatMessage {
 /// The parts of one chat turn a template renders.
 #[derive(Clone, Copy, Debug)]
 pub struct Conversation<'a> {
+    /// The messages, oldest first.
     pub messages: &'a [ChatMessage],
     /// Template-shaped tool definitions.
     pub tools: &'a [Value],
+    /// Whether the template should open a reasoning section; templates read
+    /// it as `enable_thinking`.
     pub enable_thinking: bool,
     /// Optional model-specific reasoning effort passed through to templates.
     pub reasoning_effort: Option<&'a str>,

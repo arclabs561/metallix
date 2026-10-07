@@ -85,6 +85,18 @@ pub struct IndexKeyLayout {
 
 impl IndexKeyLayout {
     /// Creates a bounded source-shaped index-key layout.
+    ///
+    /// # Errors
+    ///
+    /// * [`IndexKeyLayoutError::RopeExceedsKey`],
+    ///   [`IndexKeyLayoutError::UngroupedKeyWidth`] and
+    ///   [`IndexKeyLayoutError::KeyWidthTooLarge`] for widths the source path
+    ///   cannot use.
+    /// * [`IndexKeyLayoutError::InvalidEpsilon`] for a non-finite or
+    ///   non-positive epsilon.
+    /// * [`IndexKeyLayoutError::ShapeOverflow`] and
+    ///   [`IndexKeyLayoutError::ElementLimit`] when a staging buffer does not
+    ///   fit its bound.
     pub fn new(
         batches: NonZeroUsize,
         latent_dimension: NonZeroUsize,
@@ -212,22 +224,43 @@ pub struct IndexKeyDiagnostic {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IndexKeyLayoutError {
+    /// A derived shape does not fit in `usize`.
     #[error("index-key shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// The rotary tail is wider than one key.
     #[error("rope width {rope_width} exceeds index-key dimension {key_dimension}")]
     RopeExceedsKey {
+        /// Rotary tail width, `2 * rope_pairs`.
         rope_width: usize,
+        /// Key width.
         key_dimension: usize,
     },
+    /// The key width is not a multiple of the FP4 group of 32.
     #[error("index-key width {width} is not divisible by group 32")]
-    UngroupedKeyWidth { width: usize },
+    UngroupedKeyWidth {
+        /// Key width.
+        width: usize,
+    },
+    /// The key width passes the `RMSNorm` limit.
     #[error("index-key width {width} exceeds RMSNorm maximum {maximum}")]
-    KeyWidthTooLarge { width: usize, maximum: usize },
+    KeyWidthTooLarge {
+        /// Key width.
+        width: usize,
+        /// The `RMSNorm` width limit.
+        maximum: usize,
+    },
+    /// The `RMSNorm` epsilon is not finite and positive.
     #[error("index-key RMS epsilon must be finite and positive")]
     InvalidEpsilon,
+    /// A staging buffer would pass the fixed element cap.
     #[error("index-key {field} has {elements} elements, maximum is {MAX_INDEX_KEY_ELEMENTS}")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
 }
@@ -236,54 +269,95 @@ pub enum IndexKeyLayoutError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IndexKeyError {
+    /// The layout is invalid.
     #[error(transparent)]
     Layout(#[from] IndexKeyLayoutError),
+    /// The `wk` projection rejected its input or overflowed.
     #[error(transparent)]
     Linear(#[from] Bf16LinearError),
+    /// The `k_norm` stage rejected its input.
     #[error(transparent)]
     Norm(#[from] RmsNormError),
+    /// The scalar rotary stage rejected its input.
     #[error(transparent)]
     Rotary(#[from] RotaryError),
+    /// The Metal rotary diagnostic failed.
     #[cfg(feature = "metal")]
     #[error(transparent)]
     MetalRotary(#[from] RotaryMetalError),
+    /// The connected Metal preparation diagnostic failed.
     #[cfg(feature = "metal")]
     #[error(transparent)]
     MetalPreparation(#[from] MetalKeyPreparationError),
+    /// FP4 reconstruction rejected its input or overflowed.
     #[error(transparent)]
     Fp4(#[from] Fp4ActivationError),
+    /// The latent is empty or not whole `[batch, position]` rows.
     #[error("index-key latent length is {actual}; expected a nonempty multiple of {stride}")]
-    LatentLength { actual: usize, stride: usize },
+    LatentLength {
+        /// Supplied length.
+        actual: usize,
+        /// Elements per compressed position across all batches.
+        stride: usize,
+    },
+    /// A weight does not have the layout's length.
     #[error("index-key {field} length is {actual}, expected {expected}")]
     WeightLength {
+        /// The weight's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
+    /// The frequencies do not match the positions and rotary pairs.
     #[error("index-key frequencies length is {actual}, expected {expected}")]
-    FrequencyLength { actual: usize, expected: usize },
+    FrequencyLength {
+        /// Frequencies supplied.
+        actual: usize,
+        /// `positions * rope_pairs`.
+        expected: usize,
+    },
+    /// A staging buffer would pass the fixed element cap.
     #[error("index-key {field} has {elements} elements, maximum is {MAX_INDEX_KEY_ELEMENTS}")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
+    /// The scalar projection would pass the fixed work cap.
     #[error("index-key scalar projection work {terms} exceeds {MAX_INDEX_KEY_WORK} terms")]
-    WorkloadTooLarge { terms: usize },
+    WorkloadTooLarge {
+        /// Estimated multiply-accumulate terms.
+        terms: usize,
+    },
+    /// A derived shape does not fit in `usize`.
     #[error("index-key shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// A latent or weight value is NaN or infinite.
     #[error("nonfinite BF16 index-key {field} at position {position}")]
     NonFiniteInput {
+        /// The input's role.
         field: &'static str,
+        /// Flat index into it.
         position: usize,
     },
+    /// A rotated value narrowed to a non-finite BF16.
     #[error("index-key rotary result could not narrow to finite BF16 at element {element}")]
     NonFiniteRotary {
         /// Flat element in `[batch, compressed_position, key_dimension]` storage.
         element: usize,
     },
+    /// A staging buffer could not be reserved.
     #[error("could not allocate {elements} index-key {field} elements")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
 }
@@ -332,6 +406,20 @@ pub enum MetalKeyPreparationError {
 /// GEMM-reduction parity. All bounded shape, work, length, and finite-input
 /// checks happen before staging output allocation; no partial diagnostic
 /// escapes on error.
+///
+/// # Errors
+///
+/// * [`IndexKeyError::LatentLength`], [`IndexKeyError::WeightLength`] and
+///   [`IndexKeyError::FrequencyLength`] when an input does not match the
+///   layout.
+/// * [`IndexKeyError::ShapeOverflow`], [`IndexKeyError::ElementLimit`] and
+///   [`IndexKeyError::WorkloadTooLarge`] past the bounds, and
+///   [`IndexKeyError::AllocationFailed`] when staging cannot be reserved.
+/// * [`IndexKeyError::NonFiniteInput`] for a NaN or infinite latent or
+///   weight.
+/// * [`IndexKeyError::Linear`], [`IndexKeyError::Norm`],
+///   [`IndexKeyError::Rotary`], [`IndexKeyError::NonFiniteRotary`] and
+///   [`IndexKeyError::Fp4`] when a stage rejects its input or overflows.
 pub fn prepare_index_keys(
     latent: &[u16],
     frequencies: &[RotaryFrequency],
@@ -353,6 +441,11 @@ pub fn prepare_index_keys(
 /// reconstruction boundaries identical to [`prepare_index_keys`]. Metal
 /// rotation is a diagnostic CPU-to-GPU round trip; it does not make key-cache
 /// storage or the remaining stages device resident.
+///
+/// # Errors
+///
+/// The same as [`prepare_index_keys`], plus `IndexKeyError::MetalRotary`
+/// when the Metal rotary diagnostic is selected and fails.
 pub fn prepare_index_keys_with_rotary_execution(
     latent: &[u16],
     frequencies: &[RotaryFrequency],

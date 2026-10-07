@@ -10,6 +10,46 @@
 //! classifies every token against that set.
 //!
 //! The crate has no model or MLX dependency, so its tests run anywhere.
+//!
+//! # Overview
+//!
+//! * [`ChatFormat::load`] reads a checkpoint directory (or
+//!   [`ChatFormat::from_gguf`] a GGUF file plus its base tokenizer) into
+//!   one value holding the [`QwenTokenizer`], [`ChatTemplate`],
+//!   [`StopTokens`] and [`TurnFormat`].
+//! * [`ChatFormat::prompt`] renders a [`Conversation`] and encodes it so
+//!   that only the template can produce control tokens;
+//!   [`ChatFormat::prompt_reusing`] re-encodes only what follows a
+//!   [`PromptPrefix`] from an earlier turn.
+//! * During decode, [`StopTokens::classify`] says whether each token ends
+//!   the turn, and [`TurnStream`] releases reasoning and text as they settle.
+//! * [`parse_turn`] splits a finished generation into reasoning, text and
+//!   tool calls checked against their schemas, in the [`ToolDialect`] and
+//!   [`ReasoningDialect`] the template teaches.
+//!
+//! Errors are `String` messages meant for a client or a log.
+//!
+//! # Example: rendering is strict about undefined values
+//!
+//! ```
+//! use chat_format::{ChatMessage, ChatRole, ChatTemplate, Conversation, SpecialTokens};
+//!
+//! let template = ChatTemplate::parse(
+//!     "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}".into(),
+//!     SpecialTokens::default(),
+//! )?;
+//! let messages = [ChatMessage::text(ChatRole::User, "Hello")];
+//! assert_eq!(template.render(Conversation::new(&messages), false)?, "<|user|>Hello");
+//!
+//! // This template prints a BOS token the tokenizer config does not define.
+//! let bos = ChatTemplate::parse("{{ bos_token }}".into(), SpecialTokens::default())?;
+//! assert!(bos.render(Conversation::new(&messages), false).is_err());
+//! # Ok::<(), String>(())
+//! ```
+
+#![deny(missing_docs)]
+// The workspace allows this lint; crates opt in once their docs are complete.
+#![warn(clippy::missing_errors_doc)]
 
 mod messages;
 mod stream;
@@ -38,7 +78,9 @@ pub use crate::{
     },
 };
 
+/// Largest `tokenizer_config.json` or `chat_template.jinja` read, in bytes.
 pub const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
+/// Largest `generation_config.json` read, in bytes.
 pub const MAX_GENERATION_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_MODEL_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
@@ -50,17 +92,24 @@ const TEMPLATE_FUEL: u64 = 100_000;
 pub struct TokenId(u32);
 
 impl TokenId {
+    /// Wraps a vocabulary index.
     #[must_use]
     pub const fn new(id: u32) -> Self {
         Self(id)
     }
 
+    /// Converts a model-side `i32` ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `id` is negative.
     pub fn from_model(id: i32) -> Result<Self, String> {
         u32::try_from(id)
             .map(Self)
             .map_err(|_| String::from("token ID is negative"))
     }
 
+    /// The vocabulary index.
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
@@ -75,6 +124,7 @@ pub struct NonEmpty<T> {
 }
 
 impl<T> NonEmpty<T> {
+    /// The list `items`, or `None` when it is empty.
     #[must_use]
     pub fn from_vec(mut items: Vec<T>) -> Option<Self> {
         if items.is_empty() {
@@ -84,6 +134,7 @@ impl<T> NonEmpty<T> {
         Some(Self { first, rest: items })
     }
 
+    /// Every element, in order.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         std::iter::once(&self.first).chain(&self.rest)
     }
@@ -192,6 +243,7 @@ impl StopTokens {
         }
     }
 
+    /// Whether `token` ends the turn, ends a tool-calling turn, or is output.
     #[must_use]
     pub fn classify(&self, token: TokenId) -> TokenClass {
         if self.end_turn.iter().any(|&id| id == token) {
@@ -203,6 +255,7 @@ impl StopTokens {
         }
     }
 
+    /// Every stop token: the end-of-turn tokens first, then the tool ends.
     pub fn iter(&self) -> impl Iterator<Item = TokenId> + '_ {
         self.end_turn.iter().chain(&self.tool_end).copied()
     }
@@ -210,6 +263,12 @@ impl StopTokens {
     /// The stop set of a checkpoint directory, for callers that render no
     /// template (raw-prompt diagnostics); with no dialect known, every
     /// listed ID ends a turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a config or tokenizer file is missing or
+    /// malformed, the tokenizer's `eos_token` is not one of its tokens, or no
+    /// end-of-turn ID is listed.
     pub fn load(model: &Path) -> Result<Self, String> {
         let (config, generation_config) = read_configs(model)?;
         let tokenizer = QwenTokenizer::load(model)?;
@@ -311,6 +370,10 @@ impl ChatTemplate {
     /// Undefined values may be tested (`{% if message.tool_calls %}`), as Hugging
     /// Face templates do with optional message fields, but printing,
     /// iterating or indexing one fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the template does not parse.
     pub fn parse(source: String, specials: SpecialTokens) -> Result<Self, String> {
         let sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
         let mut environment = Environment::new();
@@ -337,6 +400,12 @@ impl ChatTemplate {
     /// Renders `conversation`, optionally without the trailing assistant
     /// generation prompt; the prefix cache renders conversation prefixes that
     /// way.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when rendering fails, as when the template prints an
+    /// undefined variable or runs out of its fuel, or when the rendered prompt
+    /// passes the 1 MiB limit.
     pub fn render(
         &self,
         conversation: Conversation<'_>,
@@ -389,9 +458,13 @@ pub struct ChatFormat {
 pub struct ChatSources {
     /// The exact `tokenizer.json` bytes.
     pub tokenizer_json: Vec<u8>,
+    /// The parsed `tokenizer_config.json`.
     pub tokenizer_config: Value,
+    /// The parsed `config.json`.
     pub config: Value,
+    /// The parsed `generation_config.json`, when the checkpoint has one.
     pub generation_config: Option<Value>,
+    /// The chat template source.
     pub template: String,
     /// The end-of-turn token when the weights file names its own (a GGUF
     /// file's `tokenizer.ggml.eos_token_id`); otherwise `tokenizer_config`'s
@@ -401,6 +474,11 @@ pub struct ChatSources {
 
 impl ChatSources {
     /// Reads every source from a Hugging Face checkpoint directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a file is missing, too large or malformed, or the
+    /// checkpoint has no chat template.
     pub fn read(model: &Path) -> Result<Self, String> {
         let (config, generation_config) = read_configs(model)?;
         let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
@@ -419,6 +497,11 @@ impl ChatSources {
 impl ChatFormat {
     /// Loads the format from a checkpoint directory. `vocabulary_size` is the
     /// model's logit width, which every stop and prompt ID must fit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for any failure of [`ChatSources::read`] or
+    /// [`ChatFormat::from_sources`].
     pub fn load(model: &Path, vocabulary_size: usize) -> Result<Self, String> {
         Self::from_sources(ChatSources::read(model)?, vocabulary_size)
     }
@@ -429,6 +512,13 @@ impl ChatFormat {
     /// and merges but not the pre-tokenizer split rule, so the base
     /// `tokenizer.json` is used, and only if its vocabulary and merges equal
     /// the file's.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the base checkpoint's files cannot be read, the
+    /// file's vocabulary or merges differ from the base tokenizer's, the file
+    /// has no chat template or end-of-turn token, or
+    /// [`ChatFormat::from_sources`] fails.
     pub fn from_gguf(
         base: &Path,
         gguf: &GgufTokenizer,
@@ -460,6 +550,14 @@ impl ChatFormat {
     }
 
     /// Builds the format from sources already read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the tokenizer or template does not parse, the
+    /// stop or suppressed tokens are malformed or outside `vocabulary_size`, a
+    /// special token is not one tokenizer token, rendering a one-message probe
+    /// fails, or the template's BOS handling would change the first token the
+    /// model sees.
     pub fn from_sources(sources: ChatSources, vocabulary_size: usize) -> Result<Self, String> {
         let ChatSources {
             tokenizer_json,
@@ -503,11 +601,13 @@ impl ChatFormat {
         Ok(format)
     }
 
+    /// The checkpoint's tokenizer.
     #[must_use]
     pub fn tokenizer(&self) -> &QwenTokenizer {
         &self.tokenizer
     }
 
+    /// The checkpoint's chat template.
     #[must_use]
     pub fn template(&self) -> &ChatTemplate {
         &self.template
@@ -520,6 +620,7 @@ impl ChatFormat {
         self.turn
     }
 
+    /// The tokens that stop generation.
     #[must_use]
     pub fn stops(&self) -> &StopTokens {
         &self.stops
@@ -556,6 +657,13 @@ impl ChatFormat {
     /// so a user cannot forge a turn boundary or a string quote. A
     /// conversation with no such spelling renders and encodes exactly as
     /// [`ChatTemplate::render`] and [`ChatFormat::encode`] do.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the template fails to render or passes the
+    /// rendered-size limit, the template alters or splits a reserved-text
+    /// placeholder, the tokenizer fails to encode, or an ID falls outside the
+    /// model vocabulary.
     pub fn prompt(
         &self,
         conversation: Conversation<'_>,
@@ -570,6 +678,11 @@ impl ChatFormat {
     /// a turn appended to a conversation re-encodes the new turn, not the
     /// whole history. Otherwise, as when a template rewrites earlier turns,
     /// the whole prompt is encoded; [`Prompt::reuse`] says which happened.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`ChatFormat::prompt`]. A prefix that does not match is not
+    /// an error: the prompt is encoded in full and reports [`PromptReuse::Full`].
     pub fn prompt_reusing(
         &self,
         conversation: Conversation<'_>,
@@ -776,6 +889,11 @@ impl ChatFormat {
     /// Encodes a rendered prompt exactly as written, as transformers'
     /// `apply_chat_template` does: no special tokens are added, so a BOS
     /// must come from the template.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the prompt is empty or too large, does not
+    /// encode, or encodes to an ID outside the model vocabulary.
     pub fn encode(&self, prompt: &str) -> Result<Vec<i32>, String> {
         let ids = self.tokenizer.encode_prompt(prompt)?;
         if ids.iter().any(|&id| {
@@ -829,6 +947,7 @@ impl ChatFormat {
 pub struct Prompt {
     /// The rendered text, reserved spellings from the conversation included.
     pub text: String,
+    /// The token IDs the model reads.
     pub ids: Vec<i32>,
     /// Whether the leading IDs came from a [`PromptPrefix`].
     pub reuse: PromptReuse,
@@ -868,7 +987,10 @@ pub enum PromptReuse {
     Full,
     /// The first `ids` IDs are a [`PromptPrefix`]'s; only the rest were
     /// encoded.
-    Prefix { ids: usize },
+    Prefix {
+        /// How many leading IDs were reused.
+        ids: usize,
+    },
 }
 
 /// The text and IDs of a prompt up to the end of a control token, from
@@ -883,11 +1005,13 @@ pub struct PromptPrefix {
 }
 
 impl PromptPrefix {
+    /// The prefix's rendered text.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// The prefix's token IDs.
     #[must_use]
     pub fn ids(&self) -> &[i32] {
         &self.ids
@@ -1042,6 +1166,11 @@ fn read_json(model: &Path, file: &str, maximum_bytes: usize) -> Result<Value, St
 }
 
 /// The template in `tokenizer_config.json`, else `chat_template.jinja`.
+///
+/// # Errors
+///
+/// Returns a message when neither holds a template, or
+/// `chat_template.jinja` is unreadable, too large, not UTF-8 or empty.
 pub fn load_template(model: &Path, tokenizer_config: &Value) -> Result<String, String> {
     if let Some(template) = tokenizer_config
         .get("chat_template")
@@ -1152,8 +1281,10 @@ pub mod test_model {
 
     use serde_json::{Value, json};
 
+    /// The test tokenizer's vocabulary size, as a model logit width.
     pub const VOCABULARY_SIZE: usize = 8;
 
+    /// A temporary checkpoint directory, removed on drop.
     pub struct ModelDir(PathBuf);
 
     impl ModelDir {
@@ -1198,6 +1329,7 @@ pub mod test_model {
             Self(root)
         }
 
+        /// The directory's path.
         #[must_use]
         pub fn path(&self) -> &Path {
             &self.0

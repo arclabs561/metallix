@@ -223,28 +223,46 @@ pub enum AttentionOutputLayoutError {
     EmptyDimension,
     /// Contiguous attention heads cannot be split evenly into output groups.
     #[error("attention-output heads {heads} are not divisible by groups {groups}")]
-    HeadsNotGrouped { heads: usize, groups: usize },
+    HeadsNotGrouped {
+        /// Attention heads.
+        heads: usize,
+        /// Output groups.
+        groups: usize,
+    },
     /// The requested inverse-RoPE tail is wider than one attention head.
     #[error("attention-output rotary width {rope_width} exceeds head width {head_dimension}")]
     RopeExceedsHead {
+        /// Rotary tail width.
         rope_width: usize,
+        /// Head width.
         head_dimension: usize,
     },
     /// The FP8 `wo_b` reduction is not compatible with fixed G32 activation groups.
     #[error("attention-output flattened rank {flattened_rank} is not divisible by 32")]
-    WoBReductionNotGrouped { flattened_rank: usize },
+    WoBReductionNotGrouped {
+        /// `groups * output_rank`, the `wo_b` reduction.
+        flattened_rank: usize,
+    },
     /// A derived shape could not be represented by `usize`.
     #[error("attention-output shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The buffer or derived count's role.
+        field: &'static str,
+    },
     /// A bounded scalar staging buffer would exceed the fixed element cap.
     #[error("attention-output {field} has {elements} elements, maximum is 1048576")]
     ElementLimit {
+        /// The buffer or derived count's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
     /// The two scalar projection stages exceed the fixed work bound.
     #[error("attention-output work estimate {elements} exceeds maximum 16777216")]
-    WorkLimit { elements: usize },
+    WorkLimit {
+        /// Estimated multiply-accumulates.
+        elements: usize,
+    },
 }
 
 /// Errors from the bounded scalar attention-output staging reference.
@@ -257,16 +275,25 @@ pub enum AttentionOutputError {
     /// A direct-runtime input has an unexpected exact length.
     #[error("attention-output {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
     /// An attention BF16 value is nonfinite before the inverse rotation.
     #[error("nonfinite attention BF16 value at element {element}")]
-    NonFiniteAttention { element: usize },
+    NonFiniteAttention {
+        /// Flat index into the attention input.
+        element: usize,
+    },
     /// The inverse rotation or its BF16 narrowing was nonfinite.
     #[error("attention-output inverse rotary value was nonfinite at element {element}")]
-    NonFiniteRotaryOutput { element: usize },
+    NonFiniteRotaryOutput {
+        /// Flat element index.
+        element: usize,
+    },
     /// The shared rotary-tail contract was invalid.
     #[error(transparent)]
     Rotary(#[from] RotaryError),
@@ -281,7 +308,10 @@ pub enum AttentionOutputError {
     WoB(#[from] Fp8LinearError),
     /// The FP8 `wo_b` FP32 output could not narrow to finite BF16 storage.
     #[error("attention-output wo_b result was nonfinite at element {element}")]
-    NonFiniteWoBOutput { element: usize },
+    NonFiniteWoBOutput {
+        /// Flat index into the output.
+        element: usize,
+    },
     /// Inside a device scope, the Metal `wo_b` linear failed.
     #[cfg(feature = "metal")]
     #[error("Metal wo_b linear failed: {0}")]

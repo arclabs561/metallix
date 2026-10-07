@@ -39,6 +39,13 @@ pub struct MoEConfig {
 
 impl MoEConfig {
     /// Validates the dimensions and scalar parameters required by one token.
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::InvalidWidth`] for a zero, unaligned or oversized width.
+    /// * [`MoEError::InvalidSwiGluLimit`], [`MoEError::InvalidTopK`],
+    ///   [`MoEError::InvalidGateTemperature`] and
+    ///   [`MoEError::InvalidRouteScale`] for a scalar outside its domain.
     #[allow(
         clippy::too_many_arguments,
         reason = "the source configuration has these independent scalar roles"
@@ -94,6 +101,13 @@ pub struct Fp4ExpertWeights<'a> {
 impl<'a> Fp4ExpertWeights<'a> {
     /// Validates geometry and exact buffer lengths for one packed FP4 expert.
     /// Numerical scale validation occurs when the expert is executed.
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::InvalidWidth`] for a zero, unaligned or oversized width.
+    /// * [`MoEError::Length`] when a code or scale buffer does not match the
+    ///   geometry, and [`MoEError::ShapeOverflow`] when that geometry does not
+    ///   fit in `usize`.
     #[allow(
         clippy::too_many_arguments,
         reason = "each encoded projection owns distinct code and scale storage"
@@ -131,6 +145,19 @@ impl<'a> Fp4ExpertWeights<'a> {
     /// shared expert, or accumulate across experts. A supplied route weight is
     /// applied within the source `SwiGLU` stage before W2, matching
     /// [`MoEReference::forward_token`].
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::Length`] when `input_bf16` is not one hidden-width token.
+    /// * [`MoEError::InvalidSwiGluLimit`] and [`MoEError::InvalidRouteWeight`]
+    ///   for a control outside its domain.
+    /// * [`MoEError::WorkOverflow`] and [`MoEError::WorkTooLarge`] when the
+    ///   expert's work does not fit the bounded reference.
+    /// * [`MoEError::NonFinite`] and [`MoEError::Bf16Overflow`] when a stage
+    ///   leaves the finite FP32 or BF16 range.
+    /// * [`MoEError::Activation`], [`MoEError::Fp4`] and [`MoEError::Fp8`] when
+    ///   a quantization or projection leaf rejects its input or overflows.
+    /// * [`MoEError::Allocation`] when a temporary buffer cannot be reserved.
     pub fn forward_token(
         &self,
         input_bf16: &[u16],
@@ -179,6 +206,13 @@ pub struct Fp8ExpertWeights<'a> {
 impl<'a> Fp8ExpertWeights<'a> {
     /// Validates geometry and exact buffer lengths for the FP8 shared expert.
     /// Numerical code and scale validation occurs during execution.
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::InvalidWidth`] for a zero, unaligned or oversized width.
+    /// * [`MoEError::Length`] when a code or scale buffer does not match the
+    ///   geometry, and [`MoEError::ShapeOverflow`] when that geometry does not
+    ///   fit in `usize`.
     #[allow(
         clippy::too_many_arguments,
         reason = "each encoded projection owns distinct code and scale storage"
@@ -287,6 +321,17 @@ impl<'a> MoEReference<'a> {
 
     /// Validates geometry, buffer lengths and the logical expert-work budget.
     /// Numerical gate validation occurs in [`Self::forward_token`].
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::NoRoutedExperts`] and [`MoEError::TopKExceedsExperts`]
+    ///   when the routed table cannot supply `top_k` experts.
+    /// * [`MoEError::Length`] when the gate or bias does not match the expert
+    ///   count and hidden width, and [`MoEError::ExpertGeometry`] when an
+    ///   expert's widths differ from the configuration.
+    /// * [`MoEError::ShapeOverflow`], [`MoEError::WorkOverflow`] and
+    ///   [`MoEError::WorkTooLarge`] when the logical work does not fit the
+    ///   bounded reference.
     pub fn new(
         config: MoEConfig,
         gate_bf16: &'a [u16],
@@ -307,6 +352,17 @@ impl<'a> MoEReference<'a> {
     ///
     /// Missing entries retain their original gate IDs and are rejected only
     /// when routing selects them, before any expert arithmetic begins.
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::NoRoutedExperts`] and [`MoEError::TopKExceedsExperts`]
+    ///   when the routed table cannot supply `top_k` experts.
+    /// * [`MoEError::Length`] when the gate or bias does not match the expert
+    ///   count and hidden width, and [`MoEError::ExpertGeometry`] when an
+    ///   expert's widths differ from the configuration.
+    /// * [`MoEError::ShapeOverflow`], [`MoEError::WorkOverflow`] and
+    ///   [`MoEError::WorkTooLarge`] when the logical work does not fit the
+    ///   bounded reference.
     pub fn new_sparse(
         config: MoEConfig,
         gate_bf16: &'a [u16],
@@ -389,6 +445,18 @@ impl<'a> MoEReference<'a> {
     }
 
     /// Executes one V4.1 text `MoE` token in the source's expert-ID order.
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::Length`] when `input_bf16` is not one hidden-width token.
+    /// * [`MoEError::RouteOutOfRange`] and [`MoEError::MissingRoutedExpert`]
+    ///   when routing selects an expert the table cannot supply; this is
+    ///   checked before any expert runs.
+    /// * [`MoEError::NonFinite`] and [`MoEError::Bf16Overflow`] when a stage
+    ///   leaves the finite FP32 or BF16 range.
+    /// * [`MoEError::Activation`], [`MoEError::Fp4`] and [`MoEError::Fp8`] when
+    ///   a quantization or projection leaf rejects its input or overflows.
+    /// * [`MoEError::Allocation`] when a temporary buffer cannot be reserved.
     pub fn forward_token(&self, input_bf16: &[u16]) -> Result<MoEDiagnostic, MoEError> {
         let routes = self.route_token(input_bf16)?;
         for route in &routes {
@@ -410,6 +478,18 @@ impl<'a> MoEReference<'a> {
     /// and fetch only the selected experts. Supplied experts must match the
     /// configured geometry. No state changes, so a source failure leaves
     /// nothing partially applied.
+    ///
+    /// # Errors
+    ///
+    /// * [`MoEError::Length`] when `input_bf16` is not one hidden-width token.
+    /// * [`MoEError::ExpertUnavailable`] when `source` cannot supply a selected
+    ///   expert, and [`MoEError::ExpertGeometry`] when a supplied expert's
+    ///   widths differ from the configuration.
+    /// * [`MoEError::NonFinite`] and [`MoEError::Bf16Overflow`] when a stage
+    ///   leaves the finite FP32 or BF16 range.
+    /// * [`MoEError::Activation`], [`MoEError::Fp4`] and [`MoEError::Fp8`] when
+    ///   a quantization or projection leaf rejects its input or overflows.
+    /// * [`MoEError::Allocation`] when a temporary buffer cannot be reserved.
     pub fn forward_token_with(
         &self,
         input_bf16: &[u16],

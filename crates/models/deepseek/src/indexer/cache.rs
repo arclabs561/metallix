@@ -81,6 +81,13 @@ impl IndexKeyState {
     ///
     /// The allocation is checked and bounded before it is reserved.  This
     /// performs no model loading and does not establish an attention cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::ShapeOverflow`],
+    /// [`IndexKeyStateError::ElementLimit`] or
+    /// [`IndexKeyStateError::AllocationFailed`] when the storage does not fit
+    /// its bound or cannot be reserved.
     pub fn new(
         batches: NonZeroUsize,
         key_dimension: NonZeroUsize,
@@ -105,6 +112,22 @@ impl IndexKeyState {
     /// token group: it preserves the valid prefix while advancing the successful
     /// call ordinal.  All validation happens before copying, so an error leaves
     /// this state unchanged.
+    ///
+    /// # Errors
+    ///
+    /// * [`IndexKeyStateError::UnexpectedSourceLayer`],
+    ///   [`IndexKeyStateError::UnexpectedEpoch`] and
+    ///   [`IndexKeyStateError::UnexpectedCallId`] when `publication` is not the
+    ///   next one this cache accepts.
+    /// * [`IndexKeyStateError::PositionDiscontinuity`] when `start_position` is
+    ///   not the end of the valid prefix.
+    /// * [`IndexKeyStateError::PreparedLength`],
+    ///   [`IndexKeyStateError::PositionOverflow`] and
+    ///   [`IndexKeyStateError::CapacityExceeded`] when the values are not whole
+    ///   rows or do not fit the capacity.
+    /// * [`IndexKeyStateError::NonFinitePrepared`] for a NaN or infinite value.
+    /// * [`IndexKeyStateError::CallIdOverflow`] when the call ordinal would
+    ///   overflow.
     pub fn append_prepared(
         &mut self,
         publication: IndexKeyPublicationId,
@@ -135,6 +158,11 @@ impl IndexKeyState {
     }
 
     /// Invalidates borrowed prefixes and begins a new checked epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::EpochOverflow`], leaving the cache
+    /// unchanged, when the epoch counter would overflow.
     pub fn reset(&mut self) -> Result<(), IndexKeyStateError> {
         self.prepare_reset()?.commit();
         Ok(())
@@ -148,6 +176,11 @@ impl IndexKeyState {
     }
 
     /// Borrows one batch's exact valid `[compressed_position, key_dimension]` prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the cache
+    /// does not have.
     pub fn prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         self.store.prefix(batch)
     }
@@ -196,6 +229,13 @@ pub struct CompressedKvState {
 
 impl CompressedKvState {
     /// Creates an empty epoch-zero compressed-KV prefix with fixed source identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::ShapeOverflow`],
+    /// [`IndexKeyStateError::ElementLimit`] or
+    /// [`IndexKeyStateError::AllocationFailed`] when the storage does not fit
+    /// its bound or cannot be reserved.
     pub fn new(
         batches: NonZeroUsize,
         value_dimension: NonZeroUsize,
@@ -217,6 +257,24 @@ impl CompressedKvState {
     ///
     /// An empty slice advances the successful source call ordinal without
     /// exposing capacity padding, matching [`IndexKeyState::append_prepared`].
+    /// All validation happens before copying, so an error leaves this state
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// * [`IndexKeyStateError::UnexpectedSourceLayer`],
+    ///   [`IndexKeyStateError::UnexpectedEpoch`] and
+    ///   [`IndexKeyStateError::UnexpectedCallId`] when `publication` is not the
+    ///   next one this cache accepts.
+    /// * [`IndexKeyStateError::PositionDiscontinuity`] when `start_position` is
+    ///   not the end of the valid prefix.
+    /// * [`IndexKeyStateError::PreparedLength`],
+    ///   [`IndexKeyStateError::PositionOverflow`] and
+    ///   [`IndexKeyStateError::CapacityExceeded`] when the values are not whole
+    ///   rows or do not fit the capacity.
+    /// * [`IndexKeyStateError::NonFinitePrepared`] for a NaN or infinite value.
+    /// * [`IndexKeyStateError::CallIdOverflow`] when the call ordinal would
+    ///   overflow.
     pub fn append_prepared(
         &mut self,
         publication: IndexKeyPublicationId,
@@ -243,6 +301,11 @@ impl CompressedKvState {
     }
 
     /// Begins a new checked epoch and invalidates all borrowed prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::EpochOverflow`], leaving the cache
+    /// unchanged, when the epoch counter would overflow.
     pub fn reset(&mut self) -> Result<(), IndexKeyStateError> {
         self.prepare_reset()?.commit();
         Ok(())
@@ -256,6 +319,11 @@ impl CompressedKvState {
     }
 
     /// Borrows one batch's exact valid `[compressed_position, value_dimension]` prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexKeyStateError::BatchOutOfRange`] for a batch the cache
+    /// does not have.
     pub fn prefix(&self, batch: usize) -> Result<&[u16], IndexKeyStateError> {
         self.store.prefix(batch)
     }
@@ -320,45 +388,105 @@ impl PendingReset<'_> {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IndexKeyStateError {
+    /// A derived cache shape does not fit in `usize`.
     #[error("owner-prefix cache shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// The cache would hold more elements than its fixed cap.
     #[error("owner-prefix cache has {elements} BF16 elements, maximum is {maximum}")]
-    ElementLimit { elements: usize, maximum: usize },
+    ElementLimit {
+        /// Requested BF16 elements.
+        elements: usize,
+        /// The fixed cap.
+        maximum: usize,
+    },
+    /// The cache storage could not be reserved.
     #[error("could not allocate {elements} BF16 owner-prefix cache elements")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Elements that could not be reserved.
+        elements: usize,
+    },
+    /// The publication came from another layer.
     #[error(
         "owner-prefix publication source layer {actual} is not expected source layer {expected}"
     )]
-    UnexpectedSourceLayer { actual: u16, expected: u16 },
+    UnexpectedSourceLayer {
+        /// The publication's layer.
+        actual: u16,
+        /// The cache's expected layer.
+        expected: u16,
+    },
+    /// The publication belongs to another epoch.
     #[error("owner-prefix publication epoch {actual} is not expected epoch {expected}")]
-    UnexpectedEpoch { actual: u64, expected: u64 },
+    UnexpectedEpoch {
+        /// The publication's epoch.
+        actual: u64,
+        /// The cache's epoch.
+        expected: u64,
+    },
+    /// The publication is not the next successful call.
     #[error("owner-prefix publication call {actual} is not expected call {expected}")]
-    UnexpectedCallId { actual: u64, expected: u64 },
+    UnexpectedCallId {
+        /// The publication's call ordinal.
+        actual: u64,
+        /// The next ordinal the cache accepts.
+        expected: u64,
+    },
+    /// The append does not start at the end of the valid prefix.
     #[error(
         "prepared owner-prefix start position {actual} is not contiguous with valid prefix {expected}"
     )]
-    PositionDiscontinuity { actual: usize, expected: usize },
+    PositionDiscontinuity {
+        /// The append's start position.
+        actual: usize,
+        /// The valid prefix length.
+        expected: usize,
+    },
+    /// The appended values are not whole `[batch, position]` rows.
     #[error(
         "prepared owner-prefix length {actual} is not a multiple of batch/value stride {stride}"
     )]
-    PreparedLength { actual: usize, stride: usize },
+    PreparedLength {
+        /// Supplied length.
+        actual: usize,
+        /// Elements per compressed position across all batches.
+        stride: usize,
+    },
+    /// The new prefix length does not fit in `usize`.
     #[error("prepared owner-prefix position count overflowed usize")]
     PositionOverflow,
+    /// The append would pass the cache's capacity.
     #[error(
         "prepared owner-prefix values end at compressed position {end_position}, capacity is {capacity}"
     )]
     CapacityExceeded {
+        /// Exclusive end of the append, in compressed positions.
         end_position: usize,
+        /// The cache's capacity.
         capacity: usize,
     },
+    /// An appended BF16 value is NaN or infinite.
     #[error("prepared BF16 owner-prefix value at flat input position {position} is not finite")]
-    NonFinitePrepared { position: usize },
+    NonFinitePrepared {
+        /// Flat index into the appended values.
+        position: usize,
+    },
+    /// The successful-call ordinal would overflow.
     #[error("owner-prefix publication call ordinal overflowed")]
     CallIdOverflow,
+    /// The epoch counter would overflow.
     #[error("owner-prefix epoch counter overflowed")]
     EpochOverflow,
+    /// The requested batch does not exist.
     #[error("batch {batch} is outside owner-prefix cache batch count {batches}")]
-    BatchOutOfRange { batch: usize, batches: usize },
+    BatchOutOfRange {
+        /// The requested batch.
+        batch: usize,
+        /// The cache's batch count.
+        batches: usize,
+    },
 }
 
 #[cfg(test)]

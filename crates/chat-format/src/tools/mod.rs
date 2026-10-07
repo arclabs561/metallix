@@ -58,6 +58,11 @@ fn typed_parameter(tools: &[Value], function: &str, key: &str, raw: String) -> V
 }
 
 /// Compile only bounded local schemas; tool schemas must not cause retrieval.
+///
+/// # Errors
+///
+/// Returns a message when the serialized schema passes 32 KiB, has a `$ref`
+/// or `$dynamicRef` outside the document, or does not compile.
 pub fn validator(schema: &Value) -> Result<jsonschema::Validator, String> {
     fn check_refs(value: &Value) -> Result<(), String> {
         match value {

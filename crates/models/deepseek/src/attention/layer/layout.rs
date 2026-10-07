@@ -68,6 +68,19 @@ impl LayerAttentionLayout {
     /// compressed numerical values may be used. `compressed_ratio` controls
     /// the per-query causal limit during a prefill (a value of one is the
     /// pinned initial layer-4 arrangement).
+    ///
+    /// # Errors
+    ///
+    /// * [`LayerAttentionLayoutError::RopeExceedsHead`],
+    ///   [`LayerAttentionLayoutError::HeadsNotGrouped`] and
+    ///   [`LayerAttentionLayoutError::UngroupedFp8Reduction`] for dimensions
+    ///   the source path cannot use.
+    /// * [`LayerAttentionLayoutError::InvalidNormEpsilon`] and
+    ///   [`LayerAttentionLayoutError::InvalidSoftmaxScale`] for a non-finite or
+    ///   non-positive scalar.
+    /// * [`LayerAttentionLayoutError::ShapeOverflow`] and
+    ///   [`LayerAttentionLayoutError::ElementLimit`] when a staging buffer does
+    ///   not fit its bound.
     #[allow(
         clippy::too_many_arguments,
         reason = "source dimensions stay explicit at the adapter boundary"
@@ -108,6 +121,19 @@ impl LayerAttentionLayout {
     /// [`LayerAttentionState::forward`](super::LayerAttentionState::forward); use
     /// [`LayerAttentionState::forward_window_only`](super::LayerAttentionState::forward_window_only)
     /// instead.
+    ///
+    /// # Errors
+    ///
+    /// * [`LayerAttentionLayoutError::RopeExceedsHead`],
+    ///   [`LayerAttentionLayoutError::HeadsNotGrouped`] and
+    ///   [`LayerAttentionLayoutError::UngroupedFp8Reduction`] for dimensions
+    ///   the source path cannot use.
+    /// * [`LayerAttentionLayoutError::InvalidNormEpsilon`] and
+    ///   [`LayerAttentionLayoutError::InvalidSoftmaxScale`] for a non-finite or
+    ///   non-positive scalar.
+    /// * [`LayerAttentionLayoutError::ShapeOverflow`] and
+    ///   [`LayerAttentionLayoutError::ElementLimit`] when a staging buffer does
+    ///   not fit its bound.
     #[allow(
         clippy::too_many_arguments,
         reason = "the source-visible attention dimensions remain explicit"

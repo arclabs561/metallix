@@ -26,6 +26,12 @@ pub struct StartupLayout {
 
 impl StartupLayout {
     /// Validates the table and Hyper-Connections startup dimensions.
+    ///
+    /// # Errors
+    ///
+    /// * [`StartupError::EmptyDimension`] when a dimension is zero.
+    /// * [`StartupError::CopyCountTooLarge`] for more than 16 copies.
+    /// * [`StartupError::ElementLimit`] when the table passes the element cap.
     pub fn new(rows: usize, width: usize, copies: usize) -> Result<Self, StartupError> {
         if rows == 0 || width == 0 || copies == 0 {
             return Err(StartupError::EmptyDimension);
@@ -73,32 +79,66 @@ pub enum StartupError {
     EmptyDimension,
     /// The requested copy count exceeds this scalar reference bound.
     #[error("startup copy count {copies} exceeds maximum {MAX_STARTUP_COPIES}")]
-    CopyCountTooLarge { copies: usize },
+    CopyCountTooLarge {
+        /// The requested copy count.
+        copies: usize,
+    },
     /// A derived shape overflowed or exceeded the scalar reference cap.
     #[error("startup {field} exceeds the bounded scalar reference")]
-    ElementLimit { field: &'static str },
+    ElementLimit {
+        /// The derived count's role.
+        field: &'static str,
+    },
     /// The BF16 table storage does not match the validated layout.
     #[error("startup embedding table length {actual}, expected {expected}")]
-    TableLength { actual: usize, expected: usize },
+    TableLength {
+        /// Supplied elements.
+        actual: usize,
+        /// `rows * width`.
+        expected: usize,
+    },
     /// A token ID cannot select a row in the supplied table.
     #[error("startup token ID {id} is outside table rows {rows}")]
-    TokenOutOfRange { id: u64, rows: usize },
+    TokenOutOfRange {
+        /// The token ID.
+        id: u64,
+        /// Rows in the table.
+        rows: usize,
+    },
     /// The original-token-ID map does not match the supplied row count.
     #[error("startup selected token ID count {actual}, expected {expected}")]
-    SelectedTokenCount { actual: usize, expected: usize },
+    SelectedTokenCount {
+        /// Selected IDs supplied.
+        actual: usize,
+        /// The layout's row count.
+        expected: usize,
+    },
     /// The selected original token IDs are not strictly increasing.
     #[error("startup selected token IDs must be strictly increasing at index {index}")]
-    SelectedTokenOrder { index: usize },
+    SelectedTokenOrder {
+        /// Index of the first ID not above its predecessor.
+        index: usize,
+    },
     /// An original token ID has no row in the selected embedding storage.
     #[error("startup token ID {id} has no selected embedding row")]
-    MissingSelectedToken { id: u64 },
+    MissingSelectedToken {
+        /// The requested token ID.
+        id: u64,
+    },
     /// A selected BF16 table element is nonfinite.
     #[error("startup embedding row {row}, feature {feature} is nonfinite")]
-    NonFiniteEmbedding { row: usize, feature: usize },
+    NonFiniteEmbedding {
+        /// Table row.
+        row: usize,
+        /// Feature within the row.
+        feature: usize,
+    },
     /// A bounded output allocation failed.
     #[error("startup allocation failed for {field} with {elements} elements")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
 }
@@ -134,6 +174,16 @@ fn finite_bf16(bits: u16) -> bool {
 /// The table is `[rows, width]`; output residual is `[ids.len(), copies, width]`.
 /// Selected IDs and BF16 values are validated before allocation. This is the
 /// single-rank, text-only source startup equation.
+///
+/// # Errors
+///
+/// * [`StartupError::TableLength`] when the table does not match `layout`.
+/// * [`StartupError::TokenOutOfRange`] for an ID past the table's rows.
+/// * [`StartupError::NonFiniteEmbedding`] for a NaN or infinite value in a
+///   selected row.
+/// * [`StartupError::ElementLimit`] when the output would pass the per-call
+///   bound, and [`StartupError::AllocationFailed`] when it cannot be
+///   reserved.
 pub fn startup_bf16_reference(
     ids: &[u64],
     embedding_table_bf16: &[u16],
@@ -206,6 +256,20 @@ pub fn startup_bf16_reference(
 /// Shape limits, requested IDs and requested BF16 rows are validated before
 /// allocating the bounded slot map. Unrequested nonfinite rows are allowed,
 /// matching [`startup_bf16_reference`].
+///
+/// # Errors
+///
+/// * [`StartupError::SelectedTokenCount`] and
+///   [`StartupError::SelectedTokenOrder`] unless `selected_token_ids` has
+///   one strictly increasing ID per row.
+/// * [`StartupError::TableLength`] when the rows do not match `layout`.
+/// * [`StartupError::MissingSelectedToken`] for a requested ID with no
+///   selected row.
+/// * [`StartupError::NonFiniteEmbedding`] for a NaN or infinite value in a
+///   requested row.
+/// * [`StartupError::ElementLimit`] when the output would pass the per-call
+///   bound, and [`StartupError::AllocationFailed`] when it cannot be
+///   reserved.
 pub fn startup_selected_bf16_reference(
     ids: &[u64],
     selected_token_ids: &[u64],

@@ -35,6 +35,16 @@ impl AttentionQrLayout {
     ///
     /// The bounds cover activation elements, not resident weight bytes or
     /// projection work. Callers must admit those resources independently.
+    ///
+    /// # Errors
+    ///
+    /// * [`LayerAttentionLayoutError::InvalidNormEpsilon`] for a non-finite or
+    ///   non-positive epsilon.
+    /// * [`LayerAttentionLayoutError::UngroupedFp8Reduction`] when the hidden
+    ///   width or rank is not a multiple of 32.
+    /// * [`LayerAttentionLayoutError::ShapeOverflow`] and
+    ///   [`LayerAttentionLayoutError::ElementLimit`] when a staging buffer does
+    ///   not fit its bound.
     pub fn new(
         batches: NonZeroUsize,
         hidden_dimension: NonZeroUsize,
@@ -132,6 +142,14 @@ impl AttentionQrDiagnostic {
 ///
 /// Activation storage is bounded; callers must separately budget checkpoint
 /// weight bytes and projection work. Errors return no partial diagnostic.
+///
+/// # Errors
+///
+/// * [`LayerAttentionError::InputLength`] when `input` is not whole rows.
+/// * [`LayerAttentionError::ShapeOverflow`] and
+///   [`LayerAttentionError::ElementLimit`] when the rows do not fit the bound.
+/// * [`LayerAttentionError::NonFiniteProjection`] and the wrapped FP8,
+///   quantization and norm errors when a stage rejects its input or overflows.
 pub fn prepare_attention_qr(
     input: &[u16],
     weights: AttentionQrWeights<'_>,

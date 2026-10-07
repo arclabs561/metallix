@@ -30,22 +30,47 @@ pub enum MlxAffineRowError {
     GroupShape,
     /// The requested bit width or group size is unsupported.
     #[error("unsupported MLX affine layout: bits={bits}, group_size={group_size}")]
-    UnsupportedLayout { bits: u8, group_size: usize },
+    UnsupportedLayout {
+        /// The requested bits per code.
+        bits: u8,
+        /// The requested group size.
+        group_size: usize,
+    },
     /// A decoded value is non-finite.
     #[error("MLX affine row produced a non-finite value at column {column}")]
-    NonFinite { column: usize },
+    NonFinite {
+        /// The column within the decoded row.
+        column: usize,
+    },
     /// A named tensor is absent from the validated shard header.
     #[error("MLX affine tensor {name:?} is missing from the shard header")]
-    MissingTensor { name: String },
+    MissingTensor {
+        /// The tensor name.
+        name: String,
+    },
     /// A named tensor has an unexpected dtype, rank, or row geometry.
     #[error("MLX affine tensor {name:?} has an invalid shape or dtype")]
-    TensorShape { name: String },
+    TensorShape {
+        /// The tensor name.
+        name: String,
+    },
     /// The bounded row read failed.
     #[error("could not read MLX affine tensor bytes: {0}")]
     Io(String),
 }
 
 /// Reads and decodes one affine row from a validated safetensors shard.
+///
+/// # Errors
+///
+/// * [`MlxAffineRowError::MissingTensor`] and
+///   [`MlxAffineRowError::TensorShape`] when a tensor is absent from
+///   `header` or its dtype, rank or rows do not match the request.
+/// * [`MlxAffineRowError::Io`] when reading the shard fails.
+/// * [`MlxAffineRowError::PackedShape`], [`MlxAffineRowError::GroupShape`]
+///   and [`MlxAffineRowError::UnsupportedLayout`] when the packed codes,
+///   scales and biases do not fit `logical_width`, `bits` and `group_size`.
+/// * [`MlxAffineRowError::NonFinite`] for a non-finite decoded value.
 #[allow(clippy::too_many_arguments)]
 pub fn read_affine_row_from_shard(
     shard: &Path,
@@ -76,6 +101,17 @@ pub fn read_affine_row_from_shard(
 ///
 /// The file is opened once for the range so callers can stream a large matrix
 /// in model-shaped chunks without paying one open/close cycle per row.
+///
+/// # Errors
+///
+/// * [`MlxAffineRowError::MissingTensor`] and
+///   [`MlxAffineRowError::TensorShape`] when a tensor is absent from
+///   `header` or its dtype, rank or rows do not match the request.
+/// * [`MlxAffineRowError::Io`] when reading the shard fails.
+/// * [`MlxAffineRowError::PackedShape`], [`MlxAffineRowError::GroupShape`]
+///   and [`MlxAffineRowError::UnsupportedLayout`] when the packed codes,
+///   scales and biases do not fit `logical_width`, `bits` and `group_size`.
+/// * [`MlxAffineRowError::NonFinite`] for a non-finite decoded value.
 #[allow(clippy::too_many_arguments)]
 pub fn read_affine_rows_from_shard(
     shard: &Path,
@@ -188,6 +224,13 @@ pub fn read_affine_rows_from_shard(
 }
 
 /// Reads a bounded row-major F32 tensor from a validated shard.
+///
+/// # Errors
+///
+/// * [`MlxAffineRowError::MissingTensor`] and
+///   [`MlxAffineRowError::TensorShape`] when a tensor is absent from
+///   `header` or its dtype, rank or rows do not match the request.
+/// * [`MlxAffineRowError::Io`] when reading the shard fails.
 pub fn read_f32_tensor_from_shard(
     shard: &Path,
     header: &V41SafetensorsHeader,
@@ -220,6 +263,13 @@ pub fn read_f32_tensor_from_shard(
 }
 
 /// Reads a bounded BF16 tensor and widens it to FP32.
+///
+/// # Errors
+///
+/// * [`MlxAffineRowError::MissingTensor`] and
+///   [`MlxAffineRowError::TensorShape`] when a tensor is absent from
+///   `header` or its dtype, rank or rows do not match the request.
+/// * [`MlxAffineRowError::Io`] when reading the shard fails.
 pub fn read_bf16_tensor_from_shard(
     shard: &Path,
     header: &V41SafetensorsHeader,
@@ -272,6 +322,13 @@ fn read_range(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), MlxA
 /// MLX stores affine codes as a contiguous little-endian bitstream. The
 /// current `DeepSeek` embedding uses 8 bits/group 64; attention projections use
 /// 6 bits/group 128. Each BF16 scale and bias pair covers one group.
+///
+/// # Errors
+///
+/// * [`MlxAffineRowError::PackedShape`], [`MlxAffineRowError::GroupShape`]
+///   and [`MlxAffineRowError::UnsupportedLayout`] when the packed codes,
+///   scales and biases do not fit `logical_width`, `bits` and `group_size`.
+/// * [`MlxAffineRowError::NonFinite`] for a non-finite decoded value.
 pub fn decode_affine_row(
     packed: &[u32],
     scales_bf16: &[u16],
@@ -326,6 +383,11 @@ pub fn decode_affine_row(
 }
 
 /// Expands one hidden state into the repeated HC input layout.
+///
+/// # Errors
+///
+/// Returns [`MlxAffineRowError::GroupShape`] when `input` is empty, `copies`
+/// is zero, or the expanded length overflows.
 pub fn expand_hc_hidden(input: &[f32], copies: usize) -> Result<Vec<f32>, MlxAffineRowError> {
     if input.is_empty() || copies == 0 {
         return Err(MlxAffineRowError::GroupShape);
@@ -342,6 +404,11 @@ pub fn expand_hc_hidden(input: &[f32], copies: usize) -> Result<Vec<f32>, MlxAff
 }
 
 /// Computes one Hyper-Connection coefficient row from decoded MLX parameters.
+///
+/// # Errors
+///
+/// Returns [`HcError`] when a buffer does not match `copies` and the hidden
+/// width, a shape overflows, or an input or control is not finite.
 pub fn mix_hc_coefficients(
     fn_matrix: &[f32],
     base: &[f32],
@@ -394,6 +461,11 @@ pub fn mix_hc_coefficients(
 }
 
 /// Collapses repeated hidden streams with real HC pre coefficients.
+///
+/// # Errors
+///
+/// Returns [`HcError`] when `hidden` does not hold the coefficients' copy
+/// count, or holds a non-finite value.
 pub fn collapse_hc_hidden(
     hidden: &[f32],
     coefficients: &HcCoefficients,
@@ -422,6 +494,10 @@ pub fn collapse_hc_hidden(
 }
 
 /// Converts one decoded row to an MLX array and evaluates it on the device.
+///
+/// # Errors
+///
+/// Returns the MLX exception when the array cannot be built or evaluated.
 #[cfg(feature = "metal")]
 pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
     let _device = crate::device_lock();
@@ -441,6 +517,10 @@ pub fn decode_affine_row_mlx(values: &[f32]) -> Result<mlx_rs::Array, mlx_rs::er
 ///
 /// Panics when the supplied matrix or input dimensions do not match the
 /// declared `rows` and `width`.
+///
+/// # Errors
+///
+/// Returns the MLX exception when the product cannot be built or evaluated.
 #[cfg(feature = "metal")]
 pub fn apply_affine_matrix_mlx(
     matrix: &[f32],
@@ -1015,8 +1095,9 @@ pub struct LayerZeroQkvResident {
     pub attn_norm: Vec<f32>,
     /// Layer-zero hyper-connection coefficient projection, widened from F32.
     pub hc_fn: Vec<f32>,
-    /// Layer-zero hyper-connection base and scale controls.
+    /// Layer-zero hyper-connection base.
     pub hc_base: Vec<f32>,
+    /// Layer-zero hyper-connection scale controls.
     pub hc_scale: Vec<f32>,
     /// Learned Q normalization weights, widened from BF16.
     pub q_norm: Vec<f32>,
@@ -1132,6 +1213,12 @@ impl LayerZeroQkvResident {
 
     /// Runs the resident HC-pre and attention-normalization boundary for one
     /// hidden state. The result is the 4,096-wide activation consumed by Q/KV.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlxAffineRowError::TensorShape`] when a resident array or the
+    /// input has the wrong shape, and [`MlxAffineRowError::NonFinite`] when the
+    /// input or a stage result is not finite.
     #[allow(clippy::cast_precision_loss, reason = "fixed model hidden width")]
     pub fn prepare_attention_hidden(
         &self,
@@ -1197,6 +1284,12 @@ impl LayerZeroQkvResident {
     /// Projects one finite hidden state through resident Q/KV weights and
     /// applies the learned low-rank RMS boundaries. This CPU path is a
     /// deterministic activation contract used before wiring the Metal graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlxAffineRowError::TensorShape`] when a resident array or the
+    /// input has the wrong shape, and [`MlxAffineRowError::NonFinite`] when the
+    /// input or a stage result is not finite.
     #[allow(
         clippy::items_after_statements,
         clippy::cast_precision_loss,
@@ -1260,6 +1353,12 @@ impl LayerZeroQkvResident {
     /// those stages and records the exact hidden activation used for the
     /// projection, so a later device implementation can compare each side of
     /// the handoff without reaching back into checkpoint state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlxAffineRowError::TensorShape`] when a resident array or the
+    /// input has the wrong shape, and [`MlxAffineRowError::NonFinite`] when the
+    /// input or a stage result is not finite.
     pub fn prepare_attention_activation(
         &self,
         hidden: &[f32],
@@ -1292,6 +1391,12 @@ impl LayerZeroQkvResident {
     /// [`Self::project_qkv`] remains the independent CPU oracle. This method
     /// only qualifies the real loaded layer-zero activation boundary; it does
     /// not own attention cache or request state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlxAffineRowError::TensorShape`] and
+    /// [`MlxAffineRowError::NonFinite`] as [`Self::project_qkv`] does, and
+    /// [`MlxAffineRowError::Io`] carrying the message when MLX fails.
     #[cfg(feature = "metal")]
     #[allow(
         clippy::items_after_statements,
@@ -1367,6 +1472,11 @@ impl LayerZeroQkvResident {
     ///
     /// This catches accidental truncation or row-major transposition before a
     /// Metal operation receives the arrays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MlxAffineRowError::TensorShape`] naming the first array with
+    /// the wrong length.
     pub fn validate(&self) -> Result<(), MlxAffineRowError> {
         if self.wq_a.len() != Self::WQ_A_ROWS * Self::HIDDEN_WIDTH
             || self.attn_norm.len() != Self::HIDDEN_WIDTH

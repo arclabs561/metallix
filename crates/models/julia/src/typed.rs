@@ -17,6 +17,8 @@ const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 20;
 const MAX_QUESTIONS: usize = 16;
 
+/// A typed request the strict inference policy rejects, or a tokenizer
+/// failure, with a human-readable reason.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
 pub struct JuliaRequestError(String);
@@ -32,12 +34,19 @@ fn fail<T>(message: impl Into<String>) -> Result<T, JuliaRequestError> {
 /// `serde_json`, unlike Python; such states serialize differently.
 #[derive(Clone, Debug, PartialEq)]
 pub enum OrderedJson {
+    /// JSON `null`.
     Null,
+    /// JSON `true` or `false`.
     Bool(bool),
+    /// An integer that fits in a signed or unsigned 64-bit integer.
     Int(i128),
+    /// Any other number.
     Float(f64),
+    /// A string.
     String(String),
+    /// An array, in order.
     Array(Vec<OrderedJson>),
+    /// An object's members in first-seen key order.
     Object(Vec<(String, OrderedJson)>),
 }
 
@@ -207,14 +216,19 @@ fn python_float_repr(x: f64) -> String {
     }
 }
 
+/// The kind of answer a question asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuestionType {
+    /// One of the caller's named options.
     Choice,
+    /// The probability-weighted index over an ordered rubric.
     Score,
+    /// The probability of the `true` option.
     Noul,
 }
 
 impl QuestionType {
+    /// The request's `type` string for this kind.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -238,24 +252,36 @@ impl QuestionType {
 /// One named question as the source turns it into a `sequence` row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypedRow {
+    /// The question's ID in the request.
     pub name: String,
+    /// The kind of answer it asks for.
     pub kind: QuestionType,
     /// Answer IDs in option order.
     pub keys: Vec<String>,
+    /// The question's `instructions` text.
     pub question: String,
     /// Option descriptions scored by the model, aligned with `keys`.
     pub options: Vec<String>,
 }
 
+/// A parsed typed request: its state and one row per question.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypedRequest {
     /// `state` as `sequence` renders it: strings verbatim, JSON via Python `json.dumps`.
     pub state_text: String,
+    /// The questions, in request order.
     pub rows: Vec<TypedRow>,
 }
 
 /// Parses `{"state": ..., "questions": {name: {type, instructions, criteria}}}`,
 /// keeping caller order for questions and choice criteria.
+///
+/// # Errors
+///
+/// Returns [`JuliaRequestError`] when the bytes are not a JSON object, the
+/// state is not a string, array or object, `questions` is not an object of
+/// 1 through 16 questions, or a question has an unknown type, non-text
+/// instructions, or other than 2 through 20 nonempty option descriptions.
 pub fn parse_typed_request(bytes: &[u8]) -> Result<TypedRequest, JuliaRequestError> {
     let request: OrderedJson = serde_json::from_slice(bytes)
         .map_err(|error| JuliaRequestError(format!("request JSON could not be parsed: {error}")))?;
@@ -386,17 +412,25 @@ fn labelled_row(
 /// Tokenizer IDs and the literal mask string that `sequence` relies on.
 #[derive(Clone, Debug)]
 pub struct SpecialTokens {
+    /// The mask token's text. Request text that contains it is rejected,
+    /// because the model reads the mask token as an option marker.
     pub mask_text: String,
+    /// ID of the mask token that starts each option.
     pub mask: u32,
+    /// ID of the token that starts the sequence.
     pub cls: u32,
+    /// ID of the separator token.
     pub sep: u32,
 }
 
 /// Serialized model input for one row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncodedRow {
+    /// Token IDs of the whole sequence, at most [`MAX_LENGTH`].
     pub ids: Vec<u32>,
+    /// Position of each option's mask token in `ids`, in option order.
     pub markers: Vec<usize>,
+    /// The type-embedding row, from [`QuestionType::qtype`].
     pub qtype: usize,
 }
 
@@ -405,6 +439,13 @@ pub struct EncodedRow {
 /// `encode` must tokenize without special tokens. Strict mode rejects every
 /// input the source would sanitize or truncate, so no clean/truncate branch
 /// can change the result.
+///
+/// # Errors
+///
+/// Returns [`JuliaRequestError`] when any request text contains the mask
+/// token's text, `encode` fails, an option encodes to more than 48 tokens,
+/// the question and options pass the [`HEAD_LENGTH`] budget, or the state
+/// does not fit in [`MAX_LENGTH`].
 pub fn sequence(
     mut encode: impl FnMut(&str) -> Result<Vec<u32>, String>,
     special: &SpecialTokens,
@@ -466,6 +507,10 @@ pub fn sequence(
 
 /// Source `predict_typed` readout: option softmax, then `choice`, expected
 /// `score`, or `noul` (probability of `true`), plus raw marker scores.
+///
+/// # Errors
+///
+/// Returns [`JuliaRequestError`] unless there is one finite score per option.
 pub fn typed_answer(row: &TypedRow, scores: &[f32]) -> Result<Value, JuliaRequestError> {
     if scores.len() != row.keys.len() || scores.iter().any(|s| !s.is_finite()) {
         return fail(format!("{:?}: invalid model scores", row.name));

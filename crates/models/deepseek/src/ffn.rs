@@ -51,6 +51,17 @@ impl<'a> FfnSublayerReference<'a> {
     /// projection and base are checked against that width and `copies` without
     /// executing artificial data. Forward-time leaf validation still checks
     /// finite encoded values and the bounded HC and norm numeric domains.
+    ///
+    /// # Errors
+    ///
+    /// * [`FfnError::Length`] when `norm_weight`, `hc_projection` or `hc_base`
+    ///   does not match the geometry.
+    /// * [`FfnError::InvalidCopies`], [`FfnError::InvalidNormEpsilon`],
+    ///   [`FfnError::InvalidSinkhornIterations`],
+    ///   [`FfnError::InvalidHcEpsilon`] and [`FfnError::InvalidHcScale`] for a
+    ///   zero count or a non-finite or non-positive control.
+    /// * [`FfnError::ShapeOverflow`] when the derived geometry does not fit in
+    ///   `usize`.
     #[allow(
         clippy::too_many_arguments,
         reason = "the source stores each FFN and Hyper-Connection role separately"

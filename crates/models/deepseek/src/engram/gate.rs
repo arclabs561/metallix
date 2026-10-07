@@ -83,11 +83,18 @@ impl EngramGateLayout {
 /// when supplied, is `[batch, position]`.
 #[derive(Clone, Copy, Debug)]
 pub struct EngramGateInputs<'a> {
+    /// Residual stream copies, BF16 bits.
     pub stream: &'a [u16],
+    /// Engram keys per copy, BF16 bits.
     pub key: &'a [u16],
+    /// Engram values, BF16 bits.
     pub value: &'a [u16],
+    /// Per-copy RMS-norm weight on the stream (query) side; it multiplies
+    /// `k_weight` elementwise in the gate's dot product.
     pub q_weight: &'a [f32],
+    /// Per-copy RMS-norm weight on the key side.
     pub k_weight: &'a [f32],
+    /// Positions to gate; `None` gates every position.
     pub mask: Option<&'a [bool]>,
 }
 
@@ -128,18 +135,26 @@ pub enum EngramGateError {
     EmptyDimension,
     /// A derived shape could not be represented by `usize`.
     #[error("Engram gate shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The tensor or derived count's role.
+        field: &'static str,
+    },
     /// One bounded scalar buffer exceeds its fixed cap.
     #[error("Engram gate {field} has {elements} elements, maximum is 1048576")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
     /// An input has an unexpected exact length.
     #[error("Engram gate {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
     /// Normalization epsilon must be finite and strictly positive.
@@ -150,21 +165,38 @@ pub enum EngramGateError {
     InvalidClamp,
     /// A BF16 tensor input denotes NaN or infinity.
     #[error("Engram gate {field} BF16 value at element {element} is non-finite")]
-    NonFiniteBf16 { field: &'static str, element: usize },
+    NonFiniteBf16 {
+        /// The tensor's role.
+        field: &'static str,
+        /// Flat index into it.
+        element: usize,
+    },
     /// A q/k weight input denotes NaN or infinity.
     #[error("Engram gate {field} weight at element {element} is non-finite")]
-    NonFiniteWeight { field: &'static str, element: usize },
+    NonFiniteWeight {
+        /// The weight's role.
+        field: &'static str,
+        /// Flat index into it.
+        element: usize,
+    },
     /// A scalar intermediate or final BF16 narrowing did not remain finite.
     #[error("Engram gate overflowed at {stage}, row {row}, copy {copy}, feature {feature}")]
     ValueOverflow {
+        /// The computation stage.
         stage: &'static str,
+        /// Flat `[batch, position]` row.
         row: usize,
+        /// Stream copy.
         copy: usize,
+        /// Feature index within the width.
         feature: usize,
     },
     /// A bounded private result could not be allocated.
     #[error("could not allocate {elements} Engram gate elements")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Elements that could not be reserved.
+        elements: usize,
+    },
 }
 
 /// Applies the source Engram residual gate to BF16 stream copies.

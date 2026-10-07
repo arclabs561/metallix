@@ -81,6 +81,15 @@ pub struct IndexQueryLayout {
 
 impl IndexQueryLayout {
     /// Creates a bounded source-shaped index-query layout.
+    ///
+    /// # Errors
+    ///
+    /// * [`IndexQueryLayoutError::RopeExceedsHead`] and
+    ///   [`IndexQueryLayoutError::UngroupedWidth`] for widths the source path
+    ///   cannot use.
+    /// * [`IndexQueryLayoutError::ShapeOverflow`] and
+    ///   [`IndexQueryLayoutError::ElementLimit`] when a staging buffer does not
+    ///   fit its bound.
     #[allow(
         clippy::too_many_arguments,
         reason = "the source's six relevant dimensions stay explicit"
@@ -175,6 +184,11 @@ impl CandidateQueryLayout {
     }
 
     /// Validates the shared QR geometry and the supplied index-query geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerAttentionLayoutError`] when the QR prefix geometry or
+    /// `norm_epsilon` is invalid; see [`AttentionQrLayout::new`].
     pub fn new(
         index: IndexQueryLayout,
         norm_epsilon: f32,
@@ -253,6 +267,13 @@ pub struct IndexKeyView<'a> {
 
 impl<'a> IndexKeyView<'a> {
     /// Validates one bounded, finite BF16 key matrix.
+    ///
+    /// # Errors
+    ///
+    /// * [`ScoredQueryError::EmptyKeys`], [`ScoredQueryError::KeyShape`] and
+    ///   [`ScoredQueryError::KeyElementLimit`] unless `values` holds one or
+    ///   more whole rows within the bound.
+    /// * [`ScoredQueryError::NonFiniteKey`] for a NaN or infinite value.
     pub fn new(values: &'a [u16], head_dimension: NonZeroUsize) -> Result<Self, ScoredQueryError> {
         if values.is_empty() {
             return Err(ScoredQueryError::EmptyKeys);
@@ -307,18 +328,34 @@ pub struct ScoredQueryDiagnostic {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IndexQueryLayoutError {
+    /// A derived shape does not fit in `usize`.
     #[error("index-query shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// The rotary tail is wider than one head.
     #[error("rope width {rope_width} exceeds index head dimension {head_dimension}")]
     RopeExceedsHead {
+        /// Rotary tail width, `2 * rope_pairs`.
         rope_width: usize,
+        /// Head width.
         head_dimension: usize,
     },
+    /// An FP8 reduction width is not a multiple of 32.
     #[error("{field} width {width} is not divisible by group 32")]
-    UngroupedWidth { field: &'static str, width: usize },
+    UngroupedWidth {
+        /// The width's role.
+        field: &'static str,
+        /// The width.
+        width: usize,
+    },
+    /// A staging buffer would pass the fixed element cap.
     #[error("index-query {field} has {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
 }
@@ -327,50 +364,84 @@ pub enum IndexQueryLayoutError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum IndexQueryError {
+    /// The layout is invalid.
     #[error(transparent)]
     Layout(#[from] IndexQueryLayoutError),
+    /// FP8 activation quantization rejected its input.
     #[error(transparent)]
     ActivationQuant(#[from] ActivationQuantError),
+    /// The FP8 `wq_b` projection rejected its input or overflowed.
     #[error(transparent)]
     Fp8Linear(#[from] Fp8LinearError),
+    /// The rotary stage rejected its input.
     #[error(transparent)]
     Rotary(#[from] RotaryError),
+    /// FP4 reconstruction rejected its input or overflowed.
     #[error(transparent)]
     Fp4(#[from] Fp4ActivationError),
+    /// The BF16 `weights_proj` projection rejected its input or overflowed.
     #[error(transparent)]
     Bf16Linear(#[from] Bf16LinearError),
+    /// `qr` or `x` is empty or not whole `[batch, position]` rows.
     #[error("{field} length is {actual}; expected a nonempty multiple of {stride}")]
     InputLength {
+        /// `qr` or `x`.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Elements per position across all batches.
         stride: usize,
     },
+    /// `qr` and `x` describe different position counts.
     #[error("qr and x have inconsistent position counts: qr {qr_positions}, x {x_positions}")]
     PositionMismatch {
+        /// Positions `qr` describes.
         qr_positions: usize,
+        /// Positions `x` describes.
         x_positions: usize,
     },
+    /// A staging buffer would pass the fixed element cap.
     #[error("index-query {field} has {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
+    /// A derived shape does not fit in `usize`.
     #[error("index-query shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// The query projection narrowed to a non-finite BF16.
     #[error("FP8 query projection was nonfinite after BF16 narrowing at {element}")]
-    NonFiniteProjection { element: usize },
+    NonFiniteProjection {
+        /// Flat element index.
+        element: usize,
+    },
+    /// A rotated query value narrowed to a non-finite BF16.
     #[error("rotary query was nonfinite after BF16 narrowing at tail element {element}")]
-    NonFiniteRotary { element: usize },
+    NonFiniteRotary {
+        /// Flat index into the rotary tail.
+        element: usize,
+    },
+    /// A scaled head weight narrowed to a non-finite BF16.
     #[error("source index scalar could not narrow to finite BF16 at head weight {element}")]
-    NonFiniteScale { element: usize },
+    NonFiniteScale {
+        /// Flat head-weight index.
+        element: usize,
+    },
 }
 
 /// Rejected model-local candidate-query preparation.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CandidateQueryError {
+    /// Deriving QR from `x` failed.
     #[error(transparent)]
     AttentionQr(#[from] LayerAttentionError),
+    /// Index-query preparation failed.
     #[error(transparent)]
     Index(#[from] IndexQueryError),
 }
@@ -381,45 +452,77 @@ pub enum CandidateQueryError {
 pub enum ScoredQueryError {
     /// This narrow adapter intentionally scores one explicit batch at a time.
     #[error("scored index query requires exactly one batch, got {actual}")]
-    BatchCount { actual: usize },
+    BatchCount {
+        /// The layout's batch count.
+        actual: usize,
+    },
     /// The residual input was not a nonempty sequence of hidden rows.
     #[error("scored index query x length {actual}; expected a nonempty multiple of {stride}")]
-    InputLength { actual: usize, stride: usize },
+    InputLength {
+        /// Supplied length.
+        actual: usize,
+        /// Elements per position.
+        stride: usize,
+    },
     /// The residual input would exceed the bounded query diagnostic surface.
     #[error("scored index query x has {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}")]
-    InputElementLimit { elements: usize },
+    InputElementLimit {
+        /// Elements in `x`.
+        elements: usize,
+    },
     /// No reconstructed key row was supplied.
     #[error("scored index query requires at least one reconstructed key")]
     EmptyKeys,
     /// Reconstructed key storage did not contain complete key rows.
     #[error("scored index key length {actual} is not divisible by head dimension {head_dimension}")]
     KeyShape {
+        /// Supplied length.
         actual: usize,
+        /// Elements per key row.
         head_dimension: usize,
     },
     /// Reconstructed key storage exceeded the explicit view bound.
     #[error("scored index keys have {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}")]
-    KeyElementLimit { elements: usize },
+    KeyElementLimit {
+        /// Elements in the key matrix.
+        elements: usize,
+    },
     /// A reconstructed key row contained NaN or infinity.
     #[error("scored index key is nonfinite at position {position}")]
-    NonFiniteKey { position: usize },
+    NonFiniteKey {
+        /// Flat index into the key matrix.
+        position: usize,
+    },
     /// The supplied key-row width differs from the source index-head width.
     #[error(
         "scored index key head dimension {actual} does not equal index head dimension {expected}"
     )]
-    KeyHeadDimension { actual: usize, expected: usize },
+    KeyHeadDimension {
+        /// The keys' row width.
+        actual: usize,
+        /// The index head width.
+        expected: usize,
+    },
     /// Checked aggregate score shape arithmetic overflowed `usize`.
     #[error("scored index query shape arithmetic overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
     /// The complete call's scalar BF16 score work exceeded its reference cap.
     #[error("scored index query scalar score work exceeds {max_terms} terms")]
-    AggregateWorkloadTooLarge { max_terms: usize },
+    AggregateWorkloadTooLarge {
+        /// The fixed scalar-term cap.
+        max_terms: usize,
+    },
     /// One source-visible score diagnostic matrix exceeded its explicit cap.
     #[error(
         "scored index query {field} has {elements} elements, maximum is {MAX_INDEX_QUERY_ELEMENTS}"
     )]
     DiagnosticElementLimit {
+        /// The diagnostic's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
     /// Candidate QR/query preparation rejected the preflighted request.
@@ -435,7 +538,9 @@ pub enum ScoredQueryError {
     /// A bounded aggregate diagnostic buffer could not be reserved.
     #[error("could not allocate {elements} BF16 scored index-query {field} elements")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
 }
@@ -445,6 +550,11 @@ pub enum ScoredQueryError {
 /// `x` is BF16 `[batch, position, hidden_dimension]`; `frequencies` is the
 /// call-local rotary span. This is an arithmetic adapter only: it neither
 /// produces index keys nor manages cache, candidate masks, or selection.
+///
+/// # Errors
+///
+/// Returns [`CandidateQueryError::AttentionQr`] when deriving QR fails and
+/// [`CandidateQueryError::Index`] when index-query preparation fails.
 pub fn prepare_candidate_query(
     x: &[u16],
     frequencies: &[RotaryFrequency],
@@ -474,6 +584,21 @@ pub fn prepare_candidate_query(
 /// and BF16 scoring stages. Existing projection-work bounds remain those stages'
 /// own responsibility. It neither discovers key provenance nor mutates a cache,
 /// causal mask, or selection state.
+///
+/// # Errors
+///
+/// * [`ScoredQueryError::BatchCount`] for a layout with more than one batch.
+/// * [`ScoredQueryError::InputLength`],
+///   [`ScoredQueryError::InputElementLimit`] and
+///   [`ScoredQueryError::KeyHeadDimension`] when `x` or the keys do not match
+///   the layout.
+/// * [`ScoredQueryError::ShapeOverflow`],
+///   [`ScoredQueryError::AggregateWorkloadTooLarge`] and
+///   [`ScoredQueryError::DiagnosticElementLimit`] past the scoring bounds,
+///   and [`ScoredQueryError::AllocationFailed`] when staging cannot be
+///   reserved.
+/// * [`ScoredQueryError::Candidate`] and [`ScoredQueryError::Score`] when
+///   query preparation or a score row fails.
 pub fn prepare_scored_query(
     x: &[u16],
     frequencies: &[RotaryFrequency],
@@ -625,6 +750,19 @@ fn reserve_scored(elements: usize, field: &'static str) -> Result<Vec<u16>, Scor
 /// `[position, rope_pair]` slice, already offset by the caller's start position.
 /// The result models scalar BF16/FP8/FP4 boundaries, not `PyTorch` GEMM reduction
 /// parity or the downstream scoring and selection operations.
+///
+/// # Errors
+///
+/// * [`IndexQueryError::InputLength`] and [`IndexQueryError::PositionMismatch`]
+///   when `qr` and `x` are not whole rows of the same positions.
+/// * [`IndexQueryError::ShapeOverflow`] and [`IndexQueryError::ElementLimit`]
+///   past the bounds.
+/// * [`IndexQueryError::ActivationQuant`], [`IndexQueryError::Fp8Linear`],
+///   [`IndexQueryError::Bf16Linear`], [`IndexQueryError::Rotary`] and
+///   [`IndexQueryError::Fp4`] when a stage rejects its input, and
+///   [`IndexQueryError::NonFiniteProjection`],
+///   [`IndexQueryError::NonFiniteRotary`] and
+///   [`IndexQueryError::NonFiniteScale`] when a stage overflows.
 pub fn prepare_index_query(
     qr: &[u16],
     x: &[u16],

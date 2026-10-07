@@ -41,6 +41,12 @@ pub struct QwenIncrementalDecode {
 }
 
 impl QwenTokenizer {
+    /// Loads `tokenizer.json` from a checkpoint directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the file is missing, too large or does not
+    /// parse as a tokenizer.
     pub fn load(model: &Path) -> Result<Self, String> {
         Self::from_bytes(Self::read_json(model)?)
     }
@@ -108,6 +114,11 @@ impl QwenTokenizer {
     /// Checks representable tokenizer IDs and EOS without requiring padded
     /// model-logit rows to have token spellings. This does not prove that a
     /// tokenizer belongs to a particular checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the vocabulary is empty, an ID does not fit
+    /// `width`, or `eos` is negative or absent from the tokenizer.
     pub fn check_model_vocabulary(&self, width: usize, eos: i32) -> Result<(), String> {
         let vocabulary = self.tokenizer.get_vocab(true);
         if vocabulary.is_empty()
@@ -143,6 +154,10 @@ impl QwenTokenizer {
     }
 
     /// Byte ranges of `text` that encode as added tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the tokenizer cannot encode `text`.
     pub fn added_token_spans(&self, text: &str) -> Result<Vec<Range<usize>>, String> {
         // Encoding a whole conversation costs as much as the prompt; most
         // text spells no added token, which a byte scan shows.
@@ -205,6 +220,11 @@ impl QwenTokenizer {
 
     /// Encodes `text` as ordinary text, so an added token's spelling never
     /// becomes that token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `text` does not encode, an ID does not fit
+    /// `i32`, or the tokenizer still produces an added token.
     pub fn encode_literal(&self, text: &str) -> Result<Vec<i32>, String> {
         let ids = token_ids(&self.plain, text)?;
         let added = self.tokenizer.get_added_tokens_decoder();
@@ -221,6 +241,11 @@ impl QwenTokenizer {
 
     /// Encodes prompt bytes exactly as supplied: no chat template or special
     /// tokens are added by this CLI layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the prompt is empty or passes the size limit,
+    /// does not encode, encodes to no IDs, or an ID does not fit `i32`.
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<i32>, String> {
         if prompt.is_empty() {
             return Err(String::from("prompt must not be empty"));
@@ -248,6 +273,11 @@ impl QwenTokenizer {
 
     /// Decodes every generated ID, rejecting absent or unsigned-incompatible
     /// IDs rather than quietly omitting output from the JSON receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when an ID is negative or absent from the
+    /// tokenizer, or the IDs do not decode.
     pub fn decode_generated(&self, token_ids: &[i32]) -> Result<String, String> {
         let token_ids = token_ids
             .iter()
@@ -269,6 +299,11 @@ impl QwenTokenizer {
     /// The exact bytes one token contributes to decoded text. Added tokens
     /// (`<think>`, `<|im_end|>`) spell themselves; vocabulary pieces are
     /// byte-level BPE, so a piece can hold part of a multi-byte character.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the ID is negative or absent from the
+    /// tokenizer, or its piece is not byte-level encoded.
     pub fn token_bytes(&self, token_id: i32) -> Result<Vec<u8>, String> {
         let token_id =
             u32::try_from(token_id).map_err(|_| String::from("generated token ID is negative"))?;
@@ -299,6 +334,11 @@ impl QwenTokenizer {
     /// Decodes one token into a suffix that the tokenizer has established as
     /// stable. `None` means the decoder is awaiting a later token, for example
     /// to complete a multi-byte UTF-8 sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the ID is negative or absent from the
+    /// tokenizer, or the decoder rejects it.
     pub fn decode_generated_token(
         &self,
         state: &mut QwenIncrementalDecode,
@@ -354,6 +394,12 @@ fn byte_level_byte(character: char) -> Option<u8> {
 /// The caller owns the artifact-specific parsing and diagnostics. This keeps a
 /// replacement between the initial metadata check and open from turning a
 /// bounded artifact load into an unbounded allocation.
+///
+/// # Errors
+///
+/// Returns a message naming `artifact` when the path is not a readable
+/// regular file, the opened file is no longer one, or it holds more than
+/// `maximum_bytes`.
 pub fn read_regular_file(
     path: &Path,
     maximum_bytes: usize,

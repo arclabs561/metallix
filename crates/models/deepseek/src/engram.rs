@@ -439,7 +439,10 @@ pub enum EngramHashError {
     InvalidLayout,
     /// A derived shape could not fit in `usize`.
     #[error("Engram {field} shape arithmetic overflowed")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The tensor or derived count's role.
+        field: &'static str,
+    },
     /// An explicit tensor did not have its exact source-shaped length.
     #[error("Engram {field} length is {actual}, expected {expected}")]
     Length {
@@ -452,22 +455,43 @@ pub enum EngramHashError {
     },
     /// The compressed pad ID must be non-negative.
     #[error("Engram compressed pad ID {id} is negative")]
-    NegativePadId { id: i64 },
+    NegativePadId {
+        /// The supplied pad ID.
+        id: i64,
+    },
     /// A hash bucket divisor must be positive.
     #[error("Engram divisor at index {index} is {divisor}, expected positive")]
-    NonPositiveDivisor { index: usize, divisor: i64 },
+    NonPositiveDivisor {
+        /// Index into the bucket divisors.
+        index: usize,
+        /// The divisor.
+        divisor: i64,
+    },
     /// Offsets are row-address bases and must be non-negative.
     #[error("Engram offset at index {index} is negative: {offset}")]
-    NegativeOffset { index: usize, offset: i64 },
+    NegativeOffset {
+        /// Index into the address offsets.
+        index: usize,
+        /// The offset.
+        offset: i64,
+    },
     /// Captured multipliers must be non-negative.
     #[error("Engram multiplier at index {index} is negative: {multiplier}")]
-    NegativeMultiplier { index: usize, multiplier: i64 },
+    NegativeMultiplier {
+        /// Index into the hash multipliers.
+        index: usize,
+        /// The multiplier.
+        multiplier: i64,
+    },
     /// History must have positive batch and absolute-position dimensions.
     #[error("Engram history requires nonzero batches and capacity")]
     EmptyHistoryDimension,
     /// The bounded scalar history would exceed its fixed cap.
     #[error("Engram history has {elements} slots, maximum is 1048576")]
-    HistoryLimit { elements: usize },
+    HistoryLimit {
+        /// Requested history slots, `batches * capacity`.
+        elements: usize,
+    },
     /// An explicit layout tensor would exceed the fixed scalar cap.
     #[error("Engram {field} has {elements} entries, maximum is 1048576")]
     LayoutLimit {
@@ -481,7 +505,12 @@ pub enum EngramHashError {
     EmptyChunk,
     /// The input has a negative live compressed ID.
     #[error("Engram live compressed ID at input index {index} is negative: {id}")]
-    NegativeLiveId { index: usize, id: i64 },
+    NegativeLiveId {
+        /// Flat index into the input tokens.
+        index: usize,
+        /// The negative ID.
+        id: i64,
+    },
     /// The requested absolute chunk lies outside state capacity.
     #[error("Engram chunk ends at {end_position}, beyond capacity {capacity}")]
     ChunkExceedsHistory {
@@ -492,29 +521,50 @@ pub enum EngramHashError {
     },
     /// A required earlier position was never written.
     #[error("Engram history for batch {batch}, position {position} was not initialized")]
-    UninitializedHistory { batch: usize, position: usize },
+    UninitializedHistory {
+        /// The batch row.
+        batch: usize,
+        /// The absolute position never written.
+        position: usize,
+    },
     /// The bounded output vector would exceed its fixed cap.
     #[error("Engram output has {elements} addresses, maximum is 1048576")]
-    OutputLimit { elements: usize },
+    OutputLimit {
+        /// Requested output addresses.
+        elements: usize,
+    },
     /// Scalar hashing would exceed its fixed operation cap.
     #[error("Engram work estimate {elements} exceeds maximum 16777216")]
-    WorkLimit { elements: usize },
+    WorkLimit {
+        /// Estimated scalar hashing operations.
+        elements: usize,
+    },
     /// A bounded intermediate/output vector could not be reserved.
     #[error("could not allocate {elements} Engram elements")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Elements that could not be reserved.
+        elements: usize,
+    },
     /// A live-ID/multiplier product cannot remain in signed 64-bit range.
     #[error("Engram product overflowed at layer {layer}, lookback {lookback}: {id} * {multiplier}")]
     ProductOverflow {
+        /// Engram layer index.
         layer: usize,
+        /// How many positions back the token is.
         lookback: usize,
+        /// The live compressed ID.
         id: i64,
+        /// Its multiplier.
         multiplier: i64,
     },
     /// A bucket remainder plus its address offset overflowed signed 64-bit range.
     #[error("Engram address overflowed at layer {layer}, n-gram {ngram_size}, head {head}")]
     AddressOverflow {
+        /// Engram layer index.
         layer: usize,
+        /// The n-gram size being hashed.
         ngram_size: usize,
+        /// The hash head.
         head: usize,
     },
 }

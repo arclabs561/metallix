@@ -37,6 +37,19 @@ pub struct SelectionGeometry {
 
 impl SelectionGeometry {
     /// Validates a score matrix and its source causal prefix.
+    ///
+    /// # Errors
+    ///
+    /// * [`SelectionGeometryError::ShapeOverflow`],
+    ///   [`SelectionGeometryError::PositionOverflow`] and
+    ///   [`SelectionGeometryError::ElementLimit`] when the score matrix does
+    ///   not fit its bound.
+    /// * [`SelectionGeometryError::KeyCountMismatch`] unless `key_count` is the
+    ///   causal prefix the last position reaches.
+    /// * [`SelectionGeometryError::DecodeMustHaveOnePosition`] for a decode
+    ///   call (nonzero `token_start`) with more than one position.
+    /// * [`SelectionGeometryError::OffsetOutOfRange`] when `offset` plus the
+    ///   highest reachable key does not fit `i32`.
     pub fn new(
         token_start: usize,
         positions: NonZeroUsize,
@@ -212,22 +225,43 @@ pub struct SelectionDiagnostic {
 pub enum SelectionGeometryError {
     /// A derived score-matrix element count overflowed `usize`.
     #[error("selection geometry overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
     /// The exclusive token end could not be represented.
     #[error("selection token end overflowed")]
     PositionOverflow,
     /// The bounded score matrix exceeds this CPU adapter's limit.
     #[error("selection score matrix has {elements} elements, maximum is {maximum}")]
-    ElementLimit { elements: usize, maximum: usize },
+    ElementLimit {
+        /// `positions * key_count`.
+        elements: usize,
+        /// The fixed cap.
+        maximum: usize,
+    },
     /// The supplied key prefix is not exactly the source causal prefix.
     #[error("key count {actual} does not equal causal reachable prefix {expected}")]
-    KeyCountMismatch { actual: usize, expected: usize },
+    KeyCountMismatch {
+        /// The supplied `key_count`.
+        actual: usize,
+        /// Keys the last position can reach.
+        expected: usize,
+    },
     /// Decode source calls must contain exactly one token position.
     #[error("selection decode at nonzero token start requires one position, got {positions}")]
-    DecodeMustHaveOnePosition { positions: usize },
+    DecodeMustHaveOnePosition {
+        /// Positions supplied.
+        positions: usize,
+    },
     /// The offset plus highest reachable compressed key cannot fit the i32 index API.
     #[error("offset {offset} plus reachable position {position} does not fit i32")]
-    OffsetOutOfRange { offset: usize, position: usize },
+    OffsetOutOfRange {
+        /// The supplied `offset`.
+        offset: usize,
+        /// The highest reachable key.
+        position: usize,
+    },
 }
 
 /// Rejected stateless candidate or final-selection work.
@@ -236,10 +270,18 @@ pub enum SelectionGeometryError {
 pub enum SelectionAdapterError {
     /// Input storage did not have exactly one BF16 score per query/key pair.
     #[error("selection score length is {actual}, expected {expected}")]
-    ScoreLength { actual: usize, expected: usize },
+    ScoreLength {
+        /// Supplied scores.
+        actual: usize,
+        /// `positions * key_count`.
+        expected: usize,
+    },
     /// A source score is non-finite before the adapter applies masking.
     #[error("selection source score at element {element} is non-finite")]
-    NonFiniteScore { element: usize },
+    NonFiniteScore {
+        /// Flat index into the scores.
+        element: usize,
+    },
     /// Candidate output belongs to a different caller-asserted selection call.
     #[error("candidate selection metadata does not match this selection call")]
     CandidateCallMismatch,
@@ -251,7 +293,10 @@ pub enum SelectionAdapterError {
     FinalSelection(#[from] SelectionError),
     /// A diagnostic allocation could not reserve its bounded output storage.
     #[error("could not allocate {elements} selection diagnostic elements")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Elements that could not be reserved.
+        elements: usize,
+    },
 }
 
 /// Produces one source candidate mask per query row from finite BF16 score storage.
@@ -259,6 +304,16 @@ pub enum SelectionAdapterError {
 /// The source causal `-∞` mask is applied before [`candidate_mask`]. The
 /// returned mask is opaque and may only be consumed with the identical
 /// [`SelectionCall`], including its publication identity, batch, and offset.
+///
+/// # Errors
+///
+/// * [`SelectionAdapterError::ScoreLength`] unless there is one score per
+///   query position and key, and [`SelectionAdapterError::NonFiniteScore`]
+///   for a NaN or infinite score.
+/// * [`SelectionAdapterError::AllocationFailed`] when output storage cannot
+///   be reserved.
+/// * [`SelectionAdapterError::Candidate`] when candidate-block selection
+///   rejects a row.
 pub fn produce_candidates(
     scores: &[u16],
     call: SelectionCall,
@@ -298,6 +353,18 @@ pub fn produce_candidates(
 /// This repeats causal masking from the finite source score matrix so the
 /// diagnostic makes both source boundaries explicit. It does not mutate score,
 /// query, key, or cache storage.
+///
+/// # Errors
+///
+/// * [`SelectionAdapterError::CandidateCallMismatch`] when `candidates` came
+///   from another call.
+/// * [`SelectionAdapterError::ScoreLength`] unless there is one score per
+///   query position and key, and [`SelectionAdapterError::NonFiniteScore`]
+///   for a NaN or infinite score.
+/// * [`SelectionAdapterError::AllocationFailed`] when output storage cannot
+///   be reserved.
+/// * [`SelectionAdapterError::FinalSelection`] when final selection rejects a
+///   row.
 pub fn select_from_candidates(
     scores: &[u16],
     call: SelectionCall,

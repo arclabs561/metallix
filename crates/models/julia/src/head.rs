@@ -2,11 +2,18 @@
 
 use thiserror::Error;
 
+/// Hidden width shared by the encoder and the decision head.
 pub const WIDTH: usize = 384;
+/// Attention heads in every encoder and decision-head layer.
 pub const ATTENTION_HEADS: usize = 6;
+/// Width of one attention head.
 pub const HEAD_WIDTH: usize = WIDTH / ATTENTION_HEADS;
+/// Hidden width of a decision-head layer's feed-forward block.
 pub const FEED_FORWARD_WIDTH: usize = 1536;
+/// Transformer layers in the decision head.
 pub const HEAD_LAYERS: usize = 2;
+/// The score a marker gets when its `marker_mask` entry is `false`, in place
+/// of running the scorer.
 pub const INVALID_MARKER_SCORE: f32 = -10_000.0;
 const EPSILON: f32 = 1e-5;
 const WIDTH_F32: f32 = 384.0;
@@ -18,85 +25,164 @@ const MAX_MARKERS: usize = 20;
 const MAX_WORK: usize = 480_000_000;
 
 /// Unvalidated transfer container; [`DecisionHead::new`] validates every field.
+///
+/// One decision-head layer, named as `PyTorch`'s `nn.TransformerEncoderLayer`
+/// names its parameters and applied pre-norm: `norm1` before attention and
+/// `norm2` before the `ReLU` feed-forward block, each followed by a residual
+/// add.
 #[derive(Clone, Debug)]
 pub struct HeadLayerWeights {
+    /// Fused query, key and value projection, `[3 * WIDTH, WIDTH]`.
     pub in_proj_weight: Vec<f32>,
+    /// Bias of the fused projection, `[3 * WIDTH]`.
     pub in_proj_bias: Vec<f32>,
+    /// Attention output projection, `[WIDTH, WIDTH]`.
     pub out_proj_weight: Vec<f32>,
+    /// Bias of the output projection, `[WIDTH]`.
     pub out_proj_bias: Vec<f32>,
+    /// Feed-forward input projection, `[FEED_FORWARD_WIDTH, WIDTH]`.
     pub linear1_weight: Vec<f32>,
+    /// Bias of the feed-forward input projection, `[FEED_FORWARD_WIDTH]`.
     pub linear1_bias: Vec<f32>,
+    /// Feed-forward output projection, `[WIDTH, FEED_FORWARD_WIDTH]`.
     pub linear2_weight: Vec<f32>,
+    /// Bias of the feed-forward output projection, `[WIDTH]`.
     pub linear2_bias: Vec<f32>,
+    /// Scale of the layer norm before attention, `[WIDTH]`.
     pub norm1_weight: Vec<f32>,
+    /// Shift of the layer norm before attention, `[WIDTH]`.
     pub norm1_bias: Vec<f32>,
+    /// Scale of the layer norm before the feed-forward block, `[WIDTH]`.
     pub norm2_weight: Vec<f32>,
+    /// Shift of the layer norm before the feed-forward block, `[WIDTH]`.
     pub norm2_bias: Vec<f32>,
 }
 /// Unvalidated transfer container; [`DecisionHead::new`] validates every field.
+///
+/// The scorer maps one marker row to one score: layer norm, a `WIDTH` to
+/// `WIDTH` projection, GELU, then a projection to a scalar.
 #[derive(Clone, Debug)]
 pub struct ScorerWeights {
+    /// Scale of the layer norm on the marker row, `[WIDTH]`.
     pub norm_weight: Vec<f32>,
+    /// Shift of the layer norm on the marker row, `[WIDTH]`.
     pub norm_bias: Vec<f32>,
+    /// Hidden projection, `[WIDTH, WIDTH]`.
     pub linear1_weight: Vec<f32>,
+    /// Bias of the hidden projection, `[WIDTH]`.
     pub linear1_bias: Vec<f32>,
+    /// Projection to the score, `[1, WIDTH]`.
     pub linear2_weight: Vec<f32>,
+    /// Bias of the score, `[1]`.
     pub linear2_bias: Vec<f32>,
 }
 /// Unvalidated transfer container; [`DecisionHead::new`] validates every field.
 #[derive(Clone, Debug)]
 pub struct HeadWeights {
+    /// The decision-head layers, in order.
     pub layers: [HeadLayerWeights; HEAD_LAYERS],
+    /// One `WIDTH` row per question type, `[3, WIDTH]`; the row for the
+    /// input's `qtype` is added to every position before the first layer.
     pub type_embedding: Vec<f32>,
+    /// The per-marker scorer.
     pub scorer: ScorerWeights,
 }
 /// Unvalidated per-call input; [`DecisionHead::scores`] validates every field.
 #[derive(Clone, Debug)]
 pub struct HeadInput {
+    /// Encoder output, `[positions, WIDTH]` row-major.
     pub hidden: Vec<f32>,
+    /// Sequence length, 1 through 126.
     pub positions: usize,
+    /// `true` for each real position and `false` for padding.
     pub attention_mask: Vec<bool>,
+    /// Positions of the option markers to score, 1 through 20 of them, each
+    /// below `positions`.
     pub marker_pos: Vec<usize>,
+    /// Whether each marker is a real option; one entry per marker.
     pub marker_mask: Vec<bool>,
+    /// Question type row, 0 through 2, as [`crate::typed::QuestionType::qtype`]
+    /// numbers them.
     pub qtype: usize,
 }
+/// An invalid head input or weight, or a non-finite intermediate value.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum JuliaHeadError {
+    /// The sequence length is 0 or above 126.
     #[error("Julia head positions must be 1..={MAX_POSITIONS}, got {0}")]
     Positions(usize),
+    /// There are no markers or more than 20.
     #[error("Julia head markers must be 1..={MAX_MARKERS}, got {0}")]
     Markers(usize),
+    /// The question type is 3 or more.
     #[error("Julia head qtype must be 0..3, got {0}")]
     Qtype(usize),
+    /// A buffer does not have the length its shape requires.
     #[error("Julia head {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// The supplied length.
         actual: usize,
+        /// The required length.
         expected: usize,
     },
+    /// A weight, an input or an intermediate value is NaN or infinite.
     #[error("Julia head {field} contains non-finite value at {index}")]
-    NonFinite { field: &'static str, index: usize },
+    NonFinite {
+        /// The buffer or computation stage.
+        field: &'static str,
+        /// Flat index into that buffer, or the row for a norm statistic.
+        index: usize,
+    },
+    /// A marker position is not below the sequence length.
     #[error("Julia head marker {marker} is outside {positions} positions: {position}")]
     MarkerPosition {
+        /// Index of the marker.
         marker: usize,
+        /// Its position.
         position: usize,
+        /// The sequence length.
         positions: usize,
     },
+    /// The attention mask has no `true` entry.
     #[error("Julia head has no unmasked key positions")]
     NoKeys,
+    /// The multiply-accumulate count passes its fixed bound.
     #[error("Julia head scalar work exceeds {MAX_WORK}")]
     Work,
 }
 
+/// The decision head: two transformer layers over the encoder output, then
+/// one score per option marker.
 pub struct DecisionHead {
     weights: HeadWeights,
 }
 impl DecisionHead {
+    /// Validates the length and finiteness of every weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JuliaHeadError::Length`] for a weight of the wrong length and
+    /// [`JuliaHeadError::NonFinite`] for a NaN or infinite weight.
     pub fn new(weights: HeadWeights) -> Result<Self, JuliaHeadError> {
         validate_weights(&weights)?;
         Ok(Self { weights })
     }
+    /// Returns one score per entry of `marker_pos`, in order. Masked markers
+    /// get [`INVALID_MARKER_SCORE`].
+    ///
+    /// # Errors
+    ///
+    /// * [`JuliaHeadError::Positions`], [`JuliaHeadError::Markers`],
+    ///   [`JuliaHeadError::Qtype`] and [`JuliaHeadError::Length`] for an input
+    ///   outside its bounds.
+    /// * [`JuliaHeadError::NoKeys`] when every position is masked.
+    /// * [`JuliaHeadError::Work`] when the work passes its bound.
+    /// * [`JuliaHeadError::MarkerPosition`] for a marker past the sequence.
+    /// * [`JuliaHeadError::NonFinite`] for a NaN or infinite input or
+    ///   intermediate value.
     pub fn scores(&self, input: &HeadInput) -> Result<Vec<f32>, JuliaHeadError> {
         validate_input(input)?;
         let keys = input.attention_mask.iter().filter(|&&x| x).count();

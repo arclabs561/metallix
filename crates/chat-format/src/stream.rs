@@ -15,7 +15,9 @@ use crate::turn::{AssistantTurn, ToolDialect, TurnFormat, parse_turn_unchecked};
 /// A piece of a turn a protocol may show as it arrives.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnDelta {
+    /// Settled reasoning text.
     Reasoning(String),
+    /// Settled visible answer text.
     Text(String),
     /// A token arrived whose text is still held back (markup, or text that
     /// may become markup). It carries nothing to show; a protocol can use
@@ -33,6 +35,8 @@ pub struct TurnStream {
 }
 
 impl TurnStream {
+    /// Starts an empty turn in `format`'s dialects. `enable_thinking` must
+    /// match the value the prompt was rendered with.
     #[must_use]
     pub fn new(format: TurnFormat, enable_thinking: bool) -> Self {
         Self {
@@ -64,6 +68,11 @@ impl TurnStream {
     /// Parses the whole turn and returns it with the deltas not yet
     /// released. Calls are not checked against their declarations; see
     /// [`crate::check_call`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for any failure of [`crate::parse_turn_unchecked`],
+    /// or when the parsed turn does not extend the deltas already released.
     pub fn finish(
         mut self,
         tools: &[Value],

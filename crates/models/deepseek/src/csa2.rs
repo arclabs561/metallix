@@ -18,13 +18,24 @@ pub enum CandidateError {
     EmptyLogits,
     /// The reachable compressed length exceeded the row width.
     #[error("reachable length {len} exceeds candidate width {width}")]
-    LengthExceedsWidth { len: usize, width: usize },
+    LengthExceedsWidth {
+        /// The supplied `compress_len`.
+        len: usize,
+        /// The score row's width.
+        width: usize,
+    },
     /// A score was not finite or negative infinity.
     #[error("candidate logit at position {position} is neither finite nor negative infinity")]
-    InvalidLogit { position: usize },
+    InvalidLogit {
+        /// Index into the score row.
+        position: usize,
+    },
     /// A position outside the reachable prefix was not already masked.
     #[error("unreachable candidate position {position} must be negative infinity")]
-    UnmaskedFuturePosition { position: usize },
+    UnmaskedFuturePosition {
+        /// Index into the score row, at or beyond `compress_len`.
+        position: usize,
+    },
     /// Upstream uses `torch.topk`; its ordering of a cutoff tie is unspecified.
     #[error("equal finite block scores straddle the Top-K cutoff")]
     AmbiguousCutoffTie,
@@ -39,6 +50,17 @@ pub enum CandidateError {
 /// than choosing a Rust ordering for `PyTorch`'s unspecified `topk` tie break.
 /// A true bit selects a whole candidate block; it is not a causality mask, so
 /// a selected partial final block can include positions beyond `compress_len`.
+///
+/// # Errors
+///
+/// * [`CandidateError::EmptyLogits`] for an empty row, and
+///   [`CandidateError::LengthExceedsWidth`] when `compress_len` passes its
+///   width.
+/// * [`CandidateError::InvalidLogit`] for a NaN or positive infinite score,
+///   and [`CandidateError::UnmaskedFuturePosition`] for a score past
+///   `compress_len` that is not negative infinity.
+/// * [`CandidateError::AmbiguousCutoffTie`] when equal finite block scores
+///   straddle the Top-K cutoff.
 pub fn candidate_mask(
     logits: &[f32],
     compress_len: usize,
