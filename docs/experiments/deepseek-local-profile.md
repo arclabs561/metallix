@@ -14,7 +14,7 @@ memory and throughput results therefore cannot qualify published V4.1 execution
 or establish its routing locality and SSD traffic budget. Keep this external
 baseline separate from the [native feasibility gate](../research/host-memory.md#deepseek-routed-expert-traffic-sensitivity).
 
-The machine-local Codex profile is `/Users/arc/.codex/deepseek-v41-local.config.toml`:
+An optional local Codex profile at `~/.codex/deepseek-v41-local.config.toml` has this shape:
 
 ```toml
 model = "deepseek-v41-flash"
