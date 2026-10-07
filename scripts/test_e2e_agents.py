@@ -633,6 +633,44 @@ class Timelines(unittest.TestCase):
 
 
 class Isolation(unittest.TestCase):
+    def test_default_paths_use_account_home_with_relocated_launch_home(self):
+        program = r"""
+import json, pathlib, pwd, sys
+from types import SimpleNamespace
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+with mock.patch.object(pwd, 'getpwuid', return_value=SimpleNamespace(pw_dir=sys.argv[2])):
+    import e2e_agents
+with mock.patch.object(pathlib.Path, 'is_file', return_value=True):
+    command = e2e_agents.sandbox_command(['true'], 'http://127.0.0.1:1')
+print(json.dumps({'pi': e2e_agents.FIXED_BINARIES['pi'], 'profile': command[2]}))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            account_home, launch_home = root / "account", root / "launch"
+            account_home.mkdir()
+            launch_home.mkdir()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    program,
+                    str(pathlib.Path(__file__).resolve().parent),
+                    str(account_home),
+                ],
+                env=os.environ | {"HOME": str(launch_home)},
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            defaults = json.loads(result.stdout)
+            self.assertEqual(defaults["pi"], str(account_home / ".node_modules/bin/pi"))
+            self.assertIn(str(account_home / "Private"), defaults["profile"])
+            self.assertNotIn(str(launch_home / "Private"), defaults["profile"])
+
     def test_runs_see_no_inherited_credentials_or_config(self):
         home = pathlib.Path(tempfile.mkdtemp())
         args = argparse.Namespace(

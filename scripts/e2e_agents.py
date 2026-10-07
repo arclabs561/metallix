@@ -41,6 +41,7 @@ import http.client
 import json
 import math
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -415,13 +416,15 @@ def real_binary(name: str, path: str | None = None) -> str | None:
     return None
 
 
+# Keep native binaries and protected reads tied to the account, even with a temporary HOME.
+ACCOUNT_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 FIXED_BINARIES = {
     "claude": "/opt/homebrew/bin/claude",
     "codex": "/opt/homebrew/bin/codex",
-    "pi": "/Users/arc/.node_modules/bin/pi",
+    "pi": str(ACCOUNT_HOME / ".node_modules/bin/pi"),
 }
 MINIMAL_PATH = "/opt/homebrew/bin:/usr/bin:/bin"
-PRIVATE_ROOT = Path("/Users/arc/Private")
+PRIVATE_ROOT = ACCOUNT_HOME / "Private"
 
 
 def sandbox_command(
