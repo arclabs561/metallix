@@ -177,6 +177,146 @@ fn chunked_extension_matches_a_single_prefill() {
     assert!(diff <= 1e-3, "split prefill diverged by {diff}");
 }
 
+/// Index of the first maximum, as MLX's argmax and a host pick that keeps
+/// the first maximum both break ties.
+fn first_argmax(logits: &[f32]) -> i32 {
+    let mut best = 0;
+    for (index, &logit) in logits.iter().enumerate() {
+        if logit > logits[best] {
+            best = index;
+        }
+    }
+    i32::try_from(best).expect("token id")
+}
+
+/// The GPU greedy pick returns the host argmax of the same step's full
+/// logits row at every step of a cached decode, so switching the decode
+/// loop to picks cannot change greedy output.
+#[test]
+fn greedy_pick_matches_the_host_argmax() {
+    let Some(case) = case() else { return };
+    let weights = Qwen35Weights::load(&case.model, Qwen35Precision::Checkpoint).expect("load");
+    let prompt = ids(&case.reference["cases"][2]["steps"][0]["input_ids"]);
+    let mut host = weights.executor();
+    let mut gpu = weights.executor();
+    let mut logits = host.prefill_last_logits(&prompt).expect("host prefill");
+    let mut picked = gpu.extend_greedy(&prompt).expect("gpu prefill");
+    for step in 0..24 {
+        let expected = first_argmax(&logits);
+        assert_eq!(picked, expected, "step {step}: GPU pick vs host argmax");
+        logits = host.decode_last_logits(expected).expect("host decode");
+        picked = gpu.decode_greedy(expected).expect("gpu decode");
+    }
+}
+
+/// Full-attention K/V grows in tiers (128, 512, then doubling). A sequence
+/// fed in pieces whose ends cross each tier, including single-token decode
+/// steps over a boundary, matches one prefill of the whole sequence.
+#[test]
+fn appends_across_kv_tiers_match_a_single_prefill() {
+    let Some(case) = case() else { return };
+    let weights = Qwen35Weights::load(&case.model, Qwen35Precision::Float32).expect("load");
+    let seed = ids(&case.reference["cases"][3]["steps"][0]["input_ids"]);
+    let sequence: Vec<i32> = seed.iter().copied().cycle().take(1_100).collect();
+    let whole = weights
+        .executor()
+        .prefill_last_logits(&sequence)
+        .expect("whole");
+    let mut split = weights.executor();
+    split.prefill_last_logits(&sequence[..126]).expect("head");
+    for &token in &sequence[126..130] {
+        split.decode_last_logits(token).expect("decode over 128");
+    }
+    split
+        .extend_last_logits(&sequence[130..511])
+        .expect("to 511");
+    split
+        .extend_last_logits(&sequence[511..514])
+        .expect("over 512");
+    split
+        .extend_last_logits(&sequence[514..1_023])
+        .expect("to 1023");
+    for &token in &sequence[1_023..1_099] {
+        split.decode_last_logits(token).expect("decode over 1024");
+    }
+    let pieces = split
+        .extend_last_logits(&sequence[1_099..])
+        .expect("last token");
+    let diff = whole
+        .iter()
+        .zip(&pieces)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    eprintln!("tiered appends vs whole prefill: max |dlogit| {diff:.3e}");
+    assert!(diff <= 1e-3, "tiered appends diverged by {diff}");
+}
+
+/// A snapshot taken mid-prompt and restored into a fresh executor, then
+/// extended with the rest of the prompt, gives the one-shot prefill's logits;
+/// the executor the snapshot came from keeps going unaffected. Boundaries sit
+/// inside and past the first prefill chunk.
+#[test]
+fn restored_snapshot_matches_a_single_prefill() {
+    let Some(case) = case() else { return };
+    let weights = Qwen35Weights::load(&case.model, Qwen35Precision::Float32).expect("load");
+    let prompt = ids(&case.reference["cases"][3]["steps"][0]["input_ids"]);
+    assert!(prompt.len() > 130);
+    let whole = weights
+        .executor()
+        .prefill_last_logits(&prompt)
+        .expect("whole");
+    let max_diff = |logits: &[f32]| {
+        whole
+            .iter()
+            .zip(logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max)
+    };
+    for boundary in [37, 130] {
+        let mut original = weights.executor();
+        original
+            .prefill_last_logits(&prompt[..boundary])
+            .expect("head");
+        let snapshot = original.snapshot().expect("snapshot");
+        assert_eq!(snapshot.tokens(), boundary);
+        let mut restored = weights.executor_from(&snapshot).expect("restore");
+        let resumed = restored
+            .extend_last_logits(&prompt[boundary..])
+            .expect("restored tail");
+        let continued = original
+            .extend_last_logits(&prompt[boundary..])
+            .expect("original tail");
+        // Roll back to the same complete hybrid state after a different branch
+        // has advanced. Recurrent state must be restored, not truncated like KV.
+        restored
+            .decode_last_logits(1)
+            .expect("advance a rejected branch");
+        let replayed = weights
+            .executor_from(&snapshot)
+            .expect("restore after branch")
+            .extend_last_logits(&prompt[boundary..])
+            .expect("replay tail");
+        assert_eq!(
+            replayed, resumed,
+            "stash and replay must recover the same logits"
+        );
+        let (resumed_diff, continued_diff) = (max_diff(&resumed), max_diff(&continued));
+        eprintln!(
+            "boundary {boundary} ({} snapshot bytes): restored max |dlogit| {resumed_diff:.3e}, original {continued_diff:.3e}",
+            snapshot.state_bytes()
+        );
+        assert_eq!(argmax(&resumed), argmax(&whole), "boundary {boundary}");
+        assert!(
+            resumed_diff <= 1e-3,
+            "restored at {boundary}: {resumed_diff}"
+        );
+        assert!(
+            continued_diff <= 1e-3,
+            "original at {boundary}: {continued_diff}"
+        );
+    }
+}
+
 /// Greedy decode throughput at checkpoint precision. Opt-in and ignored by
 /// default because it measures rather than checks.
 #[test]

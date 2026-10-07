@@ -1,13 +1,18 @@
 [workspace]
 members = [
+    "crates/audio",
     "crates/blockfloat",
     "crates/chat-format",
+    "crates/checkpoint",
     "crates/diffusion",
     "crates/engine",
+    "crates/media",
     "crates/models/deepseek",
+    "crates/models/flux2",
     "crates/models/gemma",
     "crates/models/julia",
     "crates/models/qwen",
+    "crates/models/qwen3-asr",
     "crates/models/qwen35",
     "crates/server",
 ]

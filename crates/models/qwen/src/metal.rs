@@ -9,11 +9,11 @@
 
 use std::{collections::HashMap, fs, path::Path};
 
-use mlx_rs::{Array, StreamOrDevice};
+use mlx_rs::{Array, Dtype, StreamOrDevice};
 use thiserror::Error;
 
 use crate::checkpoint::{Qwen3CheckpointError, Qwen3CheckpointInspection};
-pub use crate::forward::Qwen3WeightPrecision;
+pub use crate::forward::{Qwen3FloatPrecision, Qwen3WeightPrecision};
 
 mod layer_check;
 pub use layer_check::{LayerCheckMode, Qwen3LayerCheck, qualify_layer};
@@ -23,6 +23,8 @@ mod embedding_check;
 pub use embedding_check::{Qwen3EmbeddingCheck, qualify_embedding};
 mod projection_check;
 pub use projection_check::{Qwen3ProjectionCheck, qualify_projection};
+#[cfg(test)]
+mod affine_checkpoint_tests;
 mod stream_check;
 pub use stream_check::{
     Qwen3StreamCachedCandidateReport, Qwen3StreamCachedCheck, Qwen3StreamCandidateReport,
@@ -272,7 +274,7 @@ impl Qwen3MlxWeights {
         let plan = self.forward_config.resident_chat_plan(
             maximum_context_tokens,
             maximum_kv_bytes,
-            crate::forward::kv_precision(&self.tensors)?,
+            crate::forward::kv_precision(&self.forward_config, &self.tensors)?,
         )?;
         Ok(crate::forward::Qwen3ForwardExecutor::new_for_resident_chat(
             &self.forward_config,
@@ -313,7 +315,7 @@ impl Qwen3MlxWeights {
         let plan = self.forward_config.resident_chat_plan(
             maximum_context_tokens,
             maximum_kv_bytes,
-            crate::forward::kv_precision(&self.tensors)?,
+            crate::forward::kv_precision(&self.forward_config, &self.tensors)?,
         )?;
         if snapshot.binding() != self.binding || snapshot.plan() != plan {
             return Err(crate::forward::Qwen3ForwardError::KvSnapshotMismatch);
@@ -326,31 +328,96 @@ impl Qwen3MlxWeights {
     }
 
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
-    /// This increases resident weight memory relative to the BF16 checkpoint.
+    /// This increases resident weight memory relative to the BF16 checkpoint;
+    /// quantized weights are dequantized first.
     pub fn prepare_float32(&mut self) -> Result<(), Qwen3MetalLoadError> {
-        self.prepare_precision(Qwen3WeightPrecision::Float32)
+        self.prepare_precision(Qwen3WeightPrecision::Dense(Qwen3FloatPrecision::Float32))
     }
 
-    /// Converts every tensor to `precision` once, so the forward graph runs
-    /// in that dtype; K/V caches take the weights' dtype.
+    /// How the loaded tensors are stored now.
+    pub fn precision(&self) -> Result<Qwen3WeightPrecision, Qwen3MetalLoadError> {
+        let activations = crate::forward::kv_precision(&self.forward_config, &self.tensors)?;
+        Ok(match self.forward_config.quantization() {
+            None => Qwen3WeightPrecision::Dense(activations),
+            Some(quantization) => Qwen3WeightPrecision::Affine {
+                quantization,
+                activations,
+            },
+        })
+    }
+
+    /// Converts the weights to `precision` once: dequantizing packed
+    /// projections when it is dense or packed differently, casting every
+    /// unpacked tensor to its float dtype, and quantizing projections and the
+    /// token embedding with MLX's affine `quantize` when it is affine. K/V
+    /// caches take the resulting activation dtype.
     #[tracing::instrument(
         name = "qwen.weights.prepare_precision",
         level = "info",
         skip_all,
-        fields(?precision)
+        fields(precision = tracing::field::Empty)
     )]
     pub fn prepare_precision(
         &mut self,
-        precision: Qwen3WeightPrecision,
+        precision: impl Into<Qwen3WeightPrecision>,
     ) -> Result<(), Qwen3MetalLoadError> {
-        let dtype = precision.dtype();
+        let precision = precision.into();
+        tracing::Span::current().record("precision", tracing::field::debug(precision));
+        let stream = StreamOrDevice::gpu();
+        // A tied checkpoint may still ship an `lm_head` the forward never
+        // reads; it is left as it is rather than packed.
+        let tied = self.forward_config.tied_output_embedding();
+        let stems: Vec<String> = self
+            .tensors
+            .keys()
+            .filter(|name| crate::forward::is_quantizable(name))
+            .filter(|name| !(tied && name.as_str() == "lm_head.weight"))
+            .map(|name| name.trim_end_matches(".weight").to_owned())
+            .collect();
+        if self
+            .forward_config
+            .quantization()
+            .is_some_and(|stored| precision.quantization() != Some(stored))
+        {
+            for stem in &stems {
+                let dense =
+                    crate::forward::dense_weight(&self.forward_config, &self.tensors, stem)?;
+                dense.eval()?;
+                self.tensors.insert(format!("{stem}.weight"), dense);
+                self.tensors.remove(&format!("{stem}.scales"));
+                self.tensors.remove(&format!("{stem}.biases"));
+            }
+            self.forward_config.set_quantization(None);
+        }
+        let dtype = precision.activations().dtype();
         for weight in self.tensors.values_mut() {
-            if weight.dtype() == dtype {
+            if weight.dtype() == dtype || weight.dtype() == Dtype::Uint32 {
                 continue;
             }
-            let converted = weight.as_dtype_device(dtype, StreamOrDevice::gpu())?;
+            let converted = weight.as_dtype_device(dtype, &stream)?;
             converted.eval()?;
             *weight = converted;
+        }
+        if let Some(quantization) = precision.quantization()
+            && self.forward_config.quantization().is_none()
+        {
+            for stem in &stems {
+                let name = format!("{stem}.weight");
+                let dense = self.tensors.get(&name).ok_or_else(|| {
+                    crate::forward::Qwen3ForwardError::MissingWeight(name.clone())
+                })?;
+                let (packed, scales, biases) = mlx_rs::ops::quantize_device(
+                    dense,
+                    quantization.group_size(),
+                    quantization.bits(),
+                    &stream,
+                )?;
+                mlx_rs::transforms::eval([&packed, &scales, &biases])?;
+                self.tensors.insert(name, packed);
+                self.tensors.insert(format!("{stem}.scales"), scales);
+                self.tensors.insert(format!("{stem}.biases"), biases);
+            }
+            self.forward_config.set_quantization(Some(quantization));
         }
         // K/V computed from the earlier precision must not be restored here.
         self.binding = next_weights_binding();
@@ -468,6 +535,30 @@ impl Qwen3MlxWeights {
         crate::forward::forward_hidden_states(&self.tensors, &self.forward_config, input_ids)
     }
 
+    /// Pre-norm residual streams after the selected (1-based) decoder layers
+    /// of one right-padded sequence; see
+    /// [`crate::forward::forward_layer_states`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::forward::Qwen3ForwardError`] for a bidirectional
+    /// checkpoint, an invalid layer selection or real length, or a failed
+    /// forward pass.
+    pub fn forward_layer_states(
+        &self,
+        input_ids: &[i32],
+        real_len: usize,
+        layers: &[usize],
+    ) -> Result<Vec<Array>, crate::forward::Qwen3ForwardError> {
+        crate::forward::forward_layer_states(
+            &self.tensors,
+            &self.forward_config,
+            input_ids,
+            real_len,
+            layers,
+        )
+    }
+
     fn require_attention(
         &self,
         required: crate::Qwen3Attention,
@@ -534,10 +625,23 @@ impl Qwen3MlxWeights {
             });
         }
 
-        let expected_embedding_shape = [
-            i32::try_from(inspection.contract().vocab_size())
+        let vocab = inspection.contract().vocab_size();
+        let hidden = inspection.contract().hidden_size();
+        let embedding_shape = vec![
+            i32::try_from(vocab)
                 .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("vocab_size"))?,
-            i32::try_from(inspection.contract().hidden_size())
+            i32::try_from(hidden)
+                .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("hidden_size"))?,
+        ];
+        // Packed rows hold several elements per word.
+        let stored_columns = forward_config
+            .quantization()
+            .map_or(u64::from(hidden), |quantization| {
+                quantization.packed_columns(u64::from(hidden))
+            });
+        let expected_embedding_shape = [
+            embedding_shape[0],
+            i32::try_from(stored_columns)
                 .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("hidden_size"))?,
         ];
         let embedding = tensors
@@ -553,7 +657,6 @@ impl Qwen3MlxWeights {
         // forcing the actual checkpoint tensor through a GPU graph.
         let embedding_sum = embedding.sum_device(None, StreamOrDevice::gpu())?;
         embedding_sum.eval()?;
-        let embedding_shape = embedding.shape().to_vec();
 
         Ok(Self {
             inspection,
@@ -577,7 +680,8 @@ impl Qwen3MlxWeights {
         self.tensors.values().map(Array::nbytes).sum()
     }
 
-    /// Returns the evaluated token-embedding shape.
+    /// Returns the token embedding's logical `[vocab, hidden]` shape,
+    /// whether its rows are stored dense or packed.
     #[must_use]
     pub fn embedding_shape(&self) -> &[i32] {
         &self.embedding_shape
@@ -605,11 +709,7 @@ impl Qwen3MlxWeights {
             &[i32::try_from(input_ids.len())
                 .map_err(|_| Qwen3MetalLoadError::DimensionOutOfRange("input_ids"))?],
         );
-        let embedding = self
-            .tensors
-            .get("model.embed_tokens.weight")
-            .ok_or(Qwen3MetalLoadError::MissingEmbedding)?;
-        let vectors = embedding.take_axis_device(&token_ids, 0, StreamOrDevice::gpu())?;
+        let vectors = crate::forward::embed_rows(&self.forward_config, &self.tensors, &token_ids)?;
         vectors.eval()?;
         Ok(vectors.shape().to_vec())
     }

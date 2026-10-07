@@ -20,7 +20,7 @@ use crate::{GPU_TEST_LOCK, metal::Qwen3MlxWeights};
 
 use super::super::{
     Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, as_i32, attention_scale,
-    forward_last_logits, linear, read_last_logits, rms_norm, weight,
+    forward_last_logits, project, read_last_logits, rms_norm, weight,
 };
 
 const MAXIMUM_CONTEXT_TOKENS: usize = 2_048;
@@ -35,6 +35,7 @@ const QWEN3_06B_ATTENTION_HEADS: usize = 16;
 const QWEN3_06B_KEY_VALUE_HEADS: usize = 8;
 const QWEN3_06B_HEAD_DIM: usize = 128;
 const QWEN3_06B_MAX_POSITIONS: usize = 40_960;
+/// Fixed tiers before stepped storage starts doubling.
 const STEPPED_CAPACITY_BOUNDARIES: [usize; 2] = [128, 512];
 
 type CapacitySnapshot = Vec<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)>;
@@ -213,7 +214,11 @@ impl<'a> CapacityExecutor<'a> {
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
-        read_last_logits(&linear(&normalized, embedding)?, 1, self.config.vocab_size)
+        read_last_logits(
+            &project(self.config, self.weights, &normalized, "model.embed_tokens")?,
+            1,
+            self.config.vocab_size,
+        )
     }
 
     fn capacity_kv_bytes(&self) -> usize {
@@ -231,10 +236,13 @@ impl<'a> CapacityExecutor<'a> {
     fn target_capacity(&self, next_tokens: usize) -> usize {
         match self.mode {
             CapacityMode::Fixed => self.maximum_capacity,
-            CapacityMode::Stepped => STEPPED_CAPACITY_BOUNDARIES
-                .into_iter()
-                .find(|&boundary| next_tokens <= boundary && boundary <= self.maximum_capacity)
-                .unwrap_or(self.maximum_capacity),
+            CapacityMode::Stepped => {
+                let tier = STEPPED_CAPACITY_BOUNDARIES
+                    .into_iter()
+                    .find(|&boundary| next_tokens <= boundary)
+                    .unwrap_or_else(|| next_tokens.next_power_of_two());
+                tier.min(self.maximum_capacity)
+            }
         }
     }
 
@@ -384,20 +392,21 @@ fn capacity_layer(
         weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
         config.rms_norm_eps,
     )?;
-    let gate = linear(
+    let gate = project(
+        config,
+        weights,
         &mlp_input,
-        weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
+        &format!("{base}.mlp.gate_proj"),
     )?
     .reshape_device(&[1, seq_len, intermediate], &stream)?;
-    let up = linear(
-        &mlp_input,
-        weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
-    )?
-    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    let up = project(config, weights, &mlp_input, &format!("{base}.mlp.up_proj"))?
+        .reshape_device(&[1, seq_len, intermediate], &stream)?;
     let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
-    let mlp = linear(
+    let mlp = project(
+        config,
+        weights,
         &activated.multiply_device(&up, &stream)?,
-        weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
+        &format!("{base}.mlp.down_proj"),
     )?
     .reshape_device(&[1, seq_len, hidden], &stream)?;
     residual.add_device(&mlp, &stream).map_err(Into::into)
@@ -422,11 +431,11 @@ fn capacity_attention(
     let kv_heads = as_i32(config.key_value_heads)?;
     let head_dim = as_i32(config.head_dim)?;
     let attn = format!("{base}.self_attn");
-    let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
+    let query = project(config, weights, input, &format!("{attn}.q_proj"))?
         .reshape_device(&[1, seq_len, heads, head_dim], &stream)?;
-    let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
+    let key = project(config, weights, input, &format!("{attn}.k_proj"))?
         .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
-    let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
+    let value = project(config, weights, input, &format!("{attn}.v_proj"))?
         .reshape_device(&[1, seq_len, kv_heads, head_dim], &stream)?;
     let query = fast::rope_device(
         &rms_norm(
@@ -514,7 +523,7 @@ fn capacity_attention(
             ],
             &stream,
         )?;
-    linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
+    project(config, weights, &output, &format!("{attn}.o_proj"))
 }
 
 #[derive(Debug)]
@@ -859,7 +868,7 @@ proptest! {
         let config = super::long_small_config();
         let weights = super::deterministic_weights();
         let plan = config
-            .resident_chat_plan(1_024, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
+            .resident_chat_plan(1_024, u64::MAX, crate::forward::Qwen3FloatPrecision::Float32)
             .expect("long tiny resident plan");
         let prompt = vec![prompt_token; boundary - 1];
         let mut stepped = CapacityExecutor::new_stepped(&config, &weights, 1_024);
@@ -940,7 +949,7 @@ fn stepped_capacity_decode_overflow_preserves_allocation_and_malformed_prefill_r
     let config = super::long_small_config();
     let weights = super::deterministic_weights();
     let plan = config
-        .resident_chat_plan(512, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
+        .resident_chat_plan(512, u64::MAX, crate::forward::Qwen3FloatPrecision::Float32)
         .expect("bounded reference plan");
     let mut reference = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
     let mut full = CapacityExecutor::new_stepped(&config, &weights, 512);

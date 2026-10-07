@@ -8,6 +8,52 @@ use crate::deepseek_reduced_cli;
 #[cfg(feature = "metal")]
 use crate::{decision_cli, julia_decisions};
 
+/// Invalid explicit context input; model-specific admission happens at load.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+pub(crate) enum ExplicitContextError {
+    Integer(std::num::ParseIntError),
+    Empty,
+    Shape { requested: u32 },
+}
+
+#[cfg(feature = "metal")]
+impl std::fmt::Display for ExplicitContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Integer(error) => write!(f, "invalid explicit context: {error}"),
+            Self::Empty => f.write_str("explicit context must contain at least one token"),
+            Self::Shape { requested } => write!(
+                f,
+                "explicit context {requested} exceeds the MLX i32 shape limit"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+impl std::error::Error for ExplicitContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Integer(error) => Some(error),
+            Self::Empty | Self::Shape { .. } => None,
+        }
+    }
+}
+
+/// Parse only the explicit token count, leaving model and memory caps to adapters.
+#[cfg(feature = "metal")]
+pub(crate) fn parse_context_tokens(value: &str) -> Result<u32, ExplicitContextError> {
+    let tokens = value.parse().map_err(ExplicitContextError::Integer)?;
+    if tokens == 0 {
+        return Err(ExplicitContextError::Empty);
+    }
+    if i32::try_from(tokens).is_err() {
+        return Err(ExplicitContextError::Shape { requested: tokens });
+    }
+    Ok(tokens)
+}
+
 #[derive(Debug, Parser)]
 #[command(
     about = "Inspect model files and run experimental Metal inference",
@@ -92,7 +138,8 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=256))]
         max_tokens: u32,
         /// Total prompt plus output budget for this resident session.
-        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
+        /// Validated against the model and K/V budget before loading weights.
+        #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
         context_tokens: u32,
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
         #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
@@ -115,7 +162,8 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=16))]
         max_turns: u32,
         /// Total prompt plus output budget for each agent turn.
-        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
+        /// Validated against the model and K/V budget before loading weights.
+        #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
         context_tokens: u32,
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
         #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
@@ -150,7 +198,8 @@ pub(crate) enum Command {
         #[arg(long, default_value = "127.0.0.1:8321")]
         listen: std::net::SocketAddr,
         /// Total prompt plus output budget for each request.
-        #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
+        /// Validated against the model and K/V budget before loading weights.
+        #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
         context_tokens: u32,
         /// Paged K/V pool per generating model, in MiB, allocated when the
         /// model loads. Defaults to the smaller of 4096 and a quarter of

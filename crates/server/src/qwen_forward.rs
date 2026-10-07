@@ -94,6 +94,24 @@ pub(crate) struct ScheduleVerificationConfig {
     pub(crate) requirements: Option<crate::schedule_requirements::ScheduleRequirements>,
 }
 
+/// Which seeded sampler turns a seed into tokens. A seed only reproduces
+/// output under the sampler that produced it, so receipts name it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) enum SamplerId {
+    /// One `ChaCha8Rng` uniform per committed token, inverse CDF over the
+    /// legal rows in token-ID order with f64 cumulative weights.
+    #[serde(rename = "icdf-v1")]
+    IcdfV1,
+}
+
+impl SamplerId {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::IcdfV1 => "icdf-v1",
+        }
+    }
+}
+
 /// The explicit request settings for a reproducible categorical policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SamplingConfiguration {
@@ -102,8 +120,12 @@ pub(crate) struct SamplingConfiguration {
 }
 
 impl SamplingConfiguration {
+    /// The only sampler this policy implements.
+    pub(crate) const SAMPLER: SamplerId = SamplerId::IcdfV1;
+
     fn report(self) -> serde_json::Value {
         json!({
+            "sampler": Self::SAMPLER.as_str(),
             "algorithm": "rand_chacha::ChaCha8Rng",
             "crate_version": "0.9.0",
             "seed": self.seed,
@@ -1645,6 +1667,32 @@ mod tests {
             (raw - selected_model_logprob(&logits, token).expect("raw reference")).abs() < 1e-12
         );
     }
+
+    #[test]
+    fn icdf_v1_golden_tokens_pin_the_seeded_sampler() {
+        // Any change to the stream, the uniform mapping or the inverse CDF
+        // changes these tokens, and with them every recorded seed's output.
+        // Such a change needs a new `SamplerId`, not an edit here.
+        let configuration = SamplingConfiguration {
+            seed: 7,
+            temperature: 0.7,
+        };
+        assert_eq!(configuration.report()["sampler"], "icdf-v1");
+        let rows: [[f32; 8]; 3] = [
+            [0.0, 0.4, -0.3, 0.9, 0.1, -1.2, 0.6, 0.2],
+            [1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.9, 0.8],
+            [-2.0, 0.5, 0.5, -0.5, 2.0, -1.0, 0.0, 1.0],
+        ];
+        let mut policy = SamplingPolicy::new(configuration, 8);
+        let tokens: Vec<i32> = (0..24)
+            .map(|draw| policy.sample(&rows[draw % 3], false).expect("valid draw").0)
+            .collect();
+        assert_eq!(tokens, GOLDEN_ICDF_V1, "tokens: {tokens:?}");
+    }
+
+    const GOLDEN_ICDF_V1: [i32; 24] = [
+        1, 0, 4, 6, 3, 4, 1, 6, 4, 7, 1, 4, 3, 1, 4, 3, 1, 1, 3, 1, 4, 6, 0, 1,
+    ];
 
     #[test]
     fn uniform_conversion_is_half_open_and_uses_all_top_53_bits() {

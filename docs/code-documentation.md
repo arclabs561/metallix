@@ -56,6 +56,16 @@ The body states the contract, not the implementation:
   given value is out of range."
 - Links to the item a reader needs next, as intra-doc links.
 
+Refer to other code by item, not by path. In Rust docs, write an intra-doc
+link such as [`ChatTemplate::render`] or [`blockfloat::decode_e4m3fn`]:
+rustdoc resolves it on every gate run, so a rename or a crate move fails the
+build instead of leaving a stale `crates/...` path. Public docs cannot link
+private items, and the CPU gate documents crates without `metal`, so a link
+from always-built docs to a `metal`-only item breaks there; name both kinds
+in backticks. Markdown under `docs/` is not
+checked, so it names the crate and item ("the server crate's `gpu` module")
+and links a source file only when a line number matters.
+
 Then these sections, in this order, each only when it applies:
 
 `# Errors` names the conditions, grouped by variant where useful, and what
@@ -145,9 +155,9 @@ bytes").
 ## `unsafe`
 
 The workspace denies `unsafe_code`; a module that needs it allows it at the
-module level and says in its `//!` doc why, as `crates/server/src/gpu.rs`
-does. Every `unsafe` block gets a `// SAFETY:` comment naming the obligation
-it meets and how, every `unsafe fn` a `# Safety` section.
+module level and says in its `//!` doc why, as the server crate's `gpu`
+module does. Every `unsafe` block gets a `// SAFETY:` comment naming the
+obligation it meets and how, every `unsafe fn` a `# Safety` section.
 
 ```rust
 // SAFETY: both functions only write one `size_t` through the pointer.
@@ -160,6 +170,12 @@ fail it. Each crate adds `#![deny(missing_docs)]` once its public items are
 documented. Clippy's `missing_errors_doc` and `missing_panics_doc` keep the
 sections honest: `missing_panics_doc` is on through `clippy::pedantic`, and
 `missing_errors_doc` is enabled per crate as each is retrofitted.
+
+`scripts/check_doc_ratchet.py` keeps that progress. A crate not in its
+`PENDING` list must carry both attributes in its `lib.rs`, and a listed crate
+that already carries them fails until it is removed from the list. Retrofit a
+crate by documenting it, adding the attributes and removing it from `PENDING`
+in one change. A new crate starts documented.
 
 ## Anti-patterns
 

@@ -16,12 +16,15 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook"]
+metal = ["dep:audio", "dep:qwen3-asr", "qwen3-asr/metal", "qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook"]
 structured-output = ["dep:engine", "engine/structured-output"]
 # Chrome/Perfetto JSON timeline behind `--trace-out`.
 timeline = ["dep:tracing-chrome"]
 
 [dependencies]
+audio = { path = "../audio", optional = true }
+qwen3-asr = { path = "../models/qwen3-asr", optional = true }
+thiserror.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

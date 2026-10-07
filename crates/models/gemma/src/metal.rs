@@ -237,7 +237,7 @@ pub enum Gemma4LoadError {
     /// A tensor's shape or dtype differs from the configuration.
     #[error("text tensor {0} has an unexpected shape or dtype")]
     TensorLayout(String),
-    /// Executor construction failed.
+    /// The embedding weight was absent when loading evaluated it as a check.
     #[error(transparent)]
     Forward(#[from] Gemma4ForwardError),
 }

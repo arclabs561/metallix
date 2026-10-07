@@ -19,7 +19,16 @@ pub struct QwenTokenizer {
     /// The same tokenizer without its added vocabulary, which encodes an
     /// added token's spelling as ordinary text.
     plain: Tokenizer,
+    /// Added-token spellings, when each one matches only its literal text
+    /// (no normalizer, or no added token is normalized), so text without one
+    /// of them encodes no added token; `None` otherwise.
+    literal_added: Option<LiteralAdded>,
     source_sha256: String,
+}
+
+struct LiteralAdded {
+    spellings: Vec<String>,
+    first_bytes: [bool; 256],
 }
 
 /// Stateful decoder input retained until the tokenizer can emit a stable text
@@ -33,15 +42,19 @@ pub struct QwenIncrementalDecode {
 
 impl QwenTokenizer {
     pub fn load(model: &Path) -> Result<Self, String> {
-        let bytes = read_regular_file(
+        Self::from_bytes(Self::read_json(model)?)
+    }
+
+    /// The bounded bytes of `tokenizer.json` in `model`.
+    pub(crate) fn read_json(model: &Path) -> Result<Vec<u8>, String> {
+        read_regular_file(
             &model.join("tokenizer.json"),
             MAX_TOKENIZER_BYTES,
             "tokenizer file",
-        )?;
-        Self::from_bytes(bytes)
+        )
     }
 
-    fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
         let source_sha256 = format!("{:x}", Sha256::digest(&bytes));
         let parse_error = || String::from("local tokenizer.json could not be parsed");
         let mut plain: serde_json::Value =
@@ -52,9 +65,28 @@ impl QwenTokenizer {
                 .map_err(|_| parse_error())?,
         )?;
         let tokenizer = Self::unbounded(Tokenizer::from_bytes(bytes).map_err(|_| parse_error())?)?;
+        let added = tokenizer.get_added_tokens_decoder();
+        let literal_added = (tokenizer.get_normalizer().is_none()
+            || added.values().all(|token| !token.normalized))
+        .then(|| {
+            let mut first_bytes = [false; 256];
+            let spellings: Vec<String> = added
+                .values()
+                .map(|token| token.content.clone())
+                .filter(|spelling| !spelling.is_empty())
+                .collect();
+            for spelling in &spellings {
+                first_bytes[usize::from(spelling.as_bytes()[0])] = true;
+            }
+            LiteralAdded {
+                spellings,
+                first_bytes,
+            }
+        });
         Ok(Self {
             tokenizer,
             plain,
+            literal_added,
             source_sha256,
         })
     }
@@ -112,6 +144,21 @@ impl QwenTokenizer {
 
     /// Byte ranges of `text` that encode as added tokens.
     pub fn added_token_spans(&self, text: &str) -> Result<Vec<Range<usize>>, String> {
+        // Encoding a whole conversation costs as much as the prompt; most
+        // text spells no added token, which a byte scan shows.
+        if let Some(literal) = &self.literal_added {
+            let bytes = text.as_bytes();
+            let spelled = (0..bytes.len()).any(|index| {
+                literal.first_bytes[usize::from(bytes[index])]
+                    && literal
+                        .spellings
+                        .iter()
+                        .any(|spelling| bytes[index..].starts_with(spelling.as_bytes()))
+            });
+            if !spelled {
+                return Ok(Vec::new());
+            }
+        }
         let encoding = self
             .tokenizer
             .encode(text, false)
@@ -404,6 +451,43 @@ mod tests {
         assert_eq!(reader.position(), 4);
     }
 
+    /// The byte scan finds literal spellings; a tokenizer whose normalizer
+    /// rewrites text before matching a normalized added token is encoded.
+    #[test]
+    fn added_token_spans_skip_encoding_only_for_literal_spellings() {
+        let word_level = |normalizer: serde_json::Value, normalized: bool| {
+            let json = serde_json::json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [{"id": 1, "content": "<end>", "single_word": false,
+                    "lstrip": false, "rstrip": false, "normalized": normalized,
+                    "special": true}],
+                "normalizer": normalizer, "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null, "decoder": null,
+                "model": {"type": "WordLevel", "unk_token": "<unk>",
+                    "vocab": {"<unk>": 0, "<end>": 1, "hi": 2}}
+            });
+            QwenTokenizer::from_bytes(json.to_string().into_bytes()).expect("tokenizer")
+        };
+        let spans = |tokenizer: &QwenTokenizer, text: &str| {
+            tokenizer
+                .added_token_spans(text)
+                .expect("encodes")
+                .into_iter()
+                .map(|span| (span.start, span.end))
+                .collect::<Vec<_>>()
+        };
+        let literal = word_level(serde_json::Value::Null, true);
+        assert!(literal.literal_added.is_some());
+        assert_eq!(spans(&literal, "hi <end>"), [(3, 8)]);
+        assert_eq!(spans(&literal, "hi <END> <en"), []);
+        let lowercase = word_level(serde_json::json!({"type": "Lowercase"}), true);
+        assert!(lowercase.literal_added.is_none());
+        assert_eq!(spans(&lowercase, "hi <END>"), [(3, 8)]);
+        let raw = word_level(serde_json::json!({"type": "Lowercase"}), false);
+        assert!(raw.literal_added.is_some());
+        assert_eq!(spans(&raw, "hi <END>"), []);
+    }
+
     #[test]
     fn prompt_encoding_clears_checkpoint_padding_and_truncation() {
         assert_eq!(tokenizer().encode_prompt("hello world"), Ok(vec![2, 3]));
@@ -470,6 +554,7 @@ mod tests {
         let tokenizer = QwenTokenizer {
             tokenizer: streaming.clone(),
             plain: streaming,
+            literal_added: None,
             source_sha256: String::from("test-only"),
         };
         let mut stream = QwenTokenizer::generated_decoder();

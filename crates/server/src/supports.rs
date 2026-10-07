@@ -28,12 +28,16 @@ pub(crate) enum Adapter {
     Qwen3,
     /// `llama` (`MiniCPM5`) through the Qwen3 decoder without Q/K norms.
     Llama,
+    /// `qwen2` (Qwen2.5) through the Qwen3 decoder with Q/K/V biases.
+    Qwen2,
     /// Bidirectional `bidirectional_pplx_qwen3` (pplx-embed).
     PplxQwen3,
     /// Julia-1 decisions on the CPU.
     Julia,
     /// `qwen3_5` hybrid linear/full attention.
     Qwen35,
+    /// Experimental dense Qwen3-ASR transcription.
+    Qwen3Asr,
     /// Gemma 4 dense text.
     Gemma4,
     /// `DeepSeek` V4.1.
@@ -45,9 +49,11 @@ impl Adapter {
         match self {
             Self::Qwen3 => "qwen3",
             Self::Llama => "llama",
+            Self::Qwen2 => "qwen2",
             Self::PplxQwen3 => "pplx_qwen3",
             Self::Julia => "julia",
             Self::Qwen35 => "qwen35",
+            Self::Qwen3Asr => "qwen3_asr",
             Self::Gemma4 => "gemma4",
             Self::DeepseekV41 => "deepseek_v41",
         }
@@ -58,11 +64,12 @@ impl Adapter {
     pub(crate) const fn served_as(self) -> &'static [ModelKind] {
         match self {
             Self::Qwen3 => &[ModelKind::Qwen, ModelKind::QwenEmbedding],
-            Self::Llama => &[ModelKind::Qwen],
+            Self::Llama | Self::Qwen2 => &[ModelKind::Qwen],
             Self::PplxQwen3 => &[ModelKind::PplxContext, ModelKind::PplxLate],
             Self::Julia => &[ModelKind::Julia],
             Self::Gemma4 => &[ModelKind::Gemma4],
             Self::Qwen35 => &[ModelKind::Qwen35],
+            Self::Qwen3Asr => &[ModelKind::Qwen3Asr],
             Self::DeepseekV41 => &[],
         }
     }
@@ -73,22 +80,23 @@ impl Adapter {
     /// so such a config is refused here instead.
     const fn gate_reads_quantization(self) -> bool {
         match self {
-            // V41TextContract requires the official fp8/fp4 block layout.
-            Self::DeepseekV41 => true,
-            // Qwen3ForwardConfig ignores the field today; once it parses a
-            // typed quantization, return true for its three adapters.
-            Self::Qwen3
+            // V41TextContract requires the official fp8/fp4 block layout;
+            // Qwen3ForwardConfig parses MLX affine `quantization` and refuses
+            // any other `quantization_config`.
+            Self::DeepseekV41
+            | Self::Qwen3
             | Self::Llama
+            | Self::Qwen2
             | Self::PplxQwen3
-            | Self::Julia
-            | Self::Qwen35
-            | Self::Gemma4 => false,
+            | Self::Qwen3Asr => true,
+            Self::Julia | Self::Qwen35 | Self::Gemma4 => false,
         }
     }
 
     fn qwen(family: qwen::DecoderFamily, attention: qwen::Qwen3Attention) -> Self {
         match (family, attention) {
             (qwen::DecoderFamily::Llama, _) => Self::Llama,
+            (qwen::DecoderFamily::Qwen2, _) => Self::Qwen2,
             (qwen::DecoderFamily::Qwen3, qwen::Qwen3Attention::Bidirectional) => Self::PplxQwen3,
             (qwen::DecoderFamily::Qwen3, qwen::Qwen3Attention::Causal) => Self::Qwen3,
         }
@@ -136,6 +144,7 @@ impl Verdict {
         let claims = [
             julia_claim(document),
             qwen_claim(json, document),
+            qwen3_asr_claim(json, document),
             qwen35_claim(json),
             gemma4_claim(json),
             deepseek_v41_claim(json),
@@ -267,6 +276,9 @@ impl fmt::Display for DeclaredQuantization {
 
 fn note(adapter: Adapter) -> &'static str {
     match adapter {
+        Adapter::Qwen3Asr => {
+            " (experimental dense ASR; configuration only, weights and transcription quality not verified)"
+        }
         Adapter::Gemma4 => " (text tower only; vision encoder not loaded)",
         Adapter::Qwen35 => {
             " (text only; vision encoder not loaded; at most 16,384 context tokens; no prompt-prefix cache)"
@@ -321,6 +333,23 @@ fn qwen_claim(json: &str, document: &Value) -> Claim {
                 _ => Claim::NotMine,
             }
         }
+    }
+}
+
+fn qwen3_asr_claim(json: &str, document: &Value) -> Claim {
+    // ASR rejects packed declarations before deserializing its dense schema;
+    // claim only its own architecture, including malformed ASR documents.
+    if document["model_type"] != "qwen3_asr" {
+        return Claim::NotMine;
+    }
+    let config = match qwen3_asr::Qwen3AsrConfig::parse(json) {
+        Ok(config) => config,
+        Err(error) => return Claim::Rejected(Adapter::Qwen3Asr, error.to_string()),
+    };
+    // This is the loader's second configuration gate, before tokenizer/weights.
+    match qwen::forward::Qwen3ForwardConfig::parse(&config.text_config_json()) {
+        Ok(_) => Claim::Accepted(Adapter::Qwen3Asr),
+        Err(error) => Claim::Rejected(Adapter::Qwen3Asr, error.to_string()),
     }
 }
 

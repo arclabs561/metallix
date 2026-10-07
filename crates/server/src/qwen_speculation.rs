@@ -12,7 +12,7 @@ use engine::speculative::{
 };
 use qwen::{
     forward::{Qwen3ForwardError, Qwen3ForwardExecutor},
-    metal::Qwen3WeightPrecision,
+    metal::Qwen3FloatPrecision,
 };
 
 use super::turn::{Accepted, TurnLoop, TurnStep};
@@ -45,16 +45,16 @@ const _: () = assert!(MAX_DRAFT_TOKENS < MLX_VECTOR_ATTENTION_ROWS);
 /// (<https://github.com/ml-explore/mlx/blob/v0.32.2/mlx/backend/metal/quantized.cpp#L85>),
 /// and that cost grows with every row, so on 4-bit 8B shapes each extra
 /// verified row measured ~0.2 of a decode step rather than ~0.05.
-pub(super) fn verify_cost(precision: Qwen3WeightPrecision) -> VerifyCost {
+pub(super) fn verify_cost(precision: Qwen3FloatPrecision) -> VerifyCost {
     let (fixed, per_token) = match precision {
-        Qwen3WeightPrecision::BFloat16 | Qwen3WeightPrecision::Float16 => (0.2, 0.055),
-        Qwen3WeightPrecision::Float32 => (0.6, 0.035),
+        Qwen3FloatPrecision::BFloat16 | Qwen3FloatPrecision::Float16 => (0.2, 0.055),
+        Qwen3FloatPrecision::Float32 => (0.6, 0.035),
     };
     VerifyCost::new(fixed, per_token).expect("constant verify cost terms are valid")
 }
 
 /// The draft length controller for one turn on weights at `precision`.
-pub(super) fn draft_length(precision: Qwen3WeightPrecision) -> DraftLength {
+pub(super) fn draft_length(precision: Qwen3FloatPrecision) -> DraftLength {
     DraftLength::new(MAX_DRAFT_TOKENS, verify_cost(precision))
         .expect("constant draft range is valid")
 }
@@ -144,16 +144,16 @@ pub(super) fn verify(
 
 #[cfg(test)]
 mod tests {
-    use qwen::metal::Qwen3WeightPrecision;
+    use qwen::metal::Qwen3FloatPrecision;
 
     use super::{MAX_DRAFT_TOKENS, draft_length};
 
     #[test]
     fn full_acceptance_drafts_the_cap_at_every_precision() {
         for precision in [
-            Qwen3WeightPrecision::BFloat16,
-            Qwen3WeightPrecision::Float16,
-            Qwen3WeightPrecision::Float32,
+            Qwen3FloatPrecision::BFloat16,
+            Qwen3FloatPrecision::Float16,
+            Qwen3FloatPrecision::Float32,
         ] {
             let mut length = draft_length(precision);
             for _ in 0..50 {

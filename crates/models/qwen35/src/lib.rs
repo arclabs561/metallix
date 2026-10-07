@@ -29,8 +29,8 @@
 //! applies it one token at a time. The source prefill computes the same
 //! values in 64-token chunks: within a chunk it solves a unit lower-triangular
 //! system (the UT transform) for the corrected values, then carries `S` from
-//! chunk to chunk. This crate evaluates the token-by-token form for both
-//! prefill and decode.
+//! chunk to chunk. This crate does the same for multi-token calls (64-token
+//! chunks, f32) and evaluates the token-by-token form for decode.
 //!
 //! # Sequence state
 //!
@@ -66,9 +66,35 @@
 //!    `sigmoid(W_shared_gate x)`, is added to the sum.
 //!
 //! Experts are stored fused per layer as `[E, 2I, H]` and `[E, H, I]`.
+//!
+//! # Overview
+//!
+//! * [`Qwen35Config::parse`] validates `config.json` and refuses layout
+//!   variants this decoder does not implement. [`Qwen35Config::kv_bytes`] and
+//!   [`Qwen35Config::fixed_state_bytes`] size a sequence's state before any
+//!   weight is loaded.
+//! * With the `metal` feature, `forward::Qwen35Weights::load` loads the text
+//!   decoder, and its `executor` method starts a `forward::Qwen35Executor`
+//!   that holds one sequence's state and returns logits after a prefill, a
+//!   decoded token or an extension.
+//!
+//! # Example: refusing another architecture
+//!
+//! ```
+//! use qwen35::{Qwen35Config, Qwen35ConfigError};
+//!
+//! // Plain Qwen3 checkpoints are a different layout, served elsewhere.
+//! let error = Qwen35Config::parse(r#"{"model_type": "qwen3"}"#).unwrap_err();
+//! assert!(matches!(error, Qwen35ConfigError::UnexpectedModelType(t) if t == "qwen3"));
+//! ```
+
+#![deny(missing_docs)]
+// The workspace allows this lint; crates opt in once their docs are complete.
+#![warn(clippy::missing_errors_doc)]
 
 #[cfg(feature = "metal")]
 pub mod forward;
+pub mod gguf;
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -135,6 +161,18 @@ impl Qwen35Config {
     /// checkpoint, dense-only layers in an `MoE` one, scaled rotary embedding,
     /// attention bias, an ungated attention output, another gate activation)
     /// are refused rather than ignored.
+    ///
+    /// # Errors
+    ///
+    /// * [`Qwen35ConfigError::Json`] for malformed JSON.
+    /// * [`Qwen35ConfigError::UnexpectedModelType`] for another architecture,
+    ///   or a nested `text_config` whose type does not match the outer one.
+    /// * [`Qwen35ConfigError::Unsupported`] for a layout variant listed above.
+    /// * [`Qwen35ConfigError::Missing`], [`Qwen35ConfigError::Invalid`],
+    ///   [`Qwen35ConfigError::HeadGrouping`], [`Qwen35ConfigError::LayerCount`],
+    ///   [`Qwen35ConfigError::UnknownLayerType`] and
+    ///   [`Qwen35ConfigError::ConflictingTiedEmbeddings`] for a layout that
+    ///   cannot be built.
     pub fn parse(json: &str) -> Result<Self, Qwen35ConfigError> {
         let outer: RawOuterConfig = serde_json::from_str(json).map_err(Qwen35ConfigError::Json)?;
         let (text, outer_tie, text_type) = match (outer.model_type.as_str(), outer.text_config) {
@@ -299,6 +337,33 @@ impl Qwen35Config {
     #[must_use]
     pub const fn max_position_embeddings(&self) -> usize {
         self.max_position_embeddings
+    }
+
+    /// The longest sequence an executor admits: the checkpoint's declared
+    /// positions. Parsing refuses `RoPE` scaling, so this never extends past
+    /// what the configuration states; memory is the caller's plan.
+    #[must_use]
+    pub const fn context_limit(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    /// Full-attention K/V rows an executor allocates to hold `tokens`
+    /// positions: tiers of 128 and 512, then doubling, capped at
+    /// [`Self::context_limit`]. A short sequence under a long limit stays
+    /// small, and each doubling copies the prefix once, which is amortized
+    /// O(1) per appended token. Memory plans should count these rows, not
+    /// `tokens`.
+    #[must_use]
+    pub fn kv_storage_tokens(&self, tokens: usize) -> usize {
+        let mut tier = 128_usize;
+        while tier < tokens {
+            tier = if tier == 128 {
+                512
+            } else {
+                tier.saturating_mul(2)
+            };
+        }
+        tier.min(self.context_limit()).max(tokens)
     }
 
     /// Width of the convolved `q`, `k`, `v` projection of a linear layer.
@@ -564,6 +629,9 @@ pub enum Qwen35ConfigError {
     /// A derived size does not fit in memory arithmetic.
     #[error("qwen3_5 state size overflows")]
     ShapeOverflow,
+    /// GGUF metadata is absent or invalid.
+    #[error(transparent)]
+    Gguf(#[from] checkpoint::CheckpointError),
 }
 
 #[cfg(test)]
@@ -646,6 +714,35 @@ mod tests {
             config.kv_bytes(1000).expect("fits"),
             16 * 2 * 4 * 256 * 1000 * 4
         );
+    }
+
+    /// K/V storage tiers are 128, 512, then doubling, capped at the declared
+    /// 262,144 positions, and always hold the sequence. Above 512 tokens the
+    /// storage stays within twice the sequence, so a short chat under the
+    /// full limit never allocates 262K rows.
+    #[test]
+    fn kv_storage_tiers_follow_the_sequence_up_to_the_limit() {
+        let config = Qwen35Config::parse(&qwen38_27b()).expect("valid config");
+        assert_eq!(config.context_limit(), 262_144);
+        let tiers = [
+            (1, 128),
+            (128, 128),
+            (129, 512),
+            (513, 1_024),
+            (70_000, 131_072),
+            (200_000, 262_144),
+            (262_144, 262_144),
+        ];
+        for (tokens, rows) in tiers {
+            assert_eq!(config.kv_storage_tokens(tokens), rows, "{tokens} tokens");
+        }
+        for tokens in 1..=5_000 {
+            let rows = config.kv_storage_tokens(tokens);
+            assert!(
+                rows >= tokens && rows <= tokens.max(256) * 2,
+                "{tokens} -> {rows}"
+            );
+        }
     }
 
     #[test]

@@ -57,15 +57,22 @@ fn expected_tensors() -> Vec<super::ExpectedTensor> {
             vocab_size: 8,
             intermediate_size: 6,
             tie_word_embeddings: true,
+            quantization: None,
         },
     )
     .expect("valid layout")
 }
 
+/// Bytes per element of a fixture tensor: `U32` when the layout requires
+/// packed words, else BF16.
+fn element_bytes(tensor: &super::ExpectedTensor) -> u64 {
+    if tensor.dtype == Some("U32") { 4 } else { 2 }
+}
+
 fn write_safetensors(path: &Path, tensors: &[super::ExpectedTensor]) {
     let payload_bytes = tensors
         .iter()
-        .map(|tensor| tensor.shape.iter().product::<u64>() * 2)
+        .map(|tensor| tensor.shape.iter().product::<u64>() * element_bytes(tensor))
         .sum::<u64>();
     write_safetensors_with_payload(
         path,
@@ -80,10 +87,10 @@ fn write_safetensors_with_payload(path: &Path, tensors: &[super::ExpectedTensor]
     header.insert("__metadata__".to_owned(), json!({"format":"pt"}));
     for tensor in tensors {
         let element_count = tensor.shape.iter().product::<u64>();
-        let byte_length = element_count * 2;
+        let byte_length = element_count * element_bytes(tensor);
         header.insert(
                 tensor.name.clone(),
-                json!({"dtype":"BF16","shape": tensor.shape,"data_offsets":[offset, offset + byte_length]}),
+                json!({"dtype":tensor.dtype.unwrap_or("BF16"),"shape": tensor.shape,"data_offsets":[offset, offset + byte_length]}),
             );
         offset += byte_length;
     }
@@ -568,6 +575,7 @@ fn bare_tensors() -> Vec<super::ExpectedTensor> {
                 .expect("canonical names are prefixed")
                 .to_owned(),
             shape: tensor.shape,
+            dtype: tensor.dtype,
         })
         .collect()
 }
@@ -619,6 +627,7 @@ fn prefixed_names_keep_their_naming_and_mixed_embeddings_are_rejected() {
     mixed.push(super::ExpectedTensor {
         name: "model.embed_tokens.weight".to_owned(),
         shape: vec![8, 4],
+        dtype: None,
     });
     write_safetensors(&fixture.path.join("model.safetensors"), &mixed);
     assert!(matches!(
@@ -649,6 +658,7 @@ fn llama_layout_has_no_qk_norms_and_requires_an_untied_lm_head() {
                 vocab_size: 8,
                 intermediate_size: 6,
                 tie_word_embeddings,
+                quantization: None,
             },
         )
         .expect("valid layout")
@@ -668,4 +678,164 @@ fn llama_layout_has_no_qk_norms_and_requires_an_untied_lm_head() {
     assert!(!names(true).contains(&"lm_head.weight".to_owned()));
     // The Qwen3 fixture keeps its two per-layer Q/K norms.
     assert_eq!(expected_tensors().len(), 1 + 11 + 1);
+}
+
+/// A 64-wide layout that 4-bit, 64-element groups divide.
+const QUANTIZED_CONFIG: &str = r#"{"model_type":"qwen3","num_hidden_layers":1,"hidden_size":64,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"max_position_embeddings":16,"vocab_size":8,"intermediate_size":64,"tie_word_embeddings":true,"quantization":{"group_size":64,"bits":4}}"#;
+
+fn quantized_tensors() -> Vec<super::ExpectedTensor> {
+    let contract = Qwen3TextContract::parse(QUANTIZED_CONFIG).expect("valid contract");
+    let layout: RawCheckpointLayout = serde_json::from_str(QUANTIZED_CONFIG).expect("valid layout");
+    let quantization = Some(super::Qwen3AffineQuantization::FOUR_BIT_G64);
+    required_dense_tensors(&contract, &layout)
+        .expect("valid layout")
+        .into_iter()
+        .flat_map(|tensor| super::stored_tensors(tensor, quantization))
+        .collect()
+}
+
+#[test]
+fn affine_quantized_layouts_need_packed_words_scales_and_biases() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path.join("config.json"), QUANTIZED_CONFIG).expect("write config");
+    let tensors = quantized_tensors();
+    // Seven projections and the embedding become triples; three norms stay.
+    assert_eq!(tensors.len(), 8 * 3 + 5);
+    let packed = tensors
+        .iter()
+        .find(|tensor| tensor.name == "model.layers.0.mlp.down_proj.weight")
+        .expect("packed down projection");
+    assert_eq!(packed.shape, [64, 8]);
+    assert_eq!(packed.dtype, Some("U32"));
+    write_safetensors(&fixture.path.join("model.safetensors"), &tensors);
+    Qwen3CheckpointInspection::inspect(&fixture.path).expect("quantized checkpoint");
+
+    // Dense float words where the layout declares packed ones are refused.
+    let mut float_words = quantized_tensors();
+    for tensor in &mut float_words {
+        if tensor.name == "model.layers.0.self_attn.q_proj.weight" {
+            tensor.dtype = None;
+        }
+    }
+    write_safetensors(&fixture.path.join("model.safetensors"), &float_words);
+    assert!(matches!(
+        Qwen3CheckpointInspection::inspect(&fixture.path),
+        Err(Qwen3CheckpointError::UnexpectedTensorDtype { .. })
+    ));
+
+    // A dense checkpoint under a quantized config misses its scales.
+    write_safetensors(
+        &fixture.path.join("model.safetensors"),
+        &required_dense_tensors(
+            &Qwen3TextContract::parse(QUANTIZED_CONFIG).expect("valid contract"),
+            &serde_json::from_str(QUANTIZED_CONFIG).expect("valid layout"),
+        )
+        .expect("valid layout"),
+    );
+    assert!(matches!(
+        Qwen3CheckpointInspection::inspect(&fixture.path),
+        Err(Qwen3CheckpointError::UnexpectedTensorShape { .. }
+            | Qwen3CheckpointError::MissingRequiredTensor(_))
+    ));
+
+    // Mixed per-module precision is refused, not ignored.
+    fs::write(
+        fixture.path.join("config.json"),
+        QUANTIZED_CONFIG.replace(
+            r#""bits":4}"#,
+            r#""bits":4,"model.layers.0.mlp.down_proj":{"group_size":64,"bits":8}}"#,
+        ),
+    )
+    .expect("write config");
+    write_safetensors(&fixture.path.join("model.safetensors"), &tensors);
+    assert!(matches!(
+        Qwen3CheckpointInspection::inspect(&fixture.path),
+        Err(Qwen3CheckpointError::UnsupportedQuantization(_))
+    ));
+}
+
+/// Qwen2.5-0.5B's attention layout shrunk to 64 wide: no `head_dim`, so it is
+/// `hidden_size / num_attention_heads` = 32, and 4-bit 64-element groups divide
+/// every projection row.
+const QWEN2_CONFIG: &str = r#"{"model_type":"qwen2","num_hidden_layers":1,"hidden_size":64,"num_attention_heads":2,"num_key_value_heads":1,"max_position_embeddings":16,"vocab_size":8,"intermediate_size":64,"rope_theta":1000000.0,"sliding_window":32768,"use_sliding_window":false,"tie_word_embeddings":true}"#;
+
+#[test]
+fn qwen2_layout_requires_qkv_biases_kept_dense_under_affine_packing() {
+    let dense_tensors = |config: &str| {
+        required_dense_tensors(
+            &Qwen3TextContract::parse(config).expect("valid contract"),
+            &serde_json::from_str(config).expect("valid layout"),
+        )
+        .expect("valid layout")
+    };
+    let dense = dense_tensors(QWEN2_CONFIG);
+    let shape_of = |tensors: &[super::ExpectedTensor], name: &str| {
+        tensors
+            .iter()
+            .find(|tensor| tensor.name == name)
+            .map(|tensor| (tensor.shape.clone(), tensor.dtype))
+    };
+    // Embedding, nine layer tensors plus three biases, final norm; no Q/K norm,
+    // no O bias.
+    assert_eq!(dense.len(), 1 + 9 + 3 + 1);
+    assert_eq!(
+        shape_of(&dense, "model.layers.0.self_attn.q_proj.bias"),
+        Some((vec![64], None))
+    );
+    for name in [
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.v_proj.bias",
+    ] {
+        assert_eq!(shape_of(&dense, name), Some((vec![32], None)), "{name}");
+    }
+    assert_eq!(
+        shape_of(&dense, "model.layers.0.self_attn.o_proj.bias"),
+        None
+    );
+    assert_eq!(
+        shape_of(&dense, "model.layers.0.self_attn.q_norm.weight"),
+        None
+    );
+
+    let fixture = Fixture::new();
+    fs::write(fixture.path.join("config.json"), QWEN2_CONFIG).expect("write config");
+    write_safetensors(&fixture.path.join("model.safetensors"), &dense);
+    Qwen3CheckpointInspection::inspect(&fixture.path).expect("dense Qwen2 checkpoint");
+    let without_bias: Vec<_> = dense_tensors(QWEN2_CONFIG)
+        .into_iter()
+        .filter(|tensor| tensor.name != "model.layers.0.self_attn.v_proj.bias")
+        .collect();
+    write_safetensors(&fixture.path.join("model.safetensors"), &without_bias);
+    assert!(matches!(
+        Qwen3CheckpointInspection::inspect(&fixture.path),
+        Err(Qwen3CheckpointError::MissingRequiredTensor(name))
+            if name == "model.layers.0.self_attn.v_proj.bias"
+    ));
+
+    // Under an affine layout the projections pack, the biases stay dense.
+    let quantized_config = QWEN2_CONFIG.replace(
+        r#""tie_word_embeddings":true"#,
+        r#""tie_word_embeddings":true,"quantization":{"group_size":64,"bits":4}"#,
+    );
+    let packed: Vec<_> = dense_tensors(&quantized_config)
+        .into_iter()
+        .flat_map(|tensor| {
+            super::stored_tensors(tensor, Some(super::Qwen3AffineQuantization::FOUR_BIT_G64))
+        })
+        .collect();
+    assert_eq!(
+        shape_of(&packed, "model.layers.0.self_attn.q_proj.weight"),
+        Some((vec![64, 8], Some("U32")))
+    );
+    assert_eq!(
+        shape_of(&packed, "model.layers.0.self_attn.q_proj.bias"),
+        Some((vec![64], None))
+    );
+    assert_eq!(
+        shape_of(&packed, "model.layers.0.self_attn.q_proj.bias.scales"),
+        None
+    );
+    fs::write(fixture.path.join("config.json"), &quantized_config).expect("write config");
+    write_safetensors(&fixture.path.join("model.safetensors"), &packed);
+    Qwen3CheckpointInspection::inspect(&fixture.path).expect("affine Qwen2 checkpoint");
 }

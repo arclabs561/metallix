@@ -44,32 +44,51 @@ pub struct FlowMatchConfig {
     time_shift: TimeShift,
 }
 
+/// A rejected scheduler configuration or an invalid computed sigma schedule.
 #[derive(Debug, Error, PartialEq)]
 pub enum ScheduleError {
+    /// The configuration cannot be decoded; contains the JSON error description.
     #[error("scheduler config is not valid JSON for {SCHEDULER_CLASS}: {0}")]
     Json(String),
+    /// The declared scheduler class is unsupported; contains its name.
     #[error("scheduler class {0:?} is not {SCHEDULER_CLASS}")]
     Class(String),
+    /// An unsupported sampler option is enabled; contains its configuration key.
     #[error("scheduler option {0} is set; this schedule does not implement it")]
     Unsupported(&'static str),
+    /// The time-shift type is unknown; contains the supplied value.
     #[error("time_shift_type {0:?} is neither \"exponential\" nor \"linear\"")]
     TimeShiftType(String),
+    /// Dynamic shifting requires a caller-supplied mu.
     #[error("dynamic shifting is enabled, so the pipeline must supply mu")]
     MissingMu,
+    /// Static shifting rejects a caller-supplied mu.
     #[error("dynamic shifting is disabled, so mu must not be supplied")]
     UnexpectedMu,
+    /// The requested schedule has zero denoising steps.
     #[error("a schedule needs at least one step")]
     NoSteps,
+    /// The configured training timestep count is zero.
     #[error("num_train_timesteps must be positive")]
     NoTrainingTimesteps,
+    /// The supplied static shift is nonfinite or nonpositive.
     #[error("shift {0} must be finite and positive in float32")]
     InvalidShift(f32),
+    /// The supplied mu or its float32 shift scale is invalid.
     #[error("mu {0} must be finite and yield a finite positive float32 shift scale")]
     InvalidMu(f64),
+    /// The supplied nonzero terminal sigma is outside the representable open unit interval.
     #[error("shift_terminal {0} must lie in (0, 1)")]
     ShiftTerminal(f64),
+    /// Computed float32 arithmetic did not produce a valid descending schedule.
     #[error("sigma at step {index} is outside the finite positive descending schedule: {value}")]
-    InvalidSigma { index: usize, value: f32 },
+    InvalidSigma {
+        /// Zero-based index of the invalid sigma, before appending terminal zero.
+        index: usize,
+        /// Computed sigma that is nonfinite, nonpositive or greater than its predecessor.
+        value: f32,
+    },
+    /// The maximum image sequence length does not exceed the base length.
     #[error("max_image_seq_len must exceed base_image_seq_len")]
     SeqLenRange,
     /// diffusers divides by `1 - last_sigma` to stretch to `shift_terminal`;
@@ -135,6 +154,15 @@ fn default_time_shift() -> String {
 
 impl FlowMatchConfig {
     /// Parses a diffusers `scheduler/scheduler_config.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScheduleError::Json`] for malformed fields, [`ScheduleError::Class`]
+    /// for a different scheduler, [`ScheduleError::Unsupported`] for enabled
+    /// unsupported options, or [`ScheduleError::TimeShiftType`] for an unknown shift.
+    /// Invalid training counts, shifts, terminal values and image-length bounds
+    /// produce [`ScheduleError::NoTrainingTimesteps`], [`ScheduleError::InvalidShift`],
+    /// [`ScheduleError::ShiftTerminal`] and [`ScheduleError::SeqLenRange`], respectively.
     pub fn from_json(text: &str) -> Result<Self, ScheduleError> {
         let raw: RawConfig =
             serde_json::from_str(text).map_err(|error| ScheduleError::Json(error.to_string()))?;
@@ -239,8 +267,11 @@ pub fn linear_mu(config: &FlowMatchConfig, image_seq_len: usize) -> f64 {
 /// moves from `sigma` to `sigma_next`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlowMatchStep {
+    /// Zero-based denoising step index.
     pub index: usize,
+    /// Noise level at which the model evaluates this step.
     pub sigma: f32,
+    /// Noise level after the Euler update; zero for the final step.
     pub sigma_next: f32,
     /// `sigma * num_train_timesteps`, in float32 like the source.
     pub timestep: f32,
@@ -268,6 +299,17 @@ impl Sigmas {
     ///
     /// `mu` is required exactly when the config enables dynamic shifting; use
     /// [`flux2_empirical_mu`] or [`linear_mu`] as the pipeline does.
+    ///
+    /// Allocates storage proportional to `steps`; the caller bounds this count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScheduleError::NoSteps`] for zero steps, or
+    /// [`ScheduleError::MissingMu`] / [`ScheduleError::UnexpectedMu`] when `mu`
+    /// disagrees with the configuration. Invalid dynamic shift scales return
+    /// [`ScheduleError::InvalidMu`]. Unrepresentable terminal stretching returns
+    /// [`ScheduleError::DegenerateTerminal`]; invalid computed sigmas return
+    /// [`ScheduleError::InvalidSigma`]. The configuration is unchanged on error.
     pub fn new(
         config: &FlowMatchConfig,
         steps: usize,

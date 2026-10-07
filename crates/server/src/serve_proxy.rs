@@ -468,13 +468,14 @@ fn proxy_models(
     for socket in server.incoming().take(request_limit.unwrap_or(usize::MAX)) {
         let socket = socket.map_err(|error| error.to_string())?;
         let mut connection = Connection::accept(socket, limits);
-        let request = match connection.read_request() {
-            Ok(request) => request,
-            Err(error) => {
-                error_response(connection, error.status, None, error.message);
-                continue;
-            }
-        };
+        let request =
+            match connection.read_request_with(&crate::transcriptions::UploadLimits(limits)) {
+                Ok(request) => request,
+                Err(error) => {
+                    error_response(connection, error.status, None, &error.describe());
+                    continue;
+                }
+            };
         let context = RequestContext::from_headers(
             request.trace.traceparent.as_deref(),
             request.trace.request_id.as_deref(),
@@ -512,20 +513,33 @@ fn proxy_models(
                 "/v1/responses"
                 | "/v1/chat/completions"
                 | "/v1/messages"
+                | "/v1/completions"
+                | "/v1/score"
                 | "/v1/decisions"
                 | "/v1/embeddings"
-                | "/v1/rerank",
+                | "/v1/rerank"
+                | "/v1/audio/transcriptions",
             ) => {}
             _ => {
                 error_response(connection, 404, None, "unknown endpoint");
                 continue;
             }
         }
-        let target = match serde_json::from_slice::<Target>(&request.body) {
-            Ok(target) => target.model,
-            Err(error) => {
-                error_response(connection, 400, None, &error.to_string());
-                continue;
+        let target = if request.path == crate::transcriptions::PATH {
+            match crate::transcriptions::parse(&request.body, request.content_type.as_deref()) {
+                Ok(form) => form.model.to_owned(),
+                Err(error) => {
+                    error_response(connection, error.status, None, &error.message);
+                    continue;
+                }
+            }
+        } else {
+            match serde_json::from_slice::<Target>(&request.body) {
+                Ok(target) => target.model,
+                Err(error) => {
+                    error_response(connection, 400, None, &error.to_string());
+                    continue;
+                }
             }
         };
         span.record("gen_ai.request.model", target.as_str());
@@ -567,6 +581,38 @@ fn proxy_models(
         let _ = forward.join();
     }
     Ok(())
+}
+
+fn write_child_request(
+    child: &mut TcpStream,
+    request: &Request,
+    context: &RequestContext,
+    address: SocketAddr,
+) -> io::Result<()> {
+    let content_type = request
+        .content_type
+        .as_ref()
+        .map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
+    // A new parent id under the caller's trace id, per W3C Trace Context.
+    write!(
+        child,
+        "{} {} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\ntraceparent: {}\r\nx-request-id: {}\r\nx-metallix-cancel-on-eof: 1\r\n{content_type}{}\r\n",
+        request.method,
+        request.path,
+        request.body.len(),
+        context.trace.child(),
+        context.request_id,
+        // Already validated as visible ASCII by the transport.
+        request
+            .trace
+            .cache_salt
+            .as_ref()
+            .map_or_else(String::new, |salt| format!(
+                "x-metallix-cache-salt: {salt}\r\n"
+            )),
+    )?;
+    // Keep the write side open so a later EOF conveys cancellation.
+    child.write_all(&request.body)
 }
 
 fn forward(
@@ -637,27 +683,7 @@ fn forward(
     };
     let sent = child
         .set_read_timeout(Some(limits.response_deadline + CHILD_READ_GRACE))
-        .and_then(|()| {
-            // A new parent id under the caller's trace id, per W3C Trace Context.
-            write!(
-                child,
-                "{} {} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\ntraceparent: {}\r\nx-request-id: {}\r\nx-metallix-cancel-on-eof: 1\r\n{}\r\n",
-                request.method,
-                request.path,
-                request.body.len(),
-                context.trace.child(),
-                context.request_id,
-                // Already validated as visible ASCII by the transport.
-                request
-                    .trace
-                    .cache_salt
-                    .as_ref()
-                    .map_or_else(String::new, |salt| format!("x-metallix-cache-salt: {salt}\r\n")),
-            )
-        })
-        // The write side stays open: a child sees this end close only when
-        // the client has left, which is how it learns to stop generating.
-        .and_then(|()| child.write_all(&request.body));
+        .and_then(|()| write_child_request(&mut child, request, context, address));
     if let Err(error) = sent {
         let reason = model.fail(&format!("child request failed: {error}"));
         return unavailable(connection, reason);
@@ -1551,5 +1577,81 @@ mod tests {
 
         server.join().unwrap().unwrap();
         echo_child.join().unwrap();
+    }
+
+    #[test]
+    fn transcription_proxy_preserves_content_type_and_binary_body_above_json_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_address = listener.local_addr().unwrap();
+        let file = vec![0xa5; 1024 * 1024 + 1];
+        let body = crate::transcriptions::tests::form(&[("model", b"asr"), ("file", &file)]);
+        let expected = body.clone();
+        let child = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            let request = connection
+                .read_request_with(&crate::transcriptions::UploadLimits(
+                    TransportLimits::default(),
+                ))
+                .unwrap();
+            assert_eq!(
+                request.content_type.as_deref(),
+                Some("multipart/form-data; boundary=boundary")
+            );
+            assert_eq!(request.body, expected);
+            json_response(connection, 200, &json!({"text":"forwarded"}));
+        });
+        let pool = Arc::new(Pool {
+            models: vec![model("asr", ModelKind::Qwen3Asr, Some(child_address))],
+            launcher: None,
+            budget_mib: None,
+            residency: Mutex::new(()),
+        });
+        let (address, server) = proxy(&pool, 1);
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(stream, "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=boundary\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+        stream.write_all(&body).unwrap();
+        // Keep write open: the forwarder reserves EOF for cancellation.
+        let (status, _, value) = finish(stream);
+        assert_eq!(status, 200);
+        assert_eq!(value["text"], "forwarded");
+        server.join().unwrap();
+        child.join().unwrap();
+    }
+
+    #[test]
+    fn transcription_proxy_rejects_upload_and_json_lengths_before_body_intake() {
+        let pool = Arc::new(Pool {
+            models: vec![],
+            launcher: None,
+            budget_mib: None,
+            residency: Mutex::new(()),
+        });
+        let (address, server) = proxy(&pool, 2);
+        for (path, length, limit) in [
+            (
+                crate::transcriptions::PATH,
+                crate::transcriptions::BODY_BYTES + 1,
+                crate::transcriptions::BODY_BYTES,
+            ),
+            ("/v1/responses", 1024 * 1024 + 1, 1024 * 1024),
+        ] {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\n\r\n"
+            )
+            .unwrap();
+            let (status, _, error) = finish(stream);
+            assert_eq!(status, 413);
+            assert!(error.to_string().contains(&format!("of {limit} bytes")));
+        }
+        server.join().unwrap();
     }
 }

@@ -30,6 +30,18 @@ const MINICPM5_2B: &str = r#"{
 }"#;
 
 /// A pplx-embed layout as the qwen crate's bidirectional tests write it.
+/// Qwen/Qwen2.5-0.5B-Instruct@7ae5576 config.json.
+const QWEN25_05B: &str = r#"{
+  "architectures": ["Qwen2ForCausalLM"], "attention_dropout": 0.0, "bos_token_id": 151643,
+  "eos_token_id": 151645, "hidden_act": "silu", "hidden_size": 896, "initializer_range": 0.02,
+  "intermediate_size": 4864, "max_position_embeddings": 32768, "max_window_layers": 21,
+  "model_type": "qwen2", "num_attention_heads": 14, "num_hidden_layers": 24,
+  "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "rope_theta": 1000000.0,
+  "sliding_window": 32768, "tie_word_embeddings": true, "torch_dtype": "bfloat16",
+  "transformers_version": "4.43.1", "use_cache": true, "use_sliding_window": false,
+  "vocab_size": 151936
+}"#;
+
 const PPLX_QWEN3: &str = r#"{
   "architectures": ["PPLXQwen3Model"], "model_type": "bidirectional_pplx_qwen3",
   "use_bidirectional_attention": true, "num_hidden_layers": 28, "hidden_size": 1024,
@@ -161,6 +173,7 @@ fn assert_classified(json: &str, adapter: Option<Adapter>, supported: bool) -> V
 fn served_adapters_accept_their_published_configs() {
     assert_classified(QWEN3_06B, Some(Adapter::Qwen3), true);
     assert_classified(MINICPM5_2B, Some(Adapter::Llama), true);
+    assert_classified(QWEN25_05B, Some(Adapter::Qwen2), true);
     assert_classified(PPLX_QWEN3, Some(Adapter::PplxQwen3), true);
     assert_classified(JULIA_1, Some(Adapter::Julia), true);
     let gemma4 = assert_classified(GEMMA4_12B, Some(Adapter::Gemma4), true);
@@ -182,6 +195,19 @@ fn a_variant_the_owning_loader_refuses_keeps_its_reason() {
         r#""use_sliding_window": true"#,
     );
     let verdict = assert_classified(&sliding, Some(Adapter::Qwen3), false);
+    assert!(
+        verdict.reason().contains("sliding_window"),
+        "{}",
+        verdict.reason()
+    );
+
+    // Qwen2.5 ships a window that `use_sliding_window` disables; enabling it
+    // is refused by the same gate.
+    let qwen2_sliding = QWEN25_05B.replace(
+        r#""use_sliding_window": false"#,
+        r#""use_sliding_window": true"#,
+    );
+    let verdict = assert_classified(&qwen2_sliding, Some(Adapter::Qwen2), false);
     assert!(
         verdict.reason().contains("sliding_window"),
         "{}",
@@ -303,7 +329,7 @@ fn with_field(json: &str, field: &str) -> String {
 }
 
 #[test]
-fn quantized_configs_are_refused_while_the_gate_ignores_quantization() {
+fn qwen_gates_accept_mlx_affine_layouts_and_refuse_other_quantization() {
     // mlx-community/Qwen3-0.6B-4bit writes both fields.
     let mlx = with_field(
         &with_field(
@@ -312,12 +338,7 @@ fn quantized_configs_are_refused_while_the_gate_ignores_quantization() {
         ),
         r#""quantization_config": {"group_size": 64, "bits": 4}"#,
     );
-    let verdict = assert_classified(&mlx, Some(Adapter::Qwen3), false);
-    let reason = verdict.reason();
-    assert!(
-        reason.contains("4-bit") && reason.contains("group size 64"),
-        "{reason}"
-    );
+    assert_classified(&mlx, Some(Adapter::Qwen3), true);
 
     // Qwen/Qwen3-4B-FP8's quantization_config.
     let fp8 = with_field(
@@ -331,11 +352,23 @@ fn quantized_configs_are_refused_while_the_gate_ignores_quantization() {
         verdict.reason()
     );
 
+    // mlx-community's 8-bit layout loads; 3-bit is not implemented.
+    let eight_bit = with_field(
+        QWEN3_06B,
+        r#""quantization": {"group_size": 64, "bits": 8}"#,
+    );
+    assert_classified(&eight_bit, Some(Adapter::Qwen3), true);
+    let three_bit = with_field(
+        QWEN3_06B,
+        r#""quantization": {"group_size": 64, "bits": 3}"#,
+    );
+    assert_classified(&three_bit, Some(Adapter::Qwen3), false);
+
     let llama = with_field(
         MINICPM5_2B,
         r#""quantization": {"group_size": 64, "bits": 4, "mode": "affine"}"#,
     );
-    assert_classified(&llama, Some(Adapter::Llama), false);
+    assert_classified(&llama, Some(Adapter::Llama), true);
 
     let unquantized = with_field(QWEN3_06B, r#""quantization_config": null"#);
     assert_classified(&unquantized, Some(Adapter::Qwen3), true);
@@ -386,4 +419,75 @@ fn published_pplx_configs_pass_the_loader_gate() {
             verdict.reason()
         );
     }
+}
+
+/// Qwen/Qwen3-ASR-0.6B @ 5eb144179a02acc5e5ba31e748d22b0cf3e303b0.
+const QWEN3_ASR_06B: &str = include_str!("fixtures/qwen3-asr-06b.json");
+
+#[test]
+fn asr_config_acceptance_names_registered_kind_without_qualification_claim() {
+    let result = assert_classified(QWEN3_ASR_06B, Some(Adapter::Qwen3Asr), true);
+    assert_eq!(
+        Adapter::Qwen3Asr.served_as(),
+        &[crate::serve_registry::ModelKind::Qwen3Asr]
+    );
+    assert!(result.reason().contains("qwen3_asr"));
+    assert!(result.reason().contains("configuration only"));
+    assert!(result.reason().contains("not verified"));
+}
+
+#[test]
+fn asr_packed_config_is_rejected_by_its_loader_guard() {
+    for scope in [
+        "",
+        "/thinker_config",
+        "/thinker_config/text_config",
+        "/thinker_config/audio_config",
+    ] {
+        for key in ["quantization", "quantization_config"] {
+            let mut document: Value = serde_json::from_str(QWEN3_ASR_06B).unwrap();
+            document.pointer_mut(scope).unwrap()[key] = serde_json::json!({
+                "bits": 8, "group_size": 64, "mode": "affine"
+            });
+            let result = assert_classified(&document.to_string(), Some(Adapter::Qwen3Asr), false);
+            assert!(matches!(
+                result,
+                Verdict::Rejected {
+                    adapter: Adapter::Qwen3Asr,
+                    ..
+                }
+            ));
+            assert!(result.reason().contains("unsupported ASR quantization"));
+            assert!(result.reason().contains(&format!("{scope}/{key}")));
+        }
+    }
+}
+
+#[test]
+fn asr_claim_applies_both_configuration_gates_and_preserves_other_adapters() {
+    let mut document: Value = serde_json::from_str(QWEN3_ASR_06B).unwrap();
+    document["thinker_config"]["text_config"]["use_sliding_window"] = Value::Bool(true);
+    document["thinker_config"]["text_config"]["sliding_window"] = serde_json::json!(4096);
+    assert_classified(&document.to_string(), Some(Adapter::Qwen3Asr), false);
+    assert_classified(
+        r#"{"model_type":"qwen3_asr"}"#,
+        Some(Adapter::Qwen3Asr),
+        false,
+    );
+    assert_classified(QWEN3_06B, Some(Adapter::Qwen3), true);
+}
+
+#[test]
+fn asr_inspect_json_reports_the_config_gate_and_registered_kind() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/supports/fixtures/qwen3-asr-06b.json");
+    let mut output = Vec::new();
+    assert_eq!(write_reports(&[path], true, &mut output).unwrap(), 0);
+    let report: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["supported"], true);
+    assert_eq!(report["adapter"], "qwen3_asr");
+    assert_eq!(report["model_type"], "qwen3_asr");
+    let reason = report["reason"].as_str().unwrap();
+    assert!(reason.contains("loads as mx serve kind qwen3_asr"));
+    assert!(reason.contains("configuration only"));
 }

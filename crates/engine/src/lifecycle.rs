@@ -1,3 +1,6 @@
+//! The load, warm, ready and failed phases of one model revision, with
+//! transitions checked so a model only accepts requests once it is ready.
+
 use thiserror::Error;
 
 /// Observable lifecycle phase for one loaded model revision.
@@ -51,6 +54,11 @@ impl ModelLifecycle {
     }
 
     /// Starts a fresh load after unloading or a failed attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::InvalidTransition`], leaving the phase
+    /// unchanged, unless the current phase is [`ModelPhase::Unloaded`] or [`ModelPhase::Failed`].
     pub fn start_loading(&mut self) -> Result<(), LifecycleError> {
         self.transition(
             ModelPhase::Loading,
@@ -59,16 +67,31 @@ impl ModelLifecycle {
     }
 
     /// Records that the model is loaded and its plans are warming.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::InvalidTransition`], leaving the phase
+    /// unchanged, unless the current phase is [`ModelPhase::Loading`].
     pub fn start_warming(&mut self) -> Result<(), LifecycleError> {
         self.transition(ModelPhase::Warming, &[ModelPhase::Loading])
     }
 
     /// Records that all required warmup work completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::InvalidTransition`], leaving the phase
+    /// unchanged, unless the current phase is [`ModelPhase::Warming`].
     pub fn mark_ready(&mut self) -> Result<(), LifecycleError> {
         self.transition(ModelPhase::Ready, &[ModelPhase::Warming])
     }
 
     /// Records a failed load or warmup without retaining an error payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::InvalidTransition`], leaving the phase
+    /// unchanged, unless the current phase is [`ModelPhase::Loading`] or [`ModelPhase::Warming`].
     pub fn fail(&mut self) -> Result<(), LifecycleError> {
         self.transition(
             ModelPhase::Failed,

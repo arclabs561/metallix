@@ -20,7 +20,7 @@ use engine::blocks::{BlockTokens, PoolConfig, SequenceId};
 
 use super::paged_kv::{MIB, fixed_tokens, millis, paged_config, paged_weights, pool, prompt};
 use super::*;
-use crate::forward::{BatchDecoded, BatchReadback, PagedQwen3Session, Qwen3WeightPrecision};
+use crate::forward::{BatchDecoded, BatchReadback, PagedQwen3Session, Qwen3FloatPrecision};
 
 /// Largest batched-vs-single logit difference accepted on the fixture.
 /// Declared after the first measurement, whose largest difference over
@@ -116,7 +116,7 @@ fn start_rows<'a>(
                     .resident_chat_plan(
                         2048,
                         u64::MAX,
-                        crate::forward::Qwen3WeightPrecision::Float32,
+                        crate::forward::Qwen3FloatPrecision::Float32,
                     )
                     .expect("plan"),
             );
@@ -466,8 +466,8 @@ fn paged_batch_qwen3_06b_profile() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut checkpoint = Qwen3MlxWeights::load(model).expect("checkpoint load");
     for (dtype, precision) in [
-        ("bf16", Qwen3WeightPrecision::BFloat16),
-        ("f32", Qwen3WeightPrecision::Float32),
+        ("bf16", Qwen3FloatPrecision::BFloat16),
+        ("f32", Qwen3FloatPrecision::Float32),
     ] {
         checkpoint
             .prepare_precision(precision)

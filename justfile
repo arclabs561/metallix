@@ -15,6 +15,10 @@ check-fixtures:
     uv run scripts/check_engram_fixtures.py
     uv run scripts/test_check_engram_fixtures.py
 
+# Qualify real agent clients against a local model (dry-run unless --run).
+e2e-agents mx model model_id='qwen3-4b' *args='':
+    uv run scripts/e2e_agents.py --mx {{mx}} --model {{model}} --model-id {{model_id}} {{args}}
+
 # Compile a libFuzzer target with nightly sanitizers while preserving the
 # configured rustc wrapper and shared cache.
 fuzz-check target='decode_affine_row':

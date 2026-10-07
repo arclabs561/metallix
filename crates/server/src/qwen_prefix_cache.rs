@@ -64,9 +64,54 @@ pub(super) fn prefill<'w>(
 pub(super) struct AcceptedPrefixTokens(usize);
 
 impl AcceptedPrefixTokens {
+    pub(super) fn from_accepted_extent(tokens: usize) -> Self {
+        Self(tokens)
+    }
+
     pub(super) fn new_tokens_after(self, cached: usize) -> usize {
         self.0.saturating_sub(cached)
     }
+}
+
+/// The prompt prefixes worth caching for `request`: the leading system and
+/// tool preamble, which a later request with the same preamble shares, and
+/// the whole conversation before the generation prompt, which the next turn
+/// of the same conversation extends. A boundary is returned only when its own
+/// rendering tokenizes to a nonempty, exact prefix of `input_ids`; one that
+/// does not render or tokenize is skipped. Shortest first.
+pub(super) fn boundaries(
+    format: &ChatFormat,
+    request: ChatRequest<'_>,
+    input_ids: &[i32],
+) -> Vec<Vec<i32>> {
+    let leading_system = request
+        .messages
+        .iter()
+        .take_while(|message| message.role == super::ChatRole::System)
+        .count();
+    let mut prefixes = Vec::with_capacity(2);
+    if leading_system > 0 || !request.tools.is_empty() {
+        prefixes.push(&request.messages[..leading_system]);
+    }
+    prefixes.push(request.messages);
+    let mut boundaries: Vec<Vec<i32>> = Vec::with_capacity(prefixes.len());
+    for messages in prefixes {
+        let prefix = ChatRequest {
+            messages,
+            ..request
+        };
+        let Ok(ids) = format
+            .prompt(prefix.conversation(), false)
+            .map(|prompt| prompt.ids)
+        else {
+            continue;
+        };
+        if !ids.is_empty() && input_ids.starts_with(&ids) && !boundaries.contains(&ids) {
+            boundaries.push(ids);
+        }
+    }
+    boundaries.sort_by_key(Vec::len);
+    boundaries
 }
 
 /// Caches the prompt's reusable prefixes from `executor`: the leading system
@@ -85,31 +130,8 @@ pub(super) fn remember(
     input_ids: &[i32],
 ) -> Result<AcceptedPrefixTokens, String> {
     let mut written = 0;
-    let leading_system = request
-        .messages
-        .iter()
-        .take_while(|message| message.role == super::ChatRole::System)
-        .count();
-    let mut boundaries = Vec::with_capacity(2);
-    if leading_system > 0 || !request.tools.is_empty() {
-        boundaries.push(&request.messages[..leading_system]);
-    }
-    boundaries.push(request.messages);
-    for messages in boundaries {
-        let prefix = ChatRequest {
-            messages,
-            ..request
-        };
-        let Ok(ids) = format
-            .prompt(prefix.conversation(), false)
-            .map(|prompt| prompt.ids)
-        else {
-            continue;
-        };
-        if ids.is_empty()
-            || !input_ids.starts_with(&ids)
-            || cache.contains(request.cache_salt, &ids)
-        {
+    for ids in boundaries(format, request, input_ids) {
+        if cache.contains(request.cache_salt, &ids) {
             continue;
         }
         let snapshot = weights

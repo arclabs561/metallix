@@ -21,7 +21,7 @@ fn resident<'a>(
     weights: &'a HashMap<String, Array>,
 ) -> Qwen3ForwardExecutor<'a, std::collections::hash_map::RandomState> {
     let plan = config
-        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3WeightPrecision::Float32)
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3FloatPrecision::Float32)
         .expect("tiny resident plan");
     Qwen3ForwardExecutor::new_for_resident_chat(config, weights, plan)
 }

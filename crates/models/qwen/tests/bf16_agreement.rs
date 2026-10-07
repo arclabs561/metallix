@@ -15,7 +15,7 @@
 
 use std::{env, path::PathBuf};
 
-use qwen::metal::{Qwen3MlxWeights, Qwen3WeightPrecision};
+use qwen::metal::{Qwen3FloatPrecision, Qwen3MlxWeights};
 use tokenizers::Tokenizer;
 
 /// Logit units, which equal natural-log probability differences.
@@ -71,7 +71,7 @@ fn chat_prompt(tokenizer: &Tokenizer, user: &str) -> Vec<i32> {
         .collect()
 }
 
-fn weights(model: &PathBuf, precision: Qwen3WeightPrecision) -> Qwen3MlxWeights {
+fn weights(model: &PathBuf, precision: Qwen3FloatPrecision) -> Qwen3MlxWeights {
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_precision(precision).expect("precision");
     weights
@@ -124,13 +124,13 @@ fn bfloat16_greedy_agrees_with_float32_outside_near_ties() {
         .collect();
 
     let references: Vec<Reference> = {
-        let float32 = weights(&model, Qwen3WeightPrecision::Float32);
+        let float32 = weights(&model, Qwen3FloatPrecision::Float32);
         prompts
             .iter()
             .map(|prompt| float32_reference(&float32, prompt))
             .collect()
     };
-    let bfloat16 = weights(&model, Qwen3WeightPrecision::BFloat16);
+    let bfloat16 = weights(&model, Qwen3FloatPrecision::BFloat16);
 
     let mut steps = 0_u32;
     let mut divergences = Vec::new();

@@ -143,6 +143,19 @@ pub(crate) struct Prepared {
     controls: GenerationControls,
 }
 
+impl Prepared {
+    /// Reuses the validated chat prompt for teacher-forced scoring without
+    /// exposing protocol parsing or generation-only controls to that route.
+    pub(crate) fn into_prompt(self) -> (Vec<ChatMessage>, Vec<Value>, bool, Option<String>) {
+        (
+            self.messages,
+            self.tools,
+            self.controls.enable_thinking,
+            self.controls.reasoning_effort,
+        )
+    }
+}
+
 /// An `OpenAI`-shaped error body.
 pub(crate) fn error_body(message: &str) -> Value {
     json!({"error":{"message":message,"type":"invalid_request_error","param":null,"code":null}})

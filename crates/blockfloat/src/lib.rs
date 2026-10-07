@@ -71,6 +71,7 @@
 #![warn(clippy::missing_errors_doc)]
 
 mod blocks;
+pub mod gguf;
 pub use blocks::{BlockDecodeError, expand_e2m1x2_blocks32};
 mod bf16_linear;
 pub use bf16_linear::{Bf16LinearError, MAX_BF16_LINEAR_ELEMENTS, bf16_linear_reference};

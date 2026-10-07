@@ -54,6 +54,15 @@ impl<T> Particle<T> {
     }
 
     /// Adds a finite incremental log weight to a live particle.
+    ///
+    /// # Errors
+    ///
+    /// The particle is unchanged on error.
+    ///
+    /// * [`SmcError::NonFiniteWeight`] for a NaN or infinite `increment`.
+    /// * [`SmcError::AbsorbedParticle`] or [`SmcError::ImpossibleParticle`]
+    ///   when the particle is not live.
+    /// * [`SmcError::WeightOverflow`] when the sum is not finite.
     pub fn add_log_weight(&mut self, increment: f64) -> Result<(), SmcError> {
         if !increment.is_finite() {
             return Err(SmcError::NonFiniteWeight);
@@ -74,6 +83,19 @@ impl<T> Particle<T> {
     /// it either cannot explain a positive-target particle or describes an
     /// event that the proposal could not have drawn. Both cases fail without
     /// changing the particle.
+    ///
+    /// # Errors
+    ///
+    /// The particle is unchanged on error.
+    ///
+    /// * [`SmcError::AbsorbedParticle`] or [`SmcError::ImpossibleParticle`]
+    ///   when the particle is not live.
+    /// * [`SmcError::NonFiniteImportanceLogprob`] for a NaN or positive
+    ///   infinite log mass.
+    /// * [`SmcError::ProposalHasNoSupport`] when `log_proposal` is negative
+    ///   infinity.
+    /// * [`SmcError::WeightOverflow`] when the ratio or the new weight is not
+    ///   finite.
     pub fn add_log_importance_ratio(
         &mut self,
         log_target: f64,
@@ -105,6 +127,11 @@ impl<T> Particle<T> {
     /// This is distinct from [`Self::absorb`]: an impossible particle remains
     /// observable for ancestry accounting, but has no normalized mass and
     /// cannot be revived by a later increment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmcError::AbsorbedParticle`] or [`SmcError::ImpossibleParticle`]
+    /// when the particle is not live.
     pub fn reject(&mut self) -> Result<(), SmcError> {
         self.require_live()?;
         self.log_weight = f64::NEG_INFINITY;
@@ -113,6 +140,11 @@ impl<T> Particle<T> {
     }
 
     /// Marks a live particle terminal; subsequent transitions fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmcError::AbsorbedParticle`] or [`SmcError::ImpossibleParticle`]
+    /// when the particle is not live.
     pub fn absorb(&mut self) -> Result<(), SmcError> {
         self.require_live()?;
         self.status = ParticleStatus::Absorbed;
@@ -136,6 +168,10 @@ pub struct ParticleSet<T> {
 
 impl<T: Clone> ParticleSet<T> {
     /// Creates a population from nonempty initial states.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmcError::EmptyPopulation`] when `states` is empty.
     pub fn new(states: Vec<T>) -> Result<Self, SmcError> {
         if states.is_empty() {
             return Err(SmcError::EmptyPopulation);
@@ -177,6 +213,11 @@ impl<T: Clone> ParticleSet<T> {
     /// The returned log sum describes this population only. It is not a
     /// sequence-level evidence estimate; a caller that resamples must retain
     /// each stage's [`Self::log_mean_weight`] separately.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmcError::NoFiniteWeight`] when no particle has a finite
+    /// weight, so the population has no mass to normalize.
     pub fn normalized_weights(&self) -> Result<(Vec<f64>, f64), SmcError> {
         let maximum = self
             .particles
@@ -206,6 +247,12 @@ impl<T: Clone> ParticleSet<T> {
     /// This is the per-stage normalizer that an SMC driver may accumulate.
     /// It remains distinct from the log sum returned by
     /// [`Self::normalized_weights`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmcError::NoFiniteWeight`] when no particle has a finite
+    /// weight, and [`SmcError::PopulationTooLarge`] for more than `u32::MAX`
+    /// particles.
     pub fn log_mean_weight(&self) -> Result<f64, SmcError> {
         let (_, log_weight_sum) = self.normalized_weights()?;
         let count = f64::from(u32::try_from(self.len()).map_err(|_| SmcError::PopulationTooLarge)?);
@@ -213,6 +260,11 @@ impl<T: Clone> ParticleSet<T> {
     }
 
     /// Computes effective sample size from normalized log weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SmcError::NoFiniteWeight`] when no particle has a finite
+    /// weight, so the population has no mass to normalize.
     pub fn effective_sample_size(&self) -> Result<f64, SmcError> {
         let (weights, _) = self.normalized_weights()?;
         Ok(weights
@@ -230,6 +282,14 @@ impl<T: Clone> ParticleSet<T> {
     /// The returned value is the previous population's log mean weight. An SMC
     /// driver must retain it before advancing the fresh stage; it is not stored
     /// in this state-only primitive.
+    ///
+    /// # Errors
+    ///
+    /// The population is unchanged on error.
+    ///
+    /// * [`SmcError::InvalidOffset`] unless `offset` is in `[0, 1)`.
+    /// * [`SmcError::NoFiniteWeight`] when no particle has a finite weight.
+    /// * [`SmcError::PopulationTooLarge`] for more than `u32::MAX` particles.
     pub fn systematic_resample(&mut self, offset: f64) -> Result<f64, SmcError> {
         if !(0.0..1.0).contains(&offset) || !offset.is_finite() {
             return Err(SmcError::InvalidOffset);

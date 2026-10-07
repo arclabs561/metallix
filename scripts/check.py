@@ -18,7 +18,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def run(command: list[str], timeout_seconds: int, *, docs: bool = False) -> int:
     print("+", " ".join(command), flush=True)
-    environment = os.environ | ({"RUSTDOCFLAGS": "-Dwarnings"} if docs else {})
+    # Every crate and binary needs a crate-level doc; -Dwarnings makes it fatal.
+    rustdoc_flags = "-Dwarnings -Wrustdoc::missing_crate_level_docs"
+    environment = os.environ | ({"RUSTDOCFLAGS": rustdoc_flags} if docs else {})
     try:
         process = subprocess.Popen(
             command, cwd=ROOT, env=environment, shell=False, start_new_session=True
@@ -63,6 +65,8 @@ def main() -> int:
     commands = [
         ([sys.executable, "scripts/check_engram_fixtures.py"], False),
         ([sys.executable, "scripts/test_check_engram_fixtures.py"], False),
+        ([sys.executable, "scripts/check_doc_ratchet.py"], False),
+        ([sys.executable, "scripts/test_check_doc_ratchet.py"], False),
         ([sys.executable, "scripts/test_v41_forward_manifest.py"], False),
         ([sys.executable, "scripts/test_v41_native_receipt.py"], False),
         ([sys.executable, "scripts/test_v41_source_loader.py"], False),
@@ -134,6 +138,7 @@ def main() -> int:
         ([sys.executable, "scripts/test_qualify_codex.py"], False),
         ([sys.executable, "scripts/test_qualify_responses_tools.py"], False),
         ([sys.executable, "scripts/test_sdk_conformance.py"], False),
+        ([sys.executable, "scripts/test_e2e_agents.py"], False),
         (["node", "--test", "scripts/benchmark-openai.test.mjs"], False),
         (["ruff", "check", "scripts"], False),
         (["ruff", "format", "--check", "scripts"], False),

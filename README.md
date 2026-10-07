@@ -26,6 +26,11 @@ of scope by design: put a router or reverse proxy in front of the server.
   pplx-embed-context-v1-0.6b, and per-token vectors with pplx-embed-v1-late-0.6b.
   Each matches a pinned source reference within a declared tolerance.
 - Reranking (`POST /v1/rerank`) with MaxSim over the per-token vectors.
+- Scoring with Qwen3 (`POST /v1/score`, and `POST /v1/completions` with
+  `echo`): teacher-forced log probabilities of a continuation or a prompt. A
+  text continuation is encoded alone and appended to the prompt's tokens
+  (`metallix.continuation_tokenization: "separate"`); callers that need
+  lm-eval's joint encoding pass token IDs.
 
 DeepSeek-V4.1-Flash is the main target and is not usable for generation yet. A
 scalar CPU reference path runs all 40 layers from the real checkpoint, reading

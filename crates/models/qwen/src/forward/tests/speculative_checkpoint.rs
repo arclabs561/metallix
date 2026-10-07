@@ -21,7 +21,7 @@ use engine::speculative::{
 
 use crate::{GPU_TEST_LOCK, metal::Qwen3MlxWeights};
 
-use super::super::{Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3WeightPrecision};
+use super::super::{Qwen3FloatPrecision, Qwen3ForwardError, Qwen3ForwardExecutor};
 
 const CONTEXT_TOKENS: usize = 4_096;
 const KV_BYTES: u64 = 1024 * 1024 * 1024;
@@ -364,7 +364,7 @@ fn prompt_lookup_speculation_matches_greedy_and_reports_speed() {
         tokenizers::Tokenizer::from_file(model.join("tokenizer.json")).expect("tokenizer");
     let mut weights = Qwen3MlxWeights::load(&model).expect("checkpoint load");
     weights
-        .prepare_precision(Qwen3WeightPrecision::BFloat16)
+        .prepare_precision(Qwen3FloatPrecision::BFloat16)
         .expect("serving precision");
     println!(
         "speculation_probe weights=bf16 load_average_start={}",

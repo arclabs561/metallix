@@ -28,24 +28,36 @@ use thiserror::Error;
 
 use crate::{DecoderFamily, Qwen3Attention};
 
+mod embedded;
 mod paged;
 mod picks;
+mod projection;
+mod score;
 mod snapshot;
 mod verify;
 
+pub(crate) use crate::quantization::is_quantizable;
+pub use crate::quantization::{Qwen3AffineBits, Qwen3AffineGroupSize, Qwen3AffineQuantization};
 pub use paged::{
     BatchDecoded, BatchReadback, PagedPrefill, PagedQwen3Session, QueuedDecode, StepInput,
 };
 pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
+pub use projection::Qwen3WeightPrecision;
+pub(crate) use projection::{dense_weight, embed_rows, project};
+pub use score::{Qwen3ScoredToken, Qwen3Scores, SCORE_CHUNK_ROWS};
 pub use snapshot::Qwen3KvSnapshot;
 pub use verify::Qwen3PositionLogits;
 
 /// The largest prompt accepted by the uncached qualification forward path.
 pub const MAX_DENSE_DEBUG_TOKENS: usize = 512;
 
-/// Experimental resident-chat admission ceiling. This does not expand the
-/// 512-token uncached diagnostic forward path or qualify longer contexts.
-pub const MAX_RESIDENT_CHAT_TOKENS: usize = 16_384;
+/// Longest prompt piece built as one graph. A longer prefill or extension
+/// runs as consecutive pieces, each evaluated before the next is built, so a
+/// long prompt never becomes one command buffer or holds whole-prompt
+/// activations (on Qwen3-0.6B the MLP intermediates alone are 1.6 GB at
+/// 262K tokens). Each piece attends to the cached prefix, so the result is
+/// one call's, up to kernel reduction order.
+pub const PREFILL_CHUNK_TOKENS: usize = 2_048;
 
 /// Default logical K/V budget for the resident-chat control path.
 pub const DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
@@ -53,7 +65,7 @@ pub const DEFAULT_RESIDENT_CHAT_KV_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// A floating-point dtype for resident weights, and so for the K/V they
 /// produce: the cached keys and values take the projection output's dtype.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Qwen3WeightPrecision {
+pub enum Qwen3FloatPrecision {
     /// Serving precision: Qwen3 checkpoints ship BF16, and decode is bound
     /// by the weight bytes read per token.
     #[default]
@@ -65,7 +77,7 @@ pub enum Qwen3WeightPrecision {
     Float32,
 }
 
-impl Qwen3WeightPrecision {
+impl Qwen3FloatPrecision {
     /// Bytes of one stored element.
     #[must_use]
     pub const fn bytes_per_element(self) -> u64 {
@@ -95,25 +107,35 @@ impl Qwen3WeightPrecision {
 
 /// The dtype of the K/V a cached executor over `weights` retains: that of a
 /// key projection of an embedded token, so MLX's promotion of the embedding
-/// and key-projection dtypes.
+/// and key-projection dtypes; for packed weights, of their scales.
 pub(crate) fn kv_precision<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
     weights: &HashMap<String, Array, S>,
-) -> Result<Qwen3WeightPrecision, Qwen3ForwardError> {
-    let embedding = weight(weights, "model.embed_tokens.weight")?.dtype();
-    let key = weight(weights, "model.layers.0.self_attn.k_proj.weight")?.dtype();
+) -> Result<Qwen3FloatPrecision, Qwen3ForwardError> {
+    let unpacked = if config.quantization().is_some() {
+        "scales"
+    } else {
+        "weight"
+    };
+    let embedding = weight(weights, &format!("model.embed_tokens.{unpacked}"))?.dtype();
+    let key = weight(
+        weights,
+        &format!("model.layers.0.self_attn.k_proj.{unpacked}"),
+    )?
+    .dtype();
     let promoted = if embedding == key {
         key
     } else {
         Dtype::Float32
     };
     for dtype in [embedding, key] {
-        if Qwen3WeightPrecision::from_dtype(dtype).is_none() {
+        if Qwen3FloatPrecision::from_dtype(dtype).is_none() {
             return Err(Qwen3ForwardError::UnsupportedWeightDtype(format!(
                 "{dtype:?}"
             )));
         }
     }
-    Qwen3WeightPrecision::from_dtype(promoted)
+    Qwen3FloatPrecision::from_dtype(promoted)
         .ok_or_else(|| Qwen3ForwardError::UnsupportedWeightDtype(format!("{promoted:?}")))
 }
 
@@ -122,7 +144,7 @@ pub(crate) fn kv_precision<S: BuildHasher>(
 pub struct Qwen3ResidentChatPlan {
     maximum_context_tokens: usize,
     planned_kv_bytes: u64,
-    kv_precision: Qwen3WeightPrecision,
+    kv_precision: Qwen3FloatPrecision,
 }
 
 /// An absolute, half-open token-position range selected for a residual intervention.
@@ -312,7 +334,7 @@ impl Qwen3ResidentChatPlan {
 
     /// The K/V element dtype the estimate assumed.
     #[must_use]
-    pub const fn kv_precision(self) -> Qwen3WeightPrecision {
+    pub const fn kv_precision(self) -> Qwen3FloatPrecision {
         self.kv_precision
     }
 }
@@ -333,13 +355,51 @@ pub struct Qwen3ForwardConfig {
     attention: Qwen3Attention,
     family: DecoderFamily,
     tied_output_embedding: bool,
+    /// How projection and embedding tensors are packed, if quantized.
+    quantization: Option<Qwen3AffineQuantization>,
+}
+
+/// Checks nonzero dimensions and the grouped-query layout before tensor shapes
+/// are derived from a checkpoint configuration.
+fn validate_dimensions(raw: &RawForwardConfig) -> Result<(), Qwen3ForwardError> {
+    let fields = [
+        ("num_hidden_layers", raw.num_hidden_layers),
+        ("hidden_size", raw.hidden_size),
+        ("intermediate_size", raw.intermediate_size),
+        ("vocab_size", raw.vocab_size),
+        ("num_attention_heads", raw.num_attention_heads),
+        ("num_key_value_heads", raw.num_key_value_heads),
+        ("head_dim", raw.head_dim),
+        ("max_position_embeddings", raw.max_position_embeddings),
+    ];
+    for (name, value) in fields {
+        if value == 0 {
+            return Err(Qwen3ForwardError::MissingDimension(name));
+        }
+    }
+    if !raw.head_dim.is_multiple_of(2) {
+        return Err(Qwen3ForwardError::OddHeadDimension(raw.head_dim));
+    }
+    if raw.head_dim > usize::from(u16::MAX) {
+        return Err(Qwen3ForwardError::HeadDimensionTooLarge(raw.head_dim));
+    }
+    if !raw
+        .num_attention_heads
+        .is_multiple_of(raw.num_key_value_heads)
+    {
+        return Err(Qwen3ForwardError::InvalidGroupedQueryLayout {
+            attention_heads: raw.num_attention_heads,
+            key_value_heads: raw.num_key_value_heads,
+        });
+    }
+    Ok(())
 }
 
 impl Qwen3ForwardConfig {
-    /// Parses only the dense, bias-free Qwen3 or Llama layout this
-    /// qualification path implements. Sliding-window and scaled `RoPE`
-    /// variants require their own reference vectors, so they are refused
-    /// rather than silently ignored. An untied checkpoint projects logits
+    /// Parses only the dense Qwen3, Llama or Qwen2 layout this qualification
+    /// path implements; of the biases, only Qwen2's fixed Q/K/V projection
+    /// bias. Sliding-window and scaled `RoPE` variants require their own
+    /// reference vectors, so they are refused rather than silently ignored. An untied checkpoint projects logits
     /// through `lm_head.weight` instead of the token embedding.
     pub fn parse(json: &str) -> Result<Self, Qwen3ForwardError> {
         let mut raw: RawForwardConfig = serde_json::from_str(json)?;
@@ -380,55 +440,37 @@ impl Qwen3ForwardConfig {
             }
         }
         // Llama's documented default theta has changed across transformers
-        // releases, so a Llama checkpoint must state it.
+        // releases, so a Llama checkpoint must state it; so must Qwen2, whose
+        // published configs all do.
         let rope_theta = match (family, raw.rope_theta) {
             (_, Some(theta)) => theta,
             (DecoderFamily::Qwen3, None) => default_rope_theta(),
-            (DecoderFamily::Llama, None) => return Err(Qwen3ForwardError::MissingRopeTheta),
+            (DecoderFamily::Llama | DecoderFamily::Qwen2, None) => {
+                return Err(Qwen3ForwardError::MissingRopeTheta);
+            }
         };
-        // As in transformers' LlamaConfig, an omitted Llama `head_dim` is
-        // `hidden_size / num_attention_heads`.
-        if family == DecoderFamily::Llama
+        // As in transformers' Llama and Qwen2 attention, an omitted `head_dim`
+        // is `hidden_size / num_attention_heads`.
+        if family.derives_head_dim()
             && raw.head_dim == 0
             && raw.num_attention_heads != 0
             && raw.hidden_size.is_multiple_of(raw.num_attention_heads)
         {
             raw.head_dim = raw.hidden_size / raw.num_attention_heads;
         }
-        if raw.use_sliding_window || raw.sliding_window.is_some() {
+        // transformers' Qwen2Config and Qwen3Config keep `sliding_window`
+        // only when `use_sliding_window` is set, so Qwen2.5's
+        // `"sliding_window": 32768, "use_sliding_window": false` is full
+        // attention. Llama has no such switch: any window is refused.
+        let sliding_window = match family {
+            DecoderFamily::Qwen3 | DecoderFamily::Qwen2 => raw.use_sliding_window,
+            DecoderFamily::Llama => raw.use_sliding_window || raw.sliding_window.is_some(),
+        };
+        if sliding_window {
             return Err(Qwen3ForwardError::UnsupportedSlidingWindow);
         }
 
-        let fields = [
-            ("num_hidden_layers", raw.num_hidden_layers),
-            ("hidden_size", raw.hidden_size),
-            ("intermediate_size", raw.intermediate_size),
-            ("vocab_size", raw.vocab_size),
-            ("num_attention_heads", raw.num_attention_heads),
-            ("num_key_value_heads", raw.num_key_value_heads),
-            ("head_dim", raw.head_dim),
-            ("max_position_embeddings", raw.max_position_embeddings),
-        ];
-        for (name, value) in fields {
-            if value == 0 {
-                return Err(Qwen3ForwardError::MissingDimension(name));
-            }
-        }
-        if !raw.head_dim.is_multiple_of(2) {
-            return Err(Qwen3ForwardError::OddHeadDimension(raw.head_dim));
-        }
-        if raw.head_dim > usize::from(u16::MAX) {
-            return Err(Qwen3ForwardError::HeadDimensionTooLarge(raw.head_dim));
-        }
-        if !raw
-            .num_attention_heads
-            .is_multiple_of(raw.num_key_value_heads)
-        {
-            return Err(Qwen3ForwardError::InvalidGroupedQueryLayout {
-                attention_heads: raw.num_attention_heads,
-                key_value_heads: raw.num_key_value_heads,
-            });
-        }
+        validate_dimensions(&raw)?;
         if !raw.rms_norm_eps.is_finite() || raw.rms_norm_eps <= 0.0 {
             return Err(Qwen3ForwardError::InvalidRmsNormEpsilon(raw.rms_norm_eps));
         }
@@ -450,6 +492,10 @@ impl Qwen3ForwardConfig {
             attention,
             family,
             tied_output_embedding: raw.tie_word_embeddings,
+            quantization: parse_quantization(
+                raw.quantization.as_ref(),
+                raw.quantization_config.as_ref(),
+            )?,
         })
     }
 
@@ -466,12 +512,26 @@ impl Qwen3ForwardConfig {
         self.tied_output_embedding
     }
 
-    fn output_weight_name(&self) -> &'static str {
+    /// The projection logits are computed with: the token embedding when
+    /// tied, else `lm_head`.
+    fn output_projection(&self) -> &'static str {
         if self.tied_output_embedding {
-            "model.embed_tokens.weight"
+            "model.embed_tokens"
         } else {
-            "lm_head.weight"
+            "lm_head"
         }
+    }
+
+    /// How projection and embedding tensors are packed, if quantized: from
+    /// `config.json`'s `quantization`, or as set when weights are quantized
+    /// at load.
+    #[must_use]
+    pub const fn quantization(&self) -> Option<Qwen3AffineQuantization> {
+        self.quantization
+    }
+
+    pub(crate) const fn set_quantization(&mut self, quantization: Option<Qwen3AffineQuantization>) {
+        self.quantization = quantization;
     }
 
     /// Returns whether decoder layers attend causally or bidirectionally.
@@ -497,7 +557,7 @@ impl Qwen3ForwardConfig {
     /// The streamed checker stores detached f32 arrays, so this is deliberately
     /// not a checkpoint-byte estimate or a generic cache-layout abstraction.
     pub(crate) fn cached_kv_bytes(&self, tokens: usize) -> Result<u64, Qwen3ForwardError> {
-        self.cached_kv_bytes_at(tokens, Qwen3WeightPrecision::Float32)
+        self.cached_kv_bytes_at(tokens, Qwen3FloatPrecision::Float32)
     }
 
     /// Logical bytes for all layer K/V arrays at `tokens` positions stored as
@@ -505,7 +565,7 @@ impl Qwen3ForwardConfig {
     pub(crate) fn cached_kv_bytes_at(
         &self,
         tokens: usize,
-        precision: Qwen3WeightPrecision,
+        precision: Qwen3FloatPrecision,
     ) -> Result<u64, Qwen3ForwardError> {
         let values = self
             .hidden_layers
@@ -526,6 +586,31 @@ impl Qwen3ForwardConfig {
         MAX_DENSE_DEBUG_TOKENS.min(self.max_position_embeddings)
     }
 
+    /// Largest context fitting the logical resident K/V budget at this precision.
+    ///
+    /// `None` means even one token does not fit. This excludes weights,
+    /// scratch and allocator headroom; it does not change the requested context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration or checked-size errors as
+    /// [`Self::resident_chat_plan`].
+    pub fn resident_chat_capacity(
+        &self,
+        maximum_kv_bytes: u64,
+        kv_precision: Qwen3FloatPrecision,
+    ) -> Result<Option<std::num::NonZeroUsize>, Qwen3ForwardError> {
+        let one = self.resident_chat_plan(1, u64::MAX, kv_precision)?;
+        let fitting = usize::try_from(maximum_kv_bytes / one.planned_kv_bytes())
+            .unwrap_or(usize::MAX)
+            .min(self.max_position_embeddings)
+            .min(2_147_483_647);
+        if fitting != 0 {
+            self.resident_chat_plan(fitting, maximum_kv_bytes, kv_precision)?;
+        }
+        Ok(std::num::NonZeroUsize::new(fitting))
+    }
+
     /// Validates a resident-chat context before checkpoint payloads are loaded.
     ///
     /// The K/V budget covers only the estimated retained cache arrays at
@@ -538,12 +623,16 @@ impl Qwen3ForwardConfig {
         &self,
         maximum_context_tokens: usize,
         maximum_kv_bytes: u64,
-        kv_precision: Qwen3WeightPrecision,
+        kv_precision: Qwen3FloatPrecision,
     ) -> Result<Qwen3ResidentChatPlan, Qwen3ForwardError> {
         if self.attention != Qwen3Attention::Causal {
             return Err(Qwen3ForwardError::CachedBidirectional);
         }
-        let maximum = MAX_RESIDENT_CHAT_TOKENS.min(self.max_position_embeddings);
+        // The model's declared positions are the only context ceiling; a
+        // declared RoPE scaling is refused at parse time, so this never
+        // extends past what the configuration states. Memory is the K/V
+        // budget below.
+        let maximum = self.max_position_embeddings;
         if maximum_context_tokens == 0 || maximum_context_tokens > maximum {
             return Err(Qwen3ForwardError::ResidentChatContextLimit {
                 requested: maximum_context_tokens,
@@ -589,7 +678,7 @@ pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
     steering: Option<&Qwen3ResidualSteering>,
 ) -> Result<Vec<f32>, Qwen3ForwardError> {
     let normalized = last_normalized_hidden(weights, config, input_ids, steering)?;
-    let logits = linear(&normalized, weight(weights, config.output_weight_name())?)?;
+    let logits = project(config, weights, &normalized, config.output_projection())?;
     read_last_logits(&logits, 1, config.vocab_size)
 }
 
@@ -627,6 +716,71 @@ pub fn forward_hidden_states<S: BuildHasher>(
     .as_type_device::<f32>(StreamOrDevice::gpu())?;
     normalized.eval()?;
     Ok(normalized.as_slice::<f32>().to_vec())
+}
+
+/// Pre-norm residual streams after selected decoder layers, for one
+/// right-padded causal sequence: `layers` are 1-based counts, so entry `k`
+/// is a source `Qwen3Model`'s `hidden_states[k]` (the output of layer index
+/// `k - 1`, before the final norm).
+///
+/// Positions at or after `real_len` are padding. No query attends them, and
+/// padding queries attend the real prefix, as transformers' attention mask
+/// does; their rows are returned too, because diffusion pipelines such as
+/// `FLUX.2 [klein]` feed every padded row onward. Layers past the last
+/// requested one are not run.
+///
+/// # Errors
+///
+/// Returns an error for noncausal attention, invalid token or layer selections,
+/// inconsistent real-token length, missing weights, or backend operations.
+pub fn forward_layer_states<S: BuildHasher>(
+    weights: &HashMap<String, Array, S>,
+    config: &Qwen3ForwardConfig,
+    input_ids: &[i32],
+    real_len: usize,
+    layers: &[usize],
+) -> Result<Vec<Array>, Qwen3ForwardError> {
+    if config.attention != Qwen3Attention::Causal {
+        return Err(Qwen3ForwardError::PaddedBidirectional);
+    }
+    if real_len == 0 || real_len > input_ids.len() {
+        return Err(Qwen3ForwardError::RealLength {
+            real_len,
+            positions: input_ids.len(),
+        });
+    }
+    let last = match layers.last() {
+        Some(&last)
+            if layers.windows(2).all(|pair| pair[0] < pair[1])
+                && layers[0] >= 1
+                && last <= config.hidden_layers =>
+        {
+            last
+        }
+        _ => {
+            return Err(Qwen3ForwardError::LayerSelection {
+                layers: layers.to_vec(),
+                hidden_layers: config.hidden_layers,
+            });
+        }
+    };
+    validate_input_ids(config, input_ids, 0, config.maximum_cached_tokens())?;
+
+    let stream = StreamOrDevice::gpu();
+    let seq_len = as_i32(input_ids.len())?;
+    let hidden = as_i32(config.hidden_size)?;
+    let key_limit = Some(as_i32(real_len)?);
+    let mut hidden_states = embed_rows(config, weights, &Array::from_slice(input_ids, &[seq_len]))?
+        .reshape_device(&[1, seq_len, hidden], &stream)?;
+    let mut selected = Vec::with_capacity(layers.len());
+    for layer in 0..last {
+        hidden_states =
+            forward_layer_with_key_limit(config, weights, layer, &hidden_states, key_limit)?;
+        if layers.contains(&(layer + 1)) {
+            selected.push(hidden_states.clone());
+        }
+    }
+    Ok(selected)
 }
 
 fn last_normalized_hidden<S: BuildHasher>(
@@ -688,8 +842,7 @@ pub fn forward_last_hidden_batch<S: BuildHasher>(
     let rows = batch
         .checked_mul(seq_len)
         .ok_or(Qwen3ForwardError::ShapeOverflow)?;
-    let mut hidden_states = weight(weights, "model.embed_tokens.weight")?
-        .take_axis_device(Array::from_slice(&padded, &[rows]), 0, &stream)?
+    let mut hidden_states = embed_rows(config, weights, &Array::from_slice(&padded, &[rows]))?
         .reshape_device(&[batch, seq_len, hidden], &stream)?;
     for layer in 0..config.hidden_layers {
         hidden_states = forward_layer(config, weights, layer, &hidden_states)?;
@@ -728,10 +881,8 @@ fn decoder_states<S: BuildHasher>(
     let hidden = as_i32(config.hidden_size)?;
 
     let ids = Array::from_slice(input_ids, &[seq_len]);
-    let embedding = weight(weights, "model.embed_tokens.weight")?;
-    let mut hidden_states = embedding
-        .take_axis_device(&ids, 0, &stream)?
-        .reshape_device(&[1, seq_len, hidden], &stream)?;
+    let mut hidden_states =
+        embed_rows(config, weights, &ids)?.reshape_device(&[1, seq_len, hidden], &stream)?;
 
     for layer in 0..config.hidden_layers {
         hidden_states = forward_layer(config, weights, layer, &hidden_states)?;
@@ -754,6 +905,19 @@ pub(crate) fn forward_layer<S: BuildHasher>(
     layer: usize,
     hidden_states: &Array,
 ) -> Result<Array, Qwen3ForwardError> {
+    forward_layer_with_key_limit(config, weights, layer, hidden_states, None)
+}
+
+/// [`forward_layer`] where, under causal attention, keys at or after
+/// `key_limit` are masked for every query. Queries past the limit (right
+/// padding) still attend the real prefix, as transformers' padding mask does.
+fn forward_layer_with_key_limit<S: BuildHasher>(
+    config: &Qwen3ForwardConfig,
+    weights: &HashMap<String, Array, S>,
+    layer: usize,
+    hidden_states: &Array,
+    key_limit: Option<i32>,
+) -> Result<Array, Qwen3ForwardError> {
     let seq_len = validate_layer_input(config, layer, hidden_states)?;
     let batch = hidden_states.shape()[0];
     let stream = StreamOrDevice::gpu();
@@ -765,7 +929,15 @@ pub(crate) fn forward_layer<S: BuildHasher>(
         weight(weights, &format!("{base}.input_layernorm.weight"))?,
         config.rms_norm_eps,
     )?;
-    let attention = attention(config, weights, &base, &attention_input, batch, seq_len)?;
+    let attention = attention(
+        config,
+        weights,
+        &base,
+        &attention_input,
+        batch,
+        seq_len,
+        key_limit,
+    )?;
     let residual = hidden_states.add_device(&attention, &stream)?;
 
     let mlp_input = rms_norm(
@@ -773,20 +945,21 @@ pub(crate) fn forward_layer<S: BuildHasher>(
         weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
         config.rms_norm_eps,
     )?;
-    let gate = linear(
+    let gate = project(
+        config,
+        weights,
         &mlp_input,
-        weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
+        &format!("{base}.mlp.gate_proj"),
     )?
     .reshape_device(&[batch, seq_len, intermediate], &stream)?;
-    let up = linear(
-        &mlp_input,
-        weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
-    )?
-    .reshape_device(&[batch, seq_len, intermediate], &stream)?;
+    let up = project(config, weights, &mlp_input, &format!("{base}.mlp.up_proj"))?
+        .reshape_device(&[batch, seq_len, intermediate], &stream)?;
     let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
-    let mlp = linear(
+    let mlp = project(
+        config,
+        weights,
         &activated.multiply_device(&up, &stream)?,
-        weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
+        &format!("{base}.mlp.down_proj"),
     )?
     .reshape_device(&[batch, seq_len, hidden], &stream)?;
     residual.add_device(&mlp, &stream).map_err(Into::into)
@@ -917,6 +1090,27 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             resident_cache_capacity: Some(plan.maximum_context_tokens),
             residual_steering: None,
         }
+    }
+
+    /// Starts a resident-chat executor over a weights map the caller loaded,
+    /// such as the text decoder of a multimodal checkpoint, after validating
+    /// the context and the logical K/V estimate at the weights' precision.
+    ///
+    /// The map uses this crate's canonical `model.`-prefixed names. Unlike
+    /// [`crate::metal::Qwen3MlxWeights`], nothing has checked its tensor
+    /// shapes; a missing tensor fails the first forward pass.
+    pub fn resident(
+        config: &'a Qwen3ForwardConfig,
+        weights: &'a HashMap<String, Array, S>,
+        maximum_context_tokens: usize,
+        maximum_kv_bytes: u64,
+    ) -> Result<Self, Qwen3ForwardError> {
+        let plan = config.resident_chat_plan(
+            maximum_context_tokens,
+            maximum_kv_bytes,
+            kv_precision(config, weights)?,
+        )?;
+        Ok(Self::new_for_resident_chat(config, weights, plan))
     }
 
     /// Clears all resident KV arrays before a new sequence.
@@ -1104,22 +1298,61 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
             self.cached_tokens,
             self.maximum_context_tokens,
         )?;
+        let mut input_ids = input_ids;
+        let piece = prefill_chunk_tokens();
+        if matches!(rows, LogitRows::Last) && input_ids.len() > piece {
+            // Every piece but the last updates the cache only; its unread
+            // logits graph is dropped unevaluated.
+            let head = (input_ids.len() - 1) / piece * piece;
+            for chunk in input_ids[..head].chunks(piece) {
+                let len =
+                    i32::try_from(chunk.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+                drop(self.append_ids(&Array::from_slice(chunk, &[len]), len, LogitRows::Last)?);
+                let state: Vec<&Array> = self
+                    .cache
+                    .iter()
+                    .flatten()
+                    .flat_map(|layer| [&layer.keys, &layer.values])
+                    .collect();
+                mlx_rs::transforms::eval(state)?;
+            }
+            input_ids = &input_ids[head..];
+        }
         let seq_len =
             i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
         let logits = self.append_ids(&Array::from_slice(input_ids, &[seq_len]), seq_len, rows)?;
         match rows {
             LogitRows::Last => read_last_logits(&logits, 1, self.config.vocab_size),
             LogitRows::All => verify::read_all_logits(&logits, seq_len, self.config.vocab_size),
+            LogitRows::Hidden => Err(Qwen3ForwardError::HiddenRowsAreNotLogits),
         }
     }
 
     /// Builds, without evaluating, the graph that appends `ids` (shape
     /// `[seq_len]`, already validated against the vocabulary and context) to
-    /// every layer's cache, and returns the last position's `[1, 1, vocab]`
-    /// logits.
+    /// every layer's cache, and returns the logits `rows` selects: the last
+    /// position's `[1, 1, vocab]`, every position's `[1, seq_len, vocab]`,
+    /// or every position's normalized `[1, seq_len, hidden]` state.
     fn append_ids(
         &mut self,
         ids: &Array,
+        seq_len: i32,
+        rows: LogitRows,
+    ) -> Result<Array, Qwen3ForwardError> {
+        // Keep rejection before graph construction on the ordinary ids path.
+        if self.config.attention != Qwen3Attention::Causal {
+            return Err(Qwen3ForwardError::CachedBidirectional);
+        }
+        let hidden = as_i32(self.config.hidden_size)?;
+        let hidden_states = embed_rows(self.config, self.weights, ids)?
+            .reshape_device(&[1, seq_len, hidden], StreamOrDevice::gpu())?;
+        self.append_hidden(hidden_states, seq_len, rows)
+    }
+
+    /// Appends validated input embeddings `[1, seq_len, hidden]`.
+    fn append_hidden(
+        &mut self,
+        mut hidden_states: Array,
         seq_len: i32,
         rows: LogitRows,
     ) -> Result<Array, Qwen3ForwardError> {
@@ -1130,11 +1363,6 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
         }
         let appended = usize::try_from(seq_len).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
         let stream = StreamOrDevice::gpu();
-        let hidden = as_i32(self.config.hidden_size)?;
-        let embedding = weight(self.weights, "model.embed_tokens.weight")?;
-        let mut hidden_states = embedding
-            .take_axis_device(ids, 0, &stream)?
-            .reshape_device(&[1, seq_len, hidden], &stream)?;
 
         let rope_offset =
             i32::try_from(self.cached_tokens).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
@@ -1167,16 +1395,21 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
                 1,
                 &stream,
             )?,
-            LogitRows::All => hidden_states,
+            LogitRows::All | LogitRows::Hidden => hidden_states,
         };
         let normalized = rms_norm(
             &selected,
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
-        linear(
+        if matches!(rows, LogitRows::Hidden) {
+            return Ok(normalized);
+        }
+        project(
+            self.config,
+            self.weights,
             &normalized,
-            weight(self.weights, self.config.output_weight_name())?,
+            self.config.output_projection(),
         )
     }
 
@@ -1316,6 +1549,9 @@ enum LogitRows {
     Last,
     /// Every appended position: speculative verification and scoring.
     All,
+    /// Every appended position's normalized hidden state, before the output
+    /// head: scoring applies the head itself, a bounded chunk at a time.
+    Hidden,
 }
 
 /// Executes one cached Qwen3 decoder layer and updates its adapter-local KV.
@@ -1396,20 +1632,21 @@ fn mlp_residual<S: BuildHasher>(
         weight(weights, &format!("{base}.post_attention_layernorm.weight"))?,
         config.rms_norm_eps,
     )?;
-    let gate = linear(
+    let gate = project(
+        config,
+        weights,
         &mlp_input,
-        weight(weights, &format!("{base}.mlp.gate_proj.weight"))?,
+        &format!("{base}.mlp.gate_proj"),
     )?
     .reshape_device(&[1, seq_len, intermediate], &stream)?;
-    let up = linear(
-        &mlp_input,
-        weight(weights, &format!("{base}.mlp.up_proj.weight"))?,
-    )?
-    .reshape_device(&[1, seq_len, intermediate], &stream)?;
+    let up = project(config, weights, &mlp_input, &format!("{base}.mlp.up_proj"))?
+        .reshape_device(&[1, seq_len, intermediate], &stream)?;
     let activated = ops::sigmoid_device(&gate, &stream)?.multiply_device(&gate, &stream)?;
-    let mlp = linear(
+    let mlp = project(
+        config,
+        weights,
         &activated.multiply_device(&up, &stream)?,
-        weight(weights, &format!("{base}.mlp.down_proj.weight"))?,
+        &format!("{base}.mlp.down_proj"),
     )?
     .reshape_device(&[1, seq_len, hidden], &stream)?;
     residual.add_device(&mlp, &stream).map_err(Into::into)
@@ -1460,27 +1697,18 @@ fn cached_attention<S: BuildHasher>(
     };
     // A multi-token chunk after cached positions needs a causal mask aligned
     // to the last key: chunk query i sees the cached keys and its own earlier
-    // chunk positions. MLX 0.25's fused Metal kernel under-masks `Causal` when
-    // that offset is not a multiple of its key block (masking starts at a
-    // block computed from the tile end), so the chunk passes an explicit mask.
-    // A single decode token sees every key and keeps the unmasked kernel.
-    let chunk_mask = if !causal && seq_len > 1 {
-        Some(chunk_causal_mask(rope_offset, seq_len, &stream)?)
-    } else {
-        None
-    };
+    // chunk positions. MLX 0.25's fused kernel under-masked `Causal` when the
+    // cached length was not a multiple of its key block, so this used an
+    // explicit `[chunk, cached + chunk]` mask (512 MB per call at 262K
+    // cached). The linked MLX (0.32.2) aligns `Causal` to the last key;
+    // `fused_causal_mask_matches_the_explicit_chunk_mask` pins that. A single
+    // decode token sees every key and keeps the unmasked kernel.
     let attention_keys = attention_keys.as_ref().unwrap_or(&keys);
     let attention_values = attention_values.as_ref().unwrap_or(&values);
     // Keep KV as dependencies of attention. The final-logits readback evaluates
     // the complete graph, including these retained arrays, in one submission
     // instead of blocking twice per layer. Reset drops all request-owned KV.
-    let mask = if causal {
-        Some(fast::ScaledDotProductAttentionMask::Causal)
-    } else {
-        chunk_mask
-            .as_ref()
-            .map(fast::ScaledDotProductAttentionMask::Array)
-    };
+    let mask = (causal || seq_len > 1).then_some(fast::ScaledDotProductAttentionMask::Causal);
     let output = fast::scaled_dot_product_attention_device(
         &query,
         attention_keys,
@@ -1525,11 +1753,11 @@ fn rotated_qkv<S: BuildHasher>(
     let heads = as_i32(config.attention_heads)?;
     let kv_heads = as_i32(config.key_value_heads)?;
     let head_dim = as_i32(config.head_dim)?;
-    let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
+    let query = project(config, weights, input, &format!("{attn}.q_proj"))?
         .reshape_device(&[rows, seq_len, heads, head_dim], &stream)?;
-    let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
+    let key = project(config, weights, input, &format!("{attn}.k_proj"))?
         .reshape_device(&[rows, seq_len, kv_heads, head_dim], &stream)?;
-    let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
+    let value = project(config, weights, input, &format!("{attn}.v_proj"))?
         .reshape_device(&[rows, seq_len, kv_heads, head_dim], &stream)?;
     let rope = |projected: Array| -> Result<Array, Qwen3ForwardError> {
         Ok(match positions {
@@ -1592,7 +1820,7 @@ fn attention_output<S: BuildHasher>(
             ],
             &stream,
         )?;
-    linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
+    project(config, weights, &output, &format!("{attn}.o_proj"))
 }
 
 /// `[chunk, cached + chunk]` boolean mask letting chunk position `i` (absolute
@@ -1703,10 +1931,18 @@ fn stepped_capacity(
             maximum: maximum_capacity,
         });
     }
-    Ok([128, 512]
-        .into_iter()
-        .find(|&boundary| next_tokens <= boundary && boundary <= maximum_capacity)
-        .unwrap_or(maximum_capacity))
+    // Tiers 128 and 512, then doubling, so a short sequence under a long
+    // context limit never allocates K/V for the whole limit. Each doubling
+    // copies the prefix once, which is amortized O(1) per appended token.
+    let mut boundary = 128;
+    while boundary < next_tokens {
+        boundary = if boundary == 128 {
+            512
+        } else {
+            boundary.saturating_mul(2)
+        };
+    }
+    Ok(boundary.min(maximum_capacity))
 }
 
 fn validate_input_ids(
@@ -1817,17 +2053,18 @@ fn attention<S: BuildHasher>(
     input: &Array,
     batch: i32,
     seq_len: i32,
+    key_limit: Option<i32>,
 ) -> Result<Array, Qwen3ForwardError> {
     let stream = StreamOrDevice::gpu();
     let heads = as_i32(config.attention_heads)?;
     let kv_heads = as_i32(config.key_value_heads)?;
     let head_dim = as_i32(config.head_dim)?;
     let attn = format!("{base}.self_attn");
-    let query = linear(input, weight(weights, &format!("{attn}.q_proj.weight"))?)?
+    let query = project(config, weights, input, &format!("{attn}.q_proj"))?
         .reshape_device(&[batch, seq_len, heads, head_dim], &stream)?;
-    let key = linear(input, weight(weights, &format!("{attn}.k_proj.weight"))?)?
+    let key = project(config, weights, input, &format!("{attn}.k_proj"))?
         .reshape_device(&[batch, seq_len, kv_heads, head_dim], &stream)?;
-    let value = linear(input, weight(weights, &format!("{attn}.v_proj.weight"))?)?
+    let value = project(config, weights, input, &format!("{attn}.v_proj"))?
         .reshape_device(&[batch, seq_len, kv_heads, head_dim], &stream)?;
 
     // Qwen3 normalizes Q and K per head; both families then apply
@@ -1857,15 +2094,22 @@ fn attention<S: BuildHasher>(
         Option::<&Array>::None,
         &stream,
     )?;
+    let key_limit_mask = match (config.attention, key_limit) {
+        (Qwen3Attention::Causal, Some(limit)) => {
+            Some(causal_key_limit_mask(seq_len, limit, query.dtype())?)
+        }
+        _ => None,
+    };
     let output = fast::scaled_dot_product_attention_device(
         &query,
         &key,
         &value,
         attention_scale(config)?,
-        match config.attention {
-            Qwen3Attention::Causal => Some(fast::ScaledDotProductAttentionMask::Causal),
+        match (&key_limit_mask, config.attention) {
+            (Some(mask), _) => Some(fast::ScaledDotProductAttentionMask::Array(mask)),
+            (None, Qwen3Attention::Causal) => Some(fast::ScaledDotProductAttentionMask::Causal),
             // One unpadded sequence: every position attends to every position.
-            Qwen3Attention::Bidirectional => None,
+            (None, Qwen3Attention::Bidirectional) => None,
         },
         Option::<&Array>::None,
         &stream,
@@ -1881,7 +2125,27 @@ fn attention<S: BuildHasher>(
         ],
         &stream,
     )?;
-    linear(&output, weight(weights, &format!("{attn}.o_proj.weight"))?)
+    project(config, weights, &output, &format!("{attn}.o_proj"))
+}
+
+fn causal_key_limit_mask(
+    seq_len: i32,
+    limit: i32,
+    dtype: Dtype,
+) -> Result<Array, Qwen3ForwardError> {
+    let elements = seq_len
+        .checked_mul(seq_len)
+        .ok_or(Qwen3ForwardError::ShapeOverflow)?;
+    let elements = usize::try_from(elements).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    let mut mask = Vec::with_capacity(elements);
+    for query in 0..seq_len {
+        for key in 0..seq_len {
+            let visible = key <= query && key < limit;
+            mask.push(if visible { 0.0_f32 } else { f32::NEG_INFINITY });
+        }
+    }
+    Ok(Array::from_slice(&mask, &[seq_len, seq_len])
+        .as_dtype_device(dtype, StreamOrDevice::gpu())?)
 }
 
 /// Qwen3's per-head RMS norm on a `[batch, positions, heads, head_dim]`
@@ -1912,16 +2176,6 @@ fn rms_norm(input: &Array, scale: &Array, eps: f32) -> Result<Array, Qwen3Forwar
     )?)
 }
 
-fn linear(input: &Array, weight: &Array) -> Result<Array, Qwen3ForwardError> {
-    let stream = StreamOrDevice::gpu();
-    #[cfg(test)]
-    let transpose_started = Instant::now();
-    let transposed = weight.transpose_device(&stream)?;
-    #[cfg(test)]
-    record_decode_profile_transpose_node(transpose_started.elapsed());
-    Ok(input.matmul_device(&transposed, &stream)?)
-}
-
 /// Per-thread, opt-in timings for the local checkpoint decode-profile test.
 ///
 /// These durations are host-side intervals around MLX API calls. In
@@ -1935,6 +2189,22 @@ pub(super) struct DecodeProfile {
     pub(super) evaluation_count: usize,
     pub(super) readback: Duration,
     pub(super) readback_count: usize,
+}
+
+/// [`PREFILL_CHUNK_TOKENS`], or a test's override on this thread.
+fn prefill_chunk_tokens() -> usize {
+    #[cfg(test)]
+    if let Some(tokens) = PREFILL_CHUNK_OVERRIDE.with(std::cell::Cell::get) {
+        return tokens;
+    }
+    PREFILL_CHUNK_TOKENS
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Piece size for tests that compare chunked and single-graph prefill.
+    static PREFILL_CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2068,6 +2338,34 @@ struct RawForwardConfig {
     sliding_window: Option<usize>,
     #[serde(default)]
     use_sliding_window: bool,
+    /// mlx-lm's `{"group_size": .., "bits": ..}`; per-module entries would
+    /// mean mixed precision, which is refused.
+    quantization: Option<serde_json::Map<String, serde_json::Value>>,
+    /// transformers' quantization (fp8, GPTQ, AWQ, ...). mlx-lm writes a
+    /// copy of `quantization` here; anything else is refused.
+    quantization_config: Option<serde_json::Value>,
+}
+
+fn parse_quantization(
+    quantization: Option<&serde_json::Map<String, serde_json::Value>>,
+    quantization_config: Option<&serde_json::Value>,
+) -> Result<Option<Qwen3AffineQuantization>, Qwen3ForwardError> {
+    let parsed = quantization
+        .map(Qwen3AffineQuantization::from_config)
+        .transpose()
+        .map_err(Qwen3ForwardError::UnsupportedQuantization)?;
+    match quantization_config {
+        None | Some(serde_json::Value::Null) => Ok(parsed),
+        Some(serde_json::Value::Object(declared))
+            if parsed.is_some()
+                && Qwen3AffineQuantization::from_config(declared).ok() == parsed =>
+        {
+            Ok(parsed)
+        }
+        Some(declared) => Err(Qwen3ForwardError::UnsupportedQuantization(
+            declared.to_string(),
+        )),
+    }
 }
 
 /// transformers 5 `rope_parameters`. Any key besides these two (`factor`,
@@ -2178,6 +2476,28 @@ pub enum Qwen3ForwardError {
     /// Right-padded batches are exact only under causal attention.
     #[error("batched Qwen3 forward requires causal attention")]
     BatchedBidirectional,
+
+    /// Padded layer readout requires causal attention.
+    #[error("padded Qwen3 layer states require causal attention")]
+    PaddedBidirectional,
+
+    /// The real-token prefix is empty or exceeds the supplied positions.
+    #[error("real length {real_len} must be in 1..={positions}")]
+    RealLength {
+        /// Number of real tokens requested.
+        real_len: usize,
+        /// Total supplied positions, including padding.
+        positions: usize,
+    },
+
+    /// Layer selections must be nonempty, strictly increasing and in range.
+    #[error("layers {layers:?} must be increasing and within 1..={hidden_layers}")]
+    LayerSelection {
+        /// Requested one-based layer indices.
+        layers: Vec<usize>,
+        /// Available decoder layers.
+        hidden_layers: usize,
+    },
     /// The configuration selected a non-Qwen3 architecture, or its attention
     /// flag disagrees with its model type.
     #[error(
@@ -2239,6 +2559,18 @@ pub enum Qwen3ForwardError {
     /// The raw input must contain at least one token.
     #[error("Qwen3 forward requires at least one token")]
     EmptyInput,
+    /// A scoring range must leave at least one prefix token and one scored
+    /// token.
+    #[error("cannot score from token {from} of a {tokens}-token sequence")]
+    InvalidScoreRange {
+        /// First scored index.
+        from: usize,
+        /// Sequence length.
+        tokens: usize,
+    },
+    /// Hidden-state rows were requested where logits are read back.
+    #[error("hidden-state rows are not logits")]
+    HiddenRowsAreNotLogits,
     /// The uncached reference attention graph is deliberately bounded.
     #[error("Qwen3 reference prompt has {actual} tokens, maximum is {maximum}")]
     PromptTooLong {
@@ -2303,7 +2635,7 @@ pub enum Qwen3ForwardError {
     ResidentChatContextLimit {
         /// Requested prompt-plus-generated token capacity.
         requested: usize,
-        /// Smaller of the model and resident-chat caps.
+        /// The model's `max_position_embeddings`.
         maximum: usize,
     },
     /// A resident-chat K/V estimate exceeds the caller's logical budget.
@@ -2337,15 +2669,33 @@ pub enum Qwen3ForwardError {
         /// The K/V projection's element type.
         activation: mlx_rs::Dtype,
     },
-    /// A weight dtype is not one of [`Qwen3WeightPrecision`]'s.
+    /// A weight dtype is not one of [`Qwen3FloatPrecision`]'s.
     #[error("Qwen3 weight dtype {0} is not a supported floating-point precision")]
     UnsupportedWeightDtype(String),
     /// A GPU pick rule or its logits were malformed.
     #[error("invalid Qwen3 GPU pick rule: {0}")]
     InvalidPickRule(&'static str),
+    /// A config's `quantization` is not one uniform affine layout this path
+    /// implements.
+    #[error("unsupported Qwen3 quantization {0}")]
+    UnsupportedQuantization(String),
+    /// A weight tensor's dtype does not match how the config says it is
+    /// stored, such as packed words under a dense layout.
+    #[error("Qwen3 weight layout mismatch: {0}")]
+    WeightLayoutMismatch(String),
     /// The model produced a NaN or infinite logit, so no greedy token exists.
     #[error("Qwen3 produced non-finite vocabulary logits")]
     NonFiniteLogits,
+    /// An embedded prompt chunk does not fit this decoder: an unsupported
+    /// span kind, misshapen rows, or a chunk not starting where the cache
+    /// ends.
+    #[error("Qwen3 embedded prompt at position {position}: {reason}")]
+    EmbeddedSpan {
+        /// The prompt position involved.
+        position: usize,
+        /// What is wrong.
+        reason: &'static str,
+    },
     /// MLX could not construct, evaluate, or copy the Metal graph.
     #[error("MLX Qwen3 forward failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
@@ -2360,14 +2710,15 @@ mod tests {
 
     use crate::{DecoderFamily, GPU_TEST_LOCK};
 
-    const F32: super::Qwen3WeightPrecision = super::Qwen3WeightPrecision::Float32;
+    const F32: super::Qwen3FloatPrecision = super::Qwen3FloatPrecision::Float32;
 
     use super::{
         Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3ResidualSteering,
         Qwen3ResidualSteeringArtifact, Qwen3SteeringError, Qwen3SteeringPositionRange,
-        Qwen3TokenPicks, forward_hidden_states, forward_last_hidden, forward_last_hidden_batch,
-        forward_last_logits, forward_last_logits_with_residual_steering, forward_layer, linear,
-        read_last_logits, rms_norm, stepped_capacity, weight,
+        Qwen3TokenPicks, decoder_states, forward_hidden_states, forward_last_hidden,
+        forward_last_hidden_batch, forward_last_logits, forward_last_logits_with_residual_steering,
+        forward_layer, forward_layer_states, project, read_last_logits, rms_norm, stepped_capacity,
+        weight,
     };
 
     const QWEN3_06B: &str = r#"{
@@ -2389,6 +2740,63 @@ mod tests {
       "sliding_window":null,
       "use_sliding_window":false
     }"#;
+
+    #[test]
+    fn resident_capacity_matches_exact_plans_and_no_fit() {
+        let config = Qwen3ForwardConfig::parse(QWEN3_06B).unwrap();
+        for precision in [F32, super::Qwen3FloatPrecision::BFloat16] {
+            for tokens in [1, 128, 129, 512, 513, 4096, 40_960] {
+                let cost = config
+                    .resident_chat_plan(tokens, u64::MAX, precision)
+                    .unwrap()
+                    .planned_kv_bytes();
+                let fit = config
+                    .resident_chat_capacity(cost, precision)
+                    .unwrap()
+                    .unwrap()
+                    .get();
+                assert_eq!(fit, tokens);
+                assert!(config.resident_chat_plan(fit, cost, precision).is_ok());
+                let under = config.resident_chat_capacity(cost - 1, precision).unwrap();
+                assert_eq!(
+                    under.map(std::num::NonZeroUsize::get),
+                    (tokens > 1).then_some(tokens - 1)
+                );
+                assert!(matches!(
+                    config.resident_chat_plan(tokens, cost - 1, precision),
+                    Err(Qwen3ForwardError::ResidentChatKvBudget { .. })
+                ));
+            }
+            assert_eq!(
+                config
+                    .resident_chat_capacity(u64::MAX, precision)
+                    .unwrap()
+                    .unwrap()
+                    .get(),
+                40_960
+            );
+            assert!(
+                config
+                    .resident_chat_capacity(0, precision)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            config
+                .resident_chat_capacity(1024 * 1024, super::Qwen3FloatPrecision::BFloat16)
+                .unwrap()
+                .unwrap()
+                .get(),
+            9
+        );
+        let mut overflow = config.clone();
+        overflow.hidden_layers = usize::MAX;
+        assert!(matches!(
+            overflow.resident_chat_capacity(u64::MAX, F32),
+            Err(Qwen3ForwardError::ShapeOverflow)
+        ));
+    }
 
     fn qwen3_4b_kv_layout() -> Qwen3ForwardConfig {
         let layout = QWEN3_06B
@@ -2437,15 +2845,34 @@ mod tests {
                 let capacity = result.expect("admitted prefix has a capacity");
                 prop_assert!(capacity >= next);
                 prop_assert!(capacity <= maximum);
-                prop_assert!(capacity == maximum || capacity == 128 || capacity == 512);
+                prop_assert!(
+                    capacity == maximum
+                        || capacity == 128
+                        || (capacity >= 512 && capacity.is_power_of_two())
+                );
             }
+        }
+
+        /// Above 512 tokens storage stays within twice the sequence, however
+        /// large the context limit: a short chat under a 262K limit must not
+        /// allocate K/V for 262K positions.
+        #[test]
+        fn stepped_capacity_is_geometric_under_long_limits(
+            maximum in 513_usize..=1_048_576,
+            next in 1_usize..=1_048_576,
+        ) {
+            prop_assume!(next <= maximum);
+            let capacity = stepped_capacity(next, maximum).expect("admitted");
+            prop_assert!(capacity >= next);
+            prop_assert!(capacity <= maximum);
+            prop_assert!(capacity <= next.max(256) * 2);
         }
 
         /// Every admitted production-layout context uses exactly the logical
         /// f32 K/V formula, including the exact one-byte budget boundary.
         #[test]
         fn resident_kv_admission_matches_production_layouts(
-            context_tokens in 1_usize..=super::MAX_RESIDENT_CHAT_TOKENS,
+            context_tokens in 1_usize..=16_384,
         ) {
             for config in resident_production_layouts() {
                 let required = independent_kv_bytes(&config, context_tokens);
@@ -2468,7 +2895,7 @@ mod tests {
         /// for both the 0.6B and 36-layer 4B K/V layouts.
         #[test]
         fn resident_kv_estimate_is_strictly_monotone_for_production_layouts(
-            context_tokens in 1_usize..super::MAX_RESIDENT_CHAT_TOKENS,
+            context_tokens in 1_usize..16_384,
         ) {
             for config in resident_production_layouts() {
                 let current = config
@@ -2487,15 +2914,19 @@ mod tests {
     }
 
     #[test]
-    fn resident_production_layouts_reject_the_token_after_the_admission_ceiling() {
+    fn resident_production_layouts_reject_the_token_after_the_model_positions() {
         for config in resident_production_layouts() {
+            let positions = config.max_position_embeddings;
+            assert!(
+                config.resident_chat_plan(positions, u64::MAX, F32).is_ok(),
+                "the model's whole declared context is admitted"
+            );
             assert!(matches!(
-                config.resident_chat_plan(super::MAX_RESIDENT_CHAT_TOKENS + 1, u64::MAX, F32),
+                config.resident_chat_plan(positions + 1, u64::MAX, F32),
                 Err(Qwen3ForwardError::ResidentChatContextLimit {
                     requested,
                     maximum,
-                }) if requested == super::MAX_RESIDENT_CHAT_TOKENS + 1
-                    && maximum == super::MAX_RESIDENT_CHAT_TOKENS
+                }) if requested == positions + 1 && maximum == positions
             ));
         }
     }
@@ -2515,18 +2946,52 @@ mod tests {
     }
 
     #[test]
+    fn quantization_config_must_repeat_the_mlx_layout() {
+        let base = QWEN3_06B.trim_end().trim_end_matches('}');
+        let parse = |extra: &str| Qwen3ForwardConfig::parse(&format!("{base},{extra}}}"));
+        let layout = r#"{"group_size":64,"bits":4}"#;
+        assert_eq!(
+            parse(&format!(
+                r#""quantization":{layout},"quantization_config":{layout}"#
+            ))
+            .expect("mlx-lm writes both")
+            .quantization(),
+            Some(super::Qwen3AffineQuantization::FOUR_BIT_G64)
+        );
+        assert!(
+            parse(r#""quantization_config":null"#)
+                .expect("null is absent")
+                .quantization()
+                .is_none()
+        );
+        for refused in [
+            r#""quantization_config":{"quant_method":"fp8","weight_block_size":[128,128]}"#
+                .to_owned(),
+            format!(
+                r#""quantization":{layout},"quantization_config":{{"group_size":32,"bits":4}}"#
+            ),
+            r#""quantization":{"group_size":64,"bits":3}"#.to_owned(),
+        ] {
+            assert!(matches!(
+                parse(&refused),
+                Err(Qwen3ForwardError::UnsupportedQuantization(_))
+            ));
+        }
+    }
+
+    #[test]
     fn bfloat16_plan_reserves_half_the_float32_kv() {
         let config = Qwen3ForwardConfig::parse(QWEN3_06B).expect("official Qwen3-0.6B layout");
         let float32 = config
             .resident_chat_plan(4_096, u64::MAX, F32)
             .expect("float32 plan");
         let bfloat16 = config
-            .resident_chat_plan(4_096, u64::MAX, super::Qwen3WeightPrecision::BFloat16)
+            .resident_chat_plan(4_096, u64::MAX, super::Qwen3FloatPrecision::BFloat16)
             .expect("bfloat16 plan");
         assert_eq!(bfloat16.planned_kv_bytes() * 2, float32.planned_kv_bytes());
         assert_eq!(
             bfloat16.kv_precision(),
-            super::Qwen3WeightPrecision::BFloat16
+            super::Qwen3FloatPrecision::BFloat16
         );
         // A budget that holds BF16 K/V but not f32 admits only the BF16 plan.
         assert!(
@@ -2543,9 +3008,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = long_small_config();
         for precision in [
-            super::Qwen3WeightPrecision::BFloat16,
-            super::Qwen3WeightPrecision::Float16,
-            super::Qwen3WeightPrecision::Float32,
+            super::Qwen3FloatPrecision::BFloat16,
+            super::Qwen3FloatPrecision::Float16,
+            super::Qwen3FloatPrecision::Float32,
         ] {
             let weights: HashMap<String, Array> = deterministic_weights()
                 .into_iter()
@@ -2555,7 +3020,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(
-                super::kv_precision(&weights).expect("float weights"),
+                super::kv_precision(&config, &weights).expect("float weights"),
                 precision
             );
             let plan = config
@@ -2582,11 +3047,15 @@ mod tests {
             .expect("512 MiB admits Qwen3-0.6B K/V at 2048 tokens");
         assert_eq!(plan.maximum_context_tokens(), 2_048);
         assert_eq!(plan.planned_kv_bytes(), 469_762_048);
+        assert!(
+            config.resident_chat_plan(16_385, u64::MAX, F32).is_ok(),
+            "no resident-chat cap below the model's 40,960 positions"
+        );
         assert!(matches!(
-            config.resident_chat_plan(16_385, u64::MAX, F32),
+            config.resident_chat_plan(40_961, u64::MAX, F32),
             Err(Qwen3ForwardError::ResidentChatContextLimit {
-                requested: 16_385,
-                maximum: 16_384,
+                requested: 40_961,
+                maximum: 40_960,
             })
         ));
         assert!(matches!(
@@ -2632,7 +3101,7 @@ mod tests {
         );
         let untied = Qwen3ForwardConfig::parse(&untied).expect("untied projects through lm_head");
         assert!(!untied.tied_output_embedding());
-        assert_eq!(untied.output_weight_name(), "lm_head.weight");
+        assert_eq!(untied.output_projection(), "lm_head");
         let rope = |parameters: &str| {
             Qwen3ForwardConfig::parse(&QWEN3_06B.replace(
                 "\"rope_theta\":1000000,",
@@ -2691,6 +3160,127 @@ mod tests {
             Qwen3ForwardConfig::parse(&window),
             Err(Qwen3ForwardError::UnsupportedSlidingWindow)
         ));
+    }
+
+    /// Qwen/Qwen2.5-0.5B-Instruct@7ae5576 config.json, verbatim.
+    const QWEN25_05B: &str = r#"{
+      "architectures":["Qwen2ForCausalLM"],"attention_dropout":0.0,
+      "bos_token_id":151643,"eos_token_id":151645,"hidden_act":"silu",
+      "hidden_size":896,"initializer_range":0.02,"intermediate_size":4864,
+      "max_position_embeddings":32768,"max_window_layers":21,"model_type":"qwen2",
+      "num_attention_heads":14,"num_hidden_layers":24,"num_key_value_heads":2,
+      "rms_norm_eps":1e-06,"rope_theta":1000000.0,"sliding_window":32768,
+      "tie_word_embeddings":true,"torch_dtype":"bfloat16",
+      "transformers_version":"4.43.1","use_cache":true,"use_sliding_window":false,
+      "vocab_size":151936
+    }"#;
+
+    #[test]
+    fn qwen2_parses_with_a_disabled_window_and_refuses_an_enabled_one() {
+        let config = Qwen3ForwardConfig::parse(QWEN25_05B).expect("Qwen2.5-0.5B");
+        assert_eq!(config.family(), DecoderFamily::Qwen2);
+        assert_eq!(config.head_dim, 64);
+        assert!(config.tied_output_embedding());
+        let enabled = QWEN25_05B.replace(
+            "\"use_sliding_window\":false",
+            "\"use_sliding_window\":true",
+        );
+        assert!(matches!(
+            Qwen3ForwardConfig::parse(&enabled),
+            Err(Qwen3ForwardError::UnsupportedSlidingWindow)
+        ));
+        assert!(matches!(
+            Qwen3ForwardConfig::parse(&QWEN25_05B.replace("\"rope_theta\":1000000.0,", "")),
+            Err(Qwen3ForwardError::MissingRopeTheta)
+        ));
+        // Qwen3 follows the same switch; Llama has none, so any window is refused.
+        let qwen3 = QWEN3_06B.replace("\"sliding_window\":null", "\"sliding_window\":4096");
+        assert!(Qwen3ForwardConfig::parse(&qwen3).is_ok());
+        let llama = qwen3.replace("\"model_type\":\"qwen3\"", "\"model_type\":\"llama\"");
+        assert!(matches!(
+            Qwen3ForwardConfig::parse(&llama),
+            Err(Qwen3ForwardError::UnsupportedSlidingWindow)
+        ));
+        // Only the fixed Q/K/V bias: a declared MLP or attention bias is refused.
+        for flag in ["mlp_bias", "attention_bias"] {
+            let biased =
+                QWEN25_05B.replace("\"hidden_act\"", &format!("\"{flag}\":true,\"hidden_act\""));
+            assert!(
+                matches!(
+                    Qwen3ForwardConfig::parse(&biased),
+                    Err(Qwen3ForwardError::UnsupportedBiasLayout)
+                ),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen2_layout_reads_its_biases_and_caches_like_its_full_forward() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let config = Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen2",
+              "num_hidden_layers":2,
+              "hidden_size":4,
+              "intermediate_size":8,
+              "vocab_size":8,
+              "num_attention_heads":2,
+              "num_key_value_heads":1,
+              "max_position_embeddings":16,
+              "rms_norm_eps":0.000001,
+              "rope_theta":1000000,
+              "hidden_act":"silu",
+              "sliding_window":16,
+              "use_sliding_window":false,
+              "tie_word_embeddings":true
+            }"#,
+        )
+        .expect("small Qwen2 config");
+        // hidden 4 over 2 heads: head_dim 2, so Q is 4 wide and K/V 2 wide.
+        let mut weights = HashMap::new();
+        insert_matrix(&mut weights, "model.embed_tokens.weight", 8, 4);
+        insert_vector(&mut weights, "model.norm.weight", 4);
+        for layer in 0..2 {
+            let base = format!("model.layers.{layer}");
+            insert_vector(&mut weights, &format!("{base}.input_layernorm.weight"), 4);
+            insert_vector(
+                &mut weights,
+                &format!("{base}.post_attention_layernorm.weight"),
+                4,
+            );
+            let attn = format!("{base}.self_attn");
+            for (name, rows) in [("q_proj", 4), ("k_proj", 2), ("v_proj", 2)] {
+                insert_matrix(&mut weights, &format!("{attn}.{name}.weight"), rows, 4);
+                insert_vector(&mut weights, &format!("{attn}.{name}.bias"), rows);
+            }
+            insert_matrix(&mut weights, &format!("{attn}.o_proj.weight"), 4, 4);
+            let mlp = format!("{base}.mlp");
+            insert_matrix(&mut weights, &format!("{mlp}.gate_proj.weight"), 8, 4);
+            insert_matrix(&mut weights, &format!("{mlp}.up_proj.weight"), 8, 4);
+            insert_matrix(&mut weights, &format!("{mlp}.down_proj.weight"), 4, 8);
+        }
+
+        let prompt = [1, 2, 3];
+        let full = forward_last_logits(&weights, &config, &prompt).expect("full forward");
+        let mut executor = Qwen3ForwardExecutor::new(&config, &weights);
+        let _ = executor.prefill_last_logits(&prompt[..2]).expect("prefill");
+        assert_logits_match(
+            full.clone(),
+            executor.decode_last_logits(3).expect("cached decode"),
+        );
+
+        // The biases reach the logits: zeroing one changes them.
+        let mut unbiased = weights.clone();
+        unbiased.insert(
+            "model.layers.0.self_attn.v_proj.bias".to_owned(),
+            Array::from_slice(&[0.0_f32, 0.0], &[2]),
+        );
+        let changed = forward_last_logits(&unbiased, &config, &prompt).expect("unbiased");
+        assert!(
+            full.iter().zip(&changed).any(|(a, b)| (a - b).abs() > 1e-4),
+            "a V bias left the logits unchanged"
+        );
     }
 
     #[test]
@@ -3069,12 +3659,16 @@ mod tests {
 
     mod cache_component_profile;
     mod capacity_cache_profile;
+    mod causal_mask;
+    mod chunked_prefill;
     mod decode_profile;
+    mod embedded;
     mod hot_path_profile;
     mod paged_batch;
     mod paged_kv;
     mod particle_replay;
     mod prefix_extend;
+    mod score;
     mod speculative_checkpoint;
     mod speculative_verify;
     mod steering_checkpoint;
@@ -3184,7 +3778,8 @@ mod tests {
         )
         .expect("final norm graph");
         let composed = read_last_logits(
-            &linear(&normalized, embedding).expect("tied output projection"),
+            &project(&config, &weights, &normalized, "model.embed_tokens")
+                .expect("tied output projection"),
             1,
             8,
         )
@@ -3194,6 +3789,85 @@ mod tests {
             .prefill_last_logits(&input_ids)
             .expect("independent cached prefill");
         assert_logits_match(composed, cached);
+    }
+
+    fn two_layer_config() -> Qwen3ForwardConfig {
+        Qwen3ForwardConfig::parse(
+            r#"{
+              "model_type":"qwen3", "num_hidden_layers":2, "hidden_size":4,
+              "intermediate_size":8, "vocab_size":8, "num_attention_heads":2,
+              "num_key_value_heads":1, "head_dim":4, "max_position_embeddings":16,
+              "rms_norm_eps":0.000001, "rope_theta":1000000, "hidden_act":"silu",
+              "tie_word_embeddings":true, "attention_bias":false, "mlp_bias":false
+            }"#,
+        )
+        .expect("two-layer dense Qwen3 config")
+    }
+
+    fn close(a: &[Vec<f32>], b: &[Vec<f32>]) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(left, right)| left.len() == right.len())
+            && a.iter()
+                .flatten()
+                .zip(b.iter().flatten())
+                .all(|(x, y)| (x - y).abs() <= 1e-5 * (1.0 + y.abs()))
+    }
+
+    fn rows(state: &Array) -> Vec<Vec<f32>> {
+        let state = state.as_type::<f32>().expect("f32");
+        state.eval().expect("eval");
+        state
+            .as_slice::<f32>()
+            .chunks(4)
+            .map(<[f32]>::to_vec)
+            .collect()
+    }
+
+    // Padding is masked as keys: a later padding row must not see an earlier
+    // padding token. Without the mask, changing the token at the first
+    // padding position changes every padding row after it.
+    #[test]
+    fn padded_layer_states_hide_padding_keys() {
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = two_layer_config();
+        let weights = deterministic_weights_for_layers(2);
+        let first = forward_layer_states(&weights, &config, &[1, 2, 3, 0, 0, 0], 3, &[1, 2])
+            .expect("padded states");
+        let changed = forward_layer_states(&weights, &config, &[1, 2, 3, 5, 0, 0], 3, &[1, 2])
+            .expect("padded states");
+        assert_eq!(first.len(), 2);
+        for (a, b) in first.iter().zip(&changed) {
+            let (a, b) = (rows(a), rows(b));
+            assert!(close(&a[..3], &b[..3]), "real rows");
+            assert!(!close(&a[3..4], &b[3..4]), "the changed row itself");
+            assert!(close(&a[4..], &b[4..]), "later padding rows");
+        }
+        // Real rows equal the unpadded causal forward's.
+        let unpadded = decoder_states(&weights, &config, &[1, 2, 3], None).expect("unpadded");
+        assert!(close(&rows(&first[1])[..3], &rows(&unpadded)));
+    }
+
+    #[test]
+    fn padded_layer_states_reject_bad_selections() {
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = two_layer_config();
+        let weights = deterministic_weights_for_layers(2);
+        for layers in [&[][..], &[0][..], &[2, 1][..], &[3][..]] {
+            assert!(matches!(
+                forward_layer_states(&weights, &config, &[1, 2], 2, layers),
+                Err(Qwen3ForwardError::LayerSelection { .. })
+            ));
+        }
+        assert!(matches!(
+            forward_layer_states(&weights, &config, &[1, 2], 3, &[1]),
+            Err(Qwen3ForwardError::RealLength { .. })
+        ));
     }
 
     #[test]

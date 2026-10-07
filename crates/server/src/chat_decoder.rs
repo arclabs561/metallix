@@ -3,9 +3,17 @@
 //! The turn rules (render, budget, token picks, stop tokens, streamed text)
 //! are the ones the Qwen session uses, from [`super::turn`]; a
 //! [`FullRowDecoder`] supplies only the logits. Every step reads the full
-//! logit row: the GPU pick path and the prompt-prefix cache are built on
-//! Qwen's executor types, so each turn here prefills its whole prompt in a
-//! fresh sequence.
+//! logit row: the GPU pick path is built on Qwen's executor types.
+//!
+//! A decoder that can save its sequence state ([`FullRowDecoder::SAVES_STATE`])
+//! gets a prompt-prefix cache: before prefilling, the session finds the
+//! prompt's reusable boundaries (the shared rule in
+//! [`super::prefix_cache::boundaries`]), prefills up to each one, saves the
+//! state there and keys it by the exact token prefix and the request's cache
+//! salt. A later prompt that starts with a saved boundary resumes from it.
+//! State is saved only at those boundaries, never cut back afterwards, so a
+//! decoder whose state cannot be truncated (recurrent layers) can take part.
+//! Other decoders prefill every prompt whole in a fresh sequence.
 
 use std::{
     path::{Path, PathBuf},
@@ -15,9 +23,13 @@ use std::{
 use chat_format::{ChatFormat, TurnDelta};
 use tracing::field::Empty;
 
+use sha2::{Digest, Sha256};
+
 use super::{
     ChatBackend, ChatFinishReason, ChatGeneration, ChatGenerationError, ChatGenerationMetrics,
-    ChatRequest, GenerationDeadline, ResidentChatLimits, SamplingDefaults, elapsed_ms, timed,
+    ChatRequest, GenerationDeadline, ResidentChatLimits, SamplingDefaults, elapsed_ms,
+    prefix_cache::{self, PrefixCache},
+    timed,
     turn::{TurnModel, TurnStart, TurnStep},
 };
 
@@ -42,6 +54,13 @@ pub(crate) enum DecoderError {
         planned_bytes: u64,
         budget_bytes: u64,
     },
+    /// A state-budget refusal with an exact capacity under the adapter's cost model.
+    StateBudgetCapacity {
+        context: usize,
+        planned_bytes: u64,
+        budget_bytes: u64,
+        largest_fitting: Option<std::num::NonZeroUsize>,
+    },
     /// Reading or converting the weights failed.
     Load(String),
 }
@@ -64,6 +83,24 @@ impl std::fmt::Display for DecoderError {
                 formatter,
                 "sequence state for {context} tokens needs {planned_bytes} bytes, more than the {budget_bytes}-byte K/V budget"
             ),
+            Self::StateBudgetCapacity {
+                context,
+                planned_bytes,
+                budget_bytes,
+                largest_fitting,
+            } => {
+                write!(
+                    formatter,
+                    "sequence state for {context} tokens needs {planned_bytes} bytes, more than the {budget_bytes}-byte K/V budget; "
+                )?;
+                match largest_fitting {
+                    Some(tokens) => write!(
+                        formatter,
+                        "largest fitting logical context is {tokens} tokens"
+                    ),
+                    None => formatter.write_str("no positive logical context fits"),
+                }
+            }
             Self::Load(reason) => write!(
                 formatter,
                 "checkpoint weights could not be loaded: {reason}"
@@ -72,13 +109,25 @@ impl std::fmt::Display for DecoderError {
     }
 }
 
+/// The snapshot type of a decoder that cannot save sequence state. It has no
+/// values, so code that would restore one cannot run.
+pub(crate) enum NoSnapshot {}
+
 /// A loaded checkpoint that decodes one sequence at a time and returns the
 /// whole logit row after each call.
 pub(crate) trait FullRowDecoder: Sized + 'static {
     /// One turn's sequence, borrowing the weights.
-    type Sequence<'a>: FullRowSequence
+    type Sequence<'a>: FullRowSequence<Snapshot = Self::Snapshot>
     where
         Self: 'a;
+
+    /// A sequence's state saved after some prompt tokens; [`NoSnapshot`] for
+    /// a decoder that cannot save state.
+    type Snapshot;
+
+    /// Whether [`FullRowSequence::snapshot`] saves state, which turns on the
+    /// session's prompt-prefix cache.
+    const SAVES_STATE: bool = false;
 
     /// Reads the configuration only, refusing a context or state budget the
     /// checkpoint cannot meet before any weights load.
@@ -88,19 +137,38 @@ pub(crate) trait FullRowDecoder: Sized + 'static {
 
     /// A fresh sequence; dropping it drops all of its state.
     fn sequence(&self, context_limit: usize) -> Result<Self::Sequence<'_>, String>;
+
+    /// A sequence resumed from `snapshot`, holding its tokens.
+    fn sequence_from(
+        &self,
+        snapshot: &Self::Snapshot,
+        context_limit: usize,
+    ) -> Result<Self::Sequence<'_>, String>;
+
+    /// Bytes `snapshot` keeps alive, charged to the prefix-cache budget.
+    fn snapshot_bytes(snapshot: &Self::Snapshot) -> usize;
 }
 
 /// One sequence of a [`FullRowDecoder`].
 pub(crate) trait FullRowSequence {
-    /// Consumes the prompt and returns the logits after its last token.
+    /// The decoder's [`FullRowDecoder::Snapshot`].
+    type Snapshot;
+
+    /// Appends prompt tokens and returns the logits after the last one. A
+    /// session may call it more than once per prompt, to save state at
+    /// boundaries in between.
     fn prefill(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String>;
 
     /// Appends one token and returns its logits.
     fn step(&mut self, token: i32) -> Result<Vec<f32>, String>;
+
+    /// The state after every token consumed so far. Called only when the
+    /// decoder's [`FullRowDecoder::SAVES_STATE`] is true.
+    fn snapshot(&self) -> Result<Self::Snapshot, String>;
 }
 
 /// A resident checkpoint for serial chat turns.
-pub(crate) struct ChatDecoderSession<D> {
+pub(crate) struct ChatDecoderSession<D: FullRowDecoder> {
     decoder: D,
     format: ChatFormat,
     vocabulary_size: usize,
@@ -110,6 +178,9 @@ pub(crate) struct ChatDecoderSession<D> {
     /// Checkpoint directory, read again only to compile a JSON-schema grammar.
     model: PathBuf,
     sampling_defaults: SamplingDefaults,
+    /// Saved prompt-prefix state, bounded by `--prefix-cache-mib`; never
+    /// filled unless [`FullRowDecoder::SAVES_STATE`].
+    prefix_cache: PrefixCache<D::Snapshot>,
 }
 
 impl<D: FullRowDecoder> ChatDecoderSession<D> {
@@ -121,6 +192,18 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         let format = ChatFormat::load(model, plan.vocabulary_size)?;
         let sampling_defaults = SamplingDefaults::load(model)?;
         let decoder = D::load(model, &plan).map_err(|error| error.to_string())?;
+        // The weights, configuration, tokenizer and template fix how tokens
+        // become state, so they key the cache.
+        let config = std::fs::read(model.join("config.json"))
+            .map_err(|_| String::from("local model config.json could not be read"))?;
+        let identity = format!(
+            "model={}\0config={:x}\0tokenizer={}\0template={}",
+            model.display(),
+            Sha256::digest(&config),
+            format.tokenizer().source_sha256(),
+            format.template().sha256()
+        );
+        let prefix_budget = usize::try_from(limits.prefix_cache_bytes()).unwrap_or(usize::MAX);
         Ok(Self {
             decoder,
             format,
@@ -130,7 +213,59 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
             load_ms: elapsed_ms(started.elapsed()),
             model: model.to_path_buf(),
             sampling_defaults,
+            prefix_cache: PrefixCache::new(identity, prefix_budget),
         })
+    }
+
+    /// Starts this turn's sequence and prefills `input_ids`, resuming from
+    /// the longest saved boundary and saving state at each new boundary when
+    /// the decoder can. Returns the sequence, the last prompt logits and the
+    /// prompt tokens resumed rather than prefilled.
+    fn prefill<'s>(
+        decoder: &'s D,
+        prefix_cache: &mut PrefixCache<D::Snapshot>,
+        format: &ChatFormat,
+        context_limit: usize,
+        request: ChatRequest<'_>,
+        input_ids: &[i32],
+    ) -> Result<(D::Sequence<'s>, Vec<f32>, usize, usize), String> {
+        if !D::SAVES_STATE {
+            let mut sequence = decoder.sequence(context_limit)?;
+            let logits = sequence.prefill(input_ids)?;
+            return Ok((sequence, logits, 0, 0));
+        }
+        let (mut sequence, cached) = match prefix_cache.lookup(request.cache_salt, input_ids) {
+            Some(hit) => (decoder.sequence_from(hit.value, context_limit)?, hit.tokens),
+            None => (decoder.sequence(context_limit)?, 0),
+        };
+        let mut consumed = cached;
+        let mut written = 0;
+        for boundary in prefix_cache::boundaries(format, request, input_ids) {
+            // A boundary must leave a token to prefill after it, and one at
+            // or before the resumed prefix is already cached.
+            if boundary.len() <= consumed
+                || boundary.len() >= input_ids.len()
+                || prefix_cache.contains(request.cache_salt, &boundary)
+            {
+                continue;
+            }
+            sequence.prefill(&input_ids[consumed..boundary.len()])?;
+            consumed = boundary.len();
+            let snapshot = sequence.snapshot()?;
+            let bytes = D::snapshot_bytes(&snapshot);
+            let extent = boundary.len();
+            if prefix_cache.insert(request.cache_salt, boundary, snapshot, bytes) {
+                written = written.max(extent);
+            }
+        }
+        let logits = sequence.prefill(&input_ids[consumed..])?;
+        Ok((
+            sequence,
+            logits,
+            cached,
+            prefix_cache::AcceptedPrefixTokens::from_accepted_extent(written)
+                .new_tokens_after(cached),
+        ))
     }
 
     fn turn_model(&self) -> TurnModel<'_> {
@@ -152,18 +287,27 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         let start = TurnStart::prepare(self.turn_model(), request, deadline)?;
         let (render_ms, max_tokens) = (start.render_ms, start.max_tokens);
         let (input_ids, mut turn, mut text) = start.into_parts();
-        let mut sequence = self.decoder.sequence(self.context_limit)?;
 
         deadline.check()?;
         // Ends with the full-vocabulary logit readback, so it times the GPU work.
         let prefill = tracing::info_span!(
             "chat.prefill",
             prompt_tokens = input_ids.len(),
-            cached_tokens = 0,
+            cached_tokens = Empty,
             prefill_ms = Empty
         );
-        let (mut logits, prefill_ms) =
-            timed(&prefill, "prefill_ms", || sequence.prefill(&input_ids))?;
+        let ((mut sequence, mut logits, cached_prompt_tokens, cache_write_tokens), prefill_ms) =
+            timed(&prefill, "prefill_ms", || {
+                Self::prefill(
+                    &self.decoder,
+                    &mut self.prefix_cache,
+                    &self.format,
+                    self.context_limit,
+                    request,
+                    &input_ids,
+                )
+            })?;
+        prefill.record("cached_tokens", cached_prompt_tokens);
         let mut decode_ms = Vec::new();
         let mut finish_reason = ChatFinishReason::Length;
         for step in 0..max_tokens {
@@ -212,8 +356,8 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
                 decode_ms,
                 decode_total_ms,
                 prompt_tokens: input_ids.len(),
-                cached_prompt_tokens: 0,
-                cache_write_tokens: 0,
+                cached_prompt_tokens,
+                cache_write_tokens,
                 generated_tokens,
                 // Prompt-lookup speculation runs on the Qwen executor only;
                 // it never changes output, so a request asking for it is
@@ -345,5 +489,183 @@ pub(crate) mod test_support {
                 .unwrap();
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
+
+    use chat_format::test_model::{ModelDir, VOCABULARY_SIZE};
+    use serde_json::json;
+
+    use super::{ChatDecoderSession, DecoderError, DecoderPlan, FullRowDecoder, FullRowSequence};
+    use crate::chat_generation::{
+        ChatBackend, ChatMessage, ChatRequest, ChatRole, ResidentChatLimits,
+    };
+
+    /// A decoder whose logits are a fixed function of the whole token
+    /// history, and whose snapshot is that history: resuming from a snapshot
+    /// gives exactly the logits of a full prefill only if the session resumes
+    /// at the right token. Counts every token it is asked to prefill.
+    struct HistoryDecoder {
+        prefilled: Rc<RefCell<usize>>,
+    }
+
+    thread_local! {
+        static PREFILLED: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    }
+
+    struct HistorySequence {
+        history: Vec<i32>,
+        prefilled: Rc<RefCell<usize>>,
+    }
+
+    impl HistorySequence {
+        /// Never end-of-turn (3); otherwise a hash of the history picks one
+        /// of the two words, so a resumed sequence that lost or doubled a
+        /// token answers differently.
+        fn logits(&self) -> Vec<f32> {
+            let hash = self.history.iter().fold(17_u64, |hash, &token| {
+                hash.wrapping_mul(31)
+                    .wrapping_add(u64::from(token.unsigned_abs()))
+            });
+            let mut logits = vec![0.0; VOCABULARY_SIZE];
+            logits[3] = -100.0;
+            logits[4 + usize::from(hash % 2 == 1)] = 10.0;
+            logits
+        }
+    }
+
+    impl FullRowDecoder for HistoryDecoder {
+        type Sequence<'a> = HistorySequence;
+        type Snapshot = Vec<i32>;
+        const SAVES_STATE: bool = true;
+
+        fn plan(_: &Path, _: ResidentChatLimits) -> Result<DecoderPlan, DecoderError> {
+            Ok(DecoderPlan {
+                vocabulary_size: VOCABULARY_SIZE,
+                planned_state_bytes: 0,
+            })
+        }
+
+        fn load(_: &Path, _: &DecoderPlan) -> Result<Self, DecoderError> {
+            Ok(Self {
+                prefilled: PREFILLED.with(Rc::clone),
+            })
+        }
+
+        fn sequence(&self, _: usize) -> Result<HistorySequence, String> {
+            self.sequence_from(&Vec::new(), 0)
+        }
+
+        fn sequence_from(&self, snapshot: &Vec<i32>, _: usize) -> Result<HistorySequence, String> {
+            Ok(HistorySequence {
+                history: snapshot.clone(),
+                prefilled: Rc::clone(&self.prefilled),
+            })
+        }
+
+        fn snapshot_bytes(snapshot: &Vec<i32>) -> usize {
+            snapshot.len() * size_of::<i32>()
+        }
+    }
+
+    impl FullRowSequence for HistorySequence {
+        type Snapshot = Vec<i32>;
+
+        fn prefill(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String> {
+            *self.prefilled.borrow_mut() += tokens.len();
+            self.history.extend_from_slice(tokens);
+            Ok(self.logits())
+        }
+
+        fn step(&mut self, token: i32) -> Result<Vec<f32>, String> {
+            self.history.push(token);
+            Ok(self.logits())
+        }
+
+        fn snapshot(&self) -> Result<Vec<i32>, String> {
+            Ok(self.history.clone())
+        }
+    }
+
+    /// Every message's content, then `Hello` as the generation prompt.
+    fn model() -> ModelDir {
+        ModelDir::new(
+            &json!({"chat_template": "{% for m in messages %}{{ m.content }} {% endfor %}{% if add_generation_prompt %}Hello{% endif %}"}),
+            &json!({"eos_token_id": 3, "vocab_size": VOCABULARY_SIZE}),
+            None,
+        )
+    }
+
+    /// Runs two turns of one conversation; returns each turn's generated
+    /// tokens, resumed prompt tokens, and prefilled tokens.
+    fn two_turns(
+        prefix_cache_mib: u32,
+        second_salt: Option<&str>,
+    ) -> Vec<(Vec<i32>, usize, usize, usize)> {
+        let model = model();
+        PREFILLED.with(|count| *count.borrow_mut() = 0);
+        let mut session = ChatDecoderSession::<HistoryDecoder>::load(
+            model.path(),
+            ResidentChatLimits::from_mib(64, 1).with_prefix_cache_mib(prefix_cache_mib),
+        )
+        .expect("load");
+        let first = [
+            ChatMessage::text(ChatRole::System, "hi hi hi hi"),
+            ChatMessage::text(ChatRole::User, "hi"),
+        ];
+        let second = [
+            first[0].clone(),
+            first[1].clone(),
+            ChatMessage::text(ChatRole::Assistant, "Hello hi"),
+            ChatMessage::text(ChatRole::User, "hi hi"),
+        ];
+        let mut turns = Vec::new();
+        for (messages, salt) in [(&first[..], None), (&second[..], second_salt)] {
+            let before = PREFILLED.with(|count| *count.borrow());
+            let mut request = ChatRequest::new(messages, 3);
+            request.cache_salt = salt;
+            let generation = session
+                .generate_with_timeout(request, Duration::from_secs(10), &mut |_| Ok(()))
+                .expect("turn");
+            let prefilled = PREFILLED.with(|count| *count.borrow()) - before;
+            turns.push((
+                generation.generated_token_ids,
+                generation.metrics.cached_prompt_tokens,
+                prefilled,
+                generation.metrics.cache_write_tokens,
+            ));
+        }
+        turns
+    }
+
+    #[test]
+    fn a_saved_boundary_resumes_the_next_turn_with_identical_output() {
+        let cached = two_turns(1, None);
+        let uncached = two_turns(0, None);
+        // Greedy output does not depend on the cache.
+        assert_eq!(cached[0].0, uncached[0].0);
+        assert_eq!(cached[1].0, uncached[1].0);
+        // Turn 1 prompt: "hi hi hi hi hi Hello" (6 tokens), nothing cached.
+        assert_eq!((cached[0].1, cached[0].2), (0, 6));
+        // Turn 2 prompt: 4 + 1 + 2 + 2 words + "Hello" = 10 tokens. It
+        // resumes turn 1's history boundary ("hi" x 5, 5 tokens) and
+        // prefills the other 5; without the cache it prefills all 10.
+        assert_eq!((cached[1].1, cached[1].2), (5, 5));
+        assert_eq!((uncached[1].1, uncached[1].2), (0, 10));
+        assert_eq!(cached[0].3, 5, "first accepted history has five new tokens");
+        assert_eq!(
+            cached[1].3, 4,
+            "nine-token history extends five restored tokens"
+        );
+        assert_eq!((uncached[0].3, uncached[1].3), (0, 0));
+    }
+
+    #[test]
+    fn another_salt_resumes_nothing() {
+        let salted = two_turns(1, Some("tenant-b"));
+        assert_eq!((salted[1].1, salted[1].2), (0, 10));
     }
 }

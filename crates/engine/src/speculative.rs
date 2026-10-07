@@ -75,9 +75,19 @@ pub trait SpeculativeTarget {
 
     /// Appends `tokens` to the cache and returns logits for every appended
     /// position: row `i` is the next-token distribution after `tokens[..=i]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when it cannot append or score `tokens`.
+    /// Cache state after an error is adapter-defined.
     fn verify(&mut self, tokens: &[i32]) -> Result<PositionLogits, Self::Error>;
 
     /// Drops cached positions at and after `tokens`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when it cannot restore the requested prefix.
+    /// Cache state after an error is adapter-defined.
     fn truncate(&mut self, tokens: usize) -> Result<(), Self::Error>;
 }
 
@@ -222,6 +232,11 @@ where
 pub trait GreedySpeculativeTarget: SpeculativeTarget {
     /// Appends `tokens` and returns the greedy (lowest-ID tie) token after
     /// every appended position: entry `i` follows `tokens[..=i]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the adapter error when it cannot append, score or select tokens.
+    /// Cache state after an error is adapter-defined.
     fn verify_greedy(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Self::Error>;
 }
 

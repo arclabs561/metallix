@@ -1,3 +1,6 @@
+//! Validated benchmark workloads and per-request measurements, independent of
+//! model architecture. Samples carry timings and byte counts, never prompt text.
+
 use std::{num::NonZeroU16, time::Duration};
 
 use thiserror::Error;

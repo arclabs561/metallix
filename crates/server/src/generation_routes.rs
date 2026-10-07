@@ -8,8 +8,10 @@ use serde_json::{Value, json};
 use crate::{
     anthropic_messages, chat_completions,
     chat_generation::{ChatBackend, ChatMessage},
+    completions,
     http_transport::Connection,
     responses::{self, json_response},
+    scoring,
 };
 
 /// An error body in the shape of the protocol `path` speaks, so each client
@@ -73,6 +75,10 @@ pub(crate) enum Generation {
     },
     ChatCompletions(Box<chat_completions::Prepared>),
     Messages(Box<anthropic_messages::Prepared>),
+    /// Legacy Completions, scoring a raw prompt.
+    Completions(Box<completions::Prepared>),
+    /// Teacher-forced scoring of a continuation.
+    Score(Box<scoring::Prepared>),
 }
 
 impl Generation {
@@ -80,7 +86,11 @@ impl Generation {
     pub(crate) fn serves(path: &str) -> bool {
         matches!(
             path,
-            "/v1/responses" | "/v1/chat/completions" | "/v1/messages"
+            "/v1/responses"
+                | "/v1/chat/completions"
+                | "/v1/messages"
+                | "/v1/completions"
+                | "/v1/score"
         )
     }
 
@@ -96,6 +106,14 @@ impl Generation {
             return chat_completions::prepare(body)
                 .map(|(model, prepared)| (model, Self::ChatCompletions(Box::new(prepared))));
         }
+        if path == "/v1/completions" {
+            return completions::prepare(body)
+                .map(|(model, prepared)| (model, Self::Completions(Box::new(prepared))));
+        }
+        if path == "/v1/score" {
+            return scoring::prepare(body)
+                .map(|(model, prepared)| (model, Self::Score(Box::new(prepared))));
+        }
         let invalid = |message: &str| error_body(Some(path), 400, None, message, None);
         let request: responses::Request =
             serde_json::from_slice(body).map_err(|error| invalid(&error.to_string()))?;
@@ -110,6 +128,15 @@ impl Generation {
                 tools,
             },
         ))
+    }
+
+    /// The `GenAI` operation name the request span records.
+    pub(crate) const fn operation(&self) -> &'static str {
+        match self {
+            Self::Completions(_) => "text_completion",
+            Self::Score(_) => "score",
+            Self::Responses { .. } | Self::ChatCompletions(_) | Self::Messages(_) => "chat",
+        }
     }
 
     /// Generates and answers; `id` is the server-unique suffix each protocol
@@ -140,6 +167,16 @@ impl Generation {
             }
             Self::Messages(prepared) => {
                 anthropic_messages::respond(connection, prepared, session, id, generation_timeout)
+            }
+            // Scoring is one prefill with no decode loop, so it runs to the
+            // end rather than against the generation time budget.
+            Self::Completions(prepared) => {
+                completions::respond(connection, prepared, session, id);
+                Ok(())
+            }
+            Self::Score(prepared) => {
+                scoring::respond(connection, prepared, session, id);
+                Ok(())
             }
         }
     }

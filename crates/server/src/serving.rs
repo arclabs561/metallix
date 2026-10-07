@@ -91,6 +91,10 @@ struct GenerationJob {
 }
 
 enum Work {
+    Transcribe {
+        request: crate::transcriptions::Request,
+        generation_timeout: Duration,
+    },
     Respond {
         generation: Box<Generation>,
         /// The server-unique suffix each protocol prefixes with its own style.
@@ -253,13 +257,28 @@ fn serve_job(worker: &mut dyn ModelWorker, job: GenerationJob, capture: Option<P
 
 fn run_job(
     worker: &mut dyn ModelWorker,
-    connection: Connection,
+    mut connection: Connection,
     work: Work,
     admission: Admission,
     span: &tracing::Span,
 ) {
     let request_id = connection.request_id().map(str::to_owned);
     match work {
+        Work::Transcribe {
+            request,
+            generation_timeout,
+        } => {
+            let _socket = connection.hold_open();
+            let stage = tracing::info_span!("audio.transcribe");
+            let outcome = {
+                let mut cancelled = || connection.client_gone();
+                let mut control =
+                    crate::transcriptions::Control::new(generation_timeout, &mut cancelled);
+                stage.in_scope(|| worker.transcribe(&request, &mut control))
+            };
+            drop(admission);
+            crate::transcriptions::respond(connection, outcome);
+        }
         Work::Respond {
             generation,
             id,
@@ -733,10 +752,12 @@ fn serve_models(
             return Err(String::from("model worker is unavailable"));
         }
         let mut connection = connection;
-        let request = match connection.read_request() {
+        let request = match connection
+            .read_request_with(&crate::transcriptions::UploadLimits(transport_limits))
+        {
             Ok(request) => request,
             Err(error) => {
-                error_response(connection, error.status, None, error.message);
+                error_response(connection, error.status, None, &error.describe());
                 continue;
             }
         };
@@ -780,6 +801,7 @@ fn serve_models(
             ("POST", "/v1/decisions") => "decide",
             ("POST", "/v1/embeddings") => "embed",
             ("POST", "/v1/rerank") => "rerank",
+            ("POST", crate::transcriptions::PATH) => "transcribe",
             _ => {
                 error_response(connection, 404, None, "unknown endpoint");
                 continue;
@@ -797,27 +819,49 @@ fn serve_models(
         let parsed = if generation {
             Generation::parse(&request.path, &request.body)
                 .map(|(model, generation)| (model, Some(generation)))
+                .map_err(|error| (400, error))
+        } else if capability == "transcribe" {
+            crate::transcriptions::parse(&request.body, request.content_type.as_deref())
+                .map(|form| (form.model.to_owned(), None))
+                .map_err(|error| {
+                    (
+                        error.status,
+                        error_body(
+                            Some(&request.path),
+                            error.status,
+                            None,
+                            &error.message,
+                            None,
+                        ),
+                    )
+                })
         } else {
             serde_json::from_slice::<DecisionTarget>(&request.body)
                 .map(|target| (target.model, None))
                 .map_err(|error| {
-                    error_body(
-                        Some(request.path.as_str()),
+                    (
                         400,
-                        None,
-                        &error.to_string(),
-                        None,
+                        error_body(
+                            Some(request.path.as_str()),
+                            400,
+                            None,
+                            &error.to_string(),
+                            None,
+                        ),
                     )
                 })
         };
         let (model_id, parsed) = match parsed {
             Ok(parsed) => parsed,
-            Err(error) => {
-                json_response(connection, 400, &error);
+            Err((status, error)) => {
+                json_response(connection, status, &error);
                 continue;
             }
         };
         span.record("gen_ai.request.model", model_id.as_str());
+        if let Some(parsed) = &parsed {
+            span.record("gen_ai.operation.name", parsed.operation());
+        }
         let Some(model) = models.iter().find(|model| model.id == model_id) else {
             error_response(connection, 404, None, "model is not loaded");
             continue;
@@ -841,6 +885,19 @@ fn serve_models(
             match capability {
                 "decide" => Work::Decide { body, model },
                 "rerank" => Work::Rerank { body, model },
+                "transcribe" => match crate::transcriptions::Request::from_body(
+                    body,
+                    request.content_type.as_deref(),
+                ) {
+                    Ok(request) => Work::Transcribe {
+                        request,
+                        generation_timeout,
+                    },
+                    Err(error) => {
+                        error_response(connection, error.status, None, &error.message);
+                        continue;
+                    }
+                },
                 _ => Work::Embed { body, model },
             }
         };
@@ -986,6 +1043,17 @@ mod tests {
         responses::{Request, messages, respond, tools},
     };
 
+    fn wait_for_admission_release(occupied: &AtomicBool) {
+        let deadline = Instant::now() + HUNG;
+        while occupied.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "worker completion did not release admission"
+            );
+            thread::yield_now();
+        }
+    }
+
     #[test]
     fn engine_admission_counts_up_to_capacity_and_releases_on_drop() {
         let admitted = Arc::new(AtomicUsize::new(0));
@@ -1019,6 +1087,139 @@ mod tests {
                 .map_err(ChatGenerationError::Message)?;
             Err(ChatGenerationError::DeadlineExceeded)
         }
+    }
+
+    #[test]
+    fn unsupported_scoring_has_a_typed_http_error_for_both_routes() {
+        for (path, body) in [
+            (
+                "/v1/score",
+                r#"{"model":"control","prompt":"a","continuation":"b"}"#,
+            ),
+            (
+                "/v1/completions",
+                r#"{"model":"control","prompt":"a","max_tokens":0,"echo":true}"#,
+            ),
+        ] {
+            let mut backend = DeadlineBackend::default();
+            let wire = crate::sse::test_support::exchange(path, body, |connection, body| {
+                let (_, generation) = crate::generation_routes::Generation::parse(path, body)
+                    .expect("valid scoring request");
+                generation
+                    .respond(connection, &mut backend, "score", HUNG)
+                    .unwrap();
+            });
+            assert!(
+                wire.starts_with("HTTP/1.1 501 Not Implemented\r\n"),
+                "{wire}"
+            );
+            let (_, value) = crate::sse::test_support::json_body(&wire);
+            assert_eq!(value["error"]["code"], "scoring_unsupported");
+            assert_eq!(backend.calls, 0, "unsupported scoring must not generate");
+        }
+    }
+
+    #[test]
+    fn cancelled_scoring_holds_socket_and_admission_until_prefill_returns() {
+        use crate::chat_generation::{ScoreError, ScoreRequest, ScoreResult};
+
+        struct BlockingScore {
+            entered: SyncSender<()>,
+            release: Receiver<()>,
+            calls: std::cell::Cell<usize>,
+        }
+        impl ChatBackend for BlockingScore {
+            fn load_ms(&self) -> f64 {
+                0.0
+            }
+            fn generate_with_timeout(
+                &mut self,
+                _: ChatRequest<'_>,
+                _: Duration,
+                _: &mut dyn FnMut(chat_format::TurnDelta) -> Result<(), String>,
+            ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+                panic!("score must not enter generation")
+            }
+            fn score(&self, _: ScoreRequest<'_>) -> Result<ScoreResult, ScoreError> {
+                self.calls.set(self.calls.get() + 1);
+                if self.calls.get() == 1 {
+                    self.entered.send(()).unwrap();
+                    self.release
+                        .recv_timeout(HUNG)
+                        .expect("release blocked prefill");
+                }
+                Err(ScoreError::Execution(ChatGenerationError::Message(
+                    "finished prefill".into(),
+                )))
+            }
+        }
+        fn connect(address: std::net::SocketAddr) -> TcpStream {
+            let mut socket = TcpStream::connect(address).unwrap();
+            socket.set_read_timeout(Some(HUNG)).unwrap();
+            let body = r#"{"model":"control","prompt":"a","continuation":"b"}"#;
+            write!(socket, "POST /v1/score HTTP/1.1\r\nHost: localhost\r\nx-metallix-cancel-on-eof: 1\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            socket
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (jobs, receiver) = sync_channel(0);
+        let (entered, started) = sync_channel(1);
+        let (release, resume) = sync_channel(1);
+        let worker = thread::spawn(move || {
+            let mut backend = BlockingScore {
+                entered,
+                release: resume,
+                calls: std::cell::Cell::new(0),
+            };
+            worker_loop(&mut backend, receiver);
+            backend.calls.get()
+        });
+        let occupied = Arc::new(AtomicBool::new(false));
+        let server_occupied = Arc::clone(&occupied);
+        let sender = jobs.clone();
+        let server = thread::spawn(move || {
+            serve_listener(
+                &listener,
+                "control",
+                &sender,
+                &server_occupied,
+                &Arc::new(AtomicBool::new(true)),
+                Duration::from_millis(1),
+                Some(3),
+            )
+        });
+        let mut first = connect(address);
+        started.recv_timeout(HUNG).unwrap();
+        first.shutdown(Shutdown::Write).unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let held_read = first.read(&mut [0_u8; 1]);
+        let held_admission = occupied.load(Ordering::Acquire);
+        let mut busy = String::new();
+        connect(address).read_to_string(&mut busy).unwrap();
+        // Release before assertions so a failed invariant cannot strand the worker.
+        release.send(()).unwrap();
+        first.set_read_timeout(Some(HUNG)).unwrap();
+        let mut finished = String::new();
+        first.read_to_string(&mut finished).unwrap();
+        wait_for_admission_release(&occupied);
+        let mut next = String::new();
+        connect(address).read_to_string(&mut next).unwrap();
+        server.join().unwrap().unwrap();
+        drop(jobs);
+        let calls = worker.join().unwrap();
+        assert!(held_admission, "cancelled prefill still owns admission");
+        assert!(
+            held_read.is_err_and(|error| matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )),
+            "no response or EOF before prefill returns"
+        );
+        assert!(busy.starts_with("HTTP/1.1 503"), "{busy}");
+        assert!(next.starts_with("HTTP/1.1 400"), "{next}");
+        assert_eq!(calls, 2, "busy request must not execute");
     }
 
     struct BlockingBackend {
@@ -1524,17 +1725,6 @@ stream.close()
     fn slow_reader_write_deadline_releases_admission_and_worker_recovers() {
         const WRITE_IDLE: Duration = Duration::from_millis(250);
         const RESPONSE_DEADLINE: Duration = Duration::from_secs(2);
-
-        fn wait_for_admission_release(occupied: &AtomicBool) {
-            let deadline = Instant::now() + HUNG;
-            while occupied.load(Ordering::Acquire) {
-                assert!(
-                    Instant::now() < deadline,
-                    "write failure did not release admission"
-                );
-                thread::yield_now();
-            }
-        }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let address = listener.local_addr().expect("listener address");
@@ -2249,7 +2439,7 @@ stream.close()
                 &occupied,
                 &alive,
                 Duration::from_secs(2),
-                Some(5),
+                Some(7),
             )
         });
         let (status, completion) = post(
@@ -2287,6 +2477,25 @@ stream.close()
         );
         assert_eq!(status, 400);
         assert_eq!(rejected["error"]["type"], "invalid_request_error");
+        // The scoring routes reach the backend, which this one refuses.
+        for (path, body) in [
+            (
+                "/v1/completions",
+                r#"{"model":"control","prompt":"hello","max_tokens":0,"echo":true}"#,
+            ),
+            (
+                "/v1/score",
+                r#"{"model":"control","prompt":"hello","continuation":" there"}"#,
+            ),
+        ] {
+            let (status, rejected) = post(address, path, body);
+            assert_eq!(status, 501, "{path}: {rejected}");
+            assert_eq!(
+                rejected["error"]["message"], "this backend does not support scoring",
+                "{path}"
+            );
+            assert_eq!(rejected["error"]["code"], "scoring_unsupported", "{path}");
+        }
         server
             .join()
             .expect("join acceptor")
@@ -2794,3 +3003,6 @@ raise RuntimeError("stream exceeded 65536 bytes before a generated text delta")
         }
     }
 }
+
+#[cfg(test)]
+mod transcription_tests;

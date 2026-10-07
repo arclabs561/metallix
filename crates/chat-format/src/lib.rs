@@ -20,6 +20,7 @@ mod turn;
 
 use std::path::Path;
 
+use checkpoint::gguf::GgufTokenizer;
 use minijinja::{Environment, UndefinedBehavior};
 use minijinja_contrib::pycompat::unknown_method_callback;
 use serde::{Deserialize, Serialize};
@@ -384,14 +385,91 @@ pub struct ChatFormat {
     vocabulary_size: usize,
 }
 
+/// The checkpoint files a [`ChatFormat`] is built from.
+pub struct ChatSources {
+    /// The exact `tokenizer.json` bytes.
+    pub tokenizer_json: Vec<u8>,
+    pub tokenizer_config: Value,
+    pub config: Value,
+    pub generation_config: Option<Value>,
+    pub template: String,
+    /// The end-of-turn token when the weights file names its own (a GGUF
+    /// file's `tokenizer.ggml.eos_token_id`); otherwise `tokenizer_config`'s
+    /// `eos_token`.
+    pub eos_id: Option<u32>,
+}
+
+impl ChatSources {
+    /// Reads every source from a Hugging Face checkpoint directory.
+    pub fn read(model: &Path) -> Result<Self, String> {
+        let (config, generation_config) = read_configs(model)?;
+        let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
+        let template = load_template(model, &tokenizer_config)?;
+        Ok(Self {
+            tokenizer_json: QwenTokenizer::read_json(model)?,
+            tokenizer_config,
+            config,
+            generation_config,
+            template,
+            eos_id: None,
+        })
+    }
+}
+
 impl ChatFormat {
     /// Loads the format from a checkpoint directory. `vocabulary_size` is the
     /// model's logit width, which every stop and prompt ID must fit.
     pub fn load(model: &Path, vocabulary_size: usize) -> Result<Self, String> {
-        let (config, generation_config) = read_configs(model)?;
-        let tokenizer = QwenTokenizer::load(model)?;
-        let tokenizer_config = read_json(model, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
-        let source = load_template(model, &tokenizer_config)?;
+        Self::from_sources(ChatSources::read(model)?, vocabulary_size)
+    }
+
+    /// The format of a GGUF file: the template the file embeds, its
+    /// end-of-turn token, and the tokenizer of `base`, the Hugging Face
+    /// checkpoint the file was converted from. GGUF stores the vocabulary
+    /// and merges but not the pre-tokenizer split rule, so the base
+    /// `tokenizer.json` is used, and only if its vocabulary and merges equal
+    /// the file's.
+    pub fn from_gguf(
+        base: &Path,
+        gguf: &GgufTokenizer,
+        vocabulary_size: usize,
+    ) -> Result<Self, String> {
+        let (config, generation_config) = read_configs(base)?;
+        let tokenizer_config = read_json(base, "tokenizer_config.json", MAX_CHAT_TEMPLATE_BYTES)?;
+        let tokenizer_json = QwenTokenizer::read_json(base)?;
+        check_gguf_vocabulary(&tokenizer_json, gguf)?;
+        let template = gguf
+            .chat_template
+            .clone()
+            .filter(|template| !template.trim().is_empty())
+            .ok_or("GGUF file has no tokenizer.chat_template")?;
+        let eos_id = gguf
+            .eos
+            .ok_or("GGUF file has no tokenizer.ggml.eos_token_id")?;
+        Self::from_sources(
+            ChatSources {
+                tokenizer_json,
+                tokenizer_config,
+                config,
+                generation_config,
+                template,
+                eos_id: Some(eos_id),
+            },
+            vocabulary_size,
+        )
+    }
+
+    /// Builds the format from sources already read.
+    pub fn from_sources(sources: ChatSources, vocabulary_size: usize) -> Result<Self, String> {
+        let ChatSources {
+            tokenizer_json,
+            tokenizer_config,
+            config,
+            generation_config,
+            template: source,
+            eos_id,
+        } = sources;
+        let tokenizer = QwenTokenizer::from_bytes(tokenizer_json)?;
         let turn = TurnFormat::from_template(&source);
         let tool_end: Vec<TokenId> = turn
             .tools
@@ -400,12 +478,11 @@ impl ChatFormat {
             .map(TokenId::new)
             .into_iter()
             .collect();
-        let stops = StopTokens::from_configs(
-            &config,
-            generation_config.as_ref(),
-            eos_token(&tokenizer_config, &tokenizer)?,
-            &tool_end,
-        )?;
+        let eos = match eos_id {
+            Some(id) => tokenizer.is_special(id).then_some(TokenId::new(id)),
+            None => eos_token(&tokenizer_config, &tokenizer)?,
+        };
+        let stops = StopTokens::from_configs(&config, generation_config.as_ref(), eos, &tool_end)?;
         let suppress = suppress_tokens(generation_config.as_ref(), vocabulary_size)?;
         for id in stops.iter() {
             let id = i32::try_from(id.get())
@@ -992,6 +1069,76 @@ pub fn load_template(model: &Path, tokenizer_config: &Value) -> Result<String, S
     Ok(template)
 }
 
+/// Checks that a GGUF file's byte-level BPE vocabulary and merges are the
+/// ones in `tokenizer_json`: every token ID the tokenizer defines (vocabulary
+/// and added tokens) spells the same in the file, and the merge lists are
+/// equal in order. The file may list more IDs than the tokenizer (converters
+/// pad the vocabulary to the model's logit width).
+fn check_gguf_vocabulary(tokenizer_json: &[u8], gguf: &GgufTokenizer) -> Result<(), String> {
+    if gguf.model != "gpt2" {
+        return Err(format!(
+            "GGUF tokenizer model {:?} is not byte-level BPE (gpt2)",
+            gguf.model
+        ));
+    }
+    let tokenizer: Value = serde_json::from_slice(tokenizer_json)
+        .map_err(|_| String::from("local tokenizer.json could not be parsed"))?;
+    let model = &tokenizer["model"];
+    if model["type"] != "BPE" {
+        return Err(String::from("local tokenizer.json is not a BPE tokenizer"));
+    }
+    let mut spellings: Vec<(u64, &str)> = model["vocab"]
+        .as_object()
+        .ok_or("local tokenizer.json has no BPE vocabulary")?
+        .iter()
+        .map(|(text, id)| Some((id.as_u64()?, text.as_str())))
+        .collect::<Option<_>>()
+        .ok_or("local tokenizer.json has a non-integer token ID")?;
+    for added in tokenizer["added_tokens"].as_array().into_iter().flatten() {
+        spellings.push((
+            added["id"].as_u64().ok_or("added token without an ID")?,
+            added["content"]
+                .as_str()
+                .ok_or("added token without content")?,
+        ));
+    }
+    for (id, text) in spellings {
+        let stored = usize::try_from(id)
+            .ok()
+            .and_then(|id| gguf.tokens.get(id))
+            .ok_or_else(|| format!("GGUF vocabulary has no token {id}"))?;
+        if stored != text {
+            return Err(format!(
+                "GGUF token {id} is {stored:?}, the base tokenizer's is {text:?}"
+            ));
+        }
+    }
+    let merges: Vec<String> = model["merges"]
+        .as_array()
+        .ok_or("local tokenizer.json has no BPE merges")?
+        .iter()
+        .map(|merge| match merge {
+            Value::String(pair) => Some(pair.clone()),
+            Value::Array(pair) => match pair.as_slice() {
+                [Value::String(left), Value::String(right)] => Some(format!("{left} {right}")),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .ok_or("local tokenizer.json has a malformed merge")?;
+    if let Some(index) = (0..merges.len().max(gguf.merges.len()))
+        .find(|&index| merges.get(index) != gguf.merges.get(index))
+    {
+        return Err(format!(
+            "GGUF merge {index} is {:?}, the base tokenizer's is {:?}",
+            gguf.merges.get(index),
+            merges.get(index)
+        ));
+    }
+    Ok(())
+}
+
 /// A checkpoint directory holding only the chat-format files, with a small
 /// word-level tokenizer whose special tokens are `<s>` (1), `</s>` (2) and
 /// `<|im_end|>` (3).
@@ -1088,6 +1235,7 @@ pub mod test_model {
 mod tests {
     use std::fs;
 
+    use checkpoint::gguf::GgufTokenizer;
     use serde_json::{Value, json};
 
     use super::{
@@ -2043,6 +2191,117 @@ mod tests {
                     .map(|id| id.get())
                     .collect::<Vec<_>>(),
             );
+        }
+    }
+    /// A byte-level BPE tokenizer of three letters, one merge and an
+    /// end-of-turn token, with the GGUF tokenizer converted from it.
+    fn bpe_model() -> (tempdir::Dir, GgufTokenizer) {
+        let dir = tempdir::Dir::new("gguf-base");
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [{"id": 4, "content": "<|im_end|>", "single_word": false,
+                              "lstrip": false, "rstrip": false, "normalized": false,
+                              "special": true}],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false,
+                              "trim_offsets": false, "use_regex": true},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": false,
+                        "trim_offsets": false, "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null,
+                      "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                      "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                      "vocab": {"a": 0, "b": 1, "c": 2, "ab": 3},
+                      "merges": [["a", "b"]]}
+        });
+        dir.write("tokenizer.json", &tokenizer.to_string());
+        dir.write(
+            "tokenizer_config.json",
+            &json!({"eos_token": "<|im_end|>", "chat_template": "base"}).to_string(),
+        );
+        dir.write("config.json", &json!({"eos_token_id": 4}).to_string());
+        let gguf = GgufTokenizer {
+            model: "gpt2".into(),
+            pre: Some("qwen35".into()),
+            tokens: ["a", "b", "c", "ab", "<|im_end|>", "[PAD5]"]
+                .map(String::from)
+                .to_vec(),
+            merges: vec!["a b".into()],
+            eos: Some(4),
+            chat_template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+            ..GgufTokenizer::default()
+        };
+        (dir, gguf)
+    }
+
+    #[test]
+    fn gguf_format_uses_the_file_template_and_a_matching_base_tokenizer() {
+        let (base, gguf) = bpe_model();
+        let format = ChatFormat::from_gguf(base.path(), &gguf, 6).expect("matching tokenizer");
+        assert_eq!(render(&format, "abc"), "abc");
+        assert_eq!(format.encode("abc").expect("encode"), [3, 2]);
+        assert_eq!(
+            format.stops().classify(TokenId::new(4)),
+            TokenClass::EndTurn
+        );
+
+        let mut renamed = gguf.clone();
+        renamed.tokens[3] = "ba".into();
+        let error = ChatFormat::from_gguf(base.path(), &renamed, 6)
+            .err()
+            .expect("rejects");
+        assert!(error.contains("GGUF token 3"), "{error}");
+        let mut remerged = gguf.clone();
+        remerged.merges.push("b c".into());
+        let error = ChatFormat::from_gguf(base.path(), &remerged, 6)
+            .err()
+            .expect("rejects");
+        assert!(error.contains("GGUF merge 1"), "{error}");
+        let mut short = gguf.clone();
+        short.tokens.truncate(4);
+        assert!(ChatFormat::from_gguf(base.path(), &short, 6).is_err());
+        let mut spm = gguf.clone();
+        spm.model = "llama".into();
+        assert!(ChatFormat::from_gguf(base.path(), &spm, 6).is_err());
+        let mut untemplated = gguf;
+        untemplated.chat_template = None;
+        assert!(ChatFormat::from_gguf(base.path(), &untemplated, 6).is_err());
+    }
+
+    mod tempdir {
+        use std::{
+            fs,
+            path::{Path, PathBuf},
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        pub struct Dir(PathBuf);
+
+        impl Dir {
+            pub fn new(name: &str) -> Self {
+                static NEXT: AtomicUsize = AtomicUsize::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "metallix-{name}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir_all(&path).expect("temp dir");
+                Self(path)
+            }
+
+            pub fn path(&self) -> &Path {
+                &self.0
+            }
+
+            pub fn write(&self, name: &str, contents: &str) {
+                fs::write(self.0.join(name), contents).expect("write");
+            }
+        }
+
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
     }
 }

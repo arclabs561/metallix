@@ -1,3 +1,6 @@
+//! The logical capacity of a paged KV cache: a fixed page width and page
+//! count, and the page demand of a sequence.
+
 use std::num::NonZeroU32;
 
 use thiserror::Error;

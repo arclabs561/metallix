@@ -30,6 +30,10 @@ pub struct ConstraintLimits {
 
 impl ConstraintLimits {
     /// Validates all positive bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstraintError::ZeroLimit`] when any bound is zero.
     pub fn validate(self) -> Result<Self, ConstraintError> {
         if self.max_schema_bytes == 0 || self.max_tokenizer_bytes == 0 || self.max_output_bytes == 0
         {
@@ -199,6 +203,17 @@ pub struct JsonConstraintCompiler {
 
 impl JsonConstraintCompiler {
     /// Builds the trie and parser factory for one bounded tokenizer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstraintError::ZeroLimit`] for any zero limit and
+    /// [`ConstraintError::TokenizerTooLarge`] when serialized input exceeds its bound.
+    /// Invalid or oversized vocabulary metadata produces
+    /// [`ConstraintError::TokenizerCompilation`],
+    /// [`ConstraintError::TokenizerVocabularyTooLarge`],
+    /// [`ConstraintError::ModelVocabularyTooSmall`] or
+    /// [`ConstraintError::EosOutsideVocabulary`]. Parser-factory creation can
+    /// return [`ConstraintError::SchemaCompilation`].
     pub fn new(
         tokenizer_json: &Value,
         eos_token_id: u32,
@@ -269,6 +284,15 @@ impl JsonConstraintCompiler {
     }
 
     /// Compiles one bounded JSON Schema into a fresh session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstraintError::ZeroLimit`] for any zero limit,
+    /// [`ConstraintError::SchemaTooLarge`] when the schema exceeds its bound,
+    /// [`ConstraintError::ExternalReference`] for a nonlocal reference, and
+    /// [`ConstraintError::UnsupportedDialect`] for an unsupported dialect.
+    /// Schema compilation can return [`ConstraintError::SchemaCompilation`]
+    /// or [`ConstraintError::GrammarWarning`]. Existing sessions are unchanged.
     pub fn session(
         &self,
         schema: Value,
@@ -335,6 +359,28 @@ impl JsonConstraintSession {
     /// This compiles the tokenizer too; a caller serving many requests for one
     /// model builds a [`JsonConstraintCompiler`] once and calls
     /// [`JsonConstraintCompiler::session`] instead.
+    ///
+    /// `model_vocab_size` is the width of the logit rows passed to the
+    /// `select_*` methods; it may exceed the tokenizer's vocabulary when the
+    /// model pads its output rows.
+    ///
+    /// # Errors
+    ///
+    /// * [`ConstraintError::ZeroLimit`] for a zero bound in `limits`.
+    /// * [`ConstraintError::TokenizerTooLarge`] and
+    ///   [`ConstraintError::SchemaTooLarge`] when the serialized input passes
+    ///   its bound.
+    /// * [`ConstraintError::ExternalReference`] for a `$ref` outside the
+    ///   schema, and [`ConstraintError::UnsupportedDialect`] for a dialect
+    ///   other than draft 2020-12.
+    /// * [`ConstraintError::TokenizerVocabularyTooLarge`],
+    ///   [`ConstraintError::ModelVocabularyTooSmall`],
+    ///   [`ConstraintError::EosOutsideVocabulary`] and
+    ///   [`ConstraintError::TokenizerCompilation`] for a tokenizer that does
+    ///   not fit the model or cannot be read.
+    /// * [`ConstraintError::SchemaCompilation`] and
+    ///   [`ConstraintError::GrammarWarning`] for a schema the grammar compiler
+    ///   rejects or only partly supports.
     pub fn new(
         tokenizer_json: &Value,
         eos_token_id: u32,
@@ -358,6 +404,22 @@ impl JsonConstraintSession {
     /// one is exactly the constrained maximum. Only after
     /// [`LAZY_ARGMAX_CANDIDATES`] illegal candidates does this compute the
     /// mask over the whole vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Decoded bytes advance only on success. An unexpected matcher failure
+    /// while consuming a validated token can leave the matcher in its error state.
+    ///
+    /// * [`ConstraintError::TerminalSession`] after completion or
+    ///   [`JsonConstraintSession::finish`].
+    /// * [`ConstraintError::LogitWidth`] unless `logits` has the model's
+    ///   vocabulary width, and [`ConstraintError::NonFiniteLogit`] for a NaN
+    ///   or infinite logit.
+    /// * [`ConstraintError::NoAllowedToken`] when the grammar allows no token.
+    /// * [`ConstraintError::OutputTooLarge`] when the token's bytes would pass
+    ///   [`ConstraintLimits::max_output_bytes`].
+    /// * [`ConstraintError::NonAcceptingStop`] when the grammar stops, or would
+    ///   stop after this token, in a non-accepting state.
     pub fn select_argmax(&mut self, logits: &[f32]) -> Result<ConstraintStep, ConstraintError> {
         if let Some(index) = self.first_legal_by_logit(logits)? {
             return self.commit_in_place(index);
@@ -478,6 +540,11 @@ impl JsonConstraintSession {
     ///
     /// The checkpoint is consumed so a caller cannot accidentally reuse a
     /// stale branch after restoring it once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstraintError::CheckpointMismatch`], leaving the session
+    /// unchanged, when the checkpoint came from another session.
     pub fn restore(&mut self, checkpoint: JsonConstraintCheckpoint) -> Result<(), ConstraintError> {
         if !Arc::ptr_eq(&self.owner, &checkpoint.owner) {
             return Err(ConstraintError::CheckpointMismatch);
@@ -490,6 +557,21 @@ impl JsonConstraintSession {
     }
 
     /// Selects and consumes the constrained maximum, returning pre-consumption log probabilities.
+    ///
+    /// # Errors
+    ///
+    /// The grammar state and decoded bytes advance only on success.
+    ///
+    /// * [`ConstraintError::TerminalSession`] after completion or
+    ///   [`JsonConstraintSession::finish`].
+    /// * [`ConstraintError::LogitWidth`] unless `logits` has the model's
+    ///   vocabulary width, and [`ConstraintError::NonFiniteLogit`] for a NaN
+    ///   or infinite logit.
+    /// * [`ConstraintError::NoAllowedToken`] when the grammar allows no token.
+    /// * [`ConstraintError::OutputTooLarge`] when the token's bytes would pass
+    ///   [`ConstraintLimits::max_output_bytes`].
+    /// * [`ConstraintError::NonAcceptingStop`] when the grammar stops, or would
+    ///   stop after this token, in a non-accepting state.
     pub fn select_argmax_with_logprobs(
         &mut self,
         logits: &[f32],
@@ -508,6 +590,23 @@ impl JsonConstraintSession {
     /// its current grammar-conditioned form, and the deployed temperature-conditioned
     /// categorical policy. Padded model rows contribute to the raw probability but
     /// are never grammar-selectable.
+    ///
+    /// # Errors
+    ///
+    /// The grammar state and decoded bytes advance only on success.
+    ///
+    /// * [`ConstraintError::TerminalSession`] after completion or
+    ///   [`JsonConstraintSession::finish`].
+    /// * [`ConstraintError::LogitWidth`] unless `logits` has the model's
+    ///   vocabulary width, and [`ConstraintError::NonFiniteLogit`] for a NaN
+    ///   or infinite logit.
+    /// * [`ConstraintError::NoAllowedToken`] when the grammar allows no token.
+    /// * [`ConstraintError::OutputTooLarge`] when the token's bytes would pass
+    ///   [`ConstraintLimits::max_output_bytes`].
+    /// * [`ConstraintError::NonAcceptingStop`] when the grammar stops, or would
+    ///   stop after this token, in a non-accepting state.
+    /// * [`ConstraintError::InvalidSamplingParameter`] for an invalid
+    ///   `temperature` or `uniform`.
     pub fn select_categorical_with_logprobs(
         &mut self,
         logits: &[f32],
@@ -668,6 +767,13 @@ impl JsonConstraintSession {
     }
 
     /// Parses and independently validates accepting grammar output.
+    ///
+    /// # Errors
+    ///
+    /// * [`ConstraintError::NotComplete`] before the grammar completes.
+    /// * [`ConstraintError::InvalidJson`] when the decoded bytes do not parse.
+    /// * [`ConstraintError::SchemaValidation`] when the independent validator
+    ///   rejects the value the grammar accepted.
     pub fn validate_complete(&self) -> Result<Value, ConstraintError> {
         if !self.is_complete() {
             return Err(ConstraintError::NotComplete);

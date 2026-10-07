@@ -6,6 +6,7 @@
 //! the diagnostic forward cap remains unchanged.
 
 use std::{
+    collections::{HashMap, hash_map::Entry},
     fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -14,7 +15,7 @@ use std::{
 use engine::speculative::{SpeculationRequest, SpeculationStats};
 use qwen::{
     forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks},
-    metal::{Qwen3MlxWeights, Qwen3WeightPrecision},
+    metal::{Qwen3FloatPrecision, Qwen3MlxWeights, Qwen3WeightPrecision},
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -22,11 +23,12 @@ use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
 use chat_format::{
-    AssistantTurn, ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TurnDelta,
+    AssistantTurn, ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TokenClass,
+    TokenId, TurnDelta,
 };
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
-use crate::qwen_forward::{SamplingConfiguration, SamplingPolicy};
+use crate::qwen_forward::{SamplerId, SamplingConfiguration, SamplingPolicy};
 
 #[path = "chat_decoder.rs"]
 pub(crate) mod decoder;
@@ -60,15 +62,20 @@ mod speculation_checkpoint;
 #[path = "chat_memory_checkpoint_tests.rs"]
 mod memory_checkpoint;
 
+#[cfg(test)]
+#[path = "chat_score_checkpoint_tests.rs"]
+mod score_checkpoint;
+
 const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
 const MAX_CHAT_TOOLS: usize = 64;
 const MIB_BYTES: u64 = 1024 * 1024;
 
-/// Resident weight and K/V precision. Decode reads every weight once per
-/// token, so BF16 halves those bytes against float32, which stays the qwen
-/// crate's reference precision. Admission plans K/V at this same precision.
-const SERVING_PRECISION: Qwen3WeightPrecision = Qwen3WeightPrecision::BFloat16;
+/// Activation and K/V precision. Decode reads every weight once per token,
+/// so dense weights are served in BF16, half the bytes of float32, which
+/// stays the qwen crate's reference precision; affine-quantized checkpoints
+/// stay packed, with BF16 scales. Admission plans K/V at this precision.
+const SERVING_ACTIVATIONS: Qwen3FloatPrecision = Qwen3FloatPrecision::BFloat16;
 
 /// Default prompt-prefix cache budget: room for several multi-thousand-token
 /// agent preambles of a small Qwen3 at BF16 K/V.
@@ -269,6 +276,8 @@ pub(crate) struct AppliedSampling {
     pub(crate) top_k: Option<u32>,
     /// The seed drawn or requested, so an unseeded turn can be replayed.
     pub(crate) seed: Option<u64>,
+    /// The sampler that turned `seed` into tokens; set exactly when `seed` is.
+    pub(crate) sampler: Option<SamplerId>,
     /// Fields taken from the checkpoint's `generation_config.json`.
     pub(crate) defaults_applied: Vec<&'static str>,
 }
@@ -299,6 +308,7 @@ impl SamplingRequest {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
+                sampler: None,
                 defaults_applied,
             };
         }
@@ -323,6 +333,7 @@ impl SamplingRequest {
             top_p,
             top_k,
             seed: Some(self.seed.unwrap_or_else(fresh_seed)),
+            sampler: Some(SamplingConfiguration::SAMPLER),
             defaults_applied,
         }
     }
@@ -753,7 +764,53 @@ pub(crate) trait ChatBackend {
         timeout: Duration,
         on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError>;
+
+    /// Scores caller-given tokens teacher-forced; a backend without the
+    /// all-position rows it needs refuses.
+    fn score(&self, request: ScoreRequest<'_>) -> Result<ScoreResult, ScoreError> {
+        let _ = request;
+        Err(ScoreError::Unsupported)
+    }
 }
+
+/// Text to score: a raw string encoded as it stands, token IDs used as
+/// given, or a conversation rendered by the chat template with its
+/// generation prompt, exactly as a generation request would see it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScoreText<'a> {
+    Text(&'a str),
+    Ids(&'a [i32]),
+    Chat(Conversation<'a>),
+}
+
+/// A prompt and, optionally, a continuation scored after it. Without a
+/// continuation, `score_prompt` scores every prompt token after the first;
+/// otherwise only the tokens after the whole sequence are ranked.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScoreRequest<'a> {
+    pub(crate) prompt: ScoreText<'a>,
+    pub(crate) continuation: Option<ScoreText<'a>>,
+    pub(crate) score_prompt: bool,
+    /// Most likely alternatives to report per scored token, and after the
+    /// sequence.
+    pub(crate) top_logprobs: usize,
+}
+
+/// The scored sequence: the log probabilities of `ids[from..]`, the most
+/// likely tokens after the last one, and the bytes of every token named.
+#[derive(Clone, Debug)]
+pub(crate) struct ScoreResult {
+    pub(crate) ids: Vec<i32>,
+    pub(crate) from: usize,
+    pub(crate) scores: qwen::forward::Qwen3Scores,
+    pub(crate) pieces: HashMap<i32, Vec<u8>>,
+    /// Whether the most likely next token ends a turn.
+    pub(crate) next_ends_turn: bool,
+    pub(crate) score_ms: f64,
+}
+
+/// Most alternatives a scored token reports.
+pub(crate) const MAX_SCORE_TOP_LOGPROBS: usize = 20;
 
 /// The model config fields the chat path reads; stop tokens come from
 /// [`ChatFormat`].
@@ -772,8 +829,15 @@ impl ChatSession {
         let template_sha256 = format.template().sha256();
 
         let mut weights = Qwen3MlxWeights::load(model).map_err(|error| error.to_string())?;
+        let precision = match weights.precision().map_err(|error| error.to_string())? {
+            Qwen3WeightPrecision::Affine { quantization, .. } => Qwen3WeightPrecision::Affine {
+                quantization,
+                activations: SERVING_ACTIVATIONS,
+            },
+            Qwen3WeightPrecision::Dense(_) => Qwen3WeightPrecision::Dense(SERVING_ACTIVATIONS),
+        };
         weights
-            .prepare_precision(SERVING_PRECISION)
+            .prepare_precision(precision)
             .map_err(|error| error.to_string())?;
         // The template, tokenizer and config (which carries the RoPE
         // settings) fix how tokens become K/V; the chat path loads no adapter.
@@ -973,10 +1037,19 @@ impl ChatSession {
         // sequence competes for the compute a verify uses, and requests
         // waiting in the front queue finish sooner when this one does. Once
         // decode batches requests, pass the batch here.
-        let speculating = request.speculation.allows(0, 0) && request.json_schema.is_none();
+        // The verify-cost calibration covers dense weights only. Packed
+        // matmul has a different row-cost curve and needs its own gate.
+        let speculating = request.speculation.allows(0, 0)
+            && request.json_schema.is_none()
+            && self
+                .weights
+                .precision()
+                .map_err(|error| ChatGenerationError::message(error.to_string()))?
+                .quantization()
+                .is_none();
         let gpu_verify = turn.verifies_with_gpu_greedy(&self.format);
         let lookup = engine::speculative::PromptLookup::default();
-        let mut draft_length = speculation::draft_length(SERVING_PRECISION);
+        let mut draft_length = speculation::draft_length(SERVING_ACTIVATIONS);
         let mut speculation_stats = SpeculationStats::default();
 
         'decode: for step in 0..max_tokens {
@@ -1215,9 +1288,125 @@ impl ChatSession {
     }
 }
 
+/// Scoring capability failures are distinct from malformed scoring inputs.
+#[derive(Debug)]
+pub(crate) enum ScoreError {
+    Unsupported,
+    Execution(ChatGenerationError),
+}
+
+impl ChatSession {
+    fn score_tokens(&self, request: ScoreRequest<'_>) -> Result<ScoreResult, ChatGenerationError> {
+        let started = Instant::now();
+        let span = tracing::info_span!("chat.score", tokens = Empty, score_ms = Empty);
+        let _entered = span.enter();
+        // A string continuation is encoded alone, without special tokens, and
+        // appended to the prompt's IDs; callers who need another split (lm-eval
+        // encodes context and continuation together) pass token IDs.
+        let encode = |text: ScoreText<'_>| -> Result<Vec<i32>, String> {
+            match text {
+                ScoreText::Text(text) => self.format.encode(text),
+                ScoreText::Ids(ids) => Ok(ids.to_vec()),
+                ScoreText::Chat(conversation) => self
+                    .format
+                    .prompt(conversation, true)
+                    .map(|prompt| prompt.ids),
+            }
+        };
+        if request.top_logprobs > MAX_SCORE_TOP_LOGPROBS {
+            return Err(ChatGenerationError::Message(format!(
+                "top_logprobs must be 0..={MAX_SCORE_TOP_LOGPROBS}"
+            )));
+        }
+        let mut ids = encode(request.prompt).map_err(ChatGenerationError::Message)?;
+        let from = match request.continuation {
+            None if request.score_prompt => 1,
+            None => ids.len(),
+            Some(ScoreText::Chat(_)) => {
+                return Err(ChatGenerationError::Message(
+                    "a continuation is text or token IDs".into(),
+                ));
+            }
+            Some(continuation) => {
+                let continuation = encode(continuation).map_err(ChatGenerationError::Message)?;
+                if continuation.is_empty() || ids.is_empty() {
+                    return Err(ChatGenerationError::Message(
+                        "scoring needs a nonempty prompt and continuation".into(),
+                    ));
+                }
+                let from = ids.len();
+                ids.extend(continuation);
+                from
+            }
+        };
+        if ids.is_empty() {
+            return Err(ChatGenerationError::Message(
+                "scoring needs a nonempty prompt".into(),
+            ));
+        }
+        if ids.len() > self.context_limit {
+            return Err(ChatGenerationError::Message(format!(
+                "scoring {} tokens exceeds the {}-token context",
+                ids.len(),
+                self.context_limit
+            )));
+        }
+        let mut executor = self
+            .weights
+            .resident_chat_executor(self.context_limit, self.kv_budget_bytes)
+            .map_err(|error| ChatGenerationError::Message(error.to_string()))?;
+        let scores = executor
+            .score(
+                &ids,
+                from,
+                request.top_logprobs,
+                qwen::forward::SCORE_CHUNK_ROWS,
+            )
+            .map_err(|error| ChatGenerationError::Message(error.to_string()))?;
+        let mut pieces = HashMap::new();
+        let named = scores
+            .tokens
+            .iter()
+            .flat_map(|token| &token.top)
+            .chain(&scores.next)
+            .map(|&(id, _)| id);
+        for id in ids.iter().copied().chain(named) {
+            if let Entry::Vacant(entry) = pieces.entry(id) {
+                entry.insert(
+                    self.format
+                        .tokenizer()
+                        .token_bytes(id)
+                        .map_err(ChatGenerationError::Message)?,
+                );
+            }
+        }
+        let next_ends_turn = match scores.next.first() {
+            Some(&(id, _)) => {
+                self.format.stops().classify(TokenId::from_model(id)?) == TokenClass::EndTurn
+            }
+            None => false,
+        };
+        let score_ms = elapsed_ms(started.elapsed());
+        span.record("tokens", ids.len());
+        span.record("score_ms", score_ms);
+        Ok(ScoreResult {
+            ids,
+            from,
+            scores,
+            pieces,
+            next_ends_turn,
+            score_ms,
+        })
+    }
+}
+
 impl ChatBackend for ChatSession {
     fn load_ms(&self) -> f64 {
         self.load_ms()
+    }
+
+    fn score(&self, request: ScoreRequest<'_>) -> Result<ScoreResult, ScoreError> {
+        self.score_tokens(request).map_err(ScoreError::Execution)
     }
 
     fn generate_with_timeout(
@@ -1245,15 +1434,31 @@ fn load_config(
 ) -> Result<(ChatConfig, qwen::forward::Qwen3ResidentChatPlan, String), String> {
     let (config, raw) = read_config(model)?;
     // Reject context/KV admission before checkpoint payload loading.
-    let plan = qwen::forward::Qwen3ForwardConfig::parse(&raw)
-        .and_then(|config| {
-            config.resident_chat_plan(
-                limits.context_tokens(),
-                limits.kv_budget_bytes(),
-                SERVING_PRECISION,
-            )
-        })
-        .map_err(|error| error.to_string())?;
+    let forward =
+        qwen::forward::Qwen3ForwardConfig::parse(&raw).map_err(|error| error.to_string())?;
+    let plan = forward
+        .resident_chat_plan(
+            limits.context_tokens(),
+            limits.kv_budget_bytes(),
+            SERVING_ACTIVATIONS,
+        )
+        .map_err(|error| {
+            if matches!(
+                error,
+                qwen::forward::Qwen3ForwardError::ResidentChatKvBudget { .. }
+            ) {
+                match forward.resident_chat_capacity(limits.kv_budget_bytes(), SERVING_ACTIVATIONS)
+                {
+                    Ok(Some(tokens)) => {
+                        format!("{error}; largest fitting logical context is {tokens} tokens")
+                    }
+                    Ok(None) => format!("{error}; no positive logical context fits"),
+                    Err(capacity_error) => capacity_error.to_string(),
+                }
+            } else {
+                error.to_string()
+            }
+        })?;
     Ok((
         config,
         plan,
@@ -1711,6 +1916,42 @@ mod tests {
                 assert_eq!(final_text, "");
             }
         }
+    }
+
+    #[test]
+    fn state_budget_refusal_reports_capacity_before_any_payload_load() {
+        let directory =
+            std::env::temp_dir().join(format!("qwen-capacity-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let config = json!({
+            "model_type":"qwen3", "num_hidden_layers":28, "hidden_size":1024,
+            "intermediate_size":3072, "vocab_size":151_936, "num_attention_heads":16,
+            "num_key_value_heads":8, "head_dim":128, "max_position_embeddings":40_960,
+            "rms_norm_eps":0.000_001, "rope_theta":1_000_000, "hidden_act":"silu",
+            "tie_word_embeddings":true, "attention_bias":false, "mlp_bias":false,
+            "sliding_window":null, "use_sliding_window":false
+        });
+        std::fs::write(directory.join("config.json"), config.to_string()).unwrap();
+        for (budget, expected) in [
+            (1024 * 1024, "largest fitting logical context is 9 tokens"),
+            (4096, "no positive logical context fits"),
+        ] {
+            let error = ChatSession::load(
+                &directory,
+                ResidentChatLimits {
+                    kv_budget_bytes: budget,
+                    ..ResidentChatLimits::from_mib(256, 0)
+                },
+            )
+            .err()
+            .expect("config-only fixture refuses before tokenizer/weights");
+            assert!(error.contains(expected), "{error}");
+            assert!(
+                error.contains("29360128"),
+                "preserve required bytes: {error}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

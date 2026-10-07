@@ -346,11 +346,7 @@ fn paged_out_of_blocks_leaves_the_sequence_usable() {
         &config,
         &weights,
         config
-            .resident_chat_plan(
-                1024,
-                u64::MAX,
-                crate::forward::Qwen3WeightPrecision::Float32,
-            )
+            .resident_chat_plan(1024, u64::MAX, crate::forward::Qwen3FloatPrecision::Float32)
             .expect("plan"),
     );
     let seq = SequenceId(1);

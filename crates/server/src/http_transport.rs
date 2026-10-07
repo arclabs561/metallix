@@ -39,17 +39,34 @@ impl Default for TransportLimits {
     }
 }
 
+/// Chooses the largest request body accepted for one request, from its
+/// method and request target after the head is parsed, before allocating or
+/// reading the remaining body. The bounded header buffer can already contain
+/// initial body bytes. The target includes its query string, if any.
+pub(crate) trait BodyLimit {
+    fn body_limit(&self, method: &str, path: &str) -> usize;
+}
+
+/// Every route gets `body_bytes`.
+impl BodyLimit for TransportLimits {
+    fn body_limit(&self, _method: &str, _path: &str) -> usize {
+        self.body_bytes
+    }
+}
+
 /// A complete, bounded HTTP request. Connections accept exactly one request.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) body: Vec<u8>,
+    /// Validated media type, retained for multipart forwarding.
+    pub(crate) content_type: Option<String>,
     pub(crate) trace: TraceHeaders,
 }
 
-/// Request-correlation and router headers; every other header is dropped
-/// after validation.
+/// Request-correlation and router headers. The request retains its media
+/// type separately; other headers are dropped after framing validation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TraceHeaders {
     pub(crate) traceparent: Option<String>,
@@ -69,13 +86,24 @@ const MAX_CACHE_SALT_BYTES: usize = 256;
 pub(crate) struct HttpError {
     pub(crate) status: u16,
     pub(crate) message: &'static str,
+    /// The byte limit a 413 refers to, so the client learns what to fit.
+    pub(crate) limit: Option<u64>,
 }
 
 impl HttpError {
+    /// The message for the client, naming the limit when there is one.
+    pub(crate) fn describe(&self) -> std::borrow::Cow<'static, str> {
+        match self.limit {
+            Some(limit) => format!("{} of {limit} bytes", self.message).into(),
+            None => self.message.into(),
+        }
+    }
+
     const fn bad_request(message: &'static str) -> Self {
         Self {
             status: 400,
             message,
+            limit: None,
         }
     }
 
@@ -83,6 +111,7 @@ impl HttpError {
         Self {
             status: 408,
             message: "request read deadline exceeded",
+            limit: None,
         }
     }
 }
@@ -129,10 +158,27 @@ impl Connection {
     }
 
     /// Reads exactly one HTTP/1.0 or HTTP/1.1 request before the absolute deadline.
+    #[cfg(test)]
     pub(crate) fn read_request(&mut self) -> Result<Request, HttpError> {
+        let limits = self.limits;
+        self.read_request_with(&limits)
+    }
+
+    /// Reads one request with its body limit chosen per route by
+    /// `body_limit` instead of [`TransportLimits::body_bytes`].
+    pub(crate) fn read_request_with(
+        &mut self,
+        body_limit: &dyn BodyLimit,
+    ) -> Result<Request, HttpError> {
         let deadline = self.read_deadline;
-        let (mut received, header_end, method, path, body_length, trace) =
-            self.read_head(deadline)?;
+        let (mut received, header_end, method, path, body_length, trace, content_type) =
+            self.read_head(deadline, body_limit)?;
+        // Routing uses the URL path; read_head retains the raw request target
+        // for framing and body-limit policy decisions.
+        let path = path
+            .split_once('?')
+            .map_or(path.as_str(), |(path, _)| path)
+            .to_owned();
         self.path = Some(path.clone());
         let prefix = received.split_off(header_end);
         if prefix.len() > body_length {
@@ -157,6 +203,7 @@ impl Connection {
             path,
             body: received,
             trace,
+            content_type,
         })
     }
 
@@ -249,7 +296,19 @@ impl Connection {
     fn read_head(
         &mut self,
         deadline: Instant,
-    ) -> Result<(Vec<u8>, usize, String, String, usize, TraceHeaders), HttpError> {
+        body_limit: &dyn BodyLimit,
+    ) -> Result<
+        (
+            Vec<u8>,
+            usize,
+            String,
+            String,
+            usize,
+            TraceHeaders,
+            Option<String>,
+        ),
+        HttpError,
+    > {
         let mut input = Vec::with_capacity(self.limits.header_bytes.min(1024));
         loop {
             validate_header_wire(&input)?;
@@ -272,9 +331,11 @@ impl Connection {
                         return Err(HttpError {
                             status: 505,
                             message: "only HTTP/1.0 and HTTP/1.1 are supported",
+                            limit: None,
                         });
                     }
-                    let body_length = validate_headers(&request, &method, version, self.limits)?;
+                    let limit = body_limit.body_limit(&method, &path);
+                    let body_length = validate_headers(&request, &method, version, limit)?;
                     self.minor_version = Some(version);
                     // This opt-in affects only this connection's cancellation
                     // semantics; ordinary clients retain half-close support.
@@ -283,6 +344,7 @@ impl Connection {
                             && header.value == b"1"
                     });
                     let trace = trace_headers(&request);
+                    let content_type = content_type(&request)?;
                     if trace.cache_salt.as_deref().is_some_and(|salt| {
                         salt.is_empty()
                             || salt.len() > MAX_CACHE_SALT_BYTES
@@ -292,13 +354,22 @@ impl Connection {
                             "x-metallix-cache-salt must be 1 to 256 visible ASCII characters",
                         ));
                     }
-                    return Ok((input, header_end, method, path, body_length, trace));
+                    return Ok((
+                        input,
+                        header_end,
+                        method,
+                        path,
+                        body_length,
+                        trace,
+                        content_type,
+                    ));
                 }
                 Ok(httparse::Status::Partial) => {
                     if input.len() == self.limits.header_bytes {
                         return Err(HttpError {
                             status: 431,
                             message: "request headers exceed the 16 KiB limit",
+                            limit: None,
                         });
                     }
                 }
@@ -306,6 +377,7 @@ impl Connection {
                     return Err(HttpError {
                         status: 431,
                         message: "request has too many headers",
+                        limit: None,
                     });
                 }
                 Err(_) => return Err(HttpError::bad_request("malformed HTTP request")),
@@ -360,7 +432,7 @@ fn validate_headers(
     request: &httparse::Request<'_, '_>,
     method: &str,
     version: u8,
-    limits: TransportLimits,
+    body_limit: usize,
 ) -> Result<usize, HttpError> {
     let mut host = None;
     let mut content_length = None;
@@ -373,13 +445,14 @@ fn validate_headers(
             if content_length.is_some() {
                 return Err(HttpError::bad_request("duplicate Content-Length header"));
             }
-            content_length = Some(parse_content_length(header.value, limits.body_bytes)?);
+            content_length = Some(parse_content_length(header.value, body_limit)?);
         } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
             return Err(HttpError::bad_request("Transfer-Encoding is unsupported"));
         } else if header.name.eq_ignore_ascii_case("expect") {
             return Err(HttpError {
                 status: 417,
                 message: "Expect is unsupported",
+                limit: None,
             });
         }
     }
@@ -401,6 +474,35 @@ fn validate_headers(
             )),
         },
     }
+}
+
+/// Retains one bounded, printable media type for safe forwarding.
+fn content_type(request: &httparse::Request<'_, '_>) -> Result<Option<String>, HttpError> {
+    let mut value = None;
+    for header in request
+        .headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("content-type"))
+    {
+        if value.is_some()
+            || header.value.is_empty()
+            || header.value.len() > 1024
+            || !header
+                .value
+                .iter()
+                .all(|b| b.is_ascii_graphic() || *b == b' ')
+        {
+            return Err(HttpError::bad_request(
+                "Content-Type must be unique and contain at most 1024 visible ASCII bytes",
+            ));
+        }
+        value = Some(
+            std::str::from_utf8(header.value)
+                .map_err(|_| HttpError::bad_request("invalid Content-Type"))?
+                .to_owned(),
+        );
+    }
+    Ok(value)
 }
 
 /// The first `traceparent`, `x-request-id` and `x-metallix-cache-salt` values
@@ -432,7 +534,8 @@ fn parse_content_length(value: &[u8], maximum: usize) -> Result<usize, HttpError
     if value > maximum {
         return Err(HttpError {
             status: 413,
-            message: "request body exceeds the 1 MiB limit",
+            message: "request body exceeds this route's size limit",
+            limit: u64::try_from(maximum).ok(),
         });
     }
     Ok(value)
@@ -584,6 +687,7 @@ mod tests {
                 path: "/healthz".into(),
                 body: vec![],
                 trace: TraceHeaders::default(),
+                content_type: None,
             }
         );
         valid.join().unwrap();
@@ -718,15 +822,97 @@ mod tests {
             ),
             (
                 b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n".to_vec(),
-                HttpError { status: 417, message: "Expect is unsupported" },
+                HttpError { status: 417, message: "Expect is unsupported", limit: None },
             ),
             (
                 b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n".to_vec(),
-                HttpError { status: 413, message: "request body exceeds the 1 MiB limit" },
+                HttpError { status: 413, message: "request body exceeds this route's size limit", limit: Some(1024 * 1024) },
             ),
         ] {
             assert_eq!(parse_wire(wire, limits()), Err(expected));
         }
+    }
+
+    /// Raises the limit for one route only.
+    struct OneRoute(usize);
+
+    impl super::BodyLimit for OneRoute {
+        fn body_limit(&self, method: &str, path: &str) -> usize {
+            if method == "POST" && path == "/v1/audio/transcriptions" {
+                self.0
+            } else {
+                TransportLimits::default().body_bytes
+            }
+        }
+    }
+
+    /// Sends one request; a refused request is answered by the server's
+    /// error writer, and the client's view of that answer is returned too.
+    fn read_with(
+        path: &str,
+        body: &[u8],
+        limit: &OneRoute,
+        send_body: bool,
+    ) -> (Result<usize, HttpError>, String) {
+        let mut wire = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        if send_body {
+            wire.extend_from_slice(body);
+        }
+        let listener = listener();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            // Refusal cases send only the head: the server must reject the
+            // declared length without waiting for the body.
+            let _ = stream.write_all(&wire);
+            let _ = stream.shutdown(Shutdown::Write);
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer);
+            answer
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut connection = Connection::accept(stream, TransportLimits::default());
+        let result = connection.read_request_with(limit);
+        let result = match result {
+            Ok(request) => {
+                drop(connection);
+                Ok(request.body.len())
+            }
+            Err(error) => {
+                crate::generation_routes::error_response(
+                    connection,
+                    error.status,
+                    None,
+                    &error.describe(),
+                );
+                Err(error)
+            }
+        };
+        (result, client.join().unwrap())
+    }
+
+    #[test]
+    fn a_route_limit_raises_only_its_own_route() {
+        let body = vec![b'x'; 1024 * 1024 + 1];
+        let raised = OneRoute(2 * 1024 * 1024);
+        let (accepted, _) = read_with("/v1/audio/transcriptions", &body, &raised, true);
+        assert_eq!(accepted, Ok(body.len()));
+        let (refused, answer) = read_with("/v1/responses", &body, &raised, false);
+        assert_eq!(refused.unwrap_err().limit, Some(1024 * 1024));
+        assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
+        assert!(answer.contains("of 1048576 bytes"), "{answer}");
+        let (refused, answer) = read_with(
+            "/v1/audio/transcriptions",
+            &body,
+            &OneRoute(1024 * 1024),
+            false,
+        );
+        assert_eq!(refused.unwrap_err().status, 413);
+        assert!(answer.contains("of 1048576 bytes"), "{answer}");
     }
 
     #[test]
@@ -743,7 +929,8 @@ mod tests {
             ),
             Err(HttpError {
                 status: 431,
-                message: "request has too many headers"
+                message: "request has too many headers",
+                limit: None,
             })
         );
         let byte_limited = TransportLimits {
@@ -757,7 +944,8 @@ mod tests {
             ),
             Err(HttpError {
                 status: 431,
-                message: "request headers exceed the 16 KiB limit"
+                message: "request headers exceed the 16 KiB limit",
+                limit: None,
             })
         );
     }
@@ -793,6 +981,22 @@ mod tests {
         connection.flush().unwrap();
         drop(connection);
         assert_eq!(client.join().unwrap(), response);
+    }
+
+    #[test]
+    fn query_parameters_do_not_change_the_routing_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(b"POST /v1/messages?beta=true HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut connection = Connection::accept(stream, TransportLimits::default());
+        let request = connection.read_request().unwrap();
+        assert_eq!(request.path, "/v1/messages");
+        assert_eq!(request.body, b"{}");
+        client.join().unwrap();
     }
 
     #[test]
@@ -993,5 +1197,16 @@ mod tests {
         old.read_to_end(&mut received).expect("close arrives");
         assert!(received.is_empty());
         drop(open);
+    }
+
+    #[test]
+    fn content_type_is_unique_bounded_and_visible_before_forwarding() {
+        for value in ["Content-Type: a\r\nContent-Type: b", "Content-Type: a\tb"] {
+            let wire = format!("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\n{value}\r\nContent-Length: 0\r\n\r\n").into_bytes();
+            assert_eq!(parse_wire(wire, limits()).unwrap_err().status, 400);
+        }
+        let value = "x".repeat(1025);
+        let wire = format!("POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\nContent-Type: {value}\r\nContent-Length: 0\r\n\r\n").into_bytes();
+        assert_eq!(parse_wire(wire, limits()).unwrap_err().status, 400);
     }
 }

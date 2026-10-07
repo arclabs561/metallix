@@ -221,6 +221,8 @@ remain open.
 | Route | Capability | Body and response |
 | --- | --- | --- |
 | `POST /v1/responses` | `generate` | Unchanged Responses shape. |
+| `POST /v1/completions` | `generate` | `OpenAI` legacy Completions for scoring a raw prompt (no chat template). `echo` with `logprobs` (0 to 5) returns every prompt token's log probability, the first `null`; `max_tokens` 1 at temperature 0 adds the greedy next token. Longer generation, `n` above 1, `best_of`, `stop`, `suffix` and streaming return 400 naming the field. |
+| `POST /v1/score` | `generate` | `{model, prompt, continuation, top_logprobs?}`. The prompt is text, token IDs, or `{messages, tools?, reasoning_effort?}` rendered by the chat template; the continuation is text or token IDs. Returns each continuation token's `model_logprob` and their `sum_logprob`. |
 | `POST /v1/decisions` | `decide` | The existing `mx decide` request plus `model`; responds with the same receipt the CLI prints. |
 | `POST /v1/embeddings` | `embed` | OpenAI-compatible `{model, input}` with `data[].embedding`, plus the adapter's pooling, normalization and dimension in metadata. |
 | `GET /v1/models` | none | Every entry with `capabilities` and `loaded` state. |

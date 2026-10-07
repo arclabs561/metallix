@@ -37,6 +37,8 @@ pub(crate) enum ModelKind {
     /// `qwen3_5` hybrid checkpoint (Qwen3.5, Qwen3.6, Qwen3.8), text only:
     /// generation only.
     Qwen35,
+    /// Experimental Qwen3-ASR WAV transcription only.
+    Qwen3Asr,
     /// Julia-1 checkpoint on the native CPU path: `/v1/decisions` only.
     Julia,
     /// Qwen3-Embedding checkpoint: `/v1/embeddings` only.
@@ -59,6 +61,7 @@ impl ModelKind {
             Self::Qwen => &["generate", "decide"],
             Self::Gemma4 | Self::Qwen35 => &["generate"],
             Self::Julia => &["decide"],
+            Self::Qwen3Asr => &["transcribe"],
             Self::QwenEmbedding | Self::PplxContext => &["embed"],
             Self::PplxLate => &["embed", "rerank"],
         }
@@ -230,6 +233,14 @@ pub(crate) trait ModelWorker {
         None
     }
 
+    fn transcribe(
+        &mut self,
+        _request: &crate::transcriptions::Request,
+        _control: &mut crate::transcriptions::Control<'_>,
+    ) -> Option<Result<crate::transcriptions::Response, crate::transcriptions::Error>> {
+        None
+    }
+
     /// Runs throwaway work once after load so the first request does not pay
     /// first-use costs; models without such costs do nothing.
     fn warm(&mut self) -> Result<(), String> {
@@ -321,6 +332,22 @@ impl ModelWorker for PplxLateEmbedder {
     }
 }
 
+impl ModelWorker for crate::qwen_asr::QwenAsr {
+    fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+        None
+    }
+    fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+        None
+    }
+    fn transcribe(
+        &mut self,
+        request: &crate::transcriptions::Request,
+        control: &mut crate::transcriptions::Control<'_>,
+    ) -> Option<Result<crate::transcriptions::Response, crate::transcriptions::Error>> {
+        Some(crate::qwen_asr::QwenAsr::transcribe(self, request, control))
+    }
+}
+
 pub(crate) fn load(
     entry: &ServedEntry,
     limits: ResidentChatLimits,
@@ -335,6 +362,7 @@ pub(crate) fn load(
             &entry.path,
             limits,
         )?),
+        ModelKind::Qwen3Asr => Box::new(crate::qwen_asr::QwenAsr::load(&entry.path, limits)?),
         ModelKind::Julia => Box::new(JuliaDecider::load(&entry.path)?),
         ModelKind::QwenEmbedding => Box::new(QwenEmbedder::load(&entry.path)?),
         ModelKind::PplxContext => Box::new(PplxContextEmbedder::load(&entry.path)?),
@@ -364,6 +392,12 @@ mod tests {
         );
         assert!(!parsed[0].kind.generates());
         assert_eq!(ModelKind::Qwen.capabilities(), ["generate", "decide"]);
+        let audio =
+            parse_manifest(br#"{"models":[{"id":"asr","kind":"qwen3_asr","path":"/audio"}]}"#)
+                .unwrap();
+        assert_eq!(audio[0].kind, ModelKind::Qwen3Asr);
+        assert_eq!(audio[0].kind.capabilities(), ["transcribe"]);
+        assert!(!audio[0].kind.generates());
         let context =
             parse_manifest(br#"{"models": [{"id": "c", "kind": "pplx_context", "path": "/c"}]}"#)
                 .unwrap();

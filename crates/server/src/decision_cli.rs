@@ -18,7 +18,7 @@ pub(crate) struct DecisionArgs {
     #[arg(long, default_value = "1", value_parser = super::parse_temperature)]
     temperature: f64,
     /// Maximum rendered tokens per question; overflow fails without truncation.
-    #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..=16384))]
+    #[arg(long, default_value_t = 2048, value_parser = crate::cli::parse_context_tokens)]
     context_tokens: u32,
     /// Logical K/V admission budget in MiB, not a physical memory limit.
     #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
@@ -41,6 +41,29 @@ mod tests {
     use clap::Parser;
 
     use crate::{Cli, Command};
+
+    #[test]
+    fn decisions_accept_explicit_context_above_the_old_cli_ceiling() {
+        for requested in ["16385", "262144"] {
+            let parsed = Cli::try_parse_from([
+                "mx",
+                "decide",
+                "--model",
+                "local",
+                "--request",
+                "request.json",
+                "--context-tokens",
+                requested,
+            ])
+            .expect("explicit context");
+            let Command::Decide(args) = parsed.command else {
+                panic!("wrong command")
+            };
+            let limits = crate::resident_chat_limits(args.context_tokens, args.kv_budget_mib);
+            assert_eq!(limits.context_tokens(), requested.parse::<usize>().unwrap());
+            assert_eq!(limits.kv_budget_bytes(), 512 * 1024 * 1024);
+        }
+    }
 
     #[test]
     fn direct_decisions_have_explicit_input_and_no_generation_arguments() {

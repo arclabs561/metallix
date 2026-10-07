@@ -1,3 +1,42 @@
+//! The `mx` command-line program and its HTTP server, `mx serve`.
+//!
+//! Both binaries, `mx` and the identical `metallix`, call [`run`], which parses
+//! the command line and runs one subcommand. The library target exists so the
+//! two binaries and the integration tests share one implementation. Its only
+//! public items are [`run`] and [`range_fetch`], which the `DeepSeek` V4.1
+//! integration tests use; neither is a stable API for other crates.
+//!
+//! Model architectures live in their own crates. This crate loads them,
+//! prepares prompts, schedules requests and serves the HTTP protocols.
+//!
+//! # Layout
+//!
+//! Every module is private; these are the ones to start from.
+//!
+//! * `cli` defines the subcommands and their arguments.
+//! * `serving` is `mx serve`. `serve_proxy` runs one child `mx serve` process
+//!   per registered model (`serve_registry`), `admission_queue` orders each
+//!   model's requests, and `generation_routes` parses each protocol
+//!   (`responses`, `chat_completions`, `anthropic_messages`) before any
+//!   generation starts.
+//!   The opt-in `engine_loop` owns paged decoder state and batches active
+//!   sequences while protocol writer threads handle their output.
+//! * `chat_generation` and `chat_decoder` run resident chat generation;
+//!   `qwen_prefix_cache` and `qwen_speculation` add prefix reuse and
+//!   speculative decoding to it.
+//! * `inspect`, `supports` and `commands` implement the read-only and
+//!   diagnostic subcommands.
+//! * `telemetry`, `trace_context` and `gpu` provide spans, request IDs and
+//!   MLX memory figures for diagnostics.
+//!
+//! # Features
+//!
+//! * `metal` builds everything that runs a model on the GPU, including
+//!   `serve`, `gen` and `chat`. Without it only `inspect`, `fetch` and the
+//!   reduced `DeepSeek` runner are available.
+//! * `structured-output` enables JSON Schema constrained generation.
+//! * `timeline` writes a Chrome/Perfetto JSON timeline to `--trace-out`.
+
 use std::process::ExitCode;
 
 #[cfg(feature = "metal")]
@@ -23,6 +62,8 @@ mod chat_tools;
 mod cli;
 mod commands;
 #[cfg(feature = "metal")]
+mod completions;
+#[cfg(feature = "metal")]
 mod decision_cli;
 mod deepseek_reduced_cli;
 #[cfg(feature = "metal")]
@@ -36,9 +77,13 @@ mod inspect;
 mod julia_decisions;
 mod model_registry;
 #[cfg(feature = "metal")]
+mod multipart;
+#[cfg(feature = "metal")]
 mod pplx_context_embeddings;
 #[cfg(feature = "metal")]
 mod pplx_late_embeddings;
+#[cfg(feature = "metal")]
+mod qwen_asr;
 #[cfg(feature = "metal")]
 mod qwen_decisions;
 #[cfg(feature = "metal")]
@@ -46,6 +91,8 @@ mod qwen_embeddings;
 pub mod range_fetch;
 #[cfg(feature = "metal")]
 mod responses;
+#[cfg(feature = "metal")]
+mod scoring;
 #[cfg(feature = "metal")]
 mod serve_proxy;
 #[cfg(feature = "metal")]
@@ -56,6 +103,8 @@ mod serving;
 mod sse;
 #[cfg(feature = "metal")]
 mod supports;
+#[cfg(feature = "metal")]
+mod transcriptions;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
@@ -653,6 +702,83 @@ mod tests {
 
     use super::{Cli, Command, DeepseekInspectCommand, InspectCommand};
     use std::path::Path;
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn explicit_context_reaches_resident_limits_for_each_consumer() {
+        for (command, extra) in [
+            ("chat", vec![]),
+            ("agent", vec!["--workspace", ".", "--prompt", "hello"]),
+            ("serve", vec![]),
+        ] {
+            for requested in ["16385", "262144"] {
+                let mut args = vec![
+                    "mx",
+                    command,
+                    "--model",
+                    "local",
+                    "--context-tokens",
+                    requested,
+                ];
+                args.extend_from_slice(&extra);
+                let cli = Cli::try_parse_from(args)
+                    .expect("explicit context parses before model admission");
+                let (Command::Chat {
+                    context_tokens: tokens,
+                    ..
+                }
+                | Command::Agent {
+                    context_tokens: tokens,
+                    ..
+                }
+                | Command::Serve {
+                    context_tokens: tokens,
+                    ..
+                }) = cli.command
+                else {
+                    panic!("unexpected consumer");
+                };
+                let limits = super::resident_chat_limits(tokens, 512);
+                assert_eq!(limits.context_tokens(), requested.parse::<usize>().unwrap());
+                assert_eq!(limits.kv_budget_bytes(), 512 * 1024 * 1024);
+            }
+            for invalid in ["0", "auto", "2147483648", "4294967296"] {
+                let mut args = vec![
+                    "mx",
+                    command,
+                    "--model",
+                    "local",
+                    "--context-tokens",
+                    invalid,
+                ];
+                args.extend_from_slice(&extra);
+                assert!(Cli::try_parse_from(args).is_err(), "{command}: {invalid}");
+            }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn explicit_context_errors_distinguish_empty_from_invalid_integer() {
+        use crate::cli::{ExplicitContextError, parse_context_tokens};
+        assert!(matches!(
+            parse_context_tokens("0"),
+            Err(ExplicitContextError::Empty)
+        ));
+        assert!(matches!(
+            parse_context_tokens("2147483648"),
+            Err(ExplicitContextError::Shape {
+                requested: 2_147_483_648
+            })
+        ));
+        assert_eq!(parse_context_tokens("2147483647").unwrap(), 2_147_483_647);
+        for invalid in ["auto", "-1", "4294967296"] {
+            assert!(matches!(
+                parse_context_tokens(invalid),
+                Err(ExplicitContextError::Integer(_))
+            ));
+        }
+    }
 
     #[test]
     fn execution_shape_inspection_is_explicitly_opt_in() {

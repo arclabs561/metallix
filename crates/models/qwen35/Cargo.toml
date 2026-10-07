@@ -7,6 +7,8 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+blockfloat = { path = "../../blockfloat" }
+checkpoint = { path = "../../checkpoint" }
 mlx-rs = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -16,6 +18,7 @@ thiserror.workspace = true
 metal = ["dep:mlx-rs"]
 
 [dev-dependencies]
+chat-format = { path = "../../chat-format" }
 sha2.workspace = true
 
 [lints]

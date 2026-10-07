@@ -1,0 +1,31 @@
+[package]
+name = "qwen3-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+audio = { path = "../../audio" }
+media = { path = "../../media" }
+mlx-rs = { workspace = true, optional = true }
+qwen = { path = "../qwen", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+tracing.workspace = true
+
+[features]
+metal = ["dep:mlx-rs", "dep:qwen", "qwen/metal"]
+# Deliberately wrong encoder variants that the parity tests must reject.
+parity-controls = ["metal"]
+
+[lints]
+workspace = true
+
+[[example]]
+name = "transcribe_clips"
+required-features = ["metal"]

@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     GPU_TEST_LOCK,
-    metal::{Qwen3MlxWeights, Qwen3WeightPrecision},
+    metal::{Qwen3FloatPrecision, Qwen3MlxWeights},
 };
 
 const MAXIMUM_CONTEXT_TOKENS: usize = 4_096;
@@ -123,7 +123,7 @@ fn first_divergence(left: &[i32], right: &[i32]) -> Option<usize> {
         .position(|(left, right)| left != right)
 }
 
-fn load(model: &PathBuf, precision: Qwen3WeightPrecision) -> Qwen3MlxWeights {
+fn load(model: &PathBuf, precision: Qwen3FloatPrecision) -> Qwen3MlxWeights {
     let mut weights = Qwen3MlxWeights::load(model).expect("checkpoint load");
     weights.prepare_precision(precision).expect("precision");
     weights
@@ -143,10 +143,10 @@ fn greedy_decode_hot_path_variants() {
          context_tokens={MAXIMUM_CONTEXT_TOKENS}"
     );
     let cases = [
-        (Qwen3WeightPrecision::Float32, Variant::HostArgmax),
-        (Qwen3WeightPrecision::BFloat16, Variant::HostArgmax),
-        (Qwen3WeightPrecision::BFloat16, Variant::GpuArgmax),
-        (Qwen3WeightPrecision::BFloat16, Variant::Pipelined),
+        (Qwen3FloatPrecision::Float32, Variant::HostArgmax),
+        (Qwen3FloatPrecision::BFloat16, Variant::HostArgmax),
+        (Qwen3FloatPrecision::BFloat16, Variant::GpuArgmax),
+        (Qwen3FloatPrecision::BFloat16, Variant::Pipelined),
     ];
     for prompt_tokens in [2_300_usize, 128] {
         let prompt = fixed_tokens(prompt_tokens, 97);
@@ -166,8 +166,8 @@ fn greedy_decode_hot_path_variants() {
                 );
             }
             match precision {
-                Qwen3WeightPrecision::Float32 => reference = Some(warmup.tokens.clone()),
-                Qwen3WeightPrecision::BFloat16 | Qwen3WeightPrecision::Float16 => {
+                Qwen3FloatPrecision::Float32 => reference = Some(warmup.tokens.clone()),
+                Qwen3FloatPrecision::BFloat16 | Qwen3FloatPrecision::Float16 => {
                     // Same weights and logits: every BF16 variant must pick
                     // the same tokens, ties included.
                     match &bf16_reference {
@@ -181,6 +181,33 @@ fn greedy_decode_hot_path_variants() {
             println!(
                 "hot_path prompt_tokens={prompt_tokens} f32_vs_bf16_first_divergence={:?}",
                 first_divergence(float32, bfloat16)
+            );
+        }
+    }
+}
+
+/// Per-token pipelined greedy decode of an affine-quantized checkpoint as
+/// loaded, for comparison with the BF16 rows above.
+#[test]
+#[ignore = "requires METALLIX_QWEN_AFFINE_MODEL pointing to an MLX affine-quantized Qwen3 on Apple-Silicon Metal"]
+fn quantized_greedy_decode_hot_path() {
+    let model = env::var_os("METALLIX_QWEN_AFFINE_MODEL")
+        .map(PathBuf::from)
+        .expect("METALLIX_QWEN_AFFINE_MODEL is required for this ignored checkpoint probe");
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let weights = Qwen3MlxWeights::load(&model).expect("checkpoint load");
+    let precision = weights.precision().expect("precision");
+    for prompt_tokens in [2_300_usize, 128] {
+        let prompt = fixed_tokens(prompt_tokens, 97);
+        let warmup = generate(&weights, &prompt, Variant::Pipelined);
+        for row in 1..=MEASURED_ROWS {
+            let measured = generate(&weights, &prompt, Variant::Pipelined);
+            assert_eq!(measured.tokens, warmup.tokens, "repeat run changed tokens");
+            let (p50, mean, p90) = summarize(&measured.step_times);
+            println!(
+                "hot_path prompt_tokens={prompt_tokens} precision={precision:?} \
+                 variant=Pipelined row={row} step_ms_p50={p50:.3} \
+                 step_ms_mean={mean:.3} step_ms_p90={p90:.3}"
             );
         }
     }

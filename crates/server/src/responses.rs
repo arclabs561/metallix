@@ -401,6 +401,7 @@ pub(crate) fn json_response(mut connection: Connection, status: u16, value: &Val
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        501 => "Not Implemented",
         404 => "Not Found",
         408 => "Request Timeout",
         413 => "Content Too Large",
@@ -1254,6 +1255,8 @@ mod tests {
             (0.6, 0.95, Some(20), Some(4))
         );
         assert_eq!(all.defaults_applied, ["temperature", "top_p", "top_k"]);
+        assert_eq!(all.sampler, Some(crate::qwen_forward::SamplerId::IcdfV1));
+        assert_eq!(serde_json::to_value(&all).unwrap()["sampler"], "icdf-v1");
         // Explicit fields win; top_k has no request field, so it still applies.
         let some = resolve(json!({"temperature":1.0,"top_p":0.5}), qwen, false);
         assert_eq!(
@@ -1272,6 +1275,7 @@ mod tests {
             (0.0, None, None)
         );
         assert!(greedy.defaults_applied.is_empty());
+        assert_eq!(greedy.sampler, None, "greedy turns name no seeded sampler");
         // A model without defaults stays greedy.
         let bare = resolve(json!({}), SamplingDefaults::default(), false);
         assert_eq!((bare.temperature, bare.seed), (0.0, None));

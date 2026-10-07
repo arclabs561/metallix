@@ -25,8 +25,8 @@ use mlx_rs::{Array, Dtype, StreamOrDevice, fast, ops, ops::indexing::IndexMutOp}
 
 use super::{
     Qwen3ForwardConfig, Qwen3ForwardError, RopePositions, as_i32, attention_output,
-    attention_scale, chunk_causal_mask, kv_precision, linear, mlp_residual, read_last_logits,
-    rms_norm, rotated_qkv, validate_input_ids, weight,
+    attention_scale, chunk_causal_mask, embed_rows, kv_precision, mlp_residual, project,
+    read_last_logits, rms_norm, rotated_qkv, validate_input_ids, weight,
 };
 use crate::Qwen3Attention;
 
@@ -193,6 +193,20 @@ impl GatherPlan {
     }
 }
 
+/// Validate device dimensions while the pool is still only a host plan.
+fn pool_shape(
+    pool: PoolConfig,
+    key_value_heads: usize,
+    head_dim: usize,
+) -> Result<[i32; 3], Qwen3ForwardError> {
+    let slots = u64::from(pool.num_blocks()) * u64::from(pool.block_tokens().get());
+    Ok([
+        i32::try_from(slots).map_err(|_| Qwen3ForwardError::ShapeOverflow)?,
+        as_i32(key_value_heads)?,
+        as_i32(head_dim)?,
+    ])
+}
+
 impl KvPool {
     fn new(
         config: &Qwen3ForwardConfig,
@@ -200,12 +214,7 @@ impl KvPool {
         dtype: Dtype,
     ) -> Result<Self, Qwen3ForwardError> {
         let stream = StreamOrDevice::gpu();
-        let slots = u64::from(pool.num_blocks()) * u64::from(pool.block_tokens().get());
-        let shape = [
-            i32::try_from(slots).map_err(|_| Qwen3ForwardError::ShapeOverflow)?,
-            as_i32(config.key_value_heads)?,
-            as_i32(config.head_dim)?,
-        ];
+        let shape = pool_shape(pool, config.key_value_heads, config.head_dim)?;
         let mut layers = Vec::with_capacity(config.hidden_layers);
         for _ in 0..config.hidden_layers {
             let keys = ops::zeros_dtype_device(&shape, dtype, &stream)?;
@@ -317,12 +326,10 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         budget_bytes: u64,
         block_tokens: BlockTokens,
     ) -> Result<PoolConfig, Qwen3ForwardError> {
-        let per_token = config.cached_kv_bytes_at(1, kv_precision(weights)?)?;
-        Ok(PoolConfig::from_budget(
-            budget_bytes,
-            per_token,
-            block_tokens,
-        )?)
+        let per_token = config.cached_kv_bytes_at(1, kv_precision(config, weights)?)?;
+        let pool = PoolConfig::from_budget(budget_bytes, per_token, block_tokens)?;
+        pool_shape(pool, config.key_value_heads, config.head_dim)?;
+        Ok(pool)
     }
 
     /// Allocates the pool at the K/V precision these weights produce.
@@ -334,7 +341,7 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         if config.attention != Qwen3Attention::Causal {
             return Err(Qwen3ForwardError::CachedBidirectional);
         }
-        let dtype = kv_precision(weights)?.dtype();
+        let dtype = kv_precision(config, weights)?.dtype();
         Ok(Self {
             config,
             weights,
@@ -760,8 +767,7 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         let offsets = Array::from_slice(&positions, &[batch]);
 
         let hidden = as_i32(self.config.hidden_size)?;
-        let mut hidden_states = weight(self.weights, "model.embed_tokens.weight")?
-            .take_axis_device(ids, 0, &stream)?
+        let mut hidden_states = embed_rows(self.config, self.weights, ids)?
             .reshape_device(&[1, batch, hidden], &stream)?;
         for layer in 0..self.config.hidden_layers {
             let base = format!("model.layers.{layer}");
@@ -808,9 +814,11 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
             self.config.rms_norm_eps,
         )?;
         let vocab = as_i32(self.config.vocab_size)?;
-        Ok(linear(
+        Ok(project(
+            self.config,
+            self.weights,
             &normalized,
-            weight(self.weights, self.config.output_weight_name())?,
+            self.config.output_projection(),
         )?
         .reshape_device(&[batch, vocab], &stream)?)
     }
@@ -881,8 +889,7 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
 
         let hidden = as_i32(self.config.hidden_size)?;
         let ids = Array::from_slice(input_ids, &[seq_len]);
-        let mut hidden_states = weight(self.weights, "model.embed_tokens.weight")?
-            .take_axis_device(&ids, 0, &stream)?
+        let mut hidden_states = embed_rows(self.config, self.weights, &ids)?
             .reshape_device(&[1, seq_len, hidden], &stream)?;
         for layer in 0..self.config.hidden_layers {
             let base = format!("model.layers.{layer}");
@@ -927,9 +934,11 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
             weight(self.weights, "model.norm.weight")?,
             self.config.rms_norm_eps,
         )?;
-        let logits = linear(
+        let logits = project(
+            self.config,
+            self.weights,
             &normalized,
-            weight(self.weights, self.config.output_weight_name())?,
+            self.config.output_projection(),
         )?;
         read_last_logits(&logits, 1, self.config.vocab_size)
     }
@@ -1027,6 +1036,21 @@ mod tests {
     };
 
     use super::{GatherPlan, PoolSlot};
+
+    #[test]
+    fn pool_plan_rejects_device_shape_overflow_without_allocating() {
+        let pool = PoolConfig::new(BlockTokens::DEFAULT, 1).unwrap();
+        assert_eq!(super::pool_shape(pool, 8, 128).unwrap(), [512, 8, 128]);
+        let oversized = PoolConfig::new(BlockTokens::DEFAULT, 4_194_304).unwrap();
+        assert!(matches!(
+            super::pool_shape(oversized, 8, 128),
+            Err(super::Qwen3ForwardError::ShapeOverflow)
+        ));
+        assert!(matches!(
+            super::pool_shape(pool, 2_147_483_648, 128),
+            Err(super::Qwen3ForwardError::ShapeOverflow)
+        ));
+    }
 
     #[test]
     fn gather_plan_is_token_major_and_pads_with_the_first_slot() {

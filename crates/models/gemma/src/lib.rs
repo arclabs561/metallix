@@ -27,12 +27,49 @@
 //! - A sliding position `q` sees keys `k` with `q - window < k <= q`.
 //! - Final logits are soft-capped: `cap * tanh(logits / cap)`.
 //! - The MLP uses tanh-approximated GELU.
+//!
+//! # Overview
+//!
+//! * [`Gemma4TextConfig::parse`] validates `config.json` and refuses the
+//!   variants above. [`Gemma4GenerationConfig::parse`] reads the stop and
+//!   suppressed tokens from `generation_config.json`.
+//! * [`checkpoint::Gemma4CheckpointInspection::inspect`] checks every
+//!   safetensors header against that configuration without loading a
+//!   payload.
+//! * With the `metal` feature, `metal::Gemma4MlxWeights::load` loads the text
+//!   weights at a chosen precision, and its `executor` method starts a
+//!   `forward::Gemma4Executor`, which owns one sequence's K/V cache and
+//!   returns the logits after a prefill, a decoded token or an extension.
+//!
+//! The configuration and header checks need no GPU, so a checkpoint can be
+//! qualified on any machine before Metal is involved.
+//!
+//! # Example: refusing an unimplemented variant
+//!
+//! ```
+//! use gemma::{Gemma4ConfigError, Gemma4GenerationConfig, Gemma4TextConfig};
+//!
+//! let moe = r#"{"model_type": "gemma4_text", "enable_moe_block": true}"#;
+//! assert!(matches!(
+//!     Gemma4TextConfig::parse(moe),
+//!     Err(Gemma4ConfigError::Unsupported("mixture-of-experts block")),
+//! ));
+//!
+//! let generation = Gemma4GenerationConfig::parse(r#"{"eos_token_id": [1, 106]}"#)?;
+//! assert_eq!(generation.eos_token_ids, [1, 106]);
+//! # Ok::<(), Gemma4ConfigError>(())
+//! ```
+
+#![deny(missing_docs)]
+// The workspace allows this lint; crates opt in once their docs are complete.
+#![warn(clippy::missing_errors_doc)]
 
 pub mod checkpoint;
 #[cfg(feature = "metal")]
 pub mod forward;
 #[cfg(feature = "metal")]
 pub mod metal;
+pub mod routing;
 
 // MLX's native test operations share process-global device initialization.
 #[cfg(all(test, feature = "metal"))]
@@ -145,8 +182,18 @@ impl Gemma4TextConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Gemma4ConfigError`] for malformed JSON, another architecture,
-    /// a Gemma 4 variant this crate does not implement, or an invalid layout.
+    /// * [`Gemma4ConfigError::Json`] for malformed JSON.
+    /// * [`Gemma4ConfigError::UnexpectedModelType`] for another architecture.
+    /// * [`Gemma4ConfigError::Unsupported`] for a Gemma 4 variant this crate
+    ///   does not implement: per-layer input embeddings, K/V shared across
+    ///   layers, the mixture-of-experts block, bidirectional text attention,
+    ///   attention bias, another activation, an untied output embedding, or
+    ///   scaled or unknown `RoPE`.
+    /// * [`Gemma4ConfigError::MissingDimension`],
+    ///   [`Gemma4ConfigError::InvalidValue`],
+    ///   [`Gemma4ConfigError::InvalidLayerTypes`] and
+    ///   [`Gemma4ConfigError::InvalidGroupedQueryLayout`] for a layout that
+    ///   cannot be built.
     pub fn parse(json: &str) -> Result<Self, Gemma4ConfigError> {
         let document: RawDocument = serde_json::from_str(json).map_err(Gemma4ConfigError::Json)?;
         let raw = match document.text_config {
@@ -396,7 +443,9 @@ impl Gemma4GenerationConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Gemma4ConfigError`] for malformed JSON or no EOS token.
+    /// Returns [`Gemma4ConfigError::Json`] for malformed JSON and
+    /// [`Gemma4ConfigError::InvalidValue`] when there is no EOS token or one
+    /// is negative.
     pub fn parse(json: &str) -> Result<Self, Gemma4ConfigError> {
         #[derive(Deserialize)]
         #[serde(untagged)]

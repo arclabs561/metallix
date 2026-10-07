@@ -2,8 +2,9 @@
 //! decode with `GatedDeltaNet` recurrent state alongside full-attention K/V.
 //!
 //! Every operator runs on the MLX GPU stream; only final logits are read back.
-//! The `GatedDeltaNet` recurrence is evaluated token by token (see the crate
-//! documentation), so prefill is split into bounded chunks whose graphs are
+//! The `GatedDeltaNet` recurrence is evaluated in 64-token chunks for
+//! multi-token calls and token by token for decode (see the crate
+//! documentation). Prefill is split into bounded chunks whose graphs are
 //! evaluated before the next chunk starts.
 
 #![allow(
@@ -15,24 +16,31 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+use blockfloat::gguf::{AffineParameters, GgufDecodeError, GgufEncoding, decode, repack_affine};
+use checkpoint::{CheckpointError, TensorInfo, TensorSource, gguf::GgufFile};
 use mlx_rs::{
     Array, Dtype, StreamOrDevice, fast,
-    ops::{self, indexing::IndexOp},
+    ops::{
+        self,
+        indexing::{IndexMutOp, IndexOp},
+    },
 };
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp};
+use crate::{
+    Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp,
+    gguf::{ValueHeadAxis, canonical_name, permute_spans, tiled_positions, value_head_axis},
+};
 
-/// Tokens per prefill graph. The recurrence unrolls one step per token, so
-/// this bounds graph size; longer prompts are evaluated chunk by chunk.
+mod delta;
+
+/// Tokens per prefill graph. This bounds graph size even though the delta
+/// rule runs in 64-token chunks; longer prompts use successive graphs.
 pub const PREFILL_CHUNK_TOKENS: usize = 128;
-
-/// Context ceiling of this qualification path, before the checkpoint's own
-/// `max_position_embeddings`.
-pub const MAX_CONTEXT_TOKENS: usize = 16_384;
 
 const TEXT_PREFIX: &str = "model.language_model.";
 const L2_NORM_EPS: f32 = 1e-6;
@@ -49,10 +57,31 @@ pub enum Qwen35Precision {
 
 /// A loaded `qwen3_5` text decoder.
 pub struct Qwen35Weights {
+    identity: Arc<()>,
     config: Qwen35Config,
+    /// Dense tensors by name without the text-model prefix. Each linear
+    /// layer's decay rate `exp(A_log)` is stored as `decay_rate`, in f32.
     tensors: HashMap<String, Array>,
+    /// Projection and embedding matrices held in MLX affine quantization.
+    quantized: HashMap<String, AffineWeight>,
     precision: Qwen35Precision,
+    /// The activation dtype.
+    compute: Dtype,
 }
+
+/// A `[rows, columns]` matrix in MLX affine quantization: `bits`-wide codes
+/// packed in `u32` words and one scale and bias per `group_size` columns.
+struct AffineWeight {
+    codes: Array,
+    scales: Array,
+    biases: Array,
+    bits: i32,
+    group_size: i32,
+}
+
+/// Largest single GGUF tensor this loader reads (a 248k x 8192 F32 matrix
+/// is 8 GiB).
+const MAX_GGUF_TENSOR_BYTES: u64 = 8 << 30;
 
 impl Qwen35Weights {
     /// Loads and validates the text-decoder tensors of a local checkpoint.
@@ -133,11 +162,207 @@ impl Qwen35Weights {
             converted.eval()?;
             *tensor = converted;
         }
+        let rates: Vec<String> = tensors
+            .keys()
+            .filter(|name| name.ends_with(".A_log"))
+            .cloned()
+            .collect();
+        for name in rates {
+            let Some(log_rate) = tensors.remove(&name) else {
+                continue;
+            };
+            let rate = log_rate.as_type_device::<f32>(&gpu)?.exp_device(&gpu)?;
+            rate.eval()?;
+            tensors.insert(name.replace(".A_log", ".decay_rate"), rate);
+        }
         Ok(Self {
+            identity: Arc::new(()),
             config,
             tensors,
+            quantized: HashMap::new(),
             precision,
+            compute: match precision {
+                Qwen35Precision::Checkpoint => compute,
+                Qwen35Precision::Float32 => Dtype::Float32,
+            },
         })
+    }
+
+    /// Loads the text decoder of a `qwen35` GGUF file whose tensors are
+    /// F32, F16, BF16 or `Q8_0`.
+    ///
+    /// At [`Qwen35Precision::Checkpoint`] every `Q8_0` matrix becomes MLX
+    /// affine 8-bit quantization (group 32) with the file's own scales, so
+    /// its values are exactly the file's; activations are BF16. F32 vectors
+    /// (norms, convolution kernels, decay rates) stay F32 except the
+    /// zero-centered norms, which follow the activations as they do for a
+    /// Hugging Face checkpoint. At [`Qwen35Precision::Float32`] every tensor
+    /// is expanded to f32.
+    ///
+    /// The converter's changes are undone or adopted (see [`crate::gguf`]):
+    /// norms are already `1 + weight`, the decay rate is `-ssm_a`, the
+    /// convolution kernel is transposed to `[K, channels]`, and value heads
+    /// are put back into grouped order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35Error`] for an unreadable or invalid file, another
+    /// architecture, a missing, unexpected or misshapen tensor, or an
+    /// encoding this loader does not decode.
+    pub fn load_gguf(
+        path: impl AsRef<Path>,
+        precision: Qwen35Precision,
+    ) -> Result<Self, Qwen35Error> {
+        let file = GgufFile::open(path)?;
+        let config = Qwen35Config::from_gguf(file.metadata(), &file)?;
+        let expected = expected_shapes(&config)?;
+        let mut names = HashMap::new();
+        let mut unexpected = Vec::new();
+        for name in file.names() {
+            match canonical_name(name).filter(|canonical| expected.contains_key(canonical)) {
+                Some(canonical) => {
+                    names.insert(canonical, name.to_owned());
+                }
+                None => unexpected.push(name.to_owned()),
+            }
+        }
+        if !unexpected.is_empty() {
+            unexpected.sort();
+            return Err(Qwen35Error::UnexpectedTensors(unexpected));
+        }
+        let mut order: Vec<&String> = expected.keys().collect();
+        order.sort();
+        let compute = match precision {
+            Qwen35Precision::Checkpoint => Dtype::Bfloat16,
+            Qwen35Precision::Float32 => Dtype::Float32,
+        };
+        let heads = (config.linear_value_heads != config.linear_key_heads)
+            .then(|| tiled_positions(config.linear_key_heads, config.linear_value_heads));
+        let mut weights = Self {
+            identity: Arc::new(()),
+            config,
+            tensors: HashMap::new(),
+            quantized: HashMap::new(),
+            precision,
+            compute,
+        };
+        for canonical in order {
+            let stored = names
+                .get(canonical)
+                .ok_or_else(|| Qwen35Error::MissingTensor(canonical.clone()))?;
+            let info = file
+                .tensor(stored)
+                .ok_or_else(|| Qwen35Error::MissingTensor(stored.clone()))?;
+            let mut shape = expected[canonical].clone();
+            if canonical.ends_with("conv1d.weight") {
+                // [C, 1, K] in the Hugging Face checkpoint, squeezed in GGUF.
+                shape.remove(1);
+            }
+            if info
+                .shape()
+                .iter()
+                .map(|&dim| i32::try_from(dim).ok())
+                .ne(shape.iter().map(|&dim| Some(dim)))
+            {
+                return Err(Qwen35Error::TensorShape {
+                    name: canonical.clone(),
+                    expected: shape,
+                    actual: info
+                        .shape()
+                        .iter()
+                        .map(|&dim| i32::try_from(dim).unwrap_or(i32::MAX))
+                        .collect(),
+                });
+            }
+            let mut bytes = file.read(stored, MAX_GGUF_TENSOR_BYTES)?;
+            if let (Some(order), Some(axis)) = (&heads, value_head_axis(canonical, &weights.config))
+            {
+                reorder_value_heads(&mut bytes, info, axis, order, canonical)?;
+            }
+            weights.insert_gguf(canonical, info, &bytes, &shape)?;
+        }
+        Ok(weights)
+    }
+
+    /// Converts one GGUF tensor and stores it under `name`.
+    fn insert_gguf(
+        &mut self,
+        name: &str,
+        info: &TensorInfo,
+        bytes: &[u8],
+        shape: &[i32],
+    ) -> Result<(), Qwen35Error> {
+        let gpu = StreamOrDevice::gpu();
+        let encoding = info.encoding();
+        if encoding == GgufEncoding::Q8_0
+            && shape.len() == 2
+            && self.precision == Qwen35Precision::Checkpoint
+        {
+            let repack = repack_affine(encoding, bytes)?;
+            let groups = shape[1]
+                / i32::try_from(repack.layout.group_size)
+                    .map_err(|_| Qwen35Error::ShapeOverflow)?;
+            let parameters = match repack.layout.parameters {
+                AffineParameters::F16 => Dtype::Float16,
+                AffineParameters::F32 => Dtype::Float32,
+            };
+            let words = shape[1] * i32::from(repack.layout.bits) / 32;
+            let weight = AffineWeight {
+                codes: Array::from_slice(&repack.codes, &[shape[0], words]),
+                scales: Array::from_slice(&repack.scales, &[shape[0], groups])
+                    .as_dtype_device(parameters, &gpu)?,
+                biases: Array::from_slice(&repack.biases, &[shape[0], groups])
+                    .as_dtype_device(parameters, &gpu)?,
+                bits: i32::from(repack.layout.bits),
+                group_size: i32::try_from(repack.layout.group_size)
+                    .map_err(|_| Qwen35Error::ShapeOverflow)?,
+            };
+            mlx_rs::transforms::eval([&weight.codes, &weight.scales, &weight.biases])?;
+            self.quantized.insert(name.to_owned(), weight);
+            return Ok(());
+        }
+        let mut tensor = match encoding {
+            GgufEncoding::F16 | GgufEncoding::BF16
+                if self.precision == Qwen35Precision::Checkpoint =>
+            {
+                let halves: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|half| u16::from_le_bytes([half[0], half[1]]))
+                    .collect();
+                let dtype = if encoding == GgufEncoding::F16 {
+                    Dtype::Float16
+                } else {
+                    Dtype::Bfloat16
+                };
+                Array::from_slice(&halves, shape).view_dtype_device(dtype, &gpu)?
+            }
+            GgufEncoding::F32 | GgufEncoding::F16 | GgufEncoding::BF16 | GgufEncoding::Q8_0 => {
+                Array::from_slice(&decode(encoding, bytes)?, shape)
+            }
+            other => {
+                return Err(Qwen35Error::Encoding {
+                    tensor: name.to_owned(),
+                    encoding: other,
+                });
+            }
+        };
+        if name.ends_with("conv1d.weight") {
+            tensor = tensor.transpose_device(&gpu)?;
+        }
+        let (name, tensor) = if let Some(layer) = name.strip_suffix(".A_log") {
+            // The file stores -exp(A_log).
+            (
+                format!("{layer}.decay_rate"),
+                tensor.as_type_device::<f32>(&gpu)?.negative_device(&gpu)?,
+            )
+        } else if is_zero_centered_norm(name) || self.precision == Qwen35Precision::Float32 {
+            (name.to_owned(), tensor.as_dtype_device(self.compute, &gpu)?)
+        } else {
+            (name.to_owned(), tensor)
+        };
+        tensor.eval()?;
+        self.tensors.insert(name, tensor);
+        Ok(())
     }
 
     /// The validated decoder configuration.
@@ -155,7 +380,14 @@ impl Qwen35Weights {
     /// Logical bytes of the loaded decoder tensors.
     #[must_use]
     pub fn logical_weight_bytes(&self) -> usize {
-        self.tensors.values().map(Array::nbytes).sum()
+        self.tensors.values().map(Array::nbytes).sum::<usize>()
+            + self
+                .quantized
+                .values()
+                .map(|weight| {
+                    weight.codes.nbytes() + weight.scales.nbytes() + weight.biases.nbytes()
+                })
+                .sum::<usize>()
     }
 
     /// Starts an empty sequence borrowing these weights.
@@ -168,20 +400,195 @@ impl Qwen35Weights {
         }
     }
 
+    /// Starts a sequence from `snapshot`, as if its tokens had just been
+    /// consumed. The snapshot shares its arrays; neither side copies data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35Error::SnapshotMismatch`] for another weight load, or
+    /// [`Qwen35Error::StateKind`] when its layers do not match the configuration.
+    pub fn executor_from(
+        &self,
+        snapshot: &Qwen35Snapshot,
+    ) -> Result<Qwen35Executor<'_>, Qwen35Error> {
+        if !Arc::ptr_eq(&self.identity, &snapshot.identity) {
+            return Err(Qwen35Error::SnapshotMismatch);
+        }
+        let fits = snapshot.layers.len() == self.config.layers.len()
+            && snapshot
+                .layers
+                .iter()
+                .zip(&self.config.layers)
+                .all(|(state, kind)| {
+                    matches!(
+                        (state, kind),
+                        (None, _)
+                            | (
+                                Some(LayerState::Linear { .. }),
+                                Qwen35LayerKind::LinearAttention
+                            )
+                            | (
+                                Some(LayerState::Full { .. }),
+                                Qwen35LayerKind::FullAttention
+                            )
+                    )
+                });
+        if !fits {
+            return Err(Qwen35Error::StateKind);
+        }
+        Ok(Qwen35Executor {
+            weights: self,
+            layers: snapshot.layers.clone(),
+            tokens: snapshot.tokens,
+        })
+    }
+
     fn tensor(&self, name: &str) -> Result<&Array, Qwen35Error> {
         self.tensors
             .get(name)
             .ok_or_else(|| Qwen35Error::MissingTensor(name.to_owned()))
     }
+
+    /// `input` times the transpose of the matrix `name`, in `input`'s dtype.
+    fn project(&self, input: &Array, name: &str) -> Result<Array, Qwen35Error> {
+        let gpu = StreamOrDevice::gpu();
+        let output = match self.quantized.get(name) {
+            Some(weight) => ops::quantized_matmul_device(
+                input,
+                &weight.codes,
+                &weight.scales,
+                &weight.biases,
+                true,
+                weight.group_size,
+                weight.bits,
+                &gpu,
+            )?,
+            None => linear(input, self.tensor(name)?)?,
+        };
+        Ok(if output.dtype() == input.dtype() {
+            output
+        } else {
+            output.as_dtype_device(input.dtype(), &gpu)?
+        })
+    }
+
+    /// The embedding rows of `ids` as `[1, seq, hidden]` in the activation
+    /// dtype.
+    fn embed(&self, ids: &[i32]) -> Result<Array, Qwen35Error> {
+        let gpu = StreamOrDevice::gpu();
+        let seq = dim(ids.len())?;
+        let rows = Array::from_slice(ids, &[seq]);
+        let name = "embed_tokens.weight";
+        let embedded = match self.quantized.get(name) {
+            Some(weight) => {
+                let take = |array: &Array| array.take_axis_device(&rows, 0, &gpu);
+                // f32 parameters keep `scale * code + bias` exact before the
+                // cast to the activation dtype.
+                ops::dequantize_device(
+                    take(&weight.codes)?,
+                    take(&weight.scales)?.as_type_device::<f32>(&gpu)?,
+                    &take(&weight.biases)?.as_type_device::<f32>(&gpu)?,
+                    weight.group_size,
+                    weight.bits,
+                    &gpu,
+                )?
+            }
+            None => self.tensor(name)?.take_axis_device(&rows, 0, &gpu)?,
+        };
+        Ok(embedded
+            .as_dtype_device(self.compute, &gpu)?
+            .reshape_device(&[1, seq, dim(self.config.hidden_size)?], &gpu)?)
+    }
 }
 
-/// Per-layer sequence state.
+/// Puts a GGUF tensor's value heads back in grouped order, in place on its
+/// stored bytes. Rows and whole column blocks move intact, so this is exact
+/// for every encoding.
+fn reorder_value_heads(
+    bytes: &mut [u8],
+    info: &TensorInfo,
+    axis: ValueHeadAxis,
+    order: &[usize],
+    name: &str,
+) -> Result<(), Qwen35Error> {
+    let encoding = info.encoding();
+    let shape = info.shape();
+    let columns = if shape.len() == 2 { shape[1] } else { 1 };
+    let size = |elements: u64| -> Result<usize, Qwen35Error> {
+        encoding
+            .byte_len(elements)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| Qwen35Error::Encoding {
+                tensor: name.to_owned(),
+                encoding,
+            })
+    };
+    let row_bytes = size(columns)?;
+    let to_u64 = |value: usize| u64::try_from(value).map_err(|_| Qwen35Error::ShapeOverflow);
+    match axis {
+        ValueHeadAxis::Rows { skip, width } => {
+            let total = bytes.len();
+            permute_spans(bytes, 1, total, skip * row_bytes, width * row_bytes, order);
+        }
+        ValueHeadAxis::Columns { width } => {
+            permute_spans(
+                bytes,
+                bytes.len() / row_bytes,
+                row_bytes,
+                0,
+                size(to_u64(width)?)?,
+                order,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Per-layer sequence state. Snapshot K/V is copied to its valid rows;
+/// recurrent and convolution arrays are shared immutable values.
+#[derive(Clone)]
 enum LayerState {
     /// The last `K - 1` convolution inputs `[1, K - 1, conv_dim]` and the f32
     /// recurrent matrices `[Hv, Dk, Dv]`.
     Linear { conv: Array, recurrent: Array },
-    /// Rotated keys and values `[1, kv_heads, tokens, head_dim]`.
+    /// Rotated keys and values `[1, kv_heads, capacity, head_dim]`, valid
+    /// for the executor's first `tokens` positions. Capacity grows in
+    /// [`Qwen35Config::kv_storage_tokens`] tiers so a decode step writes one
+    /// row in place
+    /// instead of copying the cache.
     Full { keys: Array, values: Array },
+}
+
+/// A sequence's state after its first [`Self::tokens`] tokens: every linear
+/// layer's recurrent and convolution state and every full-attention layer's
+/// K/V. Recurrent state cannot be cut back to an earlier position, so a prefix
+/// can be reused only from a snapshot taken at exactly that position.
+#[derive(Clone)]
+pub struct Qwen35Snapshot {
+    identity: Arc<()>,
+    layers: Vec<Option<LayerState>>,
+    tokens: usize,
+}
+
+impl Qwen35Snapshot {
+    /// Tokens the snapshot holds.
+    #[must_use]
+    pub const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Bytes of the arrays the snapshot keeps alive.
+    #[must_use]
+    pub fn state_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|layer| match layer {
+                LayerState::Linear { conv, recurrent } => conv.nbytes() + recurrent.nbytes(),
+                LayerState::Full { keys, values } => keys.nbytes() + values.nbytes(),
+            })
+            .sum()
+    }
 }
 
 /// One sequence's decoder state over borrowed weights.
@@ -196,6 +603,53 @@ impl Qwen35Executor<'_> {
     #[must_use]
     pub const fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    /// The state after every token consumed so far, evaluated so it holds
+    /// no pending graph. Full-attention K/V is copied to the valid rows;
+    /// recurrent and convolution state retain their exact boundary values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35Error::Mlx`] if evaluating the state fails.
+    pub fn snapshot(&self) -> Result<Qwen35Snapshot, Qwen35Error> {
+        mlx_rs::transforms::eval(self.state_arrays())?;
+        let gpu = StreamOrDevice::gpu();
+        let rows = dim(self.tokens)?;
+        let positions = Array::arange_device::<i32, i32>(0, rows, None, &gpu)?;
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| {
+                match layer {
+                    Some(LayerState::Full { keys, values }) => {
+                        // A gather materializes only valid rows, so a snapshot cannot
+                        // pin unused capacity after stepped K/V growth is integrated.
+                        let keys = keys.take_axis_device(&positions, 2, &gpu)?;
+                        let values = values.take_axis_device(&positions, 2, &gpu)?;
+                        mlx_rs::transforms::eval([&keys, &values])?;
+                        Ok(Some(LayerState::Full { keys, values }))
+                    }
+                    state => Ok(state.clone()),
+                }
+            })
+            .collect::<Result<Vec<_>, Qwen35Error>>()?;
+        Ok(Qwen35Snapshot {
+            identity: Arc::clone(&self.weights.identity),
+            layers,
+            tokens: self.tokens,
+        })
+    }
+
+    fn state_arrays(&self) -> Vec<&Array> {
+        self.layers
+            .iter()
+            .flatten()
+            .flat_map(|layer| match layer {
+                LayerState::Linear { conv, recurrent } => [conv, recurrent],
+                LayerState::Full { keys, values } => [keys, values],
+            })
+            .collect()
     }
 
     /// Clears all sequence state.
@@ -237,11 +691,53 @@ impl Qwen35Executor<'_> {
     /// Returns [`Qwen35Error`] for empty input, an out-of-vocabulary ID, a
     /// context over the limit, or an MLX failure.
     pub fn extend_last_logits(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen35Error> {
+        let hidden = self.extend_hidden(input_ids)?;
+        let logits = self.last_logits(&hidden)?;
+        logits.eval()?;
+        Ok(logits.as_slice::<f32>().to_vec())
+    }
+
+    /// Consumes one token and returns the greedy next token, picked on the
+    /// GPU so only one ID crosses to the host instead of the logits row.
+    /// Ties go to the lowest ID, as in a host argmax that keeps the first
+    /// maximum.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::extend_last_logits`], plus [`Qwen35Error::NonFiniteLogits`]
+    /// when any logit is NaN or infinite.
+    pub fn decode_greedy(&mut self, input_id: i32) -> Result<i32, Qwen35Error> {
+        self.extend_greedy(&[input_id])
+    }
+
+    /// [`Self::extend_last_logits`] followed by a GPU greedy pick of the last
+    /// position, as in [`Self::decode_greedy`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decode_greedy`].
+    pub fn extend_greedy(&mut self, input_ids: &[i32]) -> Result<i32, Qwen35Error> {
+        let hidden = self.extend_hidden(input_ids)?;
+        let logits = self.last_logits(&hidden)?;
+        let gpu = StreamOrDevice::gpu();
+        let finite = logits.is_finite_device(&gpu)?.all_device(false, &gpu)?;
+        let token = ops::indexing::argmax_axis_device(&logits, -1, false, &gpu)?;
+        mlx_rs::transforms::eval([&token, &finite])?;
+        if !finite.item::<bool>() {
+            return Err(Qwen35Error::NonFiniteLogits);
+        }
+        // MLX returns argmax indices as uint32.
+        i32::try_from(token.item::<u32>()).map_err(|_| Qwen35Error::ShapeOverflow)
+    }
+
+    /// Runs `input_ids` through the decoder, updating the sequence state, and
+    /// returns the final chunk's hidden states.
+    fn extend_hidden(&mut self, input_ids: &[i32]) -> Result<Array, Qwen35Error> {
         let config = &self.weights.config;
         if input_ids.is_empty() {
             return Err(Qwen35Error::EmptyInput);
         }
-        let maximum = MAX_CONTEXT_TOKENS.min(config.max_position_embeddings);
+        let maximum = config.context_limit();
         let requested = self
             .tokens
             .checked_add(input_ids.len())
@@ -261,34 +757,31 @@ impl Qwen35Executor<'_> {
         while let Some(chunk) = chunks.next() {
             let hidden = self.forward_chunk(chunk)?;
             if chunks.peek().is_none() {
-                return self.read_logits(&hidden);
+                return Ok(hidden);
             }
             // Evaluate the carried state so the next chunk's graph starts from
             // materialized arrays instead of growing without bound.
-            let state: Vec<&Array> = self
-                .layers
-                .iter()
-                .flatten()
-                .flat_map(|layer| match layer {
-                    LayerState::Linear { conv, recurrent } => [conv, recurrent],
-                    LayerState::Full { keys, values } => [keys, values],
-                })
-                .collect();
-            mlx_rs::transforms::eval(state)?;
+            mlx_rs::transforms::eval(self.state_arrays())?;
         }
         unreachable!("input_ids is nonempty")
     }
 
     fn forward_chunk(&mut self, input_ids: &[i32]) -> Result<Array, Qwen35Error> {
+        self.forward_chunk_observed(input_ids, &mut |_, _| Ok(()))
+    }
+
+    /// Internal diagnostic seam; the normal forward supplies a no-op observer.
+    fn forward_chunk_observed(
+        &mut self,
+        input_ids: &[i32],
+        observe: &mut impl FnMut(&str, &Array) -> Result<(), Qwen35Error>,
+    ) -> Result<Array, Qwen35Error> {
         let weights = self.weights;
         let config = &weights.config;
         let gpu = StreamOrDevice::gpu();
-        let seq = dim(input_ids.len())?;
         let offset = dim(self.tokens)?;
-        let mut hidden = weights
-            .tensor("embed_tokens.weight")?
-            .take_axis_device(Array::from_slice(input_ids, &[seq]), 0, &gpu)?
-            .reshape_device(&[1, seq, dim(config.hidden_size)?], &gpu)?;
+        let mut hidden = weights.embed(input_ids)?;
+        observe("embedding", &hidden)?;
         for (index, kind) in config.layers.iter().enumerate() {
             let base = format!("layers.{index}");
             let normed = rms_norm(
@@ -310,18 +803,21 @@ impl Qwen35Executor<'_> {
                 )?,
             };
             hidden = hidden.add_device(&mixed, &gpu)?;
+            observe(&format!("{base}.post_attention"), &hidden)?;
             let normed = rms_norm(
                 &hidden,
                 weights.tensor(&format!("{base}.post_attention_layernorm.weight"))?,
                 config.rms_norm_eps,
             )?;
             hidden = hidden.add_device(mlp(weights, &base, &normed)?, &gpu)?;
+            observe(&format!("{base}.post_ffn"), &hidden)?;
         }
         self.tokens += input_ids.len();
         Ok(hidden)
     }
 
-    fn read_logits(&self, hidden: &Array) -> Result<Vec<f32>, Qwen35Error> {
+    /// The last position's f32 logits `[vocab]`, not yet evaluated.
+    fn last_logits(&self, hidden: &Array) -> Result<Array, Qwen35Error> {
         let weights = self.weights;
         let config = &weights.config;
         let gpu = StreamOrDevice::gpu();
@@ -329,15 +825,14 @@ impl Qwen35Executor<'_> {
         let last = hidden.index((.., last..last + 1, ..));
         let normed = rms_norm(&last, weights.tensor("norm.weight")?, config.rms_norm_eps)?;
         let head = if config.tie_word_embeddings {
-            weights.tensor("embed_tokens.weight")?
+            "embed_tokens.weight"
         } else {
-            weights.tensor("lm_head.weight")?
+            "lm_head.weight"
         };
-        let logits = linear(&normed, head)?
+        Ok(weights
+            .project(&normed, head)?
             .reshape_device(&[dim(config.vocab_size)?], &gpu)?
-            .as_type_device::<f32>(&gpu)?;
-        logits.eval()?;
-        Ok(logits.as_slice::<f32>().to_vec())
+            .as_type_device::<f32>(&gpu)?)
     }
 }
 
@@ -355,7 +850,7 @@ fn gated_delta_net(
     let key_dim = dim(config.linear_key_head_dim)?;
     let value_dim = dim(config.linear_value_head_dim)?;
     let compute = input.dtype();
-    let project = |name: &str| linear(input, weights.tensor(&format!("{base}.{name}.weight"))?);
+    let project = |name: &str| weights.project(input, &format!("{base}.{name}.weight"));
 
     let (conv_state, recurrent) = match state.take() {
         Some(LayerState::Linear { conv, recurrent }) => (conv, recurrent),
@@ -409,10 +904,7 @@ fn gated_delta_net(
             .as_type_device::<f32>(&gpu)?,
         &gpu,
     )?;
-    let decay_rate = weights
-        .tensor(&format!("{base}.A_log"))?
-        .as_type_device::<f32>(&gpu)?
-        .exp_device(&gpu)?;
+    let decay_rate = weights.tensor(&format!("{base}.decay_rate"))?;
     let shifted = project("in_proj_a")?
         .reshape_device(&[seq, value_heads], &gpu)?
         .as_type_device::<f32>(&gpu)?
@@ -423,12 +915,15 @@ fn gated_delta_net(
             &gpu,
         )?;
     let softplus = ops::logaddexp_device(&shifted, Array::from_f32(0.0), &gpu)?;
-    let decay = softplus
-        .multiply_device(&decay_rate, &gpu)?
-        .negative_device(&gpu)?
-        .exp_device(&gpu)?;
+    let log_decay = softplus
+        .multiply_device(decay_rate, &gpu)?
+        .negative_device(&gpu)?;
 
-    let (output, recurrent) = delta_rule(&query, &key, &value, &decay, &beta, recurrent)?;
+    let (output, recurrent) = if seq == 1 {
+        delta_rule_by_token(&query, &key, &value, &log_decay, &beta, recurrent)?
+    } else {
+        delta::chunked(&query, &key, &value, &log_decay, &beta, recurrent)?
+    };
     let normed = fast::rms_norm_device(
         &output,
         weights
@@ -448,7 +943,7 @@ fn gated_delta_net(
         conv: next_conv,
         recurrent,
     });
-    linear(&gated, weights.tensor(&format!("{base}.out_proj.weight"))?)
+    weights.project(&gated, &format!("{base}.out_proj.weight"))
 }
 
 /// Depthwise causal convolution plus `silu` over `[1, seq, channels]`, with
@@ -482,19 +977,21 @@ fn short_convolution(
     ))
 }
 
-/// The gated delta rule, one token at a time. `query`, `key` are
-/// `[seq, Hv, Dk]`, `value` is `[seq, Hv, Dv]`, `decay` (already `exp(g)`) and
-/// `beta` are `[seq, Hv]`, all f32, and `state` is `[Hv, Dk, Dv]`. Returns the
-/// outputs `[seq, Hv, Dv]` and the final state.
-fn delta_rule(
+/// The gated delta rule, one token at a time, used for decode; multi-token
+/// calls use `delta::chunked`. `query`, `key` are `[seq, Hv, Dk]`, `value` is
+/// `[seq, Hv, Dv]`, `log_decay` (`g`) and `beta` are `[seq, Hv]`, all f32, and
+/// `state` is `[Hv, Dk, Dv]`. Returns the outputs `[seq, Hv, Dv]` and the
+/// final state.
+fn delta_rule_by_token(
     query: &Array,
     key: &Array,
     value: &Array,
-    decay: &Array,
+    log_decay: &Array,
     beta: &Array,
     mut state: Array,
 ) -> Result<(Array, Array), Qwen35Error> {
     let gpu = StreamOrDevice::gpu();
+    let decay = log_decay.exp_device(&gpu)?;
     let seq = query.shape()[0];
     let heads = query.shape()[1];
     // Rows of token t as [Hv, 1, D] (or [Hv, 1, 1] for per-head scalars).
@@ -510,7 +1007,7 @@ fn delta_rule(
         Vec::with_capacity(usize::try_from(seq).map_err(|_| Qwen35Error::ShapeOverflow)?);
     for t in 0..seq {
         let key_t = row(key, t)?;
-        state = state.multiply_device(row(decay, t)?, &gpu)?;
+        state = state.multiply_device(row(&decay, t)?, &gpu)?;
         let predicted = key_t.matmul_device(&state, &gpu)?;
         let delta = row(value, t)?
             .subtract_device(&predicted, &gpu)?
@@ -543,13 +1040,12 @@ fn gated_attention(
     let kv_heads = dim(config.key_value_heads)?;
     let head_dim = dim(config.head_dim)?;
 
-    let projected = linear(input, weights.tensor(&format!("{base}.q_proj.weight"))?)?
-        .reshape_device(&[1, seq, heads, 2 * head_dim], &gpu)?;
+    let project = |name: &str| weights.project(input, &format!("{base}.{name}.weight"));
+    let projected = project("q_proj")?.reshape_device(&[1, seq, heads, 2 * head_dim], &gpu)?;
     let halves = ops::split_sections_device(&projected, &[head_dim], 3, &gpu)?;
     let gate = halves[1].reshape_device(&[1, seq, heads * head_dim], &gpu)?;
-    let key = linear(input, weights.tensor(&format!("{base}.k_proj.weight"))?)?
-        .reshape_device(&[1, seq, kv_heads, head_dim], &gpu)?;
-    let value = linear(input, weights.tensor(&format!("{base}.v_proj.weight"))?)?
+    let key = project("k_proj")?.reshape_device(&[1, seq, kv_heads, head_dim], &gpu)?;
+    let value = project("v_proj")?
         .reshape_device(&[1, seq, kv_heads, head_dim], &gpu)?
         .transpose_axes_device(&[0, 2, 1, 3], &gpu)?;
     let rotate = |x: &Array, norm: &str| -> Result<Array, Qwen35Error> {
@@ -573,14 +1069,39 @@ fn gated_attention(
     let query = rotate(&halves[0], "q_norm")?;
     let key = rotate(&key, "k_norm")?;
 
-    let (keys, values) = match state.take() {
-        Some(LayerState::Full { keys, values }) => (
-            ops::concatenate_axis_device(&[&keys, &key], 2, &gpu)?,
-            ops::concatenate_axis_device(&[&values, &value], 2, &gpu)?,
-        ),
+    let next = offset.checked_add(seq).ok_or(Qwen35Error::ShapeOverflow)?;
+    let capacity =
+        dim(config
+            .kv_storage_tokens(usize::try_from(next).map_err(|_| Qwen35Error::ShapeOverflow)?))?;
+    let storage = [1, kv_heads, capacity, head_dim];
+    let (mut keys, mut values) = match state.take() {
+        Some(LayerState::Full { keys, values }) if keys.shape()[2] >= next => (keys, values),
+        // Grow to the next tier: one copy of the valid prefix per tier.
+        Some(LayerState::Full { keys, values }) => {
+            let mut grown_keys = ops::zeros_dtype_device(&storage, key.dtype(), &gpu)?;
+            let mut grown_values = ops::zeros_dtype_device(&storage, value.dtype(), &gpu)?;
+            grown_keys.index_mut_device(
+                (.., .., 0..offset, ..),
+                &keys.index_device((.., .., 0..offset, ..), &gpu),
+                &gpu,
+            );
+            grown_values.index_mut_device(
+                (.., .., 0..offset, ..),
+                &values.index_device((.., .., 0..offset, ..), &gpu),
+                &gpu,
+            );
+            (grown_keys, grown_values)
+        }
         Some(LayerState::Linear { .. }) => return Err(Qwen35Error::StateKind),
-        None => (key, value),
+        None => (
+            ops::zeros_dtype_device(&storage, key.dtype(), &gpu)?,
+            ops::zeros_dtype_device(&storage, value.dtype(), &gpu)?,
+        ),
     };
+    keys.index_mut_device((.., .., offset..next, ..), &key, &gpu);
+    values.index_mut_device((.., .., offset..next, ..), &value, &gpu);
+    let attention_keys = keys.index_device((.., .., 0..next, ..), &gpu);
+    let attention_values = values.index_device((.., .., 0..next, ..), &gpu);
     // MLX 0.25's fused causal mask is misaligned when a multi-token chunk
     // follows cached positions, so such chunks pass an explicit mask. A first
     // chunk uses the built-in causal mask; one decode token needs none.
@@ -603,8 +1124,8 @@ fn gated_attention(
         f32::from(u16::try_from(head_dim).map_err(|_| Qwen35Error::ShapeOverflow)?).powf(-0.5);
     let attended = fast::scaled_dot_product_attention_device(
         &query,
-        &keys,
-        &values,
+        &attention_keys,
+        &attention_values,
         scale,
         mask,
         Option::<&Array>::None,
@@ -614,18 +1135,19 @@ fn gated_attention(
     .reshape_device(&[1, seq, heads * head_dim], &gpu)?;
     *state = Some(LayerState::Full { keys, values });
     let gated = attended.multiply_device(ops::sigmoid_device(&gate, &gpu)?, &gpu)?;
-    linear(&gated, weights.tensor(&format!("{base}.o_proj.weight"))?)
+    weights.project(&gated, &format!("{base}.o_proj.weight"))
 }
 
 fn mlp(weights: &Qwen35Weights, base: &str, input: &Array) -> Result<Array, Qwen35Error> {
     let tensor = |name: &str| weights.tensor(&format!("{base}.mlp.{name}"));
     match weights.config.mlp {
-        Qwen35Mlp::Dense { .. } => swiglu(
-            input,
-            tensor("gate_proj.weight")?,
-            tensor("up_proj.weight")?,
-            tensor("down_proj.weight")?,
-        ),
+        Qwen35Mlp::Dense { .. } => {
+            let gpu = StreamOrDevice::gpu();
+            let project = |name: &str, x: &Array| weights.project(x, &format!("{base}.mlp.{name}"));
+            let hidden = silu(&project("gate_proj.weight", input)?)?
+                .multiply_device(project("up_proj.weight", input)?, &gpu)?;
+            project("down_proj.weight", &hidden)
+        }
         Qwen35Mlp::Experts { top_k, .. } => {
             let gpu = StreamOrDevice::gpu();
             let shape = input.shape().to_vec();
@@ -1010,15 +1532,35 @@ pub enum Qwen35Error {
         /// Effective ceiling.
         maximum: usize,
     },
+    /// A logit was NaN or infinite, so no greedy token is defined.
+    #[error("logits contain NaN or infinite values")]
+    NonFiniteLogits,
     /// A layer's stored state does not match its kind.
     #[error("layer state does not match its layer kind")]
     StateKind,
+    /// A snapshot belongs to a different loaded checkpoint instance.
+    #[error("snapshot belongs to another weight load")]
+    SnapshotMismatch,
     /// A size does not fit MLX's 32-bit shape arithmetic.
     #[error("shape overflows")]
     ShapeOverflow,
     /// MLX failed to construct or evaluate a graph.
     #[error("MLX evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
+    /// A GGUF file could not be read or is invalid.
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
+    /// A GGUF tensor uses an encoding this loader does not decode.
+    #[error("tensor {tensor} is stored as {encoding:?}, which this loader does not decode")]
+    Encoding {
+        /// The stored tensor's name.
+        tensor: String,
+        /// Its encoding.
+        encoding: GgufEncoding,
+    },
+    /// A GGUF tensor's payload could not be decoded.
+    #[error(transparent)]
+    Decode(#[from] GgufDecodeError),
 }
 
 #[cfg(test)]
@@ -1026,6 +1568,33 @@ mod tests {
     use mlx_rs::Array;
 
     use super::{MoeTensors, moe_block};
+
+    #[test]
+    fn snapshots_are_bound_to_one_weight_load() {
+        let weights = || super::Qwen35Weights {
+            identity: std::sync::Arc::new(()),
+            config: crate::Qwen35Config::parse(include_str!(
+                "../../../../fixtures/qwen3.5-0.8b/config.json"
+            ))
+            .expect("fixture config"),
+            tensors: std::collections::HashMap::new(),
+            quantized: std::collections::HashMap::new(),
+            precision: super::Qwen35Precision::Float32,
+            compute: mlx_rs::Dtype::Float32,
+        };
+        let source = weights();
+        let other = weights();
+        let snapshot = super::Qwen35Snapshot {
+            identity: std::sync::Arc::clone(&source.identity),
+            layers: source.config.layers.iter().map(|_| None).collect(),
+            tokens: 0,
+        };
+        assert!(source.executor_from(&snapshot).is_ok());
+        assert!(matches!(
+            other.executor_from(&snapshot),
+            Err(super::Qwen35Error::SnapshotMismatch)
+        ));
+    }
 
     /// Deterministic values in [-1, 1) (xorshift64), so failures reproduce.
     fn values(seed: u64, count: usize) -> Vec<f32> {
@@ -1230,6 +1799,151 @@ mod tests {
             eprintln!("{name}: max |diff| {diff:.3e}, largest |output| {largest:.3}");
             assert!(largest < 8.0, "{name}: outputs are not O(1): {largest}");
             assert!(diff <= TOLERANCE, "{name}: max |diff| {diff}");
+        }
+    }
+}
+
+/// This reports arithmetic localization, not a relaxed model qualification gate.
+#[cfg(test)]
+mod gguf_probe {
+    use super::*;
+
+    struct Snapshot {
+        stage: String,
+        shape: Vec<i32>,
+        dtype: String,
+        values: Vec<f32>,
+    }
+
+    fn snapshot(stage: &str, array: &Array) -> Result<Snapshot, Qwen35Error> {
+        let shape = array.shape().to_vec();
+        let last = shape[1] - 1;
+        let values = array.index((.., last..last + 1, ..)).as_type::<f32>()?;
+        values.eval()?;
+        Ok(Snapshot {
+            stage: stage.to_owned(),
+            shape,
+            dtype: format!("{:?}", array.dtype()),
+            values: values.as_slice::<f32>().to_vec(),
+        })
+    }
+
+    fn dialogue_ids() -> Vec<i32> {
+        let oracle =
+            std::env::var_os("METALLIX_QWEN35_GGUF_ORACLE").expect("oracle directory required");
+        let file =
+            GgufFile::open(PathBuf::from(oracle).join("oracle-dialogue.gguf")).expect("oracle");
+        let ids: Vec<i32> = file
+            .read("tokens", 1 << 20)
+            .expect("token payload")
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().expect("token")))
+            .collect();
+        // The failing receipt names zero-based dialogue position 129.
+        assert!(ids.len() >= 130, "dialogue must include position 129");
+        ids
+    }
+
+    #[test]
+    #[ignore = "requires the pinned local GGUF, dialogue oracle and an isolated device slot"]
+    fn gguf_dialogue_layer_probe() {
+        let model = std::env::var_os("METALLIX_QWEN35_GGUF").expect("GGUF path required");
+        let ids = dialogue_ids();
+        let precision = match std::env::var("METALLIX_GGUF_PROBE_PRECISION").as_deref() {
+            Ok("f32") => Qwen35Precision::Float32,
+            Ok("checkpoint") | Err(_) => Qwen35Precision::Checkpoint,
+            _ => panic!("precision must be checkpoint or f32"),
+        };
+        let cap: usize = std::env::var("METALLIX_GGUF_GATE_GPU_GIB")
+            .unwrap_or_else(|_| "24".into())
+            .parse()
+            .expect("integer cap");
+        assert!((1..=64).contains(&cap));
+        let check_cap = || {
+            let bytes = mlx_rs::memory::active_memory().expect("active")
+                + mlx_rs::memory::cache_memory().expect("cache");
+            assert!(bytes <= cap * (1 << 30), "probe exceeds MLX memory cap");
+        };
+        let weights = Qwen35Weights::load_gguf(PathBuf::from(model), precision).expect("weights");
+        check_cap();
+        for position in [129, ids.len() - 1] {
+            let ids = &ids[..=position];
+            let mut arms = Vec::new();
+            for sequential in [true, false] {
+                let mut executor = weights.executor();
+                let mut snapshots = Vec::new();
+                let chunks: Vec<&[i32]> = if sequential {
+                    ids.chunks(1).collect()
+                } else {
+                    ids.chunks(PREFILL_CHUNK_TOKENS).collect()
+                };
+                let count = chunks.len();
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    let final_chunk = index + 1 == count;
+                    let hidden = executor
+                        .forward_chunk_observed(chunk, &mut |stage, tensor| {
+                            if final_chunk {
+                                snapshots.push(snapshot(stage, tensor)?);
+                            }
+                            Ok(())
+                        })
+                        .expect("forward");
+                    // Materialize carried state just as extend_last_logits does.
+                    let state: Vec<&Array> = executor
+                        .layers
+                        .iter()
+                        .flatten()
+                        .flat_map(|layer| match layer {
+                            LayerState::Linear { conv, recurrent } => [conv, recurrent],
+                            LayerState::Full { keys, values } => [keys, values],
+                        })
+                        .collect();
+                    mlx_rs::transforms::eval(state).expect("state");
+                    if final_chunk {
+                        let last = hidden.shape()[1] - 1;
+                        let normalized = rms_norm(
+                            &hidden.index((.., last..last + 1, ..)),
+                            weights.tensor("norm.weight").expect("norm"),
+                            weights.config.rms_norm_eps,
+                        )
+                        .expect("output norm");
+                        snapshots.push(snapshot("output_norm", &normalized).expect("snapshot"));
+                        let logits = executor.last_logits(&hidden).expect("logits");
+                        logits.eval().expect("logits evaluation");
+                        let logits = logits.as_slice::<f32>().to_vec();
+                        snapshots.push(Snapshot {
+                            stage: "logits".into(),
+                            shape: vec![1, 1, dim(logits.len()).expect("vocab")],
+                            dtype: "Float32".into(),
+                            values: logits,
+                        });
+                    }
+                    check_cap();
+                }
+                arms.push(snapshots);
+            }
+            assert_eq!(arms[0].len(), arms[1].len());
+            for (sequential, prefill) in arms[0].iter().zip(&arms[1]) {
+                assert_eq!(sequential.stage, prefill.stage);
+                assert_eq!(sequential.values.len(), prefill.values.len());
+                let mut max_abs = 0.0_f64;
+                let mut squared = 0.0_f64;
+                for (&a, &b) in sequential.values.iter().zip(&prefill.values) {
+                    assert!(
+                        a.is_finite() && b.is_finite(),
+                        "non-finite diagnostic state"
+                    );
+                    let delta = f64::from(a) - f64::from(b);
+                    max_abs = max_abs.max(delta.abs());
+                    squared += delta * delta;
+                }
+                #[allow(clippy::cast_precision_loss, reason = "bounded tensor element count")]
+                let rms = (squared / sequential.values.len() as f64).sqrt();
+                eprintln!(
+                    "GGUF-LAYER {}",
+                    serde_json::json!({"stage": sequential.stage, "position": position, "precision": format!("{precision:?}"), "sequential_shape": sequential.shape, "prefill_shape": prefill.shape, "sequential_dtype": sequential.dtype, "prefill_dtype": prefill.dtype, "elements": sequential.values.len(), "max_abs": max_abs, "rms": rms})
+                );
+            }
         }
     }
 }

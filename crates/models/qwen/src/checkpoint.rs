@@ -14,7 +14,10 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Qwen3ConfigError, Qwen3TextContract};
+use crate::{
+    Qwen3ConfigError, Qwen3TextContract,
+    quantization::{Qwen3AffineQuantization, is_quantizable},
+};
 
 const SAFETENSORS_PREFIX_BYTES: u64 = 8;
 const MAX_HEADER_BYTES: u64 = 100 * 1024 * 1024;
@@ -118,18 +121,7 @@ impl Qwen3CheckpointInspection {
             }
         }
 
-        for required in required_dense_tensors(&contract, &layout)? {
-            let Some(actual) = tensors.get(&required.name) else {
-                return Err(Qwen3CheckpointError::MissingRequiredTensor(required.name));
-            };
-            if actual.range.shape != required.shape {
-                return Err(Qwen3CheckpointError::UnexpectedTensorShape {
-                    tensor: required.name,
-                    expected: required.shape,
-                    actual: actual.range.shape.clone(),
-                });
-            }
-        }
+        check_required_tensors(&contract, &layout, &tensors)?;
 
         Ok(Self {
             contract,
@@ -621,7 +613,6 @@ fn validate_header_tensors(
             name,
             TensorRange {
                 byte_length: end - start,
-                #[cfg(any(feature = "metal", test))]
                 dtype: tensor.dtype,
                 shape: tensor.shape,
                 #[cfg(any(feature = "metal", test))]
@@ -676,7 +667,7 @@ struct RawTensor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TensorRange {
     byte_length: u64,
-    #[cfg(any(feature = "metal", test))]
+    // Header-only inspection validates packed dtype even without Metal.
     dtype: String,
     shape: Vec<u64>,
     #[cfg(any(feature = "metal", test))]
@@ -693,11 +684,89 @@ struct RawCheckpointLayout {
     intermediate_size: u64,
     #[serde(default)]
     tie_word_embeddings: bool,
+    quantization: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 struct ExpectedTensor {
     name: String,
     shape: Vec<u64>,
+    /// Required safetensors dtype, when the layout fixes one.
+    dtype: Option<&'static str>,
+}
+
+/// Checks every tensor the decoder reads is present with its stored shape and,
+/// for packed layouts, dtype.
+fn check_required_tensors(
+    contract: &Qwen3TextContract,
+    layout: &RawCheckpointLayout,
+    tensors: &BTreeMap<String, TensorLocation>,
+) -> Result<(), Qwen3CheckpointError> {
+    let quantization = layout
+        .quantization
+        .as_ref()
+        .map(Qwen3AffineQuantization::from_config)
+        .transpose()
+        .map_err(Qwen3CheckpointError::UnsupportedQuantization)?;
+    for required in required_dense_tensors(contract, layout)? {
+        for required in stored_tensors(required, quantization) {
+            let Some(actual) = tensors.get(&required.name) else {
+                return Err(Qwen3CheckpointError::MissingRequiredTensor(required.name));
+            };
+            if actual.range.shape != required.shape {
+                return Err(Qwen3CheckpointError::UnexpectedTensorShape {
+                    tensor: required.name,
+                    expected: required.shape,
+                    actual: actual.range.shape.clone(),
+                });
+            }
+            if let Some(dtype) = required.dtype
+                && actual.range.dtype != dtype
+            {
+                return Err(Qwen3CheckpointError::UnexpectedTensorDtype {
+                    tensor: required.name,
+                    expected: dtype,
+                    actual: actual.range.dtype.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The stored tensors behind one logical dense tensor: itself, or under
+/// affine quantization the packed `u32` words plus per-group scales and
+/// biases.
+fn stored_tensors(
+    dense: ExpectedTensor,
+    quantization: Option<Qwen3AffineQuantization>,
+) -> Vec<ExpectedTensor> {
+    let (Some(quantization), true, [rows, columns]) = (
+        quantization,
+        is_quantizable(&dense.name),
+        dense.shape.as_slice(),
+    ) else {
+        return vec![dense];
+    };
+    let stem = dense.name.trim_end_matches(".weight");
+    let groups = vec![*rows, quantization.groups(*columns)];
+    vec![
+        ExpectedTensor {
+            name: dense.name.clone(),
+            shape: vec![*rows, quantization.packed_columns(*columns)],
+            dtype: Some("U32"),
+        },
+        ExpectedTensor {
+            name: format!("{stem}.scales"),
+            shape: groups.clone(),
+            dtype: None,
+        },
+        ExpectedTensor {
+            name: format!("{stem}.biases"),
+            shape: groups,
+            dtype: None,
+        },
+    ]
 }
 
 fn required_dense_tensors(
@@ -715,6 +784,7 @@ fn required_dense_tensors(
     let mut expected = vec![ExpectedTensor {
         name: "model.embed_tokens.weight".to_owned(),
         shape: vec![layout.vocab_size, hidden],
+        dtype: None,
     }];
     for layer in 0..contract.total_layers() {
         let prefix = format!("model.layers.{layer}");
@@ -722,55 +792,83 @@ fn required_dense_tensors(
             ExpectedTensor {
                 name: format!("{prefix}.input_layernorm.weight"),
                 shape: vec![hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.self_attn.q_proj.weight"),
                 shape: vec![query_width, hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.self_attn.k_proj.weight"),
                 shape: vec![kv_width, hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.self_attn.v_proj.weight"),
                 shape: vec![kv_width, hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.self_attn.o_proj.weight"),
                 shape: vec![hidden, query_width],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.post_attention_layernorm.weight"),
                 shape: vec![hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.mlp.gate_proj.weight"),
                 shape: vec![layout.intermediate_size, hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.mlp.up_proj.weight"),
                 shape: vec![layout.intermediate_size, hidden],
+                dtype: None,
             },
             ExpectedTensor {
                 name: format!("{prefix}.mlp.down_proj.weight"),
                 shape: vec![hidden, layout.intermediate_size],
+                dtype: None,
             },
         ]);
         if contract.family().has_qk_norm() {
             expected.extend(["q_norm", "k_norm"].map(|norm| ExpectedTensor {
                 name: format!("{prefix}.self_attn.{norm}.weight"),
                 shape: vec![head_dim],
+                dtype: None,
             }));
+        }
+        if contract.family().has_qkv_bias() {
+            // Biases are never packed: `stored_tensors` leaves non-`.weight`
+            // tensors dense under an affine layout.
+            expected.extend(
+                [
+                    ("q_proj", query_width),
+                    ("k_proj", kv_width),
+                    ("v_proj", kv_width),
+                ]
+                .map(|(projection, width)| ExpectedTensor {
+                    name: format!("{prefix}.self_attn.{projection}.bias"),
+                    shape: vec![width],
+                    dtype: None,
+                }),
+            );
         }
     }
     expected.push(ExpectedTensor {
         name: "model.norm.weight".to_owned(),
         shape: vec![hidden],
+        dtype: None,
     });
     if !layout.tie_word_embeddings {
         expected.push(ExpectedTensor {
             name: "lm_head.weight".to_owned(),
             shape: vec![layout.vocab_size, hidden],
+            dtype: None,
         });
     }
     Ok(expected)
@@ -942,6 +1040,21 @@ pub enum Qwen3CheckpointError {
     /// A required dense decoder tensor was absent.
     #[error("Qwen3 checkpoint is missing required tensor {0:?}")]
     MissingRequiredTensor(String),
+    /// `config.json`'s `quantization` is not one supported uniform affine
+    /// layout.
+    #[error("Qwen3 checkpoint quantization {0} is unsupported")]
+    UnsupportedQuantization(String),
+    /// A required tensor has the wrong safetensors dtype for its layout,
+    /// such as a float tensor where packed `U32` words are declared.
+    #[error("Qwen3 tensor {tensor:?} has dtype {actual:?}; its layout requires {expected:?}")]
+    UnexpectedTensorDtype {
+        /// Canonical tensor name.
+        tensor: String,
+        /// Dtype the layout requires.
+        expected: &'static str,
+        /// Dtype in the header.
+        actual: String,
+    },
     /// A required tensor did not match the configuration-derived shape.
     #[error("Qwen3 tensor {tensor:?} has shape {actual:?}, expected {expected:?}")]
     UnexpectedTensorShape {

@@ -10,7 +10,7 @@ use gemma::{
 
 use super::{
     ResidentChatLimits,
-    decoder::{DecoderError, DecoderPlan, FullRowDecoder, FullRowSequence},
+    decoder::{DecoderError, DecoderPlan, FullRowDecoder, FullRowSequence, NoSnapshot},
 };
 
 /// Weights and K/V in bf16, as for Qwen: decode reads every weight once per
@@ -28,6 +28,7 @@ pub(crate) struct GemmaSequence<'a>(Gemma4Executor<'a>);
 
 impl FullRowDecoder for GemmaDecoder {
     type Sequence<'a> = GemmaSequence<'a>;
+    type Snapshot = NoSnapshot;
 
     fn plan(model: &Path, limits: ResidentChatLimits) -> Result<DecoderPlan, DecoderError> {
         let raw = std::fs::read_to_string(model.join("config.json")).map_err(|_| {
@@ -54,9 +55,19 @@ impl FullRowDecoder for GemmaDecoder {
             .map(GemmaSequence)
             .map_err(|error| error.to_string())
     }
+
+    fn sequence_from(&self, snapshot: &NoSnapshot, _: usize) -> Result<GemmaSequence<'_>, String> {
+        match *snapshot {}
+    }
+
+    fn snapshot_bytes(snapshot: &NoSnapshot) -> usize {
+        match *snapshot {}
+    }
 }
 
 impl FullRowSequence for GemmaSequence<'_> {
+    type Snapshot = NoSnapshot;
+
     fn prefill(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String> {
         self.0
             .prefill_last_logits(tokens)
@@ -67,6 +78,10 @@ impl FullRowSequence for GemmaSequence<'_> {
         self.0
             .decode_last_logits(token)
             .map_err(|error| error.to_string())
+    }
+
+    fn snapshot(&self) -> Result<NoSnapshot, String> {
+        Err(String::from("Gemma 4 sequences do not save state"))
     }
 }
 

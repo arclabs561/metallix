@@ -1912,7 +1912,7 @@ mod tests {
             let mut weights =
                 qwen::metal::Qwen3MlxWeights::load(&engine_dir).expect("checkpoint load");
             weights
-                .prepare_precision(qwen::metal::Qwen3WeightPrecision::BFloat16)
+                .prepare_precision(qwen::metal::Qwen3FloatPrecision::BFloat16)
                 .expect("bf16 weights");
             let paged = weights.paged_weights();
             let pool = paged
