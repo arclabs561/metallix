@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use deepseek::{
     checkpoint::{
         V41SafetensorsHeader, V41StorageDtype,
@@ -23,6 +23,7 @@ use deepseek::{
     },
     manifest::V41SafetensorsIndex,
     moe::{Fp8ExpertWeights, MoEConfig, MoEReference},
+    norm::rms_norm_bf16_reference,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -34,9 +35,26 @@ const INTERMEDIATE: usize = 2304;
 const EXPERTS: usize = 384;
 const MIB: u64 = 1024 * 1024;
 
+const NORM_WEIGHT: &str = "layers.0.ffn_norm.weight";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum Boundary {
+    #[default]
+    Moe,
+    FfnNormMoe,
+}
+
 /// Compare up to three captured BF16 rows through the pinned layer-zero `MoE`.
 #[derive(Debug, Args)]
 pub(crate) struct SelectedArgs {
+    /// Input boundary; the default consumes already-normalized `MoE` rows.
+    #[arg(long, value_enum, default_value_t = Boundary::Moe)]
+    boundary: Boundary,
+    /// Independent source normalized rows, required for ffn-norm-moe.
+    #[arg(long, requires = "expected_normalized_sha256")]
+    expected_normalized_bf16: Option<PathBuf>,
+    #[arg(long, requires = "expected_normalized_bf16")]
+    expected_normalized_sha256: Option<String>,
     #[arg(long)]
     index: PathBuf,
     /// Directory containing headers.json and headers/<shard>.header.bin.
@@ -106,6 +124,19 @@ fn bounded_read(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
 }
 
 fn validate_args(args: &SelectedArgs) -> Result<(), String> {
+    match (
+        args.boundary,
+        &args.expected_normalized_bf16,
+        &args.expected_normalized_sha256,
+    ) {
+        (Boundary::Moe, None, None) | (Boundary::FfnNormMoe, Some(_), Some(_)) => {}
+        _ => {
+            return Err(
+                "ffn-norm-moe requires intermediate expected path/hash; moe forbids them"
+                    .to_owned(),
+            );
+        }
+    }
     if args.revision != REVISION {
         return Err("revision is not the pinned V4.1 source".to_owned());
     }
@@ -116,7 +147,10 @@ fn validate_args(args: &SelectedArgs) -> Result<(), String> {
     {
         return Err("cache and payload budgets must be in 1..=512 MiB".to_owned());
     }
-    for value in [&args.input_sha256, &args.expected_sha256] {
+    for value in [&args.input_sha256, &args.expected_sha256]
+        .into_iter()
+        .chain(args.expected_normalized_sha256.iter())
+    {
         if value.len() != 64
             || !value
                 .bytes()
@@ -171,12 +205,13 @@ fn expected_routes(bytes: &[u8], tokens: usize) -> Result<Vec<Vec<usize>>, Strin
     Ok(rows)
 }
 
+#[derive(Clone)]
 struct TensorSpec {
     dtype: V41StorageDtype,
     shape: Vec<u64>,
     bytes: u64,
 }
-fn tensor_specs(routes: &[Vec<usize>]) -> BTreeMap<String, TensorSpec> {
+fn tensor_specs(routes: &[Vec<usize>], boundary: Boundary) -> BTreeMap<String, TensorSpec> {
     use V41StorageDtype::{Bf16, F8E4M3Fn, F8E8M0Fnu, F32, I8};
     let mut specs = BTreeMap::new();
     let mut add = |name: String, dtype, shape: Vec<u64>, bytes| {
@@ -189,6 +224,9 @@ fn tensor_specs(routes: &[Vec<usize>]) -> BTreeMap<String, TensorSpec> {
             },
         );
     };
+    if boundary == Boundary::FfnNormMoe {
+        add(NORM_WEIGHT.to_owned(), Bf16, vec![5120], 10_240);
+    }
     add(
         "layers.0.ffn.gate.weight".to_owned(),
         Bf16,
@@ -417,50 +455,133 @@ fn run(args: &SelectedArgs) -> Result<bool, String> {
     {
         return Err("input/expected SHA256 mismatch".to_owned());
     }
+    let normalized_expected = args
+        .expected_normalized_bf16
+        .as_ref()
+        .map(|path| -> Result<Vec<u8>, String> {
+            let bytes = bounded_read(path, bytes_per_capture)?;
+            validate_normalized_capture(
+                &bytes,
+                bytes_per_capture,
+                args.expected_normalized_sha256.as_deref(),
+            )?;
+            Ok(bytes)
+        })
+        .transpose()?;
     let routes_bytes = bounded_read(&args.routes, MIB)?;
     let routes = expected_routes(&routes_bytes, args.tokens)?;
-    let specs = tensor_specs(&routes);
+    let specs = tensor_specs(&routes, args.boundary);
     let counters = Arc::new(Counters::default());
     let source = SelectedSource {
         inner: V41LocalWeightsSource::new(&args.weights_dir, REVISION),
-        allowed: tensor_specs(&routes),
+        allowed: tensor_specs(&routes, args.boundary),
         budget: args.payload_budget_mib * MIB,
         counters: Arc::clone(&counters),
     };
-    let (cache, index_sha, headers_sha) = load_cache(args, source)?;
+    let (mut cache, index_sha, headers_sha) = load_cache(args, source)?;
+    // Check the new boundary before any MoE payload read or normalization.
+    if args.boundary == Boundary::FfnNormMoe {
+        let range = cache
+            .tensor_range(NORM_WEIGHT)
+            .map_err(|error| error.to_string())?;
+        validate_norm_geometry(range.dtype(), range.shape(), range.byte_length())?;
+    }
+    let native_input = match normalized_expected.as_deref() {
+        Some(expected) => {
+            let norm_spec = specs
+                .get(NORM_WEIGHT)
+                .ok_or("missing norm boundary specification")?;
+            preflight_payloads(
+                args,
+                &cache,
+                &BTreeMap::from([(NORM_WEIGHT.to_owned(), norm_spec.clone())]),
+            )?;
+            let weight = cache
+                .get_tensor(NORM_WEIGHT)
+                .map_err(|error| error.to_string())?;
+            normalize_checked(&input_bytes, &weight, expected)?
+        }
+        None => input_bytes,
+    };
+    // Unrelated MoE files are inspected only after the intermediate oracle agrees.
     preflight_payloads(args, &cache, &specs)?;
-    let (rows, matched, cache_bytes) = evaluate(cache, &input_bytes, &expected_bytes, &routes)?;
+    let (rows, matched, cache_bytes) = evaluate(cache, &native_input, &expected_bytes, &routes)?;
     let charged_bytes = *counters
         .charged
         .lock()
         .map_err(|_| "selected budget lock poisoned")?;
-    println!(
-        "{}",
-        json!({
-            "schema_version": 1,
-            "operation": "deepseek-selected-layer0-moe",
-            "scope": "local selected weights, scalar library MoE; not full checkpoint inference",
-            "revision": REVISION,
-            "tokens": args.tokens,
-            "input_sha256": args.input_sha256,
-            "expected_sha256": args.expected_sha256,
-            "routes_sha256": digest(&routes_bytes),
-            "index_sha256": index_sha,
-            "headers_manifest_sha256": headers_sha,
-            "comparison": "source expert IDs and exact BF16 bits",
-            "matched": matched,
-            "rows": rows,
-            "cache_membership_bytes": cache_bytes,
-            "source_returned_range_bytes": counters.returned.load(Ordering::Relaxed),
-            "source_range_budget_charged_bytes": charged_bytes,
-            "memory_cache_hits": counters.hits.load(Ordering::Relaxed),
-            "physical_read_bytes": null,
-            "physical_read_bytes_status": "unavailable; returned ranges exclude hash and receipt I/O",
-            "cache_budget_bytes": args.cache_budget_mib * MIB,
-            "payload_budget_bytes": args.payload_budget_mib * MIB,
-        })
-    );
+    let mut receipt = json!({
+        "schema_version": 1,
+        "operation": "deepseek-selected-layer0-moe",
+        "scope": "local selected weights, scalar library MoE; not full checkpoint inference",
+        "revision": REVISION,
+        "tokens": args.tokens,
+        "input_sha256": args.input_sha256,
+        "expected_sha256": args.expected_sha256,
+        "routes_sha256": digest(&routes_bytes),
+        "index_sha256": index_sha,
+        "headers_manifest_sha256": headers_sha,
+        "comparison": "source expert IDs and exact BF16 bits",
+        "matched": matched,
+        "rows": rows,
+        "cache_membership_bytes": cache_bytes,
+        "source_returned_range_bytes": counters.returned.load(Ordering::Relaxed),
+        "source_range_budget_charged_bytes": charged_bytes,
+        "memory_cache_hits": counters.hits.load(Ordering::Relaxed),
+        "physical_read_bytes": null,
+        "physical_read_bytes_status": "unavailable; returned ranges exclude hash and receipt I/O",
+        "cache_budget_bytes": args.cache_budget_mib * MIB,
+        "payload_budget_bytes": args.payload_budget_mib * MIB,
+    });
+    if args.boundary == Boundary::FfnNormMoe {
+        receipt["operation"] = json!("deepseek-selected-layer0-ffn-norm-moe");
+        receipt["normalized_matched"] = json!(true);
+        receipt["expected_normalized_sha256"] = json!(args.expected_normalized_sha256);
+        receipt["norm_epsilon"] = json!(1.0e-20);
+    }
+    println!("{receipt}");
     Ok(matched)
+}
+
+fn validate_normalized_capture(bytes: &[u8], length: u64, sha: Option<&str>) -> Result<(), String> {
+    if bytes.len() as u64 != length || Some(digest(bytes).as_str()) != sha {
+        return Err("normalized expected length/SHA256 mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_norm_geometry(dtype: V41StorageDtype, shape: &[u64], bytes: u64) -> Result<(), String> {
+    if dtype != V41StorageDtype::Bf16 || shape != [5120] || bytes != 10_240 {
+        return Err("fixed V4.1 norm tensor geometry mismatch".to_owned());
+    }
+    Ok(())
+}
+
+// Only native normalized rows are returned; the oracle is comparison-only.
+fn normalize_checked(input: &[u8], weight: &[u8], expected: &[u8]) -> Result<Vec<u8>, String> {
+    if input.is_empty()
+        || !input.len().is_multiple_of(HIDDEN * 2)
+        || input.len() > 3 * HIDDEN * 2
+        || expected.len() != input.len()
+        || weight.len() != HIDDEN * 2
+    {
+        return Err("normalization boundary buffer geometry mismatch".to_owned());
+    }
+    let input = bf16_words(input);
+    let weight = bf16_words(weight);
+    let mut normalized = vec![0_u16; input.len()];
+    for (row, output) in input
+        .chunks_exact(HIDDEN)
+        .zip(normalized.chunks_exact_mut(HIDDEN))
+    {
+        rms_norm_bf16_reference(row, &weight, 1.0e-20, output)
+            .map_err(|error| error.to_string())?;
+    }
+    let bytes: Vec<u8> = normalized.into_iter().flat_map(u16::to_le_bytes).collect();
+    if bytes != expected {
+        return Err("normalized BF16 comparison failed before MoE payload reads".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn evaluate(
@@ -552,7 +673,49 @@ fn compare_row(
 
 #[cfg(test)]
 mod tests {
-    use super::compare_row;
+    use super::{
+        HIDDEN, compare_row, digest, normalize_checked, validate_norm_geometry,
+        validate_normalized_capture,
+    };
+    use deepseek::checkpoint::V41StorageDtype;
+
+    #[test]
+    fn normalization_consumes_native_input_and_rejects_changed_oracle() {
+        // Analytic fixture: constant unit row has RMS=1, learned weight=2.
+        // BF16 output is exactly 2 with the pinned tiny epsilon.
+        let input = vec![0x3f80_u16; HIDDEN]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let expected = vec![0x4000_u16; HIDDEN]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            normalize_checked(&input, &expected, &expected).unwrap(),
+            expected
+        );
+        let mut changed = expected.clone();
+        changed[0] ^= 1;
+        let changed_sha = digest(&changed);
+        assert!(
+            validate_normalized_capture(&changed, changed.len() as u64, Some(&changed_sha)).is_ok()
+        );
+        assert!(
+            normalize_checked(&input, &expected, &changed)
+                .unwrap_err()
+                .contains("comparison failed")
+        );
+        assert!(normalize_checked(&vec![0; input.len()], &expected, &expected).is_err());
+    }
+
+    #[test]
+    fn norm_metadata_refuses_wrong_dtype_shape_and_storage_size() {
+        assert!(validate_norm_geometry(V41StorageDtype::Bf16, &[5120], 10_240).is_ok());
+        assert!(validate_norm_geometry(V41StorageDtype::F32, &[5120], 10_240).is_err());
+        assert!(validate_norm_geometry(V41StorageDtype::Bf16, &[2560, 2], 10_240).is_err());
+        assert!(validate_norm_geometry(V41StorageDtype::Bf16, &[5120], 10_239).is_err());
+    }
 
     #[test]
     fn comparison_rejects_changed_bits_routes_and_missing_output() {

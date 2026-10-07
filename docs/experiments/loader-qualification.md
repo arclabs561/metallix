@@ -723,6 +723,22 @@ target/release/mx run-deepseek-selected \
   --cache-budget-mib 512 --payload-budget-mib 512
 ```
 
+The default `--boundary moe` consumes already-normalized inputs. To begin at
+the FFN normalization input, use `--boundary ffn-norm-moe` with
+`--input-bf16 /path/to/ffn-norm-in.bin` and its SHA-256, plus
+`--expected-normalized-bf16 /path/to/source-ffn-in.bin` and
+`--expected-normalized-sha256 NORMALIZED_SHA256`. The intermediate capture must
+come from the independent source. This boundary also requires the verified
+`layers.0.ffn_norm.weight` payload and receipt, with BF16 shape `[5120]` and
+10,240 bytes.
+
+The scalar normalization uses epsilon `1e-20` and compares all normalized BF16
+bits before inspecting or reading MoE payloads. A mismatch refuses the run;
+the expected intermediate never supplies the native MoE input. A completed
+normalization comparison adds `normalized_matched`,
+`expected_normalized_sha256` and `norm_epsilon` to the receipt. These fields
+describe this selected boundary, not attention execution or full-model parity.
+
 The route capture requires the same revision and one `runs` entry whose
 `routes` contains exactly one layer-zero entry with `ids`, one six-ID row per
 input row. Expected outputs and routes must come from an independent source
@@ -733,8 +749,8 @@ The reader performs no network fetch. Index, manifest and aggregate header reads
 are bounded at 16, 1 and 32 MiB respectively; at most 64 shard headers are
 accepted. Both cache and cumulative requested-range admission budgets accept
 1–512 MiB. Payload geometry, local file sizes and selected inventory are checked
-before arithmetic. An unexpected expert outside the captured allowlist fails;
-it is not fetched. Every completed comparison reports exact BF16 mismatches and
+before the corresponding arithmetic stage. An unexpected expert outside the
+captured allowlist fails; it is not fetched. Every completed comparison reports exact BF16 mismatches and
 selected IDs; exit zero requires both to match. Missing captures, refusal,
 loading errors or mismatches exit nonzero and cannot count as zero-error evidence.
 

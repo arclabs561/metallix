@@ -157,3 +157,130 @@ fn missing_expected_output_cannot_be_reported_as_zero_error() {
     let output = fixture.command().output().expect("mx launches");
     assert_refused(&output, "deepseek selected refused");
 }
+
+#[test]
+fn norm_boundary_requires_independent_intermediate_before_metadata() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["--boundary", "ffn-norm-moe"])
+        .output()
+        .expect("mx launches");
+    assert_refused(&output, "requires intermediate expected path/hash");
+}
+
+#[test]
+fn norm_boundary_refuses_wrong_published_metadata_before_moe_reads() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.dir.join("headers")).expect("headers");
+    let name = "layers.0.ffn_norm.weight";
+    let shard = "model.safetensors";
+    for (dtype, shape, size) in [
+        ("F32", json!([5120]), 20480_u64),
+        ("BF16", json!([2560, 2]), 10240),
+    ] {
+        let index =
+            serde_json::to_vec(&json!({"metadata":{"total_size":size}, "weight_map":{name:shard}}))
+                .unwrap();
+        fs::write(fixture.dir.join("missing-index.json"), &index).unwrap();
+        let mut header = serde_json::to_vec(
+            &json!({name:{"dtype":dtype,"shape":shape,"data_offsets":[0,size]}}),
+        )
+        .unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut prefix = (header.len() as u64).to_le_bytes().to_vec();
+        prefix.extend_from_slice(&header);
+        fs::write(
+            fixture.dir.join("headers/model.safetensors.header.bin"),
+            &prefix,
+        )
+        .unwrap();
+        fs::write(fixture.dir.join("headers.json"), serde_json::to_vec(&json!({
+            "revision":REVISION, "index_sha256":format!("{:x}", Sha256::digest(&index)),
+            "shards":{shard:{"header_bytes":prefix.len(), "header_sha256":format!("{:x}", Sha256::digest(&prefix)),"file_bytes":prefix.len() as u64+size}}
+        })).unwrap()).unwrap();
+        let output = fixture
+            .command()
+            .args([
+                "--boundary",
+                "ffn-norm-moe",
+                "--expected-normalized-sha256",
+                &fixture.capture_sha,
+            ])
+            .arg("--expected-normalized-bf16")
+            .arg(fixture.dir.join("expected.bin"))
+            .output()
+            .unwrap();
+        assert_refused(&output, "norm tensor geometry mismatch");
+    }
+}
+
+#[test]
+fn changed_normalized_bits_with_valid_digest_refuse_before_absent_moe_files() {
+    let fixture = Fixture::new();
+    let name = "layers.0.ffn_norm.weight";
+    let shard = "model.safetensors";
+    let weights = fixture.dir.join("missing-weights");
+    fs::create_dir(&weights).unwrap();
+    fs::create_dir(fixture.dir.join("headers")).unwrap();
+    let input: Vec<u8> = vec![0x3f80_u16; 5120]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let weight: Vec<u8> = vec![0x4000_u16; 5120]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fs::write(fixture.dir.join("input.bin"), &input).unwrap();
+    fs::write(weights.join(format!("{name}.bin")), &weight).unwrap();
+    let index =
+        serde_json::to_vec(&json!({"metadata":{"total_size":10240},"weight_map":{name:shard}}))
+            .unwrap();
+    fs::write(fixture.dir.join("missing-index.json"), &index).unwrap();
+    let mut header =
+        serde_json::to_vec(&json!({name:{"dtype":"BF16","shape":[5120],"data_offsets":[0,10240]}}))
+            .unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut prefix = (header.len() as u64).to_le_bytes().to_vec();
+    prefix.extend_from_slice(&header);
+    fs::write(
+        fixture.dir.join("headers/model.safetensors.header.bin"),
+        &prefix,
+    )
+    .unwrap();
+    fs::write(fixture.dir.join("headers.json"), serde_json::to_vec(&json!({"revision":REVISION,"index_sha256":format!("{:x}",Sha256::digest(&index)),"shards":{shard:{"header_bytes":prefix.len(),"header_sha256":format!("{:x}",Sha256::digest(&prefix)),"file_bytes":prefix.len()+10240}}})).unwrap()).unwrap();
+    fs::write(weights.join(format!("{name}.receipt.json")),serde_json::to_vec(&json!({"tensor":name,"shard":shard,"revision":REVISION,"bytes":10240,"range":[prefix.len(),prefix.len()+10240],"metadata":{"dtype":"BF16","shape":[5120]},"sha256":format!("{:x}",Sha256::digest(&weight))})).unwrap()).unwrap();
+    let mut changed = weight.clone();
+    changed[0] ^= 1;
+    fs::write(fixture.dir.join("normalized.bin"), &changed).unwrap();
+    // Replace the base command's input hash instead of passing the flag twice.
+    let command = fixture.command();
+    let args = command
+        .get_args()
+        .map(std::ffi::OsStr::to_os_string)
+        .collect::<Vec<_>>();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mx"));
+    let mut args = args;
+    let position = args.iter().position(|arg| arg == "--input-sha256").unwrap();
+    args[position + 1] = format!("{:x}", Sha256::digest(&input)).into();
+    let output = command
+        .args(args)
+        .args([
+            "--boundary",
+            "ffn-norm-moe",
+            "--expected-normalized-sha256",
+            &format!("{:x}", Sha256::digest(&changed)),
+        ])
+        .arg("--expected-normalized-bf16")
+        .arg(fixture.dir.join("normalized.bin"))
+        .output()
+        .unwrap();
+    assert_refused(
+        &output,
+        "normalized BF16 comparison failed before MoE payload reads",
+    );
+}
