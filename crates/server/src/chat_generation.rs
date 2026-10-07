@@ -1030,7 +1030,7 @@ impl ChatSession {
         );
         let ((mut executor, mut logits, cached_prompt_tokens), prefill_ms) =
             timed(&prefill, "prefill_ms", || {
-                prefix_cache::prefill(
+                let prefilled = prefix_cache::prefill(
                     &self.weights,
                     &mut self.prefix_cache,
                     self.context_limit,
@@ -1038,9 +1038,10 @@ impl ChatSession {
                     request,
                     &input_ids,
                 )
-                .map_err(ChatGenerationError::message)
+                .map_err(ChatGenerationError::message)?;
+                prefill.record("cached_tokens", prefilled.2);
+                Ok::<_, ChatGenerationError>(prefilled)
             })?;
-        prefill.record("cached_tokens", cached_prompt_tokens);
         deadline.check()?;
         let mut decode_ms = Vec::new();
         let mut finish_reason = ChatFinishReason::Length;
@@ -1075,7 +1076,7 @@ impl ChatSession {
             let accepted = match pending.take() {
                 Some(current) => {
                     let span = tracing::info_span!("chat.decode_step", step, decode_ms = Empty);
-                    let (accepted, gpu_token) = span.in_scope(|| {
+                    let (accepted, gpu_token, step_ms) = span.in_scope(|| {
                         if turn.generated().len() + 1 < max_tokens as usize {
                             // This step's draw is not committed yet, so the
                             // next step's variate is one draw ahead.
@@ -1088,12 +1089,15 @@ impl ChatSession {
                                     .map_err(|error| error.to_string())?,
                             );
                         }
-                        turn.settle(&self.format, &current)
+                        let (accepted, gpu_token) = turn.settle(&self.format, &current)?;
+                        // Time between token readbacks: with a step always
+                        // queued, that is the per-token cost, not one step's
+                        // latency. Recorded before the span exits, for the
+                        // timeline.
+                        let step_ms = elapsed_ms(last_token_at.elapsed());
+                        span.record("decode_ms", step_ms);
+                        Ok::<_, String>((accepted, gpu_token, step_ms))
                     })?;
-                    // Time between token readbacks: with a step always queued,
-                    // that is the per-token cost, not one step's latency.
-                    let step_ms = elapsed_ms(last_token_at.elapsed());
-                    span.record("decode_ms", step_ms);
                     decode_ms.push(step_ms);
                     if accepted.token != gpu_token {
                         #[cfg(test)]
@@ -1164,7 +1168,7 @@ impl ChatSession {
                     mlx.peak_bytes = Empty
                 );
                 let ((outcome, verified), step_ms) = timed(&span, "decode_ms", || {
-                    speculation::verify(
+                    let verified = speculation::verify(
                         &self.format,
                         &mut executor,
                         &mut turn,
@@ -1172,10 +1176,11 @@ impl ChatSession {
                         &draft,
                         gpu_verify,
                     )
-                    .map_err(ChatGenerationError::message)
+                    .map_err(ChatGenerationError::message)?;
+                    span.record("accepted", verified.0.accepted);
+                    crate::gpu::Memory::record_on(&span);
+                    Ok::<_, ChatGenerationError>(verified)
                 })?;
-                span.record("accepted", outcome.accepted);
-                crate::gpu::Memory::record_on(&span);
                 decode_ms.push(step_ms);
                 draft_length.observe(outcome.drafted, outcome.accepted);
                 speculation_stats.record(&outcome);
@@ -1892,11 +1897,15 @@ fn timed<T, E>(
     field: &'static str,
     work: impl FnOnce() -> Result<T, E>,
 ) -> Result<(T, f64), E> {
-    let started = Instant::now();
-    let value = span.in_scope(work)?;
-    let milliseconds = elapsed_ms(started.elapsed());
-    span.record(field, milliseconds);
-    Ok((value, milliseconds))
+    span.in_scope(|| {
+        let started = Instant::now();
+        let value = work()?;
+        let milliseconds = elapsed_ms(started.elapsed());
+        // Before the span exits: the --trace-out timeline writes a span's
+        // fields with its end, so a field recorded later never reaches it.
+        span.record(field, milliseconds);
+        Ok((value, milliseconds))
+    })
 }
 
 /// The variate offset for a queued GPU step: one ahead when the previous
@@ -2161,6 +2170,63 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(TEMPLATE.as_bytes()));
         assert_eq!(digest, TEMPLATE_SHA256);
         assert_eq!(manifest["source"]["template_sha256"], TEMPLATE_SHA256);
+    }
+
+    /// A field `timed` records, and one recorded inside its work, reach the
+    /// span's end event in a Chrome timeline, which writes a span's fields
+    /// when it exits.
+    #[cfg(feature = "timeline")]
+    #[test]
+    fn timed_fields_reach_the_timeline() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let path = std::env::temp_dir().join(format!("timed-{}.json", std::process::id()));
+        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .writer(std::fs::File::create(&path).unwrap())
+            .include_args(true)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "work",
+                work_ms = tracing::field::Empty,
+                inside = tracing::field::Empty,
+                after_exit = tracing::field::Empty,
+                mlx.active_bytes = tracing::field::Empty,
+                mlx.peak_bytes = tracing::field::Empty
+            );
+            super::timed(&span, "work_ms", || {
+                span.record("inside", 7);
+                crate::gpu::Memory::record_on(&span);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            span.record("after_exit", 9);
+        });
+        drop(guard);
+        let events: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let end = events
+            .iter()
+            .find(|event| event["name"] == "work" && event["ph"] == "E")
+            .expect("the span's end event");
+        // tracing-chrome writes field values as strings.
+        let work_ms = end["args"]["work_ms"]
+            .as_str()
+            .and_then(|ms| ms.parse::<f64>().ok());
+        assert!(work_ms.is_some(), "{end}");
+        assert_eq!(end["args"]["inside"], "7", "{end}");
+        assert!(end["args"].get("after_exit").is_none(), "{end}");
+        for field in ["mlx.active_bytes", "mlx.peak_bytes"] {
+            assert!(
+                end["args"][field]
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some(),
+                "missing memory measurement at span exit: {end}"
+            );
+        }
     }
 
     /// A model that always picks end-of-turn: without `ignore_eos` the first

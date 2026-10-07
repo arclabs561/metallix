@@ -347,14 +347,19 @@ fn staged(
     request_id: Option<&str>,
     run: impl FnOnce() -> Option<Result<Value, String>>,
 ) -> Option<Result<Value, String>> {
-    let mut outcome = stage.in_scope(run);
-    match &mut outcome {
-        Some(Ok(value)) => {
-            if let Some((timing, ms)) =
-                timing.and_then(|timing| Some((timing, value["metallix"][timing].as_f64()?)))
-            {
+    // The timing is recorded before `stage` exits: the --trace-out timeline
+    // writes a span's fields with its end.
+    let mut outcome = stage.in_scope(|| {
+        let outcome = run();
+        if let (Some(Ok(value)), Some(timing)) = (&outcome, timing) {
+            if let Some(ms) = value["metallix"][timing].as_f64() {
                 stage.record(timing, ms);
             }
+        }
+        outcome
+    });
+    match &mut outcome {
+        Some(Ok(value)) => {
             let usage = &value["usage"];
             if let Some(tokens) = usage["prompt_tokens"]
                 .as_u64()

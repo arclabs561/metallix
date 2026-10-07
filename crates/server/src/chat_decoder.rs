@@ -298,16 +298,17 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         );
         let ((mut sequence, mut logits, cached_prompt_tokens, cache_write_tokens), prefill_ms) =
             timed(&prefill, "prefill_ms", || {
-                Self::prefill(
+                let prefilled = Self::prefill(
                     &self.decoder,
                     &mut self.prefix_cache,
                     &self.format,
                     self.context_limit,
                     request,
                     &input_ids,
-                )
+                )?;
+                prefill.record("cached_tokens", prefilled.2);
+                Ok::<_, ChatGenerationError>(prefilled)
             })?;
-        prefill.record("cached_tokens", cached_prompt_tokens);
         let mut decode_ms = Vec::new();
         let mut finish_reason = ChatFinishReason::Length;
         for step in 0..max_tokens {
@@ -661,6 +662,44 @@ mod prefix_cache_tests {
             "nine-token history extends five restored tokens"
         );
         assert_eq!((uncached[0].3, uncached[1].3), (0, 0));
+    }
+
+    #[cfg(feature = "timeline")]
+    #[test]
+    fn prefill_timeline_records_cold_and_resumed_cache_counts() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let path =
+            std::env::temp_dir().join(format!("decoder-prefill-trace-{}.json", std::process::id()));
+        let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()
+            .writer(std::fs::File::create(&path).unwrap())
+            .include_args(true)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let turns = tracing::subscriber::with_default(subscriber, || two_turns(1, None));
+        drop(guard);
+        let events: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let prefills: Vec<_> = events
+            .iter()
+            .filter(|event| event["name"] == "chat.prefill" && event["ph"] == "E")
+            .collect();
+        assert_eq!(prefills.len(), 2, "{events:?}");
+        assert_eq!((turns[0].1, turns[1].1), (0, 5));
+        for ((event, turn), expected) in prefills.iter().zip(&turns).zip([0, 5]) {
+            let cached = event["args"]["cached_tokens"]
+                .as_str()
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("cached_tokens must be recorded before prefill exits");
+            assert_eq!(cached, expected, "{event}");
+            assert_eq!(cached, turn.1, "trace must match generation metrics");
+            let elapsed = event["args"]["prefill_ms"]
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .expect("prefill_ms must be recorded before prefill exits");
+            assert!(elapsed.is_finite() && elapsed >= 0.0, "{event}");
+        }
     }
 
     #[test]
