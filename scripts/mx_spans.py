@@ -18,6 +18,12 @@ streaming, rendering the template).
 
 Usage:
   scripts/mx_spans.py T.json --model-id qwen3-0.6b
+  scripts/mx_spans.py T.json --model-id qwen3-0.6b --requests
+
+The opt-in request report includes scalar budget, finish, cancellation and
+sampling metadata when recorded. It reports strict JSON validity separately
+from recovered events and exits nonzero for invalid artifacts. Missing DEBUG
+sampling spans stay unknown; no token payloads or logits are exported.
 """
 
 from __future__ import annotations
@@ -57,7 +63,19 @@ def intervals(events: list[dict]) -> list[dict]:
     for event in events:
         key = (event.get("pid"), event.get("tid"))
         if event.get("ph") == "B":
-            stacks.setdefault(key, []).append(event)
+            stack = stacks.setdefault(key, [])
+            request_id = (
+                value((event.get("args") or {}).get("request_id"))
+                if event.get("name") == "http.request"
+                else None
+            )
+            stack.append(
+                {
+                    **event,
+                    "request_id": request_id
+                    or (stack[-1]["request_id"] if stack else None),
+                }
+            )
         elif event.get("ph") == "E":
             stack = stacks.get(key) or []
             while stack and stack[-1]["name"] != event["name"]:
@@ -77,6 +95,9 @@ def intervals(events: list[dict]) -> list[dict]:
                     "start": begin["ts"] / 1000,
                     "end": event["ts"] / 1000,
                     "fields": fields,
+                    "request_id": begin["request_id"],
+                    "pid": key[0],
+                    "tid": key[1],
                 }
             )
     return out
@@ -86,8 +107,15 @@ def within(inner: dict, outer: dict) -> bool:
     return outer["start"] <= inner["start"] and inner["end"] <= outer["end"]
 
 
-def request_timings(proxy: list[dict], child: list[dict]) -> list[dict]:
-    """One row per chat request served by the child, in start order (ms)."""
+def request_timings(
+    proxy: list[dict], child: list[dict], *, metadata: bool = False
+) -> list[dict]:
+    """Child requests in start order (ms), with phases owned by their request.
+
+    Default timing rows require prefill. Metadata mode also includes completed
+    request scopes without prefill, such as refusals; it cannot reconstruct a
+    proxy-only request or join unparented engine/device scopes.
+    """
     spans = intervals(child)
     by_id: dict[str, dict] = {}
     for span in spans:
@@ -120,12 +148,17 @@ def request_timings(proxy: list[dict], child: list[dict]) -> list[dict]:
         ):
             wait = value((event.get("args") or {}).get("queue.wait_ms"))
             queue_wait[open_request[key][-1]] = wait
+    proxy_spans = intervals(proxy) if metadata else []
     rows = []
     for rid, request in sorted(by_id.items(), key=lambda item: item[1]["start"]):
-        inside = [s for s in spans if s is not request and within(s, request)]
+        inside = [
+            s
+            for s in spans
+            if s is not request and s["request_id"] == rid and within(s, request)
+        ]
         prefill = [s for s in inside if s["name"] == "chat.prefill"]
         steps = [s for s in inside if s["name"] == "chat.decode_step"]
-        if not prefill:
+        if not prefill and not metadata:
             continue  # Not a generation request (for example /v1/models).
         fields = request["fields"]
         step_ms = [s["end"] - s["start"] for s in steps]
@@ -133,10 +166,14 @@ def request_timings(proxy: list[dict], child: list[dict]) -> list[dict]:
             {
                 "request_id": rid,
                 "queue_wait_ms": queue_wait.get(rid),
-                "prefill_ms": sum(s["end"] - s["start"] for s in prefill),
+                "prefill_ms": sum(s["end"] - s["start"] for s in prefill)
+                if prefill
+                else None,
                 # The first token comes from the prefill's logits; decode
                 # steps produce the rest.
-                "first_token_ms": prefill[-1]["end"] - request["start"],
+                "first_token_ms": prefill[-1]["end"] - request["start"]
+                if prefill
+                else None,
                 "decode_steps": len(steps),
                 "decode_step_ms": sum(step_ms) / len(step_ms) if step_ms else None,
                 "server_ms": request["end"] - request["start"],
@@ -144,7 +181,99 @@ def request_timings(proxy: list[dict], child: list[dict]) -> list[dict]:
                 "mlx_peak_bytes": fields.get("mlx.peak_bytes"),
             }
         )
+        if metadata:
+            rows[-1].update(request_metadata(rid, spans, proxy_spans))
     return rows
+
+
+REQUEST_FIELDS = {
+    "route": "route",
+    "model": "gen_ai.request.model",
+    "requested_max_tokens": "gen_ai.request.max_tokens",
+    "effective_max_tokens": "metallix.output_tokens.limit",
+    "budget_source": "metallix.output_budget.source",
+    "effective_context_tokens": "metallix.context_tokens.effective",
+    "finish_reason": "gen_ai.response.finish_reason",
+    "input_tokens": "gen_ai.usage.input_tokens",
+    "error_type": "error.type",
+}
+PROXY_FIELDS = {
+    "requested_context_tokens": "metallix.context_tokens.requested",
+    "cancel_reason": "cancel.reason",
+    "cancel_cleanup": "cancel.cleanup",
+    "forward_ms": "forward_ms",
+    "proxy_error_type": "error.type",
+}
+SAMPLING_FIELDS = (
+    "path",
+    "mode",
+    "temperature",
+    "top_p",
+    "top_k",
+    "sampler",
+    "rng_algorithm",
+    "outcome",
+    "rng_commit",
+    "commit_ordinal",
+    "legal_mass",
+    "fallback_reason",
+)
+
+
+def request_metadata(rid: str, child: list[dict], proxy: list[dict]) -> dict:
+    """Only scalar diagnostics attached to this request; never payload/logit fields."""
+    fields = {}
+    for span in sorted(child, key=lambda s: s["end"]):
+        if span["request_id"] == rid and span["name"] == "http.request":
+            fields.update(span["fields"])
+    out = {key: fields.get(field) for key, field in REQUEST_FIELDS.items()}
+    fields = {}
+    for span in sorted(proxy, key=lambda s: s["end"]):
+        if span["request_id"] == rid and span["name"] == "proxy.forward":
+            fields.update(span["fields"])
+    out.update({key: fields.get(field) for key, field in PROXY_FIELDS.items()})
+    sampling = [
+        {field: span["fields"].get(field) for field in SAMPLING_FIELDS}
+        for span in sorted(child, key=lambda s: s["start"])
+        if span["request_id"] == rid and span["name"] == "chat.sampling"
+    ]
+    out["sampling"] = sampling or None  # DEBUG spans may not have been collected.
+    return out
+
+
+def request_report(proxy_path: Path, model_id: str, skip: int = 0) -> dict:
+    """Recovered per-request diagnostics, explicitly separated from strict validity."""
+    artifacts, timelines = [], []
+    for path in (proxy_path, child_path(proxy_path, model_id)):
+        artifact = {"path": str(path), "strict_json_valid": False}
+        try:
+            strict = json.loads(path.read_text())
+            if not isinstance(strict, list) or not all(
+                isinstance(event, dict) for event in strict
+            ):
+                raise ValueError("expected a Chrome event array")
+            artifact["strict_json_valid"] = True
+        except (OSError, ValueError) as error:
+            artifact["strict_error"] = str(error)
+        try:
+            events = load_trace(path)
+            if not isinstance(events, list) or not all(
+                isinstance(event, dict) for event in events
+            ):
+                raise ValueError("expected a Chrome event array")
+        except (OSError, ValueError) as error:
+            events = []
+            artifact["recovery_error"] = str(error)
+        artifact["recovered"] = (
+            not artifact["strict_json_valid"] and "recovery_error" not in artifact
+        )
+        artifacts.append(artifact)
+        timelines.append(events)
+    return {
+        "strict_artifacts_valid": all(a["strict_json_valid"] for a in artifacts),
+        "artifacts": artifacts,
+        "requests": request_timings(*timelines, metadata=True)[skip:],
+    }
 
 
 def median(values: list[float]) -> float | None:
@@ -233,7 +362,16 @@ def main() -> int:
     parser.add_argument("trace", type=Path, help="the proxy timeline (--trace-out)")
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--skip", type=int, default=0, help="warmup requests")
+    parser.add_argument(
+        "--requests",
+        action="store_true",
+        help="per-request scalar diagnostics and strict artifact validity as JSON",
+    )
     args = parser.parse_args()
+    if args.requests:
+        report = request_report(args.trace, args.model_id, args.skip)
+        print(json.dumps(report, indent=1))
+        return 0 if report["strict_artifacts_valid"] else 1
     summary = summarize_files(args.trace, args.model_id, args.skip)
     print(one_line(summary))
     print(json.dumps(summary, indent=1))

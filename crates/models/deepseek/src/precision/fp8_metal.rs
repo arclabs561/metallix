@@ -845,6 +845,7 @@ fn check(status: std::os::raw::c_int) -> Result<(), Fp8MetalError> {
     if status == 0 {
         Ok(())
     } else {
+        tracing::debug!(status, "MLX-C host call rejected");
         Err(Fp8MetalError::Mlx(format!(
             "MLX-C returned status {status}"
         )))
@@ -852,6 +853,13 @@ fn check(status: std::os::raw::c_int) -> Result<(), Fp8MetalError> {
 }
 
 impl KernelHandle {
+    // Host construction only: creating a kernel handle is not GPU execution.
+    #[tracing::instrument(
+        name = "deepseek.metal.kernel_new_host",
+        level = "debug",
+        skip_all,
+        fields(kernel = name, input_count = inputs.len(), output_count = 1, completed = false)
+    )]
     fn new(name: &str, inputs: &[&str], output: &str, source: &str) -> Result<Self, Fp8MetalError> {
         ensure_mlx_error_handler()?;
         let name = CString::new(name).map_err(|error| Fp8MetalError::Mlx(error.to_string()))?;
@@ -873,13 +881,29 @@ impl KernelHandle {
             )
         };
         if kernel.ctx.is_null() {
+            tracing::debug!(null_handle = true, "MLX-C kernel construction rejected");
             return Err(Fp8MetalError::Mlx(
                 "kernel construction returned null".to_owned(),
             ));
         }
+        tracing::Span::current().record("completed", true);
         Ok(Self(kernel))
     }
 
+    // These spans measure host setup and C graph construction, not GPU duration.
+    #[tracing::instrument(
+        name = "deepseek.metal.kernel_apply_host",
+        level = "debug",
+        skip_all,
+        fields(
+            input_count = inputs.len(),
+            output_shape = ?output_shape,
+            template_count = template_ints.len(),
+            grid = ?grid,
+            threadgroup = ?threadgroup,
+            completed = false
+        )
+    )]
     fn apply(
         &self,
         inputs: &[&Array],
@@ -935,16 +959,25 @@ impl KernelHandle {
         let stream: &Stream = stream.as_ref();
         // SAFETY: `mlx_vector_array_new` has no preconditions; ownership moves into the guard.
         let mut outputs = ArrayVector(unsafe { sys::mlx_vector_array_new() });
-        // SAFETY: every handle is live for the call; `outputs.0` receives a new owned vector.
-        check(unsafe {
-            sys::mlx_fast_metal_kernel_apply(
-                &raw mut outputs.0,
-                self.0,
-                input_vector.0,
-                config.0,
-                stream.as_ptr(),
-            )
-        })?;
+        {
+            let span = tracing::debug_span!(
+                "deepseek.metal.kernel_apply_c_graph",
+                status = tracing::field::Empty
+            );
+            let _entered = span.enter();
+            // SAFETY: every handle is live; `outputs.0` receives a new owned vector.
+            let status = unsafe {
+                sys::mlx_fast_metal_kernel_apply(
+                    &raw mut outputs.0,
+                    self.0,
+                    input_vector.0,
+                    config.0,
+                    stream.as_ptr(),
+                )
+            };
+            span.record("status", status);
+            check(status)?;
+        }
         // SAFETY: `mlx_array_new` returns an empty owned array that `vector_array_get` fills.
         let mut result = unsafe { sys::mlx_array_new() };
         // SAFETY: `outputs.0` is live and holds exactly one output array.
@@ -952,6 +985,7 @@ impl KernelHandle {
         // SAFETY: `result` is an owned MLX array handle; `Array` takes ownership and frees it.
         let array = unsafe { Array::from_ptr(result) };
         check(status)?;
+        tracing::Span::current().record("completed", true);
         Ok(array)
     }
 }

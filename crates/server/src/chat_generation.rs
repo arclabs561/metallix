@@ -1527,6 +1527,88 @@ fn validate_request(request: ChatRequest<'_>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SamplingPath {
+    GpuRule,
+    GpuCandidates,
+    FullRow,
+    #[cfg(feature = "structured-output")]
+    ConstrainedFullRow,
+}
+
+impl SamplingPath {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::GpuRule => "gpu_rule",
+            Self::GpuCandidates => "gpu_candidates",
+            Self::FullRow => "full_row",
+            #[cfg(feature = "structured-output")]
+            Self::ConstrainedFullRow => "constrained_full_row",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SamplingMode {
+    Greedy,
+    Sampled,
+}
+
+impl SamplingMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Greedy => "greedy",
+            Self::Sampled => "sampled",
+        }
+    }
+}
+
+enum SamplingFallback {
+    #[cfg(feature = "structured-output")]
+    Constraint,
+    UnboundedNucleus,
+    CandidateCount,
+    InsufficientCandidates,
+}
+
+impl SamplingFallback {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "structured-output")]
+            Self::Constraint => "constrained_full_row",
+            Self::UnboundedNucleus => "unbounded_nucleus_full_row",
+            Self::CandidateCount => "candidate_count_full_row",
+            Self::InsufficientCandidates => "candidates_insufficient_full_row",
+        }
+    }
+}
+
+// Commit state derives from the outcome, so a fallback/error/greedy selection
+// cannot be independently tagged as consuming entropy.
+enum SamplingOutcome {
+    Peek,
+    Fallback(SamplingFallback),
+    Selected(SamplingMode),
+    Error,
+}
+
+impl SamplingOutcome {
+    fn record(self, span: &tracing::Span) {
+        let (outcome, commit) = match &self {
+            Self::Peek => ("peek", "not_committed"),
+            Self::Fallback(_) => ("fallback", "not_committed"),
+            Self::Selected(SamplingMode::Greedy) => ("selected", "not_committed"),
+            Self::Selected(SamplingMode::Sampled) => ("selected", "committed"),
+            Self::Error => ("error", "not_committed"),
+        };
+        span.record("outcome", outcome);
+        span.record("rng_commit", commit);
+        if let Self::Fallback(reason) = self {
+            span.record("fallback_reason", reason.as_str());
+        }
+    }
+}
+
 /// Chooses each output token: greedy, seeded nucleus sampling, or either
 /// under a JSON-schema grammar mask.
 struct TokenPicker {
@@ -1538,6 +1620,33 @@ struct TokenPicker {
 }
 
 impl TokenPicker {
+    // Metadata only: never inspect model values or advance/peek the RNG here.
+    fn sampling_mode(&self) -> SamplingMode {
+        if self.policy.is_some() {
+            SamplingMode::Sampled
+        } else {
+            SamplingMode::Greedy
+        }
+    }
+
+    fn sampling_span(&self, path: SamplingPath) -> tracing::Span {
+        tracing::debug_span!(
+            "chat.sampling",
+            path = path.as_str(),
+            mode = self.sampling_mode().as_str(),
+            temperature = self.applied.temperature,
+            top_p = self.applied.top_p,
+            top_k = ?self.applied.top_k,
+            sampler = self.applied.sampler.map_or("none", SamplerId::as_str),
+            rng_algorithm = if self.policy.is_some() { "ChaCha8Rng" } else { "none" },
+            commit_ordinal = "unavailable",
+            legal_mass = "not_collected",
+            outcome = Empty,
+            rng_commit = Empty,
+            fallback_reason = Empty,
+        )
+    }
+
     fn new(
         request: ChatRequest<'_>,
         defaults: SamplingDefaults,
@@ -1596,8 +1705,11 @@ impl TokenPicker {
         top_logprobs: Option<u8>,
         vocabulary_size: usize,
     ) -> Option<Qwen3PickRule> {
+        let span = self.sampling_span(SamplingPath::GpuRule);
+        let _entered = span.enter();
         #[cfg(feature = "structured-output")]
         if self.constraint.is_some() {
+            SamplingOutcome::Fallback(SamplingFallback::Constraint).record(&span);
             return None;
         }
         let receipts = top_logprobs.map_or(0, |top| usize::from(top) + 9);
@@ -1607,7 +1719,10 @@ impl TokenPicker {
                 candidates: receipts,
             },
             Some((policy, top_p, top_k)) => {
-                let top_k = (*top_k)?;
+                let Some(top_k) = *top_k else {
+                    SamplingOutcome::Fallback(SamplingFallback::UnboundedNucleus).record(&span);
+                    return None;
+                };
                 Qwen3PickRule {
                     selection: Qwen3Selection::TopKNucleus {
                         temperature: self.applied.temperature,
@@ -1619,7 +1734,12 @@ impl TokenPicker {
                 }
             }
         };
-        (rule.candidates < vocabulary_size).then_some(rule)
+        if rule.candidates >= vocabulary_size {
+            SamplingOutcome::Fallback(SamplingFallback::CandidateCount).record(&span);
+            return None;
+        }
+        SamplingOutcome::Peek.record(&span);
+        Some(rule)
     }
 
     /// The exact token for a GPU-picked step, from its candidates, or `None`
@@ -1631,32 +1751,62 @@ impl TokenPicker {
         gpu_token: i32,
         candidates: Option<&Qwen3RowCandidates>,
     ) -> Result<Option<i32>, String> {
-        match (self.policy.as_mut(), candidates) {
+        let span = self.sampling_span(SamplingPath::GpuCandidates);
+        let _entered = span.enter();
+        let result = match (self.policy.as_mut(), candidates) {
             (None, _) => Ok(Some(gpu_token)),
             (Some((policy, top_p, Some(top_k))), Some(candidates)) => {
                 policy.sample_top_k_candidates(candidates, *top_p, *top_k)
             }
             (Some(_), _) => Ok(None),
+        };
+        match &result {
+            Ok(Some(_)) => SamplingOutcome::Selected(self.sampling_mode()),
+            Ok(None) => SamplingOutcome::Fallback(SamplingFallback::InsufficientCandidates),
+            Err(_) => SamplingOutcome::Error,
         }
+        .record(&span);
+        result
     }
 
     /// Returns the next token and whether it completed the schema grammar.
     fn pick(&mut self, logits: &[f32]) -> Result<(i32, bool), String> {
         #[cfg(feature = "structured-output")]
+        let path = if self.constraint.is_some() {
+            SamplingPath::ConstrainedFullRow
+        } else {
+            SamplingPath::FullRow
+        };
+        #[cfg(not(feature = "structured-output"))]
+        let path = SamplingPath::FullRow;
+        let span = self.sampling_span(path);
+        let mode = self.sampling_mode();
+        let _entered = span.enter();
+        #[cfg(feature = "structured-output")]
         if let Some(constraint) = self.constraint.as_mut() {
-            let (token, _) = match self.policy.as_mut() {
+            let result = match self.policy.as_mut() {
                 None => constraint.sample(logits, false),
                 // Validation rejects a constrained top_p below one.
                 Some((policy, ..)) => policy.sample_constrained(constraint, logits, false),
             }
-            .map_err(|error| error.to_string())?;
-            return Ok((token, constraint.is_complete()));
+            .map_err(|error| error.to_string());
+            match &result {
+                Ok(_) => SamplingOutcome::Selected(mode),
+                Err(_) => SamplingOutcome::Error,
+            }
+            .record(&span);
+            return result.map(|(token, _)| (token, constraint.is_complete()));
         }
-        let token = match self.policy.as_mut() {
-            None => greedy_token(logits)?,
-            Some((policy, top_p, top_k)) => policy.sample_nucleus(logits, *top_p, *top_k)?,
+        let result = match self.policy.as_mut() {
+            None => greedy_token(logits),
+            Some((policy, top_p, top_k)) => policy.sample_nucleus(logits, *top_p, *top_k),
         };
-        Ok((token, false))
+        match &result {
+            Ok(_) => SamplingOutcome::Selected(mode),
+            Err(_) => SamplingOutcome::Error,
+        }
+        .record(&span);
+        result.map(|token| (token, false))
     }
 
     /// Validates a completed schema output independently of the grammar.
@@ -1796,6 +1946,153 @@ mod tests {
         ChatFormat, ChatTemplate, SpecialTokens,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
+
+    fn sampling_observation_probe() -> (i32, i32, u64) {
+        let config = super::SamplingConfiguration {
+            seed: 8128,
+            temperature: 0.7,
+        };
+        let mut control = super::SamplingPolicy::new(config, 4);
+        let mut picker = super::TokenPicker {
+            policy: Some((super::SamplingPolicy::new(config, 4), 0.9, Some(2))),
+            #[cfg(feature = "structured-output")]
+            constraint: None,
+            applied: super::AppliedSampling {
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(2),
+                seed: Some(8128),
+                sampler: Some(super::SamplerId::IcdfV1),
+                defaults_applied: Vec::new(),
+            },
+        };
+        let next = |p: &super::TokenPicker| p.policy.as_ref().unwrap().0.uniform_ahead(0).to_bits();
+        let before = next(&picker);
+        assert!(picker.gpu_rule(2, None, 4).is_some());
+        assert_eq!(next(&picker), before);
+        assert!(picker.pick_from_candidates(0, None).unwrap().is_none());
+        assert_eq!(next(&picker), before);
+        assert!(picker.pick(&[f32::NAN, 1.0, 0.0, -1.0]).is_err());
+        assert_eq!(next(&picker), before);
+        let logits = [2.0, 1.0, 0.0, -1.0];
+        let first = picker.pick(&logits).unwrap().0;
+        assert_eq!(
+            first,
+            control.sample_nucleus(&logits, 0.9, Some(2)).unwrap()
+        );
+        assert_eq!(next(&picker), control.uniform_ahead(0).to_bits());
+        let candidates = qwen::forward::Qwen3RowCandidates {
+            top: vec![(0, 2.0), (1, 1.0), (2, 0.0)],
+            max_logit: 2.0,
+            shifted_exp_sum: 1.0,
+        };
+        let second = picker
+            .pick_from_candidates(0, Some(&candidates))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second,
+            control.sample_nucleus(&logits, 0.9, Some(2)).unwrap()
+        );
+        assert_eq!(next(&picker), control.uniform_ahead(0).to_bits());
+        let final_rng = next(&picker);
+        picker.policy = None;
+        picker.applied.temperature = 0.0;
+        picker.applied.seed = None;
+        picker.applied.sampler = None;
+        assert_eq!(picker.pick(&logits).unwrap().0, 0);
+        (first, second, final_rng)
+    }
+
+    #[test]
+    fn sampling_debug_observation_preserves_tokens_and_rng_commits() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_record(
+                &self,
+                _: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct OutcomeFields<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for OutcomeFields<'_> {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if matches!(field.name(), "outcome" | "rng_commit") {
+                            self.0.push(format!("{}={value}", field.name()));
+                        }
+                    }
+                }
+                values.record(&mut OutcomeFields(&mut self.0.lock().unwrap()));
+            }
+            fn on_new_span(
+                &self,
+                attributes: &tracing::span::Attributes<'_>,
+                _: &tracing::span::Id,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attributes.metadata().name() == "chat.sampling" {
+                    struct Paths<'a>(&'a mut Vec<String>);
+                    impl tracing::field::Visit for Paths<'_> {
+                        fn record_debug(
+                            &mut self,
+                            _: &tracing::field::Field,
+                            _: &dyn std::fmt::Debug,
+                        ) {
+                        }
+                        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                            if field.name() == "path" {
+                                self.0.push(value.to_owned());
+                            }
+                        }
+                    }
+                    for field in attributes.metadata().fields() {
+                        assert!(
+                            !["seed", "token_id", "logits", "prompt", "schema", "uniform"]
+                                .contains(&field.name())
+                        );
+                    }
+                    attributes.record(&mut Paths(&mut self.0.lock().unwrap()));
+                }
+            }
+        }
+
+        let off = tracing::subscriber::with_default(
+            tracing::subscriber::NoSubscriber::default(),
+            sampling_observation_probe,
+        );
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&paths)));
+        let on = tracing::subscriber::with_default(subscriber, sampling_observation_probe);
+        assert_eq!(off, on);
+        assert_eq!(
+            *paths.lock().unwrap(),
+            [
+                "gpu_rule",
+                "outcome=peek",
+                "rng_commit=not_committed",
+                "gpu_candidates",
+                "outcome=fallback",
+                "rng_commit=not_committed",
+                "full_row",
+                "outcome=error",
+                "rng_commit=not_committed",
+                "full_row",
+                "outcome=selected",
+                "rng_commit=committed",
+                "gpu_candidates",
+                "outcome=selected",
+                "rng_commit=committed",
+                "full_row",
+                "outcome=selected",
+                "rng_commit=not_committed",
+            ]
+        );
+    }
 
     #[cfg(feature = "structured-output")]
     #[test]

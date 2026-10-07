@@ -509,6 +509,19 @@ print('GUARD_OK')
             raise RuntimeError("sandbox validation did not complete")
 
 
+UNMASK_EXEC = (
+    "import os,signal,sys; "
+    "signal.pthread_sigmask(signal.SIG_UNBLOCK, "
+    "{signal.SIGTERM,signal.SIGINT,signal.SIGALRM}); "
+    "os.execvpe(sys.argv[1],sys.argv[1:],os.environ)"
+)
+
+
+def unmasked_command(argv: list[str]) -> list[str]:
+    """Restore child stop delivery after exec, without threaded preexec_fn."""
+    return [sys.executable, "-I", "-S", "-c", UNMASK_EXEC, *argv]
+
+
 @contextmanager
 def defer_stop_signals():
     """Register a newly spawned process before delivering shutdown signals."""
@@ -720,6 +733,7 @@ class Run:
     cancel_server_tokens: int | None = None
     exchanges: list[dict] = field(default_factory=list)
     server: dict = field(default_factory=dict)
+    native_argv: list[str] = field(default_factory=list)
 
 
 def protocol_errors(exchanges: list[Exchange]) -> list[str]:
@@ -888,7 +902,8 @@ def run_one(cli: str, task: str, repeat: int, tap: Tap, log_path: Path, args) ->
     (home / "tmp").mkdir(parents=True)
     repo = make_fixture(root)
     argv, env = cli_command(cli, task, tap.url, args.model_id, home, repo, args)
-    argv = sandbox_command(argv, tap.url)
+    run.native_argv = list(argv)
+    argv = sandbox_command(unmasked_command(argv), tap.url)
     mark = tap.mark()
     started = time.monotonic()
     out_path, err_path = root / "stdout.jsonl", root / "stderr.txt"
@@ -1106,6 +1121,8 @@ class Session:
         self.memory: list[dict] = []
         self.traces: list[str] = []
         self.baselines: list[int] = []
+        self.launches: list[list[str]] = []
+        self.shutdowns: list[dict] = []
         self.aborted: str | None = None
 
     @property
@@ -1119,7 +1136,9 @@ class Session:
         self.logs.append(str(log))
         trace = log.with_suffix(".trace.json")
         self.traces.append(str(trace))
-        spec = replace(self.spec, argv=self.spec.argv + ["--trace-out", str(trace)])
+        argv = unmasked_command(self.spec.argv + ["--trace-out", str(trace)])
+        self.launches.append(argv)
+        spec = replace(self.spec, argv=argv)
         # The GPU reading is machine-wide; cap what this server adds to what
         # other jobs already hold.
         baseline = bench_system.probe(None).get("gpu_in_use_bytes") or 0
@@ -1148,7 +1167,31 @@ class Session:
         finally:
             if self.server is not None:
                 self.server.stop()
+                self.shutdowns.append(dict(self.server.shutdown))
                 self.server = None
+
+
+def validate_timelines(traces: list[str], model_id: str) -> dict:
+    """Strictly validate closed front/child timelines without repairing files."""
+    files = []
+    for trace in traces:
+        for path in (Path(trace), mx_spans.child_path(Path(trace), model_id)):
+            row = {"path": str(path), "valid": False}
+            try:
+                events = json.loads(path.read_text())
+                if (
+                    not isinstance(events, list)
+                    or not events
+                    or not all(
+                        isinstance(event, dict) and "ph" in event for event in events
+                    )
+                ):
+                    raise ValueError("expected a nonempty Chrome event array")
+                row.update(valid=True, events=len(events))
+            except (OSError, ValueError) as error:
+                row["error"] = str(error)
+            files.append(row)
+    return {"valid": bool(files) and all(row["valid"] for row in files), "files": files}
 
 
 def add_span_tokens(runs: list[Run], traces: list[str], model_id: str) -> None:
@@ -1343,6 +1386,7 @@ def main() -> int:
             tap.close()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+    timeline = validate_timelines(session.traces, args.model_id)
     add_span_tokens(runs, session.traces, args.model_id)
     print()
     print(render(runs, clis, tasks))
@@ -1352,6 +1396,16 @@ def main() -> int:
             "server_argv": argv,
             "server_logs": session.logs,
             "server_traces": session.traces,
+            "server_launches": session.launches,
+            "server_shutdown": session.shutdowns,
+            "exec_launcher": {
+                "interpreter": sys.executable,
+                "flags": ["-I", "-S"],
+                "program": UNMASK_EXEC,
+            },
+            "timeline": timeline,
+            "native_tasks_passed": bool(runs)
+            and all(run.outcome == "pass" for run in runs),
             "gpu_baselines": session.baselines,
             "system": bench_system.system_info(),
             "tools": tool_versions(args),
@@ -1361,7 +1415,11 @@ def main() -> int:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(receipt, indent=1) + "\n")
     hard = [run for run in runs if run.outcome != "pass"]
-    return 1 if hard else 0
+    if not timeline["valid"]:
+        print(
+            "timeline validation failed; native task outcomes are reported separately"
+        )
+    return 1 if hard or not timeline["valid"] else 0
 
 
 if __name__ == "__main__":

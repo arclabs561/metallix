@@ -615,6 +615,27 @@ fn write_child_request(
     child.write_all(&request.body)
 }
 
+/// Records the configured child limit on the existing forwarding span.
+fn forward_span(pool: &Pool, model: &ChildModel) -> tracing::Span {
+    let span = tracing::info_span!(
+        "proxy.forward",
+        model = %model.entry.id,
+        child = Empty,
+        forward_ms = Empty,
+        metallix.context_tokens.requested = Empty,
+        cancel.reason = Empty,
+        cancel.cleanup = Empty,
+        "error.type" = Empty,
+    );
+    if let Some(launcher) = &pool.launcher {
+        span.record(
+            "metallix.context_tokens.requested",
+            launcher.settings.context_tokens,
+        );
+    }
+    span
+}
+
 fn forward(
     pool: &Pool,
     model: &ChildModel,
@@ -623,13 +644,7 @@ fn forward(
     context: &RequestContext,
     limits: TransportLimits,
 ) {
-    let span = tracing::info_span!(
-        "proxy.forward",
-        model = %model.entry.id,
-        child = Empty,
-        forward_ms = Empty,
-        "error.type" = Empty,
-    );
+    let span = forward_span(pool, model);
     let _entered = span.enter();
     let started = Instant::now();
     let admitted = {
@@ -692,13 +707,22 @@ fn forward(
     let wait = limits.response_deadline + CHILD_READ_GRACE;
     let Some(passed) = relay(&mut child, &mut connection, &queue_headers, wait) else {
         span.record("error.type", "client_gone");
+        span.record("cancel.reason", "client_gone");
         tracing::info!("client disconnected before the response");
         // EOF on the forward's write half cancels generation. Keep reading
         // until the child closes: it releases admission before that EOF.
         // Releasing our queue permit earlier races the still-busy worker.
-        if let Err(error) = cancel_and_wait(&mut child, wait) {
-            model.fail(&format!("cancelled child did not finish: {error}"));
+        match cancel_and_wait(&mut child, wait) {
+            Ok(()) => {
+                span.record("cancel.cleanup", "ready");
+            }
+            Err(error) => {
+                span.record("cancel.cleanup", "failed");
+                model.fail(&format!("cancelled child did not finish: {error}"));
+            }
         }
+        span.record("forward_ms", started.elapsed().as_secs_f64() * 1000.0);
+        tracing::info!("forward cancellation finished");
         return;
     };
     // The model is free once its child has finished this response.
@@ -709,7 +733,10 @@ fn forward(
             span.record("forward_ms", forward_ms);
             tracing::info!(bytes, forward_ms, "forwarded");
         }
-        Err(error) => tracing::warn!("forwarding the response failed: {error}"),
+        Err(error) => {
+            span.record("error.type", "forwarding_failed");
+            tracing::warn!("forwarding the response failed: {error}");
+        }
     }
 }
 

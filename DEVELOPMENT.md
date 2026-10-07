@@ -588,11 +588,13 @@ matching JSON field:
 
 | Span | Where | Fields |
 |---|---|---|
-| `http.request` | front and child, one per request | `request_id`, `trace_id`, `route`, `gen_ai.operation.name` (`chat`, `embeddings`, `rerank`, `decide`), `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `error.type`, `mlx.active_bytes`, `mlx.peak_bytes` |
-| `proxy.forward` | front | `model`, `child`, `forward_ms` |
+| `http.request` | front and child, one per request | `request_id`, `trace_id`, `route`, `gen_ai.operation.name` (`chat`, `embeddings`, `rerank`, `decide`), `gen_ai.provider.name`, `gen_ai.request.model`, requested `gen_ai.request.max_tokens`, effective `metallix.output_tokens.limit`, `metallix.output_budget.source`, `metallix.context_tokens.effective`, `gen_ai.response.finish_reason`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `error.type`, `mlx.active_bytes`, `mlx.peak_bytes` |
+| `proxy.forward` | front | `model`, `child`, `forward_ms`, configured `metallix.context_tokens.requested`, `cancel.reason`, `cancel.cleanup` |
 | `proxy.queue` | front, inside `proxy.forward` | `queue.depth`, `queue.wait_ms`, `queue.outcome` |
 | `model.load` | child | `load_ms`, `mlx.active_bytes`, `mlx.peak_bytes` |
 | `chat.render`, `chat.prefill`, `chat.decode_step` | child, Qwen generation and decisions | `render_ms`, `prefill_ms`, `decode_ms` |
+| `chat.sampling` (debug) | child | applied sampler/policy, GPU candidates or full-row path, selected/peek/fallback/error outcome and RNG commit state; no logits, token values or RNG draws |
+| `deepseek.metal.kernel_new_host`, `deepseek.metal.kernel_apply_host`, `deepseek.metal.kernel_apply_c_graph` (debug) | library | shape, grid, threadgroup, input/output counts and C status; host setup and lazy graph construction, not GPU duration |
 | `embed.batch`, `rerank.score`, `decide.score` | child | `embed_ms`, `rerank_ms` |
 | `qwen.weights.load`, `qwen.weights.prepare_float32`, `julia.checkpoint.load` | library crates | |
 
@@ -619,8 +621,31 @@ METALLIX_LOG=info target/release/mx --trace-out run.json generate-qwen-metal --m
 
 Open the file at <https://ui.perfetto.dev> (Open trace file) or in
 `chrome://tracing`. Under `mx serve`, each child writes
-`run.<model-id>.json` and flushes after every request. A file whose process
-ended by signal lacks the closing `]`, which both viewers accept.
+`run.<model-id>.json` and flushes after every request. Graceful SIGTERM/SIGINT
+shutdown finalizes the JSON array; forced termination can leave it unfinished.
+The native-agent harness validates both files as strict JSON after shutdown and
+records TERM, escalation and managed-process exit separately from task quality.
+
+`uv run scripts/mx_spans.py --requests run.json --model-id <model-id>` reports
+request budgets, completion, cancellation and sampling alongside correlated
+phases. It flags unfinished artifacts and exits nonzero even when historical
+recovery can read their events. The default timing report remains available.
+
+The standard check includes `scripts/check_observability.py`: recognized Rust
+instrumentation requires `skip_all`, and telemetry expressions cannot invoke
+named tensor readbacks or sampler/RNG operations. This is a lexical guard;
+helper bodies and macro expansion still require review. Sampling outcomes use
+private enums so an error, fallback, peek or greedy selection cannot be labeled
+as an RNG commit.
+
+For C/Metal attribution, use these host spans with Metal System Trace or the
+existing capture below. MLX constructs lazy graphs, so elapsed C-call time is
+not kernel execution time. Do not add evaluation or readback merely to time an
+operation. Keep first execution separate from warmed repetitions. Creating a
+Metal kernel object is also distinct from compiling an MLX graph; only report
+compiled-call reuse when an actual callable and retracing observation support it.
+See the [MLX Metal debugger](https://ml-explore.github.io/mlx/build/html/dev/metal_debugger.html)
+and [MLX compilation](https://ml-explore.github.io/mlx/build/html/usage/compile.html).
 
 A Metal capture records one command, or under `mx serve` the first request of
 each child (`run.<model-id>.gputrace`). Metal requires

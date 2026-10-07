@@ -386,11 +386,17 @@ pub(crate) fn echo_request_id(value: &mut Value, request_id: Option<&str>) {
 /// Records the `GenAI` usage attributes on the current request span.
 pub(crate) fn record_usage(generated: &crate::chat_generation::ChatGeneration) {
     let span = tracing::Span::current();
+    let finish_reason = match generated.finish_reason {
+        crate::chat_generation::ChatFinishReason::Eos => "eos",
+        crate::chat_generation::ChatFinishReason::Length => "length",
+    };
+    span.record("gen_ai.response.finish_reason", finish_reason);
     span.record("gen_ai.usage.input_tokens", generated.metrics.prompt_tokens);
     span.record(
         "gen_ai.usage.output_tokens",
         generated.generated_token_ids.len(),
     );
+    tracing::info!(finish_reason, "generation finished");
 }
 
 pub(crate) fn json_response(mut connection: Connection, status: u16, value: &Value) {
@@ -1199,6 +1205,41 @@ mod tests {
             failure["response"]["error"],
             json!({"code": "server_error", "message": "boom"})
         );
+    }
+
+    #[test]
+    fn completion_trace_uses_actual_finish_reason() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        struct Reasons(Arc<Mutex<Vec<String>>>);
+        impl tracing::field::Visit for Reasons {
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "finish_reason" {
+                    self.0.lock().unwrap().push(value.to_owned());
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                event.record(&mut Reasons(Arc::clone(&self.0)));
+            }
+        }
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&reasons)));
+        tracing::subscriber::with_default(subscriber, || {
+            // Identical generated output cannot determine why it stopped.
+            for reason in [ChatFinishReason::Eos, ChatFinishReason::Length] {
+                record_usage(&generation_ending("same output", reason));
+            }
+        });
+        assert_eq!(*reasons.lock().unwrap(), ["eos", "length"]);
     }
 
     fn generation(text: &str) -> crate::chat_generation::ChatGeneration {

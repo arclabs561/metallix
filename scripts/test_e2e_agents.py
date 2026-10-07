@@ -16,6 +16,7 @@ import http.client
 import json
 import os
 import pathlib
+import signal
 import socket
 import subprocess
 import sys
@@ -427,7 +428,7 @@ import e2e_agents as e
 root = pathlib.Path(sys.argv[2]); mode = sys.argv[3]
 class Session:
     def __init__(self, argv, address, args):
-        self.aborted = None; self.logs = []; self.traces = []; self.baselines = []; self.memory = []; self.server = None
+        self.aborted = None; self.logs = []; self.traces = []; self.baselines = []; self.memory = []; self.launches = []; self.shutdowns = []; self.server = None
         self.log_path = root / 'server.log'; self.log_path.write_text('')
     def ensure_started(self):
         spec = e.bench_load.ServerSpec('fake', 'chat', [sys.executable, '-c', 'import time; time.sleep(60)'], {}, {})
@@ -438,8 +439,10 @@ class Session:
             self.server.stop()
 e.Session = Session
 e.FIXED_BINARIES['pi'] = sys.executable
+# Hold the empty PID-file publication window open to reproduce the original race.
+# Readiness is published only after that write has closed.
 def command(*args):
-    return [sys.executable, '-c', "import os,time,pathlib; pathlib.Path(" + repr(str(root/'client.pid')) + ").write_text(str(os.getpid())); time.sleep(60)"], {'PATH': e.MINIMAL_PATH, 'HOME': str(root)}
+    return [sys.executable, '-c', "import os,time,pathlib; pidpath=pathlib.Path(" + repr(str(root/'client.pid')) + "); handle=pidpath.open('w'); time.sleep(.1); handle.write(str(os.getpid())); handle.close(); (pidpath.parent/'client.ready').touch(); time.sleep(60)"], {'PATH': e.MINIMAL_PATH, 'HOME': str(root)}
 e.cli_command = command
 e.tool_versions = lambda args: {}
 e.bench_system.system_info = lambda: {}
@@ -464,12 +467,12 @@ raise SystemExit(e.main())
                 try:
                     deadline = time.monotonic() + 10
                     while (
-                        not (pathlib.Path(root) / "client.pid").exists()
+                        not (pathlib.Path(root) / "client.ready").exists()
                         and time.monotonic() < deadline
                         and process.poll() is None
                     ):
                         time.sleep(0.02)
-                    self.assertTrue((pathlib.Path(root) / "client.pid").exists())
+                    self.assertTrue((pathlib.Path(root) / "client.ready").exists())
                     if mode == "sigterm":
                         process.terminate()
                     stdout, stderr = process.communicate(timeout=15)
@@ -482,6 +485,151 @@ raise SystemExit(e.main())
                     if process.poll() is None:
                         process.kill()
                     process.wait(timeout=5)
+
+
+@unittest.skipUnless(sys.platform == "darwin", "requires macOS sandbox-exec")
+class SpawnSignals(unittest.TestCase):
+    def test_child_term_finalizes_after_parent_registration(self):
+        child = r"""
+import json, pathlib, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+def stop(*_):
+    (root / 'finished').write_text('graceful')
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+(root / 'ready').write_text(json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, set()))))
+while True:
+    time.sleep(.05)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            delivered = []
+            registered = False
+            previous_handler = signal.signal(
+                signal.SIGTERM, lambda *_: delivered.append(registered)
+            )
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+            process = None
+            try:
+                command = [sys.executable, "-I", "-S", "-c", child, str(root)]
+                command = e2e_agents.unmasked_command(command)
+                command = e2e_agents.sandbox_command(command, "http://127.0.0.1:1")
+                with e2e_agents.defer_stop_signals():
+                    process = subprocess.Popen(command, start_new_session=True)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    self.assertEqual(delivered, [])
+                    registered = True
+                self.assertEqual(delivered, [True])
+                deadline = time.monotonic() + 5
+                while not (root / "ready").exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue((root / "ready").exists())
+                blocked = json.loads((root / "ready").read_text())
+                self.assertFalse(
+                    set(blocked) & {signal.SIGTERM, signal.SIGINT, signal.SIGALRM}
+                )
+                self.assertIn(signal.SIGUSR1, blocked)
+                process.terminate()
+                self.assertEqual(process.wait(timeout=3), 0)
+                self.assertEqual((root / "finished").read_text(), "graceful")
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(process.pid, 0)
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=5)
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                signal.signal(signal.SIGTERM, previous_handler)
+
+    def test_session_term_closes_timelines_without_escalation(self):
+        server = r"""
+import json, pathlib, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+trace = pathlib.Path(sys.argv[sys.argv.index('--trace-out') + 1])
+child = trace.with_name(trace.stem + '.test' + trace.suffix)
+for path in (trace, child):
+    path.write_text('[')
+def stop(*_):
+    for path in (trace, child):
+        with path.open('a') as output:
+            output.write(json.dumps({'ph': 'i', 'name': 'finished'}) + ']')
+    (root / 'finished').write_text('graceful')
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+(root / 'ready').write_text(json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, set()))))
+while True:
+    time.sleep(.05)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            args = argparse.Namespace(log_dir=root, abort_gpu_gib=4)
+            original = [sys.executable, "-I", "-S", "-c", server, str(root)]
+            session = e2e_agents.Session(original, "127.0.0.1:1", args)
+
+            def ready(_server, _timeout):
+                deadline = time.monotonic() + 5
+                while not (root / "ready").exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue((root / "ready").exists())
+
+            with (
+                mock.patch.object(e2e_agents.bench_system, "probe", return_value={}),
+                mock.patch.object(e2e_agents.bench_system, "Sampler"),
+                mock.patch.object(
+                    e2e_agents.bench_load.ManagedServer, "wait_ready", ready
+                ),
+            ):
+                try:
+                    session.ensure_started()
+                    self.assertEqual(session.spec.argv, original)
+                    blocked = json.loads((root / "ready").read_text())
+                    self.assertFalse(
+                        set(blocked) & {signal.SIGTERM, signal.SIGINT, signal.SIGALRM}
+                    )
+                    process = session.server.process
+                    session.stop()
+                    self.assertEqual((root / "finished").read_text(), "graceful")
+                    self.assertEqual(len(session.shutdowns), 1)
+                    shutdown = session.shutdowns[0]
+                    self.assertTrue(shutdown["term_sent"])
+                    self.assertFalse(shutdown["kill_sent"])
+                    self.assertFalse(shutdown["grace_expired"])
+                    self.assertEqual(shutdown["returncode"], 0)
+                    self.assertTrue(
+                        e2e_agents.validate_timelines(session.traces, "test")["valid"]
+                    )
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(process.pid, 0)
+                finally:
+                    if session.server is not None:
+                        if session.server.process.poll() is None:
+                            session.server.process.kill()
+                        session.stop()
+
+
+class Timelines(unittest.TestCase):
+    def test_missing_or_unfinished_child_is_invalid_without_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            front = pathlib.Path(directory) / "trace.json"
+            child = e2e_agents.mx_spans.child_path(front, "test")
+            event = {"ph": "i", "name": "finished"}
+            front.write_text(json.dumps([event]))
+            self.assertFalse(
+                e2e_agents.validate_timelines([str(front)], "test")["valid"]
+            )
+            truncated = "[" + json.dumps(event)
+            child.write_text(truncated)
+            report = e2e_agents.validate_timelines([str(front)], "test")
+            self.assertFalse(report["valid"])
+            self.assertTrue(report["files"][0]["valid"])
+            self.assertFalse(report["files"][1]["valid"])
+            self.assertEqual(child.read_text(), truncated)
+            child.write_text(truncated + "]")
+            self.assertTrue(
+                e2e_agents.validate_timelines([str(front)], "test")["valid"]
+            )
+            self.assertFalse(e2e_agents.validate_timelines([], "test")["valid"])
 
 
 class Isolation(unittest.TestCase):

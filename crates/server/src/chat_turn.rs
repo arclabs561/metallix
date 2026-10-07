@@ -64,6 +64,19 @@ impl TurnStart {
         request: ChatRequest<'_>,
         deadline: GenerationDeadline,
     ) -> Result<Self, ChatGenerationError> {
+        let request_span = tracing::Span::current();
+        if let Some(requested) = request.max_tokens {
+            request_span.record("gen_ai.request.max_tokens", requested);
+        }
+        request_span.record("metallix.context_tokens.effective", model.context_limit);
+        request_span.record(
+            "metallix.output_budget.source",
+            if request.max_tokens.is_some() {
+                "request"
+            } else {
+                "remaining_context"
+            },
+        );
         deadline.check()?;
         validate_request(request)?;
         let started = Instant::now();
@@ -75,6 +88,11 @@ impl TurnStart {
         let input_ids = prompt.ids;
         deadline.check()?;
         let max_tokens = output_budget(model.context_limit, request.max_tokens, input_ids.len())?;
+        request_span.record("metallix.output_tokens.limit", max_tokens);
+        tracing::info!(
+            prompt_tokens = input_ids.len(),
+            "generation budget resolved"
+        );
         let picker = TokenPicker::new(
             request,
             model.sampling_defaults,

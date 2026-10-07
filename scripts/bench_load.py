@@ -891,6 +891,7 @@ class ManagedServer:
         self.started = time.perf_counter()
         self.ready_s: float | None = None
         self.stop_lock = threading.Lock()
+        self.shutdown: dict | None = None
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
         self.process = subprocess.Popen(
@@ -928,17 +929,31 @@ class ManagedServer:
             self._stop()
 
     def _stop(self) -> None:
+        started = time.perf_counter()
+        shutdown = {
+            "term_sent": False,
+            "kill_sent": False,
+            "grace_expired": False,
+            "returncode": None,
+        }
         # vLLM runs its engine in child processes, so signal the whole group.
         for sig, wait in ((signal.SIGTERM, 20), (signal.SIGKILL, 10)):
             try:
                 os.killpg(self.process.pid, sig)
             except ProcessLookupError:
                 break
+            shutdown["term_sent" if sig == signal.SIGTERM else "kill_sent"] = True
             try:
                 self.process.wait(timeout=wait)
                 break
             except subprocess.TimeoutExpired:
+                if sig == signal.SIGTERM:
+                    shutdown["grace_expired"] = True
                 continue
+        shutdown["returncode"] = self.process.poll()
+        shutdown["elapsed_seconds"] = time.perf_counter() - started
+        # This observes the managed process; it does not certify every descendant.
+        self.shutdown = shutdown
         self.log.close()
 
 
