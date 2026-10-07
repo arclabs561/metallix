@@ -96,6 +96,37 @@ Do not run competing Cargo builds or benchmarks in this checkout concurrently.
 Engram integrity gate, use `just check-fixtures`; see the
 [check recipes and custom-lint policy](docs/development.md).
 
+### Experimental isolated checks
+
+On POSIX, the check runner can capture the current working source and serialize
+checks in one persistent build lane. Opt in with an absolute, user-owned local
+state directory outside the checkout and its ancestors:
+
+```sh
+METALLIX_CHECK_STATE_DIR=/absolute/local/check-state uv run scripts/check.py --isolated
+```
+
+Add `--metal` for the same Metal gate. Locally, setting the state variable also
+selects isolation for ordinary `just check` and `just check-metal` calls. CI stays
+direct unless `--isolated` is explicit; `--direct` overrides local environment
+selection. Nothing enables this mode by default. Do not nest it inside another
+build-slot wrapper or supply a conflicting `CARGO_TARGET_DIR`.
+
+The lane preserves Cargo/CMake target state between checks and keeps the configured
+compiler cache in use; these are separate reuse mechanisms, with no promised
+speedup. Capture includes working edits and nonignored untracked files. Unsupported
+symlinks, submodules and ignored local Cargo configuration fail explicitly. Receipts
+identify the tested source digest and report later checkout changes; inherited
+user configuration means the build is not hermetic.
+
+An incomplete prior run blocks lane reuse pending inspection and explicit recovery.
+Unknown files in the projected source are preserved and rejected. Python bytecode
+is disabled there and Ruff's cache lives outside it. Completed gates retain receipts,
+including ordinary failures; interrupted capture or cleanup need not have a terminal
+receipt. Keep incomplete state for diagnosis rather than automatically reclaiming it.
+This lane coordinates cooperating checks only; model jobs still require separate
+resource admission and the existing serialization policy.
+
 ## Measure one change
 
 For a CPU selection baseline:

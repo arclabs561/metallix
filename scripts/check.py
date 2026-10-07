@@ -16,11 +16,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def run(command: list[str], timeout_seconds: int, *, docs: bool = False) -> int:
+def run(
+    command: list[str], timeout_seconds: int, *, docs: bool = False, lease_fd=None
+) -> int:
     print("+", " ".join(command), flush=True)
     # Every crate and binary needs a crate-level doc; -Dwarnings makes it fatal.
     rustdoc_flags = "-Dwarnings -Wrustdoc::missing_crate_level_docs"
     environment = os.environ | ({"RUSTDOCFLAGS": rustdoc_flags} if docs else {})
+    if lease_fd is not None:
+        from check_workspace import supervise
+
+        return supervise(
+            command,
+            cwd=ROOT,
+            environment=environment,
+            lease_fd=lease_fd,
+            timeout=timeout_seconds,
+        )
     try:
         process = subprocess.Popen(
             command, cwd=ROOT, env=environment, shell=False, start_new_session=True
@@ -56,13 +68,50 @@ def main() -> int:
         default=300,
         help="per-command timeout (default: 300)",
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--isolated", action="store_true", help="experimental POSIX source isolation"
+    )
+    mode.add_argument(
+        "--direct", action="store_true", help="check this working tree directly"
+    )
+    parser.add_argument("--queue-timeout-seconds", type=int, default=300)
     args = parser.parse_args()
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     if args.metal and (platform.system() != "Darwin" or platform.machine() != "arm64"):
         parser.error("--metal requires Darwin arm64")
+    if args.queue_timeout_seconds <= 0:
+        parser.error("--queue-timeout-seconds must be positive")
+    # Importing the controller must not generate source-tree bytecode before
+    # isolated mode has established its generated-output policy.
+    previous_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        from check_workspace import run_isolated, selected
+    finally:
+        sys.dont_write_bytecode = previous_bytecode
+
+    if selected(args, os.environ):
+        try:
+            return run_isolated(ROOT, args)
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            RuntimeError,
+            subprocess.SubprocessError,
+        ) as error:
+            print(f"isolated check failed: {error}", file=sys.stderr)
+            return 1
+    return run_checks(args)
+
+
+def run_checks(args, *, lease_fd=None) -> int:
+    """The authoritative command list, shared by direct and isolated checks."""
     feature_args = ["--all-features"] if args.metal else []
     commands = [
+        ([sys.executable, "scripts/test_check_workspace.py"], False),
         ([sys.executable, "scripts/check_engram_fixtures.py"], False),
         ([sys.executable, "scripts/test_check_engram_fixtures.py"], False),
         ([sys.executable, "scripts/check_doc_ratchet.py"], False),
@@ -146,7 +195,7 @@ def main() -> int:
         (["ruff", "format", "--check", "scripts"], False),
     ]
     for command, docs in commands:
-        if run(command, args.timeout_seconds, docs=docs) != 0:
+        if run(command, args.timeout_seconds, docs=docs, lease_fd=lease_fd) != 0:
             return 1
     return 0
 
