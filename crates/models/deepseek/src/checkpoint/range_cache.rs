@@ -44,6 +44,30 @@ pub struct V41RangeRequest<'a> {
     pub range: Range<u64>,
 }
 
+/// Ordered, tensor-contained offsets relative to the local payload file.
+struct RelativeTensorRange {
+    start: u64,
+    end: u64,
+}
+
+impl RelativeTensorRange {
+    fn from_request(request: &V41RangeRequest<'_>) -> Result<Self, V41RangeCacheError> {
+        let parent = request.tensor_range.file_range();
+        let range = &request.range;
+        if range.start < parent.start || range.start > range.end || range.end > parent.end {
+            return Err(V41RangeCacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "requested range must be ordered and contained in its tensor",
+            )));
+        }
+        // Empty ranges remain valid, including at the tensor's end.
+        Ok(Self {
+            start: range.start - parent.start,
+            end: range.end - parent.start,
+        })
+    }
+}
+
 /// Supplies exact checkpoint bytes. Implementations return exactly
 /// `request.range.end - request.range.start` bytes or an error; the cache
 /// rechecks the length.
@@ -190,6 +214,7 @@ impl V41RangeSource for V41LocalWeightsSource {
         if tensor.is_empty() || tensor.starts_with('.') || tensor.contains(['/', '\\']) {
             return Err(V41RangeCacheError::UnknownTensor(tensor.to_owned()));
         }
+        let relative = RelativeTensorRange::from_request(request)?;
         let receipt_path = self.dir.join(format!("{tensor}.receipt.json"));
         let receipt: Receipt = match fs::read(&receipt_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(V41RangeCacheError::ReceiptJson)?,
@@ -244,8 +269,7 @@ impl V41RangeSource for V41LocalWeightsSource {
             sha256: receipt.sha256,
             stat: observed,
         };
-        let base = expected.file_range().start;
-        let (start, end) = (request.range.start - base, request.range.end - base);
+        let RelativeTensorRange { start, end } = relative;
         let mut file = file;
         let gate = (!self.is_verified(tensor, &identity)).then(|| self.hash_gate(tensor));
         let _hashing = gate.as_ref().map(|gate| {
@@ -909,6 +933,96 @@ mod tests {
         )
         .expect("receipt");
         dir
+    }
+
+    // Exercise the public source API directly: the cache already makes valid
+    // intervals, but an external range-source caller can construct these too.
+    fn malformed_local_request_is_rejected_before_hashing(case: &str) {
+        let good: Vec<u8> = (0..16).collect();
+        let dir = weights_dir(&good, None);
+        let source = V41LocalWeightsSource::new(&dir, REV);
+        let header = header();
+        let tensor_range = header.tensor("e0").expect("fixture tensor");
+        let valid = tensor_range.file_range();
+        let range = match case {
+            "below_base" => valid.start - 1..valid.start + 1,
+            "reversed" => valid.start + 2..valid.start + 1,
+            "over_end" => valid.start..valid.end + 1,
+            _ => panic!("unknown malformed fixture"),
+        };
+        // Catch only to clean up the owned fixture and diagnose panic versus
+        // typed refusal. A caught panic is still a failed requirement.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.read_range(&V41RangeRequest {
+                tensor: "e0",
+                shard: SHARD,
+                tensor_range,
+                range,
+            })
+        }));
+        let hashes = source.hashes.load(Ordering::Relaxed);
+        std::fs::remove_dir_all(dir).expect("cleanup own temp dir");
+        assert!(result.is_ok(), "{case}: request must not panic");
+        assert_eq!(
+            hashes, 0,
+            "{case}: refuse before reading/hashing full payload"
+        );
+        assert!(
+            matches!(result.expect("checked panic"), Err(V41RangeCacheError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput),
+            "{case}: invalid interval must return a typed InvalidInput error"
+        );
+    }
+
+    #[test]
+    fn local_source_rejects_request_below_tensor_base_before_hashing() {
+        malformed_local_request_is_rejected_before_hashing("below_base");
+    }
+
+    #[test]
+    fn local_source_rejects_reversed_request_before_hashing() {
+        malformed_local_request_is_rejected_before_hashing("reversed");
+    }
+
+    #[test]
+    fn local_source_rejects_request_past_tensor_end_before_hashing() {
+        malformed_local_request_is_rejected_before_hashing("over_end");
+    }
+
+    #[test]
+    fn local_source_direct_whole_and_subrange_requests_preserve_bytes() {
+        let good: Vec<u8> = (0..16).collect();
+        let dir = weights_dir(&good, None);
+        let source = V41LocalWeightsSource::new(&dir, REV);
+        let header = header();
+        let tensor_range = header.tensor("e0").expect("fixture tensor");
+        let valid = tensor_range.file_range();
+        let request = |range| V41RangeRequest {
+            tensor: "e0",
+            shard: SHARD,
+            tensor_range,
+            range,
+        };
+        assert_eq!(
+            source.read_range(&request(valid.clone())).expect("whole"),
+            good
+        );
+        assert_eq!(
+            source
+                .read_range(&request(valid.start + 2..valid.start + 4))
+                .expect("slice"),
+            [2, 3]
+        );
+        for position in [valid.start, valid.start + 2, valid.end] {
+            assert_eq!(
+                source
+                    .read_range(&request(position..position))
+                    .expect("contained empty range"),
+                Vec::<u8>::new()
+            );
+        }
+        assert_eq!(source.hashes.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(dir).expect("cleanup own temp dir");
     }
 
     #[test]
