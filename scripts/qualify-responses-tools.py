@@ -555,6 +555,301 @@ def classify(error: ModelError | ProtocolError | TransportError) -> str:
     return "transport"
 
 
+class ArgumentParseError(ModelError):
+    """The model emitted argument text that is not unambiguous JSON."""
+
+
+def strict_json(text: str):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
+
+
+def typed_equal(left, right) -> bool:
+    """JSON object order is irrelevant; bool, int and float remain distinct."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            typed_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            typed_equal(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
+
+
+def fixture_value_matches(value, schema) -> bool:
+    """Validate only the deliberately small authored fixture schema subset."""
+    if not isinstance(schema, dict):
+        return False
+    kind = schema.get("type")
+    if kind == "object":
+        props = schema.get("properties")
+        required = schema.get("required")
+        return (
+            isinstance(value, dict)
+            and isinstance(props, dict)
+            and isinstance(required, list)
+            and all(isinstance(key, str) and key in props for key in required)
+            and schema.get("additionalProperties") is False
+            and set(required) <= value.keys() <= props.keys()
+            and all(
+                fixture_value_matches(item, props[key]) for key, item in value.items()
+            )
+        )
+    if kind == "array":
+        return (
+            isinstance(value, list)
+            and len(value) <= 8
+            and all(fixture_value_matches(item, schema.get("items")) for item in value)
+        )
+    expected = {"string": str, "integer": int, "boolean": bool, "null": type(None)}
+    return kind in expected and type(value) is expected[kind]
+
+
+def load_cases(path: Path, split: str) -> tuple[list[dict], str]:
+    with path.open("rb") as source:
+        raw = source.read(65_537)
+    if len(raw) > 65_536:
+        raise ValueError("case fixture exceeds 64 KiB")
+    rows = [
+        strict_json(line) for line in raw.decode("utf-8").splitlines() if line.strip()
+    ]
+    if not 1 <= len(rows) <= 64:
+        raise ValueError("fixture must contain 1..64 cases")
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TypeError("case must be an object")
+        case_id = row.get("id")
+        if (
+            not isinstance(case_id, str)
+            or not case_id
+            or len(case_id) > 64
+            or any(
+                char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in case_id
+            )
+            or case_id in seen
+            or row.get("split") not in ("calibration", "heldout")
+            or set(row) != {"id", "split", "strata", "tools", "steps", "provenance"}
+            or not isinstance(row["provenance"], str)
+            or not isinstance(row["strata"], list)
+            or not row["strata"]
+            or not all(isinstance(tag, str) and tag for tag in row["strata"])
+        ):
+            raise ValueError("invalid case identity, split or fields")
+        seen.add(case_id)
+        tools = row["tools"]
+        steps = row["steps"]
+        if not isinstance(tools, list) or not 1 <= len(tools) <= 4:
+            raise ValueError("case requires 1..4 tools")
+        names = {}
+        for tool in tools:
+            if (
+                not isinstance(tool, dict)
+                or tool.get("type") != "function"
+                or not isinstance(tool.get("name"), str)
+                or not tool["name"]
+                or tool["name"] in names
+                or not isinstance(tool.get("parameters"), dict)
+            ):
+                raise ValueError("invalid or duplicate tool")
+            names[tool["name"]] = tool["parameters"]
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 3:
+            raise ValueError("case requires 1..3 ordered calls")
+        for step in steps:
+            if (
+                not isinstance(step, dict)
+                or set(step) != {"name", "arguments"}
+                or not isinstance(step["name"], str)
+                or step["name"] not in names
+                or not fixture_value_matches(step["arguments"], names[step["name"]])
+            ):
+                raise ValueError("expected call does not match its fixture schema")
+    selected = [row for row in rows if split == "all" or row["split"] == split]
+    if not selected:
+        raise ValueError("selected split contains no cases")
+    return selected, sha256(raw)
+
+
+def instantiate_case(case: dict, seed: str, trial: str) -> dict:
+    def derive(label: str) -> str:
+        return sha256(json.dumps([seed, case["id"], trial, label]).encode())[:32]
+
+    def replace(value):
+        if isinstance(value, str):
+            return value.replace("$nonce", derive("argument"))
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        return value
+
+    steps = replace(case["steps"])
+    prompt = (
+        "Make these function calls in the stated order, waiting for each tool result "
+        "before making the next call: "
+        + json.dumps(steps, ensure_ascii=False)
+        + ". After all results, reply exactly QUALIFIED: followed by their "
+        "qualification_value strings joined with |, with no other text."
+    )
+    return {
+        "prompt": prompt,
+        "steps": steps,
+        "values": ["FACT-" + derive(f"result-{index}") for index in range(len(steps))],
+    }
+
+
+def case_call(response: dict, expected: dict) -> dict:
+    output = response["output"]
+    if (
+        len(output) != 1
+        or not isinstance(output[0], dict)
+        or output[0].get("type") != "function_call"
+    ):
+        raise ModelError("expected exactly one ordered function call")
+    call = output[0]
+    if not all(
+        isinstance(call.get(key), str) and call[key] for key in ("id", "call_id")
+    ):
+        raise ProtocolError("function-call response lacks identity")
+    if call.get("status") != "completed" or call.get("name") != expected["name"]:
+        raise ModelError("wrong function name or incomplete call")
+    if not isinstance(call.get("arguments"), str):
+        raise ArgumentParseError("function arguments are not text")
+    try:
+        arguments = strict_json(call["arguments"])
+    except ValueError as error:
+        raise ArgumentParseError(
+            "function arguments are not unambiguous JSON"
+        ) from error
+    if not typed_equal(arguments, expected["arguments"]):
+        raise ModelError("wrong typed function arguments")
+    return call
+
+
+def run_case(case, instance, host, port, path, args, stream, label):
+    history = [{"role": "user", "content": instance["prompt"]}]
+    call_ids, item_ids = set(), set()
+    requests = []
+    for index in range(len(instance["steps"]) + 1):
+        payload = {
+            "model": args.model_id,
+            "input": history,
+            "tools": case["tools"],
+            "stream": stream,
+            "max_output_tokens": 256,
+            "temperature": 0,
+            "store": False,
+        }
+        started = time.monotonic()
+        response, _ = request(
+            host,
+            port,
+            path,
+            payload,
+            args.timeout_seconds,
+            args.output,
+            f"{label}-{index}",
+        )
+        requests.append(
+            {"wall_ms": (time.monotonic() - started) * 1000, "usage": response["usage"]}
+        )
+        if index == len(instance["steps"]):
+            if answer_text(response) != "QUALIFIED:" + "|".join(instance["values"]):
+                raise ModelError(
+                    "answer does not reproduce supplied ordered runtime facts"
+                )
+            break
+        call = case_call(response, instance["steps"][index])
+        if call["call_id"] in call_ids or call["id"] in item_ids:
+            raise ProtocolError("ordered function calls reused an identity")
+        call_ids.add(call["call_id"])
+        item_ids.add(call["id"])
+        history = [*history, call, tool_result(call, instance["values"][index])]
+    return requests
+
+
+def run_cases(args, plan, cases, host, port, path) -> int:
+    seed = args.seed or os.urandom(32).hex()
+    receipt = {
+        **plan,
+        "status": "running",
+        "seed": seed,
+        "instance_algorithm": "sha256-json-seed-case-trial-label-v1",
+        "latency_scope": (
+            "client request wall including serialization, artifact writes and response "
+            "validation; not pure server/model or optimization latency"
+        ),
+        "trials": [],
+    }
+    destination = args.output / "receipt.json"
+
+    def save():
+        destination.write_text(json.dumps(receipt, indent=2, ensure_ascii=False) + "\n")
+
+    save()
+    try:
+        for case in cases:
+            for stream in (False, True):
+                for repeat in range(1, args.repeats + 1):
+                    label = f"{case['id']}-{'sse' if stream else 'json'}-{repeat}"
+                    instance = instantiate_case(case, seed, label)
+                    row = {
+                        "case_id": case["id"],
+                        "split": case["split"],
+                        "mode": "sse" if stream else "json",
+                        "repeat": repeat,
+                        "instance_sha256": sha256(
+                            json.dumps(instance, sort_keys=True).encode()
+                        ),
+                    }
+                    started = time.monotonic()
+                    try:
+                        row["requests"] = run_case(
+                            case, instance, host, port, path, args, stream, label
+                        )
+                        row.update(passed=True, task_correct=True)
+                    except (ModelError, ProtocolError, TransportError) as error:
+                        row.update(
+                            passed=False,
+                            task_correct=False
+                            if isinstance(error, ModelError)
+                            else None,
+                            failure={
+                                "class": classify(error),
+                                "stage": "arguments_parse"
+                                if isinstance(error, ArgumentParseError)
+                                else classify(error),
+                                "error": str(error),
+                            },
+                        )
+                    row["wall_ms"] = (time.monotonic() - started) * 1000
+                    receipt["trials"].append(row)
+                    save()
+                    print(f"{label}: {'pass' if row['passed'] else 'FAIL'}", flush=True)
+    except KeyboardInterrupt:
+        receipt["status"] = "interrupted"
+        save()
+        return 130
+    receipt["status"] = (
+        "passed" if all(row["passed"] for row in receipt["trials"]) else "failed"
+    )
+    save()
+    return 0 if receipt["status"] == "passed" else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", action="store_true")
@@ -563,7 +858,26 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=positive, default=3)
     parser.add_argument("--timeout-seconds", type=positive, default=90)
+    parser.add_argument("--cases", type=Path, help="authored tool-call JSONL fixture")
+    parser.add_argument(
+        "--split", choices=("all", "calibration", "heldout"), default="all"
+    )
+    parser.add_argument(
+        "--seed", help="64 hex characters; fresh random seed when omitted"
+    )
     args = parser.parse_args()
+    if args.seed is not None and (
+        len(args.seed) != 64 or any(c not in "0123456789abcdef" for c in args.seed)
+    ):
+        parser.error("--seed requires 64 lowercase hex characters")
+    if args.cases is None and (args.seed is not None or args.split != "all"):
+        parser.error("--seed and --split require --cases")
+    cases = None
+    if args.cases is not None:
+        try:
+            cases, fixture_sha = load_cases(args.cases, args.split)
+        except (OSError, ValueError, TypeError) as error:
+            parser.error(str(error))
     origin, host, port, base_path = args.url
     plan = {
         "schema_version": 1,
@@ -577,6 +891,17 @@ def main() -> int:
         "modes": ["json", "sse"],
         "server_action": "none",
     }
+    if cases is not None:
+        plan.update(
+            scope="Authored native tool-call stress cases; no constrained jump support",
+            fixture_sha256=fixture_sha,
+            split=args.split,
+            cases=[
+                {"id": case["id"], "split": case["split"], "strata": case["strata"]}
+                for case in cases
+            ],
+            seed=args.seed or "fresh_at_run",
+        )
     if not args.run:
         print(json.dumps(plan, indent=2))
         return 0
@@ -585,6 +910,8 @@ def main() -> int:
     ):
         parser.error("--output must name a new or empty directory")
     args.output.mkdir(parents=True, exist_ok=True)
+    if cases is not None:
+        return run_cases(args, plan, cases, host, port, base_path)
     receipt: dict = {**plan, "status": "running", "trials": []}
     receipt_path = args.output / "receipt.json"
     receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")

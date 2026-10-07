@@ -530,6 +530,20 @@ responses and distinguishes model, protocol, and transport failures. The client
 supplies the tool result; this does not execute filesystem tools or establish
 Codex readiness. See [measured results](docs/experiments/chat-performance.md#native-responses-tool-replay).
 
+For a small authored serving workload, add `--cases fixtures/tool-calls/cases.jsonl`
+and select `--split calibration` or `--split heldout`. The four cases cover
+ordered calls, nested typed arguments, Unicode/escapes and similar tool names;
+they do not measure tokenizer-mask coverage or enable schema-constrained tools.
+For example, append `--cases fixtures/tool-calls/cases.jsonl --split heldout
+--repeats 1` to the command above. Optional `--seed` accepts 64 lowercase hex
+characters for replay; otherwise the runner chooses a fresh seed and records it
+with fixture and instance identities. Fresh runtime facts stay out of the
+initial prompt and are supplied through tool results. Fresh values do not
+establish freedom from memorization or unseen task families. Reported client
+request wall time includes serialization, artifact writes and response validation;
+it is not pure server/model latency, an optimization comparison or a model-quality
+score.
+
 The separate native Codex command-tool qualifier is dry-run first. Start the
 4B server with the exact resident limits under test, then use an empty output
 directory:

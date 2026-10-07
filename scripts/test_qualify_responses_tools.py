@@ -472,5 +472,228 @@ class ResponsesToolsTests(unittest.TestCase):
             )
 
 
+class FixtureCaseTests(unittest.TestCase):
+    fixture = SCRIPT.parent.parent / "fixtures/tool-calls/cases.jsonl"
+
+    def setUp(self):
+        self.cases, self.fixture_sha = module.load_cases(self.fixture, "all")
+
+    def test_split_identity_and_novel_runtime_facts_without_prompt_leak(self):
+        self.assertEqual(
+            [row["split"] for row in self.cases],
+            ["calibration", "calibration", "heldout", "heldout"],
+        )
+        selected, digest = module.load_cases(self.fixture, "heldout")
+        self.assertEqual(
+            [row["id"] for row in selected], ["unicode-escaped", "name-prefix"]
+        )
+        self.assertEqual(digest, self.fixture_sha)
+        first = module.instantiate_case(self.cases[0], "a" * 64, "trial")
+        again = module.instantiate_case(self.cases[0], "a" * 64, "trial")
+        novel = module.instantiate_case(self.cases[0], "b" * 64, "trial")
+        self.assertEqual(first, again)
+        self.assertNotEqual(first["steps"], novel["steps"])
+        self.assertNotEqual(first["values"], novel["values"])
+        for value in first["values"]:
+            self.assertNotIn(value, first["prompt"])
+        self.assertNotIn("$nonce", first["prompt"])
+
+    def test_loader_rejects_duplicate_ids_wrong_types_and_schema_tools_mix(self):
+        variants = []
+        variants.append([self.cases[0], self.cases[0]])
+        wrong = copy.deepcopy(self.cases[1])
+        wrong["steps"][0]["arguments"]["query"]["limit"] = True
+        variants.append([wrong])
+        mixed = {**self.cases[0], "json_schema": {}}
+        variants.append([mixed])
+        for rows in variants:
+            with self.subTest(rows=rows), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "cases.jsonl"
+                path.write_text("\n".join(json.dumps(row) for row in rows))
+                with self.assertRaises(ValueError):
+                    module.load_cases(path, "all")
+
+    def test_call_oracle_rejects_wrong_name_bool_integer_and_malformed_json(self):
+        expected = {"name": "search_records", "arguments": {"query": {"limit": 1}}}
+        response = call_response()
+        call = response["output"][0]
+        call.update(name="search_records", arguments='{"query":{"limit":1}}')
+        self.assertEqual(module.case_call(response, expected), call)
+        for arguments in (
+            '{"query":{"limit":true}}',
+            '{"query":{"limit":1.0}}',
+            '{"query":{"limit":2}}',
+        ):
+            call["arguments"] = arguments
+            with self.assertRaises(module.ModelError):
+                module.case_call(response, expected)
+        for arguments in ("{", '{"query":{},"query":{"limit":1}}', '{"query":NaN}'):
+            call["arguments"] = arguments
+            with self.assertRaises(module.ArgumentParseError):
+                module.case_call(response, expected)
+        call.update(name="invented_tool", arguments='{"query":{"limit":1}}')
+        with self.assertRaises(module.ModelError):
+            module.case_call(response, expected)
+
+    def test_unicode_sse_offline_reconstructs_exact_arguments(self):
+        instance = module.instantiate_case(self.cases[2], "a" * 64, "unicode")
+        expected = instance["steps"][0]
+        response = call_response()
+        response["output"][0].update(
+            name=expected["name"],
+            arguments=json.dumps(expected["arguments"], ensure_ascii=False),
+        )
+        parsed, events = module.parse_sse(sse(response))
+        module.validate_stream_events(parsed, events)
+        self.assertEqual(
+            module.case_call(parsed, expected)["arguments"],
+            response["output"][0]["arguments"],
+        )
+        bad = copy.deepcopy(events)
+        next(
+            event
+            for event in bad
+            if event["type"] == "response.function_call_arguments.delta"
+        )["delta"] = "fabricated"
+        with self.assertRaises(module.ProtocolError):
+            module.validate_stream_events(parsed, bad)
+
+    def drive_case(self, *, corrupt_answer=False, duplicate_identity=False):
+        case = self.cases[0]
+        instance = module.instantiate_case(case, "a" * 64, "trial")
+        responses = []
+        for index, expected in enumerate(instance["steps"]):
+            response = call_response(
+                call_id=f"call_{0 if duplicate_identity else index}",
+                item_id=f"item_{index}",
+            )
+            response["output"][0].update(
+                name=expected["name"], arguments=json.dumps(expected["arguments"])
+            )
+            responses.append(response)
+        answer = message_response()
+        answer["output"][0]["content"][0]["text"] = (
+            "QUALIFIED:invented|invented"
+            if corrupt_answer
+            else "QUALIFIED:" + "|".join(instance["values"])
+        )
+        responses.append(answer)
+        payloads = []
+
+        def fake_request(host, port, path, payload, timeout, output, label):
+            payloads.append(copy.deepcopy(payload))
+            return responses[len(payloads) - 1], None
+
+        args = argparse.Namespace(
+            model_id="test", timeout_seconds=30, output=Path("unused")
+        )
+        with patch.object(module, "request", side_effect=fake_request):
+            result = module.run_case(
+                case, instance, "127.0.0.1", 8321, "/v1", args, False, "trial"
+            )
+        self.assertEqual(len(result), 3)
+        self.assertEqual(
+            payloads[0]["input"], [{"role": "user", "content": instance["prompt"]}]
+        )
+        self.assertEqual(
+            payloads[1]["input"][2],
+            module.tool_result(responses[0]["output"][0], instance["values"][0]),
+        )
+        self.assertEqual(
+            payloads[2]["input"][4],
+            module.tool_result(responses[1]["output"][0], instance["values"][1]),
+        )
+        return result
+
+    def test_ordered_replay_supplies_only_observed_call_results(self):
+        self.drive_case()
+
+    def test_hallucinated_answer_and_reused_call_id_fail(self):
+        with self.assertRaises(module.ModelError):
+            self.drive_case(corrupt_answer=True)
+        with self.assertRaises(module.ProtocolError):
+            self.drive_case(duplicate_identity=True)
+
+    def test_case_run_receipt_records_identity_seed_and_protocol_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(
+                seed="c" * 64,
+                output=Path(directory),
+                repeats=1,
+                model_id="test",
+                timeout_seconds=30,
+            )
+            plan = {"fixture_sha256": self.fixture_sha, "status": "dry_run"}
+            with patch.object(
+                module, "request", side_effect=module.ProtocolError("bad SSE")
+            ):
+                code = module.run_cases(
+                    args, plan, self.cases[:1], "127.0.0.1", 8321, "/v1"
+                )
+            receipt = json.loads((args.output / "receipt.json").read_text())
+            self.assertEqual(code, 1)
+            self.assertEqual(receipt["seed"], "c" * 64)
+            self.assertEqual(receipt["fixture_sha256"], self.fixture_sha)
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(len(receipt["trials"]), 2)
+            for row in receipt["trials"]:
+                self.assertIsNone(row["task_correct"])
+                self.assertEqual(row["failure"]["class"], "protocol")
+                self.assertEqual(len(row["instance_sha256"]), 64)
+
+    def test_non_object_call_output_finishes_case_receipt_as_failed(self):
+        for item in (None, "text"):
+            with self.subTest(item=item), tempfile.TemporaryDirectory() as directory:
+                response = call_response()
+                response["output"] = [item]
+                response = module.validate_response(response)
+                args = argparse.Namespace(
+                    seed="d" * 64,
+                    output=Path(directory),
+                    repeats=1,
+                    model_id="test",
+                    timeout_seconds=30,
+                )
+                with patch.object(module, "request", return_value=(response, None)):
+                    code = module.run_cases(
+                        args, {}, self.cases[:1], "127.0.0.1", 8321, "/v1"
+                    )
+                receipt = json.loads((args.output / "receipt.json").read_text())
+                self.assertEqual(code, 1)
+                self.assertEqual(receipt["status"], "failed")
+                self.assertEqual(len(receipt["trials"]), 2)
+                for row in receipt["trials"]:
+                    self.assertFalse(row["passed"])
+                    self.assertEqual(row["failure"]["class"], "model")
+                    self.assertEqual(
+                        row["failure"]["error"],
+                        "expected exactly one ordered function call",
+                    )
+
+    def test_cases_dry_run_never_contacts_server_or_creates_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "absent"
+            args = [
+                str(SCRIPT),
+                "--url",
+                "http://127.0.0.1:8321/v1",
+                "--model-id",
+                "test",
+                "--output",
+                str(output),
+                "--cases",
+                str(self.fixture),
+                "--split",
+                "heldout",
+            ]
+            with (
+                patch.object(sys, "argv", args),
+                patch.object(module, "request") as request,
+            ):
+                self.assertEqual(module.main(), 0)
+                request.assert_not_called()
+            self.assertFalse(output.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
