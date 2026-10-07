@@ -144,6 +144,12 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
+    /// Offered tools whose definition sets `strict: true`.
+    fn strict_tools(&self) -> Vec<String> {
+        crate::responses::strict_tools(&self.tools, &self.request.tools, |tool| {
+            tool["function"]["strict"] == Value::Bool(true)
+        })
+    }
     /// Reuses the validated chat prompt for teacher-forced scoring without
     /// exposing protocol parsing or generation-only controls to that route.
     pub(crate) fn into_prompt(self) -> (Vec<ChatMessage>, Vec<Value>, bool, Option<String>) {
@@ -441,7 +447,7 @@ fn completion_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(&prepared.tools, generated)?;
+    let turn = assistant_turn(&prepared.tools, &prepared.strict_tools(), generated)?;
     let mut message = json!({"role":"assistant","content":if turn.calls.is_empty() || !turn.text.trim().is_empty() {json!(turn.text)} else {Value::Null},"refusal":null});
     if !turn.calls.is_empty() {
         let calls: Vec<Value> = tool_calls(&turn, id)
@@ -602,7 +608,7 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(&prepared.tools, &generated) {
+    let turn = match assistant_turn(&prepared.tools, &prepared.strict_tools(), &generated) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "invalid_model_output", &error),
     };
@@ -1003,6 +1009,70 @@ mod tests {
             "{} pieces generated after the client left",
             backend.deltas
         );
+    }
+
+    /// A call to an undeclared tool goes back as generated (the client
+    /// validates it, per the spec's note on `arguments`); a `strict` tool's
+    /// off-schema call is still refused.
+    #[test]
+    fn calls_go_back_as_generated_unless_their_tool_is_strict() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        let undeclared = r#"<tool_call>{"name":"shell","arguments":{"cmd":"ls"}}</tool_call>"#;
+        let mut backend = Scripted::new(undeclared);
+        let (status, body) = json_body(&run(&with(&json!({"tools":[tool.clone()]})), &mut backend));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        let call = &body["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "shell");
+        assert_eq!(call["arguments"], r#"{"cmd":"ls"}"#);
+
+        let off_schema = r#"<tool_call>{"name":"read_file","arguments":{"path":5}}</tool_call>"#;
+        let mut backend = Scripted::new(off_schema);
+        let (status, _) = json_body(&run(&with(&json!({"tools":[tool.clone()]})), &mut backend));
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let mut strict = tool;
+        strict["function"]["strict"] = json!(true);
+        let mut backend = Scripted::new(off_schema);
+        let (status, _) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
+        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+    }
+
+    #[test]
+    fn streaming_validates_only_explicitly_strict_tool_arguments() {
+        for strict in [false, true] {
+            for valid in [false, true] {
+                let mut tool: Value = serde_json::from_str(TOOL).unwrap();
+                tool["function"]["strict"] = json!(strict);
+                let arguments = if valid {
+                    json!({"path":"README.md"})
+                } else {
+                    json!({"path":5})
+                };
+                let output = format!(
+                    "Checking.<tool_call>{{\"name\":\"read_file\",\"arguments\":{arguments}}}</tool_call>"
+                );
+                let mut backend = Scripted::new(&output);
+                let wire = run(&with(&json!({"tools":[tool],"stream":true})), &mut backend);
+                assert!(wire.starts_with("HTTP/1.1 200 OK"));
+                let frames: Vec<Value> = events(&wire)
+                    .into_iter()
+                    .filter_map(|(_, data)| serde_json::from_str(&data).ok())
+                    .collect();
+                assert_eq!(
+                    frames.iter().any(|frame| frame.get("error").is_some()),
+                    strict && !valid,
+                    "strict={strict}, valid={valid}: {frames:?}"
+                );
+                assert_eq!(
+                    frames.iter().any(
+                        |frame| frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+                            == "read_file"
+                    ),
+                    !strict || valid,
+                    "strict={strict}, valid={valid}: {frames:?}"
+                );
+            }
+        }
     }
 
     #[test]

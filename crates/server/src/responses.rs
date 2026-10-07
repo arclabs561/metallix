@@ -713,18 +713,37 @@ pub(crate) fn logprobs_value(logprobs: &[TokenLogprob]) -> Value {
 
 pub(crate) use chat_format::AssistantTurn;
 
-/// The turn a session parsed, with each call checked against its
-/// declaration. `tools` are template-shaped definitions, as [`tools`]
-/// returns them.
+/// The parsed turn, checking schemas only for protocol-selected tool names.
+/// This terminal validation does not constrain generation to the schema.
 pub(crate) fn assistant_turn(
     tools: &[Value],
+    strict: &[String],
     generated: &crate::chat_generation::ChatGeneration,
 ) -> Result<AssistantTurn, String> {
     let turn = generated.turn.clone()?;
-    for call in &turn.calls {
+    for call in turn.calls.iter().filter(|call| strict.contains(&call.name)) {
         chat_format::check_call(tools, call)?;
     }
     Ok(turn)
+}
+
+/// Names selected for terminal schema validation by the protocol's policy.
+/// An empty offered set means tools were disabled for this turn.
+pub(crate) fn strict_tools(
+    offered: &[Value],
+    declared: &[Value],
+    validate: impl Fn(&Value) -> bool,
+) -> Vec<String> {
+    if offered.is_empty() {
+        return Vec::new();
+    }
+    declared
+        .iter()
+        .filter(|tool| validate(tool))
+        .filter_map(|tool| tool.get("name").or_else(|| tool["function"].get("name")))
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The `Response` fields a reply carries before any output, filled from the
@@ -801,7 +820,13 @@ fn response_value(
         text,
         calls,
         complete,
-    } = assistant_turn(&tools(request)?, generated)?;
+    } = {
+        let offered = tools(request)?;
+        let strict = strict_tools(&offered, &request.tools, |tool| {
+            tool["strict"] != Value::Bool(false)
+        });
+        assistant_turn(&offered, &strict, generated)?
+    };
     let reasoned = !reasoning.is_empty();
     let mut output = Vec::new();
     if !reasoning.is_empty() {
@@ -1402,19 +1427,34 @@ mod tests {
     }
 
     #[test]
-    fn schema_validation_rejects_undeclared_and_invalid_calls() {
-        let request: Request = serde_json::from_value(json!({"model":"control","input":"hello","tools":[{"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}]})).unwrap();
+    /// Explicitly non-strict arguments pass through; malformed or truncated
+    /// calls still fail, and undeclared names remain client-validated.
+    fn explicitly_non_strict_calls_preserve_parsing_boundaries() {
+        let read_file = json!({"type":"function","name":"read_file","strict":false,"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}});
+        let request: Request = serde_json::from_value(
+            json!({"model":"control","input":"hello","tools":[read_file.clone()]}),
+        )
+        .unwrap();
         let controls = GenerationControls::default();
         let response_value = |request: &Request, generated: &_, id| {
             response_value(request, &controls, generated, id)
         };
-        for text in [
-            "<tool_call>{",
-            r#"<tool_call>{"name":"shell","arguments":{}}</tool_call>"#,
-            r#"<tool_call>{"name":"read_file","arguments":{"path":5}}</tool_call>"#,
-        ] {
-            assert!(response_value(&request, &generation(text), "test").is_err());
-        }
+        assert!(response_value(&request, &generation("<tool_call>{"), "test").is_err());
+        let undeclared = r#"<tool_call>{"name":"shell","arguments":{}}</tool_call>"#;
+        let off_schema = r#"<tool_call>{"name":"read_file","arguments":{"path":5}}</tool_call>"#;
+        let response = response_value(&request, &generation(undeclared), "test").unwrap();
+        assert_eq!(response["output"][0]["name"], "shell");
+        let response = response_value(&request, &generation(off_schema), "test").unwrap();
+        assert_eq!(response["output"][0]["arguments"], r#"{"path":5}"#);
+
+        let mut strict_tool = read_file;
+        strict_tool["strict"] = json!(true);
+        let strict: Request = serde_json::from_value(
+            json!({"model":"control","input":"hello","tools":[strict_tool]}),
+        )
+        .unwrap();
+        assert!(response_value(&strict, &generation(off_schema), "test").is_err());
+        assert!(response_value(&strict, &generation(undeclared), "test").is_ok());
         let call =
             r#"<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>"#;
         let response = response_value(&request, &generation(call), "test").unwrap();
@@ -1434,6 +1474,46 @@ mod tests {
         assert_eq!(mixed["output"][1]["type"], "function_call");
         let truncated = generation_ending(call, ChatFinishReason::Length);
         assert!(response_value(&request, &truncated, "test").is_err());
+    }
+
+    #[test]
+    fn responses_declared_call_validation_respects_protocol_defaults() {
+        let controls = GenerationControls::default();
+        for strict in [
+            None,
+            Some(Value::Null),
+            Some(json!(true)),
+            Some(json!(false)),
+        ] {
+            for valid in [false, true] {
+                let mut tool = json!({"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}});
+                if let Some(flag) = &strict {
+                    tool["strict"] = flag.clone();
+                }
+                let request: Request = serde_json::from_value(
+                    json!({"model":"control","input":"hello","tools":[tool]}),
+                )
+                .unwrap();
+                let arguments = if valid {
+                    json!({"path":"README.md"})
+                } else {
+                    json!({"path":5})
+                };
+                let text = format!(
+                    "<tool_call>{{\"name\":\"read_file\",\"arguments\":{arguments}}}</tool_call>"
+                );
+                let result = response_value(&request, &controls, &generation(&text), "test");
+                let reject = strict != Some(json!(false)) && !valid;
+                assert_eq!(result.is_err(), reject, "strict={strict:?}, valid={valid}");
+                if let Ok(response) = result {
+                    assert_eq!(response["output"][0]["name"], "read_file");
+                    let returned: Value =
+                        serde_json::from_str(response["output"][0]["arguments"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(returned, arguments);
+                }
+            }
+        }
     }
 
     mod wire {
@@ -1606,6 +1686,56 @@ mod tests {
                 .unwrap();
             assert_eq!(done["text"], "{}");
             assert_eq!(done["logprobs"], json!([]));
+        }
+
+        #[test]
+        fn responses_streaming_validation_respects_protocol_defaults() {
+            for strict in [
+                None,
+                Some(Value::Null),
+                Some(json!(true)),
+                Some(json!(false)),
+            ] {
+                for valid in [false, true] {
+                    let mut tool: Value = serde_json::from_str(TOOL).unwrap();
+                    if let Some(flag) = &strict {
+                        tool["strict"] = flag.clone();
+                    }
+                    tool["parameters"] = json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false});
+                    let arguments = if valid {
+                        json!({"path":"README.md"})
+                    } else {
+                        json!({"path":5})
+                    };
+                    let output = format!(
+                        "Checking.<tool_call>{{\"name\":\"read_file\",\"arguments\":{arguments}}}</tool_call>"
+                    );
+                    let mut backend = crate::sse::test_support::Scripted::new(&output);
+                    let body =
+                        json!({"model":"control","input":"hello","tools":[tool],"stream":true})
+                            .to_string();
+                    let frames = events(&exchange(&body, &mut backend));
+                    let last = frames.last().expect("terminal response event");
+                    if strict != Some(json!(false)) && !valid {
+                        assert_eq!(last["type"], "response.failed");
+                        assert_eq!(last["response"]["error"]["code"], "server_error");
+                        assert_eq!(
+                            last["response"]["error"]["metallix_code"],
+                            "invalid_model_output"
+                        );
+                    } else {
+                        assert_eq!(last["type"], "response.completed");
+                        assert!(
+                            last["response"]["output"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .any(|item| item["type"] == "function_call"
+                                    && item["name"] == "read_file")
+                        );
+                    }
+                }
+            }
         }
 
         #[test]

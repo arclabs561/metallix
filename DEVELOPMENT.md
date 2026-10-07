@@ -435,6 +435,21 @@ history, validated function definitions and function-call outputs, greedy
 sampling, and optional SSE. It rejects response storage, response-ID chaining,
 images, nondefault sampling controls, and forced tool choice. Treat it as a
 small Responses compatibility target, not a complete OpenAI or Codex service.
+Generated calls to declared tools receive terminal schema validation on
+`/v1/responses` when `strict` is omitted, `null`, or `true`; explicit `false`
+passes the arguments through. Chat Completions and Messages validate only
+explicit `strict: true` tools (nested in `function` for Chat). Parsed malformed
+calls still fail; undeclared tool names pass through for client validation.
+Clients should validate calls before executing them.
+
+These are local response-validation rules, not a generation-time grammar or a
+promise of schema-valid emission. [OpenAI's strict-mode guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)
+distinguishes Responses' omitted-flag normalization/fallback from Chat's
+non-strict default. This server does not reproduce that hosted normalization
+or fallback negotiation; Responses instead retains local validation against
+the supplied schema. A validation failure after streaming has begun terminates
+the stream with an error rather than repairing the call.
+
 As in vLLM, `/v1/responses`, `/v1/chat/completions` and `/v1/messages` accept
 `"ignore_eos": true`, a metallix extension that keeps generating past
 end-of-turn until the output limit, so benchmark runs produce equal-length
