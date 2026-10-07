@@ -73,6 +73,11 @@ impl Default for Envelope {
 pub trait RangeHost {
     /// Fetches bytes `range` of `url`, returning the body and the final
     /// response's `Content-Range` value (empty when absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the request fails or the range is empty;
+    /// an implementation decides how it reports a non-2xx response.
     fn get_range(&self, url: &str, range: Range<u64>) -> io::Result<(Vec<u8>, String)>;
 
     /// Free bytes on the volume holding `path`.
@@ -456,6 +461,13 @@ impl<H: RangeHost> FetchingSource<H> {
     /// `trace_dir/headers.json`, whose revision must match, and pinned experts
     /// from `trace_dir/pinned-experts.json` when present. The current `*.bin`
     /// total in `weights_dir` counts against `envelope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when `headers.json` is missing, malformed or for
+    /// another revision, `pinned-experts.json` exists but cannot be read or
+    /// parsed, or the weights store and its row packs cannot be opened or
+    /// migrated.
     pub fn new(
         weights_dir: impl Into<PathBuf>,
         trace_dir: &Path,

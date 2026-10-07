@@ -50,6 +50,18 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
     /// Starts a sequence and returns logits after every prompt position, for
     /// teacher-forced scoring. Row `i` is the next-token distribution after
     /// `input_ids[..=i]`.
+    ///
+    /// # Errors
+    ///
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn prefill_all_logits(
         &mut self,
         input_ids: &[i32],
@@ -62,6 +74,20 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
     /// chunk position. Row `i` agrees with
     /// [`Self::extend_last_logits`] of `input_ids[..=i]` up to kernel
     /// reduction order. Each row costs one vocabulary-wide readback.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn extend_all_logits(
         &mut self,
         input_ids: &[i32],
@@ -78,6 +104,22 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
     /// lowest-ID tie rule as decode. Only the `input_ids.len()` token IDs
     /// are read back, not the vocabulary rows, which is what a greedy
     /// speculative verify needs.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
+    /// * [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow)
+    ///   when a pick does not fit a token ID.
     pub fn extend_greedy(
         &mut self,
         input_ids: &[i32],

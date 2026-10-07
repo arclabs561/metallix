@@ -104,6 +104,21 @@ impl Qwen3StreamExecutor {
     ///
     /// `max_total_tokens` includes the supplied prompt and every later decode
     /// token. It is therefore a conservative, fixed K/V reservation contract.
+    ///
+    /// # Errors
+    ///
+    /// * [`LayerWeightBudget`](crate::metal::Qwen3MetalLoadError::LayerWeightBudget) when a layer's weights pass
+    ///   `max_weight_bytes`.
+    /// * [`StreamMaximumBelowPrompt`](crate::metal::Qwen3MetalLoadError::StreamMaximumBelowPrompt)
+    ///   and
+    ///   [`CachedStateBudget`](crate::metal::Qwen3MetalLoadError::CachedStateBudget)
+    ///   when the prompt or its cached state does not fit the limits.
+    /// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+    ///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig)
+    ///   when the checkpoint headers or configuration fail validation.
+    /// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+    ///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+    ///   cannot load or evaluate a tensor.
     pub fn new(
         model: &Path,
         prompt_ids: &[i32],
@@ -158,6 +173,15 @@ impl Qwen3StreamExecutor {
     }
 
     /// Fills the cache from the constructor prompt and returns the final logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`StreamPrefillAlreadyDone`](crate::metal::Qwen3MetalLoadError::StreamPrefillAlreadyDone)
+    /// on a second prefill,
+    /// [`StreamPoisoned`](crate::metal::Qwen3MetalLoadError::StreamPoisoned)
+    /// after an earlier failure, and the loading and evaluation errors of the
+    /// stream.
     pub fn prefill_last_logits(&mut self) -> Result<Vec<f32>, Qwen3MetalLoadError> {
         self.last_profile = None;
         match self.state {
@@ -168,6 +192,22 @@ impl Qwen3StreamExecutor {
     }
 
     /// Appends one token and returns its final logits.
+    ///
+    /// # Errors
+    ///
+    /// * [`StreamDecodeWithoutPrefill`](crate::metal::Qwen3MetalLoadError::StreamDecodeWithoutPrefill)
+    ///   before prefill, and
+    ///   [`StreamPoisoned`](crate::metal::Qwen3MetalLoadError::StreamPoisoned)
+    ///   after an earlier failure.
+    /// * [`StreamContextLimit`](crate::metal::Qwen3MetalLoadError::StreamContextLimit)
+    ///   past `max_total_tokens`, and
+    ///   [`InvalidTokenId`](crate::metal::Qwen3MetalLoadError::InvalidTokenId)
+    ///   or
+    ///   [`DimensionOutOfRange`](crate::metal::Qwen3MetalLoadError::DimensionOutOfRange)
+    ///   for a token outside the vocabulary.
+    /// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+    ///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when a
+    ///   layer cannot be loaded or evaluated.
     pub fn decode_last_logits(&mut self, token: i32) -> Result<Vec<f32>, Qwen3MetalLoadError> {
         self.last_profile = None;
         match self.state {

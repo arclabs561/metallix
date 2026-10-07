@@ -61,6 +61,21 @@ pub struct Qwen3LayerCheck {
 /// from preceding layers. The budget covers logical weights and read/conversion
 /// staging only; it excludes attention/MLP scratch, headers, allocator retention,
 /// hidden states, and the resident reference. This is not a whole-process limit.
+///
+/// # Errors
+///
+/// * [`LayerWeightBudget`](crate::metal::Qwen3MetalLoadError::LayerWeightBudget)
+///   when the layer's weights pass `max_weight_bytes`.
+/// * [`DimensionOutOfRange`](crate::metal::Qwen3MetalLoadError::DimensionOutOfRange)
+///   when a dimension does not fit MLX.
+/// * [`RangeCheckMismatch`](crate::metal::Qwen3MetalLoadError::RangeCheckMismatch)
+///   when the compared outputs differ.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
 pub fn qualify_layer(
     model: &Path,
     layer: usize,

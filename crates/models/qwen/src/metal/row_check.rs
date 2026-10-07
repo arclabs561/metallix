@@ -30,6 +30,27 @@ pub struct Qwen3TensorRowsCheck {
 /// Only selected raw bytes are budgeted. FP32 buffers, headers and the resident
 /// reference are excluded. Keep checkpoint files immutable for the complete
 /// comparison. This reads rows; it does not implement tiled model execution.
+///
+/// # Errors
+///
+/// * [`RangeCheckMissingTensor`](crate::metal::Qwen3MetalLoadError::RangeCheckMissingTensor),
+///   [`RangeCheckDtype`](crate::metal::Qwen3MetalLoadError::RangeCheckDtype),
+///   [`RangeCheckShape`](crate::metal::Qwen3MetalLoadError::RangeCheckShape)
+///   and
+///   [`RangeCheckOddBytes`](crate::metal::Qwen3MetalLoadError::RangeCheckOddBytes)
+///   when the tensor is absent or not the layout the check reads.
+/// * [`DimensionOutOfRange`](crate::metal::Qwen3MetalLoadError::DimensionOutOfRange)
+///   when a dimension does not fit MLX.
+/// * [`RangeCheckNonFinite`](crate::metal::Qwen3MetalLoadError::RangeCheckNonFinite)
+///   and
+///   [`RangeCheckMismatch`](crate::metal::Qwen3MetalLoadError::RangeCheckMismatch)
+///   when the decoded values are not finite or differ from the device's.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
 pub fn qualify_tensor_rows(
     model_dir: impl AsRef<Path>,
     tensor: &str,

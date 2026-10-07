@@ -267,6 +267,14 @@ impl Qwen3TokenPicks {
     }
 
     /// [`Self::wait`] for a single-row pick, such as one decode step.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`CacheInconsistent`](crate::forward::Qwen3ForwardError::CacheInconsistent)
+    /// when the picks do not hold exactly one row, and
+    /// [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when they cannot be read
+    /// back.
     pub fn wait_one(&self) -> Result<i32, Qwen3ForwardError> {
         match self.wait()?.as_slice() {
             [token] => Ok(*token),
@@ -276,6 +284,14 @@ impl Qwen3TokenPicks {
 
     /// [`Self::wait`] plus each row's candidates, when the rule asked for
     /// any.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow) when
+    /// a pick does not fit a token ID, and
+    /// [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the picks cannot be
+    /// read back.
     pub fn wait_with_candidates(
         &self,
     ) -> Result<(Vec<i32>, Option<Vec<Qwen3RowCandidates>>), Qwen3ForwardError> {
@@ -317,6 +333,14 @@ impl Qwen3TokenPicks {
 
     /// Reads back the whole `[rows, vocab]` logits as f32 rows, for a caller
     /// whose candidates could not settle its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow) when
+    /// a row's shape does not fit, and
+    /// [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the rows cannot be
+    /// read back.
     pub fn full_rows(&self) -> Result<Vec<Vec<f32>>, Qwen3ForwardError> {
         let wide = self.logits.as_type_device::<f32>(StreamOrDevice::gpu())?;
         wide.eval()?;

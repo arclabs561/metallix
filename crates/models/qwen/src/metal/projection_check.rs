@@ -49,6 +49,25 @@ pub struct Qwen3ProjectionCheck {
 /// explicitly accepted. `max_bytes` applies independently to each raw tile;
 /// it neither bounds the cumulative payload nor the process memory footprint.
 /// Checkpoint files must stay immutable for the complete qualification.
+///
+/// # Errors
+///
+/// * [`MissingEmbedding`](crate::metal::Qwen3MetalLoadError::MissingEmbedding)
+///   and
+///   [`RangeCheckShape`](crate::metal::Qwen3MetalLoadError::RangeCheckShape)
+///   when the tied embedding is absent or misshapen, and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) for an
+///   untied checkpoint.
+/// * [`DimensionOutOfRange`](crate::metal::Qwen3MetalLoadError::DimensionOutOfRange)
+///   when a dimension does not fit MLX.
+/// * [`RangeCheckMismatch`](crate::metal::Qwen3MetalLoadError::RangeCheckMismatch)
+///   when the tiled and direct projections differ.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
 pub fn qualify_projection(
     model: &Path,
     tile_rows: usize,

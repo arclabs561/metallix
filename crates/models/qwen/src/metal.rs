@@ -56,6 +56,27 @@ pub struct Qwen3TensorRangeCheck {
 /// Checkpoint files must remain immutable for the complete comparison.
 /// The read timing includes file/metadata checks, excludes inspection and is
 /// neither a repeated benchmark nor evidence of physical SSD traffic.
+///
+/// # Errors
+///
+/// * [`RangeCheckMissingTensor`](crate::metal::Qwen3MetalLoadError::RangeCheckMissingTensor),
+///   [`RangeCheckDtype`](crate::metal::Qwen3MetalLoadError::RangeCheckDtype),
+///   [`RangeCheckShape`](crate::metal::Qwen3MetalLoadError::RangeCheckShape)
+///   and
+///   [`RangeCheckOddBytes`](crate::metal::Qwen3MetalLoadError::RangeCheckOddBytes)
+///   when the tensor is absent or not the layout the check reads.
+/// * [`DimensionOutOfRange`](crate::metal::Qwen3MetalLoadError::DimensionOutOfRange)
+///   when a dimension does not fit MLX.
+/// * [`RangeCheckNonFinite`](crate::metal::Qwen3MetalLoadError::RangeCheckNonFinite)
+///   and
+///   [`RangeCheckMismatch`](crate::metal::Qwen3MetalLoadError::RangeCheckMismatch)
+///   when the decoded values are not finite or differ from the device's.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
 pub fn qualify_tensor_range(
     model_dir: impl AsRef<Path>,
     tensor: &str,
@@ -216,6 +237,14 @@ impl Qwen3PagedWeights {
     }
 
     /// Sizes a pool from a K/V byte budget at these weights' K/V precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`KvPoolConfig`](crate::forward::Qwen3ForwardError::KvPoolConfig) when
+    /// the budget cannot hold a valid pool, and
+    /// [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow) when
+    /// the per-token size overflows.
     pub fn pool_for_budget(
         &self,
         budget_bytes: u64,
@@ -230,6 +259,14 @@ impl Qwen3PagedWeights {
     }
 
     /// Allocates a paged K/V pool over these weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`CachedBidirectional`](crate::forward::Qwen3ForwardError::CachedBidirectional),
+    /// [`KvPoolDtype`](crate::forward::Qwen3ForwardError::KvPoolDtype) or
+    /// [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) as
+    /// `PagedQwen3Session::new` describes.
     pub fn session(
         &self,
         pool: engine::blocks::PoolConfig,
@@ -263,6 +300,12 @@ impl Qwen3MlxWeights {
 
     /// Starts a resident-chat executor after validating its context and logical
     /// K/V estimate against this checkpoint's decoder configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of `Qwen3ForwardExecutor::resident`: a non-causal
+    /// model, a context or KV budget that does not fit, or an MLX allocation
+    /// failure.
     pub fn resident_chat_executor(
         &self,
         maximum_context_tokens: usize,
@@ -286,6 +329,13 @@ impl Qwen3MlxWeights {
     /// Detaches the first `tokens` cached positions of a resident executor
     /// borrowed from these weights, for a later
     /// [`Self::resident_chat_executor_from`] on the same weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvSnapshotMismatch`](crate::forward::Qwen3ForwardError::KvSnapshotMismatch) when `executor`
+    /// borrows other weights, and [`KvSnapshotUnsupported`](crate::forward::Qwen3ForwardError::KvSnapshotUnsupported)
+    /// or [`CacheInconsistent`](crate::forward::Qwen3ForwardError::CacheInconsistent) when its cache cannot be
+    /// snapshotted at `tokens`.
     pub fn snapshot_resident_prefix(
         &self,
         executor: &crate::forward::Qwen3ForwardExecutor<
@@ -303,6 +353,13 @@ impl Qwen3MlxWeights {
     /// Starts a resident-chat executor whose cache already holds `snapshot`'s
     /// prefix. The snapshot must come from this load (after any precision
     /// change) and the same context and K/V limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`KvSnapshotMismatch`](crate::forward::Qwen3ForwardError::KvSnapshotMismatch)
+    /// when `snapshot` came from other weights, and the errors of
+    /// `resident_chat_executor` otherwise.
     pub fn resident_chat_executor_from(
         &self,
         snapshot: &crate::forward::Qwen3KvSnapshot,
@@ -330,11 +387,26 @@ impl Qwen3MlxWeights {
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
     /// This increases resident weight memory relative to the BF16 checkpoint;
     /// quantized weights are dequantized first.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) with
+    /// [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) when
+    /// a dense weight is absent, and
+    /// [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+    /// cannot convert it.
     pub fn prepare_float32(&mut self) -> Result<(), Qwen3MetalLoadError> {
         self.prepare_precision(Qwen3WeightPrecision::Dense(Qwen3FloatPrecision::Float32))
     }
 
     /// How the loaded tensors are stored now.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+    /// the loaded weights do not share one supported precision.
     pub fn precision(&self) -> Result<Qwen3WeightPrecision, Qwen3MetalLoadError> {
         let activations = crate::forward::kv_precision(&self.forward_config, &self.tensors)?;
         Ok(match self.forward_config.quantization() {
@@ -351,6 +423,15 @@ impl Qwen3MlxWeights {
     /// unpacked tensor to its float dtype, and quantizing projections and the
     /// token embedding with MLX's affine `quantize` when it is affine. K/V
     /// caches take the resulting activation dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) with
+    /// [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) when
+    /// a dense weight is absent, and
+    /// [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+    /// cannot convert it.
     #[tracing::instrument(
         name = "qwen.weights.prepare_precision",
         level = "info",
@@ -425,6 +506,18 @@ impl Qwen3MlxWeights {
     }
 
     /// Executes the dense qualification decoder using these checkpoint tensors.
+    ///
+    /// # Errors
+    ///
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn forward_last_logits(
         &self,
         input_ids: &[i32],
@@ -838,14 +931,21 @@ pub enum Qwen3MetalLoadError {
     DimensionOutOfRange(&'static str),
     /// Loading did not preserve the checkpoint's validated tensor count.
     #[error("MLX loaded {actual} tensors, expected {expected}")]
-    UnexpectedTensorCount { expected: usize, actual: usize },
+    UnexpectedTensorCount {
+        /// Tensors the validated headers declare.
+        expected: usize,
+        /// Tensors MLX loaded.
+        actual: usize,
+    },
     /// The required token embedding was absent after loading.
     #[error("MLX did not load model.embed_tokens.weight")]
     MissingEmbedding,
     /// MLX reported an embedding shape different from the model contract.
     #[error("MLX embedding shape {actual:?}, expected {expected:?}")]
     UnexpectedEmbeddingShape {
+        /// `[vocab_size, hidden_size]`.
         expected: Vec<i32>,
+        /// The loaded shape.
         actual: Vec<i32>,
     },
     /// A forward lookup needs at least one token ID.
@@ -853,7 +953,12 @@ pub enum Qwen3MetalLoadError {
     EmptyInputIds,
     /// Token IDs must name rows in the configured embedding vocabulary.
     #[error("token ID {token} is outside vocabulary 0..{vocab_size}")]
-    InvalidTokenId { token: i32, vocab_size: u32 },
+    InvalidTokenId {
+        /// The token ID.
+        token: i32,
+        /// The vocabulary size.
+        vocab_size: u32,
+    },
 }
 
 #[cfg(test)]

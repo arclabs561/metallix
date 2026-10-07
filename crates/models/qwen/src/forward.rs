@@ -159,6 +159,12 @@ pub struct Qwen3SteeringPositionRange {
 
 impl Qwen3SteeringPositionRange {
     /// Creates a nonempty absolute token-position range.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`EmptyPositionRange`](crate::forward::Qwen3SteeringError::EmptyPositionRange)
+    /// unless `start_inclusive < end_exclusive`.
     pub fn new(start_inclusive: usize, end_exclusive: usize) -> Result<Self, Qwen3SteeringError> {
         if start_inclusive >= end_exclusive {
             return Err(Qwen3SteeringError::EmptyPositionRange {
@@ -207,6 +213,20 @@ pub struct Qwen3ResidualSteeringArtifact {
 
 impl Qwen3ResidualSteeringArtifact {
     /// Creates an artifact whose model declaration is checked when bound.
+    ///
+    /// # Errors
+    ///
+    /// * [`MissingModelIdentity`](crate::forward::Qwen3SteeringError::MissingModelIdentity)
+    ///   for an empty identity.
+    /// * [`InvalidDeclaredDimensions`](crate::forward::Qwen3SteeringError::InvalidDeclaredDimensions),
+    ///   [`LayerOutOfDeclaredRange`](crate::forward::Qwen3SteeringError::LayerOutOfDeclaredRange)
+    ///   and
+    ///   [`ResidualDimensionMismatch`](crate::forward::Qwen3SteeringError::ResidualDimensionMismatch)
+    ///   when the dimensions, layer or residual length disagree.
+    /// * [`NonFiniteResidual`](crate::forward::Qwen3SteeringError::NonFiniteResidual)
+    ///   and
+    ///   [`NonFiniteCoefficient`](crate::forward::Qwen3SteeringError::NonFiniteCoefficient)
+    ///   for a NaN or infinite value.
     pub fn new(
         model_identity: impl Into<String>,
         declared_hidden_layers: usize,
@@ -274,6 +294,15 @@ pub struct Qwen3ResidualSteering {
 
 impl Qwen3ResidualSteering {
     /// Binds an artifact to this exact Qwen execution layout.
+    ///
+    /// # Errors
+    ///
+    /// * [`ConfigurationDimensionMismatch`](crate::forward::Qwen3SteeringError::ConfigurationDimensionMismatch)
+    ///   and
+    ///   [`LayerOutOfDeclaredRange`](crate::forward::Qwen3SteeringError::LayerOutOfDeclaredRange)
+    ///   when the artifact was not made for `config`.
+    /// * [`NonFiniteScaledResidual`](crate::forward::Qwen3SteeringError::NonFiniteScaledResidual)
+    ///   when scaling the residual overflows.
     pub fn bind(
         artifact: Qwen3ResidualSteeringArtifact,
         config: &Qwen3ForwardConfig,
@@ -401,6 +430,27 @@ impl Qwen3ForwardConfig {
     /// bias. Sliding-window and scaled `RoPE` variants require their own
     /// reference vectors, so they are refused rather than silently ignored. An untied checkpoint projects logits
     /// through `lm_head.weight` instead of the token embedding.
+    ///
+    /// # Errors
+    ///
+    /// * [`Json`](crate::forward::Qwen3ForwardError::Json) for malformed JSON.
+    /// * [`UnsupportedModelType`](crate::forward::Qwen3ForwardError::UnsupportedModelType),
+    ///   [`UnsupportedBiasLayout`](crate::forward::Qwen3ForwardError::UnsupportedBiasLayout),
+    ///   [`UnsupportedActivation`](crate::forward::Qwen3ForwardError::UnsupportedActivation),
+    ///   [`UnsupportedRopeScaling`](crate::forward::Qwen3ForwardError::UnsupportedRopeScaling)
+    ///   and
+    ///   [`UnsupportedSlidingWindow`](crate::forward::Qwen3ForwardError::UnsupportedSlidingWindow)
+    ///   for a variant this decoder does not implement.
+    /// * [`MissingDimension`](crate::forward::Qwen3ForwardError::MissingDimension),
+    ///   [`OddHeadDimension`](crate::forward::Qwen3ForwardError::OddHeadDimension),
+    ///   [`HeadDimensionTooLarge`](crate::forward::Qwen3ForwardError::HeadDimensionTooLarge),
+    ///   [`InvalidGroupedQueryLayout`](crate::forward::Qwen3ForwardError::InvalidGroupedQueryLayout),
+    ///   [`InvalidRmsNormEpsilon`](crate::forward::Qwen3ForwardError::InvalidRmsNormEpsilon),
+    ///   [`InvalidRopeTheta`](crate::forward::Qwen3ForwardError::InvalidRopeTheta),
+    ///   [`MissingRopeTheta`](crate::forward::Qwen3ForwardError::MissingRopeTheta)
+    ///   and
+    ///   [`ConflictingRopeTheta`](crate::forward::Qwen3ForwardError::ConflictingRopeTheta)
+    ///   for dimensions or controls the forward path cannot use.
     pub fn parse(json: &str) -> Result<Self, Qwen3ForwardError> {
         let mut raw: RawForwardConfig = serde_json::from_str(json)?;
         let (Some(family), Some(attention)) = (
@@ -619,6 +669,15 @@ impl Qwen3ForwardConfig {
     /// their tensors). It excludes model weights, activations, operator
     /// scratch, and allocator headroom; it does not preallocate or reserve MLX
     /// memory.
+    ///
+    /// # Errors
+    ///
+    /// * [`CachedBidirectional`](crate::forward::Qwen3ForwardError::CachedBidirectional)
+    ///   for a non-causal model.
+    /// * [`ResidentChatContextLimit`](crate::forward::Qwen3ForwardError::ResidentChatContextLimit)
+    ///   and
+    ///   [`ResidentChatKvBudget`](crate::forward::Qwen3ForwardError::ResidentChatKvBudget)
+    ///   when the context or its KV cache does not fit the limits.
     pub fn resident_chat_plan(
         &self,
         maximum_context_tokens: usize,
@@ -661,6 +720,17 @@ impl Qwen3ForwardConfig {
 /// constructed on the Metal GPU stream; only the final logit vector crosses
 /// back to the host. The caller must keep the map resident for the duration of
 /// the invocation.
+///
+/// # Errors
+///
+/// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId) and
+///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong) when
+///   the input is empty, names a token outside the vocabulary, or passes the
+///   context limit.
+/// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) and
+///   [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is absent or
+///   MLX cannot build or evaluate the graph.
 pub fn forward_last_logits<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     config: &Qwen3ForwardConfig,
@@ -671,6 +741,19 @@ pub fn forward_last_logits<S: BuildHasher>(
 
 /// Runs the bounded uncached Qwen forward with an optional validated residual
 /// intervention.
+///
+/// # Errors
+///
+/// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId) and
+///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong) when
+///   the input is empty, names a token outside the vocabulary, or passes the
+///   context limit.
+/// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) and
+///   [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is absent or
+///   MLX cannot build or evaluate the graph.
+/// * [`Steering`](crate::forward::Qwen3ForwardError::Steering) when the
+///   intervention does not apply to this input.
 pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     config: &Qwen3ForwardConfig,
@@ -689,6 +772,17 @@ pub fn forward_last_logits_with_residual_steering<S: BuildHasher>(
 /// [`forward_last_logits`] is this vector times the token-embedding matrix,
 /// or `lm_head.weight` for an untied checkpoint.
 /// It equals the last row of a source `Qwen3Model`'s `last_hidden_state`.
+///
+/// # Errors
+///
+/// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId) and
+///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong) when
+///   the input is empty, names a token outside the vocabulary, or passes the
+///   context limit.
+/// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) and
+///   [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is absent or
+///   MLX cannot build or evaluate the graph.
 pub fn forward_last_hidden<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     config: &Qwen3ForwardConfig,
@@ -703,6 +797,17 @@ pub fn forward_last_hidden<S: BuildHasher>(
 /// position's final-norm hidden state, flattened `[positions, hidden_size]`.
 ///
 /// This is a source `Qwen3Model`'s `last_hidden_state` for one sequence.
+///
+/// # Errors
+///
+/// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId) and
+///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong) when
+///   the input is empty, names a token outside the vocabulary, or passes the
+///   context limit.
+/// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) and
+///   [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is absent or
+///   MLX cannot build or evaluate the graph.
 pub fn forward_hidden_states<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     config: &Qwen3ForwardConfig,
@@ -813,6 +918,21 @@ fn last_normalized_hidden<S: BuildHasher>(
 /// cannot change its real positions, and each row is read at that sequence's
 /// own last token. Bidirectional attention would need a padding mask, so it is
 /// refused.
+///
+/// # Errors
+///
+/// * [`BatchedBidirectional`](crate::forward::Qwen3ForwardError::BatchedBidirectional)
+///   for a non-causal model.
+/// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId) and
+///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong) when
+///   the input is empty, names a token outside the vocabulary, or passes the
+///   context limit.
+/// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight) and
+///   [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is absent or
+///   MLX cannot build or evaluate the graph.
+/// * [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow) when
+///   the padded batch does not fit.
 pub fn forward_last_hidden_batch<S: BuildHasher>(
     weights: &HashMap<String, Array, S>,
     config: &Qwen3ForwardConfig,
@@ -1099,6 +1219,16 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// The map uses this crate's canonical `model.`-prefixed names. Unlike
     /// [`crate::metal::Qwen3MlxWeights`], nothing has checked its tensor
     /// shapes; a missing tensor fails the first forward pass.
+    ///
+    /// # Errors
+    ///
+    /// * [`CachedBidirectional`](crate::forward::Qwen3ForwardError::CachedBidirectional),
+    ///   [`ResidentChatContextLimit`](crate::forward::Qwen3ForwardError::ResidentChatContextLimit)
+    ///   and
+    ///   [`ResidentChatKvBudget`](crate::forward::Qwen3ForwardError::ResidentChatKvBudget)
+    ///   as `Qwen3ForwardConfig::resident_chat_plan` describes.
+    /// * [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the cache cannot
+    ///   be allocated.
     pub fn resident(
         config: &'a Qwen3ForwardConfig,
         weights: &'a HashMap<String, Array, S>,
@@ -1122,6 +1252,13 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// Installs or removes a residual intervention before this executor has
     /// materialized KV. Refusing a mid-sequence change prevents caches from
     /// mixing incompatible residual histories.
+    ///
+    /// # Errors
+    ///
+    /// * [`SteeringRequiresEmptyCache`](crate::forward::Qwen3SteeringError::SteeringRequiresEmptyCache)
+    ///   when the executor already holds tokens.
+    /// * [`BoundConfigurationMismatch`](crate::forward::Qwen3SteeringError::BoundConfigurationMismatch)
+    ///   when `steering` was bound to another configuration.
     pub fn set_residual_steering(
         &mut self,
         steering: Option<Qwen3ResidualSteering>,
@@ -1187,6 +1324,18 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     /// Starts a sequence, fills its KV cache, and returns its final logits.
+    ///
+    /// # Errors
+    ///
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn prefill_last_logits(
         &mut self,
         input_ids: &[i32],
@@ -1196,6 +1345,20 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     /// Appends exactly one token to the current sequence and returns its logits.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn decode_last_logits(&mut self, input_id: i32) -> Result<Vec<f32>, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
@@ -1211,6 +1374,20 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// cached prefix and to its own earlier positions. Logits agree with a
     /// single prefill of the concatenated tokens up to kernel reduction order,
     /// not bit-for-bit: MLX may tile the shorter matmuls differently.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn extend_last_logits(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
@@ -1226,6 +1403,15 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// The retained arrays are evaluated before their handles are cloned.
     /// Later decode appends build replacement K/V arrays through concatenation;
     /// they do not mutate the snapshot arrays owned by this executor.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`CacheInconsistent`](crate::forward::Qwen3ForwardError::CacheInconsistent)
+    ///   when the cache no longer matches the configuration.
+    /// * [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the cache cannot
+    ///   be copied.
     pub fn fork_prefilled(&self) -> Result<Self, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
@@ -1419,6 +1605,20 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// Only the selected ID and a finiteness flag are read back, not the
     /// vocabulary row. Ties go to the lowest token ID, as in a host argmax
     /// that keeps the first maximum.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn decode_greedy(&mut self, input_id: i32) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         self.decode_picks(input_id, &Qwen3PickRule::GREEDY)
     }
@@ -1429,6 +1629,22 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     ///
     /// The cache then holds `previous` even if the caller stops on it (an
     /// end-of-sequence token); [`Self::truncate_cached_tokens`] removes it.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`CacheInconsistent`](crate::forward::Qwen3ForwardError::CacheInconsistent)
+    ///   when the cache no longer matches the configuration.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn decode_greedy_after(
         &mut self,
         previous: &Qwen3TokenPicks,
@@ -1437,6 +1653,24 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     /// [`Self::decode_greedy`] under any [`Qwen3PickRule`].
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
+    /// * [`InvalidPickRule`](crate::forward::Qwen3ForwardError::InvalidPickRule)
+    ///   for a rule outside its domain, and
+    ///   [`NonFiniteLogits`](crate::forward::Qwen3ForwardError::NonFiniteLogits)
+    ///   when the logits cannot be picked from.
     pub fn decode_picks(
         &mut self,
         input_id: i32,
@@ -1455,6 +1689,26 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     }
 
     /// [`Self::decode_greedy_after`] under any [`Qwen3PickRule`].
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`CacheInconsistent`](crate::forward::Qwen3ForwardError::CacheInconsistent)
+    ///   when the cache no longer matches the configuration.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
+    /// * [`InvalidPickRule`](crate::forward::Qwen3ForwardError::InvalidPickRule)
+    ///   for a rule outside its domain, and
+    ///   [`NonFiniteLogits`](crate::forward::Qwen3ForwardError::NonFiniteLogits)
+    ///   when the logits cannot be picked from.
     pub fn decode_picks_after(
         &mut self,
         previous: &Qwen3TokenPicks,
@@ -1502,6 +1756,14 @@ impl<'a, S: BuildHasher> Qwen3ForwardExecutor<'a, S> {
     /// Shortens the sequence to its first `tokens` cached positions, such as
     /// dropping a token appended by [`Self::decode_greedy_after`] that the
     /// caller then stopped on, or rejected draft positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`TruncateOutOfRange`](crate::forward::Qwen3ForwardError::TruncateOutOfRange)
+    /// when `tokens` is more than the cached length, and
+    /// [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the cache cannot be
+    /// cut.
     pub fn truncate_cached_tokens(&mut self, tokens: usize) -> Result<(), Qwen3ForwardError> {
         if tokens == 0 || tokens > self.cached_tokens {
             return Err(Qwen3ForwardError::TruncateOutOfRange {

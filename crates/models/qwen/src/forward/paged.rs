@@ -320,6 +320,14 @@ impl KvPool {
 impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     /// Sizes a pool from a K/V byte budget at the K/V precision these
     /// weights produce, rounding down to whole slabs.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`KvPoolConfig`](crate::forward::Qwen3ForwardError::KvPoolConfig) when
+    /// the budget cannot hold a valid pool, and
+    /// [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow) when
+    /// the per-token size overflows.
     pub fn pool_for_budget(
         config: &Qwen3ForwardConfig,
         weights: &HashMap<String, Array, S>,
@@ -333,6 +341,15 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     }
 
     /// Allocates the pool at the K/V precision these weights produce.
+    ///
+    /// # Errors
+    ///
+    /// * [`CachedBidirectional`](crate::forward::Qwen3ForwardError::CachedBidirectional)
+    ///   for a non-causal model.
+    /// * [`KvPoolDtype`](crate::forward::Qwen3ForwardError::KvPoolDtype) when
+    ///   the pool's dtype differs from the activations'.
+    /// * [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the pool cannot
+    ///   be allocated.
     pub fn new(
         config: &'a Qwen3ForwardConfig,
         weights: &'a HashMap<String, Array, S>,
@@ -363,6 +380,11 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     }
 
     /// Tokens whose K/V `seq` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) for an
+    /// unknown sequence.
     pub fn cached_tokens(&self, seq: SequenceId) -> Result<usize, Qwen3ForwardError> {
         Ok(self.blocks.num_computed(seq)?)
     }
@@ -371,6 +393,20 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     /// K/V and returns the last prompt token's logits. Cached prefix blocks
     /// are reused when the pool has prefix caching enabled; this prefill is
     /// keyed with no salt and no extra keys.
+    ///
+    /// # Errors
+    ///
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn prefill_last_logits(
         &mut self,
         seq: SequenceId,
@@ -405,6 +441,20 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     ///
     /// A pool without room returns [`Qwen3ForwardError::KvBlocks`] and leaves
     /// the manager unchanged.
+    ///
+    /// # Errors
+    ///
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn prefill_with_keys(
         &mut self,
         seq: SequenceId,
@@ -443,6 +493,22 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     ///
     /// A pool without free blocks returns [`Qwen3ForwardError::KvBlocks`] and
     /// leaves `seq` unchanged, so a scheduler can preempt and retry.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn extend_last_logits(
         &mut self,
         seq: SequenceId,
@@ -463,6 +529,22 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     }
 
     /// Appends exactly one token to `seq` and returns its logits.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn decode_last_logits(
         &mut self,
         seq: SequenceId,
@@ -473,6 +555,11 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
 
     /// Starts `child` as a copy of `parent` that shares every block. The
     /// first append by either into the shared partial tail block copies it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when
+    /// the parent is unknown or the child already exists.
     pub fn fork(&mut self, parent: SequenceId, child: SequenceId) -> Result<(), Qwen3ForwardError> {
         Ok(self.blocks.fork(parent, child)?)
     }
@@ -480,6 +567,11 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     /// Releases `seq`'s blocks. Before calling this, finish every queued step
     /// that references `seq`, including steps left outstanding after errors.
     /// A completed turn alone does not mean its queued writes have settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) for an
+    /// unknown sequence.
     pub fn free(&mut self, seq: SequenceId) -> Result<(), Qwen3ForwardError> {
         Ok(self.blocks.free(seq)?)
     }
@@ -500,6 +592,20 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     /// The check counts a copy for each row whose tail is shared, so two forks
     /// of one parent may be refused one block early. Any later failure frees
     /// every row's sequence.
+    ///
+    /// # Errors
+    ///
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput) for no
+    ///   rows, and
+    ///   [`RepeatedBatchSequence`](crate::forward::Qwen3ForwardError::RepeatedBatchSequence)
+    ///   when a sequence appears twice.
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn decode_batch(
         &mut self,
         rows: &[(SequenceId, i32)],
@@ -555,6 +661,24 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     /// their state may be partially advanced. Do not resume them: finish any
     /// outstanding steps that reference them, then explicitly [`Self::free`]
     /// each failed row. An error cannot free rows owned by `previous`.
+    ///
+    /// # Errors
+    ///
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput) for no
+    ///   rows, and
+    ///   [`RepeatedBatchSequence`](crate::forward::Qwen3ForwardError::RepeatedBatchSequence)
+    ///   when a sequence appears twice.
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`CacheInconsistent`](crate::forward::Qwen3ForwardError::CacheInconsistent)
+    ///   when the cache no longer matches the configuration.
+    /// * [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   past the context limit.
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn queue_decode(
         &mut self,
         rows: &[(SequenceId, StepInput)],
@@ -677,6 +801,13 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
     /// On an error rows remain allocated but must not be resumed. The caller
     /// must finish all outstanding steps referencing them before explicitly
     /// freeing them; an already queued next step may still write their slots.
+    ///
+    /// # Errors
+    ///
+    /// * [`KvBlocks`](crate::forward::Qwen3ForwardError::KvBlocks) when the
+    ///   block pool rejects the sequence or runs out of blocks.
+    /// * [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the queued step
+    ///   cannot be read back.
     pub fn finish_decode(&mut self, step: &QueuedDecode) -> Result<Vec<i32>, Qwen3ForwardError> {
         step.picks.wait().and_then(|tokens| {
             for ((&seq, &length), &token) in step.rows.iter().zip(&step.lengths).zip(&tokens) {

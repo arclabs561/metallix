@@ -27,8 +27,6 @@ ROOT = Path(__file__).resolve().parent.parent
 PENDING = frozenset(
     {
         "crates/models/deepseek",
-        "crates/models/qwen",
-        "crates/server",
     }
 )
 

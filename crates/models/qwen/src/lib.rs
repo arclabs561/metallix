@@ -2,6 +2,22 @@
 //!
 //! The same dense decoder also runs plain `llama` checkpoints (MiniCPM5-2B)
 //! and `qwen2` checkpoints (Qwen2.5): see [`DecoderFamily`].
+//!
+//! # Overview
+//!
+//! * The crate root parses and validates a checkpoint's `config.json`.
+//!   [`preflight`] derives execution dimensions and [`checkpoint`] checks
+//!   safetensors headers, both before any weight is loaded; [`quantization`]
+//!   describes MLX affine-quantized checkpoints.
+//! * With the `metal` feature, `metal` loads weights onto the GPU and
+//!   `forward` runs them: an uncached numerical oracle, the resident chat
+//!   executor with its KV cache, and the paged batched session.
+//! * [`embedding`] and [`late`] turn the decoder's hidden states into
+//!   single-vector and per-token embeddings.
+
+#![deny(missing_docs)]
+// The workspace allows this lint; crates opt in once their docs are complete.
+#![warn(clippy::missing_errors_doc)]
 
 pub mod checkpoint;
 pub mod embedding;

@@ -24,6 +24,20 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
     ///
     /// With no spans this is the same graph as the ids path, so the logits
     /// are bit-equal.
+    ///
+    /// # Errors
+    ///
+    /// * [`EmbeddedSpan`](crate::forward::Qwen3ForwardError::EmbeddedSpan) when
+    ///   an embedded span does not fit the prompt.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn prefill_embedded_last_logits(
         &mut self,
         prompt: &EmbeddedPrompt<'_, Array>,
@@ -38,6 +52,22 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
     /// [`Self::cached_tokens`]), so a chunked prefill cannot skip or repeat
     /// positions. A span crossing the chunk's edges contributes only its
     /// rows inside the chunk.
+    ///
+    /// # Errors
+    ///
+    /// * [`DecodeWithoutPrefill`](crate::forward::Qwen3ForwardError::DecodeWithoutPrefill)
+    ///   when the sequence has not been prefilled.
+    /// * [`EmbeddedSpan`](crate::forward::Qwen3ForwardError::EmbeddedSpan) when
+    ///   an embedded span does not fit the chunk.
+    /// * [`EmptyInput`](crate::forward::Qwen3ForwardError::EmptyInput),
+    ///   [`InvalidTokenId`](crate::forward::Qwen3ForwardError::InvalidTokenId)
+    ///   and
+    ///   [`PromptTooLong`](crate::forward::Qwen3ForwardError::PromptTooLong)
+    ///   when the input is empty, names a token outside the vocabulary, or
+    ///   passes the context limit.
+    /// * [`MissingWeight`](crate::forward::Qwen3ForwardError::MissingWeight)
+    ///   and [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when a weight is
+    ///   absent or MLX cannot build or evaluate the graph.
     pub fn extend_embedded_last_logits(
         &mut self,
         chunk: &PromptChunk<'_, Array>,

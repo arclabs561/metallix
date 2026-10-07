@@ -200,6 +200,23 @@ pub struct Qwen3StreamCachedCandidateStep {
 /// vocabulary logit to both a resident cached executor and a resident uncached
 /// full-prefix forward. `max_weight_bytes` and `max_kv_bytes` are intentionally
 /// separate contracts.
+///
+/// # Errors
+///
+/// * [`LayerWeightBudget`](crate::metal::Qwen3MetalLoadError::LayerWeightBudget) when a layer's weights pass
+///   `max_weight_bytes`.
+/// * [`StreamMaximumBelowPrompt`](crate::metal::Qwen3MetalLoadError::StreamMaximumBelowPrompt)
+///   and
+///   [`CachedStateBudget`](crate::metal::Qwen3MetalLoadError::CachedStateBudget)
+///   when the prompt or its cached state does not fit the limits.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
+/// * [`CachedStreamParity`](crate::metal::Qwen3MetalLoadError::CachedStreamParity)
+///   when the streamed cached logits differ from the resident reference.
 pub fn qualify_streamed_cached_forward(
     model: &Path,
     prompt_ids: &[i32],
@@ -288,6 +305,23 @@ pub fn qualify_streamed_cached_forward(
 /// [`qualify_streamed_cached_forward`], but performs only the candidate run.
 /// Its per-step logits are intentionally retained for an external comparison;
 /// this function itself establishes no parity claim.
+///
+/// # Errors
+///
+/// * [`LayerWeightBudget`](crate::metal::Qwen3MetalLoadError::LayerWeightBudget) when a layer's weights pass
+///   `max_weight_bytes`.
+/// * [`StreamMaximumBelowPrompt`](crate::metal::Qwen3MetalLoadError::StreamMaximumBelowPrompt)
+///   and
+///   [`CachedStateBudget`](crate::metal::Qwen3MetalLoadError::CachedStateBudget)
+///   when the prompt or its cached state does not fit the limits.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
+/// * [`CandidateNonFiniteLogit`](crate::metal::Qwen3MetalLoadError::CandidateNonFiniteLogit)
+///   when a candidate logit is not finite.
 pub fn run_streamed_cached_candidate(
     model: &Path,
     prompt_ids: &[i32],
@@ -588,6 +622,19 @@ fn compare_cached_step_logits(
 /// fresh MLX hidden-state array before its weights are released. This prevents
 /// lazy graph dependencies from retaining a prior layer's candidate weights.
 /// The resident control starts only after the candidate has completed.
+///
+/// # Errors
+///
+/// * [`LayerWeightBudget`](crate::metal::Qwen3MetalLoadError::LayerWeightBudget) when a layer's weights pass
+///   `max_weight_bytes`.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
+/// * [`RangeCheckMismatch`](crate::metal::Qwen3MetalLoadError::RangeCheckMismatch)
+///   when the streamed logits differ from the resident reference.
 pub fn qualify_streamed_forward(
     model: &Path,
     input_ids: &[i32],
@@ -657,6 +704,19 @@ pub fn qualify_streamed_forward(
 /// candidate logits for an external comparison, but that output serialization
 /// itself is part of the measured process and the result is not parity
 /// qualified.
+///
+/// # Errors
+///
+/// * [`LayerWeightBudget`](crate::metal::Qwen3MetalLoadError::LayerWeightBudget) when a layer's weights pass
+///   `max_weight_bytes`.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
+/// * [`CandidateNonFiniteLogit`](crate::metal::Qwen3MetalLoadError::CandidateNonFiniteLogit)
+///   when a candidate logit is not finite.
 pub fn run_streamed_forward_candidate(
     model: &Path,
     input_ids: &[i32],

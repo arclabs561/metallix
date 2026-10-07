@@ -38,6 +38,24 @@ pub struct Qwen3EmbeddingCheck {
 /// payload budget excludes headers, FP32 buffers and the resident reference.
 /// At most 512 tokens and 1,048,576 output elements are accepted. Checkpoints
 /// must remain immutable throughout the call. This does not run the decoder.
+///
+/// # Errors
+///
+/// * [`MissingEmbedding`](crate::metal::Qwen3MetalLoadError::MissingEmbedding)
+///   and
+///   [`RangeCheckShape`](crate::metal::Qwen3MetalLoadError::RangeCheckShape)
+///   when the embedding is absent or misshapen.
+/// * [`EmptyInputIds`](crate::metal::Qwen3MetalLoadError::EmptyInputIds) and
+///   [`InvalidTokenId`](crate::metal::Qwen3MetalLoadError::InvalidTokenId) for
+///   no IDs or one outside the vocabulary.
+/// * [`RangeCheckMismatch`](crate::metal::Qwen3MetalLoadError::RangeCheckMismatch)
+///   when host and device rows differ.
+/// * [`Checkpoint`](crate::metal::Qwen3MetalLoadError::Checkpoint) and
+///   [`ForwardConfig`](crate::metal::Qwen3MetalLoadError::ForwardConfig) when
+///   the checkpoint headers or configuration fail validation.
+/// * [`Mlx`](crate::metal::Qwen3MetalLoadError::Mlx) and
+///   [`Evaluation`](crate::metal::Qwen3MetalLoadError::Evaluation) when MLX
+///   cannot load or evaluate a tensor.
 pub fn qualify_embedding(
     model: &Path,
     input_ids: &[i32],
