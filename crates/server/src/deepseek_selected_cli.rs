@@ -21,6 +21,8 @@ use deepseek::{
             V41RangeRequest, V41RangeSource,
         },
     },
+    ffn::FfnSublayerReference,
+    hc::{mixing::hc_pre_bf16_reference, projection::project_hc_coefficients},
     manifest::V41SafetensorsIndex,
     moe::{Fp8ExpertWeights, MoEConfig, MoEReference},
     norm::rms_norm_bf16_reference,
@@ -36,12 +38,18 @@ const EXPERTS: usize = 384;
 const MIB: u64 = 1024 * 1024;
 
 const NORM_WEIGHT: &str = "layers.0.ffn_norm.weight";
+const HC_PROJECTION: &str = "layers.0.hc_ffn_fn";
+const HC_SCALE: &str = "layers.0.hc_ffn_scale";
+const HC_BASE: &str = "layers.0.hc_ffn_base";
+const COPIES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Boundary {
     #[default]
     Moe,
     FfnNormMoe,
+    /// Complete diagnostic; exit zero means completed, not exact qualification.
+    FfnTail,
 }
 
 /// Compare up to three captured BF16 rows through the pinned layer-zero `MoE`.
@@ -50,6 +58,9 @@ pub(crate) struct SelectedArgs {
     /// Input boundary; the default consumes already-normalized `MoE` rows.
     #[arg(long, value_enum, default_value_t = Boundary::Moe)]
     boundary: Boundary,
+    /// Full-tail source receipt.json and fixed-name comparison/input payloads.
+    #[arg(long)]
+    tail_capture_dir: Option<PathBuf>,
     /// Independent source normalized rows, required for ffn-norm-moe.
     #[arg(long, requires = "expected_normalized_sha256")]
     expected_normalized_bf16: Option<PathBuf>,
@@ -124,12 +135,16 @@ fn bounded_read(path: &Path, maximum: u64) -> Result<Vec<u8>, String> {
 }
 
 fn validate_args(args: &SelectedArgs) -> Result<(), String> {
+    if (args.boundary == Boundary::FfnTail) != args.tail_capture_dir.is_some() {
+        return Err("ffn-tail requires --tail-capture-dir; other boundaries forbid it".to_owned());
+    }
     match (
         args.boundary,
         &args.expected_normalized_bf16,
         &args.expected_normalized_sha256,
     ) {
-        (Boundary::Moe, None, None) | (Boundary::FfnNormMoe, Some(_), Some(_)) => {}
+        (Boundary::Moe | Boundary::FfnTail, None, None)
+        | (Boundary::FfnNormMoe, Some(_), Some(_)) => {}
         _ => {
             return Err(
                 "ffn-norm-moe requires intermediate expected path/hash; moe forbids them"
@@ -224,8 +239,13 @@ fn tensor_specs(routes: &[Vec<usize>], boundary: Boundary) -> BTreeMap<String, T
             },
         );
     };
-    if boundary == Boundary::FfnNormMoe {
+    if boundary != Boundary::Moe {
         add(NORM_WEIGHT.to_owned(), Bf16, vec![5120], 10_240);
+    }
+    if boundary == Boundary::FfnTail {
+        add(HC_PROJECTION.to_owned(), F32, vec![24, 20480], 1_966_080);
+        add(HC_SCALE.to_owned(), F32, vec![3], 12);
+        add(HC_BASE.to_owned(), F32, vec![24], 96);
     }
     add(
         "layers.0.ffn.gate.weight".to_owned(),
@@ -396,7 +416,20 @@ fn load_cache(
     Ok((cache, index_sha, digest(&manifest_bytes)))
 }
 
-fn preflight_payloads(
+fn validate_tensor_geometry(
+    name: &str,
+    dtype: V41StorageDtype,
+    shape: &[u64],
+    bytes: u64,
+    spec: &TensorSpec,
+) -> Result<(), String> {
+    if dtype != spec.dtype || shape != spec.shape || bytes != spec.bytes {
+        return Err(format!("fixed V4.1 tensor geometry mismatch: {name}"));
+    }
+    Ok(())
+}
+
+fn validate_inventory(
     args: &SelectedArgs,
     cache: &V41RangeCache<SelectedSource>,
     specs: &BTreeMap<String, TensorSpec>,
@@ -406,18 +439,30 @@ fn preflight_payloads(
         let range = cache
             .tensor_range(name)
             .map_err(|error| error.to_string())?;
-        if range.dtype() != spec.dtype
-            || range.shape() != spec.shape
-            || range.byte_length() != spec.bytes
-        {
-            return Err(format!("fixed V4.1 tensor geometry mismatch: {name}"));
-        }
+        validate_tensor_geometry(
+            name,
+            range.dtype(),
+            range.shape(),
+            range.byte_length(),
+            spec,
+        )?;
         total = total
             .checked_add(spec.bytes)
             .ok_or("payload size overflow")?;
         if total > args.payload_budget_mib * MIB || spec.bytes > args.cache_budget_mib * MIB {
             return Err("selected payload inventory exceeds explicit budgets".to_owned());
         }
+    }
+    Ok(())
+}
+
+fn preflight_payloads(
+    args: &SelectedArgs,
+    cache: &V41RangeCache<SelectedSource>,
+    specs: &BTreeMap<String, TensorSpec>,
+) -> Result<(), String> {
+    validate_inventory(args, cache, specs)?;
+    for (name, spec) in specs {
         let metadata = fs::metadata(args.weights_dir.join(format!("{name}.bin")))
             .map_err(|error| error.to_string())?;
         if !metadata.is_file() || metadata.len() != spec.bytes {
@@ -441,6 +486,13 @@ fn bf16_words(bytes: &[u8]) -> Vec<u16> {
 
 fn run(args: &SelectedArgs) -> Result<bool, String> {
     validate_args(args)?;
+    match args.boundary {
+        Boundary::FfnTail => run_tail(args),
+        Boundary::Moe | Boundary::FfnNormMoe => run_moe(args),
+    }
+}
+
+fn run_moe(args: &SelectedArgs) -> Result<bool, String> {
     let bytes_per_capture = (args.tokens * HIDDEN * 2) as u64;
     let input_bytes = bounded_read(&args.input_bf16, bytes_per_capture)?;
     let expected_bytes = bounded_read(&args.expected_bf16, bytes_per_capture)?;
@@ -543,6 +595,389 @@ fn run(args: &SelectedArgs) -> Result<bool, String> {
     Ok(matched)
 }
 
+// These roles are intentionally distinct: only attention_pre is candidate input.
+// Every other source tensor below is used exclusively for comparison.
+struct TailInputs {
+    residual: Vec<u16>,
+    incoming_pre: Vec<f32>,
+}
+struct TailExpected {
+    collapsed: Vec<u16>,
+    normalized: Vec<u16>,
+    moe: Vec<u16>,
+    final_residual: Vec<u16>,
+    outgoing_pre: Vec<f32>,
+    post: Vec<f32>,
+    comb: Vec<f32>,
+}
+struct TailCapture {
+    inputs: TailInputs,
+    expected: TailExpected,
+    receipt_sha256: String,
+}
+#[derive(Deserialize)]
+struct TailReceipt {
+    schema_version: u32,
+    revision: String,
+    passed_source_joins: bool,
+    tokens: usize,
+    norm_eps: f64,
+    hc_eps: f64,
+    hc_sinkhorn_iters: usize,
+    outputs: BTreeMap<String, TailRecord>,
+}
+#[derive(Deserialize)]
+struct TailRecord {
+    dtype: String,
+    shape: Vec<usize>,
+    bytes: u64,
+    sha256: String,
+}
+
+fn finite_bf16(bytes: &[u8]) -> Result<Vec<u16>, String> {
+    let words = bf16_words(bytes);
+    if !bytes.len().is_multiple_of(2)
+        || words
+            .iter()
+            .any(|word| !f32::from_bits(u32::from(*word) << 16).is_finite())
+    {
+        return Err("full-tail BF16 capture contains nonfinite or partial values".to_owned());
+    }
+    Ok(words)
+}
+fn finite_f32(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    let words: Vec<_> = bytes
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect();
+    if !bytes.len().is_multiple_of(4) || words.iter().any(|word| !word.is_finite()) {
+        return Err("full-tail F32 capture contains nonfinite or partial values".to_owned());
+    }
+    Ok(words)
+}
+
+fn read_tail_capture(args: &SelectedArgs) -> Result<TailCapture, String> {
+    let dir = args
+        .tail_capture_dir
+        .as_ref()
+        .ok_or("missing tail capture directory")?;
+    let receipt_bytes = bounded_read(&dir.join("receipt.json"), MIB)?;
+    let receipt: TailReceipt = serde_json::from_slice(&receipt_bytes).map_err(|e| e.to_string())?;
+    if receipt.schema_version != 1
+        || receipt.revision != REVISION
+        || !receipt.passed_source_joins
+        || receipt.tokens != args.tokens
+        || receipt.norm_eps.to_bits() != 1.0e-20_f64.to_bits()
+        || receipt.hc_eps.to_bits() != 1.0e-6_f64.to_bits()
+        || receipt.hc_sinkhorn_iters != 20
+        || receipt.outputs.len() != 9
+    {
+        return Err("full-tail receipt controls/revision/count mismatch".to_owned());
+    }
+    // Names are constants owned here; no receipt-provided path is ever opened.
+    let contracts = [
+        (
+            "after_attention",
+            "bfloat16",
+            vec![1, args.tokens, COPIES, HIDDEN],
+        ),
+        ("attention_pre", "float32", vec![1, args.tokens, COPIES]),
+        ("ffn_norm_in", "bfloat16", vec![1, args.tokens, HIDDEN]),
+        ("ffn_in", "bfloat16", vec![1, args.tokens, HIDDEN]),
+        ("ffn_out", "bfloat16", vec![1, args.tokens, HIDDEN]),
+        ("out", "bfloat16", vec![1, args.tokens, COPIES, HIDDEN]),
+        ("ffn_pre", "float32", vec![1, args.tokens, COPIES]),
+        ("ffn_post", "float32", vec![1, args.tokens, COPIES]),
+        ("ffn_comb", "float32", vec![1, args.tokens, COPIES, COPIES]),
+    ];
+    let mut payloads = BTreeMap::new();
+    for (role, dtype, shape) in contracts {
+        let name = format!("layer00.{role}.torch.{dtype}.bin");
+        let record = receipt
+            .outputs
+            .get(&name)
+            .ok_or("full-tail receipt lacks fixed capture name")?;
+        let length =
+            (shape.iter().product::<usize>() * if dtype == "float32" { 4 } else { 2 }) as u64;
+        if record.dtype != format!("torch.{dtype}")
+            || record.shape != shape
+            || record.bytes != length
+            || record.sha256.len() != 64
+            || !record
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "full-tail capture geometry/hash syntax mismatch: {role}"
+            ));
+        }
+        // Common CLI paths/hashes select residual input and independent final
+        // comparison. A changed final oracle with a new digest is observable.
+        let (path, sha) = match role {
+            "after_attention" => {
+                if args.input_sha256 != record.sha256 {
+                    return Err(
+                        "full-tail residual input hash disagrees with source receipt".to_owned(),
+                    );
+                }
+                (args.input_bf16.clone(), args.input_sha256.as_str())
+            }
+            "out" => (args.expected_bf16.clone(), args.expected_sha256.as_str()),
+            _ => (dir.join(name), record.sha256.as_str()),
+        };
+        let bytes = bounded_read(&path, length)?;
+        if bytes.len() as u64 != length || digest(&bytes) != sha {
+            return Err(format!("full-tail capture length/SHA256 mismatch: {role}"));
+        }
+        payloads.insert(role, bytes);
+    }
+    Ok(TailCapture {
+        inputs: TailInputs {
+            residual: finite_bf16(&payloads["after_attention"])?,
+            incoming_pre: finite_f32(&payloads["attention_pre"])?,
+        },
+        expected: TailExpected {
+            collapsed: finite_bf16(&payloads["ffn_norm_in"])?,
+            normalized: finite_bf16(&payloads["ffn_in"])?,
+            moe: finite_bf16(&payloads["ffn_out"])?,
+            final_residual: finite_bf16(&payloads["out"])?,
+            outgoing_pre: finite_f32(&payloads["ffn_pre"])?,
+            post: finite_f32(&payloads["ffn_post"])?,
+            comb: finite_f32(&payloads["ffn_comb"])?,
+        },
+        receipt_sha256: digest(&receipt_bytes),
+    })
+}
+
+struct TailWeights {
+    norm: Vec<u16>,
+    projection: Vec<f32>,
+    scale: [f32; 3],
+    base: Vec<f32>,
+}
+
+// This phase contains no MoE provider. The production half-block recomputes it
+// after loading MoE, and must exactly reproduce both independently checked rows.
+fn tail_preflight(capture: &TailCapture, weights: &TailWeights) -> Result<(), String> {
+    for (token, residual) in capture
+        .inputs
+        .residual
+        .chunks_exact(COPIES * HIDDEN)
+        .enumerate()
+    {
+        // Validate candidate HC numeric domains before any MoE payload read.
+        project_hc_coefficients(
+            residual,
+            &weights.projection,
+            &weights.scale,
+            &weights.base,
+            COPIES,
+            1.0e-20,
+            20,
+            1.0e-6,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut collapsed = vec![0; HIDDEN];
+        hc_pre_bf16_reference(
+            residual,
+            &capture.inputs.incoming_pre[token * COPIES..(token + 1) * COPIES],
+            HIDDEN,
+            &mut collapsed,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut normalized = vec![0; HIDDEN];
+        rms_norm_bf16_reference(&collapsed, &weights.norm, 1.0e-20, &mut normalized)
+            .map_err(|e| e.to_string())?;
+        let row = token * HIDDEN..(token + 1) * HIDDEN;
+        if collapsed != capture.expected.collapsed[row.clone()] {
+            return Err("collapsed BF16 comparison failed before MoE payload reads".to_owned());
+        }
+        if normalized != capture.expected.normalized[row] {
+            return Err("normalized BF16 comparison failed before MoE payload reads".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn mismatches<T: PartialEq>(actual: &[T], expected: &[T]) -> usize {
+    actual.iter().zip(expected).filter(|(a, b)| a != b).count()
+        + actual.len().abs_diff(expected.len())
+}
+fn f32_mismatches(actual: &[f32], expected: &[f32]) -> usize {
+    mismatches(
+        &actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        &expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+    )
+}
+
+fn evaluate_tail(
+    moe: MoEReference<'_>,
+    cache: V41RangeCache<SelectedSource>,
+    capture: &TailCapture,
+    weights: &TailWeights,
+    routes: &[Vec<usize>],
+) -> Result<(Vec<serde_json::Value>, bool, u64), String> {
+    let ffn = FfnSublayerReference::new(
+        moe,
+        &weights.norm,
+        &weights.projection,
+        &weights.scale,
+        &weights.base,
+        COPIES,
+        1.0e-20,
+        20,
+        1.0e-6,
+    )
+    .map_err(|e| e.to_string())?;
+    let cache = Mutex::new(cache);
+    let experts = V41CachedRoutedExperts::new(&cache, 0, HIDDEN, INTERMEDIATE);
+    let mut rows = Vec::new();
+    let mut full_exact = true;
+    for (token, residual) in capture
+        .inputs
+        .residual
+        .chunks_exact(COPIES * HIDDEN)
+        .enumerate()
+    {
+        let pre_row = token * COPIES..(token + 1) * COPIES;
+        let row = token * HIDDEN..(token + 1) * HIDDEN;
+        let residual_row = token * COPIES * HIDDEN..(token + 1) * COPIES * HIDDEN;
+        let comb_row = token * COPIES * COPIES..(token + 1) * COPIES * COPIES;
+        let result = ffn
+            .forward_token_with(
+                residual,
+                &capture.inputs.incoming_pre[pre_row.clone()],
+                &experts,
+            )
+            .map_err(|e| e.to_string())?;
+        let collapsed = mismatches(
+            result.collapsed_bf16(),
+            &capture.expected.collapsed[row.clone()],
+        );
+        let normalized = mismatches(
+            result.normalized_bf16(),
+            &capture.expected.normalized[row.clone()],
+        );
+        if collapsed != 0 || normalized != 0 {
+            return Err("full-tail helper disagrees with validated native preflight".to_owned());
+        }
+        let actual_ids: Vec<_> = result
+            .moe()
+            .routes()
+            .iter()
+            .map(|r| r.expert_index())
+            .collect();
+        let route_mismatches = mismatches(&actual_ids, &routes[token]);
+        let moe = mismatches(result.moe().output_bf16(), &capture.expected.moe[row]);
+        let final_residual = mismatches(
+            result.output_bf16(),
+            &capture.expected.final_residual[residual_row],
+        );
+        let pre = f32_mismatches(
+            result.coefficients().pre(),
+            &capture.expected.outgoing_pre[pre_row.clone()],
+        );
+        let post = f32_mismatches(
+            result.coefficients().post(),
+            &capture.expected.post[pre_row],
+        );
+        let comb = f32_mismatches(
+            result.coefficients().comb(),
+            &capture.expected.comb[comb_row],
+        );
+        let exact = [
+            collapsed,
+            normalized,
+            route_mismatches,
+            moe,
+            final_residual,
+            pre,
+            post,
+            comb,
+        ]
+        .iter()
+        .all(|n| *n == 0);
+        full_exact &= exact;
+        rows.push(
+            json!({"row": token, "expected_ids": routes[token], "actual_ids": actual_ids,
+            "collapsed_bf16_mismatches": collapsed, "normalized_bf16_mismatches": normalized,
+            "route_mismatches": route_mismatches, "moe_bf16_mismatches": moe,
+            "final_residual_bf16_mismatches": final_residual, "outgoing_pre_f32_mismatches": pre,
+            "post_f32_mismatches": post, "comb_f32_mismatches": comb, "full_exact": exact}),
+        );
+    }
+    let bytes = cache
+        .lock()
+        .map_err(|_| "range cache lock poisoned")?
+        .used_bytes();
+    Ok((rows, full_exact, bytes))
+}
+
+fn run_tail(args: &SelectedArgs) -> Result<bool, String> {
+    let capture = read_tail_capture(args)?;
+    let routes_bytes = bounded_read(&args.routes, MIB)?;
+    let routes = expected_routes(&routes_bytes, args.tokens)?;
+    let specs = tensor_specs(&routes, Boundary::FfnTail);
+    let counters = Arc::new(Counters::default());
+    let source = SelectedSource {
+        inner: V41LocalWeightsSource::new(&args.weights_dir, REVISION),
+        allowed: specs.clone(),
+        budget: args.payload_budget_mib * MIB,
+        counters: Arc::clone(&counters),
+    };
+    let (mut cache, index_sha, headers_sha) = load_cache(args, source)?;
+    // Validate the complete metadata/budget before loading even the HC stage.
+    validate_inventory(args, &cache, &specs)?;
+    let early_specs = specs
+        .iter()
+        .filter(|(name, _)| {
+            [NORM_WEIGHT, HC_PROJECTION, HC_SCALE, HC_BASE].contains(&name.as_str())
+        })
+        .map(|(name, spec)| (name.clone(), spec.clone()))
+        .collect();
+    preflight_payloads(args, &cache, &early_specs)?;
+    let mut get = |name| cache.get_tensor(name).map_err(|e| e.to_string());
+    let weights = TailWeights {
+        norm: finite_bf16(&get(NORM_WEIGHT)?)?,
+        projection: finite_f32(&get(HC_PROJECTION)?)?,
+        scale: finite_f32(&get(HC_SCALE)?)?
+            .try_into()
+            .map_err(|_| "HC scale width mismatch")?,
+        base: finite_f32(&get(HC_BASE)?)?,
+    };
+    tail_preflight(&capture, &weights)?;
+    preflight_payloads(args, &cache, &specs)?;
+    let (rows, full_exact, cache_bytes) = with_moe(cache, |moe, cache| {
+        evaluate_tail(moe, cache, &capture, &weights, &routes)
+    })?;
+    let charged = *counters
+        .charged
+        .lock()
+        .map_err(|_| "selected budget lock poisoned")?;
+    println!(
+        "{}",
+        json!({
+            "schema_version": 1, "operation": "deepseek-selected-layer0-ffn-tail",
+            "scope": "local full FFN half-block diagnostic; not full checkpoint inference",
+            "completed": true, "full_exact": full_exact, "revision": REVISION, "tokens": args.tokens,
+            "input_sha256": args.input_sha256, "expected_sha256": args.expected_sha256,
+            "tail_capture_receipt_sha256": capture.receipt_sha256, "routes_sha256": digest(&routes_bytes),
+            "index_sha256": index_sha, "headers_manifest_sha256": headers_sha,
+            "comparison": "exact BF16 bits, F32 bits and source expert IDs", "rows": rows,
+            "cache_membership_bytes": cache_bytes,
+            "source_returned_range_bytes": counters.returned.load(Ordering::Relaxed),
+            "source_range_budget_charged_bytes": charged,
+            "memory_cache_hits": counters.hits.load(Ordering::Relaxed),
+            "physical_read_bytes": null,
+            "physical_read_bytes_status": "unavailable; returned ranges exclude hash and receipt I/O",
+            "cache_budget_bytes": args.cache_budget_mib * MIB, "payload_budget_bytes": args.payload_budget_mib * MIB
+        })
+    );
+    // A completed diagnostic is deliberately distinct from full_exact.
+    Ok(true)
+}
+
 fn validate_normalized_capture(bytes: &[u8], length: u64, sha: Option<&str>) -> Result<(), String> {
     if bytes.len() as u64 != length || Some(digest(bytes).as_str()) != sha {
         return Err("normalized expected length/SHA256 mismatch".to_owned());
@@ -584,12 +1019,10 @@ fn normalize_checked(input: &[u8], weight: &[u8], expected: &[u8]) -> Result<Vec
     Ok(bytes)
 }
 
-fn evaluate(
+fn with_moe<T>(
     mut cache: V41RangeCache<SelectedSource>,
-    input_bytes: &[u8],
-    expected_bytes: &[u8],
-    routes: &[Vec<usize>],
-) -> Result<(Vec<serde_json::Value>, bool, u64), String> {
+    evaluate: impl FnOnce(MoEReference<'_>, V41RangeCache<SelectedSource>) -> Result<T, String>,
+) -> Result<T, String> {
     let mut get = |name: &str| cache.get_tensor(name).map_err(|error| error.to_string());
     let gate = bf16_words(&get("layers.0.ffn.gate.weight")?);
     let bias = get("layers.0.ffn.gate.bias")?
@@ -625,35 +1058,46 @@ fn evaluate(
         shared,
     )
     .map_err(|error| error.to_string())?;
-    let cache = Mutex::new(cache);
-    let experts = V41CachedRoutedExperts::new(&cache, 0, HIDDEN, INTERMEDIATE);
-    let input = bf16_words(input_bytes);
-    let expected = bf16_words(expected_bytes);
-    let mut rows = Vec::new();
-    let mut matched = true;
-    for (token, (input, expected)) in input
-        .chunks_exact(HIDDEN)
-        .zip(expected.chunks_exact(HIDDEN))
-        .enumerate()
-    {
-        let result = moe
-            .forward_token_with(input, &experts)
-            .map_err(|error| error.to_string())?;
-        let actual_ids: Vec<_> = result
-            .routes()
-            .iter()
-            .map(|route| route.expert_index())
-            .collect();
-        let (row_matched, mismatch_count) =
-            compare_row(&actual_ids, &routes[token], result.output_bf16(), expected);
-        matched &= row_matched;
-        rows.push(json!({"row": token, "expected_ids": routes[token], "actual_ids": actual_ids, "bf16_mismatches": mismatch_count, "matched": row_matched}));
-    }
-    let cache_bytes = cache
-        .lock()
-        .map_err(|_| "range cache lock poisoned")?
-        .used_bytes();
-    Ok((rows, matched, cache_bytes))
+    evaluate(moe, cache)
+}
+
+fn evaluate(
+    cache: V41RangeCache<SelectedSource>,
+    input_bytes: &[u8],
+    expected_bytes: &[u8],
+    routes: &[Vec<usize>],
+) -> Result<(Vec<serde_json::Value>, bool, u64), String> {
+    with_moe(cache, |moe, cache| {
+        let cache = Mutex::new(cache);
+        let experts = V41CachedRoutedExperts::new(&cache, 0, HIDDEN, INTERMEDIATE);
+        let input = bf16_words(input_bytes);
+        let expected = bf16_words(expected_bytes);
+        let mut rows = Vec::new();
+        let mut matched = true;
+        for (token, (input, expected)) in input
+            .chunks_exact(HIDDEN)
+            .zip(expected.chunks_exact(HIDDEN))
+            .enumerate()
+        {
+            let result = moe
+                .forward_token_with(input, &experts)
+                .map_err(|error| error.to_string())?;
+            let actual_ids: Vec<_> = result
+                .routes()
+                .iter()
+                .map(|route| route.expert_index())
+                .collect();
+            let (row_matched, mismatch_count) =
+                compare_row(&actual_ids, &routes[token], result.output_bf16(), expected);
+            matched &= row_matched;
+            rows.push(json!({"row": token, "expected_ids": routes[token], "actual_ids": actual_ids, "bf16_mismatches": mismatch_count, "matched": row_matched}));
+        }
+        let cache_bytes = cache
+            .lock()
+            .map_err(|_| "range cache lock poisoned")?
+            .used_bytes();
+        Ok((rows, matched, cache_bytes))
+    })
 }
 
 fn compare_row(
@@ -732,5 +1176,108 @@ mod tests {
             (false, 0)
         );
         assert_eq!(compare_row(&[1, 2], &[1, 2], &[], &[0x3f80]), (false, 1));
+    }
+
+    #[test]
+    fn full_tail_hc_inventory_rejects_wrong_dtype_shape_and_byte_count() {
+        use super::{Boundary, HC_PROJECTION, tensor_specs, validate_tensor_geometry};
+        // Three six-route rows with a sixteen-expert union, the bounded source
+        // capture contract. Admission includes norm and all three HC tensors.
+        let routes = vec![(0..6).collect(), (6..12).collect(), (10..16).collect()];
+        let specs = tensor_specs(&routes, Boundary::FfnTail);
+        assert_eq!(
+            specs.values().map(|spec| spec.bytes).sum::<u64>(),
+            342_144_364
+        );
+        let spec = &specs[HC_PROJECTION];
+        for (dtype, shape, bytes) in [
+            (V41StorageDtype::Bf16, vec![24, 20480], 1_966_080),
+            (V41StorageDtype::F32, vec![20480, 24], 1_966_080),
+            (V41StorageDtype::F32, vec![24, 20480], 1_966_076),
+        ] {
+            assert!(validate_tensor_geometry(HC_PROJECTION, dtype, &shape, bytes, spec).is_err());
+        }
+        assert!(
+            validate_tensor_geometry(
+                HC_PROJECTION,
+                V41StorageDtype::F32,
+                &[24, 20480],
+                1_966_080,
+                spec
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn full_tail_preflight_consumes_incoming_pre_and_refuses_changed_intermediates() {
+        use super::{COPIES, TailCapture, TailExpected, TailInputs, TailWeights, tail_preflight};
+        // Analytic native boundary: four unit residual copies, incoming pre
+        // selects only the first, learned norm weight scales its unit RMS by 2.
+        // Newly projected FFN pre is unrelated and must never replace incoming.
+        let mut capture = TailCapture {
+            inputs: TailInputs {
+                residual: vec![0x3f80; COPIES * HIDDEN],
+                incoming_pre: vec![1.0, 0.0, 0.0, 0.0],
+            },
+            expected: TailExpected {
+                collapsed: vec![0x3f80; HIDDEN],
+                normalized: vec![0x4000; HIDDEN],
+                moe: vec![],
+                final_residual: vec![],
+                outgoing_pre: vec![],
+                post: vec![],
+                comb: vec![],
+            },
+            receipt_sha256: String::new(),
+        };
+        let weights = TailWeights {
+            norm: vec![0x4000; HIDDEN],
+            projection: vec![0.0; 24 * COPIES * HIDDEN],
+            scale: [1.0; 3],
+            base: vec![0.0; 24],
+        };
+        assert!(tail_preflight(&capture, &weights).is_ok());
+        capture.expected.collapsed[0] ^= 1;
+        assert!(
+            tail_preflight(&capture, &weights)
+                .unwrap_err()
+                .contains("collapsed BF16 comparison failed before MoE")
+        );
+        capture.expected.collapsed[0] ^= 1;
+        capture.expected.normalized[0] ^= 1;
+        assert!(
+            tail_preflight(&capture, &weights)
+                .unwrap_err()
+                .contains("normalized BF16 comparison failed before MoE")
+        );
+        capture.expected.normalized[0] ^= 1;
+        capture.inputs.incoming_pre[0] = 0.0;
+        assert!(
+            tail_preflight(&capture, &weights)
+                .unwrap_err()
+                .contains("collapsed BF16 comparison failed before MoE")
+        );
+    }
+
+    #[test]
+    fn full_tail_compares_f32_bits_including_signed_zero_and_bf16_mutants() {
+        use super::{f32_mismatches, finite_bf16, mismatches};
+        // Final expected bits remain comparison data even when their supplied
+        // digest is updated; their mutation must survive decoding and compare.
+        let original = [0x80_u8, 0x3f];
+        let changed = [0x81_u8, 0x3f];
+        assert_ne!(digest(&original), digest(&changed));
+        assert_eq!(
+            mismatches(
+                &finite_bf16(&original).unwrap(),
+                &finite_bf16(&changed).unwrap()
+            ),
+            1
+        );
+        assert_eq!(
+            f32_mismatches(&[0.0, 1.0], &[-0.0, f32::from_bits(1.0_f32.to_bits() + 1)]),
+            2
+        );
     }
 }

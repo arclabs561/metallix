@@ -751,10 +751,52 @@ accepted. Both cache and cumulative requested-range admission budgets accept
 1–512 MiB. Payload geometry, local file sizes and selected inventory are checked
 before the corresponding arithmetic stage. An unexpected expert outside the
 captured allowlist fails; it is not fetched. Every completed comparison reports exact BF16 mismatches and
-selected IDs; exit zero requires both to match. Missing captures, refusal,
-loading errors or mismatches exit nonzero and cannot count as zero-error evidence.
+selected IDs. For `moe` and `ffn-norm-moe`, exit zero requires both to match.
+Missing captures, refusal, loading errors or mismatches exit nonzero and cannot
+count as zero-error evidence.
 
 Cache membership bytes are not retained/process footprint. Source returned-range
 bytes exclude whole-tensor hash and receipt reads; physical read bytes are
 explicitly unavailable. Run under a separate process-memory/deadline supervisor.
 The diagnostic does not establish SSD throughput or useful full-model latency.
+
+
+The explicit `--boundary ffn-tail --tail-capture-dir /path/to/source-output`
+boundary runs the production FFN half-block: candidate HC projection, collapse
+with incoming attention-pre, normalization, actual selected-weight MoE and
+candidate HC postmix. Common input/expected arguments now identify BF16
+`[1,tokens,4,5120]` post-attention residual and final residual comparison.
+The input hash must also agree with the source receipt. The expected final
+path/hash can identify an independent copy, including a deliberate one-bit
+negative control. Neither expected outputs nor newly projected FFN pre supply
+the incoming attention-pre.
+
+The source directory contains a bounded `receipt.json` with `schema_version: 1`,
+the pinned `revision`, `passed_source_joins: true`, matching `tokens`,
+`norm_eps: 1e-20`, `hc_eps: 1e-6` and `hc_sinkhorn_iters: 20`. Its `outputs`
+map has exactly nine fixed filenames, each declaring `dtype`, `shape`, `bytes`
+and lowercase `sha256`:
+
+| Filename role (`layer00.<role>.torch.<dtype>.bin`) | dtype | Shape | Use |
+|---|---|---|---|
+| `after_attention` | `bfloat16` | `[1,tokens,4,5120]` | Common CLI input |
+| `attention_pre` | `float32` | `[1,tokens,4]` | Incoming pre input |
+| `ffn_norm_in`, `ffn_in`, `ffn_out` | `bfloat16` | `[1,tokens,5120]` | Collapsed, normalized, MoE comparisons |
+| `out` | `bfloat16` | `[1,tokens,4,5120]` | Common CLI final comparison |
+| `ffn_pre`, `ffn_post` | `float32` | `[1,tokens,4]` | Outgoing pre and post comparisons |
+| `ffn_comb` | `float32` | `[1,tokens,4,4]` | Combination comparison |
+
+All captures must be finite and have exact declared geometry and hashes.
+The receipt establishes artifact identity and declared controls, not independent
+source authenticity. This boundary additionally loads verified F32 tensors
+`layers.0.hc_ffn_fn` `[24,20480]`, `layers.0.hc_ffn_scale` `[3]` and
+`layers.0.hc_ffn_base` `[24]`, alongside the normalization and MoE inventory.
+It checks source collapsed and normalized BF16 before reading MoE payloads,
+then requires the full production helper to reproduce those intermediates.
+
+For `ffn-tail`, exit zero means `completed: true`; exact qualification is the
+separate `full_exact` field. Rows report actual routes and mismatch counts for
+collapsed, normalized, MoE and final BF16, and outgoing pre, post and combination
+F32 bits. Any coefficient mismatch keeps `full_exact` false even if every BF16
+comparison matches. Malformed data, failed intermediate prechecks, loader errors
+and budget violations still refuse with nonzero exit and no completed receipt.

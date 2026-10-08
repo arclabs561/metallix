@@ -113,7 +113,7 @@ pub(crate) enum Command {
     /// Run a fixed five-block reduced `DeepSeek` model from a synthetic artifact.
     RunDeepseekReduced(deepseek_reduced_cli::ReducedArgs),
     /// Compare local pinned V4.1 layer-zero `MoE` weights against source captures.
-    RunDeepseekSelected(deepseek_selected_cli::SelectedArgs),
+    RunDeepseekSelected(Box<deepseek_selected_cli::SelectedArgs>),
     /// Score typed decision options directly with Qwen3, without generating text.
     #[cfg(feature = "metal")]
     Decide(decision_cli::DecisionArgs),
