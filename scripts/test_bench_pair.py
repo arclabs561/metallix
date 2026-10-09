@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bench_load
@@ -78,6 +79,44 @@ class Tails(unittest.TestCase):
         itl = summary["metrics"]["itl_p99_ms"]
         self.assertEqual(itl["unresolved_n"], 60)  # 60 gaps do not resolve p99.
         self.assertIn("compare the max, not p99", bench_pair.render(summary, pairs))
+
+
+class RunLogs(unittest.TestCase):
+    def test_each_run_gets_its_own_log_directory(self) -> None:
+        logs = tempfile.TemporaryDirectory()
+        self.addCleanup(logs.cleanup)
+        seen = []
+
+        def fake_measure_level(name, set_name, kind, value, count, args, counter):
+            seen.append(args.log_dir)
+            return {
+                "summary": {
+                    "output_token_throughput": 1.0,
+                    "ttft_ms": {},
+                    "tpot_ms": {},
+                }
+            }
+
+        argv = [
+            "bench_pair.py", "--server", "stub", "--model-path", ".",
+            "--sets", "short", "--concurrency", "1", "--pairs", "2",
+            "--cooldown", "0", "--log-dir", logs.name,
+        ]  # fmt: skip
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(
+                bench_pair.bench_load, "measure_level", fake_measure_level
+            ),
+            mock.patch.object(
+                bench_pair.bench_load, "tokenizer_counter", lambda path: len
+            ),
+        ):
+            bench_pair.main()
+        root = pathlib.Path(logs.name)
+        self.assertEqual(
+            seen,
+            [root / "run00-A", root / "run01-B", root / "run02-B", root / "run03-A"],
+        )
 
 
 class NoiseFloor(unittest.TestCase):
@@ -213,6 +252,12 @@ class StubServers(unittest.TestCase):
         pairs = bench_pair.run_pairs(4, measure, lambda s: None, 0)
         summary = bench_pair.summarize_pairs(pairs, random.Random(0))
         self.assertEqual(summary["kept"], 4)
+        # Every run left its own server log and a journal of its requests.
+        journals = [pair[arm]["requests_log"] for pair in pairs for arm in "AB"]
+        self.assertEqual(len(set(journals)), 8)
+        for journal in journals:
+            lines = pathlib.Path(journal).read_text().splitlines()
+            self.assertEqual(len(lines), 4)
         tput = summary["metrics"]["output_tok_s"]
         # A fifth of the token rate, diluted by the fixed 20 ms first-token
         # delay. The wider gap tolerates more shared scheduler delay, though

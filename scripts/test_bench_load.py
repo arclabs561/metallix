@@ -295,6 +295,55 @@ class OpenLoop(unittest.TestCase):
         self.assertIn("WARNING client send lag p99", bench_load.one_line(lagging))
 
 
+class Journal(unittest.TestCase):
+    def test_fresh_paths_never_reuse_an_existing_file(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        base = pathlib.Path(directory.name) / "m-short-concurrency1.log"
+        self.assertEqual(bench_load.fresh_path(base), base)
+        base.write_text("")
+        second = bench_load.fresh_path(base)
+        self.assertEqual(second.name, "m-short-concurrency1-2.log")
+        second.write_text("")
+        self.assertEqual(bench_load.fresh_path(base).name, "m-short-concurrency1-3.log")
+        # A level whose server wrote no log still owns its journal's name.
+        journal = base.with_name("m-short-concurrency1-3.requests.jsonl")
+        journal.write_text("")
+        self.assertEqual(
+            bench_load.fresh_path(base, (".requests.jsonl",)).name,
+            "m-short-concurrency1-4.log",
+        )
+
+    def test_each_request_is_written_when_it_ends(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = pathlib.Path(directory.name) / "j.requests.jsonl"
+        seen = []
+
+        def fake_send(
+            address, path_, body, api, index, label, run_start, timeout, scheduled
+        ):
+            # Every earlier request is already on disk when this one starts.
+            seen.append(len(path.read_text().splitlines()) if path.exists() else 0)
+            if index == 1:
+                failed = record(outcome="http_400", index=index)
+                failed.detail = '{"error":{"message":"bad request"}}'
+                return failed
+            return record(index=index)
+
+        prompts = [bench_load.Prompt(f"p{i}", None, "hi", None, None) for i in range(3)]
+        with path.open("a") as file, mock.patch.object(bench_load, "send", fake_send):
+            bench_load.run_load(
+                "h:1", "chat", "m", prompts, 4, {}, concurrency=1,
+                journal=bench_load.request_journal(file, "measure"),
+            )  # fmt: skip
+        self.assertEqual(seen, [0, 1, 2])
+        lines = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([line["outcome"] for line in lines], ["ok", "http_400", "ok"])
+        self.assertEqual(lines[1]["detail"], '{"error":{"message":"bad request"}}')
+        self.assertEqual(lines[1]["phase"], "measure")
+
+
 class Prompts(unittest.TestCase):
     count = staticmethod(lambda text: len(text.split()))  # One token per word.
 
@@ -467,6 +516,9 @@ class Levels(unittest.TestCase):
             warmups.append((len(prompts), kw.get("concurrency"), kw.get("rate")))
             time.sleep(0.05)  # Long enough for the sampler's first sample.
             records = [record(index=i) for i in range(len(prompts))]
+            for item in records:
+                if kw.get("journal"):
+                    kw["journal"](item)
             return records, 1.0
 
         def fake_probe(pgid):
@@ -534,6 +586,32 @@ class Levels(unittest.TestCase):
         memory = out["concurrency"][0]["memory"]
         self.assertEqual(memory["peak_system_used_bytes"], 3 * 2**30)
         self.assertIsNone(memory["aborted"])
+
+    def test_repeated_levels_keep_their_own_log_and_request_journal(self) -> None:
+        self.fakes(load=1.0)
+        logs = tempfile.TemporaryDirectory()
+        self.addCleanup(logs.cleanup)
+        args = self.args(log_dir=pathlib.Path(logs.name), concurrency=[2], rates=[])
+        runs = [
+            bench_load.measure_set("vllm-metal", "short", args, str.split)[
+                "concurrency"
+            ][0]
+            for _ in range(2)
+        ]
+        paths = [pathlib.Path(run["requests_log"]) for run in runs]
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertEqual(
+            [run["log"] for run in runs],
+            [str(paths[0].with_name("vllm-metal-short-concurrency2.log")),
+             str(paths[1].with_name("vllm-metal-short-concurrency2-2.log"))],
+        )  # fmt: skip
+        for path in paths:
+            lines = [json.loads(line) for line in path.read_text().splitlines()]
+            # Four warmup requests (2 x c=2) and two measured ones.
+            self.assertEqual(
+                [line["phase"] for line in lines], ["warmup"] * 4 + ["measure"] * 2
+            )
+            self.assertEqual(lines[-1]["outcome"], "ok")
 
     def test_load_above_the_abort_threshold_stops_the_level(self) -> None:
         started, _ = self.fakes(load=4.5)

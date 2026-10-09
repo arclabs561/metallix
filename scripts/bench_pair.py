@@ -32,6 +32,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
+import itertools
 import json
 import math
 import random
@@ -291,8 +293,12 @@ def main() -> int:
     arms = {"A": arm_args(shared, own.a_args), "B": arm_args(shared, own.b_args)}
     tokenizers: dict[Path, Callable] = {}
 
+    runs = itertools.count()
+
     def measure(arm: str) -> dict:
-        args = arms[arm]
+        # Each run gets its own server log and request journal directory.
+        args = copy.copy(arms[arm])
+        args.log_dir = arms[arm].log_dir / f"run{next(runs):02d}-{arm}"
         if args.model_path not in tokenizers:
             tokenizers[args.model_path] = bench_load.tokenizer_counter(args.model_path)
         name = args.label if args.url else args.server

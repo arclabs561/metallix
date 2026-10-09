@@ -51,6 +51,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -574,8 +575,12 @@ def run_load(
     rate: float | None = None,
     seed: int = 0,
     timeout: float = 600,
+    journal: Callable[[Record], None] | None = None,
 ) -> tuple[list[Record], float]:
-    """Send every prompt once, at a fixed concurrency or with Poisson arrivals."""
+    """Send every prompt once, at a fixed concurrency or with Poisson arrivals.
+
+    `journal` sees each record as soon as its request ends, so a run killed
+    part way still leaves the outcomes and error bodies it got."""
     records: list[Record] = []
     lock = threading.Lock()
     run_start = time.perf_counter()
@@ -588,6 +593,8 @@ def run_load(
         )
         with lock:
             records.append(record)
+            if journal:
+                journal(record)
 
     if concurrency is not None:
         queue = iter(range(len(prompts)))
@@ -1074,6 +1081,16 @@ def measure_level(
     result: dict = {kind: value, "restarted": not args.url}
     prompts = set_prompts(set_name, count, count_tokens, args.seed, args.file_prompts)
     server = None
+    # A fresh log and request journal per run: repeated runs of one level
+    # (passes, pairs) must not overwrite each other's evidence.
+    args.log_dir.mkdir(parents=True, exist_ok=True)
+    log = fresh_path(
+        args.log_dir / f"{name}-{set_name}-{kind}{value:g}.log", (".requests.jsonl",)
+    )
+    journal_path = log.with_suffix(".requests.jsonl")
+    result["requests_log"] = str(journal_path)
+    # Exclusive create: a journal is never appended to by a later run.
+    journal_file = journal_path.open("x")
     try:
         if args.url:
             address = args.url.removeprefix("http://").rstrip("/")
@@ -1088,7 +1105,6 @@ def measure_level(
             for key in ("gpu_in_use_bytes", "system_used_bytes", "load_1m")
         }
         if not args.url:
-            log = args.log_dir / f"{name}-{set_name}-{kind}{value:g}.log"
             spec, trace = with_spans(spec, log, args)
             if trace:
                 result["trace"] = str(trace)
@@ -1107,7 +1123,14 @@ def measure_level(
         )
         with sampler:
             result["warmup"] = warm_up(
-                address, spec, set_name, kind, value, args, count_tokens
+                address,
+                spec,
+                set_name,
+                kind,
+                value,
+                args,
+                count_tokens,
+                journal=request_journal(journal_file, "warmup"),
             )
             before = load_average()
             records, duration = run_load(
@@ -1121,6 +1144,7 @@ def measure_level(
                 rate=value if kind == "rate" else None,
                 seed=args.seed,
                 timeout=args.request_timeout,
+                journal=request_journal(journal_file, "measure"),
             )
         result |= {
             "load_before": before,
@@ -1150,6 +1174,7 @@ def measure_level(
         result["error"] = str(error)
         print(f"  {set_name} {kind}={value}: not measured: {error}", flush=True)
     finally:
+        journal_file.close()
         if server:
             server.stop()
     # The timelines are complete only once the server has exited.
@@ -1157,6 +1182,43 @@ def measure_level(
         skip = result.get("warmup", {}).get("requests", 0)
         add_server_spans(result, Path(result["trace"]), args.model_id, skip)
     return result
+
+
+def fresh_path(path: Path, siblings: tuple[str, ...] = ()) -> Path:
+    """`path`, or `stem-2.ext`, `stem-3.ext`, ... : the first name that is
+    free together with its `siblings` (the same name with those suffixes).
+    A level whose server never writes its log still owns a journal."""
+    candidate, number = path, 1
+    while candidate.exists() or any(
+        candidate.with_suffix(suffix).exists() for suffix in siblings
+    ):
+        number += 1
+        candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
+    return candidate
+
+
+def request_journal(file, phase: str) -> Callable[[Record], None]:
+    """Writes each record as one JSON line the moment its request ends."""
+
+    def write(record: Record) -> None:
+        line = {"phase": phase} | {
+            key: getattr(record, key)
+            for key in (
+                "index",
+                "label",
+                "outcome",
+                "send_s",
+                "ttft_ms",
+                "e2e_ms",
+                "output_tokens",
+                "send_lag_ms",
+                "detail",
+            )
+        }
+        file.write(json.dumps(line) + "\n")
+        file.flush()
+
+    return write
 
 
 def warm_up(
@@ -1167,6 +1229,7 @@ def warm_up(
     value: float,
     args,
     count_tokens,
+    journal: Callable[[Record], None] | None = None,
 ) -> dict:
     """Discarded requests that bring the server to the level's width first.
 
@@ -1189,6 +1252,7 @@ def warm_up(
             spec.extra,
             concurrency=concurrency,
             timeout=args.request_timeout,
+            journal=journal,
         )
         return records
 
