@@ -238,6 +238,22 @@ fn sampling_configuration(
     }
 }
 
+/// Keeps a second tracing dispatcher registered for the whole test process.
+///
+/// With exactly one live registered dispatcher, tracing-core 0.1 rebuilds
+/// callsite interest from the default dispatcher of whichever thread
+/// triggers the rebuild (`Rebuilder::JustOne` in its callsite.rs). A sibling
+/// test with no subscriber can then cache `Interest::never` for a callsite
+/// that a `with_default` capture on another thread needs, and the capture
+/// records nothing. With this anchor alive, rebuilds iterate every registered
+/// dispatcher instead. Call it before `with_default` in any test that
+/// asserts on what it captured.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) fn hold_trace_capture_anchor() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
 /// Runs the shared CLI, preserving the invoked executable name in help output.
 #[must_use]
 pub fn run() -> ExitCode {

@@ -1261,6 +1261,7 @@ mod tests {
                 event.record(&mut Reasons(Arc::clone(&self.0)));
             }
         }
+        crate::hold_trace_capture_anchor();
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&reasons)));
         tracing::subscriber::with_default(subscriber, || {

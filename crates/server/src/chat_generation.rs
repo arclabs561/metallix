@@ -2088,6 +2088,7 @@ mod tests {
             }
         }
 
+        crate::hold_trace_capture_anchor();
         let off = tracing::subscriber::with_default(
             tracing::subscriber::NoSubscriber::default(),
             sampling_observation_probe,
@@ -2179,6 +2180,7 @@ mod tests {
     #[test]
     fn timed_fields_reach_the_timeline() {
         use tracing_subscriber::layer::SubscriberExt as _;
+        crate::hold_trace_capture_anchor();
 
         let path = std::env::temp_dir().join(format!("timed-{}.json", std::process::id()));
         let (layer, guard) = tracing_chrome::ChromeLayerBuilder::new()

@@ -668,6 +668,7 @@ mod prefix_cache_tests {
     #[test]
     fn prefill_timeline_records_cold_and_resumed_cache_counts() {
         use tracing_subscriber::layer::SubscriberExt as _;
+        crate::hold_trace_capture_anchor();
 
         let path =
             std::env::temp_dir().join(format!("decoder-prefill-trace-{}.json", std::process::id()));
