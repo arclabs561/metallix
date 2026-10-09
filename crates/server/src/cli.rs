@@ -230,6 +230,18 @@ pub(crate) enum Command {
         /// is faster for a single stream until its per-step cost is closed.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
         max_num_seqs: u32,
+        /// Prompt tokens a generating model prefills per batched step while
+        /// other sequences decode, a multiple of 16; a longer prompt is
+        /// prefilled in chunks between decode steps. With nothing decoding,
+        /// a prompt is prefilled whole.
+        #[arg(long, default_value_t = 1024, value_parser = parse_prefill_chunk_tokens)]
+        prefill_chunk_tokens: u32,
+        /// Target milliseconds per decoded token while prompts are prefilled
+        /// beside decodes: each step's chunks get what the decode step leaves
+        /// of it, by the model's modeled prefill cost, so a chunk shrinks the
+        /// later in its prompt it starts. `--prefill-chunk-tokens` caps it.
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        prefill_target_ms: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]
@@ -609,4 +621,17 @@ pub(crate) enum QwenInspectCommand {
         /// Directory containing config.json and safetensors shard files.
         model: PathBuf,
     },
+}
+
+/// `--prefill-chunk-tokens`: 16 to 65536, a whole number of 16-token blocks,
+/// so every chunk but a prompt's last ends on a block boundary.
+fn parse_prefill_chunk_tokens(value: &str) -> Result<u32, String> {
+    let tokens: u32 = value
+        .parse()
+        .map_err(|_| format!("{value:?} is not a whole number"))?;
+    if (16..=65_536).contains(&tokens) && tokens.is_multiple_of(16) {
+        Ok(tokens)
+    } else {
+        Err(format!("{tokens} is not a multiple of 16 from 16 to 65536"))
+    }
 }

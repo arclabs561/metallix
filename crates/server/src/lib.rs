@@ -371,6 +371,8 @@ fn dispatch(cli: Cli) -> ExitCode {
             queue_depth,
             queue_wait_ms,
             max_num_seqs,
+            prefill_chunk_tokens,
+            prefill_target_ms,
         } => {
             let kv_budget_mib = kv_budget_mib.unwrap_or_else(default_kv_budget_mib);
             if let Some(entry) = worker_entry {
@@ -382,6 +384,8 @@ fn dispatch(cli: Cli) -> ExitCode {
                             .with_prefix_cache_mib(prefix_cache_mib),
                         engine_loop::EngineLimits {
                             max_num_seqs: max_num_seqs as usize,
+                            prefill_chunk_tokens: prefill_chunk_tokens as usize,
+                            prefill_target_ms,
                         },
                         Duration::from_millis(u64::from(generation_timeout_ms)),
                         cli.gpu_capture.as_deref(),
@@ -401,6 +405,8 @@ fn dispatch(cli: Cli) -> ExitCode {
                         kv_budget_mib,
                         prefix_cache_mib,
                         max_num_seqs,
+                        prefill_chunk_tokens,
+                        prefill_target_ms,
                         generation_timeout_ms,
                         trace_out: cli.trace_out,
                         gpu_capture: cli.gpu_capture,

@@ -870,3 +870,23 @@ fn foreign_larger_pool_prefix_hit_rejects_without_panic_or_mutation() {
     assert_eq!(recipient.sequences(), 0);
     assert_eq!(fingerprint(&recipient, &BTreeMap::new()), before);
 }
+
+#[test]
+fn prefill_chunks_end_on_block_boundaries_unless_they_finish_the_prompt() {
+    let manager = BlockManager::new(PoolConfig::new(BlockTokens::DEFAULT, 1).expect("pool"));
+    // 16-token blocks.
+    assert_eq!(manager.chunk_end(0, 100, 64), 64);
+    assert_eq!(manager.chunk_end(64, 100, 64), 100, "the rest fits");
+    assert_eq!(manager.chunk_end(0, 100, 50), 48, "rounded down to a block");
+    assert_eq!(
+        manager.chunk_end(48, 100, 10),
+        48,
+        "short of the next block"
+    );
+    assert_eq!(
+        manager.chunk_end(48, 52, 10),
+        52,
+        "but the prompt's end is fine"
+    );
+    assert_eq!(manager.chunk_end(0, 100, usize::MAX), 100);
+}

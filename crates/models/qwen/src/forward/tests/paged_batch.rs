@@ -683,3 +683,121 @@ fn failed_queued_readback_retains_rows_until_caller_retires_them() {
         session.blocks().total_blocks()
     );
 }
+
+/// Qwen3-0.6B BF16 chunked prefill, for the engine's chunk budget.
+///
+/// Profile: a 4096-token prompt in chunks of 32 to 4096, printing the total,
+/// the first and last chunk, and milliseconds per token. Nothing is asserted.
+///
+/// Agreement: a 1000-token prompt prefilled in chunks of 16, 64, 100 and 256
+/// ends with the same greedy token as a one-shot BF16 prefill, and its logits
+/// differ from the one-shot's by at most twice as much as the one-shot BF16
+/// logits differ from one-shot F32. (The first run declared a fixed 0.125,
+/// one BF16 step only for logits in [16, 32); chunk 16 differed by 0.25.
+/// Chunking reorders BF16 reductions, so its error is judged against BF16's
+/// own.)
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
+fn paged_chunked_prefill_qwen3_06b_agrees_and_profiles() {
+    use crate::metal::Qwen3MlxWeights;
+
+    let model = std::env::var_os("METALLIX_QWEN_MODEL")
+        .map(std::path::PathBuf::from)
+        .expect("METALLIX_QWEN_MODEL is required for this ignored test");
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut checkpoint = Qwen3MlxWeights::load(model).expect("checkpoint load");
+    let chunked = |paged: &mut PagedQwen3Session<'_, RandomState>,
+                   prompt: &[i32],
+                   chunk: usize|
+     -> (Vec<f32>, Vec<f64>) {
+        let seq = SequenceId(1);
+        let mut times = Vec::new();
+        let mut logits = Vec::new();
+        for (index, part) in prompt.chunks(chunk).enumerate() {
+            let started = Instant::now();
+            logits = if index == 0 {
+                paged.prefill_last_logits(seq, part).expect("first chunk")
+            } else {
+                paged.extend_last_logits(seq, part).expect("chunk")
+            };
+            times.push(millis(started.elapsed()));
+        }
+        paged.free(seq).expect("free");
+        (logits, times)
+    };
+    let max_diff = |left: &[f32], right: &[f32]| {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f32, f32::max)
+    };
+    let agreement_prompt = fixed_tokens(1000, 11);
+
+    checkpoint
+        .prepare_precision(Qwen3FloatPrecision::Float32)
+        .expect("f32 weights");
+    let f32_reference = {
+        let layout = checkpoint
+            .resident_chat_executor(8192, u64::MAX)
+            .expect("resident plan");
+        let pool = PagedQwen3Session::pool_for_budget(
+            layout.config,
+            layout.weights,
+            2048 * MIB,
+            BlockTokens::DEFAULT,
+        )
+        .expect("pool")
+        .with_prefix_caching(false);
+        let mut paged = PagedQwen3Session::new(layout.config, layout.weights, pool).expect("paged");
+        chunked(&mut paged, &agreement_prompt, agreement_prompt.len()).0
+    };
+
+    checkpoint
+        .prepare_precision(Qwen3FloatPrecision::BFloat16)
+        .expect("bf16 weights");
+    let layout = checkpoint
+        .resident_chat_executor(8192, u64::MAX)
+        .expect("resident plan");
+    let (config, weights) = (layout.config, layout.weights);
+    let pool =
+        PagedQwen3Session::pool_for_budget(config, weights, 2048 * MIB, BlockTokens::DEFAULT)
+            .expect("pool")
+            .with_prefix_caching(false);
+    let mut paged = PagedQwen3Session::new(config, weights, pool).expect("paged");
+
+    let prompt = fixed_tokens(4096, 13);
+    // Warm the kernels for every shape once.
+    for chunk in [32_usize, 64, 128, 256, 512, 1024, 2048, 4096] {
+        chunked(&mut paged, &prompt[..chunk.min(1024)], chunk);
+    }
+    for chunk in [32_usize, 64, 128, 256, 512, 1024, 2048, 4096] {
+        let (_, times) = chunked(&mut paged, &prompt, chunk);
+        let total: f64 = times.iter().sum();
+        println!(
+            "chunked_prefill profile prompt=4096 chunk={chunk} chunks={} total_ms={total:.1} \
+             first_ms={:.2} last_ms={:.2} ms_per_token={:.4}",
+            times.len(),
+            times[0],
+            times[times.len() - 1],
+            total / 4096.0
+        );
+    }
+
+    let (expected, _) = chunked(&mut paged, &agreement_prompt, agreement_prompt.len());
+    let tolerance = 2.0 * max_diff(&expected, &f32_reference);
+    for chunk in [16_usize, 64, 100, 256] {
+        let (logits, _) = chunked(&mut paged, &agreement_prompt, chunk);
+        let diff = max_diff(&logits, &expected);
+        println!(
+            "chunked_prefill agree chunk={chunk} max_abs_diff={diff:e} tolerance={tolerance:e}"
+        );
+        assert_eq!(
+            first_argmax(&logits),
+            first_argmax(&expected),
+            "chunk {chunk}"
+        );
+        assert!(diff <= tolerance, "chunk {chunk}: max abs diff {diff}");
+    }
+}

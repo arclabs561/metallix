@@ -56,6 +56,8 @@ pub(crate) struct ChildSettings {
     pub(crate) kv_budget_mib: u32,
     pub(crate) prefix_cache_mib: u32,
     pub(crate) max_num_seqs: u32,
+    pub(crate) prefill_chunk_tokens: u32,
+    pub(crate) prefill_target_ms: u32,
     pub(crate) generation_timeout_ms: u32,
     /// Each child writes its own timeline beside this path.
     pub(crate) trace_out: Option<PathBuf>,
@@ -378,6 +380,14 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
         .args(["--kv-budget-mib", &settings.kv_budget_mib.to_string()])
         .args(["--prefix-cache-mib", &settings.prefix_cache_mib.to_string()])
         .args(["--max-num-seqs", &settings.max_num_seqs.to_string()])
+        .args([
+            "--prefill-chunk-tokens",
+            &settings.prefill_chunk_tokens.to_string(),
+        ])
+        .args([
+            "--prefill-target-ms",
+            &settings.prefill_target_ms.to_string(),
+        ])
         .args([
             "--generation-timeout-ms",
             &settings.generation_timeout_ms.to_string(),

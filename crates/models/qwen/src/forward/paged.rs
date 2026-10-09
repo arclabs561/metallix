@@ -25,8 +25,8 @@ use mlx_rs::{Array, Dtype, StreamOrDevice, fast, ops, ops::indexing::IndexMutOp}
 
 use super::{
     Qwen3ForwardConfig, Qwen3ForwardError, RopePositions, as_i32, attention_output,
-    attention_scale, chunk_causal_mask, embed_rows, kv_precision, mlp_residual, project,
-    read_last_logits, rms_norm, rotated_qkv, validate_input_ids, weight,
+    attention_scale, embed_rows, kv_precision, mlp_residual, project, read_last_logits, rms_norm,
+    rotated_qkv, validate_input_ids, weight,
 };
 use crate::Qwen3Attention;
 
@@ -86,6 +86,31 @@ pub struct PagedPrefill {
     /// Prompt tokens in full blocks newly published during this prefill.
     /// Later decode may complete a partial prompt block; that is excluded.
     pub cache_write_tokens: usize,
+}
+
+/// The result of one [`PagedQwen3Session::prefill_chunk`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PagedChunk {
+    /// Prompt tokens computed by this call.
+    pub computed: usize,
+    /// Leading prompt tokens served from the prefix cache; counted on the
+    /// first chunk only.
+    pub cached_tokens: usize,
+    /// Prompt tokens in full blocks newly published by this chunk.
+    pub cache_write_tokens: usize,
+    /// The last prompt token's logits, once the whole prompt is in.
+    pub logits: Option<Vec<f32>>,
+}
+
+impl PagedChunk {
+    const fn nothing() -> Self {
+        Self {
+            computed: 0,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            logits: None,
+        }
+    }
 }
 
 /// What [`PagedQwen3Session::decode_batch`] reads back per row.
@@ -526,6 +551,113 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
         )?;
         let allocation = self.blocks.allocate(seq, &token_ids(input_ids))?;
         self.run(seq, input_ids, allocation.positions, allocation.copy)
+    }
+
+    /// Prefills the next at most `budget` tokens of `input_ids`, the whole
+    /// prompt, so a long prompt can run in several calls between decode
+    /// steps. The first call for `seq` looks up the whole prompt in the
+    /// prefix cache under `keys`; each call publishes the full blocks it
+    /// computed. A chunk that does not finish the prompt ends on a block
+    /// boundary ([`BlockManager::chunk_end`]); a budget short of the next
+    /// boundary computes nothing.
+    ///
+    /// # Errors
+    ///
+    /// A pool without room returns [`Qwen3ForwardError::KvBlocks`] and leaves
+    /// `seq` as it was (absent before its first chunk), so a scheduler can
+    /// retry or free it. A zero `budget`, a finished prompt, or invalid
+    /// token IDs are refused; a failed forward frees `seq`.
+    pub fn prefill_chunk(
+        &mut self,
+        seq: SequenceId,
+        input_ids: &[i32],
+        keys: HashKeys,
+        budget: usize,
+    ) -> Result<PagedChunk, Qwen3ForwardError> {
+        if budget == 0 {
+            return Err(Qwen3ForwardError::EmptyInput);
+        }
+        let tokens = token_ids(input_ids);
+        let (start, cached, allocation) = if self.blocks.num_tokens(seq).is_ok() {
+            let done = self.blocks.num_computed(seq)?;
+            if done >= input_ids.len() {
+                return Err(Qwen3ForwardError::CacheInconsistent);
+            }
+            let end = self.blocks.chunk_end(done, input_ids.len(), budget);
+            if end == done {
+                return Ok(PagedChunk::nothing());
+            }
+            validate_input_ids(
+                self.config,
+                &input_ids[done..end],
+                done,
+                self.config.max_position_embeddings,
+            )?;
+            (done, 0, self.blocks.allocate(seq, &tokens[done..end])?)
+        } else {
+            validate_input_ids(
+                self.config,
+                input_ids,
+                0,
+                self.config.max_position_embeddings,
+            )?;
+            let hit = self.blocks.lookup_prefix(&tokens, keys);
+            let cached = hit.cached_tokens();
+            let end = self.blocks.chunk_end(cached, input_ids.len(), budget);
+            if end == cached {
+                return Ok(PagedChunk::nothing());
+            }
+            (
+                cached,
+                cached,
+                self.blocks.admit(seq, hit, &tokens[cached..end])?,
+            )
+        };
+        let end = start + allocation.positions.len();
+        let published_before = self.blocks.published_tokens();
+        let logits = self.run(
+            seq,
+            &input_ids[start..end],
+            allocation.positions,
+            allocation.copy,
+        )?;
+        Ok(PagedChunk {
+            computed: end - start,
+            cached_tokens: cached,
+            cache_write_tokens: self.blocks.published_tokens() - published_before,
+            logits: (end == input_ids.len()).then_some(logits),
+        })
+    }
+
+    /// Modeled milliseconds to prefill `tokens` prompt tokens that follow
+    /// `start` cached ones, for sizing chunks between decode steps.
+    /// Projections and the MLP cost two FLOPs per weight per token; attention
+    /// over the cached prefix plus the chunk's causal half costs
+    /// `4 * tokens * (start + tokens / 2) * heads * head_dim` per layer, so a
+    /// fixed-size chunk costs more the later it starts. Fixed per-step costs
+    /// are left out.
+    // shortcut: fixed M3 Max rates (BF16 matmul ~10.5 TFLOPS, fused attention
+    // ~8 TFLOPS); upgrade when serving runs on another chip or calibrates at
+    // startup.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "token counts and weight counts are far below 2^52"
+    )]
+    pub fn prefill_ms(&self, start: usize, tokens: usize) -> f64 {
+        const MATMUL_FLOPS_PER_MS: f64 = 10.5e9;
+        const ATTENTION_FLOPS_PER_MS: f64 = 8.0e9;
+        let config = self.config;
+        let query_width = config.attention_heads * config.head_dim;
+        let layer_weights = config.hidden_size
+            * (query_width + 2 * config.key_value_heads * config.head_dim)
+            + query_width * config.hidden_size
+            + 3 * config.hidden_size * config.intermediate_size;
+        let (tokens, start) = (tokens as f64, start as f64);
+        let linear = 2.0 * (layer_weights * config.hidden_layers) as f64 * tokens;
+        let attention =
+            4.0 * tokens * (start + tokens / 2.0) * (query_width * config.hidden_layers) as f64;
+        linear / MATMUL_FLOPS_PER_MS + attention / ATTENTION_FLOPS_PER_MS
     }
 
     /// Appends exactly one token to `seq` and returns its logits.
@@ -1008,23 +1140,12 @@ impl<'a, S: BuildHasher> PagedQwen3Session<'a, S> {
 
         let seq_len = as_i32(input_ids.len())?;
         let start = rope_offset(positions.start())?;
-        // The contiguous executor's masks: plain causal for a sequence's
-        // first chunk, an explicit offset mask for a later multi-token chunk,
-        // none for one token.
-        let chunk_mask = if start > 0 && seq_len > 1 {
-            Some(chunk_causal_mask(start, seq_len, &stream)?)
-        } else {
-            None
-        };
-        let mask = || {
-            if start == 0 {
-                Some(fast::ScaledDotProductAttentionMask::Causal)
-            } else {
-                chunk_mask
-                    .as_ref()
-                    .map(fast::ScaledDotProductAttentionMask::Array)
-            }
-        };
+        // Causal for any multi-token chunk: with more keys than queries MLX
+        // aligns the causal diagonal to the last key, which is the offset
+        // mask a later chunk needs (equal to the explicit mask, and faster).
+        // A single later token attends to everything.
+        let mask =
+            || (start == 0 || seq_len > 1).then_some(fast::ScaledDotProductAttentionMask::Causal);
 
         let hidden = as_i32(self.config.hidden_size)?;
         let ids = Array::from_slice(input_ids, &[seq_len]);

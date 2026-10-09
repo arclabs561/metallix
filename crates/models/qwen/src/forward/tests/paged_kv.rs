@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use mlx_rs::ops::indexing::IndexOp;
 
-use engine::blocks::{BlockTokens, PoolConfig, SequenceId};
+use engine::blocks::{BlockTokens, HashKeys, PoolConfig, SequenceId};
 
 use super::*;
 use crate::forward::PagedQwen3Session;
@@ -267,6 +267,47 @@ fn paged_chunked_prefill_across_blocks_and_slabs_matches_contiguous_chunks() {
         8,
         "after chunks",
     );
+}
+
+#[test]
+fn prefill_chunk_matches_manual_chunks_and_takes_a_longer_cached_prefix() {
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let config = paged_config();
+    let weights = paged_weights(&config);
+    let caching = PoolConfig::new(BlockTokens::DEFAULT, 2).expect("pool");
+    let mut paged = PagedQwen3Session::new(&config, &weights, caching).expect("paged session");
+    let mut manual = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged session");
+    let seq = SequenceId(1);
+    let prompt = prompt(70, 5);
+    let mut expected = manual
+        .prefill_last_logits(seq, &prompt[..16])
+        .expect("first chunk");
+    for chunk in prompt[16..].chunks(16) {
+        expected = manual.extend_last_logits(seq, chunk).expect("chunk");
+    }
+    let mut computed = Vec::new();
+    let mut logits = None;
+    while logits.is_none() {
+        let chunk = paged
+            .prefill_chunk(seq, &prompt, HashKeys::new(), 16)
+            .expect("chunk");
+        computed.push(chunk.computed);
+        logits = chunk.logits;
+    }
+    assert_eq!(computed, [16, 16, 16, 16, 6]);
+    assert_bits_equal(&logits.expect("done"), &expected, "chunked prefill");
+
+    // Sharing four full blocks: the first chunk takes all 64 cached tokens,
+    // more than one budget, and computes only the rest.
+    let mut other = prompt[..64].to_vec();
+    other.extend(self::prompt(10, 9));
+    let first = paged
+        .prefill_chunk(SequenceId(2), &other, HashKeys::new(), 16)
+        .expect("cached chunk");
+    assert_eq!((first.cached_tokens, first.computed), (64, 10));
+    assert!(first.logits.is_some(), "the prompt finished in one chunk");
 }
 
 #[test]

@@ -191,6 +191,8 @@ fn serve_engine(
         pool_bytes = session.pool_bytes(),
         blocks = session.blocks().total_blocks(),
         max_num_seqs = limits.max_num_seqs,
+        prefill_chunk_tokens = limits.prefill_chunk_tokens,
+        prefill_target_ms = limits.prefill_target_ms,
         cache_limit_bytes = gpu::cache_limit_bytes(),
         "batching engine ready"
     );
@@ -1998,10 +2000,18 @@ stream.close()
     #[test]
     fn one_sequence_at_a_time_keeps_the_serial_path() {
         let mut worker = BatchCapable { asked: false };
-        let serial = EngineLimits { max_num_seqs: 1 };
+        let serial = EngineLimits {
+            max_num_seqs: 1,
+            prefill_chunk_tokens: 1024,
+            prefill_target_ms: 50,
+        };
         assert!(super::engine_seed(&mut worker, serial).is_none());
         assert!(!worker.asked, "the serial default never builds an engine");
-        let batching = EngineLimits { max_num_seqs: 2 };
+        let batching = EngineLimits {
+            max_num_seqs: 2,
+            prefill_chunk_tokens: 1024,
+            prefill_target_ms: 50,
+        };
         assert!(super::engine_seed(&mut worker, batching).is_some());
         assert!(worker.asked);
     }

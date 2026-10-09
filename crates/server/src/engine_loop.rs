@@ -31,7 +31,7 @@ use std::{
 use chat_format::{ChatFormat, TurnDelta};
 use engine::blocks::{HashKeys, SequenceId};
 use qwen::forward::{
-    BatchDecoded, BatchReadback, PagedPrefill, QueuedDecode, Qwen3ForwardError, StepInput,
+    BatchDecoded, BatchReadback, PagedChunk, QueuedDecode, Qwen3ForwardError, StepInput,
 };
 use tracing::field::Empty;
 
@@ -51,13 +51,22 @@ pub(crate) trait TextDecoder {
     fn prefill_cost(&self, input_ids: &[i32], keys: &HashKeys) -> Result<usize, DecodeError>;
     /// Free blocks in the pool, cached ones included.
     fn free_blocks(&self) -> usize;
-    /// Starts `seq` and returns its last prompt token's logits.
-    fn prefill(
+    /// Prefills the next at most `budget` tokens of `seq`'s prompt
+    /// `input_ids`, starting `seq` on the first call; see
+    /// [`PagedQwen3Session::prefill_chunk`]. On [`DecodeError::OutOfBlocks`]
+    /// `seq` is as it was.
+    fn prefill_chunk(
         &mut self,
         seq: SequenceId,
         input_ids: &[i32],
         keys: &HashKeys,
-    ) -> Result<PagedPrefill, DecodeError>;
+        budget: usize,
+    ) -> Result<PagedChunk, DecodeError>;
+    /// Modeled milliseconds to prefill `tokens` prompt tokens after `start`
+    /// computed ones; see [`PagedQwen3Session::prefill_ms`].
+    fn prefill_ms(&self, start: usize, tokens: usize) -> f64;
+    /// Tokens per pool block; prefill chunks are whole blocks.
+    fn block_tokens(&self) -> usize;
     /// Appends one token to each row's sequence. On an error other than
     /// [`DecodeError::OutOfBlocks`] the rows' sequences are gone.
     fn decode(
@@ -131,13 +140,28 @@ impl<S: std::hash::BuildHasher> TextDecoder for qwen::forward::PagedQwen3Session
         self.blocks().free_blocks()
     }
 
-    fn prefill(
+    fn prefill_chunk(
         &mut self,
         seq: SequenceId,
         input_ids: &[i32],
         keys: &HashKeys,
-    ) -> Result<PagedPrefill, DecodeError> {
-        Ok(self.prefill_with_keys(seq, input_ids, keys.clone())?)
+        budget: usize,
+    ) -> Result<PagedChunk, DecodeError> {
+        Ok(Self::prefill_chunk(
+            self,
+            seq,
+            input_ids,
+            keys.clone(),
+            budget,
+        )?)
+    }
+
+    fn prefill_ms(&self, start: usize, tokens: usize) -> f64 {
+        Self::prefill_ms(self, start, tokens)
+    }
+
+    fn block_tokens(&self) -> usize {
+        self.blocks().block_tokens()
     }
 
     fn decode(
@@ -189,13 +213,22 @@ impl<T: TextDecoder> TextDecoder for &mut T {
         T::free_blocks(self)
     }
 
-    fn prefill(
+    fn prefill_chunk(
         &mut self,
         seq: SequenceId,
         input_ids: &[i32],
         keys: &HashKeys,
-    ) -> Result<PagedPrefill, DecodeError> {
-        T::prefill(self, seq, input_ids, keys)
+        budget: usize,
+    ) -> Result<PagedChunk, DecodeError> {
+        T::prefill_chunk(self, seq, input_ids, keys, budget)
+    }
+
+    fn prefill_ms(&self, start: usize, tokens: usize) -> f64 {
+        T::prefill_ms(self, start, tokens)
+    }
+
+    fn block_tokens(&self) -> usize {
+        T::block_tokens(self)
     }
 
     fn decode(
@@ -243,6 +276,9 @@ pub(crate) enum Event {
     Prefilled {
         cached_prompt_tokens: usize,
         cache_write_tokens: usize,
+        /// Wall time from the prompt's first prefill chunk to its last. With
+        /// chunks between decode steps this includes those steps, so it is
+        /// the wait before the first token, not prefill compute.
         prefill_ms: f64,
     },
     Token(Accepted),
@@ -287,6 +323,15 @@ pub(crate) struct EngineModel {
 pub(crate) struct EngineLimits {
     /// Sequences decoded together at most.
     pub(crate) max_num_seqs: usize,
+    /// Most prompt tokens prefilled in one chunk while sequences are
+    /// decoding, a multiple of the block size; a longer prompt is prefilled
+    /// in chunks between decode steps instead of stalling them for its whole
+    /// length.
+    pub(crate) prefill_chunk_tokens: usize,
+    /// Target milliseconds per decoded token while prompts are prefilled:
+    /// each iteration's chunks get what the last decode step left of it, by
+    /// [`TextDecoder::prefill_ms`], at least one block.
+    pub(crate) prefill_target_ms: u32,
 }
 
 impl EngineLimits {
@@ -304,6 +349,43 @@ impl EngineLimits {
     pub(crate) const fn batches(self) -> bool {
         self.max_num_seqs > 1
     }
+}
+
+/// The least share of a decode step's time that prefill chunks get when the
+/// step alone exceeds `prefill_target_ms`: TPOT then grows at most this much,
+/// and a long prompt still advances by more than one block per step.
+const PREFILL_FLOOR_SHARE: f64 = 0.25;
+
+/// The decode step's share of an iteration that took `iteration_ms` and ran
+/// chunks modeled at `prefill_ms`. At least half the iteration: the cost model
+/// uses fixed rates, so a chunk it overprices (mostly cached, or a faster
+/// machine) would otherwise drive the estimate to zero and hand the next
+/// chunk the whole target.
+fn decode_estimate_ms(iteration_ms: f64, prefill_ms: f64) -> f64 {
+    (iteration_ms - prefill_ms).max(iteration_ms * 0.5)
+}
+
+/// Milliseconds of prefill an iteration may add beside a `decode_step_ms`
+/// decode step: what the step leaves of `target_ms`, but at least
+/// [`PREFILL_FLOOR_SHARE`] of the step.
+fn chunk_budget_ms(target_ms: f64, decode_step_ms: f64) -> f64 {
+    (target_ms - decode_step_ms).max(decode_step_ms * PREFILL_FLOOR_SHARE)
+}
+
+/// The largest whole number of `block`-token blocks, at most `ceiling`
+/// tokens, whose modeled `cost` fits `budget_ms`; at least one block, so a
+/// prompt always progresses.
+fn chunk_tokens(
+    cost: impl Fn(usize) -> f64,
+    budget_ms: f64,
+    ceiling: usize,
+    block: usize,
+) -> usize {
+    let mut tokens = ceiling / block * block;
+    while tokens > block && cost(tokens) > budget_ms {
+        tokens -= block;
+    }
+    tokens.max(block)
 }
 
 struct Sequence {
@@ -353,6 +435,16 @@ impl Sequence {
     }
 }
 
+/// A sequence whose prompt is partly prefilled.
+struct Prefilling {
+    sequence: Sequence,
+    /// Prompt tokens in the pool so far, cached ones included.
+    done: usize,
+    cached_tokens: usize,
+    cache_write_tokens: usize,
+    started: Instant,
+}
+
 /// The engine thread's state between iterations.
 struct Engine<'a, D: TextDecoder> {
     decoder: D,
@@ -361,6 +453,10 @@ struct Engine<'a, D: TextDecoder> {
     waiting: VecDeque<Sequence>,
     /// Running sequences in admission order.
     running: Vec<Sequence>,
+    /// The sequence whose prompt is being prefilled in chunks; its next
+    /// chunk runs before any new sequence is admitted. It is never in a
+    /// queued step, so its blocks can be freed at once.
+    prefilling: Option<Prefilling>,
     next_id: u64,
     steps: u64,
     /// The greedy step queued ahead of the next readback, when every running
@@ -371,6 +467,9 @@ struct Engine<'a, D: TextDecoder> {
     retired: Vec<(SequenceId, SyncSender<()>)>,
     /// When the last step was read back, for per-token timings.
     last_readback: Instant,
+    /// The last iteration's decode time: its wall time less the modeled cost
+    /// of the prefill chunks it ran. A chunk's budget is measured against it.
+    decode_step_ms: f64,
 }
 
 /// Runs the engine until every sender is gone. `exclusive` runs other work
@@ -388,14 +487,20 @@ pub(crate) fn run<D: TextDecoder, J>(
         limits,
         waiting: VecDeque::new(),
         running: Vec::new(),
+        prefilling: None,
         next_id: 1,
         steps: 0,
         queued: None,
         retired: Vec::new(),
         last_readback: Instant::now(),
+        decode_step_ms: 0.0,
     };
     loop {
-        if engine.running.is_empty() && engine.waiting.is_empty() && engine.queued.is_none() {
+        if engine.running.is_empty()
+            && engine.waiting.is_empty()
+            && engine.prefilling.is_none()
+            && engine.queued.is_none()
+        {
             match messages.recv() {
                 Ok(message) => engine.accept(message, &mut exclusive),
                 Err(_) => return,
@@ -495,13 +600,31 @@ impl<D: TextDecoder> Engine<'_, D> {
             }
         }
         self.waiting = waiting;
+        if let Some(prefilling) = self.prefilling.take() {
+            if prefilling.sequence.deadline.check_at(now).is_err() {
+                self.release_sequence(&prefilling.sequence);
+                prefilling
+                    .sequence
+                    .fail(ChatGenerationError::DeadlineExceeded);
+            } else {
+                self.prefilling = Some(prefilling);
+            }
+        }
         // Drain retired writes before admitting work into an otherwise idle
         // pool; those rows are not reusable merely because their turns ended.
         if self.running.is_empty() && self.queued.is_some() {
             self.decode();
         }
-        self.admit();
+        let started = Instant::now();
+        let steps = self.steps;
+        let prefill_ms = self.admit();
         self.decode();
+        if self.steps > steps {
+            // The iteration's wall time less the chunks' modeled cost, so the
+            // estimate follows the batch size even while prompts stream in.
+            let iteration_ms = started.elapsed().as_secs_f64() * 1000.0;
+            self.decode_step_ms = decode_estimate_ms(iteration_ms, prefill_ms);
+        }
         span.record("running", self.running.len());
         span.record("waiting", self.waiting.len());
         span.record("free_blocks", self.decoder.free_blocks());
@@ -512,13 +635,158 @@ impl<D: TextDecoder> Engine<'_, D> {
         }
     }
 
-    fn admit(&mut self) {
-        while self.running.len() < self.limits.max_num_seqs {
-            let Some(sequence) = self.waiting.front() else {
-                return;
+    /// Spends this iteration's prefill budget: the partly prefilled
+    /// sequence's next chunk first, then new sequences in arrival order.
+    /// With nothing decoding no step can stall, so prompts go in whole;
+    /// otherwise chunks get what the last decode step left of
+    /// [`EngineLimits::prefill_target_ms`], by the decoder's cost model, at
+    /// most `prefill_chunk_tokens` and at least one block each iteration.
+    /// When the decode step alone already exceeds the target, chunks still
+    /// get [`PREFILL_FLOOR_SHARE`] of the step's time, so prompts keep
+    /// moving at a bounded cost to TPOT. Returns the modeled milliseconds of
+    /// the chunks run beside decodes.
+    fn admit(&mut self) -> f64 {
+        let mut budget_ms = chunk_budget_ms(
+            f64::from(self.limits.prefill_target_ms),
+            self.decode_step_ms,
+        );
+        let mut spent_ms = 0.0;
+        let mut chunked = false;
+        loop {
+            let Some(prefilling) = self.prefilling.take().or_else(|| self.next_admission()) else {
+                return spent_ms;
             };
+            // Decided per chunk: once a prompt queued at idle finishes and
+            // starts decoding, the next prompt is budgeted like any other.
+            let unlimited = self.running.is_empty();
+            let Some(budget) = self.chunk_budget(&prefilling, unlimited, chunked, budget_ms) else {
+                self.prefilling = Some(prefilling);
+                return spent_ms;
+            };
+            let Prefilling {
+                sequence,
+                done,
+                mut cached_tokens,
+                mut cache_write_tokens,
+                started,
+            } = prefilling;
+            let span = tracing::info_span!(
+                "engine.prefill",
+                tokens = sequence.prefill_ids().len(),
+                start = done,
+                budget = budget.min(sequence.prefill_ids().len()),
+                resumed = sequence.resumed(),
+                computed = Empty,
+                cached_tokens = Empty,
+                chunk_ms = Empty,
+            );
+            let _entered = span.enter();
+            let chunk_started = Instant::now();
+            match self.decoder.prefill_chunk(
+                sequence.id,
+                sequence.prefill_ids(),
+                &sequence.keys,
+                budget,
+            ) {
+                Ok(chunk) => {
+                    span.record("computed", chunk.computed);
+                    span.record("cached_tokens", chunk.cached_tokens);
+                    span.record("chunk_ms", chunk_started.elapsed().as_secs_f64() * 1000.0);
+                    let start = done + chunk.cached_tokens;
+                    let chunk_ms = self.decoder.prefill_ms(start, chunk.computed);
+                    budget_ms -= chunk_ms;
+                    if !unlimited && chunk.computed > 0 {
+                        chunked = true;
+                        spent_ms += chunk_ms;
+                    }
+                    cached_tokens += chunk.cached_tokens;
+                    cache_write_tokens += chunk.cache_write_tokens;
+                    let done = start + chunk.computed;
+                    if let Some(logits) = chunk.logits {
+                        self.prefilled(
+                            sequence,
+                            logits,
+                            (cached_tokens, cache_write_tokens),
+                            started.elapsed(),
+                        );
+                    } else {
+                        // The budget ran out, or is short of a block.
+                        self.prefilling = Some(Prefilling {
+                            sequence,
+                            done,
+                            cached_tokens,
+                            cache_write_tokens,
+                            started,
+                        });
+                        return spent_ms;
+                    }
+                }
+                Err(DecodeError::OutOfBlocks) if !self.running.is_empty() => {
+                    // Wait for decodes to free blocks. The chunks already
+                    // computed are published, so they come back as a prefix
+                    // hit; a fresh ID keeps the old one's state apart.
+                    self.release_sequence(&sequence);
+                    let mut sequence = sequence;
+                    sequence.id = SequenceId(self.next_id);
+                    self.next_id += 1;
+                    self.waiting.push_front(sequence);
+                    return spent_ms;
+                }
+                Err(DecodeError::OutOfBlocks) => {
+                    self.release_sequence(&sequence);
+                    sequence.fail(ChatGenerationError::message(
+                        "the prompt does not fit the KV pool",
+                    ));
+                }
+                Err(DecodeError::Failed(error)) => {
+                    self.release_sequence(&sequence);
+                    sequence.fail(ChatGenerationError::Message(error));
+                }
+            }
+        }
+    }
+
+    /// Tokens `prefilling`'s next chunk may take, or `None` to wait for the
+    /// next iteration. Unlimited with nothing decoding. Beside decodes, a
+    /// chunk waits while the pool cannot keep a free block per running
+    /// sequence, as admission keeps (so it cannot force a preemption that
+    /// discards it), and a chunk after the iteration's first needs room for
+    /// at least a block in what is left of `budget_ms`.
+    fn chunk_budget(
+        &self,
+        prefilling: &Prefilling,
+        unlimited: bool,
+        chunked: bool,
+        budget_ms: f64,
+    ) -> Option<usize> {
+        if unlimited {
+            return Some(usize::MAX);
+        }
+        let block = self.decoder.block_tokens();
+        if self.decoder.free_blocks() <= self.running.len()
+            || (chunked && self.decoder.prefill_ms(prefilling.done, block) > budget_ms)
+        {
+            return None;
+        }
+        Some(chunk_tokens(
+            |tokens| self.decoder.prefill_ms(prefilling.done, tokens),
+            budget_ms,
+            self.limits.prefill_chunk_tokens,
+            block,
+        ))
+    }
+
+    /// The first waiting sequence the batch and the pool can take now, or
+    /// `None`. A sequence whose prompt cannot be costed fails and the next is
+    /// tried.
+    fn next_admission(&mut self) -> Option<Prefilling> {
+        loop {
+            if self.running.len() >= self.limits.max_num_seqs {
+                return None;
+            }
+            let sequence = self.waiting.front()?;
             // Keep one block of headroom per running sequence, so admitting
-            // does not immediately force a preemption on the next decode.
+            // does not immediately force a preemption.
             let cost = match self
                 .decoder
                 .prefill_cost(sequence.prefill_ids(), &sequence.keys)
@@ -539,60 +807,41 @@ impl<D: TextDecoder> Engine<'_, D> {
                 }
             };
             if cost + self.running.len() > self.decoder.free_blocks() && !self.running.is_empty() {
-                return;
+                return None;
             }
-            let Some(sequence) = self.waiting.pop_front() else {
-                return;
-            };
-            let span = tracing::info_span!(
-                "engine.prefill",
-                tokens = sequence.prefill_ids().len(),
-                resumed = sequence.resumed(),
-                cached_tokens = Empty,
-                prefill_ms = Empty,
-            );
-            let _entered = span.enter();
-            let started = Instant::now();
-            match self
-                .decoder
-                .prefill(sequence.id, sequence.prefill_ids(), &sequence.keys)
-            {
-                Ok(prefill) => {
-                    let elapsed = started.elapsed();
-                    span.record("cached_tokens", prefill.cached_tokens);
-                    span.record("prefill_ms", elapsed.as_secs_f64() * 1000.0);
-                    self.prefilled(sequence, prefill, elapsed);
-                }
-                Err(DecodeError::OutOfBlocks) if !self.running.is_empty() => {
-                    self.waiting.push_front(sequence);
-                    return;
-                }
-                Err(DecodeError::OutOfBlocks) => sequence.fail(ChatGenerationError::message(
-                    "the prompt does not fit the KV pool",
-                )),
-                Err(DecodeError::Failed(error)) => {
-                    sequence.fail(ChatGenerationError::Message(error));
-                }
-            }
+            return self.waiting.pop_front().map(|sequence| Prefilling {
+                sequence,
+                done: 0,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                started: Instant::now(),
+            });
         }
     }
 
-    fn prefilled(&mut self, mut sequence: Sequence, prefill: PagedPrefill, elapsed: Duration) {
+    /// `prefix` is the prompt tokens served from the prefix cache and those
+    /// newly published to it.
+    fn prefilled(
+        &mut self,
+        mut sequence: Sequence,
+        mut logits: Vec<f32>,
+        prefix: (usize, usize),
+        elapsed: Duration,
+    ) {
         if sequence.resumed() {
             // The token after this prefix was already chosen and sent.
             self.running.push(sequence);
             return;
         }
         let event = Event::Prefilled {
-            cached_prompt_tokens: prefill.cached_tokens,
-            cache_write_tokens: prefill.cache_write_tokens,
+            cached_prompt_tokens: prefix.0,
+            cache_write_tokens: prefix.1,
             prefill_ms: elapsed.as_secs_f64() * 1000.0,
         };
         if !sequence.send(event) {
             self.release_sequence(&sequence);
             return;
         }
-        let mut logits = prefill.logits;
         match sequence.turn.pick(self.format, &mut logits) {
             Ok(accepted) => {
                 if let Some(sequence) = self.accepted(sequence, accepted) {
@@ -844,6 +1093,17 @@ impl<D: TextDecoder> Engine<'_, D> {
     /// Frees the most recently admitted sequence and queues it first, to
     /// recompute when blocks are free. A lone sequence that cannot grow fails.
     fn preempt(&mut self) {
+        // A partly prefilled prompt is the newest holder of blocks, and its
+        // computed chunks come back as a prefix hit.
+        if let Some(Prefilling { sequence, .. }) = self.prefilling.take() {
+            tracing::info!(sequence = sequence.id.0, "prefill preempted for decodes");
+            self.release_sequence(&sequence);
+            let mut sequence = sequence;
+            sequence.id = SequenceId(self.next_id);
+            self.next_id += 1;
+            self.waiting.push_front(sequence);
+            return;
+        }
         let Some(sequence) = self.running.pop() else {
             return;
         };
@@ -1033,10 +1293,11 @@ mod tests {
         collections::HashMap,
         sync::{
             Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
             mpsc::{SyncSender, sync_channel},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use chat_format::{
@@ -1047,7 +1308,7 @@ mod tests {
         blocks::{BlockManager, BlockTokens, HashKeys, PoolConfig, SequenceId},
         speculative::SpeculationRequest,
     };
-    use qwen::forward::{BatchDecoded, BatchReadback, PagedPrefill, StepInput};
+    use qwen::forward::{BatchDecoded, BatchReadback, PagedChunk, StepInput};
     use serde_json::json;
 
     use super::{
@@ -1075,6 +1336,26 @@ mod tests {
         largest_batch: usize,
         /// Steps queued before the previous one was read back.
         queued_ahead: usize,
+        /// Device work in order: prefill chunks (tokens computed) and decode
+        /// steps (rows).
+        events: Vec<Step>,
+        /// Wall time each decode step takes, to keep turns running while a
+        /// test submits more.
+        step_delay: Duration,
+        /// Engine limits for this harness, read when the engine starts;
+        /// `None` keeps the harness default.
+        limits: Option<EngineLimits>,
+        /// Modeled prefill milliseconds per token; `None` means one.
+        prefill_ms_per_token: Option<f64>,
+        /// Caps the free blocks the decoder reports, to simulate a pool
+        /// with no headroom without changing what it can allocate.
+        free_blocks_cap: Option<usize>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Step {
+        Chunk(usize),
+        Decode(usize),
     }
 
     /// A queued fake step: its rows and where each input comes from.
@@ -1170,29 +1451,80 @@ mod tests {
         }
 
         fn free_blocks(&self) -> usize {
-            self.blocks.free_blocks()
+            let cap = self.observed.lock().expect("observed").free_blocks_cap;
+            cap.map_or(self.blocks.free_blocks(), |cap| {
+                cap.min(self.blocks.free_blocks())
+            })
         }
 
-        fn prefill(
+        fn prefill_chunk(
             &mut self,
             seq: SequenceId,
             input_ids: &[i32],
             keys: &HashKeys,
-        ) -> Result<PagedPrefill, DecodeError> {
+            budget: usize,
+        ) -> Result<PagedChunk, DecodeError> {
+            let nothing = PagedChunk {
+                computed: 0,
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+                logits: None,
+            };
             let tokens = Self::ids(input_ids);
-            let hit = self.blocks.lookup_prefix(&tokens, keys.clone());
-            let cached = hit.cached_tokens();
-            self.blocks
-                .admit(seq, hit, &tokens[cached..])
-                .map_err(|_| DecodeError::OutOfBlocks)?;
+            let (start, cached) = if let Ok(done) = self.blocks.num_computed(seq) {
+                let end = self.blocks.chunk_end(done, tokens.len(), budget);
+                if end == done {
+                    return Ok(nothing);
+                }
+                self.blocks
+                    .allocate(seq, &tokens[done..end])
+                    .map_err(|_| DecodeError::OutOfBlocks)?;
+                (done, 0)
+            } else {
+                let hit = self.blocks.lookup_prefix(&tokens, keys.clone());
+                let cached = hit.cached_tokens();
+                let end = self.blocks.chunk_end(cached, tokens.len(), budget);
+                if end == cached {
+                    return Ok(nothing);
+                }
+                self.blocks
+                    .admit(seq, hit, &tokens[cached..end])
+                    .map_err(|_| DecodeError::OutOfBlocks)?;
+                (cached, cached)
+            };
             let published_before = self.blocks.published_tokens();
             self.blocks.commit(seq).expect("live");
-            self.tokens.insert(seq, input_ids.to_vec());
-            Ok(PagedPrefill {
-                logits: Self::logits(input_ids),
+            let end = self.blocks.num_computed(seq).expect("live");
+            {
+                let mut observed = self.observed.lock().expect("observed");
+                observed.events.push(Step::Chunk(end - start));
+            }
+            let done = end == tokens.len();
+            if done {
+                self.tokens.insert(seq, input_ids.to_vec());
+            }
+            Ok(PagedChunk {
+                computed: end - start,
                 cached_tokens: cached,
                 cache_write_tokens: self.blocks.published_tokens() - published_before,
+                logits: done.then(|| Self::logits(input_ids)),
             })
+        }
+
+        /// A flat modeled cost per token, wherever it starts.
+        #[allow(clippy::cast_precision_loss, reason = "test token counts are small")]
+        fn prefill_ms(&self, _start: usize, tokens: usize) -> f64 {
+            let per_token = self
+                .observed
+                .lock()
+                .expect("observed")
+                .prefill_ms_per_token
+                .unwrap_or(1.0);
+            tokens as f64 * per_token
+        }
+
+        fn block_tokens(&self) -> usize {
+            self.blocks.block_tokens()
         }
 
         fn decode(
@@ -1212,6 +1544,8 @@ mod tests {
                 }
                 observed.readbacks.push(readback);
                 observed.largest_batch = observed.largest_batch.max(rows.len());
+                observed.events.push(Step::Decode(rows.len()));
+                thread::sleep(observed.step_delay);
             }
             let mut logits = Vec::new();
             for &(seq, token) in rows {
@@ -1278,6 +1612,8 @@ mod tests {
                 }
                 observed.readbacks.push(BatchReadback::Greedy);
                 observed.largest_batch = observed.largest_batch.max(rows.len());
+                observed.events.push(Step::Decode(rows.len()));
+                thread::sleep(observed.step_delay);
                 if self.in_flight {
                     observed.queued_ahead += 1;
                 }
@@ -1423,10 +1759,22 @@ mod tests {
             let engine = thread::spawn(move || {
                 let mut decoder = decoder;
                 let _ = start.recv();
+                let limits =
+                    decoder
+                        .observed
+                        .lock()
+                        .expect("observed")
+                        .limits
+                        .unwrap_or(EngineLimits {
+                            max_num_seqs,
+                            prefill_chunk_tokens: TEST_CHUNK,
+                            // Generous, so the token ceiling sets every chunk.
+                            prefill_target_ms: 10_000,
+                        });
                 run(
                     &mut decoder,
                     &engine_format,
-                    EngineLimits { max_num_seqs },
+                    limits,
                     &receiver,
                     |job: Job| {
                         let _ = job.send(7);
@@ -1910,6 +2258,329 @@ mod tests {
     }
 
     #[test]
+    fn an_overpriced_chunk_leaves_the_decode_at_least_half_the_iteration() {
+        // A chunk-free iteration is all decode.
+        assert!((super::decode_estimate_ms(12.0, 0.0) - 12.0).abs() < 1e-9);
+        assert!((super::decode_estimate_ms(40.0, 15.0) - 25.0).abs() < 1e-9);
+        // A 30 ms iteration whose chunk the model priced at 45 ms: the
+        // estimate stays at half the iteration instead of zero, so the next
+        // budget is 50 - 15 = 35 ms, not the whole 50.
+        let estimate = super::decode_estimate_ms(30.0, 45.0);
+        assert!((estimate - 15.0).abs() < 1e-9);
+        assert!((super::chunk_budget_ms(50.0, estimate) - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_decode_step_over_the_target_still_leaves_prefill_more_than_a_block() {
+        assert!((super::chunk_budget_ms(50.0, 12.0) - 38.0).abs() < 1e-9);
+        // A 60 ms step is over the 50 ms target: prefill still gets a quarter
+        // of it, which is about ten blocks of a Qwen3-0.6B prompt's start
+        // rather than the one-block floor.
+        let budget = super::chunk_budget_ms(50.0, 60.0);
+        assert!((budget - 15.0).abs() < 1e-9);
+        #[allow(clippy::cast_precision_loss, reason = "small counts")]
+        let cost = |tokens: usize| {
+            let tokens = tokens as f64;
+            0.084 * tokens + 2.87e-5 * tokens * (tokens / 2.0)
+        };
+        assert!(super::chunk_tokens(cost, budget, 1024, 16) >= 160);
+    }
+
+    #[test]
+    fn chunks_shrink_as_their_start_moves_later() {
+        // Qwen3-0.6B's modeled cost: 0.084 ms per token plus attention over
+        // the prefix and the chunk's causal half.
+        let cost = |start: usize| {
+            move |tokens: usize| {
+                #[allow(clippy::cast_precision_loss, reason = "small counts")]
+                let (tokens, start) = (tokens as f64, start as f64);
+                0.084 * tokens + 2.87e-5 * tokens * (start + tokens / 2.0)
+            }
+        };
+        let early = super::chunk_tokens(cost(0), 40.0, 1024, 16);
+        let late = super::chunk_tokens(cost(8192), 40.0, 1024, 16);
+        assert!(early > late && late >= 16, "early {early}, late {late}");
+        assert!(cost(0)(early) <= 40.0 && cost(0)(early + 16) > 40.0);
+        assert_eq!(
+            super::chunk_tokens(cost(0), 1e9, 1024, 16),
+            1024,
+            "the ceiling"
+        );
+        assert_eq!(
+            super::chunk_tokens(cost(0), -5.0, 1024, 16),
+            16,
+            "one block at least"
+        );
+    }
+
+    /// Prompt tokens per prefill chunk in the harness: two 4-token blocks.
+    const TEST_CHUNK: usize = 8;
+
+    /// A turn that decodes until `stop` is set, to keep a batch running
+    /// while a test submits prompts beside it.
+    fn keeper(client: &EngineClient<Job>, stop: &Arc<AtomicBool>) -> thread::JoinHandle<()> {
+        let mut client = client.clone();
+        let stop = Arc::clone(stop);
+        thread::spawn(move || {
+            let messages = [ChatMessage::text(ChatRole::User, prompt(0))];
+            // The harness context is 256 tokens.
+            let mut request = ChatRequest::new(&messages, 200);
+            request.ignore_eos = true;
+            let _ = client.generate_with_timeout(request, Duration::from_secs(60), &mut |_| {
+                if stop.load(Ordering::Acquire) {
+                    Err(String::from("stopped"))
+                } else {
+                    Ok(())
+                }
+            });
+        })
+    }
+
+    fn words(count: usize, index: usize) -> String {
+        (0..count)
+            .map(|word| {
+                if (word + index).is_multiple_of(3) {
+                    "hi"
+                } else {
+                    "Hello"
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A decode step above the target (60 ms against 50) still leaves prefill
+    /// a quarter of the step: a 192-token prompt at 0.01 modeled ms per token
+    /// fits that 15 ms in one chunk. With the budget at target minus step
+    /// (negative here) it gets one 4-token block per step, 48 steps of 60 ms.
+    #[test]
+    fn a_long_prompt_beside_a_slow_decode_step_finishes_in_large_chunks() {
+        let mut harness = Harness::paused(4096, 4, true);
+        {
+            let mut observed = harness.observed.lock().expect("observed");
+            observed.limits = Some(EngineLimits {
+                max_num_seqs: 4,
+                prefill_chunk_tokens: 1024,
+                prefill_target_ms: 50,
+            });
+            observed.step_delay = Duration::from_millis(60);
+            observed.prefill_ms_per_token = Some(0.01);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let keeper = keeper(&harness.client, &stop);
+        harness.release();
+        // Several decode steps, so the engine's step estimate is ~60 ms.
+        thread::sleep(Duration::from_millis(400));
+        let started = Instant::now();
+        let outputs = generate_all(&harness.client, &[words(192, 1)], SamplingRequest::GREEDY);
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Release);
+        keeper.join().expect("keeper");
+        let observed = Arc::clone(&harness.observed);
+        harness.stop();
+        assert_eq!(outputs.len(), 1);
+        let events = observed.lock().expect("observed").events.clone();
+        let first_decode = events
+            .iter()
+            .position(|event| matches!(event, Step::Decode(_)))
+            .expect("a decode step ran");
+        let chunks = events[first_decode..]
+            .iter()
+            .filter_map(|event| match event {
+                Step::Chunk(tokens) => Some(*tokens),
+                Step::Decode(_) => None,
+            })
+            .collect::<Vec<_>>();
+        // One chunk, or a few if the step estimate is still settling; one
+        // block per step would be 48.
+        assert!(
+            chunks.len() <= 4,
+            "{} chunks beside a slow decode step: {chunks:?}",
+            chunks.len()
+        );
+        // Its 40 output tokens take ~2.4 s of 60 ms steps on their own; 48
+        // prefill steps would add another ~2.9 s.
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the prompt took {elapsed:?} beside a 60 ms decode step"
+        );
+    }
+
+    /// A chunk beside decodes waits while free blocks are at or below the
+    /// running rows, so it cannot take the block a decode needs, and resumes
+    /// when blocks free.
+    #[test]
+    fn a_chunk_waits_while_the_pool_lacks_headroom_and_resumes_after() {
+        let long = words(40, 2);
+        let expected = reference(std::slice::from_ref(&long));
+        let mut harness = Harness::paused(256, 4, true);
+        {
+            let mut observed = harness.observed.lock().expect("observed");
+            observed.step_delay = Duration::from_millis(10);
+            // At one modeled ms per token, a 12 ms target beside a ~10 ms
+            // step leaves one 4-token block per step, so the prompt is still
+            // prefilling when the pool runs out of headroom.
+            observed.limits = Some(EngineLimits {
+                max_num_seqs: 4,
+                prefill_chunk_tokens: TEST_CHUNK,
+                prefill_target_ms: 12,
+            });
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let keeper = keeper(&harness.client, &stop);
+        harness.release();
+        thread::sleep(Duration::from_millis(100));
+        let writer = {
+            let client = harness.client.clone();
+            let long = long.clone();
+            thread::spawn(move || generate_all(&client, &[long], SamplingRequest::GREEDY))
+        };
+        let chunk_beside_decode = |events: &[Step]| {
+            events
+                .iter()
+                .position(|event| matches!(event, Step::Decode(_)))
+                .is_some_and(|first| {
+                    events[first..]
+                        .iter()
+                        .any(|event| matches!(event, Step::Chunk(_)))
+                })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !chunk_beside_decode(&harness.observed.lock().expect("observed").events) {
+            assert!(Instant::now() < deadline, "no chunk ran beside a decode");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // One running row: report one free block, which leaves no headroom.
+        let before = {
+            let mut observed = harness.observed.lock().expect("observed");
+            observed.free_blocks_cap = Some(1);
+            observed.events.len()
+        };
+        thread::sleep(Duration::from_millis(200));
+        let during = {
+            let mut observed = harness.observed.lock().expect("observed");
+            observed.free_blocks_cap = None;
+            observed.events[before..].to_vec()
+        };
+        let outputs = writer.join().expect("writer");
+        stop.store(true, Ordering::Release);
+        keeper.join().expect("keeper");
+        harness.stop();
+        assert!(
+            during.iter().any(|event| matches!(event, Step::Decode(_))),
+            "decodes kept running: {during:?}"
+        );
+        assert!(
+            !during.iter().any(|event| matches!(event, Step::Chunk(_))),
+            "a chunk ran without headroom: {during:?}"
+        );
+        assert_eq!(outputs, expected, "the prompt resumed and finished");
+    }
+
+    #[test]
+    fn prompts_queued_at_idle_chunk_once_the_first_is_decoding() {
+        let long = |index: usize| {
+            (0..40)
+                .map(|word| {
+                    if (word + index).is_multiple_of(3) {
+                        "hi"
+                    } else {
+                        "Hello"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let prompts = (0..3).map(long).collect::<Vec<_>>();
+        let expected = reference(&prompts);
+        // All three are waiting before the engine looks, with nothing
+        // decoding: only the first may be prefilled whole.
+        let mut harness = Harness::paused(256, 4, true);
+        let writers = {
+            let client = harness.client.clone();
+            let prompts = prompts.clone();
+            thread::spawn(move || generate_all(&client, &prompts, SamplingRequest::GREEDY))
+        };
+        thread::sleep(Duration::from_millis(500));
+        harness.release();
+        let outputs = writers.join().expect("writers");
+        let observed = Arc::clone(&harness.observed);
+        harness.stop();
+        assert_eq!(outputs, expected, "chunked prefill changed an output");
+        let events = observed.lock().expect("observed").events.clone();
+        // Until the first decode step, the first prompt is the only one that
+        // started with nothing decoding; later prompts may go whole only
+        // after every running sequence has finished.
+        let first_decode = events
+            .iter()
+            .position(|event| matches!(event, Step::Decode(_)))
+            .expect("a decode step ran");
+        let whole = events[..first_decode]
+            .iter()
+            .filter(|event| matches!(event, Step::Chunk(tokens) if *tokens > TEST_CHUNK))
+            .count();
+        assert_eq!(
+            whole, 1,
+            "a prompt queued at idle was prefilled whole after another started decoding: {events:?}"
+        );
+    }
+
+    #[test]
+    fn long_prompts_prefill_in_chunks_between_decode_steps() {
+        let long = |index: usize| {
+            (0..40)
+                .map(|word| {
+                    if (word + index).is_multiple_of(3) {
+                        "hi"
+                    } else {
+                        "Hello"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let prompts = (0..3).map(long).collect::<Vec<_>>();
+        let expected = reference(&prompts);
+        let mut harness = Harness::paused(256, 4, true);
+        harness.observed.lock().expect("observed").step_delay = Duration::from_millis(2);
+        // A short turn decodes first, so the long prompts arrive while a
+        // decode is running and must not stall it for their whole length.
+        let keeper = {
+            let mut client = harness.client.clone();
+            thread::spawn(move || {
+                let messages = [ChatMessage::text(ChatRole::User, prompt(0))];
+                let mut request = ChatRequest::new(&messages, 40);
+                request.ignore_eos = true;
+                client
+                    .generate_with_timeout(request, Duration::from_secs(30), &mut |_| Ok(()))
+                    .expect("keeper");
+            })
+        };
+        harness.release();
+        thread::sleep(Duration::from_millis(10));
+        let outputs = generate_all(&harness.client, &prompts, SamplingRequest::GREEDY);
+        keeper.join().expect("keeper");
+        let observed = Arc::clone(&harness.observed);
+        let decoder = harness.stop();
+        assert_eq!(outputs, expected, "chunked prefill changed an output");
+        let events = observed.lock().expect("observed").events.clone();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, Step::Chunk(tokens) if *tokens > TEST_CHUNK)),
+            "a chunk exceeded the budget while decoding: {events:?}"
+        );
+        assert!(
+            events.windows(3).any(|window| matches!(
+                window,
+                [Step::Chunk(TEST_CHUNK), Step::Decode(_), Step::Chunk(_)]
+            )),
+            "no decode step ran between two chunks of a prompt: {events:?}"
+        );
+        assert_eq!(decoder.blocks.free_blocks(), 256, "every block came back");
+    }
+
+    #[test]
     fn salts_separate_tenants_and_unsalted_requests_share_one_namespace() {
         let harness = Harness::new(64, 2);
         let messages = [ChatMessage::text(ChatRole::User, prompt(4))];
@@ -2018,7 +2689,11 @@ mod tests {
             run(
                 session,
                 &engine_format,
-                EngineLimits { max_num_seqs: 16 },
+                EngineLimits {
+                    max_num_seqs: 16,
+                    prefill_chunk_tokens: 1024,
+                    prefill_target_ms: 50,
+                },
                 &receiver,
                 |()| {},
             );

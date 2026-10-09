@@ -195,6 +195,27 @@ impl BlockManager {
         self.pool.ref_counts.len()
     }
 
+    /// Tokens per block.
+    #[must_use]
+    pub const fn block_tokens(&self) -> usize {
+        self.pool.block_tokens
+    }
+
+    /// Where a prefill chunk of at most `budget` tokens from `start` in a
+    /// prompt of `len` tokens ends: the prompt's end when it fits, otherwise
+    /// the last block boundary within the budget, so each chunk's full blocks
+    /// can be published as it completes. Returns `start` when the budget does
+    /// not reach the next boundary.
+    #[must_use]
+    pub const fn chunk_end(&self, start: usize, len: usize, budget: usize) -> usize {
+        let end = start.saturating_add(budget);
+        if end >= len {
+            return len;
+        }
+        let aligned = end / self.pool.block_tokens * self.pool.block_tokens;
+        if aligned > start { aligned } else { start }
+    }
+
     /// Returns the number of free blocks, cached ones included.
     #[must_use]
     pub const fn free_blocks(&self) -> usize {

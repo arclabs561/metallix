@@ -39,7 +39,8 @@ mod verify;
 pub(crate) use crate::quantization::is_quantizable;
 pub use crate::quantization::{Qwen3AffineBits, Qwen3AffineGroupSize, Qwen3AffineQuantization};
 pub use paged::{
-    BatchDecoded, BatchReadback, PagedPrefill, PagedQwen3Session, QueuedDecode, StepInput,
+    BatchDecoded, BatchReadback, PagedChunk, PagedPrefill, PagedQwen3Session, QueuedDecode,
+    StepInput,
 };
 pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
 pub use projection::Qwen3WeightPrecision;
@@ -2086,7 +2087,10 @@ fn attention_output<S: BuildHasher>(
 }
 
 /// `[chunk, cached + chunk]` boolean mask letting chunk position `i` (absolute
-/// `cached + i`) attend to every key at or before it.
+/// `cached + i`) attend to every key at or before it. Both executors now use
+/// the fused `Causal` mask for later chunks; this stays as the oracle that
+/// checks the fused mask's alignment.
+#[cfg(test)]
 fn chunk_causal_mask(
     cached_tokens: i32,
     chunk_tokens: i32,
