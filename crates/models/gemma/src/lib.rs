@@ -682,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, reason = "exact values are the point of this test")]
     fn proportional_rope_divides_by_the_whole_head_and_stops_after_the_rotated_pairs() {
         let config = Gemma4TextConfig::parse(GEMMA4_12B_CONFIG).expect("12B layout");
         let wavelengths = config

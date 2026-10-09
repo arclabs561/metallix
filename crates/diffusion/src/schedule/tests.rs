@@ -156,6 +156,7 @@ fn mu_is_required_exactly_with_dynamic_shifting() {
 }
 
 #[test]
+#[allow(clippy::float_cmp, reason = "exact values are the point of this test")]
 fn steps_walk_the_sigmas_to_zero() {
     let config = FlowMatchConfig::from_json(KLEIN).unwrap();
     let sigmas = Sigmas::new(&config, 4, Some(flux2_empirical_mu(4096, 4))).unwrap();

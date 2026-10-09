@@ -132,6 +132,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, reason = "exact values are the point of this test")]
     fn identical_images_score_perfectly() {
         let image = gradient(32, 24);
         assert_eq!(psnr_rgb8(&image, &image), f64::INFINITY);

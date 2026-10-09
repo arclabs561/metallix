@@ -196,6 +196,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, reason = "exact values are the point of this test")]
     fn each_axis_rotates_only_its_own_lanes() {
         // A token at h=5 and nothing else: only lanes 32..64 (axis 1) turn.
         let tables = RopeTables::new(&[[0, 5, 0, 0]], [32, 32, 32, 32], 2000.0).unwrap();

@@ -625,6 +625,7 @@ pub(crate) enum QwenInspectCommand {
 
 /// `--prefill-chunk-tokens`: 16 to 65536, a whole number of 16-token blocks,
 /// so every chunk but a prompt's last ends on a block boundary.
+#[cfg(feature = "metal")]
 fn parse_prefill_chunk_tokens(value: &str) -> Result<u32, String> {
     let tokens: u32 = value
         .parse()

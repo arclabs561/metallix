@@ -399,7 +399,10 @@ impl Sigmas {
     }
 
     /// The steps in order.
-    #[must_use]
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "the returned iterator is already must_use; clippy 1.98 still asks"
+    )]
     pub fn steps(&self) -> impl ExactSizeIterator<Item = FlowMatchStep> + '_ {
         self.values
             .windows(2)

@@ -1773,6 +1773,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, reason = "exact values are the point of this test")]
     fn suppressed_tokens_come_from_the_checkpoint_and_are_masked() {
         let format = |generation: Value| {
             let model = ModelDir::new(

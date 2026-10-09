@@ -474,6 +474,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp, reason = "exact values are the point of this test")]
     fn f16_widening_is_exact_for_every_pattern() {
         for bits in 0..=u16::MAX {
             let wide = f16_to_f32(bits);
