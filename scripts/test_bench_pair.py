@@ -12,6 +12,7 @@ direction. One test runs real stub servers whose speed drifts.
 
 from __future__ import annotations
 
+import math
 import pathlib
 import random
 import statistics
@@ -77,6 +78,50 @@ class Tails(unittest.TestCase):
         itl = summary["metrics"]["itl_p99_ms"]
         self.assertEqual(itl["unresolved_n"], 60)  # 60 gaps do not resolve p99.
         self.assertIn("compare the max, not p99", bench_pair.render(summary, pairs))
+
+
+class NoiseFloor(unittest.TestCase):
+    def test_log_ratio_interval_by_hand(self) -> None:
+        # log ratios +0.1 and -0.1: mean 0, sd 0.1 * sqrt(2), n 2, t(1) 12.706.
+        out = bench_pair.log_ratio_interval([math.exp(0.1), math.exp(-0.1)])
+        self.assertAlmostEqual(out["geomean_ratio"], 1.0)
+        self.assertAlmostEqual(out["sd_log"], 0.141421, places=5)
+        self.assertAlmostEqual(out["ci95"][0], math.exp(-1.2706), places=4)
+        self.assertAlmostEqual(out["ci95"][1], math.exp(1.2706), places=4)
+        self.assertAlmostEqual(out["mde"], math.exp(0.28) - 1, places=6)
+        self.assertIsNone(bench_pair.log_ratio_interval([1.1])["ci95"])
+
+    def test_t_quantiles_past_the_table_match_published_values(self) -> None:
+        for df, published in ((40, 2.021), (60, 2.000), (120, 1.980)):
+            self.assertAlmostEqual(bench_pair.t_975(df), published, delta=0.001)
+
+    def test_pairs_favoring_b_follow_each_metrics_direction(self) -> None:
+        def run(tok_s: float, ttft: float) -> dict:
+            return {
+                "summary": {
+                    "output_token_throughput": tok_s,
+                    "tpot_ms": {"p50": 10.0},
+                    "ttft_ms": {"p50": ttft},
+                }
+            }
+
+        # B: faster throughput in 3 of 4 pairs; lower TTFT in 1 of 4.
+        values = [
+            ((100, 50), (110, 60)),
+            ((100, 50), (105, 40)),
+            ((100, 50), (102, 55)),
+            ((100, 50), (95, 55)),
+        ]
+        pairs = [
+            {"pair": i, "order": "AB", "A": run(*a), "B": run(*b)}
+            for i, (a, b) in enumerate(values)
+        ]
+        summary = bench_pair.summarize_pairs(pairs, random.Random(0))
+        self.assertEqual(summary["metrics"]["output_tok_s"]["favor_b"], [3, 4])
+        self.assertEqual(summary["metrics"]["ttft_p50_ms"]["favor_b"], [1, 4])
+        text = bench_pair.render(summary, pairs)
+        self.assertIn("3 of 4 pairs favor B", text)
+        self.assertIn("MDE", text)
 
 
 class Order(unittest.TestCase):

@@ -11,6 +11,10 @@ per-pair ratios B/A with a bootstrap 95% confidence interval. Machine load
 that drifts slowly affects both runs of a pair about equally, and alternating
 which arm goes first cancels a steady trend, so a ratio interval that
 excludes 1 is evidence of a difference even when the machine is busy.
+Each metric also reports how many pairs favor B, the geometric mean ratio
+with a t interval on log ratios, and the minimum detectable effect at that
+spread, 2.8 sd(log ratio) / sqrt(pairs); an A/A run (one build in both arms)
+measures that floor.
 Absolute numbers from a loaded machine are still not results; publish those
 only from the idle protocol (bench_campaign.py).
 
@@ -29,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import shlex
 import statistics
@@ -67,6 +72,74 @@ def bootstrap_median_ci(
         bench_load.percentile(medians, tail),
         bench_load.percentile(medians, 100 - tail),
     )
+
+
+# Two-sided 97.5% quantiles of Student's t for 1-30 degrees of freedom.
+T_975 = (
+    12.706,
+    4.303,
+    3.182,
+    2.776,
+    2.571,
+    2.447,
+    2.365,
+    2.306,
+    2.262,
+    2.228,
+    2.201,
+    2.179,
+    2.160,
+    2.145,
+    2.131,
+    2.120,
+    2.110,
+    2.101,
+    2.093,
+    2.086,
+    2.080,
+    2.074,
+    2.069,
+    2.064,
+    2.060,
+    2.056,
+    2.052,
+    2.048,
+    2.045,
+    2.042,
+)
+# z(0.975) + z(0.80): the detectable effect at 80% power and 5% two-sided.
+MDE_FACTOR = 2.8
+
+
+def t_975(df: int) -> float:
+    """Student's t 97.5% quantile; past the table, the Cornish-Fisher
+    expansion around the normal quantile (error under 0.001 for df > 30)."""
+    if df <= len(T_975):
+        return T_975[df - 1]
+    z = 1.959964
+    return z + (z**3 + z) / (4 * df) + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
+
+
+def log_ratio_interval(ratios: list[float]) -> dict:
+    """Mean of log(B/A) with a t interval, as ratios, and the minimum
+    detectable effect MDE = 2.8 sd / sqrt(n) at this spread and pair count.
+
+    A log ratio is symmetric (B twice A and A twice B are equally far from
+    0), and the mean over pairs suits a t interval where the median suits
+    the bootstrap. None when fewer than two pairs.
+    """
+    n = len(ratios)
+    if n < 2:
+        return {"geomean_ratio": None, "ci95": None, "sd_log": None, "mde": None}
+    logs = [math.log(ratio) for ratio in ratios]
+    mean, sd = statistics.fmean(logs), statistics.stdev(logs)
+    half = t_975(n - 1) * sd / math.sqrt(n)
+    return {
+        "geomean_ratio": math.exp(mean),
+        "ci95": [math.exp(mean - half), math.exp(mean + half)],
+        "sd_log": sd,
+        "mde": math.exp(MDE_FACTOR * sd / math.sqrt(n)) - 1,
+    }
 
 
 def metric(summary: dict, path: tuple[str, ...]) -> float | None:
@@ -132,6 +205,9 @@ def summarize_pairs(pairs: list[dict], rng: random.Random) -> dict:
             ]
         out["metrics"][name] = {
             "unresolved_n": min(unresolved) if unresolved else None,
+            "log_ratio": log_ratio_interval([r for r in ratios if r > 0]),
+            # Pairs whose ratio favors B, out of the pairs compared.
+            "favor_b": [sum((r > 1) == higher for r in ratios if r != 1), len(ratios)],
             "median_ratio": statistics.median(ratios),
             "ci95": [low, high],
             "ratios": ratios,
@@ -165,10 +241,18 @@ def render(summary: dict, pairs: list[dict]) -> str:
     lines.append(f"{summary['kept']} of {summary['pairs']} pairs kept")
     for name, m in summary["metrics"].items():
         direction = "higher" if m["higher_is_better"] else "lower"
+        log = m["log_ratio"]
         lines.append(
             f"{name} B/A median {m['median_ratio']:.3f} "
             f"[95% CI {m['ci95'][0]:.3f}-{m['ci95'][1]:.3f}] ({direction} is better): "
-            f"{m['verdict']}"
+            f"{m['verdict']}; {m['favor_b'][0]} of {m['favor_b'][1]} pairs favor B"
+            + (
+                f"; geomean {log['geomean_ratio']:.3f} "
+                f"[t 95% CI {log['ci95'][0]:.3f}-{log['ci95'][1]:.3f}], "
+                f"MDE {log['mde']:.1%}"
+                if log["geomean_ratio"] is not None
+                else ""
+            )
             + (
                 f" (runs with n={m['unresolved_n']} compare the max, not {METRICS[name][0][-1]})"
                 if m.get("unresolved_n") is not None
