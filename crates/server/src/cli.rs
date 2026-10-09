@@ -233,14 +233,16 @@ pub(crate) enum Command {
         /// Prompt tokens a generating model prefills per batched step while
         /// other sequences decode, a multiple of 16; a longer prompt is
         /// prefilled in chunks between decode steps. With nothing decoding,
-        /// a prompt is prefilled whole.
-        #[arg(long, default_value_t = 1024, value_parser = parse_prefill_chunk_tokens)]
+        /// a prompt is prefilled whole. The default, with the default
+        /// `--prefill-target-ms`, prefills whole: chunking is opt-in (for
+        /// example 1024 and 50) until its chunk sizing is fixed.
+        #[arg(long, default_value_t = 65_536, value_parser = parse_prefill_chunk_tokens)]
         prefill_chunk_tokens: u32,
         /// Target milliseconds per decoded token while prompts are prefilled
         /// beside decodes: each step's chunks get what the decode step leaves
         /// of it, by the model's modeled prefill cost, so a chunk shrinks the
         /// later in its prompt it starts. `--prefill-chunk-tokens` caps it.
-        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
         prefill_target_ms: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.

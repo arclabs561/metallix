@@ -837,10 +837,19 @@ mod tests {
     #[test]
     fn serve_defaults_to_one_sequence_at_a_time() {
         let cli = Cli::try_parse_from(["mx", "serve", "--model", "model"]).expect("serve defaults");
-        let super::Command::Serve { max_num_seqs, .. } = cli.command else {
+        let super::Command::Serve {
+            max_num_seqs,
+            prefill_chunk_tokens,
+            prefill_target_ms,
+            ..
+        } = cli.command
+        else {
             panic!("parsed as serve");
         };
         assert_eq!(max_num_seqs, 1, "batching stays opt-in");
+        // Chunked prefill stays opt-in until its chunk sizing is fixed: these
+        // defaults prefill a prompt whole even beside running decodes.
+        assert_eq!((prefill_chunk_tokens, prefill_target_ms), (65_536, 10_000));
     }
 
     #[cfg(feature = "metal")]
