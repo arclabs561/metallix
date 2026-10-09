@@ -14,6 +14,7 @@ import pathlib
 import random
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -205,6 +206,71 @@ class Arrivals(unittest.TestCase):
         self.assertTrue(all(x < y for x, y in itertools.pairwise(a)))
         mean_gap = a[-1] / (len(a) - 1)
         self.assertAlmostEqual(mean_gap, 0.25, delta=0.02)
+
+
+class OpenLoop(unittest.TestCase):
+    """A rate run clocks requests from their scheduled send time, so a late
+    client still counts the delay instead of hiding it."""
+
+    def stub(self) -> str:
+        from http.server import ThreadingHTTPServer
+
+        sys.path.insert(0, str(SCRIPTS))
+        import bench_stub_server
+
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), bench_stub_server.handler(0.001, 0.001)
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        return f"127.0.0.1:{server.server_address[1]}"
+
+    def test_late_send_counts_from_the_scheduled_time(self) -> None:
+        address = self.stub()
+        prompt = bench_load.Prompt("p", None, "hi", None, None)
+        path, body = bench_load.request_body("chat", "m", prompt, 4, {})
+        now = time.perf_counter()
+        late = bench_load.send(
+            address, path, body, "chat", 0, "p", now - 1.0, 5, scheduled=now - 0.25
+        )
+        self.assertEqual(late.outcome, "ok", late.detail)
+        self.assertGreaterEqual(late.send_lag_ms, 250)
+        self.assertGreaterEqual(late.ttft_ms, 250)
+        self.assertAlmostEqual(late.send_s, 0.75, delta=0.01)
+        closed = bench_load.send(address, path, body, "chat", 1, "p", now, 5)
+        self.assertIsNone(closed.send_lag_ms)
+        self.assertLess(closed.ttft_ms, 250)
+
+    def test_rate_runs_pass_each_schedule_and_closed_loop_none(self) -> None:
+        seen = []
+
+        def fake_send(
+            address, path, body, api, index, label, run_start, timeout, scheduled
+        ):
+            seen.append((index, None if scheduled is None else scheduled - run_start))
+            return record(index=index)
+
+        prompts = [bench_load.Prompt(f"p{i}", None, "hi", None, None) for i in range(4)]
+        with mock.patch.object(bench_load, "send", fake_send):
+            bench_load.run_load("h:1", "chat", "m", prompts, 4, {}, rate=200.0, seed=3)
+            offsets = bench_load.poisson_arrivals(200.0, 4, random.Random(3))
+            self.assertEqual([index for index, _ in sorted(seen)], [0, 1, 2, 3])
+            for (_, offset), expected in zip(sorted(seen), offsets, strict=True):
+                self.assertAlmostEqual(offset, expected, places=9)
+            seen.clear()
+            bench_load.run_load("h:1", "chat", "m", prompts, 4, {}, concurrency=2)
+            self.assertEqual(sorted(seen), [(i, None) for i in range(4)])
+
+    def test_send_lag_p99_above_five_ms_warns(self) -> None:
+        records = [record(index=i) for i in range(4)]
+        quiet = bench_load.summarize(records, 1.0, 2000, 50)
+        self.assertNotIn("WARNING", bench_load.one_line(quiet))
+        for index, item in enumerate(records):
+            item.send_lag_ms = 1.0 + 10.0 * (index == 3)
+        lagging = bench_load.summarize(records, 1.0, 2000, 50)
+        self.assertGreater(lagging["send_lag_ms"]["p99"], 5)
+        self.assertIn("WARNING client send lag p99", bench_load.one_line(lagging))
 
 
 class Prompts(unittest.TestCase):

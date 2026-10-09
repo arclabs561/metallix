@@ -439,7 +439,12 @@ class StreamState:
 
 @dataclass
 class Record:
-    """One request's outcome and timings, in milliseconds from its send time."""
+    """One request's outcome and timings, in milliseconds from its send time.
+
+    In an open-loop (rate) run the send time is the scheduled one, so a request
+    the client sent late still counts the delay (no coordinated omission);
+    `send_lag_ms` is how late it actually went out.
+    """
 
     index: int
     label: str
@@ -453,6 +458,7 @@ class Record:
     input_tokens: int | None = None
     output_tokens: int | None = None
     detail: str | None = None
+    send_lag_ms: float | None = None
 
 
 def timings(
@@ -494,11 +500,17 @@ def send(
     label: str,
     run_start: float,
     timeout: float,
+    scheduled: float | None = None,
 ) -> Record:
+    """Sends one request; timings run from `scheduled` when given (open loop),
+    else from the actual send."""
     host, port = address.rsplit(":", 1)
     connection = http.client.HTTPConnection(host, int(port), timeout=timeout)
-    start = time.perf_counter()
+    sent = time.perf_counter()
+    start = sent if scheduled is None else scheduled
     record = Record(index, label, "error", start - run_start)
+    if scheduled is not None:
+        record.send_lag_ms = (sent - scheduled) * 1000
     state = StreamState(api)
     try:
         connection.request(
@@ -568,10 +580,12 @@ def run_load(
     lock = threading.Lock()
     run_start = time.perf_counter()
 
-    def one(index: int) -> None:
+    def one(index: int, scheduled: float | None = None) -> None:
         prompt = prompts[index]
         path, body = request_body(api, model, prompt, max_tokens, extra)
-        record = send(address, path, body, api, index, prompt.label, run_start, timeout)
+        record = send(
+            address, path, body, api, index, prompt.label, run_start, timeout, scheduled
+        )
         with lock:
             records.append(record)
 
@@ -592,10 +606,11 @@ def run_load(
         offsets = poisson_arrivals(rate, len(prompts), random.Random(seed))
 
         def delayed(index: int) -> None:
-            delay = run_start + offsets[index] - time.perf_counter()
+            scheduled = run_start + offsets[index]
+            delay = scheduled - time.perf_counter()
             if delay > 0:
                 time.sleep(delay)
-            one(index)
+            one(index, scheduled)
 
         threads = [
             threading.Thread(target=delayed, args=(i,)) for i in range(len(prompts))
@@ -663,6 +678,9 @@ def summarize(
         "output_tokens": distribution([float(r.output_tokens or 0) for r in ok]),
         "input_tokens": distribution(
             [float(r.input_tokens) for r in ok if r.input_tokens is not None]
+        ),
+        "send_lag_ms": distribution(
+            [r.send_lag_ms for r in records if r.send_lag_ms is not None]
         ),
         "slo_attainment": meeting / len(records) if records else 0.0,
         # vLLM's "request goodput": SLO-meeting completions per second of this run.
@@ -1318,7 +1336,20 @@ def one_line(summary: dict) -> str:
         f"TPOT p50 {fmt(summary['tpot_ms']['p50'], 1)} p99 {fmt(summary['tpot_ms']['p99'], 1)} ms, "
         f"SLO {summary['slo_attainment']:.0%}"
         + (f", failed {failed}" if failed else "")
+        + send_lag_warning(summary)
     )
+
+
+# An open-loop client that sends late hides queueing; above this the run
+# measured the client as much as the server.
+SEND_LAG_WARN_MS = 5.0
+
+
+def send_lag_warning(summary: dict) -> str:
+    lag = summary.get("send_lag_ms", {}).get("p99")
+    if lag is None or lag <= SEND_LAG_WARN_MS:
+        return ""
+    return f"; WARNING client send lag p99 {lag:.1f} ms > {SEND_LAG_WARN_MS:g} ms"
 
 
 def render(report: dict) -> str:
