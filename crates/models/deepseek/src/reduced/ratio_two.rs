@@ -42,6 +42,15 @@ pub struct RatioTwoOwnerLayout {
 
 impl RatioTwoOwnerLayout {
     /// Validates fixed L1 owner geometry before request state is allocated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioTwoOwnerError::InvalidCompressorEpsilon`] for a
+    /// non-finite or non-positive epsilon, [`RatioTwoOwnerError::ElementLimit`]
+    /// or [`RatioTwoOwnerError::ShapeOverflow`] when a buffer passes its bound,
+    /// and [`RatioTwoOwnerError::KeyLayout`] or
+    /// [`RatioTwoOwnerError::KvLayout`] when the key or compressed-KV layout is
+    /// invalid.
     #[allow(
         clippy::too_many_arguments,
         reason = "each source storage dimension is independently named"
@@ -279,6 +288,12 @@ pub struct RatioTwoCompressedOwner {
 
 impl RatioTwoCompressedOwner {
     /// Creates empty paired owner prefixes and a ratio-two streaming compressor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioTwoOwnerError::Compressor`] when the compressor rejects
+    /// `compressor_norm`, and [`RatioTwoOwnerError::Cache`] when a prefix cache
+    /// cannot be allocated.
     pub fn new(
         layout: RatioTwoOwnerLayout,
         source_layer: u16,
@@ -384,6 +399,25 @@ impl RatioTwoCompressedOwner {
     /// Any rejection leaves compressor and both prefixes unchanged, so the same
     /// publication can retry. Prior-L3 score-prefix selection is intentionally
     /// outside this component and must consume the returned key prefix later.
+    ///
+    /// # Errors
+    ///
+    /// The owner is unchanged on every error.
+    /// * [`RatioTwoOwnerError::Length`] when a buffer does not match the
+    ///   layout.
+    /// * [`RatioTwoOwnerError::UnexpectedTokenStart`] and
+    ///   [`RatioTwoOwnerError::UnexpectedPublication`] when the call is not the
+    ///   next one.
+    /// * [`RatioTwoOwnerError::UnexpectedPartialFrequencies`] when a call that
+    ///   completes no group supplies group frequencies.
+    /// * [`RatioTwoOwnerError::Projection`],
+    ///   [`RatioTwoOwnerError::Compressor`], [`RatioTwoOwnerError::Key`] and
+    ///   [`RatioTwoOwnerError::CompressedKv`] when a stage fails.
+    /// * [`RatioTwoOwnerError::Cache`] and
+    ///   [`RatioTwoOwnerError::DivergentPrefixes`] when the prefix caches
+    ///   reject the append or disagree.
+    /// * [`RatioTwoOwnerError::AllocationFailed`] when a buffer cannot be
+    ///   reserved.
     pub fn forward(
         &mut self,
         call: RatioTwoOwnerCall<'_>,
@@ -493,6 +527,11 @@ impl RatioTwoCompressedOwner {
     }
 
     /// Begins one coordinated new epoch for compressor, key, and KV state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioTwoOwnerError::Cache`] when an epoch counter would
+    /// overflow.
     pub fn reset(&mut self) -> Result<(), RatioTwoOwnerError> {
         let mut keys = self.keys.clone();
         let mut kv = self.kv.clone();
@@ -505,11 +544,21 @@ impl RatioTwoCompressedOwner {
     }
 
     /// Borrows one exact valid prepared key prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioTwoOwnerError::Cache`] for a batch the owner does not
+    /// have.
     pub fn key_prefix(&self, batch: usize) -> Result<&[u16], RatioTwoOwnerError> {
         Ok(self.keys.prefix(batch)?)
     }
 
     /// Borrows one exact valid prepared compressed-KV prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RatioTwoOwnerError::Cache`] for a batch the owner does not
+    /// have.
     pub fn kv_prefix(&self, batch: usize) -> Result<&[u16], RatioTwoOwnerError> {
         Ok(self.kv.prefix(batch)?)
     }
@@ -537,55 +586,95 @@ impl RatioTwoCompressedOwner {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RatioTwoOwnerError {
+    /// The compressor epsilon is not finite and positive.
     #[error("ratio-two owner compressor epsilon must be finite and positive")]
     InvalidCompressorEpsilon,
+    /// A buffer would pass the FP32 element bound.
     #[error("ratio-two owner {field} has {elements} elements beyond the FP32 bound")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
+    /// A derived shape does not fit in `usize`.
     #[error("ratio-two owner {field} shape overflowed")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// A buffer does not have the length its shape requires.
     #[error("ratio-two owner {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
+    /// The call does not start where the owner expects.
     #[error("ratio-two owner call starts at {actual}, expected {expected}")]
-    UnexpectedTokenStart { actual: usize, expected: usize },
+    UnexpectedTokenStart {
+        /// The call's start position.
+        actual: usize,
+        /// The owner's next position.
+        expected: usize,
+    },
+    /// The publication is not the one the owner expects next.
     #[error(
         "ratio-two owner publication ({source_layer}, {epoch}, {call_id}) does not match expected ({expected_source_layer}, {expected_epoch}, {expected_call_id})"
     )]
     UnexpectedPublication {
+        /// The publication's source layer.
         source_layer: u16,
+        /// The owner's source layer.
         expected_source_layer: u16,
+        /// The publication's epoch.
         epoch: u64,
+        /// The owner's epoch.
         expected_epoch: u64,
+        /// The publication's call ordinal.
         call_id: u64,
+        /// The owner's next call ordinal.
         expected_call_id: u64,
     },
+    /// A call that completes no group supplied group frequencies.
     #[error("ratio-two owner partial call supplied {actual} completed-group frequencies")]
-    UnexpectedPartialFrequencies { actual: usize },
+    UnexpectedPartialFrequencies {
+        /// Frequencies supplied.
+        actual: usize,
+    },
+    /// The key and compressed-KV prefixes disagree.
     #[error("ratio-two owner key and KV prefix state diverged")]
     DivergentPrefixes,
+    /// A buffer could not be reserved.
     #[error("could not allocate {elements} ratio-two owner {field} elements")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
+    /// The compressor rejected its input.
     #[error(transparent)]
     Compressor(#[from] CompressorError),
+    /// The index-key layout is invalid.
     #[error(transparent)]
     KeyLayout(#[from] IndexKeyLayoutError),
+    /// The compressed-KV layout is invalid.
     #[error(transparent)]
     KvLayout(#[from] CompressedKvLayoutError),
+    /// Index-key preparation failed.
     #[error(transparent)]
     Key(#[from] IndexKeyError),
+    /// Compressed-KV preparation failed.
     #[error(transparent)]
     CompressedKv(#[from] CompressedKvError),
+    /// A prefix cache rejected the publication.
     #[error(transparent)]
     Cache(#[from] IndexKeyStateError),
+    /// The FP32 owner projection rejected its input or overflowed.
     #[error(transparent)]
     Projection(#[from] Fp32LinearError),
 }

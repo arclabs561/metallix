@@ -38,6 +38,14 @@ impl LayerFourConfig {
     }
 
     /// Validates the L4 consumer accepts only batch-one L3 publications.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerFourSessionError::BatchCount`],
+    /// [`LayerFourSessionError::InputDimension`],
+    /// [`LayerFourSessionError::AttentionSourceLayer`],
+    /// [`LayerFourSessionError::AttentionCompressionRatio`] when the query and
+    /// attention layouts do not fit the layer-four source path.
     pub fn new(
         query_layout: CandidateQueryLayout,
         attention_layout: LayerAttentionLayout,
@@ -187,6 +195,26 @@ impl LayerFourSession {
     }
 
     /// Computes one L4 partition from a committed L3 publication.
+    ///
+    /// # Errors
+    ///
+    /// After any error the session is poisoned until
+    /// [`LayerFourSession::reset`].
+    /// * [`LayerFourSessionError::Poisoned`] after an earlier failure.
+    /// * [`LayerFourSessionError::UnexpectedStart`],
+    ///   [`LayerFourSessionError::InputLength`],
+    ///   [`LayerFourSessionError::InputLengthOverflow`],
+    ///   [`LayerFourSessionError::PositionOverflow`] when the call does not
+    ///   continue the sequence or its input does not match.
+    /// * [`LayerFourSessionError::PublicationSource`],
+    ///   [`LayerFourSessionError::CandidatePublicationMismatch`],
+    ///   [`LayerFourSessionError::CandidateBatch`],
+    ///   [`LayerFourSessionError::CandidateCompressionRatio`],
+    ///   [`LayerFourSessionError::CandidateKeyCount`],
+    ///   [`LayerFourSessionError::CandidateOffset`] when the layer-three
+    ///   candidates are not the ones this call expects.
+    /// * [`LayerFourSessionError::Key`], [`LayerFourSessionError::Selection`],
+    ///   [`LayerFourSessionError::Attention`] when a stage fails.
     pub fn step(
         &mut self,
         call: LayerFourCall<'_>,
@@ -313,6 +341,11 @@ impl LayerFourSession {
     }
 
     /// Clears the L4 cursor and attention ring after a failed or completed request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerFourSessionError::Attention`] when the attention state
+    /// cannot reset.
     pub fn reset(&mut self) -> Result<(), LayerFourSessionError> {
         self.poisoned = true;
         self.attention.reset()?;
@@ -333,45 +366,103 @@ impl LayerFourSession {
     }
 }
 
+/// Errors from layer-four session construction, steps and reset.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LayerFourSessionError {
+    /// The query or attention layout is not batch one.
     #[error("layer-four requires query/attention batch one, got {query}/{attention}")]
-    BatchCount { query: usize, attention: usize },
+    BatchCount {
+        /// The query layout's batch count.
+        query: usize,
+        /// The attention layout's batch count.
+        attention: usize,
+    },
+    /// The query and attention hidden widths differ.
     #[error("layer-four query width {query} differs from attention width {attention}")]
-    InputDimension { query: usize, attention: usize },
+    InputDimension {
+        /// The query layout's hidden width.
+        query: usize,
+        /// The attention layout's hidden width.
+        attention: usize,
+    },
+    /// The attention layout names no compressed source layer.
     #[error("layer-four attention layout has no compressed source layer")]
     AttentionSourceLayer,
+    /// The attention layout's compression ratio is not one.
     #[error("layer-four attention compression ratio is not one")]
     AttentionCompressionRatio,
+    /// An earlier call failed; reset the session.
     #[error("layer-four session is poisoned; reset is required")]
     Poisoned,
+    /// The publication's source layer differs from the attention layout's.
     #[error("layer-four publication source {actual} differs from its attention layout")]
-    PublicationSource { actual: u16 },
+    PublicationSource {
+        /// The publication's source layer.
+        actual: u16,
+    },
+    /// The candidate mask belongs to another layer-three publication.
     #[error("layer-four candidate mask identity differs from its L3 publication")]
     CandidatePublicationMismatch,
+    /// The candidate mask is not for batch zero.
     #[error("layer-four candidate batch {actual} is not batch zero")]
-    CandidateBatch { actual: usize },
+    CandidateBatch {
+        /// The candidate's batch.
+        actual: usize,
+    },
+    /// The candidate mask's compression ratio is not one.
     #[error("layer-four candidate compression ratio {actual} is not one")]
-    CandidateCompressionRatio { actual: usize },
+    CandidateCompressionRatio {
+        /// The candidate's compression ratio.
+        actual: usize,
+    },
+    /// The candidate mask covers a different key count than the layer-three keys.
     #[error(
         "layer-four candidate key count {actual} differs from supplied L3 key count {expected}"
     )]
-    CandidateKeyCount { actual: usize, expected: usize },
+    CandidateKeyCount {
+        /// The candidate's key count.
+        actual: usize,
+        /// The layer-three key count.
+        expected: usize,
+    },
+    /// The candidate offset differs from the window offset.
     #[error("layer-four candidate offset {actual} differs from source window offset {expected}")]
-    CandidateOffset { actual: usize, expected: usize },
+    CandidateOffset {
+        /// The candidate's offset.
+        actual: usize,
+        /// The window offset.
+        expected: usize,
+    },
+    /// The call does not start where the session expects.
     #[error("layer-four call start {actual} differs from expected {expected}")]
-    UnexpectedStart { actual: usize, expected: usize },
+    UnexpectedStart {
+        /// The call's start position.
+        actual: usize,
+        /// The session's next position.
+        expected: usize,
+    },
+    /// The expected input length does not fit in `usize`.
     #[error("layer-four input length overflowed")]
     InputLengthOverflow,
+    /// The input does not have the length the call requires.
     #[error("layer-four input length {actual} differs from expected {expected}")]
-    InputLength { actual: usize, expected: usize },
+    InputLength {
+        /// Supplied length.
+        actual: usize,
+        /// Required length.
+        expected: usize,
+    },
+    /// A token position does not fit in `usize`.
     #[error("layer-four token position overflowed")]
     PositionOverflow,
+    /// Scoring the layer-three keys failed.
     #[error(transparent)]
     Key(#[from] ScoredQueryError),
+    /// Candidate or final selection rejected its input.
     #[error(transparent)]
     Selection(#[from] SelectionAdapterError),
+    /// The attention layer rejected the call.
     #[error(transparent)]
     Attention(#[from] LayerAttentionError),
 }

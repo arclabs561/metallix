@@ -53,6 +53,17 @@ impl LayerOneConfig {
     }
 
     /// Validates the L1 geometry shared by the ratio-two owner and attention ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerOneSessionError::OwnerBatchCount`],
+    /// [`LayerOneSessionError::AttentionBatchCount`],
+    /// [`LayerOneSessionError::AttentionSourceLayer`],
+    /// [`LayerOneSessionError::AttentionCompressionRatio`] or
+    /// [`LayerOneSessionError::InputDimensionMismatch`],
+    /// [`LayerOneSessionError::LatentDimensionMismatch`],
+    /// [`LayerOneSessionError::RopePairMismatch`] when the owner and attention
+    /// layouts do not fit the layer-one source path.
     pub fn new(
         owner_layout: RatioTwoOwnerLayout,
         attention_layout: LayerAttentionLayout,
@@ -270,6 +281,11 @@ pub struct LayerOneSession {
 
 impl LayerOneSession {
     /// Allocates synchronized empty ratio-two owner and L1 attention state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerOneSessionError::Owner`] when the ratio-two owner cannot
+    /// be built from `compressor_norm`.
     pub fn new(
         config: LayerOneConfig,
         compressor_norm: &[u16],
@@ -319,6 +335,34 @@ impl LayerOneSession {
     }
 
     /// Computes one L1 partition. Every admitted error poisons this session.
+    ///
+    /// # Errors
+    ///
+    /// After any error the session is poisoned until
+    /// [`LayerOneSession::reset`].
+    /// * [`LayerOneSessionError::Poisoned`] after an earlier failure.
+    /// * [`LayerOneSessionError::InputLength`],
+    ///   [`LayerOneSessionError::QueryInputGeometry`],
+    ///   [`LayerOneSessionError::FrequencyTableTooShort`] when the call's
+    ///   buffers do not match the layout.
+    /// * [`LayerOneSessionError::UnexpectedPreviousLayerThreePrefix`],
+    ///   [`LayerOneSessionError::MissingPreviousLayerThreePrefix`],
+    ///   [`LayerOneSessionError::NoPreviousLayerThreeCall`],
+    ///   [`LayerOneSessionError::PreviousLayerThreeIdentity`],
+    ///   [`LayerOneSessionError::PreviousLayerThreeLength`] when the previous
+    ///   layer-three prefix is missing, unexpected or from another call.
+    /// * [`LayerOneSessionError::OwnerCapacity`],
+    ///   [`LayerOneSessionError::OwnerKeyCount`],
+    ///   [`LayerOneSessionError::ScoreLength`],
+    ///   [`LayerOneSessionError::ReachableKeyCount`] when the owner or scoring
+    ///   disagrees with the call.
+    /// * [`LayerOneSessionError::Owner`], [`LayerOneSessionError::Prefix`],
+    ///   [`LayerOneSessionError::Score`], [`LayerOneSessionError::Selection`],
+    ///   [`LayerOneSessionError::Attention`] when a stage fails.
+    /// * [`LayerOneSessionError::PositionOverflow`],
+    ///   [`LayerOneSessionError::PrefixLengthOverflow`],
+    ///   [`LayerOneSessionError::AllocationFailed`] when a size overflows or a
+    ///   buffer cannot be reserved.
     pub fn step(
         &mut self,
         call: LayerOneCall<'_>,
@@ -529,6 +573,15 @@ impl LayerOneSession {
     }
 
     /// Clears owner prefixes and attention state together, then admits epoch+1.
+    ///
+    /// # Errors
+    ///
+    /// A failed reset leaves the session poisoned.
+    ///
+    /// Returns [`LayerOneSessionError::EpochOverflow`] when the epoch counter
+    /// would overflow, [`LayerOneSessionError::OwnerEpochMismatch`] when the
+    /// owner's epoch has drifted, and [`LayerOneSessionError::Owner`] or
+    /// [`LayerOneSessionError::Attention`] when a component cannot reset.
     pub fn reset(&mut self) -> Result<(), LayerOneSessionError> {
         self.lifecycle = Lifecycle::Poisoned;
         let next_epoch = self
@@ -567,98 +620,196 @@ impl LayerOneSession {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LayerOneSessionError {
+    /// The owner layout is not batch one.
     #[error("layer-one owner requires batch one, got {actual}")]
-    OwnerBatchCount { actual: usize },
+    OwnerBatchCount {
+        /// The layout's batch count.
+        actual: usize,
+    },
+    /// The attention layout is not batch one.
     #[error("layer-one attention requires batch one, got {actual}")]
-    AttentionBatchCount { actual: usize },
+    AttentionBatchCount {
+        /// The layout's batch count.
+        actual: usize,
+    },
+    /// The attention layout names no compressed source layer.
     #[error("layer-one attention layout has no compressed source layer")]
     AttentionSourceLayer,
+    /// The attention layout's compression ratio is not two.
     #[error("layer-one attention layout does not use compression ratio two")]
     AttentionCompressionRatio,
+    /// The owner's input width differs from the attention hidden width.
     #[error(
         "layer-one owner input dimension {owner} differs from attention hidden dimension {attention}"
     )]
-    InputDimensionMismatch { owner: usize, attention: usize },
+    InputDimensionMismatch {
+        /// The owner's input width.
+        owner: usize,
+        /// The attention hidden width.
+        attention: usize,
+    },
+    /// The owner's latent width differs from the attention head width.
     #[error(
         "layer-one owner latent dimension {owner} differs from attention head dimension {attention}"
     )]
-    LatentDimensionMismatch { owner: usize, attention: usize },
+    LatentDimensionMismatch {
+        /// The owner's latent width.
+        owner: usize,
+        /// The attention head width.
+        attention: usize,
+    },
+    /// The owner and attention layouts rotate different numbers of pairs.
     #[error("layer-one owner rope pairs {owner} differs from attention rope pairs {attention}")]
-    RopePairMismatch { owner: usize, attention: usize },
+    RopePairMismatch {
+        /// Rotary pairs in the owner layout.
+        owner: usize,
+        /// Rotary pairs in the attention layout.
+        attention: usize,
+    },
+    /// An earlier call failed; reset the session.
     #[error("layer-one session is poisoned; reset is required")]
     Poisoned,
+    /// The owner's epoch differs from the session's.
     #[error("layer-one owner epoch {actual} differs from expected {expected}")]
-    OwnerEpochMismatch { actual: u64, expected: u64 },
+    OwnerEpochMismatch {
+        /// The owner's epoch.
+        actual: u64,
+        /// The session's epoch.
+        expected: u64,
+    },
+    /// The epoch counter would overflow.
     #[error("layer-one session epoch overflowed")]
     EpochOverflow,
+    /// A position does not fit in `usize`.
     #[error("layer-one position arithmetic overflowed")]
     PositionOverflow,
+    /// A prefix length does not fit in `usize`.
     #[error("layer-one prefix length arithmetic overflowed")]
     PrefixLengthOverflow,
+    /// The query layout is not batch one with the attention hidden width.
     #[error(
         "layer-one query geometry is batch {batches}, hidden {hidden}; expected batch one, hidden {expected_hidden}"
     )]
     QueryInputGeometry {
+        /// The query layout's batch count.
         batches: usize,
+        /// The query layout's hidden width.
         hidden: usize,
+        /// The attention hidden width.
         expected_hidden: usize,
     },
+    /// The input does not have the length the call requires.
     #[error("layer-one input length is {actual}, expected {expected}")]
-    InputLength { actual: usize, expected: usize },
+    InputLength {
+        /// Supplied length.
+        actual: usize,
+        /// Required length.
+        expected: usize,
+    },
+    /// The call would pass the owner's capacity.
     #[error("layer-one completed position {completed} exceeds owner capacity {capacity}")]
-    OwnerCapacity { completed: usize, capacity: usize },
+    OwnerCapacity {
+        /// Completed compressed positions after the call.
+        completed: usize,
+        /// The owner's capacity.
+        capacity: usize,
+    },
+    /// The rotary-frequency table is too short for the call.
     #[error(
         "layer-one {field} needs {required} rotary-frequency elements, but the supplied table has {available}"
     )]
     FrequencyTableTooShort {
+        /// The stage that needs the table.
         field: &'static str,
+        /// Elements it needs.
         required: usize,
+        /// Elements the table holds.
         available: usize,
     },
+    /// The owner's key prefix has the wrong length.
     #[error("layer-one owner prefix has {actual} keys, expected {expected}")]
-    OwnerKeyCount { actual: usize, expected: usize },
+    OwnerKeyCount {
+        /// Keys in the prefix.
+        actual: usize,
+        /// Keys the call requires.
+        expected: usize,
+    },
+    /// A previous layer-three prefix was supplied for a complete owner group.
     #[error("layer-one complete owner group must not receive a previous layer-three prefix")]
     UnexpectedPreviousLayerThreePrefix,
+    /// An incomplete owner group was called without the previous layer-three prefix.
     #[error("layer-one incomplete owner group requires a previous layer-three prefix")]
     MissingPreviousLayerThreePrefix,
+    /// An incomplete owner group has no layer-three call before it.
     #[error("layer-one incomplete owner group has no preceding layer-three call")]
     NoPreviousLayerThreeCall,
+    /// The previous layer-three prefix is from another publication.
     #[error(
         "previous layer-three publication ({source_layer}, {epoch}, {call_id}) does not match source {expected_source_layer} epoch {expected_epoch} call {expected_call_id}"
     )]
     PreviousLayerThreeIdentity {
+        /// The prefix's source layer.
         source_layer: u16,
+        /// The prefix's epoch.
         epoch: u64,
+        /// The prefix's call ordinal.
         call_id: u64,
+        /// The expected source layer.
         expected_source_layer: u16,
+        /// The expected epoch.
         expected_epoch: u64,
+        /// The expected call ordinal.
         expected_call_id: u64,
     },
+    /// The previous layer-three prefix has the wrong length.
     #[error("previous layer-three key prefix length is {actual}, expected {expected}")]
-    PreviousLayerThreeLength { actual: usize, expected: usize },
+    PreviousLayerThreeLength {
+        /// Supplied length.
+        actual: usize,
+        /// Required length.
+        expected: usize,
+    },
+    /// A buffer could not be reserved.
     #[error("could not allocate {elements} elements for {field}")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
+    /// The scored query returned the wrong number of scores.
     #[error("scored query returned {actual} scores, expected {expected}")]
-    ScoreLength { actual: usize, expected: usize },
+    ScoreLength {
+        /// Scores returned.
+        actual: usize,
+        /// Scores required.
+        expected: usize,
+    },
+    /// A position reaches more keys than were scored.
     #[error(
         "layer-one causal position {position} reaches {reachable} keys, but only {key_count} were scored"
     )]
     ReachableKeyCount {
+        /// The causal position.
         position: usize,
+        /// Keys it reaches.
         reachable: usize,
+        /// Keys scored.
         key_count: usize,
     },
+    /// The ratio-two owner rejected the call.
     #[error(transparent)]
     Owner(#[from] RatioTwoOwnerError),
+    /// The owner's key prefix could not be read.
     #[error(transparent)]
     Prefix(#[from] IndexKeyStateError),
+    /// Scoring the query failed.
     #[error(transparent)]
     Score(#[from] ScoredQueryError),
+    /// Final index selection rejected its input.
     #[error(transparent)]
     Selection(#[from] SelectionError),
+    /// The attention layer rejected the call.
     #[error(transparent)]
     Attention(#[from] LayerAttentionError),
 }

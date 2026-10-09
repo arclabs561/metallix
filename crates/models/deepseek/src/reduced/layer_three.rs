@@ -49,6 +49,18 @@ impl LayerThreeConfig {
     }
 
     /// Validates the explicitly supplied L3 owner and candidate geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerThreeSessionError::OwnerBatchCount`],
+    /// [`LayerThreeSessionError::AttentionBatchCount`],
+    /// [`LayerThreeSessionError::AttentionSourceLayer`],
+    /// [`LayerThreeSessionError::AttentionCompressionRatio`],
+    /// [`LayerThreeSessionError::WindowMismatch`] or
+    /// [`LayerThreeSessionError::InputDimensionMismatch`],
+    /// [`LayerThreeSessionError::LatentDimensionMismatch`],
+    /// [`LayerThreeSessionError::RopePairMismatch`] when the owner and
+    /// attention layouts do not fit the layer-three source path.
     #[allow(
         clippy::too_many_arguments,
         reason = "owner and attention geometries remain explicit at the runtime boundary"
@@ -225,6 +237,13 @@ pub struct LayerThreeSession {
 
 impl LayerThreeSession {
     /// Allocates a synchronized empty ratio-one owner and L3 attention ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayerThreeSessionError::SourceLayer`] when `source_layer`
+    /// differs from the attention layout's, and
+    /// [`LayerThreeSessionError::Owner`] when the ratio-one owner cannot be
+    /// built.
     pub fn new(
         config: LayerThreeConfig,
         source_layer: u16,
@@ -277,6 +296,20 @@ impl LayerThreeSession {
     }
 
     /// Computes one L3 partition. Every admitted failure poisons the session.
+    ///
+    /// # Errors
+    ///
+    /// After any error the session is poisoned until
+    /// [`LayerThreeSession::reset`].
+    /// * [`LayerThreeSessionError::Poisoned`] after an earlier failure.
+    /// * [`LayerThreeSessionError::EmptyKeyPrefix`] when the owner produced no
+    ///   keys.
+    /// * [`LayerThreeSessionError::Owner`], [`LayerThreeSessionError::Prefix`],
+    ///   [`LayerThreeSessionError::SelectionGeometry`],
+    ///   [`LayerThreeSessionError::Candidate`],
+    ///   [`LayerThreeSessionError::Attention`] when a stage fails.
+    /// * [`LayerThreeSessionError::AllocationFailed`] when a buffer cannot be
+    ///   reserved.
     pub fn step(
         &mut self,
         call: LayerThreeCall<'_>,
@@ -368,6 +401,15 @@ impl LayerThreeSession {
     }
 
     /// Clears owner prefixes and the attention ring together, then admits epoch+1.
+    ///
+    /// # Errors
+    ///
+    /// A failed reset leaves the session poisoned.
+    ///
+    /// Returns [`LayerThreeSessionError::EpochOverflow`] when the epoch counter
+    /// would overflow, [`LayerThreeSessionError::OwnerEpochMismatch`] when the
+    /// owner's epoch has drifted, and [`LayerThreeSessionError::Owner`] or
+    /// [`LayerThreeSessionError::Attention`] when a component cannot reset.
     pub fn reset(&mut self) -> Result<(), LayerThreeSessionError> {
         self.lifecycle = Lifecycle::Poisoned;
         let next_epoch = self
@@ -406,49 +448,104 @@ impl LayerThreeSession {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LayerThreeSessionError {
+    /// The owner layout is not batch one.
     #[error("layer-three owner requires batch one, got {actual}")]
-    OwnerBatchCount { actual: usize },
+    OwnerBatchCount {
+        /// The layout's batch count.
+        actual: usize,
+    },
+    /// The attention layout is not batch one.
     #[error("layer-three attention requires batch one, got {actual}")]
-    AttentionBatchCount { actual: usize },
+    AttentionBatchCount {
+        /// The layout's batch count.
+        actual: usize,
+    },
+    /// The attention layout names no compressed source layer.
     #[error("layer-three attention layout has no compressed source layer")]
     AttentionSourceLayer,
+    /// The attention layout's compression ratio is not one.
     #[error("layer-three attention layout does not use compression ratio one")]
     AttentionCompressionRatio,
+    /// The configured window differs from the attention window.
     #[error("layer-three configured window {configured} differs from attention window {attention}")]
-    WindowMismatch { configured: usize, attention: usize },
+    WindowMismatch {
+        /// The configured window.
+        configured: usize,
+        /// The attention layout's window.
+        attention: usize,
+    },
+    /// The owner's input width differs from the attention hidden width.
     #[error(
         "layer-three owner input dimension {owner} differs from attention hidden dimension {attention}"
     )]
-    InputDimensionMismatch { owner: usize, attention: usize },
+    InputDimensionMismatch {
+        /// The owner's input width.
+        owner: usize,
+        /// The attention hidden width.
+        attention: usize,
+    },
+    /// The owner's latent width differs from the attention head width.
     #[error(
         "layer-three owner latent dimension {owner} differs from attention head dimension {attention}"
     )]
-    LatentDimensionMismatch { owner: usize, attention: usize },
+    LatentDimensionMismatch {
+        /// The owner's latent width.
+        owner: usize,
+        /// The attention head width.
+        attention: usize,
+    },
+    /// The owner and attention layouts rotate different numbers of pairs.
     #[error("layer-three owner rope pairs {owner} differs from attention rope pairs {attention}")]
-    RopePairMismatch { owner: usize, attention: usize },
+    RopePairMismatch {
+        /// Rotary pairs in the owner layout.
+        owner: usize,
+        /// Rotary pairs in the attention layout.
+        attention: usize,
+    },
+    /// The session's source layer differs from the attention layout's.
     #[error("layer-three session source layer {actual} differs from its attention layout")]
-    SourceLayer { actual: u16 },
+    SourceLayer {
+        /// The session's source layer.
+        actual: u16,
+    },
+    /// An earlier call failed; reset the session.
     #[error("layer-three session is poisoned; reset is required")]
     Poisoned,
+    /// The owner's epoch differs from the session's.
     #[error("layer-three owner epoch {actual} differs from expected {expected}")]
-    OwnerEpochMismatch { actual: u64, expected: u64 },
+    OwnerEpochMismatch {
+        /// The owner's epoch.
+        actual: u64,
+        /// The session's epoch.
+        expected: u64,
+    },
+    /// The epoch counter would overflow.
     #[error("layer-three session epoch overflowed")]
     EpochOverflow,
+    /// The owner produced no keys.
     #[error("layer-three owner produced an empty key prefix")]
     EmptyKeyPrefix,
+    /// A buffer could not be reserved.
     #[error("could not allocate {elements} BF16 elements for {field}")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
+    /// The ratio-one owner rejected the call.
     #[error(transparent)]
     Owner(#[from] RatioOneCompressedOwnerError),
+    /// The owner's key prefix could not be read.
     #[error(transparent)]
     Prefix(#[from] IndexKeyStateError),
+    /// The selection geometry is invalid.
     #[error(transparent)]
     SelectionGeometry(#[from] SelectionGeometryError),
+    /// Candidate projection failed.
     #[error(transparent)]
     Candidate(#[from] CandidateProjectorError),
+    /// The attention layer rejected the call.
     #[error(transparent)]
     Attention(#[from] LayerAttentionError),
 }
