@@ -27,7 +27,9 @@ throughput (completed output tokens over the cell's wall time), TTFT and TPOT
 percentiles, completed and failed counts, and the peak memory sampled once a
 second: system memory in use (app, wired and compressed pages, as Activity
 Monitor counts them), GPU-resident memory, and the server's process-group
-resident size.
+resident size. The same sampler keeps a once-a-second series of GPU
+utilization, thermal pressure level and GPU-resident memory for each run, so
+a report shows when a run went busy or hot, not only its peaks.
 
 A percentile needs enough samples to differ from the maximum: p90 needs 10
 and p99 needs 100. Below that, the reports print the maximum and its sample
@@ -55,8 +57,10 @@ tokens. It is used unchanged from that commit (SHA-256
 
 1. Idle gate before every arm, with its readings stored in the report:
    1-minute load average below 2.0, no `cargo` or `rustc` running, AC power
-   (`pmset -g batt`), no thermal or performance warning (`pmset -g therm`),
-   and GPU utilization at most 5% over five one-second samples
+   (`pmset -g batt`), no thermal or performance warning (`pmset -g therm`,
+   which reports CPU limits only on Intel Macs), thermal pressure nominal
+   (`notifyutil -g com.apple.system.thermalpressurelevel` reads 0), and GPU
+   utilization at most 5% over five one-second samples
    (`ioreg -r -c AGXAccelerator -d 1`). An arm that cannot pass within 30
    minutes is skipped and reported.
 2. A load average above 4 during an arm aborts it, and so does machine-wide

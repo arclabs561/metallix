@@ -148,6 +148,24 @@ def group_rss_bytes(ps_text: str, pgid: int) -> int:
     return total
 
 
+# Darwin's OSThermalPressureLevel, as `notifyutil` reports it. Apple Silicon
+# reports throttling only here: `pmset -g therm` prints its CPU limits on
+# Intel Macs alone.
+THERMAL_PRESSURE = ("nominal", "moderate", "heavy", "trapping", "sleeping")
+
+
+def parse_thermal_pressure(text: str) -> int | None:
+    """The level from `notifyutil -g com.apple.system.thermalpressurelevel`."""
+    match = re.search(r"thermalpressurelevel\s+(\d+)", text)
+    return int(match.group(1)) if match else None
+
+
+def thermal_pressure() -> int | None:
+    return parse_thermal_pressure(
+        command_output(["notifyutil", "-g", "com.apple.system.thermalpressurelevel"])
+    )
+
+
 def probe(pgid: int | None) -> dict:
     """One sample of the quantities the sampler tracks."""
     gpu = parse_gpu_stats(
@@ -157,6 +175,8 @@ def probe(pgid: int | None) -> dict:
         "load_1m": os.getloadavg()[0],
         "system_used_bytes": parse_vm_stat(command_output(["vm_stat"])),
         "gpu_in_use_bytes": gpu["in_use_bytes"],
+        "gpu_utilization_pct": gpu["utilization_pct"],
+        "thermal_level": thermal_pressure(),
         "server_rss_bytes": (
             group_rss_bytes(command_output(["ps", "-axo", "pid=,pgid=,rss="]), pgid)
             if pgid is not None
@@ -165,13 +185,23 @@ def probe(pgid: int | None) -> dict:
     }
 
 
-PEAKS = ("load_1m", "system_used_bytes", "gpu_in_use_bytes", "server_rss_bytes")
+PEAKS = (
+    "load_1m",
+    "system_used_bytes",
+    "gpu_in_use_bytes",
+    "server_rss_bytes",
+    "thermal_level",
+)
+# Kept per sample, so a report shows when the GPU went busy or hot, not only
+# how far it went.
+SERIES = ("gpu_utilization_pct", "thermal_level", "gpu_in_use_bytes")
 
 
 class Sampler:
     """Samples memory, GPU memory and load every `interval` seconds on a thread.
 
-    Keeps the peak of each quantity. When the 1-minute load average rises above
+    Keeps the peak of each quantity, and a series (seconds since the first
+    sample, plus SERIES) of every sample. When the 1-minute load average rises above
     `abort_load`, or GPU-resident memory above `abort_gpu_bytes`, records the
     reason and calls `on_abort` once. GPU memory is the guard that matters for
     a leak: Metal buffers count there but not in the server's RSS.
@@ -194,13 +224,22 @@ class Sampler:
         self.probe = probe
         self.samples = 0
         self.peaks: dict[str, float | None] = dict.fromkeys(PEAKS)
+        self.series: list[dict] = []
+        self._started: float | None = None
         self.aborted: str | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def take(self) -> None:
+        now = time.monotonic()
+        if self._started is None:
+            self._started = now
         sample = self.probe(self.pgid)
         self.samples += 1
+        self.series.append(
+            {"t_s": round(now - self._started, 2)}
+            | {key: sample.get(key) for key in SERIES}
+        )
         for key in PEAKS:
             value = sample.get(key)
             if value is not None and (
@@ -245,6 +284,7 @@ class Sampler:
             "interval_s": self.interval,
             "samples": self.samples,
             **{f"peak_{key}": value for key, value in self.peaks.items()},
+            "series": self.series,
             "aborted": self.aborted,
         }
 
@@ -312,6 +352,7 @@ def idle_readings(gpu_samples: int = 5, interval: float = 1.0) -> dict:
         "thermal_warnings": parse_thermal_warnings(
             command_output(["pmset", "-g", "therm"])
         ),
+        "thermal_pressure_level": thermal_pressure(),
         "gpu_utilization_pct": utilization,
     }
 
@@ -329,6 +370,12 @@ def idle_failures(
         failures.append(f"power source {readings['power_source']!r}, not AC")
     if readings["thermal_warnings"]:
         failures.append(f"thermal: {'; '.join(readings['thermal_warnings'])}")
+    level = readings.get("thermal_pressure_level")
+    if level is None:
+        failures.append("thermal pressure unavailable")
+    elif level > 0:
+        name = THERMAL_PRESSURE[level] if level < len(THERMAL_PRESSURE) else "unknown"
+        failures.append(f"thermal pressure {name} ({level})")
     gpu = readings["gpu_utilization_pct"]
     if not gpu or any(value is None for value in gpu):
         failures.append("GPU utilization unavailable")

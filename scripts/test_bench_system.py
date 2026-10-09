@@ -122,6 +122,25 @@ class SamplerPeaks(unittest.TestCase):
         sampler.take()
         self.assertIsNone(sampler.aborted)
 
+    def test_every_sample_is_kept_as_a_series(self) -> None:
+        samples = iter(
+            [
+                {"gpu_utilization_pct": 3, "thermal_level": 0, "gpu_in_use_bytes": 1},
+                {"gpu_utilization_pct": 97, "thermal_level": 2, "gpu_in_use_bytes": 5},
+                {"gpu_utilization_pct": 90, "thermal_level": 1, "gpu_in_use_bytes": 4},
+            ]
+        )
+        sampler = bench_system.Sampler(probe=lambda pgid: next(samples))
+        for _ in range(3):
+            sampler.take()
+        summary = sampler.summary()
+        series = summary["series"]
+        self.assertEqual([s["gpu_utilization_pct"] for s in series], [3, 97, 90])
+        self.assertEqual([s["thermal_level"] for s in series], [0, 2, 1])
+        self.assertEqual([s["gpu_in_use_bytes"] for s in series], [1, 5, 4])
+        self.assertEqual(series[0]["t_s"], 0.0)
+        self.assertEqual(summary["peak_thermal_level"], 2)
+
 
 # `pmset -g therm` on a cool machine (recorded with VM_STAT above).
 THERM_COOL = """\
@@ -147,6 +166,7 @@ class IdleGate(unittest.TestCase):
             "build_processes": [],
             "power_source": "AC Power",
             "thermal_warnings": [],
+            "thermal_pressure_level": 0,
             "gpu_utilization_pct": [0, 1, 0, 2, 0],
         }
         return idle | overrides
@@ -166,6 +186,11 @@ class IdleGate(unittest.TestCase):
                 "CPU_Speed_Limit \t= 71",
             ],
         )
+        # `notifyutil -g com.apple.system.thermalpressurelevel`, recorded on
+        # an M-series Mac under load.
+        pressure = "com.apple.system.thermalpressurelevel 1\n"
+        self.assertEqual(bench_system.parse_thermal_pressure(pressure), 1)
+        self.assertIsNone(bench_system.parse_thermal_pressure(""))
         ps = "/usr/bin/zsh\n/opt/rust/bin/rustc\ncargo\nrustc-wrapper\n"
         self.assertEqual(bench_system.build_processes(ps), ["cargo", "rustc"])
 
@@ -180,6 +205,8 @@ class IdleGate(unittest.TestCase):
             "thermal: CPU_Speed_Limit = 71": {
                 "thermal_warnings": ["CPU_Speed_Limit = 71"]
             },
+            "thermal pressure moderate (1)": {"thermal_pressure_level": 1},
+            "thermal pressure unavailable": {"thermal_pressure_level": None},
             "GPU utilization up to 29% > 5%": {"gpu_utilization_pct": [0, 29, 0]},
             "GPU utilization unavailable": {"gpu_utilization_pct": [0, None]},
         }
