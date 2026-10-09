@@ -14,7 +14,9 @@ excludes 1 is evidence of a difference even when the machine is busy.
 Each metric also reports how many pairs favor B, the geometric mean ratio
 with a t interval on log ratios, and the minimum detectable effect at that
 spread, 2.8 sd(log ratio) / sqrt(pairs); an A/A run (one build in both arms)
-measures that floor.
+measures that floor. --max-load-delta drops a pair whose two runs started at
+1-min loads further apart than a threshold declared before the run; dropped
+pairs are counted, and more than a quarter dropped refuses the result.
 Absolute numbers from a loaded machine are still not results; publish those
 only from the idle protocol (bench_campaign.py).
 
@@ -180,9 +182,41 @@ def pair_load(pair: dict) -> list[float | None]:
     return [(pair[arm].get("baseline") or {}).get("load_1m") for arm in "AB"]
 
 
+# A comparison whose dropped pairs exceed this share is not reported: the
+# pairs left are the ones the machine happened to leave alone.
+MAX_DROPPED_SHARE = 0.25
+
+
+def drop_load_swings(pairs: list[dict], max_delta: float | None) -> int:
+    """Drops each pair whose two runs started at 1-min loads more than
+    `max_delta` apart, a threshold declared before the run. A load swing
+    inside a pair is what spreads an A/A, so such a pair compares machine
+    states, not arms. Returns how many it dropped."""
+    if max_delta is None:
+        return 0
+    dropped = 0
+    for pair in pairs:
+        if "dropped" in pair:
+            continue
+        loads = pair_load(pair)
+        if None in loads:
+            continue
+        delta = abs(loads[0] - loads[1])
+        if delta > max_delta:
+            pair["dropped"] = f"load delta {delta:.1f} > {max_delta:g}"
+            dropped += 1
+    return dropped
+
+
 def summarize_pairs(pairs: list[dict], rng: random.Random) -> dict:
     kept = [pair for pair in pairs if "dropped" not in pair]
     out: dict = {"pairs": len(pairs), "kept": len(kept), "metrics": {}}
+    if pairs and (len(pairs) - len(kept)) / len(pairs) > MAX_DROPPED_SHARE:
+        out["refused"] = (
+            f"{len(pairs) - len(kept)} of {len(pairs)} pairs dropped, more than "
+            f"{MAX_DROPPED_SHARE:.0%}"
+        )
+        return out
     for name, (path, higher) in METRICS.items():
         ratios = []
         for pair in kept:
@@ -241,6 +275,13 @@ def render(summary: dict, pairs: list[dict]) -> str:
             f"load at start A, B: {load}"
         )
     lines.append(f"{summary['kept']} of {summary['pairs']} pairs kept")
+    if summary.get("max_load_delta") is not None:
+        lines.append(
+            f"{summary['load_dropped']} pairs dropped for a load delta above "
+            f"{summary['max_load_delta']:g}"
+        )
+    if "refused" in summary:
+        lines.append(f"RESULT REFUSED: {summary['refused']}")
     for name, m in summary["metrics"].items():
         direction = "higher" if m["higher_is_better"] else "lower"
         log = m["log_ratio"]
@@ -289,6 +330,13 @@ def main() -> int:
     )
     parser.add_argument("--requests", type=int, default=32, help="requests per run")
     parser.add_argument("--boot-seed", type=int, default=0)
+    parser.add_argument(
+        "--max-load-delta",
+        type=float,
+        help="drop a pair whose runs started at 1-min loads further apart than "
+        "this, for example 1.0; off unless given, and declared (on the A/B "
+        "card) before the run, never fitted afterwards",
+    )
     own, shared = parser.parse_known_args()
     arms = {"A": arm_args(shared, own.a_args), "B": arm_args(shared, own.b_args)}
     tokenizers: dict[Path, Callable] = {}
@@ -315,7 +363,10 @@ def main() -> int:
         )
 
     pairs = run_pairs(own.pairs, measure, time.sleep, own.cooldown)
+    load_dropped = drop_load_swings(pairs, own.max_load_delta)
     summary = summarize_pairs(pairs, random.Random(own.boot_seed))
+    summary["max_load_delta"] = own.max_load_delta
+    summary["load_dropped"] = load_dropped
     print()
     print(render(summary, pairs))
     path = arms["A"].json  # bench_load's --json, shared by both arms.
@@ -332,7 +383,7 @@ def main() -> int:
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=1, default=str) + "\n")
-    return 0
+    return 1 if "refused" in summary else 0
 
 
 if __name__ == "__main__":

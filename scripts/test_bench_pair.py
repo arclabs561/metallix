@@ -119,6 +119,57 @@ class RunLogs(unittest.TestCase):
         )
 
 
+class LoadGuard(unittest.TestCase):
+    def pair(self, index: int, load_a: float, load_b: float) -> dict:
+        def run(load: float) -> dict:
+            return {
+                "summary": {
+                    "output_token_throughput": 100.0,
+                    "tpot_ms": {"p50": 10.0},
+                    "ttft_ms": {"p50": 20.0},
+                },
+                "baseline": {"load_1m": load},
+            }
+
+        return {"pair": index, "order": "AB", "A": run(load_a), "B": run(load_b)}
+
+    def test_pairs_above_the_declared_delta_are_dropped_and_counted(self) -> None:
+        pairs = [
+            self.pair(i, 4.0, 4.0 + delta)
+            for i, delta in enumerate([0.2, 1.6, 0.9, 0.0])
+        ]
+        self.assertEqual(bench_pair.drop_load_swings(pairs, 1.0), 1)
+        self.assertEqual(pairs[1]["dropped"], "load delta 1.6 > 1")
+        summary = bench_pair.summarize_pairs(pairs, random.Random(0))
+        self.assertEqual(summary["kept"], 3)
+        self.assertNotIn("refused", summary)
+        self.assertIn("output_tok_s", summary["metrics"])
+        # No threshold, no guard.
+        fresh = [self.pair(0, 1.0, 9.0)]
+        self.assertEqual(bench_pair.drop_load_swings(fresh, None), 0)
+
+    def test_more_than_a_quarter_dropped_refuses_the_result(self) -> None:
+        pairs = [
+            self.pair(i, 4.0, 4.0 + delta)
+            for i, delta in enumerate([2.0, 2.0, 0.1, 0.1])
+        ]
+        bench_pair.drop_load_swings(pairs, 1.0)
+        summary = bench_pair.summarize_pairs(pairs, random.Random(0))
+        self.assertEqual(summary["metrics"], {})
+        self.assertIn("2 of 4 pairs dropped", summary["refused"])
+        summary |= {"max_load_delta": 1.0, "load_dropped": 2}
+        text = bench_pair.render(summary, pairs)
+        self.assertIn("RESULT REFUSED", text)
+        self.assertIn("2 pairs dropped for a load delta above 1", text)
+        # Exactly a quarter is still reported.
+        pairs = [
+            self.pair(i, 4.0, 4.0 + delta)
+            for i, delta in enumerate([2.0, 0.1, 0.1, 0.1])
+        ]
+        bench_pair.drop_load_swings(pairs, 1.0)
+        self.assertNotIn("refused", bench_pair.summarize_pairs(pairs, random.Random(0)))
+
+
 class NoiseFloor(unittest.TestCase):
     def test_log_ratio_interval_by_hand(self) -> None:
         # log ratios +0.1 and -0.1: mean 0, sd 0.1 * sqrt(2), n 2, t(1) 12.706.
@@ -216,10 +267,11 @@ class Drift(unittest.TestCase):
                 return {"aborted": "1-min load 9.00 rose above 4"}
             return measure(arm)
 
-        pairs = bench_pair.run_pairs(3, flaky, lambda s: None, 0)
+        # Four pairs, so the one dropped stays within the 25% refusal limit.
+        pairs = bench_pair.run_pairs(4, flaky, lambda s: None, 0)
         summary = bench_pair.summarize_pairs(pairs, random.Random(0))
         self.assertEqual(pairs[0]["dropped"], "B: 1-min load 9.00 rose above 4")
-        self.assertEqual((summary["pairs"], summary["kept"]), (3, 2))
+        self.assertEqual((summary["pairs"], summary["kept"]), (4, 3))
         self.assertAlmostEqual(summary["metrics"]["output_tok_s"]["median_ratio"], 1.25)
 
 
