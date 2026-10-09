@@ -167,14 +167,23 @@ def run_pairs(
             if index or position:
                 sleep(cooldown)
             pair[arm] = measure(arm)
-        missing = [arm for arm in "AB" if "summary" not in pair[arm]]
-        if missing:
+        reasons = {arm: unusable(pair[arm]) for arm in "AB"}
+        if any(reasons.values()):
             pair["dropped"] = "; ".join(
-                f"{arm}: {pair[arm].get('aborted') or pair[arm].get('error')}"
-                for arm in missing
+                f"{arm}: {reason}" for arm, reason in reasons.items() if reason
             )
         out.append(pair)
     return out
+
+
+def unusable(run: dict) -> str | None:
+    """Why a run cannot enter a ratio, or None. A run whose requests all
+    failed has a summary but no completed output to compare."""
+    if "summary" not in run:
+        return str(run.get("aborted") or run.get("error"))
+    if not run["summary"].get("output_token_throughput"):
+        return f"no completed requests ({run['summary'].get('outcomes')})"
+    return None
 
 
 def pair_load(pair: dict) -> list[float | None]:

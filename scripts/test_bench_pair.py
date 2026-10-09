@@ -274,6 +274,32 @@ class Drift(unittest.TestCase):
         self.assertEqual((summary["pairs"], summary["kept"]), (4, 3))
         self.assertAlmostEqual(summary["metrics"]["output_tok_s"]["median_ratio"], 1.25)
 
+    def test_a_run_with_no_completed_request_is_dropped_and_rendered(self) -> None:
+        # Every request of A's run failed (HTTP 503): the run has a summary,
+        # but zero throughput, which used to divide by zero in render.
+        measure, _ = drifting_machine(0.0, noise=0.0, seed=0)
+        calls = []
+
+        def failing(arm: str) -> dict:
+            calls.append(arm)
+            if len(calls) == 1:
+                return {
+                    "summary": {
+                        "output_token_throughput": 0.0,
+                        "outcomes": {"http_503": 4},
+                        "tpot_ms": {"p50": None},
+                        "ttft_ms": {"p50": None},
+                    }
+                }
+            return measure(arm)
+
+        pairs = bench_pair.run_pairs(2, failing, lambda s: None, 0)
+        self.assertEqual(
+            pairs[0]["dropped"], "A: no completed requests ({'http_503': 4})"
+        )
+        summary = bench_pair.summarize_pairs(pairs, random.Random(0))
+        self.assertIn("1 of 2 pairs kept", bench_pair.render(summary, pairs))
+
 
 class StubServers(unittest.TestCase):
     def test_drifting_stub_servers_end_to_end(self) -> None:
