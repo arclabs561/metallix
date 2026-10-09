@@ -112,3 +112,50 @@ fn a_scoring_range_needs_a_prefix_within_the_sequence() {
         ));
     }
 }
+
+/// For a greedy continuation each scored token is its row's top
+/// alternative, and its log probability is that alternative's value bit for
+/// bit, in every chunk layout and on the rows either side of a chunk
+/// boundary. lm-eval calls a continuation greedy when each
+/// `token_logprobs[i]` equals `max(top_logprobs[i].values())` exactly.
+#[test]
+fn a_greedy_tokens_logprob_is_bit_equal_to_its_top_alternative() {
+    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let config = two_layer_long_config();
+    let weights = sensitive_weights();
+    let plan = || {
+        config
+            .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3FloatPrecision::Float32)
+            .expect("tiny resident plan")
+    };
+    let mut executor = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan());
+    let mut ids = IDS[..FROM].to_vec();
+    for _ in 0..8 {
+        let next = executor
+            .score(&ids, ids.len(), 1, SCORE_CHUNK_ROWS)
+            .expect("next token")
+            .next;
+        ids.push(next[0].0);
+    }
+    for chunk in [1, 3, SCORE_CHUNK_ROWS] {
+        let scores = executor
+            .score(&ids, FROM, 3, chunk)
+            .expect("scored continuation");
+        assert_eq!(scores.tokens.len(), ids.len() - FROM);
+        for (offset, token) in scores.tokens.iter().enumerate() {
+            let (best_id, best) = token.top[0];
+            assert_eq!(
+                best_id,
+                ids[FROM + offset],
+                "chunk {chunk}, offset {offset}"
+            );
+            assert_eq!(
+                token.logprob.to_bits(),
+                best.to_bits(),
+                "chunk {chunk}, offset {offset}: {} vs {}",
+                token.logprob,
+                best
+            );
+        }
+    }
+}
