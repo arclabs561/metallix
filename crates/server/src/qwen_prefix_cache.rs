@@ -23,7 +23,7 @@ use qwen::{
 use sha2::{Digest, Sha256};
 
 use super::ChatRequest;
-use chat_format::ChatFormat;
+use chat_format::{ChatFormat, PromptPrefix};
 
 type PrefixKey = [u8; 32];
 type Executor<'w> = Qwen3ForwardExecutor<'w, std::collections::hash_map::RandomState>;
@@ -80,10 +80,15 @@ impl AcceptedPrefixTokens {
 /// rendering tokenizes to a nonempty, exact prefix of `input_ids`; one that
 /// does not render or tokenize is skipped. Shortest first; when both render
 /// to the same tokens, the boundary counts as the preamble.
+///
+/// `reused` is the encoded prefix the request's own prompt reused, if any;
+/// each boundary then encodes only its text past that prefix, or all of it
+/// when the boundary does not extend it.
 pub(super) fn boundaries(
     format: &ChatFormat,
     request: ChatRequest<'_>,
     input_ids: &[i32],
+    reused: Option<&PromptPrefix>,
 ) -> Vec<Boundary> {
     let leading_system = request
         .messages
@@ -101,10 +106,11 @@ pub(super) fn boundaries(
             messages,
             ..request
         };
-        let Ok(ids) = format
-            .prompt(prefix.conversation(), false)
-            .map(|prompt| prompt.ids)
-        else {
+        let encoded = match reused {
+            Some(reused) => format.prompt_reusing(prefix.conversation(), false, reused),
+            None => format.prompt(prefix.conversation(), false),
+        };
+        let Ok(ids) = encoded.map(|prompt| prompt.ids) else {
             continue;
         };
         if !ids.is_empty()
@@ -152,9 +158,10 @@ pub(super) fn remember(
     executor: &Executor<'_>,
     request: ChatRequest<'_>,
     input_ids: &[i32],
+    reused: Option<&PromptPrefix>,
 ) -> Result<AcceptedPrefixTokens, String> {
     let mut written = 0;
-    for Boundary { ids, role } in boundaries(format, request, input_ids) {
+    for Boundary { ids, role } in boundaries(format, request, input_ids, reused) {
         if cache.contains(request.cache_salt, &ids) {
             continue;
         }

@@ -308,6 +308,7 @@ fn checkpoint_prefix_snapshot_copy_time() {
             &executor,
             request,
             &input_ids,
+            None,
         )
         .expect("store");
         let store_ms = started.elapsed().as_secs_f64() * 1e3;
@@ -320,4 +321,62 @@ fn checkpoint_prefix_snapshot_copy_time() {
             stats.bytes >> 20,
         );
     }
+}
+
+/// An agent loop of six turns over a ~3,000-token preamble, each turn adding
+/// a reply and a ~900-token tool result, run with encoded-prefix reuse
+/// and without. Greedy output must not change; prints the render time per
+/// turn (render plus encode), the cost reuse removes.
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+fn checkpoint_prompt_reuse_keeps_output_and_cuts_render_time() {
+    let Some(mut session) = load_session() else {
+        return;
+    };
+    // About 900 tokens, so six turns stay inside the 8K context.
+    let tool_output: String = preamble("tool")
+        .lines()
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut arms = Vec::new();
+    for reuse in [true, false, true, false] {
+        session.reset_prefix_cache(1 << 32);
+        session.prompt_prefixes =
+            super::super::prompt_prefixes::PromptPrefixes::new(if reuse { 64 } else { 0 });
+        let mut messages = vec![
+            ChatMessage::text(ChatRole::System, preamble("Ada")),
+            ChatMessage::text(ChatRole::User, "Check the stock of aisle 7."),
+        ];
+        let mut turns = Vec::new();
+        for turn in 0..6 {
+            let generation = generate(&mut session, &messages);
+            eprintln!(
+                "prompt_reuse reuse={reuse} turn={turn} prompt_tokens={} render_ms={:.2}",
+                generation.metrics.prompt_tokens, generation.metrics.render_ms
+            );
+            // A fixed reply keeps both arms' conversations identical.
+            messages.push(ChatMessage::text(
+                ChatRole::Assistant,
+                format!("Checking aisle 7, step {turn}."),
+            ));
+            messages.push(ChatMessage::text(
+                ChatRole::User,
+                format!("Tool result {turn}:\n{tool_output}"),
+            ));
+            turns.push((generation.generated_token_ids, generation.metrics.render_ms));
+        }
+        arms.push(turns);
+    }
+    for (with, without) in arms[0].iter().zip(&arms[1]) {
+        assert_eq!(with.0, without.0, "reuse must not change greedy output");
+    }
+    let later = |arm: &Vec<(Vec<i32>, f64)>| arm[1..].iter().map(|turn| turn.1).sum::<f64>();
+    eprintln!(
+        "prompt_reuse later-turn render_ms with={:.1}/{:.1} without={:.1}/{:.1}",
+        later(&arms[0]),
+        later(&arms[2]),
+        later(&arms[1]),
+        later(&arms[3])
+    );
 }

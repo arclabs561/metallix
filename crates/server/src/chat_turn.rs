@@ -19,15 +19,16 @@
 use std::{path::Path, time::Instant};
 
 use chat_format::{
-    AssistantTurn, ChatFormat, QwenIncrementalDecode, TokenClass, TokenId, TurnDelta, TurnStream,
+    AssistantTurn, ChatFormat, Prompt, PromptPrefix, PromptReuse, QwenIncrementalDecode,
+    TokenClass, TokenId, TurnDelta, TurnStream,
 };
 use qwen::forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
 use serde_json::Value;
 
 use super::{
     AppliedSampling, ChatFinishReason, ChatGenerationError, ChatRequest, GenerationDeadline,
-    SamplingDefaults, TokenLogprob, TokenPicker, TopLogprob, elapsed_ms, full_row, timed,
-    validate_request,
+    SamplingDefaults, TokenLogprob, TokenPicker, TopLogprob, elapsed_ms, full_row,
+    prompt_prefixes::PromptPrefixes, timed, validate_request,
 };
 
 /// A validated, rendered and encoded turn, ready for prefill.
@@ -64,6 +65,37 @@ impl TurnStart {
         request: ChatRequest<'_>,
         deadline: GenerationDeadline,
     ) -> Result<Self, ChatGenerationError> {
+        Self::prepare_with(model, request, deadline, |conversation| {
+            model
+                .format
+                .prompt(conversation, true)
+                .map(|prompt| (prompt, None))
+        })
+        .map(|(start, _)| start)
+    }
+
+    /// [`Self::prepare`], encoding only what `prefixes` cannot supply from an
+    /// earlier turn of the same conversation. Also returns the prefix it
+    /// reused, which encodes this turn's prefix-cache boundaries as cheaply.
+    pub(crate) fn prepare_reusing(
+        model: TurnModel<'_>,
+        request: ChatRequest<'_>,
+        deadline: GenerationDeadline,
+        prefixes: &mut PromptPrefixes,
+    ) -> Result<(Self, Option<PromptPrefix>), ChatGenerationError> {
+        Self::prepare_with(model, request, deadline, |conversation| {
+            prefixes.prompt(model.format, request.cache_salt, conversation)
+        })
+    }
+
+    fn prepare_with(
+        model: TurnModel<'_>,
+        request: ChatRequest<'_>,
+        deadline: GenerationDeadline,
+        encode: impl FnOnce(
+            chat_format::Conversation<'_>,
+        ) -> Result<(Prompt, Option<PromptPrefix>), String>,
+    ) -> Result<(Self, Option<PromptPrefix>), ChatGenerationError> {
         let request_span = tracing::Span::current();
         if let Some(requested) = request.max_tokens {
             request_span.record("gen_ai.request.max_tokens", requested);
@@ -80,11 +112,21 @@ impl TurnStart {
         deadline.check()?;
         validate_request(request)?;
         let started = Instant::now();
-        let render = tracing::info_span!("chat.render", render_ms = tracing::field::Empty);
+        let render = tracing::info_span!(
+            "chat.render",
+            render_ms = tracing::field::Empty,
+            reused_ids = tracing::field::Empty
+        );
         // Renders and encodes; the render span covers both.
-        let (prompt, render_ms) = timed(&render, "render_ms", || {
-            model.format.prompt(request.conversation(), true)
-        })?;
+        let ((prompt, reused), render_ms) =
+            timed(&render, "render_ms", || encode(request.conversation()))?;
+        render.record(
+            "reused_ids",
+            match prompt.reuse {
+                PromptReuse::Full => 0,
+                PromptReuse::Prefix { ids } => ids,
+            },
+        );
         let input_ids = prompt.ids;
         deadline.check()?;
         let max_tokens = output_budget(model.context_limit, request.max_tokens, input_ids.len())?;
@@ -99,17 +141,20 @@ impl TurnStart {
             model.model,
             model.vocabulary_size,
         )?;
-        Ok(Self {
-            input_ids,
-            max_tokens,
-            render_ms,
-            started,
-            picker,
-            top_logprobs: request.top_logprobs,
-            ignore_eos: request.ignore_eos,
-            stream: TurnStream::new(model.format.turn_format(), request.enable_thinking),
-            vocabulary_size: model.vocabulary_size,
-        })
+        Ok((
+            Self {
+                input_ids,
+                max_tokens,
+                render_ms,
+                started,
+                picker,
+                top_logprobs: request.top_logprobs,
+                ignore_eos: request.ignore_eos,
+                stream: TurnStream::new(model.format.turn_format(), request.enable_thinking),
+                vocabulary_size: model.vocabulary_size,
+            },
+            reused,
+        ))
     }
 
     /// Splits the turn into its token loop and its text.

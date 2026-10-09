@@ -36,6 +36,8 @@ pub(crate) mod decoder;
 mod gemma;
 #[path = "qwen_prefix_cache.rs"]
 mod prefix_cache;
+#[path = "chat_prompt_prefixes.rs"]
+mod prompt_prefixes;
 #[path = "qwen35_chat.rs"]
 mod qwen35_decoder;
 #[path = "qwen_speculation.rs"]
@@ -720,6 +722,9 @@ pub(crate) struct ChatSession {
     sampling_defaults: SamplingDefaults,
     /// Prompt-prefix K/V kept across turns, bounded by `--prefix-cache-mib`.
     prefix_cache: prefix_cache::PrefixCache<qwen::forward::Qwen3KvSnapshot>,
+    /// Encoded prompts kept across turns, so a grown conversation encodes
+    /// only its new turns.
+    prompt_prefixes: prompt_prefixes::PromptPrefixes,
 }
 
 /// The parts of a loaded session a batched engine is built from; see
@@ -859,6 +864,7 @@ impl ChatSession {
             model: model.to_path_buf(),
             sampling_defaults: SamplingDefaults::load(model)?,
             prefix_cache: prefix_cache::PrefixCache::new(prefix_identity, prefix_budget),
+            prompt_prefixes: prompt_prefixes::PromptPrefixes::default(),
         })
     }
 
@@ -1016,7 +1022,12 @@ impl ChatSession {
         deadline: GenerationDeadline,
         on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
-        let start = TurnStart::prepare(self.turn_model(), request, deadline)?;
+        // Moved out for the call: the turn model borrows the whole session.
+        let mut prefixes = std::mem::take(&mut self.prompt_prefixes);
+        let prepared =
+            TurnStart::prepare_reusing(self.turn_model(), request, deadline, &mut prefixes);
+        self.prompt_prefixes = prefixes;
+        let (start, reused_prefix) = prepared?;
         let (render_ms, max_tokens) = (start.render_ms, start.max_tokens);
         let (input_ids, mut turn, mut text) = start.into_parts();
 
@@ -1237,6 +1248,7 @@ impl ChatSession {
                 &executor,
                 request,
                 &input_ids,
+                reused_prefix.as_ref(),
             )
         })?;
         let cache_write_tokens = accepted_prefix.new_tokens_after(cached_prompt_tokens);

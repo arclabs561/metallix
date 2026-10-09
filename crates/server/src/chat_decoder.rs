@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chat_format::{ChatFormat, TurnDelta};
+use chat_format::{ChatFormat, PromptPrefix, TurnDelta};
 use tracing::field::Empty;
 
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ use super::{
     ChatBackend, ChatFinishReason, ChatGeneration, ChatGenerationError, ChatGenerationMetrics,
     ChatRequest, GenerationDeadline, ResidentChatLimits, SamplingDefaults, elapsed_ms,
     prefix_cache::{self, PrefixCache},
+    prompt_prefixes::PromptPrefixes,
     timed,
     turn::{TurnModel, TurnStart, TurnStep},
 };
@@ -181,6 +182,9 @@ pub(crate) struct ChatDecoderSession<D: FullRowDecoder> {
     /// Saved prompt-prefix state, bounded by `--prefix-cache-mib`; never
     /// filled unless [`FullRowDecoder::SAVES_STATE`].
     prefix_cache: PrefixCache<D::Snapshot>,
+    /// Encoded prompts kept across turns, so a grown conversation encodes
+    /// only its new turns.
+    prompt_prefixes: PromptPrefixes,
 }
 
 impl<D: FullRowDecoder> ChatDecoderSession<D> {
@@ -214,6 +218,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
             model: model.to_path_buf(),
             sampling_defaults,
             prefix_cache: PrefixCache::new(identity, prefix_budget),
+            prompt_prefixes: PromptPrefixes::default(),
         })
     }
 
@@ -228,6 +233,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         context_limit: usize,
         request: ChatRequest<'_>,
         input_ids: &[i32],
+        reused: Option<&PromptPrefix>,
     ) -> Result<(D::Sequence<'s>, Vec<f32>, usize, usize), String> {
         if !D::SAVES_STATE {
             let mut sequence = decoder.sequence(context_limit)?;
@@ -243,7 +249,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         for prefix_cache::Boundary {
             ids: boundary,
             role,
-        } in prefix_cache::boundaries(format, request, input_ids)
+        } in prefix_cache::boundaries(format, request, input_ids, reused)
         {
             // A boundary must leave a token to prefill after it, and one at
             // or before the resumed prefix is already cached.
@@ -288,7 +294,12 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         deadline: GenerationDeadline,
         on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
-        let start = TurnStart::prepare(self.turn_model(), request, deadline)?;
+        // Moved out for the call: the turn model borrows the whole session.
+        let mut prefixes = std::mem::take(&mut self.prompt_prefixes);
+        let prepared =
+            TurnStart::prepare_reusing(self.turn_model(), request, deadline, &mut prefixes);
+        self.prompt_prefixes = prefixes;
+        let (start, reused_prefix) = prepared?;
         let (render_ms, max_tokens) = (start.render_ms, start.max_tokens);
         let (input_ids, mut turn, mut text) = start.into_parts();
 
@@ -309,6 +320,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
                     self.context_limit,
                     request,
                     &input_ids,
+                    reused_prefix.as_ref(),
                 )?;
                 prefill.record("cached_tokens", prefilled.2);
                 Ok::<_, ChatGenerationError>(prefilled)
