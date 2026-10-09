@@ -28,6 +28,16 @@ impl<'a> AttentionInput<'a> {
     }
 
     /// Validates the normalization weight, HC copy count, and RMS epsilon.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttentionInputError::EmptyWidth`],
+    /// [`AttentionInputError::EmptyCopies`],
+    /// [`AttentionInputError::WidthTooLarge`],
+    /// [`AttentionInputError::CopyCountTooLarge`] for a size outside its
+    /// bounds, [`AttentionInputError::InvalidEpsilon`] for a non-finite or
+    /// non-positive epsilon, and [`AttentionInputError::NonFiniteNormWeight`]
+    /// for a non-finite weight.
     pub fn new(
         norm_weight: &'a [u16],
         copies: usize,
@@ -73,6 +83,13 @@ impl<'a> AttentionInput<'a> {
     /// `residual` is `[copies, hidden_width]` BF16 storage and `pre` is one
     /// finite FP32 incoming coefficient per residual copy. Returned rows are
     /// owned, so failure cannot alter caller-owned inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttentionInputError::Length`] when `residual` or `pre` does
+    /// not match the copies and width, [`AttentionInputError::ShapeOverflow`]
+    /// or [`AttentionInputError::AllocationFailed`] when a buffer does not fit,
+    /// and the wrapped Hyper-Connections error when the pre-mix fails.
     pub fn forward(
         &self,
         residual: &[u16],
@@ -142,33 +159,54 @@ pub enum AttentionInputError {
     EmptyWidth,
     /// The hidden width exceeds a scalar component bound.
     #[error("attention input width {width} exceeds maximum {maximum}")]
-    WidthTooLarge { width: usize, maximum: usize },
+    WidthTooLarge {
+        /// The hidden width.
+        width: usize,
+        /// The largest accepted width.
+        maximum: usize,
+    },
     /// At least one Hyper-Connections residual copy is required.
     #[error("attention input requires at least one residual copy")]
     EmptyCopies,
     /// The residual copy count exceeds the scalar HC pre-mix bound.
     #[error("attention input copies {copies} exceeds maximum {maximum}")]
-    CopyCountTooLarge { copies: usize, maximum: usize },
+    CopyCountTooLarge {
+        /// The copy count.
+        copies: usize,
+        /// The largest accepted count.
+        maximum: usize,
+    },
     /// The `RMSNorm` epsilon must be finite and positive.
     #[error("attention input epsilon must be finite and positive")]
     InvalidEpsilon,
     /// A derived runtime shape overflowed `usize`.
     #[error("attention input {field} shape overflowed")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
     /// A caller buffer has an unexpected exact length.
     #[error("attention input {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
     /// A learned BF16 normalization weight is NaN or infinity.
     #[error("attention input normalization weight at element {element} is non-finite")]
-    NonFiniteNormWeight { element: usize },
+    NonFiniteNormWeight {
+        /// Flat index into the weight.
+        element: usize,
+    },
     /// A temporary output row could not be reserved.
     #[error("could not allocate {elements} attention-input elements for {field}")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
     /// Hyper-Connections pre-mix rejected a runtime input.

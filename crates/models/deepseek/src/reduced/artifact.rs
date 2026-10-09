@@ -69,6 +69,13 @@ impl ReducedGeneration {
 
 impl ReducedArtifact {
     /// Parses a size-bounded, versioned artifact with checksummed tensors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::SizeLimit`] past the size bound,
+    /// [`ArtifactError::Format`] or [`ArtifactError::Json`] when the bytes are
+    /// not an artifact, and [`ArtifactError::Invalid`] when its contents break
+    /// a layout invariant.
     pub fn parse(bytes: &[u8]) -> Result<Self, ArtifactError> {
         if bytes.len() > MAX_REDUCED_ARTIFACT_BYTES {
             return Err(ArtifactError::SizeLimit);
@@ -104,6 +111,12 @@ impl ReducedArtifact {
     /// At least two prefill tokens are required by the ratio-two L1 owner.
     /// Every invocation constructs fresh request state; no state is retained
     /// in the artifact between calls. No token sampling or text decoding occurs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::Invalid`] unless `2 <= prefill_tokens <= ids.len()
+    /// <= max_tokens` and every ID is in the vocabulary, and
+    /// [`ArtifactError::Request`] when a step fails.
     pub fn run(
         &self,
         ids: &[i64],
@@ -122,6 +135,12 @@ impl ReducedArtifact {
     /// Metal scoring is mixed execution: all other arithmetic remains scalar.
     /// Every invocation constructs fresh state with the same admission limits as
     /// [`Self::run`]. The artifact does not retain an execution preference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::Invalid`] unless `2 <= prefill_tokens <= ids.len()
+    /// <= max_tokens` and every ID is in the vocabulary, and
+    /// [`ArtifactError::Request`] when a step fails.
     pub fn run_with_score_execution(
         &self,
         ids: &[i64],
@@ -140,6 +159,12 @@ impl ReducedArtifact {
     ///
     /// Both device choices are bounded mixed-execution diagnostics; all other
     /// arithmetic remains scalar and the artifact retains neither preference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::Invalid`] unless `2 <= prefill_tokens <= ids.len()
+    /// <= max_tokens` and every ID is in the vocabulary, and
+    /// [`ArtifactError::Request`] when a step fails.
     pub fn run_with_execution(
         &self,
         ids: &[i64],
@@ -160,6 +185,12 @@ impl ReducedArtifact {
     ///
     /// Every device choice is an independently selectable mixed-execution
     /// diagnostic. The artifact retains no execution preference between calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::Invalid`] unless `2 <= prefill_tokens <= ids.len()
+    /// <= max_tokens` and every ID is in the vocabulary, and
+    /// [`ArtifactError::Request`] when a step fails.
     pub fn run_with_head_execution(
         &self,
         ids: &[i64],
@@ -181,6 +212,12 @@ impl ReducedArtifact {
     ///
     /// Every device choice is an independently selectable mixed-execution
     /// diagnostic. The artifact retains no execution preference between calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::Invalid`] unless `2 <= prefill_tokens <= ids.len()
+    /// <= max_tokens` and every ID is in the vocabulary, and
+    /// [`ArtifactError::Request`] when a step fails.
     pub fn run_with_key_preparation_execution(
         &self,
         ids: &[i64],
@@ -221,6 +258,12 @@ impl ReducedArtifact {
     /// This exact capacity accounting allows a prompt plus generated output to
     /// occupy all configured positions without admitting an unused decode step.
     /// Equal finite logits choose the lower vocabulary ID deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactError::Invalid`] when the prompt has fewer than 2 or more
+    /// than `max_tokens` IDs, `max_new_tokens` is zero, or the positions overflow,
+    /// and [`ArtifactError::Request`] when a step fails.
     pub fn generate_greedy(
         &self,
         prompt_ids: &[i64],

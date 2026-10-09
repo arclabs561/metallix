@@ -149,6 +149,11 @@ pub enum V41LayerRole {
 
 impl V41InferenceConfig {
     /// Parses and checks the fields this native schedule supports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Config`] when the configuration does
+    /// not parse or describes a layout this path cannot run.
     pub fn parse(json: &str) -> Result<Self, V41CheckpointModelError> {
         let config: Self = serde_json::from_str(json)
             .map_err(|error| V41CheckpointModelError::Config(error.to_string()))?;
@@ -196,6 +201,12 @@ impl V41InferenceConfig {
     }
 
     /// Returns `layer`'s role, derived from the compression schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Config`] for a layer past the
+    /// configuration, or one whose compression ratio, owner and indexer roles
+    /// form no supported combination.
     pub fn role(&self, layer: usize) -> Result<V41LayerRole, V41CheckpointModelError> {
         let fail = |reason: &str| {
             Err(V41CheckpointModelError::Config(format!(
@@ -402,6 +413,16 @@ impl V41CheckpointWeights {
     /// Reads every non-expert, non-Engram-table tensor of `layers` plus the
     /// final norm, checking each header dtype and shape before reading it.
     /// Rotary tables cover `max_tokens` positions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Config`] for a layer range or token
+    /// budget the configuration cannot serve,
+    /// [`V41CheckpointModelError::Cache`] when a tensor cannot be read, and
+    /// [`V41CheckpointModelError::Tensor`],
+    /// [`V41CheckpointModelError::Missing`],
+    /// [`V41CheckpointModelError::Component`] when a tensor has the wrong
+    /// shape, is absent, or cannot form its component.
     pub fn load<S: V41RangeSource>(
         cache: &mut V41RangeCache<S>,
         config: &V41InferenceConfig,
@@ -461,6 +482,12 @@ impl V41CheckpointWeights {
     /// rows are not loaded: request steps read them from an
     /// [`crate::engram::embedding::EngramRowSource`] (e.g.
     /// `checkpoint::engram_rows::V41CachedEngramRows`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Component`] or
+    /// [`V41CheckpointModelError::Missing`] when the Engram tensors or `inputs`
+    /// cannot form a definition.
     pub fn engram_definitions(
         &self,
         inputs: &EngramHashInputs,
@@ -516,6 +543,13 @@ impl V41CheckpointWeights {
 
     /// Reads the BF16 output head `[vocab_size, dim]` (1.3 GB). The token
     /// embedding is not loaded: startup reads its rows per step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Cache`] when a head tensor cannot be
+    /// read, and [`V41CheckpointModelError::Tensor`],
+    /// [`V41CheckpointModelError::Component`] when the head cannot be built
+    /// from it.
     pub fn load_head<S: V41RangeSource>(
         &mut self,
         cache: &mut V41RangeCache<S>,
@@ -529,6 +563,11 @@ impl V41CheckpointWeights {
     /// it uploads a 2.6 GB FP32 copy of it to the GPU once. Each FP8 linear's
     /// weights (attention and shared expert) are uploaded on first use and
     /// stay resident while these weights live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Component`] when a loaded weight
+    /// cannot be prepared for `backend`.
     pub fn set_backend(&mut self, backend: V41Backend) -> Result<(), V41CheckpointModelError> {
         #[cfg(feature = "metal")]
         {
@@ -586,6 +625,14 @@ impl V41CheckpointWeights {
     /// Assembles the request model. Requires every layer and the head. Steps
     /// supply routed experts, Engram rows and embedding rows through
     /// [`super::StepSources`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::PartialModel`] when the model was
+    /// loaded for a layer range rather than all layers,
+    /// [`V41CheckpointModelError::Config`] when the configuration cannot form a
+    /// request, and [`V41CheckpointModelError::Component`],
+    /// [`V41CheckpointModelError::Request`] when a layer cannot be built.
     pub fn request_model(
         &self,
         engrams: V41Engrams,
@@ -666,6 +713,12 @@ impl V41CheckpointWeights {
     /// call order as a request step. Layers must run in order within one
     /// `state`, because consumers read the latest owner's publication.
     /// Engram is not applied: a caller forcing layer inputs supplies its output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41CheckpointModelError::Config`] for a layer this model did
+    /// not load, and [`V41CheckpointModelError::Component`],
+    /// [`V41CheckpointModelError::Request`] when a layer stage fails.
     #[allow(
         clippy::too_many_lines,
         reason = "each attention role's call stays visible in one teacher-forced step"

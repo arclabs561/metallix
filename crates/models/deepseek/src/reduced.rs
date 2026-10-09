@@ -139,6 +139,19 @@ impl<'a> FinalHead<'a> {
     /// `norm_weight` is BF16 storage `[hidden_width]`; `head_weight` is FP32
     /// storage `[vocabulary, hidden_width]`; and `copies` is the number of
     /// copy-major residual rows to collapse for one token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinalHeadError::EmptyWidth`],
+    /// [`FinalHeadError::WidthTooLarge`], [`FinalHeadError::EmptyCopies`],
+    /// [`FinalHeadError::CopyCountTooLarge`],
+    /// [`FinalHeadError::EmptyVocabulary`],
+    /// [`FinalHeadError::VocabularyTooLarge`] for sizes outside their bounds,
+    /// [`FinalHeadError::InvalidEpsilon`] for an unusable epsilon,
+    /// [`FinalHeadError::Length`], [`FinalHeadError::ElementLimit`],
+    /// [`FinalHeadError::ShapeOverflow`] when a weight does not match, and
+    /// [`FinalHeadError::NonFiniteNormWeight`],
+    /// [`FinalHeadError::NonFiniteHeadWeight`] for a non-finite weight.
     pub fn new(
         norm_weight: &'a [u16],
         head_weight: &'a [f32],
@@ -158,6 +171,19 @@ impl<'a> FinalHead<'a> {
     /// Like [`Self::new`] for either head storage. FP32 weights keep the
     /// scalar FP32 linear limits; BF16 weights are bounded by
     /// [`MAX_BF16_HEAD_ELEMENTS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinalHeadError::EmptyWidth`],
+    /// [`FinalHeadError::WidthTooLarge`], [`FinalHeadError::EmptyCopies`],
+    /// [`FinalHeadError::CopyCountTooLarge`],
+    /// [`FinalHeadError::EmptyVocabulary`],
+    /// [`FinalHeadError::VocabularyTooLarge`] for sizes outside their bounds,
+    /// [`FinalHeadError::InvalidEpsilon`] for an unusable epsilon,
+    /// [`FinalHeadError::Length`], [`FinalHeadError::ElementLimit`],
+    /// [`FinalHeadError::ShapeOverflow`] when a weight does not match, and
+    /// [`FinalHeadError::NonFiniteNormWeight`],
+    /// [`FinalHeadError::NonFiniteHeadWeight`] for a non-finite weight.
     pub fn with_weights(
         norm_weight: &'a [u16],
         head_weight: HeadWeights<'a>,
@@ -266,6 +292,15 @@ impl<'a> FinalHead<'a> {
     /// `residual_bf16` must be `[copies, hidden_width]` and `incoming_pre`
     /// must be `[copies]`. The returned intermediate rows and logits are owned
     /// by the result, so a failed call leaves all caller-owned operands intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinalHeadError::Length`] when the inputs do not match the
+    /// head, [`FinalHeadError::UnsupportedExecution`] when the selected execution
+    /// cannot use the head's weight storage, [`FinalHeadError::HcMix`],
+    /// [`FinalHeadError::RmsNorm`], [`FinalHeadError::Linear`] or
+    /// [`FinalHeadError::NonFiniteProjectionInput`] when a stage fails, and
+    /// [`FinalHeadError::AllocationFailed`] when a buffer cannot be reserved.
     pub fn forward(
         &self,
         residual_bf16: &[u16],
@@ -309,6 +344,15 @@ impl<'a> FinalHead<'a> {
     /// HC collapse and `RMSNorm` keep their scalar BF16 staging, and the
     /// projection is FP32 over the exactly widened weights, so logits differ
     /// from the scalar BF16 path only by FP32 summation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinalHeadError::Length`] when the inputs do not match the
+    /// head, [`FinalHeadError::UnsupportedExecution`] when the head weights are
+    /// not stored as BF16, and [`FinalHeadError::Metal`],
+    /// [`FinalHeadError::MetalOutputLength`],
+    /// [`FinalHeadError::NonFiniteMetalOutput`] when the device projection
+    /// fails.
     #[cfg(feature = "metal")]
     pub fn forward_metal(
         &self,
@@ -419,6 +463,15 @@ impl MetalBf16Head {
     /// Validates `weights` like [`FinalHead::with_weights`] does for
     /// [`HeadWeights::Bf16`], then uploads them to the GPU and widens them
     /// there in blocks of rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FinalHeadError::EmptyVocabulary`],
+    /// [`FinalHeadError::EmptyWidth`], [`FinalHeadError::Length`],
+    /// [`FinalHeadError::ElementLimit`] for sizes that do not match,
+    /// [`FinalHeadError::NonFiniteHeadWeight`] for a non-finite weight, and
+    /// [`FinalHeadError::MetalDimension`], [`FinalHeadError::Metal`] when MLX
+    /// cannot hold or upload the matrix.
     pub fn new(weights: &[u16], vocabulary: usize, width: usize) -> Result<Self, FinalHeadError> {
         if width == 0 {
             return Err(FinalHeadError::EmptyWidth);

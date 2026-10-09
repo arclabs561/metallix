@@ -19,7 +19,12 @@ pub enum ScheduleError {
     LayerCount,
     /// A layer names an Engram definition the model does not hold.
     #[error("Engram index {index} is outside {available} definitions")]
-    EngramIndex { index: usize, available: usize },
+    EngramIndex {
+        /// The Engram index.
+        index: usize,
+        /// Engram definitions in the request.
+        available: usize,
+    },
     /// A window-only layer was given a compressed attention layout.
     #[error("window-only layer has a compressed attention layout")]
     WindowLayoutCompressed,
@@ -28,13 +33,28 @@ pub enum ScheduleError {
     MissingCompression,
     /// The attention layout's ratio disagrees with the layer kind.
     #[error("layer kind needs compression ratio {expected}, layout has {actual}")]
-    CompressionRatio { expected: usize, actual: usize },
+    CompressionRatio {
+        /// The ratio the layer kind needs.
+        expected: usize,
+        /// The layout's ratio.
+        actual: usize,
+    },
     /// An owner does not publish under its own layer number.
     #[error("owner must publish as layer {expected}, layout names {actual}")]
-    OwnerSource { expected: u16, actual: u16 },
+    OwnerSource {
+        /// The layer the owner must publish as.
+        expected: u16,
+        /// The layer the layout names.
+        actual: u16,
+    },
     /// A consumer or indexer has no matching latest preceding owner.
     #[error("no latest preceding ratio-{ratio} owner at source layer {source_layer}")]
-    MissingProducer { source_layer: u16, ratio: usize },
+    MissingProducer {
+        /// The expected source layer.
+        source_layer: u16,
+        /// The compression ratio.
+        ratio: usize,
+    },
     /// A ratio-two layer follows a ratio-one owner.
     #[error("ratio-two layers must precede ratio-one layers")]
     RatioOrder,
@@ -43,6 +63,7 @@ pub enum ScheduleError {
     MissingRatioOneOwner,
 }
 
+/// A reduced V4.1 request that cannot be built, or a step that failed.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum RequestError {
@@ -57,16 +78,34 @@ pub enum RequestError {
     AttentionGeometry,
     /// The layer schedule is not a valid sequence of producers and consumers.
     #[error("schedule layer {layer}: {reason}")]
-    Schedule { layer: usize, reason: ScheduleError },
+    Schedule {
+        /// The layer whose schedule failed.
+        layer: usize,
+        /// The schedule rule the layer breaks.
+        reason: ScheduleError,
+    },
     /// A per-layer expert-source slice did not have one entry per model layer.
     #[error("request needs {expected} per-layer expert sources, got {actual}")]
-    ExpertSourceCount { expected: usize, actual: usize },
+    ExpertSourceCount {
+        /// Layers with experts.
+        expected: usize,
+        /// Sources supplied.
+        actual: usize,
+    },
     /// A per-Engram row-source slice did not have one entry per Engram definition.
     #[error("request needs {expected} per-Engram row sources, got {actual}")]
-    EngramRowSourceCount { expected: usize, actual: usize },
+    EngramRowSourceCount {
+        /// Engram layers.
+        expected: usize,
+        /// Sources supplied.
+        actual: usize,
+    },
     /// A requested static or dynamic request surface exceeds its bound.
     #[error("request has {elements} tokens beyond the bounded maximum")]
-    ElementLimit { elements: usize },
+    ElementLimit {
+        /// Tokens in the request.
+        elements: usize,
+    },
     /// A prior admitted stage failed after possibly advancing inner state.
     #[error("request is poisoned; restart is required")]
     Poisoned,
@@ -75,33 +114,54 @@ pub enum RequestError {
     EmptyIds,
     /// A post-prefill call included more than one decode token.
     #[error("request decode accepts one token, got {actual}")]
-    DecodeChunk { actual: usize },
+    DecodeChunk {
+        /// Tokens supplied.
+        actual: usize,
+    },
     /// Absolute token arithmetic overflowed before state mutation.
     #[error("request token position overflowed")]
     PositionOverflow,
     /// The requested call would exceed the immutable request token limit.
     #[error("request end {end} exceeds configured maximum {maximum}")]
-    TokenLimit { end: usize, maximum: usize },
+    TokenLimit {
+        /// Exclusive end of the call.
+        end: usize,
+        /// The configured maximum.
+        maximum: usize,
+    },
     /// The model's full rotary table is too short for a requested span.
     #[error("request needs {required} rotary-frequency elements, table has {available}")]
-    FrequencyTable { required: usize, available: usize },
+    FrequencyTable {
+        /// Elements the call needs.
+        required: usize,
+        /// Elements the table holds.
+        available: usize,
+    },
     /// Startup accepts unsigned IDs and rejected a negative input ID.
     #[error("request token ID {id} cannot convert to startup unsigned form")]
-    NegativeToken { id: i64 },
+    NegativeToken {
+        /// The negative token ID.
+        id: i64,
+    },
     /// An incomplete ratio-two group had no previous-step ratio-one owner keys.
     #[error("a partial ratio-two owner call needs an earlier successful ratio-one publication")]
     MissingPriorLayerThree,
     /// A composed buffer did not match its exact stage geometry.
     #[error("request buffer {field} has {actual} elements, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
     /// A bounded owned stage buffer could not be allocated.
     #[error("request allocation failed for {field} with {elements} elements")]
     Allocation {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
     /// Startup execution rejected its live input or operands.

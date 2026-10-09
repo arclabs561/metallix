@@ -231,7 +231,10 @@ impl RotaryFrequencyParameters {
 pub enum RotaryFrequencyError {
     /// The source's adjacent-complex layout requires an even scalar width.
     #[error("rotary width {width} must be even")]
-    OddRotaryWidth { width: usize },
+    OddRotaryWidth {
+        /// Rotary width in values.
+        width: usize,
+    },
     /// The source base must be finite and strictly positive.
     #[error("rotary base must be finite and strictly positive")]
     InvalidBase,
@@ -246,10 +249,18 @@ pub enum RotaryFrequencyError {
     OutputLengthOverflow,
     /// The allocator could not reserve the bounded result buffer.
     #[error("could not allocate {elements} rotary frequencies")]
-    AllocationFailed { elements: usize },
+    AllocationFailed {
+        /// Frequencies that could not be reserved.
+        elements: usize,
+    },
     /// Source-equivalent FP32 arithmetic produced a non-finite frequency.
     #[error("rotary frequency at position {position}, pair {pair} is not finite")]
-    NonFiniteOutput { position: usize, pair: usize },
+    NonFiniteOutput {
+        /// Position index in the frequency table.
+        position: usize,
+        /// Pair index within that position.
+        pair: usize,
+    },
 }
 
 /// Validated shape of a contiguous V4.1 rotary tail.
@@ -323,13 +334,26 @@ pub enum RotaryError {
     LayoutOverflow,
     /// The input scalar buffer does not match the validated shape.
     #[error("rotary tail contains {actual} scalar values, expected {expected}")]
-    ValueLengthMismatch { actual: usize, expected: usize },
+    ValueLengthMismatch {
+        /// Supplied values.
+        actual: usize,
+        /// Values the layout requires.
+        expected: usize,
+    },
     /// The frequency buffer does not contain one value per sequence/pair.
     #[error("rotary frequencies contain {actual} pairs, expected {expected}")]
-    FrequencyLengthMismatch { actual: usize, expected: usize },
+    FrequencyLengthMismatch {
+        /// Supplied pairs.
+        actual: usize,
+        /// Pairs the layout requires.
+        expected: usize,
+    },
     /// One input scalar was not finite.
     #[error("rotary tail value at scalar index {index} is not finite")]
-    NonFiniteValue { index: usize },
+    NonFiniteValue {
+        /// Flat index into the values.
+        index: usize,
+    },
     /// A complex frequency component was not finite.
     #[error("rotary frequency components must be finite")]
     NonFiniteFrequency,
@@ -345,7 +369,10 @@ pub enum RotaryMetalError {
     Contract(#[from] RotaryError),
     /// A validated dimension cannot be represented by MLX's signed shape type.
     #[error("{field} does not fit MLX's shape representation")]
-    DimensionOutOfRange { field: &'static str },
+    DimensionOutOfRange {
+        /// The dimension's role.
+        field: &'static str,
+    },
     /// MLX could not construct, evaluate, or read back the Metal graph.
     #[error("MLX Metal rotary-tail evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),

@@ -47,8 +47,14 @@ pub(super) enum LayerState {
 /// [`super::StartupDefinition::with_row_source`]; a dense-table startup ignores it.
 #[derive(Clone, Copy, Default)]
 pub struct StepSources<'a> {
+    /// Routed-expert sources indexed by model layer; `None` keeps the
+    /// construction-time experts.
     pub experts: &'a [Option<&'a dyn RoutedExpertSource>],
+    /// Engram row sources indexed by Engram definition; `None` keeps the
+    /// construction-time table.
     pub engram_rows: &'a [Option<&'a dyn EngramRowSource>],
+    /// Embedding rows for a row-source startup; ignored by a dense-table
+    /// startup.
     pub embedding_rows: Option<&'a dyn EmbeddingRowSource>,
 }
 
@@ -81,6 +87,11 @@ pub struct RequestSession<'a> {
 
 impl<'a> RequestSession<'a> {
     /// Constructs all request-local owners from one immutable model definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `RequestError` of the first layer session that cannot be
+    /// built.
     pub fn new(model: &'a RequestModel<'a>) -> Result<Self, RequestError> {
         Self::build(model)
     }
@@ -145,6 +156,11 @@ impl<'a> RequestSession<'a> {
     }
 
     /// Drops every request-local publication and reconstructs pristine inner state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `RequestError` of the first layer session that cannot be
+    /// rebuilt.
     pub fn restart(&mut self) -> Result<(), RequestError> {
         let rebuilt = Self::build(self.model)?;
         *self = rebuilt;
@@ -152,6 +168,16 @@ impl<'a> RequestSession<'a> {
     }
 
     /// Executes a prefill at start zero or one-token decode at the request cursor.
+    ///
+    /// # Errors
+    ///
+    /// * `RequestError::EmptyIds`, `RequestError::DecodeChunk`,
+    ///   `RequestError::TokenLimit` and `RequestError::PositionOverflow` when
+    ///   the call's tokens or position do not fit.
+    /// * `RequestError::Poisoned` after an earlier failure; call
+    ///   [`RequestSession::restart`].
+    /// * The wrapped layer error (`Startup`, `Engram`, `Input`, `LayerOne`
+    ///   through `LayerFour`) of the first stage that fails.
     pub fn step(&mut self, ids: &[i64]) -> Result<RequestStepOutput, RequestError> {
         self.step_with_sources(ids, StepSources::default())
     }
@@ -163,6 +189,19 @@ impl<'a> RequestSession<'a> {
     /// the only shape a step after the first admits. Returns the last step's
     /// output; call [`Self::step_with_sources`] directly to keep each step's.
     /// Each position attends to the same causal history as in one prefill.
+    ///
+    /// # Errors
+    ///
+    /// * `RequestError::EmptyIds`, `RequestError::DecodeChunk`,
+    ///   `RequestError::TokenLimit` and `RequestError::PositionOverflow` when
+    ///   the call's tokens or position do not fit.
+    /// * `RequestError::Poisoned` after an earlier failure; call
+    ///   [`RequestSession::restart`].
+    /// * The wrapped layer error (`Startup`, `Engram`, `Input`, `LayerOne`
+    ///   through `LayerFour`) of the first stage that fails.
+    /// * `RequestError::ExpertSourceCount` and
+    ///   `RequestError::EngramRowSourceCount` when `sources` does not supply
+    ///   one source per layer.
     pub fn prefill_with_sources(
         &mut self,
         ids: &[i64],
@@ -189,6 +228,19 @@ impl<'a> RequestSession<'a> {
     /// Each [`StepSources`] slice is either empty (no sources of that kind)
     /// or has exactly one entry per model layer or Engram definition; a
     /// mismatch is rejected before admission without poisoning the session.
+    ///
+    /// # Errors
+    ///
+    /// * `RequestError::EmptyIds`, `RequestError::DecodeChunk`,
+    ///   `RequestError::TokenLimit` and `RequestError::PositionOverflow` when
+    ///   the call's tokens or position do not fit.
+    /// * `RequestError::Poisoned` after an earlier failure; call
+    ///   [`RequestSession::restart`].
+    /// * The wrapped layer error (`Startup`, `Engram`, `Input`, `LayerOne`
+    ///   through `LayerFour`) of the first stage that fails.
+    /// * `RequestError::ExpertSourceCount` and
+    ///   `RequestError::EngramRowSourceCount` when `sources` does not supply
+    ///   one source per layer.
     pub fn step_with_sources(
         &mut self,
         ids: &[i64],

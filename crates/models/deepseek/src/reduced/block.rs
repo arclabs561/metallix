@@ -44,6 +44,21 @@ impl<'a> BlockTailReference<'a> {
     /// The attention HC projection is row-major
     /// `[(copies + 2) * copies, copies * hidden_width]`. `ffn` remains the
     /// authority for the following FFN sublayer's independent operands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockTailError::EmptyCopies`], [`BlockTailError::EmptyWidth`],
+    /// [`BlockTailError::CopyCountTooLarge`],
+    /// [`BlockTailError::WidthTooLarge`], [`BlockTailError::CopyCountMismatch`]
+    /// for sizes outside their bounds, [`BlockTailError::InvalidNormEpsilon`],
+    /// [`BlockTailError::InvalidHcEpsilon`],
+    /// [`BlockTailError::InvalidSinkhornIterations`] for unusable controls,
+    /// [`BlockTailError::Length`], [`BlockTailError::ProjectionTooLarge`],
+    /// [`BlockTailError::ShapeOverflow`] when a buffer does not match, and
+    /// [`BlockTailError::NonFiniteScale`],
+    /// [`BlockTailError::NonFiniteProjection`],
+    /// [`BlockTailError::NonFiniteBase`] for non-finite Hyper-Connection
+    /// parameters.
     #[allow(
         clippy::too_many_arguments,
         reason = "the source stores each attention HC role separately"
@@ -155,6 +170,14 @@ impl<'a> BlockTailReference<'a> {
     /// `residual` is copy-major `[copies, hidden_width]`; `attention` is the
     /// already computed BF16 attention row `[hidden_width]`. A successful
     /// result owns every intermediate and leaves the borrowed operands intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockTailError::Length`] when `residual` or `attention` does
+    /// not match the copies and width, [`BlockTailError::HcProjection`],
+    /// [`BlockTailError::HcMix`], [`BlockTailError::Ffn`] when a stage fails,
+    /// and [`BlockTailError::AllocationFailed`] when a buffer cannot be
+    /// reserved.
     pub fn forward_token(
         &self,
         residual: &[u16],
@@ -165,6 +188,14 @@ impl<'a> BlockTailReference<'a> {
 
     /// Same as [`Self::forward_token`], with routed experts fetched from `source`
     /// after routing instead of from the FFN's construction-time table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlockTailError::Length`] when `residual` or `attention` does
+    /// not match the copies and width, [`BlockTailError::HcProjection`],
+    /// [`BlockTailError::HcMix`], [`BlockTailError::Ffn`] when a stage fails,
+    /// and [`BlockTailError::AllocationFailed`] when a buffer cannot be
+    /// reserved.
     pub fn forward_token_with(
         &self,
         residual: &[u16],

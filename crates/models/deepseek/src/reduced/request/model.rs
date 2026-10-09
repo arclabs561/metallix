@@ -63,6 +63,11 @@ impl<'a> RequestModel<'a> {
     /// This is [`Self::from_schedule`] over startup, Engram, L1 ratio-two
     /// owner, L2 ratio-two consumer, Engram, L3 ratio-one owner, and L4
     /// candidate indexer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RequestError::LayerTwoGeometry` when layer two's compression
+    /// differs from layer one's, and the errors of [`RequestModel::from_schedule`].
     #[allow(
         clippy::too_many_arguments,
         reason = "the fixed numbered block definitions are explicit"
@@ -112,6 +117,13 @@ impl<'a> RequestModel<'a> {
     /// ratio-one owner whose previous-step keys score incomplete groups.
     /// Window-only layers use the startup rotary table; every compressed
     /// layer uses `frequencies`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RequestError::Schedule` naming the first layer whose schedule is
+    /// invalid, `RequestError::BlockGeometry` or `RequestError::AttentionGeometry`
+    /// when the layers do not fit together, and `RequestError::ElementLimit` past
+    /// the token bound.
     pub fn from_schedule(
         startup: StartupDefinition<'a>,
         layers: Vec<ScheduledLayer<'a>>,

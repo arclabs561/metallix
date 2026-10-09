@@ -62,6 +62,13 @@ pub struct StartupSession<'a> {
 
 impl<'a> StartupSession<'a> {
     /// Constructs a bounded batch-one window-only startup block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupSessionError::Geometry`] when the table, attention
+    /// layout and block tail do not fit together, and
+    /// [`StartupSessionError::Startup`] or [`StartupSessionError::Input`] when
+    /// a component rejects its weights.
     pub fn new(
         table: &'a [u16],
         norm: &'a [u16],
@@ -87,6 +94,11 @@ impl<'a> StartupSession<'a> {
 
     /// Like [`Self::new`] over a `vocabulary`-row table whose rows each step
     /// reads from the [`EmbeddingRowSource`] passed to [`Self::step_with_sources`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupSessionError::Startup`] for an empty vocabulary, and
+    /// the other construction errors of [`StartupSession::new`].
     pub fn with_row_source(
         vocabulary: usize,
         norm: &'a [u16],
@@ -147,6 +159,11 @@ impl<'a> StartupSession<'a> {
     }
 
     /// Clears the window and cursor, retaining the supplied immutable operands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartupSessionError::Attention`] when the attention state
+    /// cannot reset.
     pub fn reset(&mut self) -> Result<(), StartupSessionError> {
         self.attention.reset()?;
         self.next_start = 0;
@@ -158,6 +175,24 @@ impl<'a> StartupSession<'a> {
     ///
     /// An out-of-order call is rejected without invalidating an otherwise healthy
     /// session. Any error during an admitted call invalidates the entire session.
+    ///
+    /// # Errors
+    ///
+    /// [`StartupSessionError::Poisoned`], [`StartupSessionError::UnexpectedStart`]
+    /// and row-source errors leave the session as it was; any later error
+    /// poisons it until [`StartupSession::reset`].
+    /// * [`StartupSessionError::Poisoned`] after an earlier failure, and
+    ///   [`StartupSessionError::UnexpectedStart`] when `start` does not
+    ///   continue the sequence.
+    /// * [`StartupSessionError::ElementLimit`],
+    ///   [`StartupSessionError::Allocation`] when the step's buffers do not
+    ///   fit.
+    /// * [`StartupSessionError::MissingEmbeddingRows`],
+    ///   [`StartupSessionError::RowsUnavailable`] when a row-source session
+    ///   gets no rows.
+    /// * [`StartupSessionError::Startup`], [`StartupSessionError::Input`],
+    ///   [`StartupSessionError::Attention`], [`StartupSessionError::Tail`] when
+    ///   a stage fails.
     pub fn step(
         &mut self,
         start: usize,
@@ -169,6 +204,24 @@ impl<'a> StartupSession<'a> {
 
     /// Same as [`Self::step`], with the block tail's routed experts fetched
     /// from `experts` when supplied instead of its construction-time table.
+    ///
+    /// # Errors
+    ///
+    /// [`StartupSessionError::Poisoned`], [`StartupSessionError::UnexpectedStart`]
+    /// and row-source errors leave the session as it was; any later error
+    /// poisons it until [`StartupSession::reset`].
+    /// * [`StartupSessionError::Poisoned`] after an earlier failure, and
+    ///   [`StartupSessionError::UnexpectedStart`] when `start` does not
+    ///   continue the sequence.
+    /// * [`StartupSessionError::ElementLimit`],
+    ///   [`StartupSessionError::Allocation`] when the step's buffers do not
+    ///   fit.
+    /// * [`StartupSessionError::MissingEmbeddingRows`],
+    ///   [`StartupSessionError::RowsUnavailable`] when a row-source session
+    ///   gets no rows.
+    /// * [`StartupSessionError::Startup`], [`StartupSessionError::Input`],
+    ///   [`StartupSessionError::Attention`], [`StartupSessionError::Tail`] when
+    ///   a stage fails.
     pub fn step_with(
         &mut self,
         start: usize,
@@ -183,6 +236,24 @@ impl<'a> StartupSession<'a> {
     /// a session built [`Self::with_row_source`]; a dense-table session
     /// ignores `rows`. A row-source failure is rejected before admission and
     /// leaves the session unpoisoned.
+    ///
+    /// # Errors
+    ///
+    /// [`StartupSessionError::Poisoned`], [`StartupSessionError::UnexpectedStart`]
+    /// and row-source errors leave the session as it was; any later error
+    /// poisons it until [`StartupSession::reset`].
+    /// * [`StartupSessionError::Poisoned`] after an earlier failure, and
+    ///   [`StartupSessionError::UnexpectedStart`] when `start` does not
+    ///   continue the sequence.
+    /// * [`StartupSessionError::ElementLimit`],
+    ///   [`StartupSessionError::Allocation`] when the step's buffers do not
+    ///   fit.
+    /// * [`StartupSessionError::MissingEmbeddingRows`],
+    ///   [`StartupSessionError::RowsUnavailable`] when a row-source session
+    ///   gets no rows.
+    /// * [`StartupSessionError::Startup`], [`StartupSessionError::Input`],
+    ///   [`StartupSessionError::Attention`], [`StartupSessionError::Tail`] when
+    ///   a stage fails.
     pub fn step_with_sources(
         &mut self,
         start: usize,
@@ -304,26 +375,32 @@ pub struct StartupStepOutput {
 }
 
 impl StartupStepOutput {
+    /// The embedding startup output.
     #[must_use]
     pub const fn startup(&self) -> &StartupOutput {
         &self.startup
     }
+    /// The normalized attention input, BF16.
     #[must_use]
     pub fn attention_input(&self) -> &[u16] {
         &self.attention_input
     }
+    /// The first attention layer's stages.
     #[must_use]
     pub const fn attention(&self) -> &LayerAttentionDiagnostic {
         &self.attention
     }
+    /// Each position's block-tail stages.
     #[must_use]
     pub fn tails(&self) -> &[BlockTailDiagnostic] {
         &self.tails
     }
+    /// The residual after the block, BF16.
     #[must_use]
     pub fn residual(&self) -> &[u16] {
         &self.residual
     }
+    /// The Hyper-Connections pre-mix for the next block.
     #[must_use]
     pub fn next_pre(&self) -> &[f32] {
         &self.next_pre
@@ -345,26 +422,45 @@ fn reserve<T>(elements: Option<usize>) -> Result<Vec<T>, StartupSessionError> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StartupSessionError {
+    /// The embedding table, attention layout and block tail do not fit together.
     #[error("startup block geometry is incompatible")]
     Geometry,
+    /// An earlier call failed; reset the session.
     #[error("startup session requires reset after a failed call")]
     Poisoned,
+    /// The call does not start where the session expects.
     #[error("startup position {actual} differs from expected {expected}")]
-    UnexpectedStart { expected: usize, actual: usize },
+    UnexpectedStart {
+        /// The session's next position.
+        expected: usize,
+        /// The call's start position.
+        actual: usize,
+    },
+    /// A buffer would pass the session's element bound.
     #[error("startup session exceeds bounded element count")]
     ElementLimit,
+    /// A buffer could not be reserved.
     #[error("startup session allocation failed")]
     Allocation,
+    /// The session owns no embedding table, so it needs a row source.
     #[error("row-source startup needs an embedding row source")]
     MissingEmbeddingRows,
+    /// The row source could not supply the rows.
     #[error("startup embedding rows unavailable: {reason}")]
-    RowsUnavailable { reason: String },
+    RowsUnavailable {
+        /// The row source's explanation.
+        reason: String,
+    },
+    /// The startup reference rejected its input.
     #[error(transparent)]
     Startup(#[from] StartupError),
+    /// Attention-input preparation rejected its input.
     #[error(transparent)]
     Input(#[from] AttentionInputError),
+    /// The attention layer rejected the call.
     #[error(transparent)]
     Attention(#[from] LayerAttentionError),
+    /// The block tail rejected its input.
     #[error(transparent)]
     Tail(#[from] BlockTailError),
 }

@@ -69,6 +69,15 @@ impl<'a> CandidateProjector<'a> {
     /// The selection call remains explicit because cache/publication provenance is
     /// owned by the surrounding request. Its score matrix dimensions must match
     /// the supplied input rows and reconstructed key rows exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandidateProjectorError::BatchCount`] or
+    /// [`CandidateProjectorError::CallGeometry`] when the call does not match
+    /// the projector's layout, [`CandidateProjectorError::Scored`] when the keys
+    /// are invalid or query scoring fails, and
+    /// [`CandidateProjectorError::Selection`] when candidate selection rejects
+    /// the scores.
     pub fn project(
         &self,
         input: &[u16],
@@ -140,6 +149,11 @@ impl CandidateProjection {
     }
 
     /// Applies this candidate mask to this producer's freshly computed scores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CandidateProjectorError::Selection`] when final selection
+    /// rejects the scores.
     pub fn select(
         &self,
         index_topk: usize,
@@ -165,15 +179,22 @@ impl CandidateProjection {
 pub enum CandidateProjectorError {
     /// This narrow candidate scorer accepts exactly one explicit batch.
     #[error("candidate projector requires exactly one batch, got {actual}")]
-    BatchCount { actual: usize },
+    BatchCount {
+        /// The layout's batch count.
+        actual: usize,
+    },
     /// Input and key rows disagree with the caller's selection-call matrix.
     #[error(
         "candidate projector input/key geometry is [{input_positions}, {key_count}], expected [{expected_positions}, {expected_keys}]"
     )]
     CallGeometry {
+        /// Positions in the input.
         input_positions: usize,
+        /// Keys in the prefix.
         key_count: usize,
+        /// Positions the call expects.
         expected_positions: usize,
+        /// Keys the call expects.
         expected_keys: usize,
     },
     /// Query scoring rejected caller-owned operands.

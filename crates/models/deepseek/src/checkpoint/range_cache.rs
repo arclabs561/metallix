@@ -73,6 +73,11 @@ impl RelativeTensorRange {
 /// rechecks the length.
 pub trait V41RangeSource {
     /// Reads the requested range.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`V41RangeCacheError`] when the bytes cannot be read;
+    /// implementations report I/O failures as [`V41RangeCacheError::Io`].
     fn read_range(&self, request: &V41RangeRequest<'_>) -> Result<Vec<u8>, V41RangeCacheError>;
 
     /// Called when [`V41RangeCache`] serves `request` from memory without
@@ -355,6 +360,11 @@ pub struct V41RangeCache<S> {
 impl<S: V41RangeSource> V41RangeCache<S> {
     /// Builds a cache over `headers`, each checked against `index` for an
     /// exact tensor-name agreement. Shards without a header stay unreadable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41RangeCacheError::Header`] or [`V41RangeCacheError::Index`]
+    /// when a supplied header disagrees with the index about its shard.
     pub fn new(
         source: S,
         index: V41SafetensorsIndex,
@@ -382,6 +392,15 @@ impl<S: V41RangeSource> V41RangeCache<S> {
     /// `header_bytes`, `header_sha256` and `file_bytes` for `revision`, and
     /// `trace_dir/headers/<shard>.header.bin` holds its prefixed header. The
     /// index and every listed header must match their recorded digests.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41RangeCacheError::Io`] when the index, a receipt or a header
+    ///   cannot be read.
+    /// * [`V41RangeCacheError::HeadersManifest`] and
+    ///   [`V41RangeCacheError::ReceiptJson`] when the trace's manifest or a
+    ///   receipt does not parse or names another revision.
+    /// * The errors of [`V41RangeCache::new`].
     pub fn load(
         source: S,
         index_path: &Path,
@@ -435,6 +454,11 @@ impl<S: V41RangeSource> V41RangeCache<S> {
     }
 
     /// Returns a named tensor's validated header dtype, shape and range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`V41RangeCacheError::UnknownTensor`] for a tensor the index
+    /// does not list.
     pub fn tensor_range(&self, tensor: &str) -> Result<V41TensorRange, V41RangeCacheError> {
         self.lookup(tensor).map(|(_, range)| range)
     }
@@ -446,6 +470,20 @@ impl<S: V41RangeSource> V41RangeCache<S> {
     }
 
     /// Returns the cached or freshly read bytes of a whole named tensor.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41RangeCacheError::UnknownTensor`] for a tensor the index does not
+    ///   list.
+    /// * [`V41RangeCacheError::BudgetTooSmall`] when the tensor is larger than
+    ///   the cache budget.
+    /// * [`V41RangeCacheError::NotLocal`],
+    ///   [`V41RangeCacheError::SizeMismatch`],
+    ///   [`V41RangeCacheError::HashMismatch`] and
+    ///   [`V41RangeCacheError::ReceiptMismatch`] when the local bytes are
+    ///   missing or do not match their receipt.
+    /// * [`V41RangeCacheError::Io`] and [`V41RangeCacheError::Allocation`] when
+    ///   reading fails.
     pub fn get_tensor(&mut self, tensor: &str) -> Result<Arc<[u8]>, V41RangeCacheError> {
         let (shard, range) = self.lookup(tensor)?;
         let file_range = range.file_range();
@@ -456,6 +494,12 @@ impl<S: V41RangeSource> V41RangeCache<S> {
     /// `layers.N.engram.embed.weight` or its `.scale` companion. Row `r`
     /// occupies `r * row_bytes .. (r + 1) * row_bytes` of the tensor, with
     /// `row_bytes = shape[1] * dtype bytes`.
+    ///
+    /// # Errors
+    ///
+    /// * [`V41RangeCacheError::RowRangeOutOfBounds`] when `rows` falls outside
+    ///   the table.
+    /// * The errors of [`V41RangeCache::get_tensor`] for the table.
     pub fn get_rows(
         &mut self,
         table: &str,
