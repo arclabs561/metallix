@@ -45,6 +45,8 @@ METRICS = {
     "output_tok_s": (("output_token_throughput",), True),
     "tpot_p50_ms": (("tpot_ms", "p50"), False),
     "ttft_p50_ms": (("ttft_ms", "p50"), False),
+    "ttft_p90_ms": (("ttft_ms", "p90"), False),
+    "itl_p99_ms": (("itl_ms", "p99"), False),
 }
 
 
@@ -116,7 +118,20 @@ def summarize_pairs(pairs: list[dict], rng: random.Random) -> dict:
         if not ratios:
             continue
         low, high = bootstrap_median_ci(ratios, rng)
+        # A tail percentile from too few samples is the run's max, so its ratio
+        # compares maxima; say so rather than report it as a percentile.
+        unresolved = []
+        if path[-1] in ("p90", "p99"):
+            q = int(path[-1][1:])
+            unresolved = [
+                n
+                for pair in kept
+                for arm in "AB"
+                if (n := pair[arm]["summary"][path[0]].get("n")) is not None
+                and not bench_load.resolves(q, n)
+            ]
         out["metrics"][name] = {
+            "unresolved_n": min(unresolved) if unresolved else None,
             "median_ratio": statistics.median(ratios),
             "ci95": [low, high],
             "ratios": ratios,
@@ -154,6 +169,11 @@ def render(summary: dict, pairs: list[dict]) -> str:
             f"{name} B/A median {m['median_ratio']:.3f} "
             f"[95% CI {m['ci95'][0]:.3f}-{m['ci95'][1]:.3f}] ({direction} is better): "
             f"{m['verdict']}"
+            + (
+                f" (runs with n={m['unresolved_n']} compare the max, not {METRICS[name][0][-1]})"
+                if m.get("unresolved_n") is not None
+                else ""
+            )
         )
     return "\n".join(lines)
 

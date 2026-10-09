@@ -50,6 +50,35 @@ def drifting_machine(drift_per_run: float, noise: float, seed: int):
     return measure, runs
 
 
+class Tails(unittest.TestCase):
+    def test_tail_metrics_are_compared_and_flagged_when_unresolved(self) -> None:
+        self.assertIn("ttft_p90_ms", bench_pair.METRICS)
+        self.assertIn("itl_p99_ms", bench_pair.METRICS)
+
+        def run(scale: float) -> dict:
+            ttft = bench_load.distribution([scale * v for v in range(1, 33)])
+            itl = bench_load.distribution([scale * v for v in range(1, 61)])
+            return {
+                "summary": {
+                    "output_token_throughput": 100.0 / scale,
+                    "tpot_ms": {"p50": scale},
+                    "ttft_ms": ttft,
+                    "itl_ms": itl,
+                }
+            }
+
+        pairs = [
+            {"pair": i, "order": "AB", "A": run(1.0), "B": run(1.1)} for i in range(4)
+        ]
+        summary = bench_pair.summarize_pairs(pairs, random.Random(0))
+        p90 = summary["metrics"]["ttft_p90_ms"]
+        self.assertAlmostEqual(p90["median_ratio"], 1.1)
+        self.assertIsNone(p90["unresolved_n"])  # 32 requests resolve p90.
+        itl = summary["metrics"]["itl_p99_ms"]
+        self.assertEqual(itl["unresolved_n"], 60)  # 60 gaps do not resolve p99.
+        self.assertIn("compare the max, not p99", bench_pair.render(summary, pairs))
+
+
 class Order(unittest.TestCase):
     def test_pairs_alternate_which_arm_goes_first(self) -> None:
         self.assertEqual(

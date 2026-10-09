@@ -167,6 +167,59 @@ def row(engine, value, number, tokens=128, grade=True):
     }
 
 
+def tail_row(number: int, ttfts: list[float]) -> dict:
+    records = [
+        {
+            "index": i,
+            "outcome": "ok",
+            "ttft_ms": t,
+            "itl_ms": [t / 10, t / 5],
+            "output_tokens": 3,
+        }
+        for i, t in enumerate(ttfts)
+    ]
+    ok = records
+    summary = {
+        "output_token_throughput": 100.0,
+        "ttft_ms": bench_campaign.bench_load.distribution([r["ttft_ms"] for r in ok]),
+        "tpot_ms": {"p50": 10.0},
+        "itl_ms": bench_campaign.bench_load.distribution(
+            [g for r in ok for g in r["itl_ms"]]
+        ),
+    }
+    return {
+        "engine": "metallix",
+        "set": "short",
+        "cache": "on",
+        "concurrency": 1,
+        "pass": f"pass {number}",
+        "summary": summary,
+        "records": records,
+        "claim_grade": True,
+    }
+
+
+class PooledTails(unittest.TestCase):
+    def test_tails_pool_requests_across_passes(self) -> None:
+        # Three 40-request passes; one slow pass holds the true tail.
+        rows = [
+            tail_row(1, [10.0] * 40),
+            tail_row(2, [10.0] * 40),
+            tail_row(3, [10.0] * 28 + [500.0] * 12),
+        ]
+        summary = bench_campaign.summarize_rows(rows)
+        stats = summary["cells"][0]["stats"]["metallix"]
+        # Per pass p90 is 10, 10, 500, so their median says 10; pooled over
+        # 120 requests, 12 are slow and p90 is the slow value.
+        self.assertEqual(stats["ttft_p90_ms"]["median"], 10.0)
+        pooled = stats["ttft_p90_ms"]["pooled"]
+        self.assertEqual((pooled["n"], pooled["resolved"]), (120, True))
+        self.assertGreater(pooled["value"], 10.0)
+        # 240 gaps resolve p99.
+        self.assertEqual(stats["itl_p99_ms"]["pooled"]["n"], 240)
+        self.assertIn("TTFT p90 / ITL p99", bench_campaign.render(summary))
+
+
 class Summaries(unittest.TestCase):
     def test_claims_compare_the_subject_with_each_competitor(self) -> None:
         rows = [row("metallix", v, n) for n, v in enumerate([600, 610, 620], 1)]

@@ -50,7 +50,33 @@ METRICS = {
     "output_tok_s": (("output_token_throughput",), True),
     "ttft_p50_ms": (("ttft_ms", "p50"), False),
     "tpot_p50_ms": (("tpot_ms", "p50"), False),
+    "ttft_p90_ms": (("ttft_ms", "p90"), False),
+    "itl_p99_ms": (("itl_ms", "p99"), False),
 }
+# Tail metrics are also computed over every pass's requests pooled: a p99 of
+# one 64-request pass is about its max, and the median of three maxima is no
+# p99. Record field and percentile per pooled metric.
+POOLED_TAILS = {"ttft_p90_ms": ("ttft_ms", 90), "itl_p99_ms": ("itl_ms", 99)}
+
+
+def pooled_tail(rows: list[dict], field: str, q: int) -> dict:
+    """The q-th percentile of `field` over the successful requests of every
+    pass, with the sample count, and the max when the count is too small."""
+    values = []
+    for row in rows:
+        for record in row["records"]:
+            value = record.get(field)
+            if record.get("outcome") != "ok" or value is None:
+                continue
+            values += value if isinstance(value, list) else [value]
+    return {
+        "value": bench_load.percentile(values, q),
+        "max": max(values) if values else None,
+        "n": len(values),
+        "resolved": bench_load.resolves(q, len(values)),
+    }
+
+
 SIGNIFICANT_RATIO = 1.5
 PARITY_BAND = 0.10
 # The baseline gate: each engine's passes within this share of their median.
@@ -338,6 +364,10 @@ def summarize_rows(rows: list[dict], subject: str = SUBJECT) -> dict:
                     if (v := metric(r["summary"], path)) is not None
                 ]
                 stats[engine][name] = spread(values) if values else None
+                if name in POOLED_TAILS and stats[engine][name] is not None:
+                    stats[engine][name]["pooled"] = pooled_tail(
+                        engine_rows, *POOLED_TAILS[name]
+                    )
             deviation = (stats[engine]["output_tok_s"] or {}).get("max_deviation")
             if deviation is not None and deviation > SPREAD_LIMIT:
                 warnings.append(
@@ -405,13 +435,14 @@ def render(summary: dict) -> str:
     lines = [
         (
             "set/cache            c  engine        out tok/s med [min-max]   "
-            "TTFT p50 ms med [min-max]   TPOT p50 ms med [min-max]   n"
+            "TTFT p50 ms med [min-max]   TPOT p50 ms med [min-max]   n  "
+            "TTFT p90 / ITL p99 ms, all passes"
         )
     ]
     for cell in summary["cells"]:
         for engine, stats in cell["stats"].items():
             parts = []
-            for name in METRICS:
+            for name in ("output_tok_s", "ttft_p50_ms", "tpot_p50_ms"):
                 s = stats[name]
                 digits = 1 if name == "tpot_p50_ms" else 0
                 parts.append(
@@ -421,9 +452,20 @@ def render(summary: dict) -> str:
                     f"{fmt(s['max'], digits)}]"
                 )
             n = (stats["output_tok_s"] or {}).get("n", 0)
+            tails = []
+            for name in POOLED_TAILS:
+                pooled = (stats[name] or {}).get("pooled")
+                tails.append(
+                    "-"
+                    if pooled is None
+                    else fmt(pooled["value"], 1)
+                    if pooled["resolved"]
+                    else f"{fmt(pooled['max'], 1)}*"
+                )
             lines.append(
                 f"{cell['set'] + '/' + cell['cache']:<20} {cell['concurrency']:>2}  "
-                f"{engine:<12}  {parts[0]:<26} {parts[1]:<27} {parts[2]:<27} {n}"
+                f"{engine:<12}  {parts[0]:<26} {parts[1]:<27} {parts[2]:<27} {n}  "
+                f"{tails[0]} / {tails[1]}"
             )
         for engine, claims in cell["claims"].items():
             verdicts = ", ".join(
@@ -437,6 +479,10 @@ def render(summary: dict) -> str:
     lines += [
         f"note: {engine}: {note}" for engine, note in summary.get("notes", {}).items()
     ]
+    lines.append(
+        "* the max: too few requests across passes for that percentile "
+        "(p90 needs 10, p99 100)"
+    )
     lines += [f"no numbers: {line}" for line in summary.get("unmeasured", [])]
     lines += [f"warning: {warning}" for warning in summary["warnings"]]
     return "\n".join(lines)

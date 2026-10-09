@@ -172,6 +172,28 @@ class Metrics(unittest.TestCase):
         self.assertEqual(s["ttft_ms"]["n"], 7)
 
 
+class Tails(unittest.TestCase):
+    """A p99 from fewer than 100 samples is about the max; say max instead."""
+
+    def test_small_samples_print_the_max_with_its_count(self) -> None:
+        dist = bench_load.distribution([float(v) for v in range(1, 33)])
+        self.assertEqual(dist["max"], 32.0)
+        self.assertEqual(bench_load.tail_text(dist, 99), "max 32 (n=32)")
+        self.assertEqual(bench_load.tail_text(dist, 90), "p90 29")
+        self.assertEqual(bench_load.tail_cell(dist, 99), "32*")
+        big = bench_load.distribution([float(v) for v in range(1, 201)])
+        self.assertEqual(bench_load.tail_text(big, 99), "p99 198")
+        self.assertEqual(bench_load.tail_cell(big, 99), "198")
+
+    def test_one_line_reports_the_max_below_a_hundred_requests(self) -> None:
+        summary = bench_load.summarize(
+            [record(index=i, ttft=100.0 + i) for i in range(32)], 1.0, 2000, 50
+        )
+        line = bench_load.one_line(summary)
+        self.assertIn("TTFT p50 116 max 131 (n=32) ms", line)
+        self.assertNotIn("p99", line)
+
+
 class Goodput(unittest.TestCase):
     @staticmethod
     def attainment(rate: float, capacity: float, rng: random.Random, n: int = 400):

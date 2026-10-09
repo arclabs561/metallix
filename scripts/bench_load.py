@@ -641,8 +641,29 @@ def percentile(values: list[float], q: float) -> float | None:
 def distribution(values: list[float]) -> dict:
     out = {f"p{q}": percentile(values, q) for q in PERCENTILES}
     out["mean"] = sum(values) / len(values) if values else None
+    out["max"] = max(values) if values else None
     out["n"] = len(values)
     return out
+
+
+def resolves(q: float, n: int) -> bool:
+    """Whether n samples resolve the q-th percentile: at least 100/(100-q),
+    so p99 needs 100 and p90 needs 10. Below that it is about the max."""
+    return n * (100 - q) >= 100
+
+
+def tail_text(dist: dict, q: int, digits: int = 0) -> str:
+    """`pQ value`, or `max value (n=...)` when n is too small for pQ."""
+    if resolves(q, dist["n"]):
+        return f"p{q} {fmt(dist[f'p{q}'], digits)}"
+    return f"max {fmt(dist.get('max'), digits)} (n={dist['n']})"
+
+
+def tail_cell(dist: dict, q: int, digits: int = 0) -> str:
+    """A table cell: the percentile, or the max marked `*` when n is too small."""
+    if resolves(q, dist["n"]):
+        return fmt(dist[f"p{q}"], digits)
+    return fmt(dist.get("max"), digits) + "*"
 
 
 def meets_slo(record: Record, ttft_slo_ms: float, tpot_slo_ms: float) -> bool:
@@ -1332,8 +1353,8 @@ def one_line(summary: dict) -> str:
     return (
         f"{summary['request_throughput']:.2f} req/s, "
         f"{summary['output_token_throughput']:.0f} out tok/s, "
-        f"TTFT p50 {fmt(summary['ttft_ms']['p50'])} p99 {fmt(summary['ttft_ms']['p99'])} ms, "
-        f"TPOT p50 {fmt(summary['tpot_ms']['p50'], 1)} p99 {fmt(summary['tpot_ms']['p99'], 1)} ms, "
+        f"TTFT p50 {fmt(summary['ttft_ms']['p50'])} {tail_text(summary['ttft_ms'], 99)} ms, "
+        f"TPOT p50 {fmt(summary['tpot_ms']['p50'], 1)} {tail_text(summary['tpot_ms'], 99, 1)} ms, "
         f"SLO {summary['slo_attainment']:.0%}"
         + (f", failed {failed}" if failed else "")
         + send_lag_warning(summary)
@@ -1382,8 +1403,8 @@ def render(report: dict) -> str:
                 lines.append(
                     f"{server['name']:<11} {result['set']:<14} {run['load_before'][0]:>5.1f}  "
                     f"{kind}={value:<6g} {s['request_throughput']:>5.2f}  {s['output_token_throughput']:>9.0f}  "
-                    f"{fmt(ttft['p50']):>6}/{fmt(ttft['p90']):>6}/{fmt(ttft['p99']):>6}   "
-                    f"{fmt(tpot['p50'], 1):>5}/{fmt(tpot['p90'], 1):>5}/{fmt(tpot['p99'], 1):>5}    "
+                    f"{fmt(ttft['p50']):>6}/{tail_cell(ttft, 90):>6}/{tail_cell(ttft, 99):>6}   "
+                    f"{fmt(tpot['p50'], 1):>5}/{tail_cell(tpot, 90, 1):>5}/{tail_cell(tpot, 99, 1):>5}    "
                     f"{s['outcomes'].get('ok', 0):>2}/{s['requests']:<2}  {s['slo_attainment']:>4.0%}  "
                     f"{fmt(gib(run['memory']['peak_system_used_bytes']), 1):>7}"
                 )
@@ -1392,6 +1413,9 @@ def render(report: dict) -> str:
                     f"{'':<11} {result['set']:<14} goodput {fmt(result['goodput_rps'], 2)} req/s "
                     f"(highest swept rate with >= {ATTAINMENT_GOAL:.0%} SLO attainment)"
                 )
+    lines.append(
+        "* the max: too few requests for that percentile (p90 needs 10, p99 100)"
+    )
     lines += [f"warning: {warning}" for warning in report.get("warnings", [])]
     return "\n".join(lines)
 

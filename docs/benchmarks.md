@@ -29,6 +29,12 @@ second: system memory in use (app, wired and compressed pages, as Activity
 Monitor counts them), GPU-resident memory, and the server's process-group
 resident size.
 
+A percentile needs enough samples to differ from the maximum: p90 needs 10
+and p99 needs 100. Below that, the reports print the maximum and its sample
+count instead (`max 131 (n=32)`, or a `*` in tables). A campaign computes its
+TTFT p90 and inter-token p99 over the requests of all passes pooled, since
+the median of three per-pass tails is not a tail.
+
 ## Matrix
 
 | Axis | Values |
