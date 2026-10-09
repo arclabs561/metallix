@@ -399,6 +399,7 @@ impl Sigmas {
     }
 
     /// The steps in order.
+    #[must_use]
     pub fn steps(&self) -> impl ExactSizeIterator<Item = FlowMatchStep> + '_ {
         self.values
             .windows(2)
