@@ -44,6 +44,7 @@ import random
 import re
 import shlex
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -1033,9 +1034,6 @@ def measure_level(
     """
     result: dict = {kind: value, "restarted": not args.url}
     prompts = set_prompts(set_name, count, count_tokens, args.seed, args.file_prompts)
-    warm = warmup_prompts(
-        set_name, args.warmup, count_tokens, args.seed, args.file_prompts
-    )
     server = None
     try:
         if args.url:
@@ -1069,17 +1067,9 @@ def measure_level(
             on_abort=lambda reason: server.stop() if server else None,
         )
         with sampler:
-            if warm:
-                run_load(
-                    address,
-                    spec.api,
-                    args.model_id,
-                    warm,
-                    args.max_tokens,
-                    spec.extra,
-                    concurrency=level_concurrency,
-                    timeout=args.request_timeout,
-                )
+            result["warmup"] = warm_up(
+                address, spec, set_name, kind, value, args, count_tokens
+            )
             before = load_average()
             records, duration = run_load(
                 address,
@@ -1125,8 +1115,61 @@ def measure_level(
             server.stop()
     # The timelines are complete only once the server has exited.
     if result.get("trace") and "summary" in result:
-        add_server_spans(result, Path(result["trace"]), args.model_id, args.warmup)
+        skip = result.get("warmup", {}).get("requests", 0)
+        add_server_spans(result, Path(result["trace"]), args.model_id, skip)
     return result
+
+
+def warm_up(
+    address: str,
+    spec: ServerSpec,
+    set_name: str,
+    kind: str,
+    value: float,
+    args,
+    count_tokens,
+) -> dict:
+    """Discarded requests that bring the server to the level's width first.
+
+    A few requests at c=1 never allocate what 16 concurrent ones do, so the
+    first measured requests would pay for it. Warmup sends max(--warmup, 2w)
+    requests at width w: the level's concurrency, or for a rate run the
+    expected number in flight, rate x time in system (Little's law), with the
+    time measured by two serial requests first. --warmup 0 sends nothing.
+    """
+    if args.warmup <= 0:
+        return {"requests": 0, "concurrency": 0}
+
+    def send_warm(prompts: list[Prompt], concurrency: int) -> list[Record]:
+        records, _ = run_load(
+            address,
+            spec.api,
+            args.model_id,
+            prompts,
+            args.max_tokens,
+            spec.extra,
+            concurrency=concurrency,
+            timeout=args.request_timeout,
+        )
+        return records
+
+    sent = 0
+    if kind == "concurrency":
+        width = int(value)
+    else:
+        probe = send_warm(
+            warmup_prompts(set_name, 2, count_tokens, args.seed, args.file_prompts), 1
+        )
+        sent += len(probe)
+        times = [r.e2e_ms for r in probe if r.outcome == "ok" and r.e2e_ms]
+        in_system_s = statistics.median(times) / 1000 if times else 0.0
+        width = max(1, min(args.rate_requests, math.ceil(value * in_system_s)))
+    count = max(args.warmup, 2 * width)
+    send_warm(
+        warmup_prompts(set_name, count, count_tokens, args.seed, args.file_prompts),
+        width,
+    )
+    return {"requests": sent + count, "concurrency": width}
 
 
 def with_spans(spec: ServerSpec, log: Path, args) -> tuple[ServerSpec, Path | None]:
@@ -1417,7 +1460,8 @@ def build_parser(description: str = __doc__.splitlines()[0]) -> argparse.Argumen
         "--warmup",
         type=int,
         default=3,
-        help="discarded requests before each level, sent at its concurrency",
+        help="least discarded requests before each level; warmup sends at least "
+        "twice the level's width, at that width (0: none)",
     )
     parser.add_argument(
         "--prefix-cache",

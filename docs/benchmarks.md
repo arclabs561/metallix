@@ -60,7 +60,9 @@ tokens. It is used unchanged from that commit (SHA-256
    numbers.
 3. A fresh server for every engine at every concurrency level, so no level
    inherits another level's prefix cache or allocator state.
-4. Three discarded warmup requests at the level's concurrency.
+4. Discarded warmup requests at the level's width: at least three, and at
+   least twice the concurrency. A rate level warms at its expected number of
+   requests in flight, the rate times the time two serial requests took.
 5. 64 measured requests per cell up to concurrency 8, 100 above.
 6. Three passes. Each pass visits the engines in an order shuffled from a
    recorded seed, with a 60-second cooldown between arms.

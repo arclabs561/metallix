@@ -376,8 +376,7 @@ class Levels(unittest.TestCase):
                 started.append("stopped")
 
         def fake_run_load(address, api, model, prompts, max_tokens, extra, **kw):
-            if kw.get("rate") is None and len(prompts) == 3:
-                warmups.append(kw["concurrency"])
+            warmups.append((len(prompts), kw.get("concurrency"), kw.get("rate")))
             time.sleep(0.05)  # Long enough for the sampler's first sample.
             records = [record(index=i) for i in range(len(prompts))]
             return records, 1.0
@@ -419,7 +418,29 @@ class Levels(unittest.TestCase):
         # c=1, c=4 and one rate: three servers, each stopped before the next.
         argv = ["vllm", "--no-enable-prefix-caching"]
         self.assertEqual(started, [argv, "stopped"] * 3)
-        self.assertEqual(warmups, [1, 4, 1])
+        # Each run as (requests, concurrency, rate). Warmup reaches the level's
+        # width: c=4 warms eight at 4, and the 2/s rate level times two serial
+        # requests (1 s each) and warms at 2/s x 1 s = 2 in flight.
+        self.assertEqual(
+            warmups,
+            [
+                (3, 1, None),
+                (2, 1, None),
+                (8, 4, None),
+                (4, 4, None),
+                (2, 1, None),
+                (4, 2, None),
+                (2, None, 2.0),
+            ],
+        )
+        self.assertEqual(
+            [run["warmup"] for run in out["concurrency"] + out["rates"]],
+            [
+                {"requests": 3, "concurrency": 1},
+                {"requests": 8, "concurrency": 4},
+                {"requests": 6, "concurrency": 2},
+            ],
+        )
         self.assertTrue(all(run["restarted"] for run in out["concurrency"]))
         self.assertEqual(out["goodput_rps"], 2.0)
         memory = out["concurrency"][0]["memory"]
