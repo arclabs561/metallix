@@ -56,6 +56,19 @@ pub struct EngramSessionConfig {
 
 impl EngramSessionConfig {
     /// Creates bounded batch-one Engram request configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngramSessionError::EmptyTokenMap`],
+    /// [`EngramSessionError::NegativeTokenMap`],
+    /// [`EngramSessionError::HashLayerOutOfRange`] for an unusable token map or
+    /// layer, [`EngramSessionError::EmptyDimension`],
+    /// [`EngramSessionError::EmbeddingWidthNotGrouped`],
+    /// [`EngramSessionError::ReductionNotGrouped`],
+    /// [`EngramSessionError::ElementLimit`] for sizes the session cannot use,
+    /// and [`EngramSessionError::InvalidEpsilon`],
+    /// [`EngramSessionError::InvalidGateClamp`] for a non-finite or
+    /// non-positive control.
     #[allow(
         clippy::too_many_arguments,
         reason = "each source-shaped geometry is explicit"
@@ -239,30 +252,37 @@ pub struct EngramStepOutput {
 }
 
 impl EngramStepOutput {
+    /// The call's first token position.
     #[must_use]
     pub const fn start(&self) -> usize {
         self.start
     }
+    /// This layer's hashed embedding addresses, one row per position.
     #[must_use]
     pub fn hash_ids(&self) -> &[i64] {
         &self.hash_ids
     }
+    /// Embedding rows the addresses selected, BF16.
     #[must_use]
     pub fn embedding(&self) -> &[u16] {
         &self.embedding
     }
+    /// The WKV projection of the embeddings, BF16.
     #[must_use]
     pub fn wkv(&self) -> &[u16] {
         &self.wkv
     }
+    /// The key half of the WKV projection, BF16.
     #[must_use]
     pub fn key(&self) -> &[u16] {
         &self.key
     }
+    /// The value half of the WKV projection, BF16.
     #[must_use]
     pub fn value(&self) -> &[u16] {
         &self.value
     }
+    /// The gated residual, BF16.
     #[must_use]
     pub fn output(&self) -> &[u16] {
         &self.output
@@ -284,6 +304,16 @@ pub struct EngramSession {
 
 impl EngramSession {
     /// Validates static operands and starts at absolute token position zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngramSessionError::Length`] when a weight does not match the
+    /// configuration, [`EngramSessionError::NonFiniteBf16`],
+    /// [`EngramSessionError::NonFiniteFp8`] or
+    /// [`EngramSessionError::NonFiniteScale`] for a NaN or infinite weight,
+    /// [`EngramSessionError::ShapeOverflow`] or
+    /// [`EngramSessionError::AllocationFailed`] when a buffer does not fit, and
+    /// [`EngramSessionError::Hash`] when the hash history cannot be built.
     pub fn new(
         config: EngramSessionConfig,
         weights: EngramSessionWeights,
@@ -328,6 +358,11 @@ impl EngramSession {
     }
 
     /// Reconstructs pristine request-local history after a successfully allocated reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngramSessionError::AllocationFailed`] when the pristine state
+    /// cannot be copied.
     pub fn reset(&mut self) -> Result<(), EngramSessionError> {
         let hashes = EngramHashState::new(
             self.config.hash_layout.try_clone()?,
@@ -343,6 +378,26 @@ impl EngramSession {
     ///
     /// Embedding rows come from the session's owned table; weights built
     /// [`EngramSessionWeights::without_embedding_table`] need [`Self::step_with`].
+    ///
+    /// # Errors
+    ///
+    /// * [`EngramSessionError::MissingEmbeddingRows`] when the session owns no
+    ///   embedding table.
+    /// * [`EngramSessionError::EmptyChunk`],
+    ///   [`EngramSessionError::UnexpectedStart`],
+    ///   [`EngramSessionError::ChunkExceedsCapacity`],
+    ///   [`EngramSessionError::StepTooLong`] when the call does not continue
+    ///   the sequence or does not fit.
+    /// * [`EngramSessionError::Length`] when `residual` does not match the
+    ///   call.
+    /// * [`EngramSessionError::TokenIdOutOfRange`],
+    ///   [`EngramSessionError::NegativeCompressedToken`] for a token the map
+    ///   cannot compress.
+    /// * [`EngramSessionError::Hash`], [`EngramSessionError::Embedding`],
+    ///   [`EngramSessionError::Activation`], [`EngramSessionError::Wkv`],
+    ///   [`EngramSessionError::Gate`] when a stage fails, and
+    ///   [`EngramSessionError::AllocationFailed`] when a buffer cannot be
+    ///   reserved.
     pub fn step(
         &mut self,
         start: usize,
@@ -355,6 +410,24 @@ impl EngramSession {
     /// Like [`Self::step`], with embedding rows read from `rows` after hashing
     /// selects them. Any owned table is not consulted. A source failure leaves
     /// history and the request cursor unchanged.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngramSessionError::EmptyChunk`],
+    ///   [`EngramSessionError::UnexpectedStart`],
+    ///   [`EngramSessionError::ChunkExceedsCapacity`],
+    ///   [`EngramSessionError::StepTooLong`] when the call does not continue
+    ///   the sequence or does not fit.
+    /// * [`EngramSessionError::Length`] when `residual` does not match the
+    ///   call.
+    /// * [`EngramSessionError::TokenIdOutOfRange`],
+    ///   [`EngramSessionError::NegativeCompressedToken`] for a token the map
+    ///   cannot compress.
+    /// * [`EngramSessionError::Hash`], [`EngramSessionError::Embedding`],
+    ///   [`EngramSessionError::Activation`], [`EngramSessionError::Wkv`],
+    ///   [`EngramSessionError::Gate`] when a stage fails, and
+    ///   [`EngramSessionError::AllocationFailed`] when a buffer cannot be
+    ///   reserved.
     pub fn step_with(
         &mut self,
         start: usize,
@@ -843,71 +916,165 @@ fn reserved_vec<T>(elements: usize, field: &'static str) -> Result<Vec<T>, Engra
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EngramSessionError {
+    /// The token map is empty.
     #[error("Engram token map must not be empty")]
     EmptyTokenMap,
+    /// A token map entry is negative.
     #[error("Engram token map entry {index} is negative: {id}")]
-    NegativeTokenMap { index: usize, id: i64 },
+    NegativeTokenMap {
+        /// Raw token ID of the entry.
+        index: usize,
+        /// The negative compressed ID.
+        id: i64,
+    },
+    /// The hash layer is not one of the configured Engram layers.
     #[error("Engram hash layer {layer} is outside {layers} configured layers")]
-    HashLayerOutOfRange { layer: usize, layers: usize },
+    HashLayerOutOfRange {
+        /// The requested layer.
+        layer: usize,
+        /// Configured Engram layers.
+        layers: usize,
+    },
+    /// A session dimension is zero.
     #[error("Engram session dimensions must be nonzero")]
     EmptyDimension,
+    /// The norm epsilon is not finite and positive.
     #[error("Engram session epsilon must be finite and positive")]
     InvalidEpsilon,
+    /// The gate clamp is not finite and positive.
     #[error("Engram session gate clamp must be finite and positive")]
     InvalidGateClamp,
+    /// The embedding width is not a multiple of 32.
     #[error("Engram embedding width {embedding_width} is not grouped by 32")]
-    EmbeddingWidthNotGrouped { embedding_width: usize },
+    EmbeddingWidthNotGrouped {
+        /// The embedding width.
+        embedding_width: usize,
+    },
+    /// The WKV reduction width is not a multiple of 32.
     #[error("Engram WKV reduction {reduction} is not grouped by 32")]
-    ReductionNotGrouped { reduction: usize },
+    ReductionNotGrouped {
+        /// The reduction width.
+        reduction: usize,
+    },
+    /// A buffer would pass the session's element bound.
     #[error("Engram {field} exceeds session bound with {elements} elements")]
     ElementLimit {
+        /// The buffer's role.
         field: &'static str,
+        /// Its element count.
         elements: usize,
     },
+    /// A buffer does not have the length its shape requires.
     #[error("Engram {field} length is {actual}, expected {expected}")]
     Length {
+        /// The buffer's role.
         field: &'static str,
+        /// Supplied length.
         actual: usize,
+        /// Required length.
         expected: usize,
     },
+    /// A BF16 value is NaN or infinite.
     #[error("Engram BF16 {field} is nonfinite at {index}")]
-    NonFiniteBf16 { field: &'static str, index: usize },
+    NonFiniteBf16 {
+        /// The tensor's role.
+        field: &'static str,
+        /// Flat index into it.
+        index: usize,
+    },
+    /// An FP8 code is NaN.
     #[error("Engram FP8 {field} is nonfinite at {index}")]
-    NonFiniteFp8 { field: &'static str, index: usize },
+    NonFiniteFp8 {
+        /// The tensor's role.
+        field: &'static str,
+        /// Flat index into it.
+        index: usize,
+    },
+    /// An E8M0 scale code is NaN.
     #[error("Engram E8M0 {field} is nonfinite at {index}")]
-    NonFiniteScale { field: &'static str, index: usize },
+    NonFiniteScale {
+        /// The tensor's role.
+        field: &'static str,
+        /// Flat index into it.
+        index: usize,
+    },
+    /// A raw token ID is negative or past the token map.
     #[error("Engram token ID {id} at {index} is outside the token map")]
-    TokenIdOutOfRange { index: usize, id: i64 },
+    TokenIdOutOfRange {
+        /// Index into the call's tokens.
+        index: usize,
+        /// The raw token ID.
+        id: i64,
+    },
+    /// A compressed token is negative.
     #[error("Engram compressed token {id} at {index} is negative")]
-    NegativeCompressedToken { index: usize, id: i64 },
+    NegativeCompressedToken {
+        /// Index into the call's tokens.
+        index: usize,
+        /// The compressed ID.
+        id: i64,
+    },
+    /// The call does not start where the session expects.
     #[error("Engram call starts at {actual}, expected {expected}")]
-    UnexpectedStart { actual: usize, expected: usize },
+    UnexpectedStart {
+        /// The call's start position.
+        actual: usize,
+        /// The session's next position.
+        expected: usize,
+    },
+    /// The call has no tokens.
     #[error("Engram calls require at least one token")]
     EmptyChunk,
+    /// The session owns no embedding table, so it needs a row source.
     #[error("Engram session has no owned embedding table; step with a row source")]
     MissingEmbeddingRows,
+    /// The call would pass the session's capacity.
     #[error("Engram chunk ends at {end}, beyond capacity {capacity}")]
-    ChunkExceedsCapacity { end: usize, capacity: usize },
+    ChunkExceedsCapacity {
+        /// Exclusive end position of the call.
+        end: usize,
+        /// The session's capacity.
+        capacity: usize,
+    },
+    /// The call has more positions than one step allows; prefill in chunks.
     #[error("Engram step of {positions} positions exceeds {maximum}; prefill in chunks")]
-    StepTooLong { positions: usize, maximum: usize },
+    StepTooLong {
+        /// Positions in the call.
+        positions: usize,
+        /// Positions one step allows.
+        maximum: usize,
+    },
+    /// A derived shape does not fit in `usize`.
     #[error("Engram shape overflowed for {field}")]
-    ShapeOverflow { field: &'static str },
+    ShapeOverflow {
+        /// The derived count's role.
+        field: &'static str,
+    },
+    /// A buffer could not be reserved.
     #[error("could not allocate {elements} Engram {field} elements")]
     AllocationFailed {
+        /// The buffer's role.
         field: &'static str,
+        /// Elements that could not be reserved.
         elements: usize,
     },
+    /// Engram hashing rejected its input.
     #[error(transparent)]
     Hash(#[from] EngramHashError),
+    /// The embedding lookup rejected its input.
     #[error(transparent)]
     Embedding(#[from] EngramEmbeddingError),
+    /// FP8 activation quantization rejected its input.
     #[error(transparent)]
     Activation(#[from] ActivationQuantError),
+    /// The scalar WKV projection rejected its input or overflowed.
     #[error(transparent)]
     Wkv(#[from] Fp8LinearError),
+    /// The Metal WKV projection failed.
     #[cfg(feature = "metal")]
     #[error(transparent)]
     MetalWkv(#[from] Fp8MetalError),
+    /// The residual gate rejected its input or overflowed.
     #[error(transparent)]
     Gate(#[from] EngramGateError),
 }

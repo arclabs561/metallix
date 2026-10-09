@@ -24,11 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Workspace members not yet retrofitted. Remove a crate in the same change
 # that adds its attributes; never add one.
-PENDING = frozenset(
-    {
-        "crates/models/deepseek",
-    }
-)
+PENDING: frozenset[str] = frozenset()
 
 # Inner attributes at the start of a line, so commented-out ones do not count.
 INNER_ATTRIBUTE = re.compile(
