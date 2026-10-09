@@ -240,7 +240,11 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
         };
         let mut consumed = cached;
         let mut written = 0;
-        for boundary in prefix_cache::boundaries(format, request, input_ids) {
+        for prefix_cache::Boundary {
+            ids: boundary,
+            role,
+        } in prefix_cache::boundaries(format, request, input_ids)
+        {
             // A boundary must leave a token to prefill after it, and one at
             // or before the resumed prefix is already cached.
             if boundary.len() <= consumed
@@ -254,7 +258,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
             let snapshot = sequence.snapshot()?;
             let bytes = D::snapshot_bytes(&snapshot);
             let extent = boundary.len();
-            if prefix_cache.insert(request.cache_salt, boundary, snapshot, bytes) {
+            if prefix_cache.insert(request.cache_salt, boundary, snapshot, bytes, role) {
                 written = written.max(extent);
             }
         }

@@ -78,12 +78,13 @@ impl AcceptedPrefixTokens {
 /// the whole conversation before the generation prompt, which the next turn
 /// of the same conversation extends. A boundary is returned only when its own
 /// rendering tokenizes to a nonempty, exact prefix of `input_ids`; one that
-/// does not render or tokenize is skipped. Shortest first.
+/// does not render or tokenize is skipped. Shortest first; when both render
+/// to the same tokens, the boundary counts as the preamble.
 pub(super) fn boundaries(
     format: &ChatFormat,
     request: ChatRequest<'_>,
     input_ids: &[i32],
-) -> Vec<Vec<i32>> {
+) -> Vec<Boundary> {
     let leading_system = request
         .messages
         .iter()
@@ -91,11 +92,11 @@ pub(super) fn boundaries(
         .count();
     let mut prefixes = Vec::with_capacity(2);
     if leading_system > 0 || !request.tools.is_empty() {
-        prefixes.push(&request.messages[..leading_system]);
+        prefixes.push((&request.messages[..leading_system], PrefixRole::Preamble));
     }
-    prefixes.push(request.messages);
-    let mut boundaries: Vec<Vec<i32>> = Vec::with_capacity(prefixes.len());
-    for messages in prefixes {
+    prefixes.push((request.messages, PrefixRole::Conversation));
+    let mut boundaries: Vec<Boundary> = Vec::with_capacity(prefixes.len());
+    for (messages, role) in prefixes {
         let prefix = ChatRequest {
             messages,
             ..request
@@ -106,12 +107,35 @@ pub(super) fn boundaries(
         else {
             continue;
         };
-        if !ids.is_empty() && input_ids.starts_with(&ids) && !boundaries.contains(&ids) {
-            boundaries.push(ids);
+        if !ids.is_empty()
+            && input_ids.starts_with(&ids)
+            && !boundaries.iter().any(|boundary| boundary.ids == ids)
+        {
+            boundaries.push(Boundary { ids, role });
         }
     }
-    boundaries.sort_by_key(Vec::len);
+    boundaries.sort_by_key(|boundary| boundary.ids.len());
     boundaries
+}
+
+/// A prompt prefix worth caching, and why.
+pub(super) struct Boundary {
+    pub(super) ids: Vec<i32>,
+    pub(super) role: PrefixRole,
+}
+
+/// Why a prefix was cached, which decides when a newer entry makes it
+/// redundant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrefixRole {
+    /// The system and tool preamble, shared by every conversation that
+    /// starts with it.
+    Preamble,
+    /// A whole conversation before its generation prompt. Chat is
+    /// append-only, so its expected reuse is the next turn of the same
+    /// conversation; once that turn stores its own longer entry, this one is
+    /// superseded.
+    Conversation,
 }
 
 /// Caches the prompt's reusable prefixes from `executor`: the leading system
@@ -130,7 +154,7 @@ pub(super) fn remember(
     input_ids: &[i32],
 ) -> Result<AcceptedPrefixTokens, String> {
     let mut written = 0;
-    for ids in boundaries(format, request, input_ids) {
+    for Boundary { ids, role } in boundaries(format, request, input_ids) {
         if cache.contains(request.cache_salt, &ids) {
             continue;
         }
@@ -139,7 +163,7 @@ pub(super) fn remember(
             .map_err(|error| error.to_string())?;
         let bytes = snapshot.kv_bytes();
         let tokens = ids.len();
-        if cache.insert(request.cache_salt, ids, snapshot, bytes) {
+        if cache.insert(request.cache_salt, ids, snapshot, bytes, role) {
             written = written.max(tokens);
         }
     }
@@ -152,6 +176,7 @@ struct Entry<V> {
     value: V,
     bytes: usize,
     last_used: u64,
+    role: PrefixRole,
 }
 
 /// Counters a metrics endpoint can expose. `queries` counts lookups, so the
@@ -162,6 +187,9 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) hits: u64,
     pub(crate) hit_tokens: u64,
     pub(crate) evictions: u64,
+    /// Conversation entries dropped because a longer turn of the same
+    /// conversation was stored; not counted in `evictions`.
+    pub(crate) superseded: u64,
     pub(crate) entries: usize,
     pub(crate) bytes: usize,
     pub(crate) budget_bytes: usize,
@@ -178,6 +206,7 @@ pub(crate) struct PrefixCache<V> {
     hits: u64,
     hit_tokens: u64,
     evictions: u64,
+    superseded: u64,
 }
 
 /// A reusable prefix found for one prompt.
@@ -199,6 +228,7 @@ impl<V> PrefixCache<V> {
             hits: 0,
             hit_tokens: 0,
             evictions: 0,
+            superseded: 0,
         }
     }
 
@@ -273,16 +303,42 @@ impl<V> PrefixCache<V> {
     /// Caches `value` for `tokens` under `salt`, evicting least-recently-used
     /// entries of any salt until it fits. Returns false, caching nothing, when
     /// the entry alone exceeds the budget or is already present.
+    ///
+    /// A [`PrefixRole::Conversation`] entry first drops the conversation
+    /// entries under the same salt whose tokens are a strict prefix of its
+    /// own: earlier turns of this conversation, whose only expected reuse has
+    /// just happened. A client that retries an older turn then misses and
+    /// re-prefills; preambles are never dropped this way.
     pub(crate) fn insert(
         &mut self,
         salt: Option<&str>,
         tokens: Vec<i32>,
         value: V,
         value_bytes: usize,
+        role: PrefixRole,
     ) -> bool {
         let bytes = value_bytes.saturating_add(tokens.len().saturating_mul(size_of::<i32>()));
         if tokens.is_empty() || bytes > self.budget_bytes || self.contains(salt, &tokens) {
             return false;
+        }
+        if role == PrefixRole::Conversation {
+            let superseded = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.role == PrefixRole::Conversation
+                        && entry.salt.as_deref() == salt
+                        && entry.tokens.len() < tokens.len()
+                        && tokens.starts_with(&entry.tokens)
+                })
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>();
+            for key in superseded {
+                if let Some(dropped) = self.entries.remove(&key) {
+                    self.used_bytes -= dropped.bytes;
+                    self.superseded += 1;
+                }
+            }
         }
         while self.used_bytes + bytes > self.budget_bytes {
             let Some(oldest) = self
@@ -309,6 +365,7 @@ impl<V> PrefixCache<V> {
                 value,
                 bytes,
                 last_used: self.clock,
+                role,
             },
         );
         true
@@ -320,6 +377,7 @@ impl<V> PrefixCache<V> {
             hits: self.hits,
             hit_tokens: self.hit_tokens,
             evictions: self.evictions,
+            superseded: self.superseded,
             entries: self.entries.len(),
             bytes: self.used_bytes,
             budget_bytes: self.budget_bytes,
@@ -329,15 +387,15 @@ impl<V> PrefixCache<V> {
 
 #[cfg(test)]
 mod tests {
-    use super::PrefixCache;
+    use super::{PrefixCache, PrefixRole};
 
     const TOKEN: usize = size_of::<i32>();
 
     #[test]
     fn whole_entry_prefixes_hit_and_leave_one_prompt_token() {
         let mut cache = PrefixCache::new("model", 1_000);
-        assert!(cache.insert(None, vec![1, 2, 3], "abc", 10));
-        assert!(cache.insert(None, vec![1, 2], "ab", 10));
+        assert!(cache.insert(None, vec![1, 2, 3], "abc", 10, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![1, 2], "ab", 10, PrefixRole::Preamble));
         // The longest whole entry that is a strict prefix wins.
         let hit = cache.lookup(None, &[1, 2, 3, 4]).expect("hit");
         assert_eq!((hit.tokens, *hit.value), (3, "abc"));
@@ -352,7 +410,7 @@ mod tests {
     #[test]
     fn a_changed_prefix_never_hits_even_when_leading_tokens_match() {
         let mut cache = PrefixCache::new("model", 1_000);
-        assert!(cache.insert(None, vec![10, 11, 12, 13], (), 0));
+        assert!(cache.insert(None, vec![10, 11, 12, 13], (), 0, PrefixRole::Preamble));
         // Shares three leading tokens but not the whole entry.
         assert!(cache.lookup(None, &[10, 11, 12, 99, 5, 6]).is_none());
         assert!(cache.lookup(None, &[10, 11, 12, 13, 5]).is_some());
@@ -362,13 +420,25 @@ mod tests {
     fn identical_prompts_under_different_salts_never_share_entries() {
         let mut cache = PrefixCache::new("model", 1_000);
         let prompt = [1, 2, 3, 4];
-        assert!(cache.insert(Some("tenant-a"), vec![1, 2, 3], 'a', 0));
+        assert!(cache.insert(
+            Some("tenant-a"),
+            vec![1, 2, 3],
+            'a',
+            0,
+            PrefixRole::Preamble
+        ));
         assert!(cache.lookup(Some("tenant-b"), &prompt).is_none());
         assert!(cache.lookup(None, &prompt).is_none());
         assert!(cache.lookup(Some(""), &prompt).is_none());
         // The same tokens can be cached separately per salt.
-        assert!(cache.insert(Some("tenant-b"), vec![1, 2, 3], 'b', 0));
-        assert!(cache.insert(None, vec![1, 2, 3], 'n', 0));
+        assert!(cache.insert(
+            Some("tenant-b"),
+            vec![1, 2, 3],
+            'b',
+            0,
+            PrefixRole::Preamble
+        ));
+        assert!(cache.insert(None, vec![1, 2, 3], 'n', 0, PrefixRole::Preamble));
         assert_eq!(cache.stats().entries, 3);
         for (salt, value) in [
             (Some("tenant-a"), 'a'),
@@ -395,30 +465,169 @@ mod tests {
     fn budget_evicts_least_recently_used_and_refuses_oversized_entries() {
         let entry = 100 + 2 * TOKEN;
         let mut cache = PrefixCache::new("model", 2 * entry);
-        assert!(cache.insert(None, vec![1, 1], 'a', 100));
-        assert!(cache.insert(None, vec![2, 2], 'b', 100));
+        assert!(cache.insert(None, vec![1, 1], 'a', 100, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![2, 2], 'b', 100, PrefixRole::Preamble));
         assert_eq!(cache.stats().bytes, 2 * entry);
         // Touch `a`, so `b` is least recently used.
         assert!(cache.lookup(None, &[1, 1, 9]).is_some());
-        assert!(cache.insert(None, vec![3, 3], 'c', 100));
+        assert!(cache.insert(None, vec![3, 3], 'c', 100, PrefixRole::Preamble));
         assert_eq!((cache.stats().entries, cache.stats().evictions), (2, 1));
         assert!(cache.contains(None, &[1, 1]));
         assert!(!cache.contains(None, &[2, 2]));
         assert!(cache.contains(None, &[3, 3]));
         assert_eq!(cache.stats().bytes, 2 * entry);
         // Larger than the whole budget: nothing is evicted for it.
-        assert!(!cache.insert(None, vec![4, 4], 'd', 2 * entry));
+        assert!(!cache.insert(None, vec![4, 4], 'd', 2 * entry, PrefixRole::Preamble));
         assert_eq!(cache.stats().entries, 2);
         // Duplicates are not stored twice.
-        assert!(!cache.insert(None, vec![3, 3], 'e', 100));
+        assert!(!cache.insert(None, vec![3, 3], 'e', 100, PrefixRole::Preamble));
         assert_eq!(cache.stats().bytes, 2 * entry);
     }
 
     #[test]
     fn zero_budget_caches_nothing() {
         let mut cache = PrefixCache::new("model", 0);
-        assert!(!cache.insert(None, vec![1], (), 0));
+        assert!(!cache.insert(None, vec![1], (), 0, PrefixRole::Preamble));
         assert!(cache.lookup(None, &[1, 2]).is_none());
+    }
+
+    #[test]
+    fn a_later_turn_supersedes_earlier_turns_of_its_conversation_only() {
+        let mut cache = PrefixCache::new("model", 10_000);
+        let conversation = PrefixRole::Conversation;
+        assert!(cache.insert(None, vec![1, 2], 'p', 100, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![1, 2, 3], 'a', 100, conversation));
+        // Another conversation on the same preamble, and the same tokens
+        // under another salt.
+        assert!(cache.insert(None, vec![1, 2, 7], 'b', 100, conversation));
+        assert!(cache.insert(Some("t"), vec![1, 2, 3], 's', 100, conversation));
+        assert!(cache.insert(None, vec![1, 2, 3, 4, 5], 'c', 100, conversation));
+        assert!(!cache.contains(None, &[1, 2, 3]), "turn 1 was superseded");
+        for (salt, tokens) in [
+            (None, &[1, 2][..]),
+            (None, &[1, 2, 7]),
+            (Some("t"), &[1, 2, 3]),
+            (None, &[1, 2, 3, 4, 5]),
+        ] {
+            assert!(cache.contains(salt, tokens), "{salt:?} {tokens:?} kept");
+        }
+        let stats = cache.stats();
+        assert_eq!(
+            (stats.superseded, stats.evictions, stats.entries),
+            (1, 0, 4)
+        );
+        assert_eq!(stats.bytes, 4 * 100 + (2 + 3 + 3 + 5) * TOKEN);
+        // A preamble insert never supersedes, even when it extends an entry.
+        assert!(cache.insert(None, vec![1, 2, 7, 8], 'q', 100, PrefixRole::Preamble));
+        assert!(cache.contains(None, &[1, 2, 7]));
+    }
+
+    /// Deterministic `SplitMix64` for the trace below.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> usize {
+            usize::try_from(self.next() % bound).expect("small bound")
+        }
+    }
+
+    /// Replays an agent trace through the cache the way `remember` and
+    /// `prefill` use it: look up the prompt, then store the preamble and the
+    /// whole conversation. Six concurrent agents run 60 conversations of
+    /// 3-12 turns over three preambles (300, 200 and 450 tokens; 60/30/10
+    /// percent of conversations); each turn adds 30-150 user or tool tokens,
+    /// and the reply adds 5-40 tokens to the next prompt. Every token costs
+    /// `KV` bytes. Returns the fraction of prompt tokens served from cache.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "token counts here stay far below 2^52"
+    )]
+    fn replay_agent_trace(seed: u64, budget_tokens: usize, conversation: PrefixRole) -> f64 {
+        const KV: usize = 1_024;
+        struct Agent {
+            preamble: usize,
+            tokens: Vec<i32>,
+            turns_left: usize,
+        }
+        let preambles: [Vec<i32>; 3] = [300, 200, 450]
+            .map(|length: i32| (0..length).map(|index| length * 1_000 + index).collect());
+        let mut rng = Rng(seed);
+        let mut cache = PrefixCache::new("model", budget_tokens * KV);
+        let mut next_token = 10_000_000;
+        let (mut started, mut active) = (0, Vec::<Agent>::new());
+        let (mut prompt_tokens, mut cached_tokens) = (0, 0);
+        while started < 60 || !active.is_empty() {
+            while active.len() < 6 && started < 60 {
+                let draw = rng.below(10);
+                let preamble = usize::from(draw >= 6) + usize::from(draw >= 9);
+                active.push(Agent {
+                    preamble,
+                    tokens: preambles[preamble].clone(),
+                    turns_left: 3 + rng.below(10),
+                });
+                started += 1;
+            }
+            let index = rng.below(active.len() as u64);
+            let agent = &mut active[index];
+            for _ in 0..30 + rng.below(121) {
+                agent.tokens.push(next_token);
+                next_token += 1;
+            }
+            // The prompt also carries a generation prompt after the history.
+            let prompt = [agent.tokens.as_slice(), &[-1]].concat();
+            prompt_tokens += prompt.len();
+            cached_tokens += cache.lookup(None, &prompt).map_or(0, |hit| hit.tokens);
+            let preamble = &preambles[agent.preamble];
+            cache.insert(
+                None,
+                preamble.clone(),
+                (),
+                preamble.len() * KV,
+                PrefixRole::Preamble,
+            );
+            cache.insert(
+                None,
+                agent.tokens.clone(),
+                (),
+                agent.tokens.len() * KV,
+                conversation,
+            );
+            for _ in 0..5 + rng.below(36) {
+                agent.tokens.push(next_token);
+                next_token += 1;
+            }
+            agent.turns_left -= 1;
+            if agent.turns_left == 0 {
+                active.swap_remove(index);
+            }
+        }
+        cached_tokens as f64 / prompt_tokens as f64
+    }
+
+    #[test]
+    fn superseding_old_turns_raises_hits_on_an_agent_trace() {
+        // Inserting conversations as preambles is the behaviour before
+        // supersession: plain LRU over every stored boundary.
+        for (budget_tokens, minimum_gain) in [(1_870, 0.0), (7_490, 0.08)] {
+            let (mut before, mut after) = (0.0, 0.0);
+            for seed in 0..5 {
+                before += replay_agent_trace(seed, budget_tokens, PrefixRole::Preamble) / 5.0;
+                after += replay_agent_trace(seed, budget_tokens, PrefixRole::Conversation) / 5.0;
+            }
+            eprintln!("budget {budget_tokens} tokens: LRU {before:.3}, superseding {after:.3}");
+            assert!(
+                after >= before + minimum_gain,
+                "budget {budget_tokens}: {after:.3} vs {before:.3}"
+            );
+        }
     }
 }
 
