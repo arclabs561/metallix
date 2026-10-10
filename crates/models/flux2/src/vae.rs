@@ -172,9 +172,14 @@ impl Flux2VaeDecoder {
         x = self.resnet(&x, "decoder.mid_block.resnets.0")?;
         x = self.attention(&x, "decoder.mid_block.attentions.0")?;
         x = self.resnet(&x, "decoder.mid_block.resnets.1")?;
+        // Evaluating block by block bounds the live graph: at 1024x1024 one
+        // full-resolution activation is 0.5 GiB in f32, and a whole-decoder
+        // graph keeps dozens of them alive at once.
+        x.eval()?;
         for block in 0..self.blocks {
             for resnet in 0..self.resnets_per_block {
                 x = self.resnet(&x, &format!("decoder.up_blocks.{block}.resnets.{resnet}"))?;
+                x.eval()?;
             }
             if block + 1 < self.blocks {
                 x = self.conv(

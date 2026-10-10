@@ -204,6 +204,17 @@ impl Flux2Pipeline {
             .as_dtype(self.dtype)?;
 
         for step in sigmas.steps() {
+            let span = tracing::info_span!(
+                "flux2.denoise_step",
+                step = step.index,
+                tokens = size.tokens(),
+                elapsed_ms = tracing::field::Empty,
+                mlx.active_bytes = tracing::field::Empty,
+                mlx.cache_bytes = tracing::field::Empty,
+                mlx.peak_bytes = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            let started = std::time::Instant::now();
             let velocity = self
                 .transformer
                 .forward(&latents, text, step.timestep, &rope)?;
@@ -216,6 +227,8 @@ impl Flux2Pipeline {
                 .as_dtype(self.dtype)?;
             latents = latents.add(&update)?;
             latents.eval()?;
+            span.record("elapsed_ms", started.elapsed().as_secs_f64() * 1e3);
+            record_memory(&span);
             on_step(step.index, &latents);
         }
         Ok(latents)
@@ -231,12 +244,41 @@ impl Flux2Pipeline {
     ///
     /// Inherits [`crate::Flux2VaeDecoder::latents_to_decoder_input`] shape preconditions.
     pub fn decode_rgb8(&self, packed: &Array, size: ImageSize) -> Result<Vec<u8>, PipelineError> {
+        let span = tracing::info_span!(
+            "flux2.vae_decode",
+            elapsed_ms = tracing::field::Empty,
+            mlx.active_bytes = tracing::field::Empty,
+            mlx.cache_bytes = tracing::field::Empty,
+            mlx.peak_bytes = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = std::time::Instant::now();
+        // The allocator's cached buffers are sized for transformer
+        // activations, which the decoder cannot reuse; release them first so
+        // the decode's peak does not stack on top of them.
+        mlx_rs::memory::clear_cache()?;
         let (rows, columns) = size.grid();
         let input =
             self.vae
                 .latents_to_decoder_input(packed, rows.cast_signed(), columns.cast_signed())?;
         let image = self.vae.decode(&input)?;
-        Ok(to_rgb8(&image)?)
+        let pixels = to_rgb8(&image)?;
+        span.record("elapsed_ms", started.elapsed().as_secs_f64() * 1e3);
+        record_memory(&span);
+        Ok(pixels)
+    }
+}
+
+/// Records MLX's allocator figures on `span`, as the server's spans do.
+fn record_memory(span: &tracing::Span) {
+    if let (Ok(active), Ok(cache), Ok(peak)) = (
+        mlx_rs::memory::active_memory(),
+        mlx_rs::memory::cache_memory(),
+        mlx_rs::memory::peak_memory(),
+    ) {
+        span.record("mlx.active_bytes", active);
+        span.record("mlx.cache_bytes", cache);
+        span.record("mlx.peak_bytes", peak);
     }
 }
 

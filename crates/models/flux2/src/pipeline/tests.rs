@@ -130,10 +130,26 @@ fn generate(setup: &Setup, text_reference: &Path) -> Vec<u8> {
             },
         )
         .expect("denoise");
+    let gib = |bytes: usize| {
+        #[allow(clippy::cast_precision_loss)]
+        let gib = bytes as f64 / f64::from(1u32 << 30);
+        gib
+    };
+    let report = |phase: &str| {
+        eprintln!(
+            "{phase}: MLX active {:.2} GiB, cache {:.2} GiB, peak {:.2} GiB",
+            gib(mlx_rs::memory::active_memory().unwrap()),
+            gib(mlx_rs::memory::cache_memory().unwrap()),
+            gib(mlx_rs::memory::peak_memory().unwrap()),
+        );
+    };
+    report("after denoise");
+    mlx_rs::memory::reset_peak_memory().unwrap();
     let pixels = setup
         .pipeline
         .decode_rgb8(&packed, setup.size)
         .expect("decode");
+    report("after decode");
     if let Some(out) = process_env("METALLIX_FLUX2_OUT").map(PathBuf::from) {
         let mut ppm =
             format!("P6\n{} {}\n255\n", setup.size.width(), setup.size.height()).into_bytes();
