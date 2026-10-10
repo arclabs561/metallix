@@ -36,3 +36,18 @@ jobs:
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps
+
+      # The diagram check compares committed SVGs with a fresh rendering, so
+      # CI uses the same pinned typst release as local renders.
+      - name: Install typst
+        env:
+          TYPST_URL: https://github.com/typst/typst/releases/download/v0.15.1/typst-aarch64-apple-darwin.tar.xz
+          TYPST_SHA256: 48f62ed034aa3a7978309579ac6ca00045e2ef0da73114e8af27cfd8e74dc05a
+        run: |
+          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/typst.tar.xz" "$TYPST_URL"
+          echo "$TYPST_SHA256  $RUNNER_TEMP/typst.tar.xz" | shasum -a 256 --check
+          tar -xJf "$RUNNER_TEMP/typst.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/typst-aarch64-apple-darwin" >> "$GITHUB_PATH"
+
+      - name: Check architecture diagrams
+        run: python3 scripts/check_arch_diagrams.py --require-typst

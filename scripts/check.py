@@ -116,6 +116,8 @@ def run_checks(args, *, lease_fd=None) -> int:
         ([sys.executable, "scripts/test_check_engram_fixtures.py"], False),
         ([sys.executable, "scripts/check_doc_ratchet.py"], False),
         ([sys.executable, "scripts/test_check_doc_ratchet.py"], False),
+        ([sys.executable, "scripts/check_arch_diagrams.py"], False),
+        ([sys.executable, "scripts/test_check_arch_diagrams.py"], False),
         ([sys.executable, "scripts/check_observability.py"], False),
         ([sys.executable, "scripts/test_check_observability.py"], False),
         ([sys.executable, "scripts/test_v41_forward_manifest.py"], False),
