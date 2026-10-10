@@ -139,6 +139,29 @@ def record(outcome="ok", ttft=100.0, tpot=20.0, out=10, inp=50, index=0):
     )
 
 
+class Readiness(unittest.TestCase):
+    def test_timeout_names_the_last_readiness_error(self) -> None:
+        # A server that never listens: the timeout must say the connection
+        # was refused rather than only that time ran out.
+        spec = bench_load.ServerSpec(
+            "idle",
+            "chat",
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            {},
+            {},
+        )
+        address = bench_load.bench_serve.free_address()
+        with tempfile.TemporaryDirectory() as directory:
+            server = bench_load.ManagedServer(
+                spec, address, pathlib.Path(directory) / "server.log"
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "last error: .*refused"):
+                    server.wait_ready(1.5)
+            finally:
+                server.stop()
+
+
 class Metrics(unittest.TestCase):
     def test_percentile_matches_linear_interpolation(self) -> None:
         values = [float(v) for v in range(1, 101)]  # 1..100

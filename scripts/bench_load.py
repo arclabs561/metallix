@@ -951,6 +951,9 @@ class ManagedServer:
 
     def wait_ready(self, timeout: float) -> None:
         deadline = time.perf_counter() + timeout
+        # Kept for the timeout message: a refused connection (nothing
+        # listening yet) and an error response need different fixes.
+        last_error = "no attempt"
         while time.perf_counter() < deadline:
             if self.process.poll() is not None:
                 raise RuntimeError(
@@ -963,10 +966,13 @@ class ManagedServer:
                     if response.status == 200:
                         self.ready_s = time.perf_counter() - self.started
                         return
-            except (OSError, urllib.error.URLError):
-                pass
+                    last_error = f"HTTP {response.status}"
+            except (OSError, urllib.error.URLError) as error:
+                last_error = f"{type(error).__name__}: {error}"
             time.sleep(1)
-        raise RuntimeError(f"{self.spec.name} not ready within {timeout:.0f} s")
+        raise RuntimeError(
+            f"{self.spec.name} not ready within {timeout:.0f} s; last error: {last_error}"
+        )
 
     def stop(self) -> None:
         # The load sampler may stop the server from its thread to abort a level.
