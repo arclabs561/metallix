@@ -450,6 +450,14 @@ the choice does. This applies to checkpoints whose tool-call format has a
 grammar (Qwen3's `<tool_call>` JSON); others answer such a request 400. The
 validation above stays as a check on the grammar.
 
+A JSON schema response format (`text.format` on Responses, `response_format`
+on Chat Completions) sent together with tools binds only the turn's final
+message, as in OpenAI's Structured Outputs: the turn either calls tools, with
+optional commentary before each call, or ends in one message that matches the
+schema. Commentary cannot start with `{` or `<`, which keeps the two apart.
+The final message is also validated against the schema once parsed. Without
+tools, the schema covers the whole reply and cannot be combined with reasoning.
+
 Without those flags the rules above are response validation only, not a promise
 of schema-valid emission. [OpenAI's strict-mode guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)
 distinguishes Responses' omitted-flag normalization/fallback from Chat's

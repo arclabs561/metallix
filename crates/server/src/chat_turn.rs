@@ -127,8 +127,9 @@ impl TurnStart {
                 PromptReuse::Prefix { ids } => ids,
             },
         );
-        // Strict tools and a required or named tool choice hold by grammar.
-        // An unsupported tool format fails here, before any model work.
+        // Strict tools, a required or named tool choice, and a response format
+        // alongside tools hold by grammar. An unsupported tool format fails
+        // here, before any model work.
         let tool_grammar = request
             .constrains_tool_calls()
             .then(|| {
@@ -136,6 +137,7 @@ impl TurnStart {
                     request.tools,
                     request.strict_tools,
                     request.tool_requirement,
+                    request.json_schema,
                     &prompt.text,
                 )
             })

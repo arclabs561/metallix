@@ -729,14 +729,25 @@ pub(crate) use chat_format::AssistantTurn;
 
 /// The parsed turn, checking schemas only for protocol-selected tool names.
 /// This terminal validation does not constrain generation to the schema.
+/// With a response format, a turn that ends without calls must also end in
+/// a message matching `final_schema`; text before calls is commentary the
+/// schema does not bind.
 pub(crate) fn assistant_turn(
     tools: &[Value],
     strict: &[String],
+    final_schema: Option<&Value>,
     generated: &crate::chat_generation::ChatGeneration,
 ) -> Result<AssistantTurn, String> {
     let turn = generated.turn.clone()?;
     for call in turn.calls.iter().filter(|call| strict.contains(&call.name)) {
         chat_format::check_call(tools, call)?;
+    }
+    if let Some(schema) = final_schema.filter(|_| turn.calls.is_empty() && turn.complete) {
+        let message: Value = serde_json::from_str(turn.text.trim())
+            .map_err(|_| String::from("the final message is not JSON"))?;
+        if !chat_format::validator(schema)?.is_valid(&message) {
+            return Err("the final message does not match the response format's schema".into());
+        }
     }
     Ok(turn)
 }
@@ -843,7 +854,7 @@ fn response_value(
         let strict = strict_tools(!offered.is_empty(), &request.tools, |tool| {
             tool["strict"] != Value::Bool(false)
         });
-        assistant_turn(&offered, &strict, generated)?
+        assistant_turn(&offered, &strict, controls.json_schema.as_ref(), generated)?
     };
     let reasoned = !reasoning.is_empty();
     let mut output = Vec::new();
@@ -1009,7 +1020,6 @@ mod tests {
             json!({"max_tool_calls":1}),
             json!({"text":{"format":{"type":"json_schema","name":"x","schema":true}}}),
             json!({"text":{"format":{"type":"json_schema","schema":{}}},"reasoning":{"effort":"low"}}),
-            json!({"text":{"format":{"type":"json_schema","schema":{}}},"tools":[tool.clone()]}),
             json!({"text":{"format":{"type":"json_schema","schema":{}}},"temperature":0.7,"top_p":0.9}),
             json!({"top_logprobs":2,"tools":[tool.clone()]}),
             json!({"top_logprobs":2,"reasoning":{"effort":"high"}}),
@@ -1984,11 +1994,24 @@ mod tests {
         assert!(messages(&edit).is_ok());
         assert_eq!(controls(&edit).map(|c| c.json_schema.is_some()), Ok(false));
         // `codex exec --output-schema` sends text.format json_schema (strict)
-        // together with its tools and reasoning. That combination is refused
-        // today, so even this mode never reaches the constrained path.
+        // together with its tools and reasoning. The schema then binds the
+        // turn's final message through the tool grammar, so this mode
+        // reaches the constrained path.
         let recorded = include_str!("fixtures/client_requests/codex-0.160.0-output-schema.json");
         let schema = parse(recorded);
-        assert!(controls(&schema).is_err());
+        let resolved = controls(&schema);
+        if cfg!(feature = "structured-output") {
+            let controls = resolved.unwrap();
+            assert!(controls.json_schema.is_some());
+            let messages = Vec::new();
+            let tools = Vec::from([json!({"type":"function","function":{"name":"exec_command"}})]);
+            assert!(controls.request(&messages, &tools).constrains_tool_calls());
+        } else {
+            assert!(resolved.is_err());
+        }
+        // Its hosted `web_search` tool is still refused: mx runs no hosted
+        // tools, so the recorded request as a whole is not served yet.
+        assert!(tools(&schema).is_err());
         // The same schema without tools and reasoning is what selects it.
         let mut bare: Value = serde_json::from_str(recorded).unwrap();
         let object = bare.as_object_mut().unwrap();

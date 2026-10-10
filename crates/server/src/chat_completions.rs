@@ -461,7 +461,12 @@ fn completion_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(&prepared.tools, &prepared.controls.strict_tools, generated)?;
+    let turn = assistant_turn(
+        &prepared.tools,
+        &prepared.controls.strict_tools,
+        prepared.controls.json_schema.as_ref(),
+        generated,
+    )?;
     let mut message = json!({"role":"assistant","content":if turn.calls.is_empty() || !turn.text.trim().is_empty() {json!(turn.text)} else {Value::Null},"refusal":null});
     if !turn.calls.is_empty() {
         let calls: Vec<Value> = tool_calls(&turn, id)
@@ -622,7 +627,12 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(&prepared.tools, &prepared.controls.strict_tools, &generated) {
+    let turn = match assistant_turn(
+        &prepared.tools,
+        &prepared.controls.strict_tools,
+        prepared.controls.json_schema.as_ref(),
+        &generated,
+    ) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "invalid_model_output", &error),
     };

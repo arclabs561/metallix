@@ -439,7 +439,12 @@ fn message_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(&prepared.tools, &prepared.controls.strict_tools, generated)?;
+    let turn = assistant_turn(
+        &prepared.tools,
+        &prepared.controls.strict_tools,
+        prepared.controls.json_schema.as_ref(),
+        generated,
+    )?;
     Ok(
         json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":blocks(&turn, id),"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":{"sampling":generated.sampling,"metrics":generated.metrics}}),
     )
@@ -608,7 +613,12 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(&prepared.tools, &prepared.controls.strict_tools, &generated) {
+    let turn = match assistant_turn(
+        &prepared.tools,
+        &prepared.controls.strict_tools,
+        prepared.controls.json_schema.as_ref(),
+        &generated,
+    ) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "api_error", &error),
     };

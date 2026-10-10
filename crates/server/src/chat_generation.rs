@@ -195,12 +195,15 @@ pub(crate) struct ChatRequest<'a> {
 static ANY_TOOL_CALLS: ToolRequirement = ToolRequirement::Auto;
 
 impl ChatRequest<'_> {
-    /// Whether the turn's tool calls run under a grammar: a strict tool, or
-    /// a `tool_choice` that requires a call.
+    /// Whether the turn runs under the tool grammar: offered tools with a
+    /// strict tool, a `tool_choice` that requires a call, or a JSON schema,
+    /// which then binds only the turn's final message.
     #[must_use]
     pub(crate) fn constrains_tool_calls(&self) -> bool {
         !self.tools.is_empty()
-            && (*self.tool_requirement != ToolRequirement::Auto || !self.strict_tools.is_empty())
+            && (*self.tool_requirement != ToolRequirement::Auto
+                || !self.strict_tools.is_empty()
+                || self.json_schema.is_some())
     }
 }
 
@@ -468,8 +471,11 @@ impl GenerationControls {
                         .into(),
                 );
             }
-            if has_tools || self.enable_thinking {
-                return Err("JSON schema output cannot be combined with tools or reasoning".into());
+            // With tools, the tool grammar holds the schema to the final
+            // message and leaves reasoning outside it; alone, the schema
+            // grammar covers the whole output, which a reasoning block breaks.
+            if !has_tools && self.enable_thinking {
+                return Err("JSON schema output cannot be combined with reasoning".into());
             }
             // A completed grammar admits only end-of-turn; there is nothing
             // valid to generate past it.
@@ -1753,9 +1759,12 @@ impl TokenPicker {
                 applied.top_k.and_then(|top_k| usize::try_from(top_k).ok()),
             )
         });
+        // With tools, the tool grammar carries the schema for the final
+        // message, so the whole-output schema grammar is not loaded.
         #[cfg(feature = "structured-output")]
         let constraint = request
             .json_schema
+            .filter(|_| tool_grammar.is_none())
             .map(|schema| {
                 crate::qwen_constraints::ConstraintRun::load(
                     model,

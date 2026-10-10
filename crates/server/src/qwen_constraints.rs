@@ -682,7 +682,13 @@ mod tool_grammar_tests {
             .unwrap();
         let grammar = |requirement: &ToolRequirement| {
             format
-                .tool_grammar(&tools, &["get_weather".into()], requirement, &prompt.text)
+                .tool_grammar(
+                    &tools,
+                    &["get_weather".into()],
+                    requirement,
+                    None,
+                    &prompt.text,
+                )
                 .unwrap()
         };
         let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
@@ -722,5 +728,36 @@ mod tool_grammar_tests {
         let mut run = ConstraintRun::load_grammar(&model, &named).unwrap();
         let (taken, total) = drive(&mut run, &format, vocab, call);
         assert_eq!(taken, total, "the named tool's call is refused");
+
+        // A response format alongside tools binds only the final message:
+        // calls, with commentary before them, or one schema-valid message.
+        let schema = json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false});
+        let with_final = format
+            .tool_grammar(
+                &tools,
+                &["get_weather".into()],
+                &ToolRequirement::Auto,
+                Some(&schema),
+                &prompt.text,
+            )
+            .unwrap();
+        for accepted in [
+            call.to_owned(),
+            format!("Let me check.\n{call}"),
+            "{\"answer\": \"sunny\"}".to_owned(),
+        ] {
+            let mut run = ConstraintRun::load_grammar(&model, &with_final).unwrap();
+            let (taken, total) = drive(&mut run, &format, vocab, &accepted);
+            assert_eq!(taken, total, "refused {accepted:?}");
+        }
+        for refused in [
+            "It is sunny.".to_owned(),
+            "{\"answer\": 5}".to_owned(),
+            format!("{call}\nIt is sunny."),
+        ] {
+            let mut run = ConstraintRun::load_grammar(&model, &with_final).unwrap();
+            let (taken, total) = drive(&mut run, &format, vocab, &refused);
+            assert!(taken < total, "accepted {refused:?}");
+        }
     }
 }
