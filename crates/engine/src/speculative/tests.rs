@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use super::{
     CalibratedDraftLength, ConfigError, DraftLength, GreedySpeculativeTarget, Pick, PositionLogits,
     PromptLookup, SpeculationError, SpeculationRequest, SpeculationStats, SpeculativeTarget,
-    StepOutcome, Verdict, VerifyCost, accept_or_resample, greedy_speculative_step,
+    StepOutcome, Verdict, VerifyCost, accept_or_resample, accept_verified, greedy_speculative_step,
     speculative_step,
 };
 use crate::sampling::sample_categorical;
@@ -261,6 +261,59 @@ fn seeded_sampling_reproduces_plain_sampling_token_for_token() {
             &mut random_draft(&mut draft_rng),
         );
         assert_eq!(output, expected, "seed {seed}");
+    }
+}
+
+#[test]
+fn pre_drawn_row_uniforms_reproduce_plain_sampling() {
+    // A device verify draws row i's variate before knowing which rows will
+    // be committed: it reads i draws ahead of the stream, as the server's
+    // `uniform_ahead(i)` does. Committing one draw per settled row keeps the
+    // stream aligned with plain decoding, including after rejections.
+    for seed in 0..20 {
+        let mut plain_rng = Rng(seed);
+        let expected = decode_plain(24, &mut |row| sample(row, 0.9, plain_rng.uniform()));
+
+        let (mut model, logits) = ToyModel::prefilled(&PROMPT);
+        let mut stream = Rng(seed);
+        let mut output = vec![sample(&logits, 0.9, stream.uniform())];
+        let mut draft_rng = Rng(seed ^ 0xABCD);
+        let mut draft = random_draft(&mut draft_rng);
+        let mut rejected = 0;
+        while output.len() < 24 {
+            let mut history = PROMPT.to_vec();
+            history.extend(&output);
+            let proposal = draft(&history, 24 - output.len() - 1);
+            let base = model.cached_tokens();
+            let mut input = vec![*output.last().expect("first token")];
+            input.extend(&proposal);
+            let rows = model.verify(&input).expect("toy model");
+            let ahead: Vec<f64> = {
+                let mut peek = Rng(stream.0);
+                (0..input.len()).map(|_| peek.uniform()).collect()
+            };
+            let mut settled = 0;
+            let mut pick_at = |index: usize| {
+                assert_eq!(index, settled, "rows settle in order, once each");
+                settled += 1;
+                let committed = stream.uniform();
+                assert_eq!(committed.to_bits(), ahead[index].to_bits());
+                Ok::<_, Infallible>(Pick {
+                    token: sample(rows.row(index).expect("row"), 0.9, ahead[index]),
+                    stop: false,
+                })
+            };
+            let outcome =
+                accept_verified(&mut model, base, &proposal, &mut pick_at).expect("toy model");
+            assert_eq!(settled, outcome.emitted.len());
+            rejected += usize::from(outcome.accepted < outcome.drafted && outcome.accepted > 0);
+            output.extend(outcome.emitted);
+        }
+        assert_eq!(output, expected, "seed {seed}");
+        assert_eq!(model.cache.len(), PROMPT.len() + output.len() - 1);
+        if seed == 0 {
+            assert!(rejected > 0, "seed 0 rejects mid-draft at least once");
+        }
     }
 }
 

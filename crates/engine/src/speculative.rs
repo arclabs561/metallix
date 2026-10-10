@@ -279,6 +279,31 @@ where
     })
 }
 
+/// The acceptance walk of [`speculative_step`] for a caller that verified
+/// `last_token` plus `draft` itself, starting from `base` cached tokens, in
+/// a form the target traits do not cover (device picks whose rows the
+/// caller settles on the host, say). `pick_at(i)` settles row `i`; it is
+/// called in row order and not past the first row that leaves the draft or
+/// stops, so a picker that consumes one random draw per call draws exactly
+/// what plain decoding of the emitted tokens would.
+///
+/// # Errors
+///
+/// Returns the picker's error, or the target's when rolling back fails.
+pub fn accept_verified<T, P>(
+    target: &mut T,
+    base: usize,
+    draft: &[i32],
+    pick_at: &mut dyn FnMut(usize) -> Result<Pick, P>,
+) -> Result<StepOutcome, SpeculationError<T::Error, P>>
+where
+    T: SpeculativeTarget + ?Sized,
+{
+    accept_and_roll_back(target, base, draft, |index| {
+        pick_at(index).map_err(SpeculationError::Pick)
+    })
+}
+
 /// Picks row by row until a pick diverges from the draft, stops, or is the
 /// bonus row, then drops cache positions conditioned on rejected drafts.
 fn accept_and_roll_back<T, P>(
