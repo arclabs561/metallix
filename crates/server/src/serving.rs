@@ -157,6 +157,45 @@ fn engine_seed(
     }
 }
 
+/// Warms and wires a loaded worker, announces it on `startup`, then serves
+/// it through the batching engine or the serial job loop.
+fn serve_loaded(
+    worker: &mut dyn ModelWorker,
+    startup: &SyncSender<Startup>,
+    jobs: Receiver<GenerationJob>,
+    capture: Option<PathBuf>,
+    engine_limits: EngineLimits,
+    planned_bytes: u64,
+) {
+    if let Some(seed) = engine_seed(worker, engine_limits) {
+        serve_engine(worker, seed, engine_limits, startup);
+    } else {
+        prepare_resident(worker, planned_bytes);
+        if startup.send(Ok(None)).is_ok() {
+            serve_jobs(worker, jobs, capture);
+        }
+    }
+}
+
+/// Warms the model and wires its memory (`planned_bytes` beyond what is
+/// loaded, see [`gpu::wire_resident`]) before the worker is announced, so
+/// a ready model gives its first request normal latency. Warmup makes
+/// several GPU round trips, each queued behind other processes' GPU work,
+/// so readiness takes longer on a shared GPU. Wiring precedes any request,
+/// since MLX must not change the wired limit while an asynchronous
+/// evaluation runs.
+fn prepare_resident(worker: &mut dyn ModelWorker, planned_bytes: u64) {
+    if let Err(error) = worker.warm() {
+        // Warmup only saves first-use cost; a broken model fails its
+        // requests with their own errors.
+        tracing::warn!(%error, "model warmup failed");
+    }
+    if worker.chat().is_some() {
+        let wired_bytes = gpu::wire_resident(planned_bytes);
+        tracing::info!(wired_bytes = ?wired_bytes, "model memory wired");
+    }
+}
+
 /// Builds a paged pool from `seed` and runs the batching engine on this
 /// thread until the acceptor drops its client. Non-generation jobs run
 /// between engine steps.
@@ -205,6 +244,8 @@ fn serve_engine(
         pool_bytes: session.pool_bytes() as u64,
         load_ms: seed.load_ms,
     });
+    // The paged pool is allocated by now, so MLX's active bytes count it.
+    prepare_resident(worker, 0);
     let (messages, receiver) = sync_channel(limits.capacity());
     if startup
         .send(Ok(Some(EngineClient::new(model, messages))))
@@ -570,35 +611,19 @@ fn serve_inner(
                 load.record("load_ms", load_ms);
                 gpu::Memory::record_on(&load);
                 tracing::info!("model loaded");
-                // Before the child announces itself, so the first request
-                // does not wait on first-use kernel builds.
-                if let Err(error) = worker.warm() {
-                    load.record("error.type", "warmup_failed");
-                    let _ = startup_sender.send(Err(format!("warmup failed: {error}")));
-                    return;
-                }
-                // Before any request, since MLX must not change the wired
-                // limit while an asynchronous evaluation runs.
-                if worker.chat().is_some() {
-                    let wired_bytes = gpu::wire_resident(
-                        limits
-                            .kv_budget_bytes()
-                            .saturating_add(limits.prefix_cache_bytes()),
-                    );
-                    tracing::info!(wired_bytes = ?wired_bytes, "model memory wired");
-                }
                 drop(entered);
                 drop(load);
-                match engine_seed(worker.as_mut(), engine_limits) {
-                    Some(seed) => {
-                        serve_engine(worker.as_mut(), seed, engine_limits, &startup_sender);
-                    }
-                    None => {
-                        if startup_sender.send(Ok(None)).is_ok() {
-                            serve_jobs(worker.as_mut(), job_receiver, worker_capture);
-                        }
-                    }
-                }
+                let planned_bytes = limits
+                    .kv_budget_bytes()
+                    .saturating_add(limits.prefix_cache_bytes());
+                serve_loaded(
+                    worker.as_mut(),
+                    &startup_sender,
+                    job_receiver,
+                    worker_capture,
+                    engine_limits,
+                    planned_bytes,
+                );
             })
             .map_err(|error| format!("{}: could not start the model thread: {error}", entry.id))?;
         workers.push(worker);
@@ -2012,6 +2037,109 @@ stream.close()
         };
         assert!(super::engine_seed(&mut worker, batching).is_some());
         assert!(worker.asked);
+    }
+
+    /// Runs its warmup when the test releases it, then succeeds or fails.
+    struct HeldWarmup {
+        release: Receiver<()>,
+        warmed: Arc<AtomicBool>,
+        fails: bool,
+    }
+
+    impl ModelWorker for HeldWarmup {
+        fn chat(&mut self) -> Option<&mut dyn ChatBackend> {
+            None
+        }
+
+        fn decide(&mut self, _body: &[u8], _model: &str) -> Option<Result<Value, String>> {
+            None
+        }
+
+        fn warm(&mut self) -> Result<(), String> {
+            let _ = self.release.recv();
+            self.warmed.store(true, Ordering::Release);
+            if self.fails {
+                Err(String::from("warmup failed in this test"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A serial worker served by `serve_loaded` on its own thread, with its
+    /// warmup waiting for `release`. Dropping `jobs` ends the thread.
+    struct HeldServing {
+        release: SyncSender<()>,
+        announced: Receiver<Startup>,
+        jobs: SyncSender<GenerationJob>,
+        warmed: Arc<AtomicBool>,
+        serving: thread::JoinHandle<()>,
+    }
+
+    fn serve_held_warmup(fails: bool) -> HeldServing {
+        let (release, held) = sync_channel(1);
+        let warmed = Arc::new(AtomicBool::new(false));
+        let mut worker = HeldWarmup {
+            release: held,
+            warmed: Arc::clone(&warmed),
+            fails,
+        };
+        let (startup, announced) = sync_channel(1);
+        let (jobs, receiver) = sync_channel::<GenerationJob>(0);
+        let serving = thread::spawn(move || {
+            serve_loaded(
+                &mut worker,
+                &startup,
+                receiver,
+                None,
+                EngineLimits {
+                    max_num_seqs: 1,
+                    prefill_chunk_tokens: 1024,
+                    prefill_target_ms: 50,
+                },
+                0,
+            );
+        });
+        HeldServing {
+            release,
+            announced,
+            jobs,
+            warmed,
+            serving,
+        }
+    }
+
+    /// Ready means the first request gets normal latency, so a worker is
+    /// announced only once its warmup has finished.
+    #[test]
+    fn a_worker_is_announced_only_after_its_warmup() {
+        let held = serve_held_warmup(false);
+        assert!(
+            held.announced
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "announced while warmup is still held"
+        );
+        held.release.send(()).expect("warmup is waiting");
+        assert!(matches!(held.announced.recv_timeout(HUNG), Ok(Ok(None))));
+        assert!(held.warmed.load(Ordering::Acquire));
+        drop(held.jobs);
+        held.serving.join().expect("worker thread");
+    }
+
+    /// Warmup only saves first-use cost: a failed warmup is logged and the
+    /// worker is still announced and served.
+    #[test]
+    fn a_failed_warmup_still_serves() {
+        let held = serve_held_warmup(true);
+        held.release.send(()).expect("warmup is waiting");
+        assert!(
+            matches!(held.announced.recv_timeout(HUNG), Ok(Ok(None))),
+            "a failed warmup must not fail startup"
+        );
+        assert!(held.warmed.load(Ordering::Acquire));
+        drop(held.jobs);
+        held.serving.join().expect("worker thread");
     }
 
     /// Answers decisions with a fixed receipt that names the requested model.
