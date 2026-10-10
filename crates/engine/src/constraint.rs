@@ -176,6 +176,10 @@ pub enum ConstraintError {
     /// Grammar-complete output was not valid JSON.
     #[error("grammar-complete output was not valid JSON")]
     InvalidJson,
+    /// Whole-output validation was requested from a session built from a
+    /// Lark grammar, which has no single schema to validate against.
+    #[error("the session was built from a grammar, not a JSON Schema")]
+    NoWholeOutputSchema,
     /// Independent JSON Schema validation rejected grammar-complete output.
     #[error("independent JSON Schema validation rejected the output")]
     SchemaValidation,
@@ -303,6 +307,31 @@ impl JsonConstraintCompiler {
         self.compile_session(schema, limits)
     }
 
+    /// Compiles one bounded Lark grammar into a fresh session. The grammar
+    /// may embed JSON Schemas with `%json{...}`, and names special tokens
+    /// `<[id]>`; the trie prefixes their bytes with 0xFF, so no text rule can
+    /// produce one. [`JsonConstraintSession::validate_complete`] does not
+    /// apply: a grammar has no single whole-output schema, so callers check
+    /// what they parse out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConstraintError::ZeroLimit`] for any zero limit and
+    /// [`ConstraintError::SchemaTooLarge`] when the grammar text exceeds the
+    /// schema bound. Compilation can return
+    /// [`ConstraintError::GrammarWarning`].
+    pub fn lark_session(
+        &self,
+        grammar: &str,
+        limits: ConstraintLimits,
+    ) -> Result<JsonConstraintSession, ConstraintError> {
+        let limits = limits.validate()?;
+        if grammar.len() > limits.max_schema_bytes {
+            return Err(ConstraintError::SchemaTooLarge);
+        }
+        self.grammar_session(TopLevelGrammar::from_lark(grammar.to_owned()), None, limits)
+    }
+
     fn compile_session(
         &self,
         schema: Value,
@@ -313,10 +342,20 @@ impl JsonConstraintCompiler {
             .offline()
             .build(&schema)
             .map_err(|_| ConstraintError::SchemaCompilation)?;
-        let mut matcher = Matcher::new(
-            self.factory
-                .create_parser(TopLevelGrammar::from_json_schema(schema)),
-        );
+        self.grammar_session(
+            TopLevelGrammar::from_json_schema(schema),
+            Some(validator),
+            limits,
+        )
+    }
+
+    fn grammar_session(
+        &self,
+        grammar: TopLevelGrammar,
+        validator: Option<Validator>,
+        limits: ConstraintLimits,
+    ) -> Result<JsonConstraintSession, ConstraintError> {
+        let mut matcher = Matcher::new(self.factory.create_parser(grammar));
         if matcher.is_error() || !matcher.grammar_warnings().is_empty() {
             return Err(ConstraintError::GrammarWarning);
         }
@@ -343,7 +382,8 @@ pub struct JsonConstraintSession {
     /// Identifies this session's checkpoints; the trie may be shared.
     owner: Arc<()>,
     matcher: Matcher,
-    validator: Validator,
+    /// The whole-output schema check; `None` for a Lark-grammar session.
+    validator: Option<Validator>,
     model_vocab_size: usize,
     tokenizer_vocab_size: usize,
     eos_token_id: u32,
@@ -747,13 +787,18 @@ impl JsonConstraintSession {
     /// * [`ConstraintError::InvalidJson`] when the decoded bytes do not parse.
     /// * [`ConstraintError::SchemaValidation`] when the independent validator
     ///   rejects the value the grammar accepted.
+    /// * [`ConstraintError::NoWholeOutputSchema`] for a Lark-grammar session.
     pub fn validate_complete(&self) -> Result<Value, ConstraintError> {
+        let validator = self
+            .validator
+            .as_ref()
+            .ok_or(ConstraintError::NoWholeOutputSchema)?;
         if !self.is_complete() {
             return Err(ConstraintError::NotComplete);
         }
         let value =
             serde_json::from_slice(&self.output).map_err(|_| ConstraintError::InvalidJson)?;
-        self.validator
+        validator
             .validate(&value)
             .map_err(|_| ConstraintError::SchemaValidation)?;
         Ok(value)
@@ -1848,5 +1893,68 @@ mod tests {
         assert!(session.is_complete());
         assert_eq!(session.decoded_bytes(), b"1");
         assert_eq!(session.validate_complete(), Ok(json!(1)));
+    }
+
+    /// A Lark grammar names a special token by id and embeds a JSON Schema;
+    /// the special token is reachable only where the grammar names it, and
+    /// whole-output validation does not apply.
+    #[test]
+    fn lark_grammars_name_special_tokens_by_id_and_embed_json() {
+        const CALL: u32 = 15;
+        let tokenizer = json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [
+                {"id": EOS, "content": "<eos>", "special": true},
+                {"id": CALL, "content": "<call>", "special": true}
+            ],
+            "model": {"vocab": {
+                "{": 0, "}": 1, "\"": 2, "o": 3, "k": 4, ":": 5,
+                "t": 6, "r": 7, "u": 8, "e": 9, "f": 10, "a": 11,
+                "l": 12, "s": 13
+            }}
+        });
+        let mut session = JsonConstraintCompiler::new(&tokenizer, EOS, MODEL_VOCAB, limits())
+            .expect("bounded compiler")
+            .lark_session(r#"start: "o" <[15]> %json{"type": "boolean"}"#, limits())
+            .expect("bounded lark session");
+        let favour = |order: &[u32]| {
+            let mut values = vec![-10.0; MODEL_VOCAB];
+            for (rank, &token) in order.iter().enumerate() {
+                values[token as usize] = 10.0 - f32::from(u8::try_from(rank).expect("few tokens"));
+            }
+            values
+        };
+        // The call token outranks everything but is not legal before "o".
+        let step = session.select_argmax(&favour(&[CALL, token_id(b't'), token_id(b'o')]));
+        assert_eq!(
+            step,
+            Ok(ConstraintStep::Token {
+                token_id: token_id(b'o')
+            })
+        );
+        // Then only the call token is legal, whatever outranks it.
+        let step = session.select_argmax(&favour(&[token_id(b't'), CALL]));
+        assert_eq!(step, Ok(ConstraintStep::Token { token_id: CALL }));
+        for &byte in b"tru" {
+            let step = session.select_argmax(&favour(&[token_id(byte)]));
+            assert_eq!(
+                step,
+                Ok(ConstraintStep::Token {
+                    token_id: token_id(byte)
+                })
+            );
+        }
+        let step = session.select_argmax(&favour(&[token_id(b'e')]));
+        assert_eq!(
+            step,
+            Ok(ConstraintStep::Complete {
+                token_id: token_id(b'e')
+            })
+        );
+        assert_eq!(session.decoded_bytes()[0], b'o');
+        assert_eq!(
+            session.validate_complete(),
+            Err(ConstraintError::NoWholeOutputSchema)
+        );
     }
 }
