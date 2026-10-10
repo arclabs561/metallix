@@ -105,6 +105,12 @@ Model lifecycle is explicit: `unloaded`, `loading`, `warming`, `ready`, or
 from process startup, a listening port, or model discovery; it includes the
 adapter's required plan compilation and warmup.
 
+## Model architectures
+
+[Diagrams of each model architecture](arch/README.md) show the blocks each
+model crate executes, with numbers its own config parsing derives from a
+reference checkpoint.
+
 ## Planned execution plug-ins
 
 Each adapter under `crates/models/` owns validated configuration, checkpoint
