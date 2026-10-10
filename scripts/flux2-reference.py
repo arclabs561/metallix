@@ -60,7 +60,7 @@ def versions() -> dict[str, str]:
 def write(out: Path, tensors: dict[str, torch.Tensor], meta: dict) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     save_file({k: v.detach().contiguous().cpu() for k, v in tensors.items()}, str(out))
-    meta = {"versions": versions(), **meta}
+    meta = {"versions": versions(), "torch_threads": torch.get_num_threads(), **meta}
     out.with_suffix(".json").write_text(json.dumps(meta, indent=1) + "\n")
 
 
@@ -129,6 +129,7 @@ def text_encoder(args: argparse.Namespace) -> None:
         tensors,
         {
             "kind": "text-encoder",
+            "device": "cpu",
             "dtype": args.dtype,
             "prompt": args.prompt,
             "rendered": text,
@@ -206,6 +207,7 @@ def transformer(args: argparse.Namespace) -> None:
         },
         {
             "kind": "transformer",
+            "device": "cpu",
             "dtype": args.dtype,
             "seed": args.seed,
             "height": args.height,
@@ -228,6 +230,7 @@ def vae(args: argparse.Namespace) -> None:
         {"latents": latents, "decoded": image, "image": (image / 2 + 0.5).clamp(0, 1)},
         {
             "kind": "vae",
+            "device": "cpu",
             "dtype": args.dtype,
             "source": f"{args.latents.name}:{args.key}",
         },
@@ -255,12 +258,15 @@ def pipeline(args: argparse.Namespace) -> None:
             width=args.width,
             num_inference_steps=args.steps,
             latents=latents.to(device=args.device, dtype=dtype),
-            output_type="pt",
+            # "latent" stops before the VAE; `vae --key vae_input` then
+            # decodes as its own step (the CPU bf16 decode takes hours).
+            output_type="latent" if args.skip_decode else "pt",
             callback_on_step_end=record,
             callback_on_step_end_tensor_inputs=["latents"],
         ).images
-    image = image.cpu()
-    tensors = {"initial_latents": latents, "image": image}
+    tensors = {"initial_latents": latents}
+    if not args.skip_decode:
+        tensors["image"] = image.cpu()
     for index, step in enumerate(steps):
         tensors[f"latents.step{index}"] = step
 
@@ -289,10 +295,17 @@ def pipeline(args: argparse.Namespace) -> None:
             "width": args.width,
             "steps": args.steps,
             "device": args.device,
+            "decoded": not args.skip_decode,
         },
     )
+    if args.skip_decode:
+        return
     # diffusers' numpy_to_pil quantization: round(x * 255) as uint8.
-    pixels = (image[0].permute(1, 2, 0).float().numpy() * 255).round().astype("uint8")
+    pixels = (
+        (tensors["image"][0].permute(1, 2, 0).float().numpy() * 255)
+        .round()
+        .astype("uint8")
+    )
     from PIL import Image
 
     Image.fromarray(pixels).save(args.out.with_suffix(".png"))
@@ -345,6 +358,11 @@ def main() -> None:
     full.add_argument("--height", type=int, default=1024)
     full.add_argument("--width", type=int, default=1024)
     full.add_argument("--steps", type=int, default=4)
+    full.add_argument(
+        "--skip-decode",
+        action="store_true",
+        help="save latents and vae_input only; decode later with the vae subcommand",
+    )
     full.set_defaults(run=pipeline)
 
     parser.add_argument(
