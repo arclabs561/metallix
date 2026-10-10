@@ -367,6 +367,12 @@ fn qwen35_claim(json: &str) -> Claim {
 fn gemma4_claim(json: &str) -> Claim {
     use gemma::{Gemma4ConfigError, Gemma4TextConfig};
     match Gemma4TextConfig::parse(json) {
+        // The gemma crate runs the expert block; serving waits for its
+        // full-model check against the source.
+        Ok(config) if config.moe().is_some() => Claim::Rejected(
+            Adapter::Gemma4,
+            "Gemma 4 mixture-of-experts block is not yet validated on a full checkpoint".to_owned(),
+        ),
         Ok(_) => Claim::Accepted(Adapter::Gemma4),
         Err(Gemma4ConfigError::UnexpectedModelType(_) | Gemma4ConfigError::Json(_)) => {
             Claim::NotMine

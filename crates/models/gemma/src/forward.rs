@@ -10,6 +10,7 @@
     reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
 )]
 
+use layers::moe::{Activation, Experts, Matrix, MoeError, routed_experts};
 use mlx_rs::{Array, StreamOrDevice, fast, ops, ops::indexing::IndexOp};
 use thiserror::Error;
 
@@ -283,10 +284,16 @@ fn decoder_layer(
         &mlp_input,
         weights.tensor(&format!("{base}.mlp.up_proj.weight"))?,
     )?;
-    let mlp = linear(
+    let mut mlp = linear(
         &gelu_tanh(&gate)?.multiply_device(&up, &stream)?,
         weights.tensor(&format!("{base}.mlp.down_proj.weight"))?,
     )?;
+    if let Some(moe) = weights.config().moe() {
+        // Both branches are normed and summed before the shared post norm.
+        let experts = experts(weights, &base, moe.top_k(), &residual)?;
+        mlp = norm("post_feedforward_layernorm_1", &mlp)?
+            .add_device(norm("post_feedforward_layernorm_2", &experts)?, &stream)?;
+    }
     let mut output = residual.add_device(norm("post_feedforward_layernorm", &mlp)?, &stream)?;
     if let Some(per_layer_input) = per_layer_input {
         // gelu(gate(x)) * per-layer input, projected back and normed, added
@@ -306,6 +313,40 @@ fn decoder_layer(
     let output =
         output.multiply_device(weights.tensor(&format!("{base}.layer_scalar"))?, &stream)?;
     Ok((output, attended))
+}
+
+/// The routed-expert branch of a layer over the post-attention residual
+/// `[1, n, H]`: the router reads the raw residual, the experts read
+/// `pre_feedforward_layernorm_2` of it.
+fn experts(
+    weights: &Gemma4MlxWeights,
+    base: &str,
+    top_k: usize,
+    residual: &Array,
+) -> Result<Array, Gemma4ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let shape = residual.shape().to_vec();
+    let hidden = shape.last().copied().unwrap_or(0);
+    let tensor = |name: &str| weights.tensor(&format!("{base}.{name}"));
+    let eps = weights.config().rms_norm_eps();
+    let rows = residual.reshape_device(&[-1, hidden], &stream)?;
+    let routing = crate::routing::route(
+        &rows,
+        tensor("router.scale")?,
+        tensor("router.proj.weight")?,
+        tensor("router.per_expert_scale")?,
+        top_k,
+        eps,
+    )?;
+    let input = rms_norm(&rows, tensor("pre_feedforward_layernorm_2.weight")?, eps)?;
+    let stacks = Experts::Fused {
+        gate_up: Matrix::Dense(tensor("experts.gate_up_proj")?),
+        down: Matrix::Dense(tensor("experts.down_proj")?),
+    };
+    Ok(
+        routed_experts(&input, &stacks, &routing, Activation::GeluTanh)?
+            .reshape_device(&shape, &stream)?,
+    )
 }
 
 /// `(rms_norm((embeds @ P) / sqrt(H)) + table[ids] * sqrt(width)) / sqrt(2)`
@@ -646,6 +687,9 @@ pub enum Gemma4ForwardError {
     /// A tensor the forward pass needs is absent.
     #[error("missing weight {0}")]
     MissingWeight(String),
+    /// The routed-expert block refused its routing or expert stacks.
+    #[error("mixture-of-experts block: {0}")]
+    Experts(#[from] MoeError),
     /// No tokens were supplied.
     #[error("input must contain at least one token")]
     EmptyInput,

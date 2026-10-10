@@ -184,6 +184,20 @@ fn served_adapters_accept_their_published_configs() {
 }
 
 #[test]
+fn gemma4_experts_are_refused_until_validated() {
+    let moe = GEMMA4_12B.replace(
+        r#""enable_moe_block": false"#,
+        r#""enable_moe_block": true, "num_experts": 128, "top_k_experts": 8,
+    "moe_intermediate_size": 704"#,
+    );
+    let verdict = assert_classified(&moe, Some(Adapter::Gemma4), false);
+    assert!(
+        verdict.reason().contains("mixture-of-experts"),
+        "{verdict:?}"
+    );
+}
+
+#[test]
 fn unserved_adapters_name_themselves_but_are_not_supported() {
     assert_classified(DEEPSEEK_V41, Some(Adapter::DeepseekV41), false);
 }

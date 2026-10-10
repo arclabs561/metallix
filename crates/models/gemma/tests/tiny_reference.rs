@@ -20,9 +20,10 @@ use serde::Deserialize;
 /// Bound on |logit - float64 logit|. The fixture records the source's own
 /// float64 logits beside its float32 ones: on these random weights (softmax
 /// scale 1 over unit-norm Q and K, so attention is sharp) the source's float32
-/// lands up to 4.1e-5 from float64 on the PLE model. Any float32
-/// implementation carries that noise; 1e-4 allows about 2.5 times it, while
-/// each wiring mistake the reference script lists moves logits by far more.
+/// lands up to 4.1e-5 from float64 on the PLE model and 1.1e-5 on the `MoE`
+/// one. Any float32 implementation carries that noise; 1e-4 allows about 2.5
+/// times the PLE figure, while each wiring mistake the reference script lists
+/// moves logits by far more.
 const MAX_ABS_LOGIT: f64 = 1e-4;
 
 /// MLX's native test operations share process-global device initialization.
@@ -142,6 +143,66 @@ fn per_layer_inputs_and_shared_kv_match_transformers() {
         );
 
         // A prompt split across an extend crosses the window inside the cache.
+        let prompt = &case.steps[0].input_ids;
+        for split in 1..prompt.len() {
+            let mut executor = weights.executor(64).expect("executor");
+            executor
+                .prefill_last_logits(&prompt[..split])
+                .expect("prefix");
+            let logits = executor
+                .extend_last_logits(&prompt[split..])
+                .expect("extend");
+            let difference = worst(&logits, &case.steps[0].logits_float64);
+            assert!(
+                difference <= MAX_ABS_LOGIT,
+                "{} split at {split}: max |dlogit| {difference}",
+                case.name
+            );
+        }
+    }
+}
+
+/// `fixtures/gemma-4-tiny/moe-reference.json`: 8 experts, top-3, beside the
+/// dense MLP in each of 4 layers, so routing, the expert branch and its
+/// norms all move the logits.
+#[test]
+fn routed_experts_match_transformers() {
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reference, weights) = load(include_str!(
+        "../../../../fixtures/gemma-4-tiny/moe-reference.json"
+    ));
+    let moe = weights.config().moe().expect("expert block");
+    assert_eq!((moe.experts(), moe.top_k()), (8, 3));
+    for case in &reference.cases {
+        let mut executor = weights.executor(64).expect("executor");
+        let mut overall = 0.0_f64;
+        for (index, step) in case.steps.iter().enumerate() {
+            let logits = if index == 0 {
+                executor.prefill_last_logits(&step.input_ids)
+            } else {
+                executor.decode_last_logits(step.input_ids[0])
+            }
+            .expect("forward");
+            let difference = worst(&logits, &step.logits_float64);
+            overall = overall.max(difference);
+            assert!(
+                difference <= MAX_ABS_LOGIT,
+                "{} step {index}: max |dlogit| {difference}",
+                case.name
+            );
+            assert_eq!(
+                argmax(&logits),
+                argmax(&step.logits),
+                "{} step {index}",
+                case.name
+            );
+        }
+        eprintln!("{}: worst |logit - float64 logit| {overall:e}", case.name);
+
+        // Routing is per token, so a prompt split across an extend routes
+        // the same.
         let prompt = &case.steps[0].input_ids;
         for split in 1..prompt.len() {
             let mut executor = weights.executor(64).expect("executor");

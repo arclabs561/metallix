@@ -165,6 +165,22 @@ pub fn expected_text_tensors(config: &Gemma4TextConfig) -> BTreeMap<String, Vec<
             add("per_layer_projection.weight", vec![hidden, width]);
             add("post_per_layer_input_norm.weight", vec![hidden]);
         }
+        if let Some(moe) = config.moe() {
+            let (experts, inner) = (moe.experts(), moe.intermediate());
+            for norm in [
+                "pre_feedforward_layernorm_2",
+                "post_feedforward_layernorm_1",
+                "post_feedforward_layernorm_2",
+            ] {
+                add(&format!("{norm}.weight"), vec![hidden]);
+            }
+            add("router.proj.weight", vec![experts, hidden]);
+            add("router.scale", vec![hidden]);
+            add("router.per_expert_scale", vec![experts]);
+            // Gate rows, then up rows, as `chunk(2)` splits them.
+            add("experts.gate_up_proj", vec![experts, 2 * inner, hidden]);
+            add("experts.down_proj", vec![experts, hidden, inner]);
+        }
     }
     expected
 }

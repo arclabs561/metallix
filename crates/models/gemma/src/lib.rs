@@ -1,9 +1,9 @@
-//! Gemma 4 dense text-model contract, checkpoint validation and Metal forward.
+//! Gemma 4 text-model contract, checkpoint validation and Metal forward.
 //!
 //! Gemma 4 interleaves sliding-window and full-attention decoder layers. This
-//! crate implements the dense text path of the `gemma4` (31B, E2B, E4B) and
-//! `gemma4_unified` (12B) checkpoints and refuses the mixture-of-experts block
-//! (26B-A4B).
+//! crate implements the text path of the `gemma4` (31B, E2B, E4B, 26B-A4B)
+//! and `gemma4_unified` (12B) checkpoints. The server does not admit 26B-A4B
+//! until its expert block passes a full-checkpoint check against the source.
 //!
 //! Source: `modeling_gemma4.py` and `modeling_gemma4_unified.py` in
 //! transformers v5.18.0. The numerics that differ from the Qwen3 adapter:
@@ -34,6 +34,12 @@
 //! - Their last layers share K/V: such a layer projects only Q and attends over
 //!   the K/V of the last earlier layer of its kind, as that layer saw it in the
 //!   same step. On E2B these layers also use a twice-as-wide MLP.
+//! - 26B-A4B adds routed experts beside the dense MLP in every layer. The
+//!   router reads the raw post-attention residual, the experts read
+//!   `pre_feedforward_layernorm_2` of it, and the two branches are normed
+//!   separately and summed before `post_feedforward_layernorm`:
+//!   `r + post_ff(post_ff_1(mlp(pre_ff(r))) + post_ff_2(experts(pre_ff_2(r))))`.
+//!   [`routing`] has the router.
 //!
 //! # Overview
 //!
@@ -56,10 +62,11 @@
 //! ```
 //! use gemma::{Gemma4ConfigError, Gemma4GenerationConfig, Gemma4TextConfig};
 //!
-//! let moe = r#"{"model_type": "gemma4_text", "enable_moe_block": true}"#;
+//! let bidirectional =
+//!     r#"{"model_type": "gemma4_text", "use_bidirectional_attention": "all"}"#;
 //! assert!(matches!(
-//!     Gemma4TextConfig::parse(moe),
-//!     Err(Gemma4ConfigError::Unsupported("mixture-of-experts block")),
+//!     Gemma4TextConfig::parse(bidirectional),
+//!     Err(Gemma4ConfigError::Unsupported("bidirectional text attention")),
 //! ));
 //!
 //! let generation = Gemma4GenerationConfig::parse(r#"{"eos_token_id": [1, 106]}"#)?;
@@ -165,7 +172,7 @@ impl Gemma4Attention {
     }
 }
 
-/// The validated dense Gemma 4 text layout.
+/// The validated Gemma 4 text layout.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gemma4TextConfig {
     hidden_size: usize,
@@ -184,6 +191,8 @@ pub struct Gemma4TextConfig {
     kv_sources: Vec<Option<usize>>,
     /// K/V-sharing layers use a twice-as-wide MLP (E2B).
     double_wide_mlp: bool,
+    /// Routed experts beside the dense MLP in every layer (26B-A4B).
+    moe: Option<routing::Gemma4MoeGeometry>,
 }
 
 impl Gemma4TextConfig {
@@ -196,10 +205,9 @@ impl Gemma4TextConfig {
     /// * [`Gemma4ConfigError::Json`] for malformed JSON.
     /// * [`Gemma4ConfigError::UnexpectedModelType`] for another architecture.
     /// * [`Gemma4ConfigError::Unsupported`] for a Gemma 4 variant this crate
-    ///   does not implement: the mixture-of-experts block, a per-layer
-    ///   vocabulary unlike the main one, bidirectional text attention,
-    ///   attention bias, another activation, an untied output embedding, or
-    ///   scaled or unknown `RoPE`.
+    ///   does not implement: a per-layer vocabulary unlike the main one,
+    ///   bidirectional text attention, attention bias, another activation, an
+    ///   untied output embedding, or scaled or unknown `RoPE`.
     /// * [`Gemma4ConfigError::MissingDimension`],
     ///   [`Gemma4ConfigError::InvalidValue`],
     ///   [`Gemma4ConfigError::InvalidLayerTypes`] and
@@ -229,9 +237,6 @@ impl Gemma4TextConfig {
             "gemma4_text" | "gemma4_unified_text"
         ) {
             return Err(Gemma4ConfigError::UnexpectedModelType(raw.model_type));
-        }
-        if raw.enable_moe_block {
-            return Err(Gemma4ConfigError::Unsupported("mixture-of-experts block"));
         }
         if raw.use_bidirectional_attention.as_deref() == Some("all") {
             return Err(Gemma4ConfigError::Unsupported(
@@ -306,6 +311,35 @@ impl Gemma4TextConfig {
             }
         };
 
+        let moe = if raw.enable_moe_block {
+            let fields = [
+                ("num_experts", raw.num_experts),
+                ("top_k_experts", raw.top_k_experts),
+                ("moe_intermediate_size", raw.moe_intermediate_size),
+            ];
+            for (name, value) in fields {
+                if value == 0 {
+                    return Err(Gemma4ConfigError::MissingDimension(name));
+                }
+            }
+            Some(
+                routing::Gemma4MoeGeometry::new(
+                    raw.hidden_size,
+                    raw.num_experts,
+                    raw.top_k_experts,
+                    raw.moe_intermediate_size,
+                )
+                .map_err(|error| match error {
+                    routing::Gemma4RouterError::InvalidTopK => {
+                        Gemma4ConfigError::InvalidValue("top_k_experts")
+                    }
+                    _ => Gemma4ConfigError::InvalidValue("num_experts"),
+                })?,
+            )
+        } else {
+            None
+        };
+
         let rope = raw
             .rope_parameters
             .ok_or(Gemma4ConfigError::InvalidValue("rope_parameters"))?;
@@ -357,6 +391,7 @@ impl Gemma4TextConfig {
             per_layer_input,
             kv_sources,
             double_wide_mlp: raw.use_double_wide_mlp,
+            moe,
         })
     }
 
@@ -452,6 +487,13 @@ impl Gemma4TextConfig {
         } else {
             self.intermediate_size
         }
+    }
+
+    /// The routed-expert geometry, when every layer has experts beside its
+    /// dense MLP (26B-A4B).
+    #[must_use]
+    pub const fn moe(&self) -> Option<routing::Gemma4MoeGeometry> {
+        self.moe
     }
 
     /// The embedding multiplier before rounding to the weight dtype.
@@ -617,6 +659,12 @@ struct RawTextConfig {
     num_kv_shared_layers: usize,
     #[serde(default)]
     enable_moe_block: bool,
+    #[serde(default)]
+    num_experts: usize,
+    #[serde(default)]
+    top_k_experts: usize,
+    #[serde(default)]
+    moe_intermediate_size: usize,
     use_bidirectional_attention: Option<String>,
 }
 
@@ -802,15 +850,48 @@ mod tests {
     }
 
     #[test]
-    fn refuses_variants_without_a_dense_text_path() {
-        let moe = GEMMA4_12B_CONFIG.replace(
-            r#""enable_moe_block": false"#,
-            r#""enable_moe_block": true"#,
+    fn an_expert_block_needs_its_geometry() {
+        let moe = |extra: &str| {
+            GEMMA4_12B_CONFIG.replace(
+                r#""enable_moe_block": false"#,
+                &format!(r#""enable_moe_block": true{extra}"#),
+            )
+        };
+        assert!(matches!(
+            Gemma4TextConfig::parse(&moe("")),
+            Err(Gemma4ConfigError::MissingDimension("num_experts"))
+        ));
+        // google/gemma-4-26B-A4B-it's expert geometry.
+        let config = Gemma4TextConfig::parse(&moe(
+            r#", "num_experts": 128, "top_k_experts": 8, "moe_intermediate_size": 704"#,
+        ))
+        .expect("26B-A4B experts");
+        let geometry = config.moe().expect("experts");
+        assert_eq!(
+            (
+                geometry.experts(),
+                geometry.top_k(),
+                geometry.intermediate(),
+                geometry.hidden()
+            ),
+            (128, 8, 704, config.hidden_size())
         );
         assert!(matches!(
-            Gemma4TextConfig::parse(&moe),
-            Err(Gemma4ConfigError::Unsupported("mixture-of-experts block"))
+            Gemma4TextConfig::parse(&moe(
+                r#", "num_experts": 4, "top_k_experts": 8, "moe_intermediate_size": 704"#,
+            )),
+            Err(Gemma4ConfigError::InvalidValue("top_k_experts"))
         ));
+        assert_eq!(
+            Gemma4TextConfig::parse(GEMMA4_12B_CONFIG)
+                .expect("dense")
+                .moe(),
+            None
+        );
+    }
+
+    #[test]
+    fn refuses_variants_without_a_dense_text_path() {
         // Sharing every one of the 12 layers leaves no layer to share from.
         let all_shared = GEMMA4_12B_CONFIG.replace(
             r#""num_kv_shared_layers": 0"#,

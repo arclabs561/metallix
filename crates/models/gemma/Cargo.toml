@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+layers = { path = "../../metal/layers", optional = true }
 mlx-rs = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -14,7 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [features]
-metal = ["dep:mlx-rs"]
+metal = ["dep:mlx-rs", "layers/metal"]
 
 [dev-dependencies]
 # Same pins as the server, which owns tokenization and template rendering.

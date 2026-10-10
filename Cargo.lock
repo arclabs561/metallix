@@ -754,6 +754,7 @@ dependencies = [
 name = "gemma"
 version = "0.1.0"
 dependencies = [
+ "layers",
  "minijinja",
  "minijinja-contrib",
  "mlx-rs",

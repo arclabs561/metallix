@@ -1,10 +1,10 @@
-//! Gemma 4 `MoE` router geometry and a scalar float32 reference boundary.
+//! Gemma 4 `MoE` geometry and router.
 //!
-//! This does not enable `MoE` checkpoint admission or expert execution. It follows
-//! `Gemma4TextRouter` in Transformers commit
-//! `a906d3c4b65095f2308b6a6a193e934d03b8eb5d`: unweighted RMS normalization,
-//! learned input scaling, softmax, selected-weight renormalization, then learned
-//! per-expert scaling. Scalar reductions are not backend reduction-parity claims.
+//! The router follows `Gemma4TextRouter` in Transformers commit
+//! `a906d3c4b65095f2308b6a6a193e934d03b8eb5d`: unweighted RMS normalization of
+//! the raw residual, learned input scaling, `H^-0.5`, a projection to expert
+//! logits, then `layers::moe::route` (softmax in f32, top-k, renormalization,
+//! learned per-expert scaling).
 
 use thiserror::Error;
 
@@ -71,151 +71,7 @@ impl Gemma4MoeGeometry {
     }
 }
 
-/// One selected expert and its weight after per-expert scaling.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Gemma4ExpertRoute {
-    expert: usize,
-    weight: f32,
-}
-
-impl Gemma4ExpertRoute {
-    /// Expert index in the checkpoint tensors.
-    #[must_use]
-    pub fn expert(self) -> usize {
-        self.expert
-    }
-    /// Renormalized top-k probability times the learned expert scale.
-    #[must_use]
-    pub fn weight(self) -> f32 {
-        self.weight
-    }
-}
-
-/// Borrowed, shape-checked Gemma router tensors for one residual row at a time.
-pub struct Gemma4Router<'a> {
-    geometry: Gemma4MoeGeometry,
-    scale: &'a [f32],
-    projection: &'a [f32],
-    expert_scale: &'a [f32],
-    epsilon: f32,
-}
-
-impl<'a> Gemma4Router<'a> {
-    /// Borrows `scale[H]`, row-major `projection[E,H]`, and `expert_scale[E]`.
-    ///
-    /// Learned scales may be negative. Epsilon must be finite and positive;
-    /// all tensor values must be finite.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for tensor lengths inconsistent with the geometry,
-    /// nonfinite tensor values, or nonpositive/nonfinite RMS epsilon.
-    pub fn new(
-        geometry: Gemma4MoeGeometry,
-        scale: &'a [f32],
-        projection: &'a [f32],
-        expert_scale: &'a [f32],
-        epsilon: f32,
-    ) -> Result<Self, Gemma4RouterError> {
-        if scale.len() != geometry.hidden
-            || projection.len() != geometry.experts * geometry.hidden
-            || expert_scale.len() != geometry.experts
-        {
-            return Err(Gemma4RouterError::ShapeMismatch);
-        }
-        if !epsilon.is_finite() || epsilon <= 0.0 {
-            return Err(Gemma4RouterError::InvalidEpsilon);
-        }
-        if !scale
-            .iter()
-            .chain(projection)
-            .chain(expert_scale)
-            .all(|v| v.is_finite())
-        {
-            return Err(Gemma4RouterError::NonFinite);
-        }
-        Ok(Self {
-            geometry,
-            scale,
-            projection,
-            expert_scale,
-            epsilon,
-        })
-    }
-
-    /// Routes one pre-MLP residual row, without applying expert computation.
-    ///
-    /// Ties use ascending expert index in this scalar reference. `PyTorch` does
-    /// not promise stable tie indices, so exact source index parity requires
-    /// distinct scores at the selection boundary. Final weights need not sum
-    /// to one: per-expert scales are applied after selected normalization.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a residual row with the wrong width or nonfinite
-    /// values, or if normalization, projection or route weights become nonfinite.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        reason = "tensor widths are converted to source float32 arithmetic"
-    )]
-    pub fn route(&self, residual: &[f32]) -> Result<Vec<Gemma4ExpertRoute>, Gemma4RouterError> {
-        let g = self.geometry;
-        if residual.len() != g.hidden {
-            return Err(Gemma4RouterError::ShapeMismatch);
-        }
-        if !residual.iter().all(|v| v.is_finite()) {
-            return Err(Gemma4RouterError::NonFinite);
-        }
-        let variance = residual.iter().map(|v| v * v).sum::<f32>() / g.hidden as f32;
-        let denominator = variance + self.epsilon;
-        if !denominator.is_finite() {
-            return Err(Gemma4RouterError::NonFinite);
-        }
-        let inverse = denominator.powf(-0.5);
-        let root = (g.hidden as f64).powf(-0.5) as f32;
-        let input: Vec<f32> = residual
-            .iter()
-            .zip(self.scale)
-            .map(|(x, scale)| ((x * inverse) * scale) * root)
-            .collect();
-        let scores: Vec<f32> = self
-            .projection
-            .chunks_exact(g.hidden)
-            .map(|row| row.iter().zip(&input).map(|(w, x)| w * x).sum())
-            .collect();
-        if !variance.is_finite() || !scores.iter().all(|v| v.is_finite()) {
-            return Err(Gemma4RouterError::NonFinite);
-        }
-        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut probabilities: Vec<f32> = scores.iter().map(|s| (s - maximum).exp()).collect();
-        let denominator: f32 = probabilities.iter().sum();
-        for probability in &mut probabilities {
-            *probability /= denominator;
-        }
-        let mut selected: Vec<usize> = (0..g.experts).collect();
-        selected.sort_by(|&a, &b| {
-            probabilities[b]
-                .total_cmp(&probabilities[a])
-                .then(a.cmp(&b))
-        });
-        selected.truncate(g.top_k);
-        let selected_sum: f32 = selected.iter().map(|&i| probabilities[i]).sum();
-        let routes: Vec<_> = selected
-            .into_iter()
-            .map(|expert| Gemma4ExpertRoute {
-                expert,
-                weight: (probabilities[expert] / selected_sum) * self.expert_scale[expert],
-            })
-            .collect();
-        if !routes.iter().all(|r| r.weight.is_finite()) {
-            return Err(Gemma4RouterError::NonFinite);
-        }
-        Ok(routes)
-    }
-}
-
-/// An invalid Gemma router contract or nonfinite intermediate.
+/// An invalid Gemma expert geometry.
 #[derive(Debug, Error, PartialEq)]
 #[non_exhaustive]
 pub enum Gemma4RouterError {
@@ -228,13 +84,51 @@ pub enum Gemma4RouterError {
     /// A required tensor element count overflows usize.
     #[error("router or expert tensor shape overflows")]
     ShapeOverflow,
-    /// A tensor or residual row has the wrong element count.
-    #[error("router tensor shape mismatch")]
-    ShapeMismatch,
-    /// RMS epsilon is nonfinite or nonpositive.
-    #[error("router epsilon must be finite and positive")]
-    InvalidEpsilon,
-    /// Input, parameter or intermediate arithmetic is nonfinite.
-    #[error("nonfinite router value")]
-    NonFinite,
+}
+
+/// Routes each row of the raw residual `[.., H]` to its experts.
+///
+/// `scale` `[H]`, `projection` `[E, H]` and `per_expert_scale` `[E]` are the
+/// layer's `router.*` tensors. The input transform runs in the residual's
+/// dtype, as the source does; [`layers::moe::route`] then works in f32.
+/// Nothing is evaluated.
+///
+/// # Errors
+///
+/// [`layers::moe::MoeError`] when `top_k` exceeds the expert count, the
+/// tensors do not compose, or MLX fails.
+#[cfg(feature = "metal")]
+#[allow(
+    deprecated,
+    reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
+)]
+pub fn route(
+    residual: &mlx_rs::Array,
+    scale: &mlx_rs::Array,
+    projection: &mlx_rs::Array,
+    per_expert_scale: &mlx_rs::Array,
+    top_k: usize,
+    epsilon: f32,
+) -> Result<layers::moe::Routing, layers::moe::MoeError> {
+    use mlx_rs::{Array, StreamOrDevice, fast};
+
+    let gpu = StreamOrDevice::gpu();
+    let dtype = residual.dtype();
+    let hidden = residual.shape().last().copied().unwrap_or(0);
+    // The source multiplies by the Python double `H ** -0.5`: torch converts
+    // it to f32 once, computes the product in f32 and rounds that to the
+    // residual's dtype, so the root stays f32 here (MLX promotes) and only
+    // the product is cast.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the root of a positive width is well inside f32's range"
+    )]
+    let root = Array::from_f32(f64::from(hidden).powf(-0.5) as f32);
+    let input = mlx_rs::with_stream(gpu.as_ref(), || fast::rms_norm(residual, None, epsilon))?
+        .multiply_device(scale, &gpu)?
+        .multiply_device(&root, &gpu)?
+        .as_dtype_device(dtype, &gpu)?;
+    let logits = input.matmul_device(projection.transpose_device(&gpu)?, &gpu)?;
+    let router = layers::moe::Router::softmax(top_k, true, true)?;
+    layers::moe::route(&logits, &router, Some(per_expert_scale))
 }
