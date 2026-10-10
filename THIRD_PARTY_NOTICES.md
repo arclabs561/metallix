@@ -29,6 +29,13 @@ generated locally from that checkpoint by `scripts/gemma4-reference.py`:
 input IDs, rendered prompts, top-8 logits and hashes of the local config,
 tokenizer and weights. It contains no copied config, tokenizer payload,
 checkpoint or full-logit sidecar.
+`fixtures/gemma-4-e2b/chat-template.jinja` and `reference.json` are the same
+kinds of files for google/gemma-4-E2B-it revision
+`3e22461f65e89153144f8adb70e3b8c2cc9845a7` (Apache-2.0, Google DeepMind, per
+its [model card](https://huggingface.co/google/gemma-4-E2B-it/blob/3e22461f65e89153144f8adb70e3b8c2cc9845a7/README.md)).
+`fixtures/gemma-4-tiny/` holds synthetic references: random weights run
+through transformers' Gemma 4 modeling code by
+`scripts/gemma4-tiny-reference.py`; no checkpoint data.
 
 `crates/models/julia/src/encoder.rs`,
 `scripts/julia_encoder_reference.py`, and

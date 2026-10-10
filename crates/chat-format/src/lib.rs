@@ -1524,15 +1524,36 @@ mod tests {
     /// its OpenAI-style tool result.
     #[test]
     fn gemma4_template_matches_transformers_rendering() {
-        const TEMPLATE: &str = include_str!("../../../fixtures/gemma-4-12b/chat-template.jinja");
-        let reference: Value =
-            serde_json::from_str(include_str!("../../../fixtures/gemma-4-12b/reference.json"))
-                .expect("fixture JSON");
+        assert_gemma4_renderings(
+            include_str!("../../../fixtures/gemma-4-12b/chat-template.jinja"),
+            include_str!("../../../fixtures/gemma-4-12b/reference.json"),
+        );
+    }
+
+    /// The E2B and E4B template (byte-identical) differs from the 12B one:
+    /// with thinking off it does not pre-fill an empty thought channel. Same
+    /// six prompts against transformers.
+    #[test]
+    fn gemma4_e2b_template_matches_transformers_rendering() {
+        assert_gemma4_renderings(
+            include_str!("../../../fixtures/gemma-4-e2b/chat-template.jinja"),
+            include_str!("../../../fixtures/gemma-4-e2b/reference.json"),
+        );
+    }
+
+    fn assert_gemma4_renderings(source: &str, reference: &str) {
+        let reference: Value = serde_json::from_str(reference).expect("fixture JSON");
         let template = ChatTemplate::parse(
-            TEMPLATE.to_owned(),
+            source.to_owned(),
             SpecialTokens::spelled(Some("<bos>"), Some("<eos>")),
         )
         .expect("Gemma 4 template parses");
+        assert_eq!(
+            template.sha256(),
+            reference["reference"]["chat_template_sha256"]
+                .as_str()
+                .expect("hash")
+        );
         let cases = reference["templates"].as_array().expect("templates");
         assert_eq!(cases.len(), 6);
         for case in cases {
