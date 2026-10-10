@@ -41,8 +41,12 @@ use crate::{
 
 const START_TIMEOUT: Duration = Duration::from_secs(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-// Grace beyond the client response deadline for the child's own response.
+// Grace beyond the client response deadline for the child's own response,
+// and how long a child that missed it gets to close before it is stopped.
+#[cfg(not(test))]
 const CHILD_READ_GRACE: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const CHILD_READ_GRACE: Duration = Duration::from_millis(300);
 // How often the front checks its client while a child has not answered yet.
 const CLIENT_POLL: Duration = Duration::from_millis(100);
 // ponytail: fixed cap on concurrent forwards; children reject their own overlap.
@@ -713,55 +717,115 @@ fn forward(
         let reason = model.fail(&format!("child request failed: {error}"));
         return unavailable(connection, reason);
     }
+    let forwarded = Instant::now();
+    // A cancelled child that is healthy closes once it notices, which can take
+    // up to a chunk of work; a stuck one holds the permit for at most what is
+    // left of the response deadline, plus the grace.
+    let drain = || {
+        (forwarded + limits.response_deadline).saturating_duration_since(Instant::now())
+            + CHILD_READ_GRACE
+    };
     // The child writes one complete HTTP response and closes; pass it through.
     let wait = limits.response_deadline + CHILD_READ_GRACE;
     let Some(passed) = relay(&mut child, &mut connection, &queue_headers, wait) else {
         span.record("error.type", "client_gone");
-        span.record("cancel.reason", "client_gone");
         tracing::info!("client disconnected before the response");
-        // EOF on the forward's write half cancels generation. Keep reading
-        // until the child closes: it releases admission before that EOF.
-        // Releasing our queue permit earlier races the still-busy worker.
-        match cancel_and_wait(&mut child, wait) {
-            Ok(()) => {
-                span.record("cancel.cleanup", "ready");
-            }
-            Err(error) => {
-                span.record("cancel.cleanup", "failed");
-                model.fail(&format!("cancelled child did not finish: {error}"));
-            }
-        }
+        // EOF on the forward's write half cancels generation.
+        release_child(&mut child, model, "client_gone", drain(), started);
+        drop(admitted);
         span.record("forward_ms", started.elapsed().as_secs_f64() * 1000.0);
         tracing::info!("forward cancellation finished");
         return;
     };
-    if passed.is_err() {
-        // The relay failed after the response began (the client left mid
-        // stream, or a write failed), so the child may still be generating.
-        // Cancel and hold the queue permit until it closes, as above, or the
-        // next request reaches a busy child and is refused 503 server_busy.
-        span.record("cancel.reason", "relay_failed");
-        match cancel_and_wait(&mut child, wait) {
-            Ok(()) => {
-                span.record("cancel.cleanup", "ready");
-            }
-            Err(error) => {
-                span.record("cancel.cleanup", "failed");
-                model.fail(&format!("cancelled child did not finish: {error}"));
-            }
-        }
-    }
-    // The model is free once its child has finished this response.
-    drop(admitted);
     match passed {
         Ok(bytes) => {
+            // The model is free once its child has finished this response.
+            drop(admitted);
             let forward_ms = started.elapsed().as_secs_f64() * 1000.0;
             span.record("forward_ms", forward_ms);
             tracing::info!(bytes, forward_ms, "forwarded");
         }
+        Err(failure) => {
+            fail_forward(connection, &mut child, model, &failure, drain(), started);
+            drop(admitted);
+            span.record("forward_ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+/// Settles a relay that stopped early. The child may still be working on
+/// the request (the client left mid stream, a write failed, or the child
+/// sent nothing for the whole deadline), so it is released first; a client
+/// that has received nothing yet then gets an error response.
+fn fail_forward(
+    connection: Connection,
+    child: &mut TcpStream,
+    model: &ChildModel,
+    failure: &RelayFailure,
+    drain: Duration,
+    started: Instant,
+) {
+    // A socket read timeout reads as WouldBlock on macOS (EAGAIN), TimedOut
+    // elsewhere: the child sent nothing for the whole deadline. A child that
+    // stalled that long (a GPU wait it cannot interrupt) gets only the grace
+    // to close before it is stopped; others get `drain`.
+    let timed_out = matches!(
+        failure.error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    );
+    let (reason, drain) = if timed_out {
+        ("child_timeout", CHILD_READ_GRACE)
+    } else {
+        ("relay_failed", drain)
+    };
+    let span = tracing::Span::current();
+    span.record(
+        "error.type",
+        if timed_out {
+            "child_timeout"
+        } else {
+            "forwarding_failed"
+        },
+    );
+    tracing::warn!("forwarding the response failed: {}", failure.error);
+    release_child(child, model, reason, drain, started);
+    if !failure.answered {
+        let (status, message) = if timed_out {
+            (504, "the model did not answer within the response deadline")
+        } else {
+            (502, "the model's response could not be forwarded")
+        };
+        error_response(connection, status, Some(reason), message);
+    }
+}
+
+/// Cancels the child's request and holds the caller's queue permit until the
+/// child closes its socket, which it does after releasing its own admission:
+/// releasing the permit earlier sends the next request to a child that is
+/// still busy and answers it 503 `server_busy`. A child that has not closed
+/// within `drain` is stopped. Records `cancel.reason` and `cancel.cleanup`.
+fn release_child(
+    child: &mut TcpStream,
+    model: &ChildModel,
+    reason: &'static str,
+    drain: Duration,
+    started: Instant,
+) {
+    let span = tracing::Span::current();
+    span.record("cancel.reason", reason);
+    match cancel_and_wait(child, drain) {
+        Ok(()) => {
+            span.record("cancel.cleanup", "ready");
+        }
         Err(error) => {
-            span.record("error.type", "forwarding_failed");
-            tracing::warn!("forwarding the response failed: {error}");
+            span.record("cancel.cleanup", "stopped");
+            let cause = model.fail(&format!("cancelled child did not finish: {error}"));
+            // In the request's span, so the stop carries its request id.
+            tracing::warn!(
+                reason,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "stopped the child: {cause}"
+            );
         }
     }
 }
@@ -788,6 +852,13 @@ fn cancel_and_wait(child: &mut TcpStream, wait: Duration) -> io::Result<()> {
     }
 }
 
+/// A forward that stopped early, and whether any of the response reached the
+/// client (after which no error response can follow).
+struct RelayFailure {
+    error: io::Error,
+    answered: bool,
+}
+
 /// Passes the child's response through once it starts, or returns `None` if
 /// the client leaves first (see [`await_child`]).
 fn relay(
@@ -795,14 +866,29 @@ fn relay(
     client: &mut Connection,
     headers: &str,
     wait: Duration,
-) -> Option<io::Result<u64>> {
+) -> Option<Result<u64, RelayFailure>> {
+    let unanswered = |error| RelayFailure {
+        error,
+        answered: false,
+    };
     match await_child(child, client, wait) {
         Ok(true) => {}
         Ok(false) => return None,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Some(Err(unanswered(error))),
     }
+    let head = match read_head(child) {
+        Ok(head) => head,
+        Err(error) => return Some(Err(unanswered(error))),
+    };
     client.begin_response();
-    Some(pass_response(child, client, headers).and_then(|bytes| client.flush().map(|()| bytes)))
+    Some(
+        pass_response(head, child, client, headers)
+            .and_then(|bytes| client.flush().map(|()| bytes))
+            .map_err(|error| RelayFailure {
+                error,
+                answered: true,
+            }),
+    )
 }
 
 /// Waits up to `wait` for the child's first response byte, checking every
@@ -835,12 +921,19 @@ fn await_child(child: &TcpStream, client: &mut Connection, wait: Duration) -> io
     Ok(ready)
 }
 
-/// Copies the child's response to the client, adding `headers` (complete
-/// header lines) to its head. Interim 1xx responses (a `100 Continue`
-/// probe) are dropped, as HTTP clients skip them, so the headers land on
-/// the final response. A head that does not end within 16 KiB passes
-/// through unchanged.
-fn pass_response(child: &mut impl Read, client: &mut impl Write, headers: &str) -> io::Result<u64> {
+/// The child's response head as read so far, and where its header lines end
+/// (before the blank line), if they end within the limit.
+struct Head {
+    bytes: Vec<u8>,
+    end: Option<usize>,
+}
+
+/// Reads the child's final response head, before anything is written to the
+/// client. Interim 1xx responses (a `100 Continue` probe) are dropped, as
+/// HTTP clients skip them, so added headers land on the final response. A
+/// head that does not end within 16 KiB is returned as read; a child that
+/// closes before its head ends is an error, which the client gets as a 502.
+fn read_head(child: &mut impl Read) -> io::Result<Head> {
     let mut head = Vec::new();
     let mut chunk = [0_u8; 4096];
     let end = loop {
@@ -851,13 +944,31 @@ fn pass_response(child: &mut impl Read, client: &mut impl Write, headers: &str) 
             }
             break Some(end + 2);
         }
-        let read = child.read(&mut chunk)?;
-        if read == 0 || head.len() > 16 * 1024 {
-            head.extend_from_slice(&chunk[..read]);
+        if head.len() > 16 * 1024 {
             break None;
+        }
+        let read = child.read(&mut chunk)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the child closed before its response head ended",
+            ));
         }
         head.extend_from_slice(&chunk[..read]);
     };
+    Ok(Head { bytes: head, end })
+}
+
+/// Copies the child's response to the client, adding `headers` (complete
+/// header lines) to its head (see [`read_head`]); a head with no end passes
+/// through unchanged.
+fn pass_response(
+    head: Head,
+    child: &mut impl Read,
+    client: &mut impl Write,
+    headers: &str,
+) -> io::Result<u64> {
+    let Head { bytes: head, end } = head;
     let mut written = head.len() as u64;
     if let Some(end) = end {
         client.write_all(&head[..end])?;
@@ -1132,11 +1243,19 @@ mod tests {
     }
 
     fn proxy(pool: &Arc<Pool>, requests: usize) -> (SocketAddr, thread::JoinHandle<()>) {
+        proxy_with(pool, requests, TransportLimits::default())
+    }
+
+    fn proxy_with(
+        pool: &Arc<Pool>,
+        requests: usize,
+        limits: TransportLimits,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let pool = Arc::clone(pool);
         let server = thread::spawn(move || {
-            proxy_models(&listener, &pool, TransportLimits::default(), Some(requests)).unwrap();
+            proxy_models(&listener, &pool, limits, Some(requests)).unwrap();
         });
         (address, server)
     }
@@ -1265,22 +1384,31 @@ mod tests {
 
     #[test]
     fn queue_headers_join_the_response_head_and_the_body_is_unchanged() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let mut client = Vec::new();
-        let bytes = pass_response(&mut &response[..], &mut client, "X-A: 1\r\n").unwrap();
+        fn relayed(mut response: &[u8]) -> (Vec<u8>, u64) {
+            let head = read_head(&mut response).unwrap();
+            let mut client = Vec::new();
+            let bytes = pass_response(head, &mut response, &mut client, "X-A: 1\r\n").unwrap();
+            (client, bytes)
+        }
+        let (client, bytes) = relayed(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
         assert_eq!(
             client,
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: 1\r\n\r\nhi"
         );
         assert_eq!(bytes, client.len() as u64);
-        // Without a complete head the bytes pass through untouched.
-        let mut client = Vec::new();
-        pass_response(&mut &b"garbage"[..], &mut client, "X-A: 1\r\n").unwrap();
-        assert_eq!(client, b"garbage");
+        // A child that closes before its head ends is an error, not a reply.
+        assert_eq!(
+            read_head(&mut &b"garbage"[..])
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
+        // A head that does not end within 16 KiB passes through untouched.
+        let long = vec![b'x'; 20 * 1024];
+        assert_eq!(relayed(&long).0, long);
         // An interim 100 Continue is dropped; the headers join the final head.
         let probed = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
-        let mut client = Vec::new();
-        pass_response(&mut &probed[..], &mut client, "X-A: 1\r\n").unwrap();
+        let (client, _) = relayed(probed);
         assert_eq!(
             client,
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-A: 1\r\n\r\nhi"
@@ -1465,6 +1593,211 @@ mod tests {
         release.send(()).unwrap();
         let (status, _, body) = finish(second);
         assert_eq!((status, body), (200, json!({"input": "second"})));
+        child.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A child that sends part of a head and then nothing past the response
+    /// deadline, so the front's read times out mid-forward (EAGAIN on macOS).
+    /// The client gets a 504, and the queued request reaches the child only
+    /// after the stalled connection closes: until then the child is still
+    /// working and would refuse it as busy.
+    #[test]
+    fn a_child_that_misses_the_deadline_holds_the_queue_until_it_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_address = listener.local_addr().unwrap();
+        let (stalled_tx, stalled) = channel();
+        let child = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            connection.read_request().unwrap();
+            connection.begin_response();
+            connection.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            connection.flush().unwrap();
+            stalled_tx.send(()).unwrap();
+            // The front gives up on this connection by closing its write half.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !connection.client_gone() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the front never gave up on the stalled response"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            // Still unwinding: no request may arrive in the meantime.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline {
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            drop(connection);
+            listener.set_nonblocking(false).unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            let request = connection.read_request().unwrap();
+            assert_eq!(json(&request.body)["input"], "second");
+            json_response(connection, 200, &json!({"input": "second"}));
+        });
+        let pool = queued_pool(child_address, QueueSettings::default());
+        let limits = TransportLimits {
+            response_deadline: Duration::from_millis(200),
+            ..TransportLimits::default()
+        };
+        let (address, server) = proxy_with(&pool, 2, limits);
+        let first = send(address, "first");
+        stalled.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = send(address, "second");
+        until_waiting(&pool.models[0], 1);
+        let (status, _, body) = finish(first);
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (504, &json!("child_timeout"))
+        );
+        let (status, _, body) = finish(second);
+        assert_eq!((status, body), (200, json!({"input": "second"})));
+        child.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A child that keeps streaming after its client left, ignoring the
+    /// cancellation, holds the permit for at most what is left of the
+    /// response deadline plus the grace, then is stopped; the waiting
+    /// request is then answered, not forwarded to it.
+    #[test]
+    fn a_child_ignoring_cancellation_is_stopped_within_the_remaining_deadline() {
+        const DEADLINE: Duration = Duration::from_secs(3);
+        const LEAVE_AFTER: Duration = Duration::from_millis(2500);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_address = listener.local_addr().unwrap();
+        let (done_tx, done) = channel::<()>();
+        let child = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0_u8; 4096]).unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            // Streams until the test ends, whatever the front does.
+            while done.recv_timeout(Duration::from_millis(10)).is_err() {
+                let _ = socket.write_all(b"data: token\n\n");
+            }
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "a request reached the stopped child"
+            );
+        });
+        let pool = queued_pool(child_address, QueueSettings::default());
+        let limits = TransportLimits {
+            response_deadline: DEADLINE,
+            ..TransportLimits::default()
+        };
+        let (address, server) = proxy_with(&pool, 2, limits);
+        let sent = Instant::now();
+        let mut first = send(address, "first");
+        assert!(
+            first.read(&mut [0_u8; 64]).unwrap() > 0,
+            "the stream started"
+        );
+        let second = send(address, "second");
+        until_waiting(&pool.models[0], 1);
+        thread::sleep(LEAVE_AFTER.saturating_sub(sent.elapsed()));
+        drop(first);
+        let left = Instant::now();
+        let (status, _, body) = finish(second);
+        let held = left.elapsed();
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (503, &json!("model_worker_unavailable"))
+        );
+        // About 0.5 s of deadline was left when the client went.
+        assert!(held >= CHILD_READ_GRACE, "stopped after {held:?}");
+        assert!(
+            held <= DEADLINE.saturating_sub(LEAVE_AFTER)
+                + CHILD_READ_GRACE
+                + Duration::from_millis(1500),
+            "held the permit for {held:?}"
+        );
+        done_tx.send(()).unwrap();
+        child.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A child that closes before its response head ends (a crash mid
+    /// reply) is answered 502, not passed through as a truncated reply.
+    #[test]
+    fn a_child_that_closes_before_its_head_ends_is_a_502() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_address = listener.local_addr().unwrap();
+        let child = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            connection.read_request().unwrap();
+            connection.begin_response();
+            connection.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+        });
+        let pool = queued_pool(child_address, QueueSettings::default());
+        let (address, server) = proxy(&pool, 1);
+        let (status, _, body) = finish(send(address, "first"));
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (502, &json!("relay_failed"))
+        );
+        child.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A stalled child that also ignores the front closing its write half is
+    /// stopped once the grace runs out, and the queued request is never sent
+    /// to it: without a launcher (as in tests) it is refused as unavailable,
+    /// where a serving front would start a fresh child for it.
+    #[test]
+    fn a_stalled_child_that_does_not_close_is_stopped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_address = listener.local_addr().unwrap();
+        let (stalled_tx, stalled) = channel();
+        let (done_tx, done) = channel::<()>();
+        let child = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            stalled_tx.send(()).unwrap();
+            // Holds the socket open, never reading, until the test ends.
+            done.recv_timeout(Duration::from_secs(10)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "a request reached the stopped child"
+            );
+        });
+        let pool = queued_pool(child_address, QueueSettings::default());
+        let limits = TransportLimits {
+            response_deadline: Duration::from_millis(200),
+            ..TransportLimits::default()
+        };
+        let (address, server) = proxy_with(&pool, 2, limits);
+        let first = send(address, "first");
+        stalled.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = send(address, "second");
+        until_waiting(&pool.models[0], 1);
+        let (status, _, body) = finish(first);
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (504, &json!("child_timeout"))
+        );
+        let (status, _, body) = finish(second);
+        assert_eq!(
+            (status, &body["error"]["code"]),
+            (503, &json!("model_worker_unavailable"))
+        );
+        assert!(pool.models[0].address().is_none());
+        done_tx.send(()).unwrap();
         child.join().unwrap();
         server.join().unwrap();
     }
