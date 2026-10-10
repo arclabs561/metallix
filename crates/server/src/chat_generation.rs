@@ -1765,7 +1765,7 @@ impl TokenPicker {
                         top_k,
                         uniforms: vec![policy.uniform_ahead(ahead)],
                     },
-                    candidates: receipts.max(top_k + 1),
+                    candidates: receipts.max(top_k_window(top_k, vocabulary_size)),
                 }
             }
         };
@@ -1889,6 +1889,24 @@ fn greedy_token(logits: &[f32]) -> Result<i32, String> {
     }
     i32::try_from(best)
         .map_err(|_| String::from("model vocabulary token ID does not fit server token IDs"))
+}
+
+/// Candidates past `top_k` read back for a `top_k` draw. The host settles a
+/// draw from the candidates only when the `top_k`-th largest logit is
+/// strictly above the smallest candidate (`Qwen3RowCandidates::settles_head`);
+/// BF16 logits tie at a one-spare boundary on about a third of Qwen3-0.6B
+/// rows, each of which then reads its whole row back. Eight spares settled
+/// every one of 1,081 rows at `top_k` 20 and 40.
+const TOP_K_SPARE_CANDIDATES: usize = 8;
+
+/// The candidate count for a `top_k` draw: `top_k` plus
+/// [`TOP_K_SPARE_CANDIDATES`] spares, fewer below a small vocabulary, and at
+/// least one. A vocabulary too small for one spare still falls back to the
+/// full row.
+fn top_k_window(top_k: usize, vocabulary_size: usize) -> usize {
+    (top_k + TOP_K_SPARE_CANDIDATES)
+        .min(vocabulary_size.saturating_sub(1))
+        .max(top_k + 1)
 }
 
 /// The whole logit row of a single-row GPU pick, for steps its candidates
@@ -2041,6 +2059,92 @@ mod tests {
         picker.applied.sampler = None;
         assert_eq!(picker.pick(&logits).unwrap().0, 0);
         (first, second, final_rng)
+    }
+
+    fn sampled_picker(top_k: usize, vocabulary_size: usize) -> super::TokenPicker {
+        let config = super::SamplingConfiguration {
+            seed: 11,
+            temperature: 0.7,
+        };
+        super::TokenPicker {
+            policy: Some((
+                super::SamplingPolicy::new(config, vocabulary_size),
+                0.95,
+                Some(top_k),
+            )),
+            #[cfg(feature = "structured-output")]
+            constraint: None,
+            applied: super::AppliedSampling {
+                temperature: 0.7,
+                top_p: 0.95,
+                top_k: Some(u32::try_from(top_k).expect("small top_k")),
+                seed: Some(11),
+                sampler: Some(super::SamplerId::IcdfV1),
+                defaults_applied: Vec::new(),
+            },
+        }
+    }
+
+    /// The row's `count` largest logits, by value then lowest ID, as the GPU
+    /// candidates arrive after readback.
+    fn top_candidates(logits: &[f32], count: usize) -> qwen::forward::Qwen3RowCandidates {
+        let mut order: Vec<usize> = (0..logits.len()).collect();
+        order.sort_by(|&left, &right| {
+            logits[right]
+                .total_cmp(&logits[left])
+                .then(left.cmp(&right))
+        });
+        qwen::forward::Qwen3RowCandidates {
+            top: order
+                .into_iter()
+                .take(count)
+                .map(|index| (i32::try_from(index).expect("id"), logits[index]))
+                .collect(),
+            max_logit: logits[0],
+            shifted_exp_sum: 1.0,
+        }
+    }
+
+    /// BF16 logits often tie at the `top_k` boundary. With one spare
+    /// candidate that tie leaves the draw unsettled and the step reads its
+    /// whole row; the spare candidates settle it, with the full row's token.
+    #[test]
+    fn a_tie_at_the_top_k_boundary_settles_from_spare_candidates() {
+        let vocabulary = 64;
+        let top_k = 3;
+        // The 3rd largest logit ties the 4th and 5th.
+        let mut logits = vec![-4.0_f32; vocabulary];
+        logits[..6].copy_from_slice(&[5.0, 4.0, 2.0, 2.0, 2.0, 1.0]);
+        let mut picker = sampled_picker(top_k, vocabulary);
+        let rule = picker
+            .gpu_rule(0, None, vocabulary)
+            .expect("a top_k draw picks on the GPU");
+        assert!(
+            rule.candidates > top_k + 1,
+            "spare candidates are read back"
+        );
+        let mut control = sampled_picker(top_k, vocabulary);
+        for _ in 0..20 {
+            let candidates = top_candidates(&logits, rule.candidates);
+            let settled = picker
+                .pick_from_candidates(0, Some(&candidates))
+                .expect("valid candidates")
+                .expect("the boundary tie settles");
+            assert_eq!(settled, control.pick(&logits).expect("full row").0);
+        }
+    }
+
+    /// The window never reaches the vocabulary; one too small for a spare
+    /// falls back to the full row.
+    #[test]
+    fn the_top_k_window_stays_below_the_vocabulary() {
+        assert_eq!(super::top_k_window(20, 151_936), 28);
+        assert_eq!(super::top_k_window(2, 4), 3);
+        assert_eq!(super::top_k_window(3, 6), 5);
+        let picker = sampled_picker(3, 4);
+        assert!(picker.gpu_rule(0, None, 4).is_none(), "no room for a spare");
+        let picker = sampled_picker(3, 6);
+        assert_eq!(picker.gpu_rule(0, None, 6).expect("GPU rule").candidates, 5);
     }
 
     #[test]

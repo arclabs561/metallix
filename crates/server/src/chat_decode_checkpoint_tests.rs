@@ -6,6 +6,8 @@
 
 use std::{env, fmt::Write as _, path::PathBuf, time::Instant};
 
+use qwen::forward::Qwen3Selection;
+
 use super::{
     ChatMessage, ChatRequest, ChatRole, ChatSession, GenerationDeadline, ResidentChatLimits,
     SamplingRequest, TurnStart, full_row,
@@ -100,6 +102,9 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
             token
         );
         let mut gpu_draws_rejected = 0;
+        // Steps whose candidates could not settle a top_k draw and read the
+        // whole row instead.
+        let mut full_row_fallbacks = 0;
         for step in 1..64 {
             let rule = gpu
                 .gpu_rule(format, 0)
@@ -107,6 +112,13 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
             let picks = executor.decode_picks(token, &rule).expect("decode");
             let mut row = full_row(&picks).expect("row");
             let expected = host.pick(format, &mut row).expect("host pick").token;
+            if let Qwen3Selection::TopKNucleus { top_k, .. } = &rule.selection {
+                let (_, candidates) = picks.wait_with_candidates().expect("candidates");
+                let candidates = candidates.expect("a top_k rule reads candidates");
+                if !candidates[0].settles_head(*top_k) {
+                    full_row_fallbacks += 1;
+                }
+            }
             let (settled, gpu_token) = gpu.settle(format, &picks).expect("settle");
             assert_eq!(settled.token, expected, "{name} step {step}");
             if gpu_token != settled.token {
@@ -126,7 +138,15 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
                 assert!((actual.logprob - expected.logprob).abs() < LOGPROB_TOLERANCE);
             }
         }
-        println!("decode_checkpoint case={name} steps=63 gpu_draws_rejected={gpu_draws_rejected}");
+        println!(
+            "decode_checkpoint case={name} steps=63 gpu_draws_rejected={gpu_draws_rejected} \
+             full_row_fallbacks={full_row_fallbacks}"
+        );
+        // One spare candidate left about a third of BF16 steps unsettled.
+        assert!(
+            full_row_fallbacks <= 2,
+            "{name}: {full_row_fallbacks} of 63"
+        );
     }
 }
 
