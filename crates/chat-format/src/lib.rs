@@ -71,7 +71,7 @@ pub use crate::{
     messages::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation},
     stream::{TurnDelta, TurnStream},
     tokenizer::{QwenIncrementalDecode, QwenTokenizer, read_regular_file},
-    tools::validator,
+    tools::{grammar::ToolRequirement, validator},
     turn::{
         AssistantTurn, ReasoningDialect, ToolDialect, TurnFormat, check_call, parse_turn,
         parse_turn_unchecked,
@@ -624,6 +624,33 @@ impl ChatFormat {
     #[must_use]
     pub fn stops(&self) -> &StopTokens {
         &self.stops
+    }
+
+    /// The Lark grammar that holds one turn's tool calls to `requirement` and
+    /// to the schemas of the tools named in `strict`, for this checkpoint's
+    /// tool dialect and tokenizer. A marker the tokenizer holds as a special
+    /// token is named by id, any other is written as text. `prompt` is the
+    /// rendered generation prompt, whose tail says whether a reasoning block
+    /// is closed, open, or still to come.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message meant for a 400 response when this checkpoint's tool
+    /// dialect has no grammar yet (or writes its markers as special tokens),
+    /// or when no offered tool can satisfy `requirement`.
+    pub fn tool_grammar(
+        &self,
+        tools: &[Value],
+        strict: &[String],
+        requirement: &ToolRequirement,
+        prompt: &str,
+    ) -> Result<String, String> {
+        tools::grammar::tool_grammar(self.turn, tools, strict, requirement, prompt, |marker| {
+            match self.tokenizer.token_id(marker) {
+                Some(id) if self.tokenizer.is_special(id) => tools::grammar::Marker::Special(id),
+                _ => tools::grammar::Marker::Text,
+            }
+        })
     }
 
     /// Whether [`ChatFormat::suppress`] masks anything; a device-side pick
