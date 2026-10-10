@@ -122,6 +122,41 @@ fn decode_matches_diffusers() {
     );
 }
 
+/// The image gate's f32 PSNR floor (plan gate B), which gate C3 must miss.
+const IMAGE_GATE_MIN_PSNR_DB: f64 = 40.0;
+
+/// Gate C3: decoding the final latents without undoing the latent
+/// `BatchNorm` must fail the image bar, or that bar could not catch a
+/// dropped de-normalization.
+#[test]
+#[ignore = "needs a FLUX.2 checkpoint and a diffusers pipeline reference"]
+fn skipping_the_latent_denorm_fails_the_image_gate() {
+    let reference = reference(&process_env);
+    let vae =
+        Flux2VaeDecoder::load(reference.model.join("vae"), Flux2Precision::F32).expect("load");
+    let last = &reference.tensors[&format!("latents.step{}", reference.steps - 1)];
+    let (rows, columns) = (reference.height / 16, reference.width / 16);
+    // `latents_to_decoder_input` minus the BatchNorm step: unpatchify only.
+    let raw = last
+        .reshape(&[1, rows, columns, 32, 2, 2])
+        .and_then(|grid| grid.transpose_axes(&[0, 1, 4, 2, 5, 3]))
+        .and_then(|grid| grid.reshape(&[1, 2 * rows, 2 * columns, 32]))
+        .expect("unpatchify");
+    let ours = to_rgb8(&vae.decode(&raw).expect("decode")).expect("rgb8");
+    let image = nchw_to_nhwc(&reference.tensors["image"]);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let expected: Vec<u8> = values(&image)
+        .iter()
+        .map(|&v| (v * 255.0).round_ties_even() as u8)
+        .collect();
+    let psnr = diffusion::metrics::psnr_rgb8(&ours, &expected);
+    eprintln!("decode without the latent denorm: PSNR {psnr:.2} dB");
+    assert!(
+        psnr < IMAGE_GATE_MIN_PSNR_DB,
+        "{psnr:.2} dB passes the image bar"
+    );
+}
+
 /// The gates above fail, not skip, without their inputs.
 #[test]
 fn missing_vae_inputs_fail_the_gate() {
