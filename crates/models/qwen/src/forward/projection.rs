@@ -148,6 +148,15 @@ fn matmul<'a, S: BuildHasher>(
     }
 }
 
+/// Rows of `input` `[.., K]`: the product of its leading axes.
+fn rows(input: &Array) -> usize {
+    let shape = input.shape();
+    shape[..shape.len().saturating_sub(1)]
+        .iter()
+        .map(|&dim| usize::try_from(dim).unwrap_or(0))
+        .product()
+}
+
 /// `input @ W.T` for the projection `{stem}.weight`, plus `{stem}.bias` when
 /// the family declares one, `[.., in] -> [.., out]`.
 pub(crate) fn project<S: BuildHasher>(
@@ -160,6 +169,14 @@ pub(crate) fn project<S: BuildHasher>(
     let Projection { matmul, bias } = projection(config, weights, stem)?;
     let output = match matmul {
         Matmul::Dense(dense) => linear(input, dense)?,
+        Matmul::Affine {
+            packed,
+            scales,
+            biases,
+            quantization,
+        } if super::small_m::applies(input, rows(input), quantization) => {
+            super::small_m::matmul(input, packed, scales, biases, quantization.group_size())?
+        }
         Matmul::Affine {
             packed,
             scales,

@@ -33,6 +33,7 @@ mod paged;
 mod picks;
 mod projection;
 mod score;
+mod small_m;
 mod snapshot;
 mod verify;
 
@@ -46,6 +47,7 @@ pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPic
 pub use projection::Qwen3WeightPrecision;
 pub(crate) use projection::{dense_weight, embed_rows, project};
 pub use score::{Qwen3ScoredToken, Qwen3Scores, SCORE_CHUNK_ROWS};
+pub use small_m::set_small_m_qmv;
 pub use snapshot::Qwen3KvSnapshot;
 pub use verify::Qwen3PositionLogits;
 
@@ -2965,6 +2967,9 @@ pub enum Qwen3ForwardError {
     /// MLX could not construct, evaluate, or copy the Metal graph.
     #[error("MLX Qwen3 forward failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
+    /// A custom Metal kernel could not be built or launched.
+    #[error("Qwen3 custom kernel failed: {0}")]
+    Kernel(#[from] mlx_kernels::KernelError),
 }
 
 #[cfg(test)]
@@ -3936,6 +3941,7 @@ mod tests {
     mod particle_replay;
     mod prefix_extend;
     mod score;
+    mod small_m_qmv;
     mod speculative_checkpoint;
     mod speculative_verify;
     mod steering_checkpoint;
