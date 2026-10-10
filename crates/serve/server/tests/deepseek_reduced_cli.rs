@@ -83,7 +83,8 @@ fn export_artifact() -> Vec<u8> {
         .expect("repository Python exporter launches");
     assert!(
         output.status.success(),
-        "exporter failed: {}",
+        "exporter failed ({}): {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty(), "exporter wrote diagnostics");
@@ -327,7 +328,8 @@ fn cli_matches_library_artifact_for_both_fixed_partitions() {
         let output = run_cli(artifact_file.path(), prefill_tokens);
         assert!(
             output.status.success(),
-            "CLI failed: {}",
+            "CLI failed ({}): {}",
+            output.status,
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(output.stderr.is_empty());
@@ -343,7 +345,8 @@ fn cli_matches_library_artifact_for_both_fixed_partitions() {
         );
         assert!(
             explicit_scalar.status.success(),
-            "CLI failed: {}",
+            "CLI failed ({}): {}",
+            explicit_scalar.status,
             String::from_utf8_lossy(&explicit_scalar.stderr)
         );
         assert!(explicit_scalar.stderr.is_empty());
@@ -363,7 +366,8 @@ fn cli_greedy_generation_matches_library_and_reports_its_stop_reason() {
     let output = run_cli_generation(artifact_file.path(), &prompt_ids, 2, None);
     assert!(
         output.status.success(),
-        "CLI failed: {}",
+        "CLI failed ({}): {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
@@ -387,7 +391,8 @@ fn cli_greedy_generation_stops_at_the_requested_eos_id() {
     let output = run_cli_generation(artifact_file.path(), &prompt_ids, 2, Some(eos_token_id));
     assert!(
         output.status.success(),
-        "CLI failed: {}",
+        "CLI failed ({}): {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
@@ -475,7 +480,8 @@ fn metal_cli_matches_scalar_library_output_for_both_fixed_partitions() {
             run_cli_with_score_execution(artifact_file.path(), prefill_tokens, Some("metal-bf16"));
         assert!(
             output.status.success(),
-            "CLI failed: {}",
+            "CLI failed ({}): {}",
+            output.status,
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(output.stderr.is_empty());
@@ -506,7 +512,8 @@ fn metal_key_rotation_alone_and_with_scores_matches_scalar_cli() {
                 run_cli_with_execution(file.path(), prefill, Some(score), Some("metal-fp32"));
             assert!(
                 output.status.success(),
-                "{}",
+                "CLI failed ({}): {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(output.stderr.is_empty());
@@ -548,7 +555,8 @@ fn metal_key_preparation_receipt_and_execution_match_selected_library() {
             );
             assert!(
                 output.status.success(),
-                "{}",
+                "CLI failed ({}): {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(output.stderr.is_empty());
@@ -615,7 +623,8 @@ fn metal_final_head_cli_matches_selected_library_execution_for_both_fixed_partit
             );
             assert!(
                 output.status.success(),
-                "{}",
+                "CLI failed ({}): {}",
+                output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(output.stderr.is_empty());

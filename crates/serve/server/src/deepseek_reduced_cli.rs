@@ -157,7 +157,7 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     let bytes = read_artifact(&args.artifact)?;
     let artifact_sha256 = format!("{:x}", Sha256::digest(&bytes));
     let artifact = deepseek::reduced::ReducedArtifact::parse(&bytes)
-        .map_err(|_| "artifact is not a valid reduced request artifact".to_owned())?;
+        .map_err(|error| format!("artifact is not a valid reduced request artifact: {error}"))?;
     if let Some(max_new_tokens) = args.generation_max_new_tokens {
         let generation = artifact
             .generate_greedy(
@@ -165,7 +165,7 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
                 args.generation_eos_token_id,
                 max_new_tokens,
             )
-            .map_err(|_| "reduced generation was rejected".to_owned())?;
+            .map_err(|error| format!("reduced generation was rejected: {error}"))?;
         let stop_reason = match generation.stop_reason() {
             deepseek::reduced::ReducedGenerationStop::Eos => "eos",
             deepseek::reduced::ReducedGenerationStop::MaxNewTokens => "max_new_tokens",
@@ -180,7 +180,7 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
             "stop_reason": stop_reason,
         });
         let rendered = serde_json::to_string(&response)
-            .map_err(|_| "could not render reduced generation response".to_owned())?;
+            .map_err(|error| format!("could not render reduced generation response: {error}"))?;
         println!("{rendered}");
         return Ok(());
     }
@@ -196,7 +196,7 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
             key_preparation_execution(args),
             args.head_execution.into(),
         )
-        .map_err(|_| "reduced request execution was rejected".to_owned())?;
+        .map_err(|error| format!("reduced request execution was rejected: {error}"))?;
     let expected_calls = 1 + args.input_ids.len() - prefill_tokens;
     if outputs.len() != expected_calls {
         return Err("reduced request returned an invalid call count".to_owned());
@@ -236,7 +236,7 @@ fn run(args: &ReducedArgs) -> Result<(), String> {
     #[cfg(feature = "metal")]
     let response = execution_metadata(response, args);
     let rendered = serde_json::to_string(&response)
-        .map_err(|_| "could not render reduced request response".to_owned())?;
+        .map_err(|error| format!("could not render reduced request response: {error}"))?;
     println!("{rendered}");
     Ok(())
 }
@@ -334,7 +334,8 @@ fn key_preparation_execution(args: &ReducedArgs) -> IndexKeyPreparationExecution
 }
 
 fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::metadata(path).map_err(|_| "artifact cannot be inspected".to_owned())?;
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("artifact cannot be inspected: {error}"))?;
     if !metadata.file_type().is_file() {
         return Err("artifact must be one regular file".to_owned());
     }
@@ -342,17 +343,17 @@ fn read_artifact(path: &Path) -> Result<Vec<u8>, String> {
         return Err("artifact exceeds 64 MiB".to_owned());
     }
     let mut bytes = Vec::new();
-    let file = File::open(path).map_err(|_| "artifact cannot be opened".to_owned())?;
+    let file = File::open(path).map_err(|error| format!("artifact cannot be opened: {error}"))?;
     let opened = file
         .metadata()
-        .map_err(|_| "opened artifact cannot be inspected".to_owned())?;
+        .map_err(|error| format!("opened artifact cannot be inspected: {error}"))?;
     if !opened.is_file() || opened.len() > MAX_ARTIFACT_BYTES {
         return Err("opened artifact must be a regular file within 64 MiB".to_owned());
     }
     file.take(MAX_ARTIFACT_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "artifact cannot be read".to_owned())?;
-    if u64::try_from(bytes.len()).map_err(|_| "artifact length overflow".to_owned())?
+        .map_err(|error| format!("artifact cannot be read: {error}"))?;
+    if u64::try_from(bytes.len()).map_err(|error| format!("artifact length overflow: {error}"))?
         > MAX_ARTIFACT_BYTES
     {
         return Err("artifact exceeds 64 MiB".to_owned());
