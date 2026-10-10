@@ -150,6 +150,8 @@ pub struct Qwen35Config {
     conv_kernel: usize,
     max_position_embeddings: usize,
     tie_word_embeddings: bool,
+    mtp_layers: usize,
+    mtp_dedicated_embeddings: bool,
 }
 
 impl Qwen35Config {
@@ -258,23 +260,7 @@ impl Qwen35Config {
             return Err(Qwen35ConfigError::Invalid("rms_norm_eps"));
         }
 
-        let layer_types = raw
-            .layer_types
-            .ok_or(Qwen35ConfigError::Missing("layer_types"))?;
-        if layer_types.len() != raw.num_hidden_layers {
-            return Err(Qwen35ConfigError::LayerCount {
-                layer_types: layer_types.len(),
-                num_hidden_layers: raw.num_hidden_layers,
-            });
-        }
-        let layers = layer_types
-            .iter()
-            .map(|kind| match kind.as_str() {
-                "linear_attention" => Ok(Qwen35LayerKind::LinearAttention),
-                "full_attention" => Ok(Qwen35LayerKind::FullAttention),
-                _ => Err(Qwen35ConfigError::UnknownLayerType(kind.clone())),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let layers = layer_kinds(raw.layer_types.as_deref(), raw.num_hidden_layers)?;
 
         Ok(Self {
             layers,
@@ -294,6 +280,8 @@ impl Qwen35Config {
             conv_kernel: raw.linear_conv_kernel_dim,
             max_position_embeddings: raw.max_position_embeddings,
             tie_word_embeddings,
+            mtp_layers: raw.mtp_num_hidden_layers.unwrap_or(0),
+            mtp_dedicated_embeddings: raw.mtp_use_dedicated_embeddings.unwrap_or(false),
         })
     }
 
@@ -319,6 +307,20 @@ impl Qwen35Config {
     #[must_use]
     pub const fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+
+    /// Decoder layers of the multi-token-prediction head (0 when the
+    /// checkpoint has none).
+    #[must_use]
+    pub const fn mtp_layers(&self) -> usize {
+        self.mtp_layers
+    }
+
+    /// Whether the multi-token-prediction head has its own embedding and LM
+    /// head instead of sharing the decoder's.
+    #[must_use]
+    pub const fn mtp_dedicated_embeddings(&self) -> bool {
+        self.mtp_dedicated_embeddings
     }
 
     /// Whether the output projection reuses the token embedding.
@@ -418,6 +420,29 @@ impl Qwen35Config {
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(Qwen35ConfigError::ShapeOverflow)
     }
+}
+
+/// Each layer's token mixer from `layer_types`, which must name every one
+/// of `num_hidden_layers` layers.
+fn layer_kinds(
+    layer_types: Option<&[String]>,
+    num_hidden_layers: usize,
+) -> Result<Vec<Qwen35LayerKind>, Qwen35ConfigError> {
+    let layer_types = layer_types.ok_or(Qwen35ConfigError::Missing("layer_types"))?;
+    if layer_types.len() != num_hidden_layers {
+        return Err(Qwen35ConfigError::LayerCount {
+            layer_types: layer_types.len(),
+            num_hidden_layers,
+        });
+    }
+    layer_types
+        .iter()
+        .map(|kind| match kind.as_str() {
+            "linear_attention" => Ok(Qwen35LayerKind::LinearAttention),
+            "full_attention" => Ok(Qwen35LayerKind::FullAttention),
+            _ => Err(Qwen35ConfigError::UnknownLayerType(kind.clone())),
+        })
+        .collect()
 }
 
 /// Refuses layout variants the decoder does not implement.
@@ -567,6 +592,8 @@ struct RawTextConfig {
     moe_intermediate_size: Option<usize>,
     shared_expert_intermediate_size: Option<usize>,
     mlp_only_layers: Option<Vec<usize>>,
+    mtp_num_hidden_layers: Option<usize>,
+    mtp_use_dedicated_embeddings: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

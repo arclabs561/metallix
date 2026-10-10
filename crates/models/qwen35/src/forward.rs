@@ -43,6 +43,8 @@ mod delta;
 pub const PREFILL_CHUNK_TOKENS: usize = 128;
 
 const TEXT_PREFIX: &str = "model.language_model.";
+/// Multi-token-prediction head tensors keep this prefix in the tensor map.
+const MTP_PREFIX: &str = "mtp.";
 const L2_NORM_EPS: f32 = 1e-6;
 
 /// Weight and activation precision.
@@ -67,6 +69,28 @@ pub struct Qwen35Weights {
     precision: Qwen35Precision,
     /// The activation dtype.
     compute: Dtype,
+}
+
+/// Whether [`Qwen35Weights::load_with`] keeps the checkpoint's
+/// multi-token-prediction head.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MtpHead {
+    /// Drop the head's tensors unread, as [`Qwen35Weights::load`] does.
+    #[default]
+    Skip,
+    /// Load the one-layer dense head, sharing the decoder's embedding and LM
+    /// head, for drafting.
+    Load,
+}
+
+/// Optional parts of a checkpoint beyond the text decoder, for
+/// [`Qwen35Weights::load_with`]. The default loads the text decoder only.
+/// Build it with `LoadParts::default()` and set the fields you need.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct LoadParts {
+    /// The multi-token-prediction head.
+    pub mtp_head: MtpHead,
 }
 
 /// A `[rows, columns]` matrix in MLX affine quantization: `bits`-wide codes
@@ -98,19 +122,46 @@ impl Qwen35Weights {
         model_dir: impl AsRef<Path>,
         precision: Qwen35Precision,
     ) -> Result<Self, Qwen35Error> {
+        Self::load_with(model_dir, precision, &LoadParts::default())
+    }
+
+    /// [`Self::load`], also keeping the parts `parts` asks for: the
+    /// multi-token-prediction head when `parts.mtp_head` is [`MtpHead::Load`]. Its norms get the same `1 + weight` shift
+    /// as the decoder's, including `pre_fc_norm_embedding` and
+    /// `pre_fc_norm_hidden`, whose names do not end in a layer-norm suffix.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`], plus [`Qwen35Error::MtpUnsupported`] when
+    /// `parts.mtp_head` is [`MtpHead::Load`] and the checkpoint has no one-layer dense head that
+    /// shares the decoder's embedding.
+    pub fn load_with(
+        model_dir: impl AsRef<Path>,
+        precision: Qwen35Precision,
+        parts: &LoadParts,
+    ) -> Result<Self, Qwen35Error> {
         let model_dir = model_dir.as_ref();
         let config = Qwen35Config::parse(&read_file(&model_dir.join("config.json"))?)?;
+        let load_mtp = parts.mtp_head == MtpHead::Load;
+        if load_mtp {
+            check_mtp(&config)?;
+        }
         let mut tensors = HashMap::new();
         for shard in shard_paths(model_dir)? {
             for (name, tensor) in Array::load_safetensors_device(&shard, StreamOrDevice::cpu())? {
                 if let Some(name) = name.strip_prefix(TEXT_PREFIX) {
                     tensors.insert(name.to_owned(), tensor);
-                } else if name == "lm_head.weight" && !config.tie_word_embeddings() {
+                } else if (name == "lm_head.weight" && !config.tie_word_embeddings())
+                    || (load_mtp && name.starts_with(MTP_PREFIX))
+                {
                     tensors.insert(name, tensor);
                 }
             }
         }
-        let expected = expected_shapes(&config)?;
+        let mut expected = expected_shapes(&config)?;
+        if load_mtp {
+            expected.extend(mtp_shapes(&config)?);
+        }
         for (name, shape) in &expected {
             let tensor = tensors
                 .get(name)
@@ -1299,16 +1350,25 @@ fn dim(value: usize) -> Result<i32, Qwen35Error> {
     i32::try_from(value).map_err(|_| Qwen35Error::ShapeOverflow)
 }
 
+/// Norm weights stored as `weight - 1`. The multi-token-prediction head's
+/// final and pre-projection norms are listed by name: their names end in
+/// neither `norm.weight` alone nor a layer-norm suffix, and missing them
+/// leaves the head's inputs scaled by roughly zero.
 fn is_zero_centered_norm(name: &str) -> bool {
-    name == "norm.weight"
-        || [
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        ]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
+    matches!(
+        name,
+        "norm.weight"
+            | "mtp.norm.weight"
+            | "mtp.pre_fc_norm_embedding.weight"
+            | "mtp.pre_fc_norm_hidden.weight"
+    ) || [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+    ]
+    .iter()
+    .any(|suffix| name.ends_with(suffix))
 }
 
 /// The stored shapes of one layer's `MoE` tensors under `mlp`, from the
@@ -1345,13 +1405,97 @@ fn expert_shapes(
     Ok(())
 }
 
+/// The stored shapes of one gated full-attention block under `attn`.
+fn full_attention_shapes(
+    put: &mut impl FnMut(String, &[i32]),
+    attn: &str,
+    config: &Qwen35Config,
+) -> Result<(), Qwen35Error> {
+    let hidden = dim(config.hidden_size)?;
+    let heads = dim(config.attention_heads)?;
+    let kv_heads = dim(config.key_value_heads)?;
+    let head_dim = dim(config.head_dim)?;
+    put(
+        format!("{attn}.q_proj.weight"),
+        &[2 * heads * head_dim, hidden],
+    );
+    put(
+        format!("{attn}.k_proj.weight"),
+        &[kv_heads * head_dim, hidden],
+    );
+    put(
+        format!("{attn}.v_proj.weight"),
+        &[kv_heads * head_dim, hidden],
+    );
+    put(format!("{attn}.o_proj.weight"), &[hidden, heads * head_dim]);
+    put(format!("{attn}.q_norm.weight"), &[head_dim]);
+    put(format!("{attn}.k_norm.weight"), &[head_dim]);
+    Ok(())
+}
+
+/// The stored shapes of one dense `SwiGLU` block under `mlp`.
+fn dense_mlp_shapes(
+    put: &mut impl FnMut(String, &[i32]),
+    mlp: &str,
+    hidden: i32,
+    intermediate_size: usize,
+) -> Result<(), Qwen35Error> {
+    let intermediate = dim(intermediate_size)?;
+    put(format!("{mlp}.gate_proj.weight"), &[intermediate, hidden]);
+    put(format!("{mlp}.up_proj.weight"), &[intermediate, hidden]);
+    put(format!("{mlp}.down_proj.weight"), &[hidden, intermediate]);
+    Ok(())
+}
+
+/// Refuses a multi-token-prediction head this loader does not implement.
+fn check_mtp(config: &Qwen35Config) -> Result<(), Qwen35Error> {
+    if config.mtp_layers() != 1 {
+        return Err(Qwen35Error::MtpUnsupported(
+            "a checkpoint without exactly one multi-token-prediction layer",
+        ));
+    }
+    if config.mtp_dedicated_embeddings() {
+        return Err(Qwen35Error::MtpUnsupported(
+            "a head with its own embedding and LM head",
+        ));
+    }
+    if matches!(config.mlp, Qwen35Mlp::Experts { .. }) {
+        return Err(Qwen35Error::MtpUnsupported("a mixture-of-experts head"));
+    }
+    Ok(())
+}
+
+/// The stored shapes of the one-layer dense multi-token-prediction head:
+/// pre-projection norms of the token embedding and the decoder's hidden
+/// state, `fc` over their concatenation, one gated full-attention decoder
+/// layer, and a final norm. The embedding and LM head are the decoder's.
+fn mtp_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Qwen35Error> {
+    let Qwen35Mlp::Dense { intermediate_size } = config.mlp else {
+        return Err(Qwen35Error::MtpUnsupported("a mixture-of-experts head"));
+    };
+    let hidden = dim(config.hidden_size)?;
+    let mut shapes = HashMap::new();
+    let mut put = |name: String, shape: &[i32]| {
+        shapes.insert(name, shape.to_vec());
+    };
+    put("mtp.pre_fc_norm_embedding.weight".into(), &[hidden]);
+    put("mtp.pre_fc_norm_hidden.weight".into(), &[hidden]);
+    put("mtp.fc.weight".into(), &[hidden, 2 * hidden]);
+    put("mtp.norm.weight".into(), &[hidden]);
+    put("mtp.layers.0.input_layernorm.weight".into(), &[hidden]);
+    put(
+        "mtp.layers.0.post_attention_layernorm.weight".into(),
+        &[hidden],
+    );
+    full_attention_shapes(&mut put, "mtp.layers.0.self_attn", config)?;
+    dense_mlp_shapes(&mut put, "mtp.layers.0.mlp", hidden, intermediate_size)?;
+    Ok(shapes)
+}
+
 /// Every decoder tensor this implementation reads, with its stored shape.
 fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Qwen35Error> {
     let hidden = dim(config.hidden_size)?;
     let vocab = dim(config.vocab_size)?;
-    let heads = dim(config.attention_heads)?;
-    let kv_heads = dim(config.key_value_heads)?;
-    let head_dim = dim(config.head_dim)?;
     let value_heads = dim(config.linear_value_heads)?;
     let value_width = dim(config.linear_value_heads * config.linear_value_head_dim)?;
     let conv = dim(config.conv_dim())?;
@@ -1373,10 +1517,7 @@ fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Q
         let mlp = format!("{base}.mlp");
         match config.mlp {
             Qwen35Mlp::Dense { intermediate_size } => {
-                let intermediate = dim(intermediate_size)?;
-                put(format!("{mlp}.gate_proj.weight"), &[intermediate, hidden]);
-                put(format!("{mlp}.up_proj.weight"), &[intermediate, hidden]);
-                put(format!("{mlp}.down_proj.weight"), &[hidden, intermediate]);
+                dense_mlp_shapes(&mut put, &mlp, hidden, intermediate_size)?;
             }
             Qwen35Mlp::Experts {
                 experts,
@@ -1407,22 +1548,7 @@ fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Q
                 put(format!("{attn}.out_proj.weight"), &[hidden, value_width]);
             }
             Qwen35LayerKind::FullAttention => {
-                let attn = format!("{base}.self_attn");
-                put(
-                    format!("{attn}.q_proj.weight"),
-                    &[2 * heads * head_dim, hidden],
-                );
-                put(
-                    format!("{attn}.k_proj.weight"),
-                    &[kv_heads * head_dim, hidden],
-                );
-                put(
-                    format!("{attn}.v_proj.weight"),
-                    &[kv_heads * head_dim, hidden],
-                );
-                put(format!("{attn}.o_proj.weight"), &[hidden, heads * head_dim]);
-                put(format!("{attn}.q_norm.weight"), &[head_dim]);
-                put(format!("{attn}.k_norm.weight"), &[head_dim]);
+                full_attention_shapes(&mut put, &format!("{base}.self_attn"), config)?;
             }
         }
     }
@@ -1535,6 +1661,10 @@ pub enum Qwen35Error {
     /// A logit was NaN or infinite, so no greedy token is defined.
     #[error("logits contain NaN or infinite values")]
     NonFiniteLogits,
+    /// The checkpoint's multi-token-prediction head is a layout this loader
+    /// does not implement.
+    #[error("unsupported multi-token-prediction head: {0}")]
+    MtpUnsupported(&'static str),
     /// A layer's stored state does not match its kind.
     #[error("layer state does not match its layer kind")]
     StateKind,
@@ -1567,7 +1697,8 @@ pub enum Qwen35Error {
 mod tests {
     use mlx_rs::Array;
 
-    use super::{MoeTensors, moe_block};
+    use super::{MoeTensors, is_zero_centered_norm, moe_block, mtp_shapes};
+    use crate::Qwen35Config;
 
     #[test]
     fn snapshots_are_bound_to_one_weight_load() {
@@ -1799,6 +1930,75 @@ mod tests {
             eprintln!("{name}: max |diff| {diff:.3e}, largest |output| {largest:.3}");
             assert!(largest < 8.0, "{name}: outputs are not O(1): {largest}");
             assert!(diff <= TOLERANCE, "{name}: max |diff| {diff}");
+        }
+    }
+
+    /// The text fields of Qwen/Qwen3.5-9B@c2022362 (32 layers, every fourth
+    /// full attention), whose checkpoint carries a one-layer dense head.
+    fn qwen35_9b() -> Qwen35Config {
+        let layer_types = (0..32)
+            .map(|layer| {
+                if layer % 4 == 3 {
+                    "\"full_attention\""
+                } else {
+                    "\"linear_attention\""
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Qwen35Config::parse(&format!(
+            r#"{{"model_type": "qwen3_5", "tie_word_embeddings": false, "text_config": {{
+                "model_type": "qwen3_5_text", "attention_bias": false, "attn_output_gate": true,
+                "head_dim": 256, "hidden_act": "silu", "hidden_size": 4096,
+                "intermediate_size": 12288, "layer_types": [{layer_types}],
+                "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+                "linear_value_head_dim": 128, "mamba_ssm_dtype": "float32",
+                "max_position_embeddings": 262144, "mlp_only_layers": [],
+                "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": false,
+                "num_attention_heads": 16, "num_hidden_layers": 32,
+                "num_key_value_heads": 4, "rms_norm_eps": 1e-06, "vocab_size": 248320,
+                "rope_parameters": {{"mrope_interleaved": true, "mrope_section": [11, 11, 10],
+                    "rope_type": "default", "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25}}}}}}"#
+        ))
+        .expect("Qwen3.5-9B config")
+    }
+
+    /// Every `mtp.*` tensor in Qwen/Qwen3.5-9B@c2022362's
+    /// model.safetensors.index.json, with its stored shape.
+    const QWEN35_9B_MTP: [(&str, &[i32]); 15] = [
+        ("mtp.fc.weight", &[4096, 8192]),
+        ("mtp.layers.0.input_layernorm.weight", &[4096]),
+        ("mtp.layers.0.mlp.down_proj.weight", &[4096, 12288]),
+        ("mtp.layers.0.mlp.gate_proj.weight", &[12288, 4096]),
+        ("mtp.layers.0.mlp.up_proj.weight", &[12288, 4096]),
+        ("mtp.layers.0.post_attention_layernorm.weight", &[4096]),
+        ("mtp.layers.0.self_attn.k_norm.weight", &[256]),
+        ("mtp.layers.0.self_attn.k_proj.weight", &[1024, 4096]),
+        ("mtp.layers.0.self_attn.o_proj.weight", &[4096, 4096]),
+        ("mtp.layers.0.self_attn.q_norm.weight", &[256]),
+        ("mtp.layers.0.self_attn.q_proj.weight", &[8192, 4096]),
+        ("mtp.layers.0.self_attn.v_proj.weight", &[1024, 4096]),
+        ("mtp.norm.weight", &[4096]),
+        ("mtp.pre_fc_norm_embedding.weight", &[4096]),
+        ("mtp.pre_fc_norm_hidden.weight", &[4096]),
+    ];
+
+    /// The head's expected tensors are exactly the published ones, and every
+    /// norm among them (and only a norm) gets the `1 + weight` shift. Missing
+    /// the shift on `pre_fc_norm_*` drives draft acceptance to zero.
+    #[test]
+    fn mtp_head_matches_the_published_tensors_and_shifts_every_norm() {
+        let expected = mtp_shapes(&qwen35_9b()).expect("dense head");
+        assert_eq!(expected.len(), QWEN35_9B_MTP.len());
+        for (name, shape) in QWEN35_9B_MTP {
+            assert_eq!(expected.get(name).map(Vec::as_slice), Some(shape), "{name}");
+            assert_eq!(
+                is_zero_centered_norm(name),
+                name.contains("norm"),
+                "{name}: shifted iff a norm"
+            );
         }
     }
 }

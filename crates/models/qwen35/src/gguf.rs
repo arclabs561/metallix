@@ -122,6 +122,9 @@ impl Qwen35Config {
             conv_kernel: count("ssm.conv_kernel")?,
             max_position_embeddings: count("context_length")?,
             tie_word_embeddings: tensors.tensor("output.weight").is_none(),
+            // The GGUF loader reads no multi-token-prediction head.
+            mtp_layers: 0,
+            mtp_dedicated_embeddings: false,
         };
         config.check_gguf()?;
         Ok(config)
