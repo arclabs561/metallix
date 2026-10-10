@@ -2002,15 +2002,13 @@ stream.close()
         let mut worker = BatchCapable { asked: false };
         let serial = EngineLimits {
             max_num_seqs: 1,
-            prefill_chunk_tokens: 1024,
-            prefill_target_ms: 50,
+            ..EngineLimits::for_tests()
         };
         assert!(super::engine_seed(&mut worker, serial).is_none());
         assert!(!worker.asked, "the serial default never builds an engine");
         let batching = EngineLimits {
             max_num_seqs: 2,
-            prefill_chunk_tokens: 1024,
-            prefill_target_ms: 50,
+            ..EngineLimits::for_tests()
         };
         assert!(super::engine_seed(&mut worker, batching).is_some());
         assert!(worker.asked);

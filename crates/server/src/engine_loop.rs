@@ -367,6 +367,18 @@ impl EngineLimits {
     pub(crate) const fn batches(self) -> bool {
         self.max_num_seqs > 1
     }
+
+    /// Limits for tests: four sequences, 1024-token chunks, a 50 ms target.
+    /// Tests override fields with `..EngineLimits::for_tests()`, so a new
+    /// field needs a value here and not at every test.
+    #[cfg(test)]
+    pub(crate) const fn for_tests() -> Self {
+        Self {
+            max_num_seqs: 4,
+            prefill_chunk_tokens: 1024,
+            prefill_target_ms: 50,
+        }
+    }
 }
 
 /// The least share of a decode step's time that prefill chunks get when the
@@ -1836,6 +1848,10 @@ mod tests {
             let engine = thread::spawn(move || {
                 let mut decoder = decoder;
                 let _ = start.recv();
+                #[allow(
+                    clippy::needless_update,
+                    reason = "a field added to EngineLimits takes its test value here too"
+                )]
                 let limits =
                     decoder
                         .observed
@@ -1847,6 +1863,7 @@ mod tests {
                             prefill_chunk_tokens: TEST_CHUNK,
                             // Generous, so the token ceiling sets every chunk.
                             prefill_target_ms: 10_000,
+                            ..EngineLimits::for_tests()
                         });
                 run(
                     &mut decoder,
@@ -2435,11 +2452,7 @@ mod tests {
         let mut harness = Harness::paused(4096, 4, true);
         {
             let mut observed = harness.observed.lock().expect("observed");
-            observed.limits = Some(EngineLimits {
-                max_num_seqs: 4,
-                prefill_chunk_tokens: 1024,
-                prefill_target_ms: 50,
-            });
+            observed.limits = Some(EngineLimits::for_tests());
             observed.step_delay = Duration::from_millis(60);
             observed.prefill_ms_per_token = Some(0.01);
         }
@@ -2498,9 +2511,9 @@ mod tests {
             // step leaves one 4-token block per step, so the prompt is still
             // prefilling when the pool runs out of headroom.
             observed.limits = Some(EngineLimits {
-                max_num_seqs: 4,
                 prefill_chunk_tokens: TEST_CHUNK,
                 prefill_target_ms: 12,
+                ..EngineLimits::for_tests()
             });
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -2568,9 +2581,9 @@ mod tests {
             observed.step_delay = Duration::from_millis(10);
             // One 4-token block per step beside a ~10 ms decode step.
             observed.limits = Some(EngineLimits {
-                max_num_seqs: 4,
                 prefill_chunk_tokens: TEST_CHUNK,
                 prefill_target_ms: 12,
+                ..EngineLimits::for_tests()
             });
         }
         harness.release();
@@ -2645,9 +2658,9 @@ mod tests {
             let mut observed = harness.observed.lock().expect("observed");
             observed.step_delay = Duration::from_millis(10);
             observed.limits = Some(EngineLimits {
-                max_num_seqs: 4,
                 prefill_chunk_tokens: TEST_CHUNK,
                 prefill_target_ms: 12,
+                ..EngineLimits::for_tests()
             });
         }
         harness.release();
@@ -2933,8 +2946,7 @@ mod tests {
                 &engine_format,
                 EngineLimits {
                     max_num_seqs: 16,
-                    prefill_chunk_tokens: 1024,
-                    prefill_target_ms: 50,
+                    ..EngineLimits::for_tests()
                 },
                 &receiver,
                 |()| {},

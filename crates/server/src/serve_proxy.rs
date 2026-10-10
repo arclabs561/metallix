@@ -69,6 +69,28 @@ pub(crate) struct ChildSettings {
     pub(crate) gpu_capture: Option<PathBuf>,
 }
 
+impl ChildSettings {
+    /// Settings for tests: a 4096-token context, a 64 MiB KV budget, no
+    /// prefix cache, one sequence, 2048-token chunks, no prefill target, a
+    /// one-second generation timeout and no trace or capture paths. Tests
+    /// override fields with `..ChildSettings::for_tests()`, so a new field
+    /// needs a value here and not at every test.
+    #[cfg(test)]
+    pub(crate) const fn for_tests() -> Self {
+        Self {
+            context_tokens: 4096,
+            kv_budget_mib: 64,
+            prefix_cache_mib: 0,
+            max_num_seqs: 1,
+            prefill_chunk_tokens: 2048,
+            prefill_target_ms: 0,
+            generation_timeout_ms: 1000,
+            trace_out: None,
+            gpu_capture: None,
+        }
+    }
+}
+
 enum ChildState {
     Stopped,
     /// `child` is `None` only for test stand-ins that have no process.
@@ -1871,17 +1893,7 @@ mod tests {
             )],
             launcher: Some(Launcher {
                 executable: script,
-                settings: ChildSettings {
-                    context_tokens: 4096,
-                    kv_budget_mib: 64,
-                    prefix_cache_mib: 0,
-                    max_num_seqs: 1,
-                    prefill_chunk_tokens: 2048,
-                    prefill_target_ms: 0,
-                    generation_timeout_ms: 1000,
-                    trace_out: None,
-                    gpu_capture: None,
-                },
+                settings: ChildSettings::for_tests(),
             }),
             budget_mib: None,
             residency: Mutex::new(()),
