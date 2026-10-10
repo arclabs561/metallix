@@ -35,11 +35,16 @@ pub enum Marker {
 /// rendered generation prompt: its tail says whether a reasoning block is
 /// already closed, open, or still to come. `marker` reports how the
 /// tokenizer holds a marker string.
+///
+/// With `final_schema` (a response format), the turn either calls tools or
+/// ends in one message that matches the schema; the schema binds only that
+/// final message, not text before calls.
 pub fn tool_grammar(
     format: TurnFormat,
     tools: &[Value],
     strict: &[String],
     requirement: &ToolRequirement,
+    final_schema: Option<&Value>,
     prompt: &str,
     marker: impl Fn(&str) -> Marker,
 ) -> Result<String, String> {
@@ -80,13 +85,24 @@ pub fn tool_grammar(
     } else {
         json!({"anyOf": calls})
     };
-    let repeat = match requirement {
-        ToolRequirement::Auto => "*",
-        ToolRequirement::Required | ToolRequirement::Named(_) => "+",
-    };
+    let calls_required = *requirement != ToolRequirement::Auto;
     let reasoning = reasoning_rule(format.reasoning, prompt);
     match format.tools {
-        ToolDialect::JsonInTags => json_in_tags(&call_schema, repeat, reasoning.as_ref(), &marker),
+        ToolDialect::JsonInTags => match final_schema {
+            None => json_in_tags(
+                &call_schema,
+                if calls_required { "+" } else { "*" },
+                reasoning.as_ref(),
+                &marker,
+            ),
+            Some(final_schema) => json_in_tags_with_final(
+                &call_schema,
+                final_schema,
+                calls_required,
+                reasoning.as_ref(),
+                &marker,
+            ),
+        },
         ToolDialect::XmlFunctionParams | ToolDialect::MiniCpmXml | ToolDialect::GemmaCall => Err(
             "strict tools and tool_choice required or named are not supported yet for this \
              model's tool-call format"
@@ -156,6 +172,52 @@ fn json_in_tags(
     ))
 }
 
+/// Qwen3 with a response format: a turn of calls, each optionally preceded
+/// by commentary, or (unless a call is required) one message matching
+/// `final_schema`. Commentary cannot open (after whitespace) with `{` or
+/// `<`, so the first visible character decides the branch: the lexer never
+/// weighs prose against the schema's JSON, and a leading reasoning block or
+/// marker cannot lex as commentary. Nothing but whitespace may follow the last call or the
+/// final message.
+fn json_in_tags_with_final(
+    call_schema: &Value,
+    final_schema: &Value,
+    calls_required: bool,
+    reasoning: Option<&(&'static str, String)>,
+    marker: &impl Fn(&str) -> Marker,
+) -> Result<String, String> {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    if marker(OPEN) != Marker::Text || marker(CLOSE) != Marker::Text {
+        return Err(
+            "this model's tool-call markers are special tokens, which the JSON-in-tags \
+                    grammar does not support yet"
+                .into(),
+        );
+    }
+    let calls = serde_json::to_string(call_schema).map_err(|error| error.to_string())?;
+    let answer = serde_json::to_string(final_schema).map_err(|error| error.to_string())?;
+    let (start, think) = match reasoning {
+        Some((rule, definition)) => (format!("{rule} "), format!("{definition}\n")),
+        None => (String::new(), String::new()),
+    };
+    let body = if calls_required {
+        "calls"
+    } else {
+        "(calls | final)"
+    };
+    Ok(format!(
+        "start: {start}{body}\n\
+         {think}\
+         calls: (pre_call call)+ WS\n\
+         final: WS %json{answer} WS\n\
+         pre_call[lazy]: /\\s*([^{{<\\s](?s:.)*)?{open}/ & ~/(?s:.)*<think>(?s:.)*/\n\
+         call: \"\\n\" %json{calls} \"\\n{CLOSE}\"\n\
+         WS: /\\s*/\n",
+        open = regex_escape(OPEN),
+    ))
+}
+
 /// Escapes regex metacharacters (and the `/` delimiter) in a literal.
 fn regex_escape(literal: &str) -> String {
     let mut escaped = String::with_capacity(literal.len());
@@ -194,6 +256,7 @@ mod tests {
             &weather(),
             &["get_weather".into()],
             &ToolRequirement::Auto,
+            None,
             closed,
             |_| Marker::Text,
         )
@@ -208,6 +271,7 @@ mod tests {
             &weather(),
             &[],
             &ToolRequirement::Required,
+            None,
             closed,
             |_| Marker::Text,
         )
@@ -224,6 +288,7 @@ mod tests {
                 &weather(),
                 &[],
                 &ToolRequirement::Auto,
+                None,
                 prompt,
                 |_| Marker::Text,
             )
@@ -248,11 +313,22 @@ mod tests {
     fn named_choices_and_unsupported_formats_are_refused_up_front() {
         let prompt = "assistant\n";
         let named = ToolRequirement::Named("shell".into());
-        assert!(tool_grammar(QWEN3, &weather(), &[], &named, prompt, |_| Marker::Text).is_err());
         assert!(
-            tool_grammar(QWEN3, &[], &[], &ToolRequirement::Required, prompt, |_| {
+            tool_grammar(QWEN3, &weather(), &[], &named, None, prompt, |_| {
                 Marker::Text
             })
+            .is_err()
+        );
+        assert!(
+            tool_grammar(
+                QWEN3,
+                &[],
+                &[],
+                &ToolRequirement::Required,
+                None,
+                prompt,
+                |_| { Marker::Text }
+            )
             .is_err()
         );
         let special = tool_grammar(
@@ -260,6 +336,7 @@ mod tests {
             &weather(),
             &[],
             &ToolRequirement::Auto,
+            None,
             prompt,
             |_| Marker::Special(1),
         );
@@ -274,10 +351,49 @@ mod tests {
                 &weather(),
                 &[],
                 &ToolRequirement::Auto,
+                None,
                 prompt,
                 |_| Marker::Text
             )
             .is_err()
         );
+    }
+
+    /// With a response format, a turn is calls (each optionally after
+    /// commentary) or one final message matching the schema; a required
+    /// call drops the final branch.
+    #[test]
+    fn a_final_schema_binds_only_the_turn_final_message() {
+        let schema = json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]});
+        let grammar = |requirement: &ToolRequirement| {
+            tool_grammar(
+                QWEN3,
+                &weather(),
+                &[],
+                requirement,
+                Some(&schema),
+                "assistant\n",
+                |_| Marker::Text,
+            )
+            .unwrap()
+        };
+        let auto = grammar(&ToolRequirement::Auto);
+        assert!(
+            auto.starts_with("start: think? (calls | final)\n"),
+            "{auto}"
+        );
+        let final_rule = auto
+            .lines()
+            .find(|line| line.starts_with("final: WS %json{"))
+            .unwrap_or_else(|| panic!("no final rule in {auto}"));
+        assert!(final_rule.contains(r#""answer""#), "{final_rule}");
+        // Commentary may not open with `{` or `<` after whitespace.
+        assert!(
+            auto.contains(r"pre_call[lazy]: /\s*([^{<\s](?s:.)*)?<tool_call>/"),
+            "{auto}"
+        );
+        assert!(!auto.contains("FREE"), "{auto}");
+        let required = grammar(&ToolRequirement::Required);
+        assert!(required.starts_with("start: think? calls\n"), "{required}");
     }
 }

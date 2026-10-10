@@ -631,7 +631,9 @@ impl ChatFormat {
     /// tool dialect and tokenizer. A marker the tokenizer holds as a special
     /// token is named by id, any other is written as text. `prompt` is the
     /// rendered generation prompt, whose tail says whether a reasoning block
-    /// is closed, open, or still to come.
+    /// is closed, open, or still to come. With `final_schema` (a response
+    /// format), a turn either calls tools, optionally with commentary before
+    /// each call, or ends in one message matching the schema.
     ///
     /// # Errors
     ///
@@ -643,14 +645,21 @@ impl ChatFormat {
         tools: &[Value],
         strict: &[String],
         requirement: &ToolRequirement,
+        final_schema: Option<&Value>,
         prompt: &str,
     ) -> Result<String, String> {
-        tools::grammar::tool_grammar(self.turn, tools, strict, requirement, prompt, |marker| {
-            match self.tokenizer.token_id(marker) {
+        tools::grammar::tool_grammar(
+            self.turn,
+            tools,
+            strict,
+            requirement,
+            final_schema,
+            prompt,
+            |marker| match self.tokenizer.token_id(marker) {
                 Some(id) if self.tokenizer.is_special(id) => tools::grammar::Marker::Special(id),
                 _ => tools::grammar::Marker::Text,
-            }
-        })
+            },
+        )
     }
 
     /// Whether [`ChatFormat::suppress`] masks anything; a device-side pick
