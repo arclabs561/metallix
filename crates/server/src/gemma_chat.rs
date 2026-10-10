@@ -268,6 +268,64 @@ mod tests {
         );
     }
 
+    /// google/gemma-4-E2B-it named by `METALLIX_GEMMA4_E2B_MODEL`: per-layer
+    /// inputs, shared K/V and the template without an empty thought pre-fill,
+    /// served end to end (about 9 GiB of bf16 text weights).
+    #[test]
+    #[ignore = "requires METALLIX_GEMMA4_E2B_MODEL (google/gemma-4-E2B-it) on Apple-Silicon Metal"]
+    fn real_gemma4_e2b_answers_streams_and_calls_a_tool() {
+        let _serial = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _cap = GpuCap::start(24);
+        let model =
+            std::env::var_os("METALLIX_GEMMA4_E2B_MODEL").expect("set METALLIX_GEMMA4_E2B_MODEL");
+        let mut session = ChatDecoderSession::<GemmaDecoder>::load(
+            std::path::Path::new(&model),
+            ResidentChatLimits::from_mib(16_384, 1_024),
+        )
+        .expect("load local Gemma 4 E2B checkpoint");
+
+        let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":32});
+        let (status, plain) = json_body(&chat_completion(&body, &mut session));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{plain}");
+        let text = plain["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!text.is_empty(), "{plain}");
+        assert_no_channel_markers(&text);
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        let joined: String = events(&chat_completion(&streamed, &mut session))
+            .iter()
+            .filter_map(|(_, data)| serde_json::from_str::<Value>(data).ok())
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(joined, text);
+
+        let tools = json!([{"type":"function","function":{"name":"get_weather","description":"Current weather for a city.","parameters":weather_parameters()}}]);
+        let body = json!({"model":"m","messages":[{"role":"user","content":"Weather in Paris?"}],"tools":tools,"temperature":0,"max_completion_tokens":64});
+        let (_, called) = json_body(&chat_completion(&body, &mut session));
+        assert_eq!(
+            called["choices"][0]["finish_reason"], "tool_calls",
+            "{called}"
+        );
+        let call = &called["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "get_weather", "{called}");
+        let arguments: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["city"], "Paris", "{called}");
+        eprintln!(
+            "E2B answer {text:?}; call {arguments}; MLX held {:?} bytes",
+            crate::gpu::held_bytes()
+        );
+    }
+
     #[test]
     #[ignore = "requires METALLIX_GEMMA4_MODEL (google/gemma-4-12B-it) on Apple-Silicon Metal"]
     fn real_gemma4_answers_streams_and_calls_a_tool() {
