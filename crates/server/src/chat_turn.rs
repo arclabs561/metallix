@@ -27,7 +27,7 @@ use serde_json::Value;
 
 use super::{
     AppliedSampling, ChatFinishReason, ChatGenerationError, ChatRequest, GenerationDeadline,
-    SamplingDefaults, TokenLogprob, TokenPicker, TopLogprob, elapsed_ms, full_row,
+    SamplingDefaults, TokenLogprob, TokenPicker, TopLogprob, elapsed_ms,
     prompt_prefixes::PromptPrefixes, timed, validate_request,
 };
 
@@ -264,11 +264,25 @@ impl TurnLoop {
     /// checkpoint that suppresses tokens (the GPU pick has no suppression
     /// mask).
     pub(crate) fn gpu_rule(&self, format: &ChatFormat, ahead: usize) -> Option<Qwen3PickRule> {
+        self.gpu_rule_rows(format, ahead, 1)
+    }
+
+    /// [`Self::gpu_rule`] for `rows` consecutive positions, such as the rows
+    /// of a speculative verify: row `i` carries the variate `ahead + i`
+    /// draws past the next uncommitted one. Kept rows are settled in order
+    /// with [`Self::settle_row`], each consuming one draw, so a row's
+    /// variate is the one plain decoding would give its token.
+    pub(crate) fn gpu_rule_rows(
+        &self,
+        format: &ChatFormat,
+        ahead: usize,
+        rows: usize,
+    ) -> Option<Qwen3PickRule> {
         if format.suppresses_tokens() {
             return None;
         }
         self.picker
-            .gpu_rule(ahead, self.top_logprobs, self.vocabulary_size)
+            .gpu_rule(ahead, rows, self.top_logprobs, self.vocabulary_size)
     }
 
     /// Picks the next token from the whole logit row, after the checkpoint's
@@ -304,15 +318,36 @@ impl TurnLoop {
             return Err("a decode step picks one token".into());
         };
         let candidates = candidates.as_ref().and_then(|rows| rows.first());
-        let mut row = None;
+        let (accepted, _) = self.settle_row(format, picks, 0, gpu_token, candidates)?;
+        Ok((accepted, gpu_token))
+    }
+
+    /// [`Self::settle`] for row `row` of picks already read back, such as
+    /// one row of a speculative verify scored under
+    /// [`Self::gpu_rule_rows`]. Each call settles one token and, for a
+    /// sampled turn, consumes one draw, so rows must be settled in order and
+    /// only while the turn keeps them. Also returns whether the row's whole
+    /// logits had to be read back because its candidates could not settle
+    /// it.
+    pub(crate) fn settle_row(
+        &mut self,
+        format: &ChatFormat,
+        picks: &Qwen3TokenPicks,
+        row: usize,
+        gpu_token: i32,
+        candidates: Option<&Qwen3RowCandidates>,
+    ) -> Result<(Accepted, bool), String> {
+        let read_row = || picks.full_row(row).map_err(|error| error.to_string());
+        let mut full = None;
         let token = if let Some(token) = self.picker.pick_from_candidates(gpu_token, candidates)? {
             token
         } else {
-            let full = full_row(picks)?;
-            let (token, _) = self.picker.pick(&full)?;
-            row = Some(full);
+            let whole = read_row()?;
+            let (token, _) = self.picker.pick(&whole)?;
+            full = Some(whole);
             token
         };
+        let mut read_whole = full.is_some();
         let receipt = match self.receipt_wanted(format, token)? {
             None => None,
             Some(top) => {
@@ -323,15 +358,17 @@ impl TurnLoop {
                 Some(if let Some(receipt) = settled {
                     receipt
                 } else {
-                    let full = match row {
-                        Some(full) => full,
-                        None => full_row(picks)?,
+                    let whole = if let Some(whole) = full {
+                        whole
+                    } else {
+                        read_whole = true;
+                        read_row()?
                     };
-                    token_logprob(format, &full, token, top)?
+                    token_logprob(format, &whole, token, top)?
                 })
             }
         };
-        Ok((self.accept(format, token, false, receipt)?, gpu_token))
+        Ok((self.accept(format, token, false, receipt)?, read_whole))
     }
 
     /// Whether a speculative verify may take the GPU's argmax of each

@@ -5,13 +5,16 @@
 //! engine's speculation step needs. A recurrent-state adapter would need a
 //! checkpoint scheme before it could join.
 
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+
 use chat_format::ChatFormat;
 use engine::speculative::{
-    DraftLength, GreedySpeculativeTarget, Pick, PositionLogits, SpeculativeTarget, StepOutcome,
-    VerifyCost, greedy_speculative_step, speculative_step,
+    DraftLength, Pick, PositionLogits, SpeculativeTarget, StepOutcome, VerifyCost, accept_verified,
+    speculative_step,
 };
 use qwen::{
-    forward::{Qwen3ForwardError, Qwen3ForwardExecutor},
+    forward::{Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3PickRule},
     metal::Qwen3FloatPrecision,
 };
 
@@ -82,64 +85,101 @@ impl SpeculativeTarget for Target<'_, '_> {
     }
 }
 
-impl GreedySpeculativeTarget for Target<'_, '_> {
-    fn verify_greedy(&mut self, tokens: &[i32]) -> Result<Vec<i32>, Qwen3ForwardError> {
-        self.0.extend_greedy(tokens)?.wait()
-    }
+/// What one verify did, beyond the engine's outcome.
+pub(super) struct Verified {
+    pub(super) outcome: StepOutcome,
+    /// The accepted tokens, in order.
+    pub(super) tokens: Vec<Accepted>,
+    /// Rows settled from whole vocabulary rows read back to the host: every
+    /// settled row on the host-row path, and on the GPU path only the rows
+    /// whose candidates could not settle them.
+    pub(super) full_rows: usize,
 }
 
 /// Scores `last_token` plus `draft` in one forward pass and accepts tokens
 /// from the scored rows through the turn's own rules until one leaves the
 /// draft or ends the turn, then rolls the K/V back to the accepted tokens.
 ///
-/// Every accepted token goes through `turn`: [`TurnLoop::pick`] (after
-/// suppression, with logprob receipts, consuming the sampler's draws in
-/// order) or, for a plain greedy turn, [`TurnLoop::accept_gpu_greedy`] on the
-/// GPU's argmax. So a sampled turn keeps its distribution and a seeded turn
-/// its random stream, and stop and length rules apply to verified tokens as
-/// to decoded ones.
+/// With `gpu_rule` (from [`TurnLoop::gpu_rule_rows`]) the GPU picks every
+/// row and the host settles each kept row from its candidates with
+/// [`TurnLoop::settle_row`], reading a whole row only when those cannot
+/// decide it. Without it every kept row is read back and picked with
+/// [`TurnLoop::pick`] after suppression. Either way each kept token takes
+/// the sampler's next draw, in order, so a sampled turn keeps its
+/// distribution and a seeded turn its random stream, and stop and length
+/// rules apply to verified tokens as to decoded ones.
 pub(super) fn verify(
     format: &ChatFormat,
     executor: &mut Executor<'_>,
     turn: &mut TurnLoop,
     last_token: i32,
     draft: &[i32],
-    gpu_greedy: bool,
-) -> Result<(StepOutcome, Vec<Accepted>), String> {
-    let mut accepted = Vec::with_capacity(draft.len() + 1);
-    let mut target = Target(executor);
-    let outcome = if gpu_greedy {
-        let mut failure = None;
-        let mut is_stop = |token: i32| match turn.accept_gpu_greedy(format, token) {
-            Ok(token) => {
-                accepted.push(token);
-                matches!(token.step, TurnStep::Stop(_))
-            }
-            Err(error) => {
-                failure = Some(error);
-                true
-            }
-        };
-        let outcome = greedy_speculative_step(&mut target, last_token, draft, &mut is_stop)
-            .map_err(|error| error.to_string())?;
-        if let Some(error) = failure {
-            return Err(error);
+    gpu_rule: Option<&Qwen3PickRule>,
+) -> Result<Verified, String> {
+    let mut tokens = Vec::with_capacity(draft.len() + 1);
+    let mut full_rows = 0;
+    let mut kept = |token: Accepted| {
+        tokens.push(token);
+        Pick {
+            token: token.token,
+            stop: matches!(token.step, TurnStep::Stop(_)),
         }
-        outcome
+    };
+    #[cfg(test)]
+    let gpu_rule = gpu_rule.filter(|_| !test_hooks::HOST_ROW_VERIFY.load(Ordering::Relaxed));
+    let outcome = if let Some(rule) = gpu_rule {
+        #[cfg(test)]
+        test_hooks::GPU_VERIFIES.fetch_add(1, Ordering::Relaxed);
+        let base = executor.cached_tokens();
+        let mut input = Vec::with_capacity(draft.len() + 1);
+        input.push(last_token);
+        input.extend_from_slice(draft);
+        let picks = executor
+            .extend_picks(&input, rule)
+            .map_err(|error| error.to_string())?;
+        let (gpu_tokens, candidates) = picks
+            .wait_with_candidates()
+            .map_err(|error| error.to_string())?;
+        if gpu_tokens.len() != input.len() {
+            return Err(format!(
+                "verify picked {} rows for {} tokens",
+                gpu_tokens.len(),
+                input.len()
+            ));
+        }
+        let mut settle = |row: usize| -> Result<Pick, String> {
+            let row_candidates = candidates.as_ref().and_then(|rows| rows.get(row));
+            let (token, read_whole) =
+                turn.settle_row(format, &picks, row, gpu_tokens[row], row_candidates)?;
+            full_rows += usize::from(read_whole);
+            Ok(kept(token))
+        };
+        accept_verified(&mut Target(executor), base, draft, &mut settle)
     } else {
         let mut pick = |row: &[f32]| -> Result<Pick, String> {
             let mut row = row.to_vec();
-            let token = turn.pick(format, &mut row)?;
-            accepted.push(token);
-            Ok(Pick {
-                token: token.token,
-                stop: matches!(token.step, TurnStep::Stop(_)),
-            })
+            full_rows += 1;
+            Ok(kept(turn.pick(format, &mut row)?))
         };
-        speculative_step(&mut target, last_token, draft, &mut pick)
-            .map_err(|error| error.to_string())?
-    };
-    Ok((outcome, accepted))
+        speculative_step(&mut Target(executor), last_token, draft, &mut pick)
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(Verified {
+        outcome,
+        tokens,
+        full_rows,
+    })
+}
+
+/// Switches for checkpoint tests that compare the two verify paths.
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// Forces every verify onto whole host rows.
+    pub(crate) static HOST_ROW_VERIFY: AtomicBool = AtomicBool::new(false);
+    /// Verifies that took the GPU-pick path.
+    pub(crate) static GPU_VERIFIES: AtomicUsize = AtomicUsize::new(0);
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use qwen::forward::Qwen3Selection;
 
 use super::{
     ChatMessage, ChatRequest, ChatRole, ChatSession, GenerationDeadline, ResidentChatLimits,
-    SamplingRequest, TurnStart, full_row,
+    SamplingRequest, TurnStart,
 };
 
 const MAX_TOKENS: u32 = 128;
@@ -110,7 +110,7 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
                 .gpu_rule(format, 0)
                 .expect("this case takes the GPU path");
             let picks = executor.decode_picks(token, &rule).expect("decode");
-            let mut row = full_row(&picks).expect("row");
+            let mut row = picks.full_row(0).expect("row");
             let expected = host.pick(format, &mut row).expect("host pick").token;
             if let Qwen3Selection::TopKNucleus { top_k, .. } = &rule.selection {
                 let (_, candidates) = picks.wait_with_candidates().expect("candidates");

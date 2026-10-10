@@ -1130,7 +1130,6 @@ impl ChatSession {
                 .map_err(|error| ChatGenerationError::message(error.to_string()))?
                 .quantization()
                 .is_none();
-        let gpu_verify = turn.verifies_with_gpu_greedy(&self.format);
         let lookup = engine::speculative::PromptLookup::default();
         let mut draft_length = speculation::draft_length(SERVING_ACTIVATIONS);
         let mut speculation_stats = SpeculationStats::default();
@@ -1227,24 +1226,34 @@ impl ChatSession {
                     batch = 1,
                     drafted = draft.len(),
                     accepted = Empty,
+                    full_rows = Empty,
                     decode_ms = Empty,
                     mlx.active_bytes = Empty,
                     mlx.peak_bytes = Empty
                 );
-                let ((outcome, verified), step_ms) = timed(&span, "decode_ms", || {
+                // Sampled turns pre-draw one variate per scored row, so the
+                // rule is rebuilt for every verify.
+                let gpu_rule = turn.gpu_rule_rows(&self.format, 0, draft.len() + 1);
+                let (verified, step_ms) = timed(&span, "decode_ms", || {
                     let verified = speculation::verify(
                         &self.format,
                         &mut executor,
                         &mut turn,
                         last_token,
                         &draft,
-                        gpu_verify,
+                        gpu_rule.as_ref(),
                     )
                     .map_err(ChatGenerationError::message)?;
-                    span.record("accepted", verified.0.accepted);
+                    span.record("accepted", verified.outcome.accepted);
+                    span.record("full_rows", verified.full_rows);
                     crate::gpu::Memory::record_on(&span);
                     Ok::<_, ChatGenerationError>(verified)
                 })?;
+                let speculation::Verified {
+                    outcome,
+                    tokens: verified,
+                    ..
+                } = verified;
                 decode_ms.push(step_ms);
                 draft_length.observe(outcome.drafted, outcome.accepted);
                 speculation_stats.record(&outcome);
@@ -1797,14 +1806,18 @@ impl TokenPicker {
         })
     }
 
-    /// How the GPU picks this turn's tokens, with the variate `ahead` draws
-    /// past the next uncommitted one, or `None` when every step must read
-    /// the whole logit row: under a grammar mask, or sampling without
-    /// `top_k`, whose nucleus normalizer spans the whole row. Candidates
-    /// cover the receipts `top_logprobs` asks for and the `top_k` draw.
+    /// How the GPU picks this turn's next `rows` tokens, row `i` with the
+    /// variate `ahead + i` draws past the next uncommitted one, or `None`
+    /// when every step must read the whole logit row: under a grammar mask,
+    /// or sampling without `top_k`, whose nucleus normalizer spans the whole
+    /// row. Candidates cover the receipts `top_logprobs` asks for and the
+    /// `top_k` draw. A decode step is one row; a speculative verify scores
+    /// several, and row `i`'s variate is used only if the rows before it
+    /// were kept, each consuming one draw.
     fn gpu_rule(
         &self,
         ahead: usize,
+        rows: usize,
         top_logprobs: Option<u8>,
         vocabulary_size: usize,
     ) -> Option<Qwen3PickRule> {
@@ -1831,7 +1844,9 @@ impl TokenPicker {
                         temperature: self.applied.temperature,
                         top_p: *top_p,
                         top_k,
-                        uniforms: vec![policy.uniform_ahead(ahead)],
+                        uniforms: (ahead..ahead + rows)
+                            .map(|draw| policy.uniform_ahead(draw))
+                            .collect(),
                     },
                     candidates: receipts.max(top_k_window(top_k, vocabulary_size)),
                 }
@@ -1981,16 +1996,6 @@ fn top_k_window(top_k: usize, vocabulary_size: usize) -> usize {
         .max(top_k + 1)
 }
 
-/// The whole logit row of a single-row GPU pick, for steps its candidates
-/// cannot settle.
-fn full_row(picks: &Qwen3TokenPicks) -> Result<Vec<f32>, String> {
-    picks
-        .full_rows()
-        .map_err(|error| error.to_string())?
-        .pop()
-        .ok_or_else(|| String::from("a decode step has one logit row"))
-}
-
 /// Runs `work` inside `span` and records its wall time in milliseconds as
 /// `field`, returning the same figure for the JSON metrics. For MLX work that
 /// ends in a host readback, the span covers the GPU evaluation.
@@ -2076,6 +2081,41 @@ mod tests {
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
 
+    /// A multi-row rule (a speculative verify) carries consecutive
+    /// variates, row `i` at `ahead + i`, and draws none of them.
+    #[test]
+    fn multi_row_gpu_rule_carries_consecutive_variates() {
+        let config = super::SamplingConfiguration {
+            seed: 8128,
+            temperature: 0.7,
+        };
+        let picker = super::TokenPicker {
+            policy: Some((super::SamplingPolicy::new(config, 4), 0.9, Some(2))),
+            #[cfg(feature = "structured-output")]
+            constraint: None,
+            applied: super::AppliedSampling {
+                temperature: 0.7,
+                top_p: 0.9,
+                top_k: Some(2),
+                seed: Some(8128),
+                sampler: Some(super::SamplerId::IcdfV1),
+                defaults_applied: Vec::new(),
+            },
+        };
+        let policy = &picker.policy.as_ref().unwrap().0;
+        let before = policy.uniform_ahead(0).to_bits();
+        let Some(qwen::forward::Qwen3PickRule {
+            selection: qwen::forward::Qwen3Selection::TopKNucleus { uniforms, .. },
+            ..
+        }) = picker.gpu_rule(1, 3, None, 4)
+        else {
+            panic!("a top_k turn has a sampling rule");
+        };
+        let expected: Vec<f64> = (1..4).map(|draw| policy.uniform_ahead(draw)).collect();
+        assert_eq!(uniforms, expected);
+        assert_eq!(policy.uniform_ahead(0).to_bits(), before);
+    }
+
     fn sampling_observation_probe() -> (i32, i32, u64) {
         let config = super::SamplingConfiguration {
             seed: 8128,
@@ -2097,7 +2137,7 @@ mod tests {
         };
         let next = |p: &super::TokenPicker| p.policy.as_ref().unwrap().0.uniform_ahead(0).to_bits();
         let before = next(&picker);
-        assert!(picker.gpu_rule(2, None, 4).is_some());
+        assert!(picker.gpu_rule(2, 1, None, 4).is_some());
         assert_eq!(next(&picker), before);
         assert!(picker.pick_from_candidates(0, None).unwrap().is_none());
         assert_eq!(next(&picker), before);
@@ -2189,7 +2229,7 @@ mod tests {
         logits[..6].copy_from_slice(&[5.0, 4.0, 2.0, 2.0, 2.0, 1.0]);
         let mut picker = sampled_picker(top_k, vocabulary);
         let rule = picker
-            .gpu_rule(0, None, vocabulary)
+            .gpu_rule(0, 1, None, vocabulary)
             .expect("a top_k draw picks on the GPU");
         assert!(
             rule.candidates > top_k + 1,
@@ -2214,9 +2254,15 @@ mod tests {
         assert_eq!(super::top_k_window(2, 4), 3);
         assert_eq!(super::top_k_window(3, 6), 5);
         let picker = sampled_picker(3, 4);
-        assert!(picker.gpu_rule(0, None, 4).is_none(), "no room for a spare");
+        assert!(
+            picker.gpu_rule(0, 1, None, 4).is_none(),
+            "no room for a spare"
+        );
         let picker = sampled_picker(3, 6);
-        assert_eq!(picker.gpu_rule(0, None, 6).expect("GPU rule").candidates, 5);
+        assert_eq!(
+            picker.gpu_rule(0, 1, None, 6).expect("GPU rule").candidates,
+            5
+        );
     }
 
     #[test]
