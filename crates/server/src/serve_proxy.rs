@@ -735,6 +735,22 @@ fn forward(
         tracing::info!("forward cancellation finished");
         return;
     };
+    if passed.is_err() {
+        // The relay failed after the response began (the client left mid
+        // stream, or a write failed), so the child may still be generating.
+        // Cancel and hold the queue permit until it closes, as above, or the
+        // next request reaches a busy child and is refused 503 server_busy.
+        span.record("cancel.reason", "relay_failed");
+        match cancel_and_wait(&mut child, wait) {
+            Ok(()) => {
+                span.record("cancel.cleanup", "ready");
+            }
+            Err(error) => {
+                span.record("cancel.cleanup", "failed");
+                model.fail(&format!("cancelled child did not finish: {error}"));
+            }
+        }
+    }
     // The model is free once its child has finished this response.
     drop(admitted);
     match passed {
@@ -1377,6 +1393,75 @@ mod tests {
         drop(first);
         cancelled.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(pool.models[0].queue.waiting(), 1);
+        release.send(()).unwrap();
+        let (status, _, body) = finish(second);
+        assert_eq!((status, body), (200, json!({"input": "second"})));
+        child.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// A client that leaves after the response has started streaming leaves
+    /// the child generating until it sees the forward close. The next queued
+    /// request must not reach the child before then, or the child answers it
+    /// 503 `server_busy`.
+    #[test]
+    fn a_client_leaving_mid_stream_holds_the_queue_until_the_child_releases() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_address = listener.local_addr().unwrap();
+        let (cancelled_tx, cancelled) = channel();
+        let (release, released) = channel();
+        let child = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            connection.read_request().unwrap();
+            // Stream tokens, as a generation does, until the forward is gone:
+            // a failed write, or EOF (`x-metallix-cancel-on-eof`).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "cancellation did not reach the child"
+                );
+                let wrote = connection
+                    .write_all(b"data: token\n\n")
+                    .and_then(|()| connection.flush());
+                if wrote.is_err() || connection.client_gone() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            cancelled_tx.send(()).unwrap();
+            // Model work can still be unwinding after noticing cancellation.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("the next request reached a child still busy with the last"),
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(connection);
+            listener.set_nonblocking(false).unwrap();
+            let (socket, _) = listener.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            let request = connection.read_request().unwrap();
+            assert_eq!(json(&request.body)["input"], "second");
+            json_response(connection, 200, &json!({"input": "second"}));
+        });
+        let pool = queued_pool(child_address, QueueSettings::default());
+        let (address, server) = proxy(&pool, 2);
+        let mut first = send(address, "first");
+        let mut streamed = [0_u8; 64];
+        assert!(first.read(&mut streamed).unwrap() > 0, "the stream started");
+        let second = send(address, "second");
+        until_waiting(&pool.models[0], 1);
+        drop(first);
+        cancelled.recv_timeout(Duration::from_secs(5)).unwrap();
         release.send(()).unwrap();
         let (status, _, body) = finish(second);
         assert_eq!((status, body), (200, json!({"input": "second"})));
