@@ -1,0 +1,205 @@
+{
+ "model": "m",
+ "instructions": "(Codex instructions removed)",
+ "input": [
+  {
+   "type": "message",
+   "role": "user",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "Fix the bug in calc.py."
+    }
+   ]
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "name": "exec_command",
+   "description": "",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "cmd": {
+      "type": "string",
+      "description": ""
+     },
+     "justification": {
+      "type": "string",
+      "description": ""
+     },
+     "login": {
+      "type": "boolean",
+      "description": ""
+     },
+     "max_output_tokens": {
+      "type": "number",
+      "description": ""
+     },
+     "prefix_rule": {
+      "type": "array",
+      "description": "",
+      "items": {
+       "type": "string"
+      }
+     },
+     "sandbox_permissions": {
+      "type": "string",
+      "description": "",
+      "enum": [
+       "use_default",
+       "require_escalated"
+      ]
+     },
+     "shell": {
+      "type": "string",
+      "description": ""
+     },
+     "tty": {
+      "type": "boolean",
+      "description": ""
+     },
+     "workdir": {
+      "type": "string",
+      "description": ""
+     },
+     "yield_time_ms": {
+      "type": "number",
+      "description": ""
+     }
+    },
+    "required": [
+     "cmd"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "write_stdin",
+   "description": "",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "chars": {
+      "type": "string",
+      "description": ""
+     },
+     "max_output_tokens": {
+      "type": "number",
+      "description": ""
+     },
+     "session_id": {
+      "type": "number",
+      "description": ""
+     },
+     "yield_time_ms": {
+      "type": "number",
+      "description": ""
+     }
+    },
+    "required": [
+     "session_id"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "request_user_input",
+   "description": "",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "questions": {
+      "type": "array",
+      "description": "",
+      "items": {
+       "type": "object",
+       "properties": {
+        "header": {
+         "type": "string",
+         "description": ""
+        },
+        "id": {
+         "type": "string",
+         "description": ""
+        },
+        "options": {
+         "type": "array",
+         "description": "",
+         "items": {
+          "type": "object",
+          "properties": {
+           "description": {
+            "type": "string",
+            "description": ""
+           },
+           "label": {
+            "type": "string",
+            "description": ""
+           }
+          },
+          "required": [
+           "label",
+           "description"
+          ],
+          "additionalProperties": false
+         }
+        },
+        "question": {
+         "type": "string",
+         "description": ""
+        }
+       },
+       "required": [
+        "id",
+        "header",
+        "question",
+        "options"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "questions"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "type": "function",
+   "name": "view_image",
+   "description": "",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": ""
+     }
+    },
+    "required": [
+     "path"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "tool_choice": "auto",
+ "parallel_tool_calls": true,
+ "reasoning": {
+  "summary": "auto"
+ },
+ "store": false,
+ "stream": true,
+ "include": [
+  "reasoning.encrypted_content"
+ ]
+}

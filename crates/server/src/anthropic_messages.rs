@@ -1214,4 +1214,16 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         let (status, answered) = json_body(&run(&follow, &mut session));
         assert_eq!(status, "HTTP/1.1 200 OK", "{answered}");
     }
+    // A recorded Claude Code 2.1.289 --bare request, trimmed (system prompt,
+    // messages and descriptions replaced): no tool_choice, no strict tools and
+    // no output schema, so its turns never take the constrained sampling path.
+    #[test]
+    fn recorded_claude_code_request_loads_no_grammar() {
+        let (_, prepared) = prepare(
+            include_str!("fixtures/client_requests/claude-code-2.1.289-edit.json").as_bytes(),
+        )
+        .unwrap();
+        assert!(prepared.controls.json_schema.is_none());
+        assert_eq!(prepared.tools.len(), 3);
+    }
 }

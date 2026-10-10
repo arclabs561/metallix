@@ -1,0 +1,131 @@
+{
+ "model": "m",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Fix the bug in calc.py."
+  }
+ ],
+ "system": [
+  {
+   "type": "text",
+   "text": "(Claude Code system prompt removed)"
+  }
+ ],
+ "tools": [
+  {
+   "name": "Bash",
+   "description": "",
+   "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "command": {
+      "description": "",
+      "type": "string"
+     },
+     "timeout": {
+      "description": "",
+      "type": "number"
+     },
+     "description": {
+      "description": "",
+      "type": "string"
+     },
+     "dangerouslyDisableSandbox": {
+      "description": "",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Edit",
+   "description": "",
+   "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "description": "",
+      "type": "string"
+     },
+     "old_string": {
+      "description": "",
+      "type": "string"
+     },
+     "new_string": {
+      "description": "",
+      "type": "string"
+     },
+     "replace_all": {
+      "description": "",
+      "default": false,
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "file_path",
+     "old_string",
+     "new_string"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Read",
+   "description": "",
+   "input_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "description": "",
+      "type": "string"
+     },
+     "offset": {
+      "description": "",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+     },
+     "limit": {
+      "description": "",
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+     },
+     "pages": {
+      "description": "",
+      "type": "string"
+     }
+    },
+    "required": [
+     "file_path"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "max_tokens": 256,
+ "thinking": {
+  "type": "adaptive",
+  "display": "updates"
+ },
+ "context_management": {
+  "edits": [
+   {
+    "type": "clear_thinking_20251015",
+    "keep": "all"
+   }
+  ]
+ },
+ "output_config": {
+  "effort": "high"
+ },
+ "stream": true
+}

@@ -1922,4 +1922,38 @@ mod tests {
             }
         }
     }
+    // Recorded Codex 0.160.0 requests, trimmed (instructions, input and
+    // descriptions replaced). A grammar loads only when the controls carry a
+    // JSON schema (chat_generation builds its ConstraintRun from it), so this
+    // decides f, the share of decode tokens on the constrained sampling path.
+    #[test]
+    fn recorded_codex_requests_load_a_grammar_only_with_an_output_schema() {
+        let parse = |text: &str| serde_json::from_str::<Request>(text).unwrap();
+        // Default session: tool_choice "auto", every tool strict false. The
+        // whole request resolves, and its controls carry no schema.
+        let edit = parse(include_str!(
+            "fixtures/client_requests/codex-0.160.0-edit.json"
+        ));
+        assert_eq!(tools(&edit).map(|tools| tools.len()), Ok(4));
+        assert!(messages(&edit).is_ok());
+        assert_eq!(controls(&edit).map(|c| c.json_schema.is_some()), Ok(false));
+        // `codex exec --output-schema` sends text.format json_schema (strict)
+        // together with its tools and reasoning. That combination is refused
+        // today, so even this mode never reaches the constrained path.
+        let recorded = include_str!("fixtures/client_requests/codex-0.160.0-output-schema.json");
+        let schema = parse(recorded);
+        assert!(controls(&schema).is_err());
+        // The same schema without tools and reasoning is what selects it.
+        let mut bare: Value = serde_json::from_str(recorded).unwrap();
+        let object = bare.as_object_mut().unwrap();
+        object.remove("tools");
+        object.remove("reasoning");
+        let resolved =
+            controls(&serde_json::from_value(bare).unwrap()).map(|c| c.json_schema.is_some());
+        if cfg!(feature = "structured-output") {
+            assert_eq!(resolved, Ok(true));
+        } else {
+            assert!(resolved.is_err());
+        }
+    }
 }
