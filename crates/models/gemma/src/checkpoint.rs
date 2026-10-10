@@ -67,7 +67,9 @@ impl Gemma4CheckpointInspection {
                 stored.insert(name, header);
             }
         }
-        let tensors = text_tensors(stored)?;
+        let mut tensors = text_tensors(stored)?;
+        let ignored = ignored_text_tensors(&config);
+        tensors.retain(|name, _| !ignored.contains(name));
         check_layout(&config, &tensors)?;
         Ok(Self {
             config,
@@ -107,7 +109,6 @@ impl Gemma4CheckpointInspection {
 #[must_use]
 pub fn expected_text_tensors(config: &Gemma4TextConfig) -> BTreeMap<String, Vec<usize>> {
     let hidden = config.hidden_size();
-    let intermediate = config.intermediate_size();
     let mut expected = BTreeMap::from([
         (
             "embed_tokens.weight".to_owned(),
@@ -115,10 +116,24 @@ pub fn expected_text_tensors(config: &Gemma4TextConfig) -> BTreeMap<String, Vec<
         ),
         ("norm.weight".to_owned(), vec![hidden]),
     ]);
+    let layers = config.hidden_layers();
+    if let Some(width) = config.per_layer_input_width() {
+        expected.insert(
+            "embed_tokens_per_layer.weight".to_owned(),
+            vec![config.vocab_size(), layers * width],
+        );
+        expected.insert(
+            "per_layer_model_projection.weight".to_owned(),
+            vec![layers * width, hidden],
+        );
+        expected.insert("per_layer_projection_norm.weight".to_owned(), vec![width]);
+    }
     for (layer, &kind) in config.layers().iter().enumerate() {
         let attention = config.attention(kind);
         let query = attention.heads * attention.head_dim;
         let key_value = attention.kv_heads * attention.head_dim;
+        let intermediate = config.mlp_width(layer);
+        let shares_kv = config.kv_source(layer).is_some();
         let base = format!("layers.{layer}");
         let mut add = |name: &str, shape: Vec<usize>| {
             expected.insert(format!("{base}.{name}"), shape);
@@ -136,15 +151,41 @@ pub fn expected_text_tensors(config: &Gemma4TextConfig) -> BTreeMap<String, Vec<
         add("mlp.up_proj.weight", vec![intermediate, hidden]);
         add("mlp.down_proj.weight", vec![hidden, intermediate]);
         add("self_attn.q_proj.weight", vec![query, hidden]);
-        add("self_attn.k_proj.weight", vec![key_value, hidden]);
-        if !attention.value_from_key {
-            add("self_attn.v_proj.weight", vec![key_value, hidden]);
+        if !shares_kv {
+            add("self_attn.k_proj.weight", vec![key_value, hidden]);
+            if !attention.value_from_key {
+                add("self_attn.v_proj.weight", vec![key_value, hidden]);
+            }
+            add("self_attn.k_norm.weight", vec![attention.head_dim]);
         }
         add("self_attn.o_proj.weight", vec![hidden, query]);
         add("self_attn.q_norm.weight", vec![attention.head_dim]);
-        add("self_attn.k_norm.weight", vec![attention.head_dim]);
+        if let Some(width) = config.per_layer_input_width() {
+            add("per_layer_input_gate.weight", vec![width, hidden]);
+            add("per_layer_projection.weight", vec![hidden, width]);
+            add("post_per_layer_input_norm.weight", vec![hidden]);
+        }
     }
     expected
+}
+
+/// Tensors a checkpoint may store that the forward never reads: published
+/// E2B and E4B shards keep K/V projections for the layers that share K/V,
+/// which transformers also drops at load.
+#[must_use]
+pub fn ignored_text_tensors(config: &Gemma4TextConfig) -> BTreeSet<String> {
+    (0..config.hidden_layers())
+        .filter(|&layer| config.kv_source(layer).is_some())
+        .flat_map(|layer| {
+            [
+                "k_proj.weight",
+                "v_proj.weight",
+                "k_norm.weight",
+                "v_norm.weight",
+            ]
+            .map(|name| format!("layers.{layer}.self_attn.{name}"))
+        })
+        .collect()
 }
 
 fn check_layout(

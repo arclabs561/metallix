@@ -1,10 +1,9 @@
 //! Gemma 4 dense text-model contract, checkpoint validation and Metal forward.
 //!
 //! Gemma 4 interleaves sliding-window and full-attention decoder layers. This
-//! crate implements the dense text path shared by `gemma4` (31B) and
-//! `gemma4_unified` (12B) checkpoints and refuses the variants it does not
-//! implement: per-layer input embeddings, K/V shared across layers, and the
-//! mixture-of-experts block (the E2B/E4B and 26B-A4B models).
+//! crate implements the dense text path of the `gemma4` (31B, E2B, E4B) and
+//! `gemma4_unified` (12B) checkpoints and refuses the mixture-of-experts block
+//! (26B-A4B).
 //!
 //! Source: `modeling_gemma4.py` and `modeling_gemma4_unified.py` in
 //! transformers v5.18.0. The numerics that differ from the Qwen3 adapter:
@@ -27,6 +26,14 @@
 //! - A sliding position `q` sees keys `k` with `q - window < k <= q`.
 //! - Final logits are soft-capped: `cap * tanh(logits / cap)`.
 //! - The MLP uses tanh-approximated GELU.
+//! - E2B and E4B add a per-layer input: a table row of `width` per layer and
+//!   token, scaled by `sqrt(width)`, plus `rms_norm(embeds @ P / sqrt(H))`,
+//!   both times `2^-0.5`. Each layer adds
+//!   `norm(proj(gelu_tanh(gate(x)) * input))` after its MLP, before
+//!   `layer_scalar`.
+//! - Their last layers share K/V: such a layer projects only Q and attends over
+//!   the K/V of the last earlier layer of its kind, as that layer saw it in the
+//!   same step. On E2B these layers also use a twice-as-wide MLP.
 //!
 //! # Overview
 //!
@@ -173,6 +180,12 @@ pub struct Gemma4TextConfig {
     layers: Vec<Gemma4LayerKind>,
     sliding: Gemma4Attention,
     full: Gemma4Attention,
+    /// Width of each layer's slice of the per-layer input table (E2B, E4B).
+    per_layer_input: Option<usize>,
+    /// For a layer that shares K/V, the layer whose K/V it attends over.
+    kv_sources: Vec<Option<usize>>,
+    /// K/V-sharing layers use a twice-as-wide MLP (E2B).
+    double_wide_mlp: bool,
 }
 
 impl Gemma4TextConfig {
@@ -185,8 +198,8 @@ impl Gemma4TextConfig {
     /// * [`Gemma4ConfigError::Json`] for malformed JSON.
     /// * [`Gemma4ConfigError::UnexpectedModelType`] for another architecture.
     /// * [`Gemma4ConfigError::Unsupported`] for a Gemma 4 variant this crate
-    ///   does not implement: per-layer input embeddings, K/V shared across
-    ///   layers, the mixture-of-experts block, bidirectional text attention,
+    ///   does not implement: the mixture-of-experts block, a per-layer
+    ///   vocabulary unlike the main one, bidirectional text attention,
     ///   attention bias, another activation, an untied output embedding, or
     ///   scaled or unknown `RoPE`.
     /// * [`Gemma4ConfigError::MissingDimension`],
@@ -218,12 +231,6 @@ impl Gemma4TextConfig {
             "gemma4_text" | "gemma4_unified_text"
         ) {
             return Err(Gemma4ConfigError::UnexpectedModelType(raw.model_type));
-        }
-        if raw.hidden_size_per_layer_input.unwrap_or(0) != 0 {
-            return Err(Gemma4ConfigError::Unsupported("per-layer input embeddings"));
-        }
-        if raw.num_kv_shared_layers != 0 {
-            return Err(Gemma4ConfigError::Unsupported("K/V shared across layers"));
         }
         if raw.enable_moe_block {
             return Err(Gemma4ConfigError::Unsupported("mixture-of-experts block"));
@@ -286,6 +293,20 @@ impl Gemma4TextConfig {
         if layers.len() != raw.num_hidden_layers || layers.last() != Some(&Gemma4LayerKind::Full) {
             return Err(Gemma4ConfigError::InvalidLayerTypes);
         }
+        let kv_sources = kv_sources(&layers, raw.num_kv_shared_layers)?;
+        let per_layer_input = match raw.hidden_size_per_layer_input.unwrap_or(0) {
+            0 => None,
+            width => {
+                // Token IDs index both tables; a different per-layer
+                // vocabulary would need its own bounds check.
+                if raw.vocab_size_per_layer_input.unwrap_or(raw.vocab_size) != raw.vocab_size {
+                    return Err(Gemma4ConfigError::Unsupported(
+                        "per-layer vocabulary unlike the main vocabulary",
+                    ));
+                }
+                Some(width)
+            }
+        };
 
         let rope = raw
             .rope_parameters
@@ -335,6 +356,9 @@ impl Gemma4TextConfig {
             layers,
             sliding,
             full,
+            per_layer_input,
+            kv_sources,
+            double_wide_mlp: raw.use_double_wide_mlp,
         })
     }
 
@@ -401,6 +425,37 @@ impl Gemma4TextConfig {
         }
     }
 
+    /// Width of each layer's per-layer input, when the checkpoint has the
+    /// per-layer input table (E2B, E4B).
+    #[must_use]
+    pub const fn per_layer_input_width(&self) -> Option<usize> {
+        self.per_layer_input
+    }
+
+    /// The earlier layer whose K/V `layer` attends over, when `layer` keeps
+    /// none of its own.
+    #[must_use]
+    pub fn kv_source(&self, layer: usize) -> Option<usize> {
+        self.kv_sources.get(layer).copied().flatten()
+    }
+
+    /// Whether a later layer attends over `layer`'s K/V.
+    #[must_use]
+    pub fn is_kv_source(&self, layer: usize) -> bool {
+        self.kv_sources.contains(&Some(layer))
+    }
+
+    /// MLP inner width of `layer`: doubled in K/V-sharing layers when the
+    /// checkpoint asks for a double-wide MLP.
+    #[must_use]
+    pub fn mlp_width(&self, layer: usize) -> usize {
+        if self.double_wide_mlp && self.kv_source(layer).is_some() {
+            2 * self.intermediate_size
+        } else {
+            self.intermediate_size
+        }
+    }
+
     /// The embedding multiplier before rounding to the weight dtype.
     #[must_use]
     pub fn embed_scale(&self) -> f32 {
@@ -412,12 +467,15 @@ impl Gemma4TextConfig {
     }
 
     /// K/V elements retained after `tokens` positions: sliding layers keep at
-    /// most `sliding_window - 1` earlier positions, full layers keep all.
+    /// most `sliding_window - 1` earlier positions, full layers keep all, and
+    /// K/V-sharing layers keep none.
     #[must_use]
     pub fn retained_kv_elements(&self, tokens: usize) -> u128 {
         self.layers
             .iter()
-            .map(|&kind| {
+            .enumerate()
+            .filter(|&(layer, _)| self.kv_source(layer).is_none())
+            .map(|(_, &kind)| {
                 let attention = self.attention(kind);
                 let positions = match kind {
                     Gemma4LayerKind::Sliding => tokens.min(self.sliding_window - 1),
@@ -427,6 +485,34 @@ impl Gemma4TextConfig {
             })
             .sum()
     }
+}
+
+/// The source layer of each K/V-sharing layer: the last layer of the same
+/// kind before the first sharing layer, as transformers' `store_full_length_kv`
+/// selects it.
+fn kv_sources(
+    layers: &[Gemma4LayerKind],
+    shared: usize,
+) -> Result<Vec<Option<usize>>, Gemma4ConfigError> {
+    let first_shared = layers
+        .len()
+        .checked_sub(shared)
+        .filter(|&first| first > 0 || shared == 0)
+        .ok_or(Gemma4ConfigError::InvalidValue("num_kv_shared_layers"))?;
+    layers
+        .iter()
+        .enumerate()
+        .map(|(layer, &kind)| {
+            if layer < first_shared {
+                return Ok(None);
+            }
+            layers[..first_shared]
+                .iter()
+                .rposition(|&earlier| earlier == kind)
+                .map(Some)
+                .ok_or(Gemma4ConfigError::InvalidLayerTypes)
+        })
+        .collect()
 }
 
 /// Stop and suppressed tokens from a checkpoint's `generation_config.json`.
@@ -526,6 +612,9 @@ struct RawTextConfig {
     #[serde(default)]
     tie_word_embeddings: bool,
     hidden_size_per_layer_input: Option<usize>,
+    vocab_size_per_layer_input: Option<usize>,
+    #[serde(default)]
+    use_double_wide_mlp: bool,
     #[serde(default)]
     num_kv_shared_layers: usize,
     #[serde(default)]
@@ -716,29 +805,73 @@ mod tests {
 
     #[test]
     fn refuses_variants_without_a_dense_text_path() {
-        for (from, to, expected) in [
-            (
-                r#""hidden_size_per_layer_input": 0"#,
-                r#""hidden_size_per_layer_input": 256"#,
-                "per-layer input embeddings",
-            ),
-            (
-                r#""num_kv_shared_layers": 0"#,
-                r#""num_kv_shared_layers": 18"#,
-                "K/V shared across layers",
-            ),
-            (
-                r#""enable_moe_block": false"#,
-                r#""enable_moe_block": true"#,
-                "mixture-of-experts block",
-            ),
-        ] {
-            let config = GEMMA4_12B_CONFIG.replace(from, to);
-            match Gemma4TextConfig::parse(&config) {
-                Err(Gemma4ConfigError::Unsupported(what)) => assert_eq!(what, expected),
-                other => panic!("expected {expected} to be refused, got {other:?}"),
-            }
-        }
+        let moe = GEMMA4_12B_CONFIG.replace(
+            r#""enable_moe_block": false"#,
+            r#""enable_moe_block": true"#,
+        );
+        assert!(matches!(
+            Gemma4TextConfig::parse(&moe),
+            Err(Gemma4ConfigError::Unsupported("mixture-of-experts block"))
+        ));
+        // Sharing every one of the 12 layers leaves no layer to share from.
+        let all_shared = GEMMA4_12B_CONFIG.replace(
+            r#""num_kv_shared_layers": 0"#,
+            r#""num_kv_shared_layers": 12"#,
+        );
+        assert!(matches!(
+            Gemma4TextConfig::parse(&all_shared),
+            Err(Gemma4ConfigError::InvalidValue("num_kv_shared_layers"))
+        ));
+    }
+
+    /// google/gemma-4-E2B-it@3e22461's text layout: 35 layers, every fifth
+    /// full, the last 20 sharing K/V, a 256-wide per-layer input.
+    fn gemma4_e2b() -> Gemma4TextConfig {
+        let layer_types: Vec<&str> = (0..35)
+            .map(|layer| {
+                if layer % 5 == 4 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect();
+        let config = serde_json::json!({
+            "model_type": "gemma4_text", "attention_k_eq_v": false,
+            "final_logit_softcapping": 30.0, "global_head_dim": 512, "head_dim": 256,
+            "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 1536,
+            "hidden_size_per_layer_input": 256, "intermediate_size": 6144,
+            "layer_types": layer_types, "max_position_embeddings": 131_072,
+            "num_attention_heads": 8, "num_hidden_layers": 35, "num_key_value_heads": 1,
+            "num_kv_shared_layers": 20, "rms_norm_eps": 1e-6,
+            "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1_000_000.0, "rope_type": "proportional"},
+                "sliding_attention": {"rope_theta": 10_000.0, "rope_type": "default"}
+            },
+            "sliding_window": 512, "tie_word_embeddings": true, "use_double_wide_mlp": true,
+            "vocab_size": 262_144, "vocab_size_per_layer_input": 262_144
+        });
+        Gemma4TextConfig::parse(&config.to_string()).expect("E2B layout")
+    }
+
+    #[test]
+    fn shared_layers_attend_over_the_last_earlier_layer_of_their_kind() {
+        let config = gemma4_e2b();
+        assert_eq!(config.per_layer_input_width(), Some(256));
+        // Layers 0-14 keep their own K/V; 13 is the last sliding layer and 14
+        // the last full layer before sharing starts at 15.
+        assert!((0..15).all(|layer| config.kv_source(layer).is_none()));
+        assert_eq!(config.kv_source(15), Some(13));
+        assert_eq!(config.kv_source(19), Some(14));
+        assert_eq!(config.kv_source(34), Some(14));
+        assert_eq!(config.kv_source(33), Some(13));
+        assert_eq!((config.mlp_width(14), config.mlp_width(15)), (6144, 12_288));
+        // 12 sliding layers of 1x256 K and V up to the window, 3 full layers of
+        // 1x512; the 20 sharing layers keep nothing.
+        assert_eq!(
+            config.retained_kv_elements(4096),
+            12 * 2 * 256 * 511 + 3 * 2 * 512 * 4096
+        );
     }
 
     #[test]

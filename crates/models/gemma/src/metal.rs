@@ -43,6 +43,9 @@ pub struct Gemma4MlxWeights {
     precision: Gemma4Precision,
     /// `sqrt(hidden_size)` rounded to the compute dtype, as the source does.
     pub(crate) embed_scale: Array,
+    /// `sqrt(per-layer input width)` rounded the same way; 1 without the
+    /// per-layer input table.
+    pub(crate) per_layer_embed_scale: Array,
     /// Unit weights for the V norm, which has no stored scale.
     pub(crate) sliding_value_norm: Array,
     pub(crate) full_value_norm: Array,
@@ -129,6 +132,16 @@ impl Gemma4MlxWeights {
         let gpu = StreamOrDevice::gpu();
         let dtype = precision.dtype();
         let embed_scale = Array::from_f32(config.embed_scale()).as_dtype_device(dtype, &gpu)?;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "per-layer widths are far below f32's exact-integer range"
+        )]
+        let per_layer_embed_scale = Array::from_f32(
+            config
+                .per_layer_input_width()
+                .map_or(1.0, |width| (width as f32).sqrt()),
+        )
+        .as_dtype_device(dtype, &gpu)?;
         let unit = |kind| -> Result<Array, Gemma4LoadError> {
             let head_dim = i32::try_from(config.attention(kind).head_dim)
                 .map_err(|_| Gemma4LoadError::TensorLayout("head_dim".into()))?;
@@ -148,6 +161,7 @@ impl Gemma4MlxWeights {
             tensors,
             precision,
             embed_scale,
+            per_layer_embed_scale,
         };
         // Force the embedding through a GPU graph so a bad payload fails at
         // load rather than on the first request.

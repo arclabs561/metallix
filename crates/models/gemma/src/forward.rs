@@ -27,6 +27,15 @@ struct LayerKv {
     start: usize,
 }
 
+/// Where a layer's attention gets its K/V.
+enum LayerKvAccess<'c> {
+    /// The layer projects K/V and keeps them in its own cache.
+    Own(&'c mut Option<LayerKv>),
+    /// The layer shares the K/V its source layer attended over in this
+    /// step, before that layer trimmed its window.
+    Shared(&'c LayerKv),
+}
+
 /// A Gemma 4 decoder sequence bound to one set of loaded weights.
 pub struct Gemma4Executor<'a> {
     weights: &'a Gemma4MlxWeights,
@@ -178,23 +187,48 @@ impl<'a> Gemma4Executor<'a> {
         let length = as_i32(input_ids.len())?;
         let hidden = as_i32(config.hidden_size())?;
         let embedding = weights.tensor("embed_tokens.weight")?;
+        let ids = Array::from_slice(input_ids, &[length]);
         let mut hidden_states = embedding
-            .take_axis_device(Array::from_slice(input_ids, &[length]), 0, &stream)?
+            .take_axis_device(&ids, 0, &stream)?
             .reshape_device(&[1, length, hidden], &stream)?
             .multiply_device(&weights.embed_scale, &stream)?;
+        let per_layer_inputs = match config.per_layer_input_width() {
+            Some(width) => Some(per_layer_inputs(weights, &ids, &hidden_states, width)?),
+            None => None,
+        };
+        // The untrimmed K/V of each layer some later layer shares, this step.
+        let mut step_kv: Vec<Option<LayerKv>> = config.layers().iter().map(|_| None).collect();
         for (layer, &kind) in config.layers().iter().enumerate() {
-            let cache = self
-                .cache
-                .get_mut(layer)
-                .ok_or(Gemma4ForwardError::CacheInconsistent)?;
-            hidden_states = decoder_layer(
+            let access = match config.kv_source(layer) {
+                Some(source) => LayerKvAccess::Shared(
+                    step_kv
+                        .get(source)
+                        .and_then(Option::as_ref)
+                        .ok_or(Gemma4ForwardError::CacheInconsistent)?,
+                ),
+                None => LayerKvAccess::Own(
+                    self.cache
+                        .get_mut(layer)
+                        .ok_or(Gemma4ForwardError::CacheInconsistent)?,
+                ),
+            };
+            let per_layer_input = match &per_layer_inputs {
+                Some(inputs) => Some(inputs.index_device((.., .., as_i32(layer)?, ..), &stream)),
+                None => None,
+            };
+            let (next, attended) = decoder_layer(
                 weights,
                 layer,
                 kind,
-                cache,
+                access,
                 &hidden_states,
+                per_layer_input.as_ref(),
                 self.cached_tokens,
             )?;
+            hidden_states = next;
+            if config.is_kv_source(layer) {
+                step_kv[layer] = attended;
+            }
         }
         self.cached_tokens += input_ids.len();
 
@@ -213,14 +247,17 @@ impl<'a> Gemma4Executor<'a> {
     }
 }
 
+/// Returns the layer output and, for a layer with its own K/V, the
+/// untrimmed K/V it attended over.
 fn decoder_layer(
     weights: &Gemma4MlxWeights,
     layer: usize,
     kind: Gemma4LayerKind,
-    cache: &mut Option<LayerKv>,
+    kv: LayerKvAccess<'_>,
     hidden_states: &Array,
+    per_layer_input: Option<&Array>,
     position: usize,
-) -> Result<Array, Gemma4ForwardError> {
+) -> Result<(Array, Option<LayerKv>), Gemma4ForwardError> {
     let stream = StreamOrDevice::gpu();
     let eps = weights.config().rms_norm_eps();
     let base = format!("layers.{layer}");
@@ -233,7 +270,7 @@ fn decoder_layer(
     };
 
     let attention_input = norm("input_layernorm", hidden_states)?;
-    let attention = attention(weights, &base, kind, cache, &attention_input, position)?;
+    let (attention, attended) = attention(weights, &base, kind, kv, &attention_input, position)?;
     let residual =
         hidden_states.add_device(norm("post_attention_layernorm", &attention)?, &stream)?;
 
@@ -250,82 +287,106 @@ fn decoder_layer(
         &gelu_tanh(&gate)?.multiply_device(&up, &stream)?,
         weights.tensor(&format!("{base}.mlp.down_proj.weight"))?,
     )?;
-    let output = residual.add_device(norm("post_feedforward_layernorm", &mlp)?, &stream)?;
+    let mut output = residual.add_device(norm("post_feedforward_layernorm", &mlp)?, &stream)?;
+    if let Some(per_layer_input) = per_layer_input {
+        // gelu(gate(x)) * per-layer input, projected back and normed, added
+        // before the layer scalar.
+        let gated = gelu_tanh(&linear(
+            &output,
+            weights.tensor(&format!("{base}.per_layer_input_gate.weight"))?,
+        )?)?
+        .multiply_device(per_layer_input, &stream)?;
+        let projected = linear(
+            &gated,
+            weights.tensor(&format!("{base}.per_layer_projection.weight"))?,
+        )?;
+        output = output.add_device(norm("post_per_layer_input_norm", &projected)?, &stream)?;
+    }
     // The source scales the whole layer output, residual included.
-    output
-        .multiply_device(weights.tensor(&format!("{base}.layer_scalar"))?, &stream)
-        .map_err(Into::into)
+    let output =
+        output.multiply_device(weights.tensor(&format!("{base}.layer_scalar"))?, &stream)?;
+    Ok((output, attended))
+}
+
+/// `(rms_norm((embeds @ P) / sqrt(H)) + table[ids] * sqrt(width)) / sqrt(2)`
+/// as `[1, n, layers, width]`: the per-layer inputs of every layer at once.
+fn per_layer_inputs(
+    weights: &Gemma4MlxWeights,
+    ids: &Array,
+    embeds: &Array,
+    width: usize,
+) -> Result<Array, Gemma4ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let config = weights.config();
+    let length = ids.shape()[0];
+    let shape = [1, length, as_i32(config.hidden_layers())?, as_i32(width)?];
+    let dtype = embeds.dtype();
+    let scalar = |value: f32| Array::from_f32(value).as_dtype_device(dtype, &stream);
+    let token = weights
+        .tensor("embed_tokens_per_layer.weight")?
+        .take_axis_device(ids, 0, &stream)?
+        .reshape_device(&shape, &stream)?
+        .multiply_device(&weights.per_layer_embed_scale, &stream)?;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "hidden sizes are far below f32's exact-integer range"
+    )]
+    let projection_scale = (config.hidden_size() as f32).sqrt().recip();
+    let context = linear(embeds, weights.tensor("per_layer_model_projection.weight")?)?
+        .multiply_device(scalar(projection_scale)?, &stream)?
+        .reshape_device(&shape, &stream)?;
+    let context = rms_norm(
+        &context,
+        weights.tensor("per_layer_projection_norm.weight")?,
+        config.rms_norm_eps(),
+    )?;
+    Ok(context
+        .add_device(&token, &stream)?
+        .multiply_device(scalar(std::f32::consts::FRAC_1_SQRT_2)?, &stream)?)
 }
 
 fn attention(
     weights: &Gemma4MlxWeights,
     base: &str,
     kind: Gemma4LayerKind,
-    cache: &mut Option<LayerKv>,
+    kv: LayerKvAccess<'_>,
     input: &Array,
     position: usize,
-) -> Result<Array, Gemma4ForwardError> {
+) -> Result<(Array, Option<LayerKv>), Gemma4ForwardError> {
     let stream = StreamOrDevice::gpu();
     let config = weights.config();
     let geometry = config.attention(kind);
-    let eps = config.rms_norm_eps();
     let length = input.shape()[1];
     let heads = as_i32(geometry.heads)?;
-    let kv_heads = as_i32(geometry.kv_heads)?;
     let head_dim = as_i32(geometry.head_dim)?;
-    let offset = as_i32(position)?;
     let attn = format!("{base}.self_attn");
-    let (wavelengths, value_norm) = match kind {
-        Gemma4LayerKind::Sliding => (&weights.sliding_wavelengths, &weights.sliding_value_norm),
-        Gemma4LayerKind::Full => (&weights.full_wavelengths, &weights.full_value_norm),
-    };
-    let rope = |input: &Array| -> Result<Array, Gemma4ForwardError> {
-        let base = match geometry.rope {
-            crate::Gemma4Rope::Default { theta } => Some(theta),
-            crate::Gemma4Rope::Proportional { .. } => None,
-        };
-        Ok(fast::rope_device(
-            input,
-            head_dim,
-            false,
-            base,
-            1.0,
-            offset,
-            wavelengths.as_ref(),
-            &stream,
-        )?)
-    };
 
     let query = linear(input, weights.tensor(&format!("{attn}.q_proj.weight"))?)?
         .reshape_device(&[1, length, heads, head_dim], &stream)?;
     let query = rope(
+        weights,
+        kind,
         &rms_norm(
             &query,
             weights.tensor(&format!("{attn}.q_norm.weight"))?,
-            eps,
+            config.rms_norm_eps(),
         )?
         .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
+        position,
     )?;
-    let raw_key = linear(input, weights.tensor(&format!("{attn}.k_proj.weight"))?)?
-        .reshape_device(&[1, length, kv_heads, head_dim], &stream)?;
-    let raw_value = if geometry.value_from_key {
-        raw_key.clone()
-    } else {
-        linear(input, weights.tensor(&format!("{attn}.v_proj.weight"))?)?
-            .reshape_device(&[1, length, kv_heads, head_dim], &stream)?
+    let (keys, values, start, cache) = match kv {
+        LayerKvAccess::Shared(shared) => (
+            shared.keys.clone(),
+            shared.values.clone(),
+            shared.start,
+            None,
+        ),
+        LayerKvAccess::Own(cache) => {
+            let (key, value) = project_kv(weights, &attn, kind, input, position)?;
+            let (keys, values, start) = append(cache.take(), key, value, position, &stream)?;
+            (keys, values, start, Some(cache))
+        }
     };
-    let key = rope(
-        &rms_norm(
-            &raw_key,
-            weights.tensor(&format!("{attn}.k_norm.weight"))?,
-            eps,
-        )?
-        .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
-    )?;
-    let value =
-        rms_norm(&raw_value, value_norm, eps)?.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
-
-    let (keys, values, start) = append(cache.take(), key, value, position, &stream)?;
     let window = match kind {
         Gemma4LayerKind::Sliding => Some(config.sliding_window()),
         Gemma4LayerKind::Full => None,
@@ -353,15 +414,105 @@ fn attention(
         &stream,
     )?;
 
-    *cache = Some(retain(
-        keys,
-        values,
-        start,
-        position + usize::try_from(length).map_err(|_| Gemma4ForwardError::ShapeOverflow)?,
-        window,
-        &stream,
-    )?);
-    linear(&output, weights.tensor(&format!("{attn}.o_proj.weight"))?)
+    let attended = match cache {
+        Some(cache) => {
+            let attended = LayerKv {
+                keys: keys.clone(),
+                values: values.clone(),
+                start,
+            };
+            *cache = Some(retain(
+                keys,
+                values,
+                start,
+                position
+                    + usize::try_from(length).map_err(|_| Gemma4ForwardError::ShapeOverflow)?,
+                window,
+                &stream,
+            )?);
+            Some(attended)
+        }
+        None => None,
+    };
+    Ok((
+        linear(&output, weights.tensor(&format!("{attn}.o_proj.weight"))?)?,
+        attended,
+    ))
+}
+
+/// Rotates `[1, heads, n, head_dim]` rows at absolute positions from
+/// `position` with the layer kind's `RoPE`.
+fn rope(
+    weights: &Gemma4MlxWeights,
+    kind: Gemma4LayerKind,
+    input: &Array,
+    position: usize,
+) -> Result<Array, Gemma4ForwardError> {
+    let geometry = weights.config().attention(kind);
+    let base = match geometry.rope {
+        crate::Gemma4Rope::Default { theta } => Some(theta),
+        crate::Gemma4Rope::Proportional { .. } => None,
+    };
+    let wavelengths = match kind {
+        Gemma4LayerKind::Sliding => &weights.sliding_wavelengths,
+        Gemma4LayerKind::Full => &weights.full_wavelengths,
+    };
+    Ok(fast::rope_device(
+        input,
+        as_i32(geometry.head_dim)?,
+        false,
+        base,
+        1.0,
+        as_i32(position)?,
+        wavelengths.as_ref(),
+        StreamOrDevice::gpu(),
+    )?)
+}
+
+/// This chunk's rotated, normed K and normed V, `[1, kv_heads, n, head_dim]`.
+fn project_kv(
+    weights: &Gemma4MlxWeights,
+    attn: &str,
+    kind: Gemma4LayerKind,
+    input: &Array,
+    position: usize,
+) -> Result<(Array, Array), Gemma4ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let config = weights.config();
+    let geometry = config.attention(kind);
+    let eps = config.rms_norm_eps();
+    let shape = [
+        1,
+        input.shape()[1],
+        as_i32(geometry.kv_heads)?,
+        as_i32(geometry.head_dim)?,
+    ];
+    let value_norm = match kind {
+        Gemma4LayerKind::Sliding => &weights.sliding_value_norm,
+        Gemma4LayerKind::Full => &weights.full_value_norm,
+    };
+    let raw_key = linear(input, weights.tensor(&format!("{attn}.k_proj.weight"))?)?
+        .reshape_device(&shape, &stream)?;
+    let raw_value = if geometry.value_from_key {
+        raw_key.clone()
+    } else {
+        linear(input, weights.tensor(&format!("{attn}.v_proj.weight"))?)?
+            .reshape_device(&shape, &stream)?
+    };
+    let key = rope(
+        weights,
+        kind,
+        &rms_norm(
+            &raw_key,
+            weights.tensor(&format!("{attn}.k_norm.weight"))?,
+            eps,
+        )?
+        .transpose_axes_device(&[0, 2, 1, 3], &stream)?,
+        position,
+    )?;
+    let value =
+        rms_norm(&raw_value, value_norm, eps)?.transpose_axes_device(&[0, 2, 1, 3], &stream)?;
+    Ok((key, value))
 }
 
 /// The layer's K/V with this chunk's rows appended, and the absolute
