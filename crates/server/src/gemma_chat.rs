@@ -268,6 +268,45 @@ mod tests {
         );
     }
 
+    /// One process serves the 12B and then E2B under E2B's 24 GiB cap. The
+    /// 12B's weights stay in MLX's cache after its session drops (about
+    /// 22 GB), which once aborted E2B's run at 29.3 GB; the cap must count
+    /// only what E2B holds.
+    #[test]
+    #[ignore = "requires METALLIX_GEMMA4_MODEL and METALLIX_GEMMA4_E2B_MODEL on Apple-Silicon Metal"]
+    fn real_gemma4_two_models_back_to_back_stay_under_the_later_cap() {
+        let _serial = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":16});
+        {
+            let _cap = GpuCap::start(40);
+            let mut session = real_session();
+            let (status, _) = json_body(&chat_completion(&body, &mut session));
+            assert_eq!(status, "HTTP/1.1 200 OK");
+        }
+        let cached = crate::gpu::held_bytes().expect("MLX memory");
+        // The condition this test exists for: the dropped 12B is still cached.
+        assert!(
+            cached > 8 << 30,
+            "MLX held only {cached} bytes after the 12B"
+        );
+        let _cap = GpuCap::start(24);
+        let model =
+            std::env::var_os("METALLIX_GEMMA4_E2B_MODEL").expect("set METALLIX_GEMMA4_E2B_MODEL");
+        let mut session = ChatDecoderSession::<GemmaDecoder>::load(
+            std::path::Path::new(&model),
+            ResidentChatLimits::from_mib(16_384, 1_024),
+        )
+        .expect("load local Gemma 4 E2B checkpoint");
+        let (status, plain) = json_body(&chat_completion(&body, &mut session));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{plain}");
+        eprintln!(
+            "12B left {cached} bytes in MLX before E2B; E2B then held {:?} bytes",
+            crate::gpu::held_bytes()
+        );
+    }
+
     /// google/gemma-4-E2B-it named by `METALLIX_GEMMA4_E2B_MODEL`: per-layer
     /// inputs, shared K/V and the template without an empty thought pre-fill,
     /// served end to end (about 9 GiB of bf16 text weights).

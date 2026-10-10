@@ -421,10 +421,15 @@ pub(crate) mod test_support {
     /// `cap_gib` (`METALLIX_GPU_CAP_GIB` overrides it), checked every 200 ms;
     /// stops checking when dropped. MLX Metal buffers can grow far past the
     /// process's resident size, so RSS alone does not show a leak.
+    ///
+    /// Starting it first returns MLX's cache to Metal: an earlier test in the
+    /// same process leaves its dropped model's buffers cached, which would
+    /// otherwise count against this test's cap.
     pub(crate) struct GpuCap(Arc<AtomicBool>);
 
     impl GpuCap {
         pub(crate) fn start(cap_gib: u64) -> Self {
+            crate::gpu::clear_cache();
             let cap_gib: u64 = std::env::var("METALLIX_GPU_CAP_GIB")
                 .ok()
                 .and_then(|value| value.parse().ok())

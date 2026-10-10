@@ -123,6 +123,14 @@ pub(crate) fn held_bytes() -> Option<u64> {
     (status == 0).then_some(active as u64 + cache as u64)
 }
 
+/// Returns MLX's cached buffers to Metal, so a later [`held_bytes`] counts
+/// only what is in use or cached since.
+#[cfg(test)]
+pub(crate) fn clear_cache() {
+    // SAFETY: takes no arguments.
+    let _ = unsafe { sys::mlx_clear_cache() };
+}
+
 /// Starts a new peak-memory window, so the next [`Memory::read`] reports the
 /// peak since this call. The peak is process-wide; `mx serve` runs one model
 /// per child process and one request per model, so a window is one request.
