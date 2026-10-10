@@ -1802,6 +1802,116 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// A stopped child is replaced: the request queued behind the stalled
+    /// one starts a second child through the launcher, which answers it. The
+    /// launcher is a script that records each spawn and announces the next
+    /// of two in-process stand-ins.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_child_is_replaced_for_the_queued_request() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+        let healthy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = std::env::temp_dir().join(format!("mx-launcher-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("spawns"));
+        std::fs::write(
+            dir.join("ports"),
+            format!(
+                "{}\n{}\n",
+                stalled.local_addr().unwrap().port(),
+                healthy.local_addr().unwrap().port()
+            ),
+        )
+        .unwrap();
+        let script = dir.join("launch.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             dir=$(dirname \"$0\")\n\
+             echo spawn >> \"$dir/spawns\"\n\
+             n=$(($(wc -l < \"$dir/spawns\")))\n\
+             port=$(sed -n \"${n}p\" \"$dir/ports\")\n\
+             echo \"mx listening on http://127.0.0.1:$port; models=1\" >&2\n\
+             exec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (stalled_tx, stalled_seen) = channel();
+        let (done_tx, done) = channel::<()>();
+        let first_child = thread::spawn(move || {
+            let (mut socket, _) = stalled.accept().unwrap();
+            let _ = socket.read(&mut [0_u8; 4096]).unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            stalled_tx.send(()).unwrap();
+            // Never closes and never reads again, until the test ends.
+            done.recv_timeout(Duration::from_secs(10)).unwrap();
+            stalled.set_nonblocking(true).unwrap();
+            assert_eq!(
+                stalled.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "a request reached the stopped child"
+            );
+        });
+        let second_child = thread::spawn(move || {
+            let (socket, _) = healthy.accept().unwrap();
+            let mut connection = Connection::accept(socket, TransportLimits::default());
+            let request = connection.read_request().unwrap();
+            assert_eq!(json(&request.body)["input"], "second");
+            json_response(connection, 200, &json!({"input": "second"}));
+        });
+        let pool = Arc::new(Pool {
+            models: vec![queued_model(
+                "m",
+                ModelKind::Qwen,
+                None,
+                QueueSettings::default(),
+            )],
+            launcher: Some(Launcher {
+                executable: script,
+                settings: ChildSettings {
+                    context_tokens: 4096,
+                    kv_budget_mib: 64,
+                    prefix_cache_mib: 0,
+                    max_num_seqs: 1,
+                    prefill_chunk_tokens: 2048,
+                    prefill_target_ms: 0,
+                    generation_timeout_ms: 1000,
+                    trace_out: None,
+                    gpu_capture: None,
+                },
+            }),
+            budget_mib: None,
+            residency: Mutex::new(()),
+        });
+        let limits = TransportLimits {
+            response_deadline: Duration::from_millis(200),
+            ..TransportLimits::default()
+        };
+        let (address, server) = proxy_with(&pool, 2, limits);
+        let first = send(address, "first");
+        stalled_seen.recv_timeout(Duration::from_secs(10)).unwrap();
+        let second = send(address, "second");
+        until_waiting(&pool.models[0], 1);
+        assert_eq!(finish(first).0, 504);
+        let (status, _, body) = finish(second);
+        assert_eq!((status, body), (200, json!({"input": "second"})));
+        let spawns = std::fs::read_to_string(dir.join("spawns")).unwrap();
+        assert_eq!(
+            spawns.lines().count(),
+            2,
+            "the second request did not respawn"
+        );
+        done_tx.send(()).unwrap();
+        first_child.join().unwrap();
+        second_child.join().unwrap();
+        server.join().unwrap();
+        drop(pool);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn forwards_a_trace_context_and_request_id_to_the_child() {
         const INCOMING: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
