@@ -7,6 +7,7 @@ members = [
     "crates/core/diffusion",
     "crates/core/engine",
     "crates/core/media",
+    "crates/metal/layers",
     "crates/metal/mlx-kernels",
     "crates/models/deepseek",
     "crates/models/flux2",
