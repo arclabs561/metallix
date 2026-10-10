@@ -1848,6 +1848,7 @@ dependencies = [
  "clap",
  "deepseek",
  "engine",
+ "flux2",
  "gemma",
  "httparse",
  "jsonschema",

@@ -75,6 +75,8 @@ mod engine_loop;
 mod generation_routes;
 #[cfg(feature = "metal")]
 mod http_transport;
+#[cfg(feature = "metal")]
+mod image_cli;
 mod inspect;
 #[cfg(feature = "metal")]
 mod julia_decisions;
@@ -311,6 +313,10 @@ fn dispatch(cli: Cli) -> ExitCode {
         Command::Decide(args) => args.run(),
         #[cfg(feature = "metal")]
         Command::DecideJulia(args) => args.run(),
+        #[cfg(feature = "metal")]
+        Command::Image {
+            command: cli::ImageCommand::Generate(args),
+        } => args.run(),
         Command::Fetch {
             command:
                 FetchCommand::Deepseek {

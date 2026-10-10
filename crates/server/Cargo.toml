@@ -16,7 +16,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["dep:audio", "dep:qwen3-asr", "qwen3-asr/metal", "qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook", "dep:png"]
+metal = ["dep:audio", "dep:qwen3-asr", "qwen3-asr/metal", "qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook", "dep:flux2", "flux2/metal", "dep:png"]
 structured-output = ["dep:engine", "engine/structured-output"]
 # Chrome/Perfetto JSON timeline behind `--trace-out`.
 timeline = ["dep:tracing-chrome"]
@@ -34,6 +34,7 @@ julia = { path = "../models/julia" }
 gemma = { path = "../models/gemma", optional = true }
 qwen35 = { path = "../models/qwen35", optional = true }
 qwen = { path = "../models/qwen" }
+flux2 = { path = "../models/flux2", optional = true }
 chat-format = { path = "../chat-format", optional = true }
 engine = { path = "../engine", optional = true }
 rand_chacha = { workspace = true, optional = true }
@@ -45,7 +46,7 @@ rustix = { version = "=1.1.4", features = ["fs"], optional = true }
 # Stops `mx serve` on SIGTERM/SIGINT with its telemetry written.
 signal-hook = { version = "=0.4.4", default-features = false, features = ["iterator"], optional = true }
 mlx-rs = { workspace = true, optional = true }
-# PNG output for .
+# PNG output for `mx image generate`.
 png = { version = "=0.18.1", optional = true }
 mlx-sys = { version = "=0.6.0", optional = true }
 tracing.workspace = true

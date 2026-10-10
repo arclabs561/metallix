@@ -125,6 +125,12 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: FetchCommand,
     },
+    /// Generate images with a local FLUX.2 [klein] checkpoint.
+    #[cfg(feature = "metal")]
+    Image {
+        #[command(subcommand)]
+        command: ImageCommand,
+    },
     /// Inspect local model and checkpoint artifacts without loading weights.
     Inspect {
         #[command(subcommand)]
@@ -537,6 +543,14 @@ pub(crate) enum Command {
         #[arg(long)]
         input_shard: Option<PathBuf>,
     },
+}
+
+/// `mx image` subcommands.
+#[cfg(feature = "metal")]
+#[derive(Debug, Subcommand)]
+pub(crate) enum ImageCommand {
+    /// Write one text-to-image PNG; see `mx image generate --help`.
+    Generate(crate::image_cli::ImageGenerateArgs),
 }
 
 #[derive(Debug, Subcommand)]
