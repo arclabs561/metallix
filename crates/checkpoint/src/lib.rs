@@ -11,6 +11,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 
+pub mod expert;
 pub mod gguf;
 mod nocache;
 
