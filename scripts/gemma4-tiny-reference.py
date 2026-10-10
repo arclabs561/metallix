@@ -119,7 +119,10 @@ def randomize(model: torch.nn.Module, seed: int) -> None:
                 )
 
 
-def capture(model: torch.nn.Module, input_ids: list[int]) -> list[dict[str, Any]]:
+def capture(
+    model: torch.nn.Module, input_ids: list[int], forced: list[int] | None = None
+) -> list[dict[str, Any]]:
+    """Prefill and greedy decode; `forced` feeds another run's decode tokens."""
     cache = transformers.DynamicCache(config=model.config)
     steps = []
     with torch.inference_mode():
@@ -127,17 +130,42 @@ def capture(model: torch.nn.Module, input_ids: list[int]) -> list[dict[str, Any]
             input_ids=torch.tensor([input_ids]), past_key_values=cache, use_cache=True
         )
         logits = output.logits[0, -1]
-        steps.append({"input_ids": input_ids, "logits": f32_list(logits)})
-        for _ in range(DECODE_STEPS):
-            token = int(torch.argmax(logits))
+        steps.append({"input_ids": input_ids, "logits": logits.clone()})
+        for step in range(DECODE_STEPS):
+            token = forced[step] if forced else int(torch.argmax(logits))
             output = model(
                 input_ids=torch.tensor([[token]]),
                 past_key_values=output.past_key_values,
                 use_cache=True,
             )
             logits = output.logits[0, -1]
-            steps.append({"input_ids": [token], "logits": f32_list(logits)})
+            steps.append({"input_ids": [token], "logits": logits.clone()})
     return steps
+
+
+def cases(
+    model: torch.nn.Module, prompts: dict[str, list[int]]
+) -> list[dict[str, Any]]:
+    """Float32 steps, each with the float64 logits of the same weights fed the
+    same tokens: how far float32 itself lands from exact on this model."""
+    float32 = {name: capture(model, ids) for name, ids in prompts.items()}
+    # The default grouped expert kernel takes no float64; the per-expert loop
+    # computes the same sum exactly enough.
+    implementation = model.config._experts_implementation
+    model.config._experts_implementation = "eager"
+    model.to(torch.float64)
+    try:
+        for name, ids in prompts.items():
+            forced = [step["input_ids"][0] for step in float32[name][1:]]
+            for step, exact in zip(
+                float32[name], capture(model, ids, forced), strict=True
+            ):
+                step["logits"] = f32_list(step["logits"])
+                step["logits_float64"] = exact["logits"].tolist()
+    finally:
+        model.to(torch.float32)
+        model.config._experts_implementation = implementation
+    return [{"name": name, "steps": steps} for name, steps in float32.items()]
 
 
 def variant(name: str, settings: dict[str, Any], seed: int) -> dict[str, Any]:
@@ -180,10 +208,7 @@ def variant(name: str, settings: dict[str, Any], seed: int) -> dict[str, Any]:
         "seed": seed,
         "config": {"model_type": "gemma4_text", **settings},
         "tensors": tensors,
-        "cases": [
-            {"name": prompt, "steps": capture(model, ids)}
-            for prompt, ids in PROMPTS.items()
-        ],
+        "cases": cases(model, PROMPTS),
     }
 
 
