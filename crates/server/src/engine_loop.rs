@@ -23,6 +23,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
     },
     time::{Duration, Instant},
@@ -298,6 +299,23 @@ pub(crate) struct Submission {
     deadline: GenerationDeadline,
     events: SyncSender<Event>,
     cleanup_tx: SyncSender<()>,
+    cancel: Cancel,
+}
+
+/// Set when a turn's client is gone, so the engine retires it at its next
+/// iteration even while it waits or prefills and sends no events. The writer
+/// keeps a clone and sets it when it leaves.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    pub(crate) fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// One message to the engine thread: a turn to batch, or exclusive work to
@@ -399,6 +417,7 @@ struct Sequence {
     deadline: GenerationDeadline,
     events: SyncSender<Event>,
     cleanup_tx: SyncSender<()>,
+    cancel: Cancel,
     decode_ms: Vec<f64>,
 }
 
@@ -558,6 +577,7 @@ impl<D: TextDecoder> Engine<'_, D> {
                     deadline,
                     events,
                     cleanup_tx,
+                    cancel,
                 } = *submission;
                 let id = SequenceId(self.next_id);
                 self.next_id += 1;
@@ -570,6 +590,7 @@ impl<D: TextDecoder> Engine<'_, D> {
                     deadline,
                     events,
                     cleanup_tx,
+                    cancel,
                     decode_ms: Vec::new(),
                 });
             }
@@ -593,7 +614,9 @@ impl<D: TextDecoder> Engine<'_, D> {
         let now = Instant::now();
         let mut waiting = VecDeque::with_capacity(self.waiting.len());
         for sequence in self.waiting.drain(..) {
-            if sequence.deadline.check_at(now).is_err() {
+            if sequence.cancel.is_set() {
+                // Holds no blocks; dropping it releases the writer.
+            } else if sequence.deadline.check_at(now).is_err() {
                 sequence.fail(ChatGenerationError::DeadlineExceeded);
             } else {
                 waiting.push_back(sequence);
@@ -601,7 +624,9 @@ impl<D: TextDecoder> Engine<'_, D> {
         }
         self.waiting = waiting;
         if let Some(prefilling) = self.prefilling.take() {
-            if prefilling.sequence.deadline.check_at(now).is_err() {
+            if prefilling.sequence.cancel.is_set() {
+                self.release_sequence(&prefilling.sequence);
+            } else if prefilling.sequence.deadline.check_at(now).is_err() {
                 self.release_sequence(&prefilling.sequence);
                 prefilling
                     .sequence
@@ -891,7 +916,9 @@ impl<D: TextDecoder> Engine<'_, D> {
         let now = Instant::now();
         let running = std::mem::take(&mut self.running);
         for sequence in running {
-            if sequence.deadline.check_at(now).is_err() {
+            if sequence.cancel.is_set() {
+                self.release_sequence(&sequence);
+            } else if sequence.deadline.check_at(now).is_err() {
                 self.release_sequence(&sequence);
                 sequence.fail(ChatGenerationError::DeadlineExceeded);
             } else {
@@ -1131,6 +1158,7 @@ impl<D: TextDecoder> Engine<'_, D> {
 struct WriterEvents {
     events: Option<Receiver<Event>>,
     cleanup: Receiver<()>,
+    cancel: Cancel,
 }
 
 impl WriterEvents {
@@ -1144,6 +1172,7 @@ impl WriterEvents {
 
 impl Drop for WriterEvents {
     fn drop(&mut self) {
+        self.cancel.set();
         drop(self.events.take());
         // There are no messages: closing the sequence's sole sender is the
         // acknowledgment. Engine teardown also releases this lifetime.
@@ -1192,15 +1221,15 @@ impl<J> EngineClient<J> {
     }
 }
 
-impl<J> ChatBackend for EngineClient<J> {
-    fn load_ms(&self) -> f64 {
-        self.model.load_ms
-    }
-
-    fn generate_with_timeout(
+impl<J> EngineClient<J> {
+    /// [`ChatBackend::generate_with_timeout`] with the turn's cancel token
+    /// supplied, so a caller holding a clone can retire the turn while it
+    /// waits or prefills, before any event reaches the writer.
+    pub(crate) fn generate_with_cancel(
         &mut self,
         request: ChatRequest<'_>,
         timeout: Duration,
+        cancel: Cancel,
         on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError> {
         let deadline = GenerationDeadline::after(timeout);
@@ -1216,6 +1245,7 @@ impl<J> ChatBackend for EngineClient<J> {
         let receiver = WriterEvents {
             events: Some(receiver),
             cleanup,
+            cancel: cancel.clone(),
         };
         self.messages
             .send(EngineMessage::Submit(Box::new(Submission {
@@ -1225,6 +1255,7 @@ impl<J> ChatBackend for EngineClient<J> {
                 deadline,
                 events,
                 cleanup_tx,
+                cancel,
             })))
             .map_err(|_| ChatGenerationError::message("the model engine is unavailable"))?;
         let format = Arc::clone(&self.model.format);
@@ -1287,6 +1318,21 @@ impl<J> ChatBackend for EngineClient<J> {
     }
 }
 
+impl<J> ChatBackend for EngineClient<J> {
+    fn load_ms(&self) -> f64 {
+        self.model.load_ms
+    }
+
+    fn generate_with_timeout(
+        &mut self,
+        request: ChatRequest<'_>,
+        timeout: Duration,
+        on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
+    ) -> Result<ChatGeneration, ChatGenerationError> {
+        self.generate_with_cancel(request, timeout, Cancel::default(), on_token)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1312,7 +1358,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DecodeError, EngineClient, EngineLimits, EngineMessage, EngineModel, TextDecoder, run,
+        Cancel, DecodeError, EngineClient, EngineLimits, EngineMessage, EngineModel, TextDecoder,
+        run,
     };
     use crate::chat_generation::{
         ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
@@ -2475,6 +2522,85 @@ mod tests {
             "a chunk ran without headroom: {during:?}"
         );
         assert_eq!(outputs, expected, "the prompt resumed and finished");
+    }
+
+    /// A cancelled turn retires mid-prefill within one more chunk, right
+    /// after a prefix-cache hit (the case most likely to leak a reference on
+    /// a shared block): its writer gets no completion, the next request is
+    /// admitted while decodes run, and the pool is whole once all turns end.
+    #[test]
+    fn a_turn_cancelled_mid_prefill_releases_its_blocks_and_prefix_references() {
+        let shared = words(40, 3);
+        let longer = format!("{shared} {}", words(40, 4));
+        let mut harness = Harness::paused(256, 4, true);
+        {
+            let mut observed = harness.observed.lock().expect("observed");
+            observed.step_delay = Duration::from_millis(10);
+            // One 4-token block per step beside a ~10 ms decode step.
+            observed.limits = Some(EngineLimits {
+                max_num_seqs: 4,
+                prefill_chunk_tokens: TEST_CHUNK,
+                prefill_target_ms: 12,
+            });
+        }
+        harness.release();
+        // Publish the shared prefix's blocks with nothing decoding.
+        generate_all(
+            &harness.client,
+            std::slice::from_ref(&shared),
+            SamplingRequest::GREEDY,
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let keeper = keeper(&harness.client, &stop);
+        thread::sleep(Duration::from_millis(100));
+        let mark = harness.observed.lock().expect("observed").events.len();
+        let cancel = Cancel::default();
+        let writer = {
+            let mut client = harness.client.clone();
+            let cancel = cancel.clone();
+            thread::spawn(move || {
+                let messages = [ChatMessage::text(ChatRole::User, longer)];
+                client
+                    .generate_with_cancel(
+                        ChatRequest::new(&messages, 40),
+                        Duration::from_secs(30),
+                        cancel,
+                        &mut |_| Ok(()),
+                    )
+                    .is_ok()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness.observed.lock().expect("observed").events[mark..]
+            .iter()
+            .any(|event| matches!(event, Step::Chunk(_)))
+        {
+            assert!(Instant::now() < deadline, "the long prompt never started");
+            thread::sleep(Duration::from_millis(1));
+        }
+        cancel.set();
+        let cancelled_at = harness.observed.lock().expect("observed").events.len();
+        let finished = writer.join().expect("writer");
+        // The next request is admitted while the keeper still decodes.
+        let next = generate_all(&harness.client, &[prompt(3)], SamplingRequest::GREEDY);
+        stop.store(true, Ordering::Release);
+        keeper.join().expect("keeper");
+        let observed = Arc::clone(&harness.observed);
+        let decoder = harness.stop();
+        assert!(!finished, "a cancelled turn completed");
+        assert_eq!(next.len(), 1);
+        let after = observed.lock().expect("observed").events[cancelled_at..]
+            .iter()
+            .filter(|event| matches!(event, Step::Chunk(tokens) if *tokens > 0))
+            .count();
+        // The next request's own prefill is one chunk; the cancelled prompt
+        // may run at most the one already in flight.
+        assert!(after <= 2, "{after} chunks after the cancel");
+        assert_eq!(
+            decoder.blocks.free_blocks(),
+            256,
+            "a block or a prefix reference leaked"
+        );
     }
 
     #[test]
