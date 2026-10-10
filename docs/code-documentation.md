@@ -174,7 +174,8 @@ sections honest: both are on for every crate through `clippy::pedantic`.
 `PENDING` list must carry `#![deny(missing_docs)]` in its `lib.rs`, and a
 listed crate that already carries it fails until it is removed from the list.
 Retrofit a crate by documenting it, adding the attribute and removing it from
-`PENDING` in one change. A new crate starts documented.
+`PENDING` in one change. A new crate starts documented. The script also
+rejects a crate-wide `allow` or `expect` of `missing_errors_doc`.
 
 ## Anti-patterns
 

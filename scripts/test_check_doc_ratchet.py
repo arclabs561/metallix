@@ -77,6 +77,26 @@ class DocRatchetTests(unittest.TestCase):
         found = ratchet.problems(self.root, frozenset())
         self.assertEqual(found, ["b/src/lib.rs lacks #![deny(missing_docs)]"])
 
+    def test_crate_wide_errors_doc_allow_fails(self) -> None:
+        write_workspace(
+            self.root,
+            {
+                "a": "#![deny(missing_docs)]\n#![allow(clippy::missing_errors_doc)]\n",
+                "b": "#![deny(missing_docs)]\n"
+                "#![expect(clippy::pedantic, clippy::missing_errors_doc)]\n",
+                "c": "#![deny(missing_docs)]\n// #![allow(clippy::missing_errors_doc)]\n",
+            },
+            allow_errors_doc=False,
+        )
+        found = ratchet.problems(self.root, frozenset())
+        self.assertEqual(
+            found,
+            [
+                "a/src/lib.rs allows clippy::missing_errors_doc",
+                "b/src/lib.rs allows clippy::missing_errors_doc",
+            ],
+        )
+
     def test_warn_missing_docs_is_not_enough(self) -> None:
         write_workspace(
             self.root,

@@ -5,7 +5,9 @@ documented to the standard in docs/code-documentation.md, or its library root
 carries `#![deny(missing_docs)]` and, while the workspace allows
 `clippy::missing_errors_doc`, `#![warn(clippy::missing_errors_doc)]`. The
 Clippy and rustdoc steps of the main gate then enforce those lints; this check
-only keeps the attributes from being dropped or never added.
+only keeps the attributes from being dropped or never added. It also rejects a
+crate-wide `allow` or `expect` of `clippy::missing_errors_doc`, which would
+switch off the workspace lint for that crate.
 
 `PENDING` only shrinks. A listed crate that already carries the attributes
 fails here, so the list stays accurate, and a crate added to the workspace
@@ -28,7 +30,7 @@ PENDING: frozenset[str] = frozenset()
 
 # Inner attributes at the start of a line, so commented-out ones do not count.
 INNER_ATTRIBUTE = re.compile(
-    r"^#!\[(allow|warn|deny|forbid)\(([^)]*)\)\]", re.MULTILINE
+    r"^#!\[(allow|expect|warn|deny|forbid)\(([^)]*)\)\]", re.MULTILINE
 )
 
 
@@ -80,6 +82,8 @@ def problems(root: Path, pending: frozenset[str]) -> list[str]:
             )
         elif member not in pending and missing:
             found.append(f"{relative} lacks {' and '.join(missing)}")
+        if levels.get("clippy::missing_errors_doc") in {"allow", "expect"}:
+            found.append(f"{relative} allows clippy::missing_errors_doc")
     return found
 
 
