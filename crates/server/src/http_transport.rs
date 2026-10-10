@@ -3,6 +3,7 @@
 //! This deliberately owns no worker threads. A connection is read, answered,
 //! and dropped by the serving loop, so a timed-out peer cannot retain a handler.
 
+use chat_format::TurnDelta;
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
@@ -263,15 +264,17 @@ impl Connection {
         }
     }
 
-    /// An `on_token` for a reply written only when generation ends: every
-    /// [`CLIENT_POLL_DELTAS`] deltas it checks [`Self::client_gone`] and stops
-    /// the generation once the client has left, so a dropped request stops
-    /// costing model time. A streamed reply learns the same from its writes.
-    pub(crate) fn stop_when_gone<T>(&mut self) -> impl FnMut(T) -> Result<(), String> + '_ {
+    /// An `on_token` for a reply written only when generation ends: on every
+    /// [`TurnDelta::Held`] probe, and every [`CLIENT_POLL_DELTAS`] deltas, it
+    /// checks [`Self::client_gone`] and stops the generation once the client
+    /// has left, so a dropped request stops costing model time. A streamed
+    /// reply learns the same from its writes.
+    pub(crate) fn stop_when_gone(&mut self) -> impl FnMut(TurnDelta) -> Result<(), String> + '_ {
         let mut deltas = 0_usize;
-        move |_| {
+        move |delta| {
             deltas += 1;
-            if deltas.is_multiple_of(CLIENT_POLL_DELTAS) && self.client_gone() {
+            let probe = delta == TurnDelta::Held || deltas.is_multiple_of(CLIENT_POLL_DELTAS);
+            if probe && self.client_gone() {
                 return Err(String::from("the client disconnected"));
             }
             Ok(())
@@ -284,8 +287,10 @@ impl Connection {
         self.stream.try_clone().ok()
     }
 
-    /// Starts a new bounded response-write interval.
+    /// Starts a new bounded response-write interval. Once a final response
+    /// has begun, [`Self::client_gone`] never writes an interim `100 Continue`.
     pub(crate) fn begin_response(&mut self) {
+        self.probed = true;
         self.response_deadline = Some(deadline_after(self.limits.response_deadline));
     }
 

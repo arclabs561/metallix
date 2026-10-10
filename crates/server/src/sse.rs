@@ -1,7 +1,10 @@
 //! A server-sent-event response whose HTTP head is written with its first
 //! event, shared by the Chat Completions and Messages adapters.
 
-use std::io::{BufWriter, Write};
+use std::{
+    io::{BufWriter, Write},
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 
@@ -13,6 +16,7 @@ use crate::http_transport::Connection;
 pub(crate) struct LazySse {
     pending: Option<Connection>,
     writer: Option<BufWriter<Connection>>,
+    keepalive: Keepalive,
 }
 
 impl LazySse {
@@ -20,6 +24,7 @@ impl LazySse {
         Self {
             pending: Some(connection),
             writer: None,
+            keepalive: Keepalive::new(),
         }
     }
 
@@ -60,10 +65,55 @@ impl LazySse {
         writer.flush().map_err(|e| e.to_string())
     }
 
-    /// Writes an SSE comment, which clients ignore, so a disconnect is
-    /// noticed while output is withheld.
+    /// Answers a [`chat_format::TurnDelta::Held`]; see [`Keepalive::held`].
     pub(crate) fn keepalive(&mut self) -> Result<(), String> {
-        let writer = self.open()?;
+        self.keepalive.held(&mut self.pending, &mut self.writer)
+    }
+}
+
+/// Least time between two keepalive comments on an open stream.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(1);
+
+/// How a streamed reply answers [`chat_format::TurnDelta::Held`], shared by
+/// every event-stream protocol.
+pub(crate) struct Keepalive {
+    written: Option<Instant>,
+}
+
+impl Keepalive {
+    pub(crate) const fn new() -> Self {
+        Self { written: None }
+    }
+
+    /// Probes the client and errs once it has gone, which cancels the
+    /// generation. A stream not yet opened writes nothing, so a failure
+    /// before any output still answers with an ordinary HTTP error status. An
+    /// open stream also gets an SSE comment, which clients ignore, at most
+    /// once per [`KEEPALIVE_EVERY`]: the write is what notices a peer that
+    /// vanished without closing.
+    pub(crate) fn held(
+        &mut self,
+        pending: &mut Option<Connection>,
+        writer: &mut Option<BufWriter<Connection>>,
+    ) -> Result<(), String> {
+        let connection = match (pending.as_mut(), writer.as_mut()) {
+            (Some(connection), _) => connection,
+            (None, Some(writer)) => writer.get_mut(),
+            (None, None) => return Err(String::from("response connection is unavailable")),
+        };
+        if connection.client_gone() {
+            return Err(String::from("the client disconnected"));
+        }
+        let Some(writer) = writer.as_mut() else {
+            return Ok(());
+        };
+        if self
+            .written
+            .is_some_and(|written| written.elapsed() < KEEPALIVE_EVERY)
+        {
+            return Ok(());
+        }
+        self.written = Some(Instant::now());
         writer
             .write_all(b": generating\n\n")
             .map_err(|error| error.to_string())?;
@@ -165,9 +215,14 @@ pub(crate) mod test_support {
         )
     }
 
-    /// Each event's optional name and raw `data` of a `200` event stream;
+    /// Each event's optional name and raw `data` of a `200` event stream,
+    /// after any interim `100 Continue` a half-closed client is probed with;
     /// comments are skipped.
     pub(crate) fn events(wire: &str) -> Vec<(Option<String>, String)> {
+        let mut wire = wire;
+        while let Some(rest) = wire.strip_prefix("HTTP/1.1 100 Continue\r\n\r\n") {
+            wire = rest;
+        }
         let (head, payload) = wire.split_once("\r\n\r\n").unwrap();
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         assert!(head.contains("Content-Type: text/event-stream"), "{head}");
@@ -210,6 +265,11 @@ pub(crate) mod test_support {
         pub(crate) cache_write_tokens: usize,
         /// A pause before each text piece, as a model spends per token.
         pub(crate) piece_delay: Duration,
+        /// A prefill to wait out first, probing the client with
+        /// `TurnDelta::Held` every 100 ms as the engine's writer does.
+        pub(crate) prefill: Duration,
+        /// How many prefill probes were sent.
+        pub(crate) probes: usize,
     }
 
     impl Scripted {
@@ -225,6 +285,8 @@ pub(crate) mod test_support {
                 cached_prompt_tokens: 0,
                 cache_write_tokens: 0,
                 piece_delay: Duration::ZERO,
+                prefill: Duration::ZERO,
+                probes: 0,
             }
         }
 
@@ -258,6 +320,12 @@ pub(crate) mod test_support {
         ) -> Result<ChatGeneration, ChatGenerationError> {
             self.seen = Some((!request.tools.is_empty(), request.enable_thinking));
             self.salt = request.cache_salt.map(str::to_owned);
+            let prefill_end = std::time::Instant::now() + self.prefill;
+            while std::time::Instant::now() < prefill_end {
+                std::thread::sleep(Duration::from_millis(100));
+                self.probes += 1;
+                on_token(chat_format::TurnDelta::Held).map_err(ChatGenerationError::Message)?;
+            }
             if let Some(failure) = &self.failure {
                 return Err(ChatGenerationError::Message(failure.clone()));
             }

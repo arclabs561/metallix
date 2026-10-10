@@ -24,7 +24,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     time::{Duration, Instant},
 };
@@ -1168,7 +1168,19 @@ impl WriterEvents {
             .expect("receiver held until drop")
             .recv()
     }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Event, RecvTimeoutError> {
+        self.events
+            .as_ref()
+            .expect("receiver held until drop")
+            .recv_timeout(timeout)
+    }
 }
+
+/// How often a writer waiting for prefill checks that its client is still
+/// there. No event arrives until prefill ends, so without this a long
+/// chunked prefill runs to the end for a client that left at its start.
+const PREFILL_PROBE: Duration = Duration::from_millis(100);
 
 impl Drop for WriterEvents {
     fn drop(&mut self) {
@@ -1260,8 +1272,26 @@ impl<J> EngineClient<J> {
             .map_err(|_| ChatGenerationError::message("the model engine is unavailable"))?;
         let format = Arc::clone(&self.model.format);
         let mut prefill = (0, 0, 0.0);
+        let mut started = false;
         loop {
-            match receiver.recv() {
+            let event = if started {
+                receiver.recv()
+            } else {
+                // Until the first event, probe the client through on_token:
+                // a TurnDelta::Held the protocol answers with Err once the
+                // client has gone. Returning drops WriterEvents, which sets
+                // the cancel flag the engine checks before each chunk.
+                match receiver.recv_timeout(PREFILL_PROBE) {
+                    Ok(event) => Ok(event),
+                    Err(RecvTimeoutError::Timeout) => {
+                        on_token(TurnDelta::Held)?;
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => Err(std::sync::mpsc::RecvError),
+                }
+            };
+            started = true;
+            match event {
                 Ok(Event::Prefilled {
                     cached_prompt_tokens,
                     cache_write_tokens,
@@ -1358,8 +1388,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Cancel, DecodeError, EngineClient, EngineLimits, EngineMessage, EngineModel, TextDecoder,
-        run,
+        Cancel, DecodeError, EngineClient, EngineLimits, EngineMessage, EngineModel, PREFILL_PROBE,
+        TextDecoder, run,
     };
     use crate::chat_generation::{
         ChatBackend, ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole,
@@ -2601,6 +2631,92 @@ mod tests {
             256,
             "a block or a prefix reference leaked"
         );
+    }
+
+    /// End to end through the writer: a client that leaves mid-prefill is
+    /// noticed by the next Held probe (within `PREFILL_PROBE`), and the engine
+    /// then runs at most the chunk already in flight before it frees the
+    /// turn's blocks; the next request is admitted beside a decoding keeper.
+    #[test]
+    fn a_client_gone_mid_prefill_frees_its_turn_within_a_probe_and_a_chunk() {
+        let long = format!("{} {}", words(40, 3), words(120, 4));
+        let mut harness = Harness::paused(256, 4, true);
+        {
+            let mut observed = harness.observed.lock().expect("observed");
+            observed.step_delay = Duration::from_millis(10);
+            observed.limits = Some(EngineLimits {
+                max_num_seqs: 4,
+                prefill_chunk_tokens: TEST_CHUNK,
+                prefill_target_ms: 12,
+            });
+        }
+        harness.release();
+        let stop = Arc::new(AtomicBool::new(false));
+        let keeper = keeper(&harness.client, &stop);
+        thread::sleep(Duration::from_millis(100));
+        let mark = harness.observed.lock().expect("observed").events.len();
+        let gone = Arc::new(AtomicBool::new(false));
+        // (when the probe answered Err, engine events seen by then)
+        let noticed = Arc::new(std::sync::Mutex::new(None::<(Instant, usize)>));
+        let writer = {
+            let mut client = harness.client.clone();
+            let gone = Arc::clone(&gone);
+            let noticed = Arc::clone(&noticed);
+            let observed = Arc::clone(&harness.observed);
+            thread::spawn(move || {
+                let messages = [ChatMessage::text(ChatRole::User, long)];
+                let returned = client.generate_with_timeout(
+                    ChatRequest::new(&messages, 40),
+                    Duration::from_secs(30),
+                    &mut |delta| {
+                        // The protocol's answer to a probe: Err once gone.
+                        if delta == TurnDelta::Held && gone.load(Ordering::Acquire) {
+                            let events = observed.lock().expect("observed").events.len();
+                            *noticed.lock().unwrap() = Some((Instant::now(), events));
+                            return Err(String::from("the client disconnected"));
+                        }
+                        Ok(())
+                    },
+                );
+                (returned.is_ok(), Instant::now())
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness.observed.lock().expect("observed").events[mark..]
+            .iter()
+            .any(|event| matches!(event, Step::Chunk(_)))
+        {
+            assert!(Instant::now() < deadline, "the long prompt never started");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let left = Instant::now();
+        gone.store(true, Ordering::Release);
+        let (finished, returned_at) = writer.join().expect("writer");
+        let released = harness.observed.lock().expect("observed").events.len();
+        let next = generate_all(&harness.client, &[prompt(3)], SamplingRequest::GREEDY);
+        stop.store(true, Ordering::Release);
+        keeper.join().expect("keeper");
+        let observed = Arc::clone(&harness.observed);
+        let decoder = harness.stop();
+        assert!(!finished, "a turn whose client left completed");
+        assert_eq!(next.len(), 1, "the next request was not served");
+        let (noticed_at, noticed_events) = noticed
+            .lock()
+            .unwrap()
+            .expect("a probe saw the client gone");
+        let detect = noticed_at.duration_since(left);
+        assert!(
+            detect < PREFILL_PROBE + Duration::from_millis(150),
+            "noticed {detect:?} after the client left"
+        );
+        let chunks = observed.lock().expect("observed").events[noticed_events..released]
+            .iter()
+            .filter(|event| matches!(event, Step::Chunk(tokens) if *tokens > 0))
+            .count();
+        assert!(chunks <= 1, "{chunks} chunks ran after the probe noticed");
+        // The writer returned only once the engine had released the turn.
+        assert!(returned_at >= noticed_at);
+        assert_eq!(decoder.blocks.free_blocks(), 256, "a block leaked");
     }
 
     #[test]

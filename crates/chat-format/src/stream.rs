@@ -19,9 +19,12 @@ pub enum TurnDelta {
     Reasoning(String),
     /// Settled visible answer text.
     Text(String),
-    /// A token arrived whose text is still held back (markup, or text that
-    /// may become markup). It carries nothing to show; a protocol can use
-    /// it to notice a disconnected client.
+    /// Nothing to show yet: a token whose text is still held back (markup,
+    /// or text that may become markup), or a writer waiting for prefill to
+    /// end. It is both a keepalive and a liveness probe. A protocol checks
+    /// that its client is still there and may keep an idle stream alive;
+    /// returning `Err` from `on_token` for it means the client has gone, and
+    /// the generation is cancelled.
     Held,
 }
 

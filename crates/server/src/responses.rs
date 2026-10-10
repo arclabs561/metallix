@@ -455,6 +455,7 @@ struct EventStream<'a> {
     live_reasoning: bool,
     /// The message item's output index, once its text began to stream.
     live_message: Option<usize>,
+    keepalive: crate::sse::Keepalive,
 }
 
 impl EventStream<'_> {
@@ -487,11 +488,7 @@ impl EventStream<'_> {
     /// Writes an SSE comment while output is held back, so a disconnect is
     /// still noticed.
     fn keepalive(&mut self) -> Result<(), String> {
-        let writer = self.open()?;
-        writer
-            .write_all(b": generating\n\n")
-            .map_err(|error| error.to_string())?;
-        writer.flush().map_err(|error| error.to_string())
+        self.keepalive.held(&mut self.pending, &mut self.writer)
     }
 
     /// Streams one delta, opening the reasoning item (always output 0) or
@@ -584,6 +581,7 @@ pub(crate) fn respond(
         envelope: envelope(parsed, id, unix_now()),
         live_reasoning: false,
         live_message: None,
+        keepalive: crate::sse::Keepalive::new(),
     };
     let generated = session.generate_with_timeout(
         ChatRequest {

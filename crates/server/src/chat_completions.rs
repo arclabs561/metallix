@@ -1026,6 +1026,86 @@ mod tests {
         );
     }
 
+    /// A client that leaves during a long prefill is noticed by the writer's
+    /// Held probes, streamed or not, within a few probes and with nothing
+    /// generated: the cancellation reaches the engine in about one probe.
+    #[test]
+    fn a_client_that_leaves_during_prefill_is_noticed_by_the_probes() {
+        for stream in [false, true] {
+            let mut backend = Scripted::new("never sent");
+            backend.prefill = Duration::from_secs(30);
+            let started = std::time::Instant::now();
+            abandon(
+                "/v1/chat/completions",
+                &with(&json!({"stream": stream})).to_string(),
+                |connection, body| {
+                    let (_, prepared) = prepare(body).unwrap();
+                    respond(
+                        connection,
+                        &prepared,
+                        &mut backend,
+                        "t",
+                        Duration::from_secs(60),
+                    )
+                    .unwrap();
+                },
+            );
+            // An HTTP/1.1 client's first EOF is answered with one interim
+            // 100 Continue; the reset that follows is seen on the next probe.
+            assert!(
+                backend.probes <= 3,
+                "stream={stream}: {} probes",
+                backend.probes
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "stream={stream}: noticed after {:?}",
+                started.elapsed()
+            );
+            assert_eq!(backend.deltas, 0, "stream={stream}");
+        }
+    }
+
+    /// A client that half-closes after its request (shuts down its write
+    /// side) and still reads is not cancelled by the prefill probes: its EOF
+    /// is answered with one interim 100 Continue, and it gets the reply.
+    #[test]
+    fn a_half_closed_client_survives_prefill_probes() {
+        for stream in [false, true] {
+            let mut backend = Scripted::new("hello");
+            backend.prefill = Duration::from_millis(500);
+            let wire = exchange(
+                "/v1/chat/completions",
+                &with(&json!({"stream": stream})).to_string(),
+                |connection, body| {
+                    let (_, prepared) = prepare(body).unwrap();
+                    respond(
+                        connection,
+                        &prepared,
+                        &mut backend,
+                        "t",
+                        Duration::from_secs(60),
+                    )
+                    .unwrap();
+                },
+            );
+            assert!(
+                backend.probes >= 4,
+                "stream={stream}: {} probes",
+                backend.probes
+            );
+            assert!(backend.deltas > 0, "stream={stream}: nothing generated");
+            if stream {
+                let events = events(&wire);
+                assert_eq!(events.last().unwrap().1, "[DONE]", "{wire}");
+            } else {
+                let (status, body) = json_body(&wire);
+                assert_eq!(status, "HTTP/1.1 200 OK");
+                assert_eq!(body["choices"][0]["message"]["content"], "hello");
+            }
+        }
+    }
+
     /// A call to an undeclared tool goes back as generated (the client
     /// validates it, per the spec's note on `arguments`); a `strict` tool's
     /// off-schema call is still refused.
