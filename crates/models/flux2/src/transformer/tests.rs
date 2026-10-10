@@ -12,19 +12,17 @@
 //! bf16 text-encoder output and set `METALLIX_FLUX2_DIT_REF_BF16` to the
 //! source's bf16 transformer reference on those same inputs. The bf16 bar is
 //! then relative: at most twice the source's own bf16 distance from f32.
+//! A missing or empty input fails the gate; it is never skipped.
 
 use std::path::PathBuf;
 
 use super::*;
+use crate::gate_inputs::{self, InputError, Lookup, process_env, require};
 use crate::rope::{image_position_ids, text_position_ids};
 
 /// Declared before the first run (plan gate A2): f32 relative L2 per traced
 /// output against the f32 source.
 const F32_RELATIVE_L2: f64 = 1e-4;
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
 
 fn load(path: &Path) -> HashMap<String, Array> {
     Array::load_safetensors(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
@@ -60,31 +58,53 @@ struct Case {
     rope: RopeTables,
 }
 
-fn case(reference_var: &str) -> Option<Case> {
-    let model = env_path("METALLIX_FLUX2_MODEL")?;
-    let reference_path = env_path(reference_var)?;
-    let text_path = env_path("METALLIX_FLUX2_TEXT_REF")?;
-    let meta: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(reference_path.with_extension("json")).expect("reference sidecar"),
-    )
-    .expect("sidecar JSON");
+struct CasePaths {
+    model: PathBuf,
+    reference: PathBuf,
+    text: PathBuf,
+    timestep: f32,
+    height: usize,
+    width: usize,
+}
+
+fn case_paths(lookup: Lookup<'_>) -> Result<CasePaths, InputError> {
+    let model = gate_inputs::dir(lookup, "METALLIX_FLUX2_MODEL")?;
+    let reference = gate_inputs::file(lookup, "METALLIX_FLUX2_DIT_REF")?;
+    let text = gate_inputs::file(lookup, "METALLIX_FLUX2_TEXT_REF")?;
+    let meta = gate_inputs::sidecar(&reference)?;
     #[allow(clippy::cast_possible_truncation)]
-    let timestep = meta["scheduler_timestep"].as_f64().expect("timestep") as f32;
-    let height = usize::try_from(meta["height"].as_u64().expect("height")).unwrap() / 16;
-    let width = usize::try_from(meta["width"].as_u64().expect("width")).unwrap() / 16;
-    let text = load(&text_path)
+    let timestep = meta["scheduler_timestep"]
+        .as_f64()
+        .ok_or_else(|| InputError::Field("scheduler_timestep".into()))? as f32;
+    let side = |key: &str| -> Result<usize, InputError> {
+        usize::try_from(gate_inputs::field(&meta, key)?)
+            .map(|pixels| pixels / 16)
+            .map_err(|_| InputError::Field(key.into()))
+    };
+    Ok(CasePaths {
+        height: side("height")?,
+        width: side("width")?,
+        model,
+        reference,
+        text,
+        timestep,
+    })
+}
+
+fn case(paths: CasePaths) -> Case {
+    let text = load(&paths.text)
         .remove("prompt_embeds")
         .expect("prompt_embeds");
     let text_len = usize::try_from(text.shape()[1]).unwrap();
     let mut ids = text_position_ids(text_len);
-    ids.extend(image_position_ids(height, width));
-    Some(Case {
-        model,
-        reference: load(&reference_path),
+    ids.extend(image_position_ids(paths.height, paths.width));
+    Case {
+        model: paths.model,
+        reference: load(&paths.reference),
         text,
-        timestep,
+        timestep: paths.timestep,
         rope: RopeTables::new(&ids, [32, 32, 32, 32], 2000.0).unwrap(),
-    })
+    }
 }
 
 fn run(case: &Case, precision: Flux2Precision) -> Flux2Trace {
@@ -119,14 +139,15 @@ fn named(trace: &Flux2Trace) -> [(&'static str, &Array); 4] {
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and diffusers references; see the module docs"]
 fn transformer_matches_diffusers_reference() {
-    let precision = match std::env::var("METALLIX_FLUX2_PRECISION").as_deref() {
-        Ok("bf16") => Flux2Precision::Bf16,
-        _ => Flux2Precision::F32,
-    };
-    let Some(case) = case("METALLIX_FLUX2_DIT_REF") else {
-        eprintln!("skipping: METALLIX_FLUX2_MODEL, _DIT_REF and _TEXT_REF are required");
-        return;
-    };
+    let precision = require(gate_inputs::precision(&process_env));
+    // Resolved up front so a missing bf16 reference fails before the run.
+    let source_bf16 = (precision == Flux2Precision::Bf16).then(|| {
+        require(gate_inputs::cpu_reference(
+            &process_env,
+            "METALLIX_FLUX2_DIT_REF_BF16",
+        ))
+    });
+    let case = case(require(case_paths(&process_env)));
     let trace = run(&case, precision);
 
     match precision {
@@ -141,9 +162,7 @@ fn transformer_matches_diffusers_reference() {
             }
         }
         Flux2Precision::Bf16 => {
-            let source = load(
-                &env_path("METALLIX_FLUX2_DIT_REF_BF16").expect("METALLIX_FLUX2_DIT_REF_BF16"),
-            );
+            let source = load(source_bf16.as_deref().expect("resolved above"));
             for (name, ours) in named(&trace) {
                 let ours_distance = relative_l2(ours, &case.reference[name]);
                 let source_distance = relative_l2(&source[name], &case.reference[name]);
@@ -157,4 +176,11 @@ fn transformer_matches_diffusers_reference() {
             }
         }
     }
+}
+
+/// The gate above fails, not skips, without its inputs.
+#[test]
+fn missing_transformer_inputs_fail_the_gate() {
+    let unset: Lookup<'_> = &|_| None;
+    assert!(matches!(case_paths(unset), Err(InputError::Unset(_))));
 }

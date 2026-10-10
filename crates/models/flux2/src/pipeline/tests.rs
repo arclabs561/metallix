@@ -12,7 +12,8 @@
 //! `METALLIX_FLUX2_PIPE_REF_BF16=<pipe-bf16-pN.safetensors>`, the source's own
 //! bf16 image whose distance from f32 sets the bar. The control takes
 //! `METALLIX_FLUX2_OTHER_TEXT_REF`, another prompt's embedding.
-//! `METALLIX_FLUX2_OUT=<file.ppm>` saves the generated image.
+//! `METALLIX_FLUX2_OUT=<file.ppm>` saves the generated image. A missing or
+//! empty input fails the gate; it is never skipped.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,16 +21,13 @@ use std::path::PathBuf;
 use diffusion::metrics::{psnr_rgb8, ssim_rgb8};
 
 use super::*;
+use crate::gate_inputs::{self, InputError, Lookup, process_env, require};
 
 /// Declared before the first run (plan gate B).
 const F32_MIN_PSNR_DB: f64 = 40.0;
 const F32_MIN_SSIM: f64 = 0.99;
 const BF16_PSNR_MARGIN_DB: f64 = 3.0;
 const BF16_MIN_SSIM: f64 = 0.95;
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
 
 fn load(path: &Path) -> HashMap<String, Array> {
     Array::load_safetensors(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
@@ -61,19 +59,40 @@ struct Setup {
     steps: usize,
 }
 
-fn setup(precision: Flux2Precision) -> Option<Setup> {
-    let model = env_path("METALLIX_FLUX2_MODEL")?;
-    let reference_path = env_path("METALLIX_FLUX2_PIPE_REF")?;
-    let meta: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(reference_path.with_extension("json")).ok()?)
-            .ok()?;
-    let side = |key: &str| u32::try_from(meta[key].as_u64().expect(key)).unwrap();
-    Some(Setup {
-        pipeline: Flux2Pipeline::load(&model, precision).expect("load"),
-        reference: load(&reference_path),
-        size: ImageSize::new(side("width"), side("height")).expect("size"),
-        steps: usize::try_from(meta["steps"].as_u64().expect("steps")).unwrap(),
+/// Where a pipeline gate's checkpoint and reference live, resolved before
+/// anything is loaded.
+struct Paths {
+    model: PathBuf,
+    reference: PathBuf,
+    width: u32,
+    height: u32,
+    steps: usize,
+}
+
+fn paths(lookup: Lookup<'_>) -> Result<Paths, InputError> {
+    let model = gate_inputs::dir(lookup, "METALLIX_FLUX2_MODEL")?;
+    let reference = gate_inputs::file(lookup, "METALLIX_FLUX2_PIPE_REF")?;
+    let meta = gate_inputs::sidecar(&reference)?;
+    let side = |key: &str| -> Result<u32, InputError> {
+        u32::try_from(gate_inputs::field(&meta, key)?).map_err(|_| InputError::Field(key.into()))
+    };
+    Ok(Paths {
+        width: side("width")?,
+        height: side("height")?,
+        steps: usize::try_from(gate_inputs::field(&meta, "steps")?)
+            .map_err(|_| InputError::Field("steps".into()))?,
+        model,
+        reference,
     })
+}
+
+fn setup(paths: &Paths, precision: Flux2Precision) -> Setup {
+    Setup {
+        pipeline: Flux2Pipeline::load(&paths.model, precision).expect("load"),
+        reference: load(&paths.reference),
+        size: ImageSize::new(paths.width, paths.height).expect("size"),
+        steps: paths.steps,
+    }
 }
 
 fn generate(setup: &Setup, text_reference: &Path) -> Vec<u8> {
@@ -115,7 +134,7 @@ fn generate(setup: &Setup, text_reference: &Path) -> Vec<u8> {
         .pipeline
         .decode_rgb8(&packed, setup.size)
         .expect("decode");
-    if let Some(out) = env_path("METALLIX_FLUX2_OUT") {
+    if let Some(out) = process_env("METALLIX_FLUX2_OUT").map(PathBuf::from) {
         let mut ppm =
             format!("P6\n{} {}\n255\n", setup.size.width(), setup.size.height()).into_bytes();
         ppm.extend(&pixels);
@@ -127,14 +146,17 @@ fn generate(setup: &Setup, text_reference: &Path) -> Vec<u8> {
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and diffusers references; see the module docs"]
 fn generated_image_matches_diffusers() {
-    let precision = match std::env::var("METALLIX_FLUX2_PRECISION").as_deref() {
-        Ok("bf16") => Flux2Precision::Bf16,
-        _ => Flux2Precision::F32,
-    };
-    let (Some(setup), Some(text)) = (setup(precision), env_path("METALLIX_FLUX2_TEXT_REF")) else {
-        eprintln!("skipping: METALLIX_FLUX2_MODEL, _PIPE_REF and _TEXT_REF are required");
-        return;
-    };
+    let precision = require(gate_inputs::precision(&process_env));
+    let paths = require(paths(&process_env));
+    let text = require(gate_inputs::file(&process_env, "METALLIX_FLUX2_TEXT_REF"));
+    // Resolved up front so a missing bf16 reference fails before the run.
+    let source_bf16 = (precision == Flux2Precision::Bf16).then(|| {
+        require(gate_inputs::cpu_reference(
+            &process_env,
+            "METALLIX_FLUX2_PIPE_REF_BF16",
+        ))
+    });
+    let setup = setup(&paths, precision);
     let ours = generate(&setup, &text);
     let reference = reference_rgb8(&setup.reference);
     let (width, height) = (setup.size.width() as usize, setup.size.height() as usize);
@@ -150,9 +172,7 @@ fn generated_image_matches_diffusers() {
             assert!(ssim >= F32_MIN_SSIM, "SSIM {ssim:.4} < {F32_MIN_SSIM}");
         }
         Flux2Precision::Bf16 => {
-            let source = reference_rgb8(&load(
-                &env_path("METALLIX_FLUX2_PIPE_REF_BF16").expect("METALLIX_FLUX2_PIPE_REF_BF16"),
-            ));
+            let source = reference_rgb8(&load(source_bf16.as_deref().expect("resolved above")));
             let source_psnr = psnr_rgb8(&source, &reference);
             eprintln!("source bf16 vs source f32: PSNR {source_psnr:.2} dB");
             assert!(
@@ -169,13 +189,12 @@ fn generated_image_matches_diffusers() {
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and diffusers references; see the module docs"]
 fn another_prompt_fails_the_image_gate() {
-    let (Some(setup), Some(other)) = (
-        setup(Flux2Precision::F32),
-        env_path("METALLIX_FLUX2_OTHER_TEXT_REF"),
-    ) else {
-        eprintln!("skipping: METALLIX_FLUX2_OTHER_TEXT_REF and the gate's variables are required");
-        return;
-    };
+    let paths = require(paths(&process_env));
+    let other = require(gate_inputs::file(
+        &process_env,
+        "METALLIX_FLUX2_OTHER_TEXT_REF",
+    ));
+    let setup = setup(&paths, Flux2Precision::F32);
     let ours = generate(&setup, &other);
     let reference = reference_rgb8(&setup.reference);
     let (width, height) = (setup.size.width() as usize, setup.size.height() as usize);
@@ -183,4 +202,12 @@ fn another_prompt_fails_the_image_gate() {
     let ssim = ssim_rgb8(&ours, &reference, width, height);
     eprintln!("other prompt vs reference: PSNR {psnr:.2} dB, SSIM {ssim:.4}");
     assert!(psnr < F32_MIN_PSNR_DB && ssim < F32_MIN_SSIM);
+}
+
+/// The gates above fail, not skip, without their inputs: an unset
+/// environment resolves to an error. This runs without a checkpoint.
+#[test]
+fn missing_pipeline_inputs_fail_the_gate() {
+    let unset: Lookup<'_> = &|_| None;
+    assert!(matches!(paths(unset), Err(InputError::Unset(_))));
 }

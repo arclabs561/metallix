@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use super::*;
+use crate::gate_inputs::{self, InputError, Lookup, process_env, require};
 
 /// Declared before the first run (plan gate A3).
 const F32_DECODE_MIN_PSNR_DB: f64 = 60.0;
@@ -23,20 +24,28 @@ struct Reference {
     width: i32,
 }
 
-fn reference() -> Option<Reference> {
-    let model = PathBuf::from(std::env::var_os("METALLIX_FLUX2_MODEL")?);
-    let path = PathBuf::from(std::env::var_os("METALLIX_FLUX2_PIPE_REF")?);
-    let meta: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.with_extension("json")).expect("sidecar"))
-            .expect("JSON");
+fn reference_paths(
+    lookup: Lookup<'_>,
+) -> Result<(PathBuf, PathBuf, serde_json::Value), InputError> {
+    let model = gate_inputs::dir(lookup, "METALLIX_FLUX2_MODEL")?;
+    let path = gate_inputs::file(lookup, "METALLIX_FLUX2_PIPE_REF")?;
+    let meta = gate_inputs::sidecar(&path)?;
+    for key in ["steps", "height", "width"] {
+        gate_inputs::field(&meta, key)?;
+    }
+    Ok((model, path, meta))
+}
+
+fn reference(lookup: Lookup<'_>) -> Reference {
+    let (model, path, meta) = require(reference_paths(lookup));
     let dimension = |key: &str| i32::try_from(meta[key].as_u64().expect(key)).unwrap();
-    Some(Reference {
+    Reference {
         model,
         tensors: Array::load_safetensors(&path).expect("reference"),
         steps: meta["steps"].as_u64().expect("steps"),
         height: dimension("height"),
         width: dimension("width"),
-    })
+    }
 }
 
 fn values(array: &Array) -> Vec<f64> {
@@ -60,10 +69,7 @@ fn nchw_to_nhwc(array: &Array) -> Array {
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and a diffusers pipeline reference"]
 fn latent_post_processing_matches_diffusers() {
-    let Some(reference) = reference() else {
-        eprintln!("skipping: METALLIX_FLUX2_MODEL and METALLIX_FLUX2_PIPE_REF are required");
-        return;
-    };
+    let reference = reference(&process_env);
     let vae =
         Flux2VaeDecoder::load(reference.model.join("vae"), Flux2Precision::F32).expect("load");
     let last = &reference.tensors[&format!("latents.step{}", reference.steps - 1)];
@@ -83,10 +89,7 @@ fn latent_post_processing_matches_diffusers() {
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and a diffusers pipeline reference"]
 fn decode_matches_diffusers() {
-    let Some(reference) = reference() else {
-        eprintln!("skipping: METALLIX_FLUX2_MODEL and METALLIX_FLUX2_PIPE_REF are required");
-        return;
-    };
+    let reference = reference(&process_env);
     let vae =
         Flux2VaeDecoder::load(reference.model.join("vae"), Flux2Precision::F32).expect("load");
     let decoded = vae
@@ -117,4 +120,11 @@ fn decode_matches_diffusers() {
         psnr >= F32_DECODE_MIN_PSNR_DB,
         "{psnr:.2} dB < {F32_DECODE_MIN_PSNR_DB} dB"
     );
+}
+
+/// The gates above fail, not skip, without their inputs.
+#[test]
+fn missing_vae_inputs_fail_the_gate() {
+    let unset: Lookup<'_> = &|_| None;
+    assert!(matches!(reference_paths(unset), Err(InputError::Unset(_))));
 }

@@ -10,22 +10,19 @@
 //! bf16 adds `METALLIX_FLUX2_PRECISION=bf16` and
 //! `METALLIX_FLUX2_TEXT_REF_BF16=<te-bf16-pN.safetensors>` (the source's bf16
 //! run); the bar is then twice the source's own bf16 distance per layer.
+//! A missing or empty input fails the gate; it is never skipped.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 
 use mlx_rs::Dtype;
 
 use super::*;
+use crate::gate_inputs::{self, InputError, Lookup, process_env, require};
 
 /// Declared before the first run (plan gate A1): every element within
 /// 1e-3 of its row's RMS, real and padding rows alike.
 const F32_MAX_ABS_OVER_ROW_RMS: f64 = 1e-3;
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).map(PathBuf::from)
-}
 
 fn load(path: &Path) -> HashMap<String, Array> {
     Array::load_safetensors(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
@@ -69,34 +66,40 @@ struct Reference {
     real_ids: Vec<i32>,
 }
 
-fn reference(var: &str) -> Option<Reference> {
-    let model = env_path("METALLIX_FLUX2_MODEL")?;
-    let path = env_path(var)?;
-    let meta: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path.with_extension("json")).ok()?).ok()?;
-    let real = usize::try_from(meta["real_tokens"].as_u64()?).ok()?;
+/// Resolves the checkpoint and reference paths and the real token count.
+fn paths(lookup: Lookup<'_>) -> Result<(PathBuf, PathBuf, usize), InputError> {
+    let model = gate_inputs::dir(lookup, "METALLIX_FLUX2_MODEL")?;
+    let path = gate_inputs::file(lookup, "METALLIX_FLUX2_TEXT_REF")?;
+    let real = gate_inputs::field(&gate_inputs::sidecar(&path)?, "real_tokens")?;
+    let real = usize::try_from(real).map_err(|_| InputError::Field("real_tokens".into()))?;
+    Ok((model, path, real))
+}
+
+fn reference(lookup: Lookup<'_>) -> Reference {
+    let (model, path, real) = require(paths(lookup));
     let tensors = load(&path);
     let ids = tensors["input_ids"].reshape(&[-1]).unwrap();
     ids.eval().unwrap();
     let real_ids = ids.as_slice::<i32>()[..real].to_vec();
-    Some(Reference {
+    Reference {
         model,
         tensors,
         real_ids,
-    })
+    }
 }
 
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and diffusers references; see the module docs"]
 fn layer_states_match_diffusers() {
-    let precision = match std::env::var("METALLIX_FLUX2_PRECISION").as_deref() {
-        Ok("bf16") => Flux2Precision::Bf16,
-        _ => Flux2Precision::F32,
-    };
-    let Some(reference) = reference("METALLIX_FLUX2_TEXT_REF") else {
-        eprintln!("skipping: METALLIX_FLUX2_MODEL and METALLIX_FLUX2_TEXT_REF are required");
-        return;
-    };
+    let precision = require(gate_inputs::precision(&process_env));
+    // Resolved up front so a missing bf16 reference fails before the run.
+    let source_bf16_path = (precision == Flux2Precision::Bf16).then(|| {
+        require(gate_inputs::cpu_reference(
+            &process_env,
+            "METALLIX_FLUX2_TEXT_REF_BF16",
+        ))
+    });
+    let reference = reference(&process_env);
     let (padded, real_len) = KleinTextEncoder::pad(&reference.real_ids).unwrap();
     let expected_ids = reference.tensors["input_ids"].reshape(&[-1]).unwrap();
     expected_ids.eval().unwrap();
@@ -109,9 +112,7 @@ fn layer_states_match_diffusers() {
     let encoder = KleinTextEncoder::load(reference.model.join("text_encoder"), precision).unwrap();
     let states = encoder.layer_states(&reference.real_ids).unwrap();
     let hidden = usize::try_from(states[0].shape()[2]).unwrap();
-    let source_bf16 = (precision == Flux2Precision::Bf16).then(|| {
-        load(&env_path("METALLIX_FLUX2_TEXT_REF_BF16").expect("METALLIX_FLUX2_TEXT_REF_BF16"))
-    });
+    let source_bf16 = source_bf16_path.as_deref().map(load);
     for (state, layer) in states.iter().zip(TEXT_LAYERS) {
         let key = format!("hidden_states.{layer}");
         let ours = rows(state, hidden);
@@ -152,10 +153,7 @@ fn layer_states_match_diffusers() {
 #[test]
 #[ignore = "needs a FLUX.2 checkpoint and diffusers references; see the module docs"]
 fn a_neighbouring_layer_fails_the_text_gate() {
-    let Some(reference) = reference("METALLIX_FLUX2_TEXT_REF") else {
-        eprintln!("skipping: METALLIX_FLUX2_MODEL and METALLIX_FLUX2_TEXT_REF are required");
-        return;
-    };
+    let reference = reference(&process_env);
     let encoder =
         KleinTextEncoder::load(reference.model.join("text_encoder"), Flux2Precision::F32).unwrap();
     let (padded, real_len) = KleinTextEncoder::pad(&reference.real_ids).unwrap();
@@ -181,4 +179,11 @@ fn the_rendered_prompt_matches_the_reference_template() {
         "<|im_start|>user\nA red fox sitting in fresh snow at dawn, photograph<|im_end|>\n\
          <|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
+}
+
+/// The gates above fail, not skip, without their inputs.
+#[test]
+fn missing_text_inputs_fail_the_gate() {
+    let unset: Lookup<'_> = &|_| None;
+    assert!(matches!(paths(unset), Err(InputError::Unset(_))));
 }

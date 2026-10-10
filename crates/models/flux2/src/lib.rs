@@ -54,6 +54,8 @@ pub use text_encoder::{
     KleinTextEncoder, MAX_TEXT_TOKENS, PAD_TOKEN_ID, TEXT_LAYERS, TextEncoderError,
     klein_prompt_text,
 };
+#[cfg(all(test, feature = "metal"))]
+mod gate_inputs;
 #[cfg(feature = "metal")]
 mod pipeline;
 #[cfg(feature = "metal")]
