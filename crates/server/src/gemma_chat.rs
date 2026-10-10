@@ -68,10 +68,15 @@ impl FullRowDecoder for GemmaDecoder {
 impl FullRowSequence for GemmaSequence<'_> {
     type Snapshot = NoSnapshot;
 
+    /// Appends: the first call starts the sequence, later calls extend it,
+    /// as the session may prefill a prompt in pieces.
     fn prefill(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String> {
-        self.0
-            .prefill_last_logits(tokens)
-            .map_err(|error| error.to_string())
+        if self.0.cached_tokens() == 0 {
+            self.0.prefill_last_logits(tokens)
+        } else {
+            self.0.extend_last_logits(tokens)
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn step(&mut self, token: i32) -> Result<Vec<f32>, String> {
@@ -118,7 +123,8 @@ fn plan_kv_bytes(
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{DecoderError, GemmaDecoder, ResidentChatLimits, plan_kv_bytes};
+    use super::{DecoderError, GemmaDecoder, GemmaSequence, ResidentChatLimits, plan_kv_bytes};
+    use crate::chat_generation::decoder::FullRowSequence;
     use crate::{
         chat_generation::{
             ChatDecoderSession,
@@ -154,6 +160,55 @@ mod tests {
             "sliding_window": 1024, "tie_word_embeddings": true, "vocab_size": 262_144
         });
         gemma::Gemma4TextConfig::parse(&config.to_string()).unwrap()
+    }
+
+    /// The tiny transformers reference model from
+    /// `fixtures/gemma-4-tiny/ple-reference.json`, in f32.
+    fn tiny_weights() -> gemma::metal::Gemma4MlxWeights {
+        let reference: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/gemma-4-tiny/ple-reference.json"
+        ))
+        .unwrap();
+        let config = gemma::Gemma4TextConfig::parse(&reference["config"].to_string()).unwrap();
+        let tensors = reference["tensors"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, tensor)| tensor["ignored"] != json!(true))
+            .map(|(name, tensor)| {
+                let shape: Vec<i32> = serde_json::from_value(tensor["shape"].clone()).unwrap();
+                let values: Vec<f32> = serde_json::from_value(tensor["values"].clone()).unwrap();
+                (name.clone(), mlx_rs::Array::from_slice(&values, &shape))
+            })
+            .collect();
+        gemma::metal::Gemma4MlxWeights::from_tensors(
+            config,
+            tensors,
+            gemma::metal::Gemma4Precision::Float32,
+        )
+        .unwrap()
+    }
+
+    /// The session may prefill a prompt in pieces; a second piece must extend
+    /// the sequence, not restart it.
+    #[test]
+    fn prefill_in_pieces_equals_one_prefill() {
+        let _gpu = REAL_CHECKPOINT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let weights = tiny_weights();
+        let prompt = [2, 17, 33, 5, 61, 9, 40, 12, 3];
+        let mut whole = GemmaSequence(weights.executor(64).unwrap());
+        let expected = whole.prefill(&prompt).unwrap();
+        let mut pieces = GemmaSequence(weights.executor(64).unwrap());
+        pieces.prefill(&prompt[..4]).unwrap();
+        let actual = pieces.prefill(&prompt[4..]).unwrap();
+        let worst = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst <= 1e-5, "max |dlogit| {worst}");
     }
 
     #[test]
