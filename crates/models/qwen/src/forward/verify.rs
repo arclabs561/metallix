@@ -9,7 +9,8 @@ use std::hash::BuildHasher;
 use mlx_rs::{Array, StreamOrDevice};
 
 use super::{
-    LogitRows, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3TokenPicks, as_i32, validate_input_ids,
+    LogitRows, Qwen3ForwardError, Qwen3ForwardExecutor, Qwen3PickRule, Qwen3TokenPicks, as_i32,
+    validate_input_ids,
 };
 
 /// Row-major `[positions, vocab_size]` f32 logits from one append.
@@ -124,6 +125,24 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
         &mut self,
         input_ids: &[i32],
     ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
+        self.extend_picks(input_ids, &Qwen3PickRule::GREEDY)
+    }
+
+    /// [`Self::extend_greedy`] under any pick rule: row `i`'s pick and
+    /// candidates come from the row [`Self::extend_all_logits`] would return
+    /// at `i`, and a sampling rule carries one uniform per appended token.
+    /// A sampled speculative verify reads back token IDs and a few
+    /// candidates per row, and whole rows only where those cannot settle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen3ForwardError::InvalidPickRule`] for a rule that does
+    /// not fit `input_ids.len()` rows, before anything is appended.
+    pub fn extend_picks(
+        &mut self,
+        input_ids: &[i32],
+        rule: &Qwen3PickRule,
+    ) -> Result<Qwen3TokenPicks, Qwen3ForwardError> {
         if self.cached_tokens == 0 {
             return Err(Qwen3ForwardError::DecodeWithoutPrefill);
         }
@@ -135,6 +154,8 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
         )?;
         let seq_len =
             i32::try_from(input_ids.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        let vocab = as_i32(self.config.vocab_size)?;
+        rule.checked_candidates(&[seq_len, vocab])?;
         let pending = self
             .append_ids(
                 &Array::from_slice(input_ids, &[seq_len]),
@@ -142,11 +163,8 @@ impl<S: BuildHasher> Qwen3ForwardExecutor<'_, S> {
                 LogitRows::All,
             )
             .and_then(|logits| {
-                let rows = logits.reshape_device(
-                    &[seq_len, as_i32(self.config.vocab_size)?],
-                    StreamOrDevice::gpu(),
-                )?;
-                Qwen3TokenPicks::start(&rows, self.weights_address())
+                let rows = logits.reshape_device(&[seq_len, vocab], StreamOrDevice::gpu())?;
+                Qwen3TokenPicks::start_with(&rows, self.weights_address(), rule)
             });
         if pending.is_err() {
             // A partly built append must not leave some layers ahead.

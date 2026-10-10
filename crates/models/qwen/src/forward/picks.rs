@@ -113,7 +113,10 @@ struct Candidates {
 impl Qwen3PickRule {
     /// Validates this rule against `[rows, vocab]` logits and returns the
     /// row count and the number of candidates to read per row.
-    fn checked_candidates(&self, shape: &[i32]) -> Result<(i32, i32), Qwen3ForwardError> {
+    pub(super) fn checked_candidates(
+        &self,
+        shape: &[i32],
+    ) -> Result<(i32, i32), Qwen3ForwardError> {
         let &[rows, vocab] = shape else {
             return Err(Qwen3ForwardError::InvalidPickRule(
                 "logits must be [rows, vocab]",
@@ -352,6 +355,29 @@ impl Qwen3TokenPicks {
             .map(<[f32]>::to_vec)
             .collect())
     }
+
+    /// [`Self::full_rows`] for one row, so a verify that settles most rows
+    /// from candidates reads back only the rows that need the whole
+    /// vocabulary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen3ForwardError::CacheInconsistent`] for a row past the
+    /// picks' rows.
+    pub fn full_row(&self, row: usize) -> Result<Vec<f32>, Qwen3ForwardError> {
+        let rows = usize::try_from(self.logits.shape()[0])
+            .map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        if row >= rows {
+            return Err(Qwen3ForwardError::CacheInconsistent);
+        }
+        let index = i32::try_from(row).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        let wide = self
+            .logits
+            .index(index..=index)
+            .as_type_device::<f32>(StreamOrDevice::gpu())?;
+        wide.eval()?;
+        Ok(wide.as_slice::<f32>().to_vec())
+    }
 }
 
 fn to_token(id: u32) -> Result<i32, Qwen3ForwardError> {
@@ -476,6 +502,19 @@ mod tests {
             .take(count)
             .map(|index| (i32::try_from(index).expect("id"), logits[index]))
             .collect()
+    }
+
+    #[test]
+    fn full_row_reads_back_one_row_of_full_rows() {
+        let _gpu = GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let logits = vec![row(3_000, 1), row(3_000, 2), row(3_000, 3)];
+        let picks = Qwen3TokenPicks::start(&rows_array(&logits), 0).expect("queued argmax");
+        for (index, expected) in logits.iter().enumerate() {
+            assert_eq!(&picks.full_row(index).expect("row in range"), expected);
+        }
+        assert!(picks.full_row(3).is_err());
     }
 
     #[test]
