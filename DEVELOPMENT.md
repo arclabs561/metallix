@@ -451,12 +451,22 @@ grammar (Qwen3's `<tool_call>` JSON); others answer such a request 400. The
 validation above stays as a check on the grammar.
 
 A JSON schema response format (`text.format` on Responses, `response_format`
-on Chat Completions) sent together with tools binds only the turn's final
+on Chat Completions, `output_config.format` on Messages) sent together with
+tools binds only the turn's final
 message, as in OpenAI's Structured Outputs: the turn either calls tools, with
 optional commentary before each call, or ends in one message that matches the
 schema. Commentary cannot start with `{` or `<`, which keeps the two apart.
 The final message is also validated against the schema once parsed. Without
 tools, the schema covers the whole reply and cannot be combined with reasoning.
+
+Hosted tools that the provider runs server-side have no executor here. They
+are left out of the prompt and the request is served with the remaining tools;
+the reply names each one in `metallix.dropped_tools` (in `response.created`
+and the final response on a Responses stream, in `message_start` on a Messages
+stream). On Responses these are `web_search` (and its dated and preview
+types), `file_search`, `code_interpreter`, `image_generation` and `mcp`; on
+Messages, the `web_search_*`, `web_fetch_*`, `code_execution_*` and
+`tool_search_tool_*` server tools. Other non-function tool types are refused.
 
 Without those flags the rules above are response validation only, not a promise
 of schema-valid emission. [OpenAI's strict-mode guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)

@@ -247,11 +247,11 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         ignore_eos: request.ignore_eos,
         speculation: request.speculation.into(),
         tool_requirement: tool_requirement(request.tool_choice.as_ref())?,
-        strict_tools: strict_tools(!request.tools.is_empty(), &request.tools, |tool| {
+        strict_tools: strict_tools(has_function_tools(request), &request.tools, |tool| {
             tool["strict"] == Value::Bool(true)
         }),
     };
-    controls.validate(!request.tools.is_empty())?;
+    controls.validate(has_function_tools(request))?;
     Ok(controls)
 }
 
@@ -358,9 +358,51 @@ pub(crate) fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
     Ok(messages)
 }
 
+/// `OpenAI` hosted tools: `OpenAI` runs them server-side, and mx has nothing to
+/// run them with, so they are left out of the prompt and reported.
+const HOSTED_TOOLS: [&str; 8] = [
+    "web_search",
+    "web_search_2025_08_26",
+    "web_search_preview",
+    "web_search_preview_2025_03_11",
+    "file_search",
+    "code_interpreter",
+    "image_generation",
+    "mcp",
+];
+
+fn is_hosted_tool(tool: &Value) -> bool {
+    tool["type"]
+        .as_str()
+        .is_some_and(|kind| HOSTED_TOOLS.contains(&kind))
+}
+
+/// Whether any declared tool is one the model is offered (not hosted).
+fn has_function_tools(request: &Request) -> bool {
+    request.tools.iter().any(|tool| !is_hosted_tool(tool))
+}
+
+/// The hosted tools [`tools`] leaves out, by name or else by type.
+pub(crate) fn dropped_tools(request: &Request) -> Vec<String> {
+    request
+        .tools
+        .iter()
+        .filter(|tool| is_hosted_tool(tool))
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .or_else(|| tool["type"].as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The function tools in the template's shape; hosted tools are left out
+/// (see [`dropped_tools`]) and any other tool type is refused.
 pub(crate) fn tools(request: &Request) -> Result<Vec<Value>, String> {
     let mut names = HashSet::new();
-    request.tools.iter().map(|tool| {
+    request.tools.iter().filter(|tool| !is_hosted_tool(tool)).map(|tool| {
         if tool["type"] != "function" || !tool["name"].is_string() || !tool["parameters"].is_object() {
             return Err("only function tools with name and parameters are supported".into());
         }
@@ -796,7 +838,7 @@ fn envelope(request: &Request, id: &str, created_at: u64) -> Value {
             tool
         })
         .collect();
-    json!({
+    let mut envelope = json!({
         "id": id,
         "object": "response",
         "created_at": created_at,
@@ -814,7 +856,12 @@ fn envelope(request: &Request, id: &str, created_at: u64) -> Value {
         "top_p": request.top_p,
         "access_programs": null,
         "usage": null,
-    })
+    });
+    let dropped = dropped_tools(request);
+    if !dropped.is_empty() {
+        envelope["metallix"] = json!({"dropped_tools": dropped});
+    }
+    envelope
 }
 
 /// `envelope` for a failed reply. `ResponseError.code` must be one of the
@@ -896,7 +943,7 @@ fn response_value(
         // The values the turn used, which may come from generation_config.json.
         response["temperature"] = json!(sampling.temperature);
         response["top_p"] = json!(sampling.top_p);
-        response["metallix"] = json!({ "sampling": sampling });
+        response["metallix"]["sampling"] = json!(sampling);
     }
     Ok(response)
 }
@@ -1795,6 +1842,38 @@ mod tests {
             }
         }
 
+        /// A hosted tool next to a function tool is left out of the prompt
+        /// and named in `metallix.dropped_tools`, streamed (from
+        /// `response.created` on) and not; the function tool stays offered.
+        #[test]
+        fn hosted_tools_are_dropped_and_reported() {
+            let tools = r#"[{"type":"function","name":"read_file","parameters":{"type":"object"}},{"type":"web_search"}]"#;
+            let request: Request = serde_json::from_str(&format!(
+                r#"{{"model":"control","input":"hi","tools":{tools}}}"#
+            ))
+            .unwrap();
+            let offered = super::tools(&request).unwrap();
+            assert_eq!(offered.len(), 1);
+            assert_eq!(offered[0]["function"]["name"], "read_file");
+            assert_eq!(super::dropped_tools(&request), ["web_search"]);
+            let mut backend = Recording::default();
+            let body = format!(r#"{{"model":"control","input":"hi","tools":{tools}}}"#);
+            let (status, response) = json_body(&exchange(&body, &mut backend));
+            assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+            assert_eq!(response["metallix"]["dropped_tools"], json!(["web_search"]));
+            let body =
+                format!(r#"{{"model":"control","input":"hi","stream":true,"tools":{tools}}}"#);
+            let events = events(&exchange(&body, &mut backend));
+            for kind in ["response.created", "response.completed"] {
+                let event = events.iter().find(|event| event["type"] == kind).unwrap();
+                assert_eq!(
+                    event["response"]["metallix"]["dropped_tools"],
+                    json!(["web_search"]),
+                    "{kind}"
+                );
+            }
+        }
+
         #[test]
         fn failure_before_any_output_is_an_http_error_even_when_streaming() {
             for stream in [false, true] {
@@ -2009,9 +2088,10 @@ mod tests {
         } else {
             assert!(resolved.is_err());
         }
-        // Its hosted `web_search` tool is still refused: mx runs no hosted
-        // tools, so the recorded request as a whole is not served yet.
-        assert!(tools(&schema).is_err());
+        // Its hosted `web_search` tool is left out of the prompt and reported;
+        // the seven function tools stay offered.
+        assert_eq!(tools(&schema).map(|tools| tools.len()), Ok(7));
+        assert_eq!(dropped_tools(&schema), ["web_search"]);
         // The same schema without tools and reasoning is what selects it.
         let mut bare: Value = serde_json::from_str(recorded).unwrap();
         let object = bare.as_object_mut().unwrap();

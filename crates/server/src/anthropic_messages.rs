@@ -138,6 +138,8 @@ pub(crate) struct Prepared {
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     controls: GenerationControls,
+    /// Server tools left out of the prompt, named in the reply.
+    dropped_tools: Vec<String>,
 }
 
 /// An Anthropic-shaped error body.
@@ -160,6 +162,7 @@ pub(crate) fn prepare(body: &[u8]) -> Result<(String, Prepared), Value> {
     Ok((
         request.model.clone(),
         Prepared {
+            dropped_tools: dropped_tools(&request),
             request,
             messages,
             tools,
@@ -234,10 +237,50 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
     Ok(controls)
 }
 
+/// The reply's `metallix` block: `fields`, plus the server tools left out of
+/// the prompt when there were any.
+fn metallix(prepared: &Prepared, mut fields: Value) -> Value {
+    if !prepared.dropped_tools.is_empty() {
+        fields["dropped_tools"] = json!(prepared.dropped_tools);
+    }
+    fields
+}
+
+/// Anthropic server tools: Anthropic runs them, and mx has nothing to run
+/// them with, so they are left out of the prompt and reported.
+fn is_server_tool(tool: &Value) -> bool {
+    tool["type"].as_str().is_some_and(|kind| {
+        [
+            "web_search_",
+            "web_fetch_",
+            "code_execution_",
+            "tool_search_tool_",
+        ]
+        .iter()
+        .any(|family| kind.starts_with(family))
+    })
+}
+
+/// The names of the server tools [`tools`] leaves out.
+fn dropped_tools(request: &Request) -> Vec<String> {
+    request
+        .tools
+        .iter()
+        .filter(|tool| is_server_tool(tool))
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .or_else(|| tool["type"].as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
 /// Converts client tools to the template's shape. `tool_choice: none`
-/// withholds them from the prompt; forcing a call is unsupported because
-/// nothing here can make the model call. Server tools (web search, code
-/// execution, editors) have no executor here.
+/// withholds them from the prompt. Server tools are left out (see
+/// [`is_server_tool`]); other Anthropic-defined tools (bash, text editor,
+/// computer) are refused.
 fn tools(request: &Request) -> Result<Vec<Value>, String> {
     match request.tool_choice {
         None | Some(ToolChoice::Auto { .. } | ToolChoice::Any { .. } | ToolChoice::Tool { .. }) => {
@@ -248,6 +291,7 @@ fn tools(request: &Request) -> Result<Vec<Value>, String> {
     request
         .tools
         .iter()
+        .filter(|tool| !is_server_tool(tool))
         .map(|tool| {
             if !matches!(tool.get("type").and_then(Value::as_str), None | Some("custom")) {
                 return Err("only client tools with an input_schema are supported".to_owned());
@@ -446,7 +490,7 @@ fn message_value(
         generated,
     )?;
     Ok(
-        json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":blocks(&turn, id),"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":{"sampling":generated.sampling,"metrics":generated.metrics}}),
+        json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":blocks(&turn, id),"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":metallix(prepared, json!({"sampling":generated.sampling,"metrics":generated.metrics}))}),
     )
 }
 
@@ -579,7 +623,10 @@ fn stream(
 ) -> Result<(), String> {
     // The prompt is counted only once generation ends, so the opening usage
     // is zero and `message_delta` carries the real counts.
-    let start = json!({"type":"message_start","message":{"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}});
+    let mut start = json!({"type":"message_start","message":{"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}});
+    if !prepared.dropped_tools.is_empty() {
+        start["message"]["metallix"] = metallix(prepared, json!({}));
+    }
     // Thinking and text stream as blocks while they settle; the session
     // holds back markup, and tool calls arrive whole once the turn ends.
     let mut sse = LazySse::new(connection);
@@ -701,7 +748,7 @@ mod tests {
             json!({"top_k":0}),
             json!({"temperature":2.5}),
             json!({"tool_choice":{"type":"any"}}),
-            json!({"tools":[{"type":"web_search_20250305","name":"web_search"}]}),
+            json!({"tools":[{"type":"bash_20250124","name":"bash"}]}),
             json!({"tools":[{"name":"x"}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"x"}}]}]}),
             json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"Sure,"}]}),
@@ -834,6 +881,38 @@ mod tests {
                 Some(schema)
             );
         }
+    }
+
+    /// A server tool next to a client tool is left out of the prompt and
+    /// named in the reply, streamed and not; the client tool stays offered.
+    #[test]
+    fn server_tools_are_dropped_and_reported() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        let body =
+            with(&json!({"tools":[tool, {"type":"web_search_20250305","name":"web_search"}]}));
+        let prepared = prepare_body(&body).unwrap();
+        let offered: Vec<&Value> = prepared
+            .tools
+            .iter()
+            .map(|tool| &tool["function"]["name"])
+            .collect();
+        assert_eq!(offered, [&json!("read_file")]);
+        assert_eq!(prepared.dropped_tools, ["web_search"]);
+        let (status, reply) = json_body(&run(&body, &mut Scripted::new("Hi")));
+        assert_eq!(status, "HTTP/1.1 200 OK", "{reply}");
+        assert_eq!(reply["metallix"]["dropped_tools"], json!(["web_search"]));
+        let mut streamed = body;
+        streamed["stream"] = json!(true);
+        let wire = run(&streamed, &mut Scripted::new("Hi"));
+        let start: Value = events(&wire)
+            .into_iter()
+            .find(|(name, _)| name.as_deref() == Some("message_start"))
+            .map(|(_, data)| serde_json::from_str(&data).unwrap())
+            .unwrap();
+        assert_eq!(
+            start["message"]["metallix"]["dropped_tools"],
+            json!(["web_search"])
+        );
     }
 
     fn run(body: &Value, backend: &mut Scripted) -> String {
