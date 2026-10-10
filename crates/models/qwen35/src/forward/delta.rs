@@ -94,12 +94,12 @@ pub(super) fn chunked(
     )?
     .exp_device(&gpu)?;
     let key_rows = key.transpose_axes_device(&[0, 1, 3, 2], &gpu)?;
-    let strictly_below = Array::tri_device::<f32>(CHUNK_TOKENS, None, Some(-1), &gpu)?;
+    // A with its diagonal and the (zero) upper part left in place:
+    // `unit_lower_inverse` reads only the strictly lower part.
     let coupling = key
         .matmul_device(&key_rows, &gpu)?
         .multiply_device(&gamma, &gpu)?
-        .multiply_device(&beta, &gpu)?
-        .multiply_device(&strictly_below, &gpu)?;
+        .multiply_device(&beta, &gpu)?;
     let inverse = unit_lower_inverse(&coupling)?;
     let gain = cumulative.exp_device(&gpu)?.expand_dims_device(-1, &gpu)?;
     let corrected = inverse.matmul_device(value.multiply_device(&beta, &gpu)?, &gpu)?;
@@ -146,7 +146,8 @@ pub(super) fn chunked(
     Ok((output, state))
 }
 
-/// `(I + A)^-1` for strictly lower-triangular `A` of shape `[..., C, C]`.
+/// `(I + A)^-1` for the strictly lower-triangular part `A` of `coupling`
+/// (`[..., C, C]`); its diagonal and upper part are never read.
 ///
 /// Each `BLOCK_TOKENS`-wide diagonal block is inverted by forward
 /// substitution (row `i` of the inverse is `e_i - A_i T`, where only the rows
@@ -480,15 +481,18 @@ mod tests {
     }
 
     #[test]
-    fn unit_lower_inverse_inverts() {
+    fn unit_lower_inverse_inverts_the_strictly_lower_part() {
         let gpu = StreamOrDevice::gpu();
         let strictly_below = Array::tri_device::<f32>(64, None, Some(-1), &gpu).expect("mask");
-        let coupling = array(11, &[3, 64, 64])
+        // Nonzero diagonal and upper entries, which the inverse must ignore.
+        let full = array(11, &[3, 64, 64])
             .multiply_device(Array::from_f32(0.2), &gpu)
-            .and_then(|a| a.multiply_device(&strictly_below, &gpu))
+            .expect("full");
+        let coupling = full
+            .multiply_device(&strictly_below, &gpu)
             .expect("strictly lower");
         let identity = Array::eye_device::<f32>(64, None, None, &gpu).expect("identity");
-        let inverse = super::unit_lower_inverse(&coupling).expect("inverse");
+        let inverse = super::unit_lower_inverse(&full).expect("inverse");
         let product = identity
             .add_device(&coupling, &gpu)
             .and_then(|m| m.matmul_device(&inverse, &gpu))
