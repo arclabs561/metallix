@@ -40,6 +40,11 @@ use crate::{
 mod delta;
 #[cfg(test)]
 mod mlx_affine_tests;
+mod paged;
+#[cfg(test)]
+mod paged_tests;
+
+pub use paged::{Qwen35PagerStats, Qwen35Paging};
 
 /// Tokens per prefill graph. This bounds graph size even though the delta
 /// rule runs in 64-token chunks; longer prompts use successive graphs.
@@ -83,6 +88,8 @@ pub struct Qwen35Weights {
     /// `YaRN` rotary arrays when the configuration's scaling is in force.
     yarn: Option<YarnArrays>,
     numerics: Numerics,
+    /// Routed experts read on demand instead of held in `quantized`.
+    paged: Option<paged::PagedExperts>,
 }
 
 /// Precomputed `YaRN` inputs to MLX's rope: the per-pair periods it rotates
@@ -314,7 +321,54 @@ impl Qwen35Weights {
             precision,
             compute,
             numerics,
+            paged: None,
         })
+    }
+
+    /// Loads like [`Self::load`] at [`Qwen35Precision::Checkpoint`], except
+    /// that the routed experts of an MLX affine `qwen3_5_moe` checkpoint are
+    /// never loaded whole: each `MoE` call reads the experts it routes to
+    /// that are not resident, keeping at most `paging.budget_bytes` of them
+    /// (least recently used evicted first). This bounds logical cache
+    /// membership, not process or GPU footprint. Bit-identical outputs to
+    /// [`Self::load`] are the qualification target, not yet established for
+    /// every prefill shape.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`], plus [`Qwen35Error::Unsupported`] for a dense or
+    /// non-affine checkpoint and [`Qwen35Error::PagerBudget`] for a budget
+    /// smaller than one layer's experts.
+    pub fn load_paged(
+        model_dir: impl AsRef<Path>,
+        paging: Qwen35Paging,
+    ) -> Result<Self, Qwen35Error> {
+        let model_dir = model_dir.as_ref();
+        let mut weights = Self::load(model_dir, Qwen35Precision::Checkpoint)?;
+        let Qwen35Mlp::Experts { experts, .. } = weights.config.mlp else {
+            return Err(Qwen35Error::Unsupported("paging a dense checkpoint"));
+        };
+        if weights.numerics != Numerics::MlxLm {
+            return Err(Qwen35Error::Unsupported(
+                "paging experts outside mlx-lm's affine layout",
+            ));
+        }
+        let layers = weights.config.layers().len();
+        // The loaded expert arrays are still lazy: dropping them here means
+        // their payloads are never read.
+        weights
+            .quantized
+            .retain(|name, _| !name.contains(".mlp.switch_mlp."));
+        weights.paged = Some(paged::PagedExperts::open(
+            model_dir, layers, experts, paging,
+        )?);
+        Ok(weights)
+    }
+
+    /// The expert pager's counters, for a paged load.
+    #[must_use]
+    pub fn pager_stats(&self) -> Option<Qwen35PagerStats> {
+        self.paged.as_ref().map(paged::PagedExperts::stats)
     }
 
     /// Loads the text decoder of a `qwen35` GGUF file whose tensors are
@@ -378,6 +432,7 @@ impl Qwen35Weights {
             // goes through `with_rope_scaling`.
             yarn: None,
             numerics: Numerics::Transformers,
+            paged: None,
         };
         for canonical in order {
             let stored = names
@@ -1739,12 +1794,19 @@ fn mlp(weights: &Qwen35Weights, base: &str, input: &Array) -> Result<Array, Qwen
             project("down_proj.weight", &hidden)
         }
         Qwen35Mlp::Experts { top_k, .. } => {
-            let experts = match weights.numerics {
-                Numerics::Transformers => Experts::Fused {
+            let experts = match (weights.numerics, &weights.paged) {
+                (Numerics::Transformers, _) => Experts::Fused {
                     gate_up: weights.tensor(&format!("{base}.mlp.experts.gate_up_proj"))?,
                     down: weights.tensor(&format!("{base}.mlp.experts.down_proj"))?,
                 },
-                Numerics::MlxLm => Experts::Split {
+                (Numerics::MlxLm, Some(paged)) => Experts::Paged {
+                    paged,
+                    layer: base
+                        .strip_prefix("layers.")
+                        .and_then(|layer| layer.parse().ok())
+                        .ok_or(Qwen35Error::ShapeOverflow)?,
+                },
+                (Numerics::MlxLm, None) => Experts::Split {
                     gate: matrix("switch_mlp.gate_proj.weight")?,
                     up: matrix("switch_mlp.up_proj.weight")?,
                     down: matrix("switch_mlp.down_proj.weight")?,
@@ -1837,6 +1899,11 @@ enum Experts<'a> {
         up: Matrix<'a>,
         down: Matrix<'a>,
     },
+    /// mlx-lm's layout with the experts read on demand.
+    Paged {
+        paged: &'a paged::PagedExperts,
+        layer: usize,
+    },
 }
 
 /// One layer's `MoE` weights, as stored.
@@ -1865,7 +1932,7 @@ fn moe_block(tokens: &Array, block: &MoeTensors<'_>, top_k: usize) -> Result<Arr
     let gpu = StreamOrDevice::gpu();
     let numerics = match block.experts {
         Experts::Fused { .. } => Numerics::Transformers,
-        Experts::Split { .. } => Numerics::MlxLm,
+        Experts::Split { .. } | Experts::Paged { .. } => Numerics::MlxLm,
     };
     let routed = match block.experts {
         Experts::Fused { gate_up, down } => {
@@ -1875,6 +1942,11 @@ fn moe_block(tokens: &Array, block: &MoeTensors<'_>, top_k: usize) -> Result<Arr
         Experts::Split { gate, up, down } => {
             let routing = route_mlx(tokens, block.router, top_k)?;
             split_experts(tokens, [gate, up, down], &routing)?
+        }
+        Experts::Paged { paged, layer } => {
+            let routing = route_mlx(tokens, block.router, top_k)?;
+            let (stack, routing) = paged.stack(layer, &routing)?;
+            split_experts(tokens, stack.matrices(), &routing)?
         }
     };
     let shared = swiglu(
@@ -2671,6 +2743,21 @@ pub enum Qwen35Error {
     /// A size does not fit MLX's 32-bit shape arithmetic.
     #[error("shape overflows")]
     ShapeOverflow,
+    /// The request needs a capability this loader does not implement.
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
+    /// The expert budget cannot hold one layer's experts, which one prefill
+    /// call may route to.
+    #[error("expert budget of {budget} bytes is below one layer's experts, {needed} bytes")]
+    PagerBudget {
+        /// The requested budget.
+        budget: u64,
+        /// One layer's routed experts.
+        needed: u64,
+    },
+    /// The expert cache refused to hold an expert a call needs.
+    #[error("expert pager: {0}")]
+    Pager(String),
     /// MLX failed to construct or evaluate a graph.
     #[error("MLX evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
@@ -2768,6 +2855,7 @@ mod tests {
             compute: mlx_rs::Dtype::Float32,
             yarn: None,
             numerics: super::Numerics::Transformers,
+            paged: None,
         };
         let source = weights();
         let other = weights();

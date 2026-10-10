@@ -15,7 +15,7 @@ use super::{
 use crate::Qwen35Config;
 
 /// A two-layer dense `qwen3_5` small enough to build in memory.
-fn tiny_config(quantization: &Value) -> Value {
+pub(super) fn tiny_config(quantization: &Value) -> Value {
     json!({
         "model_type": "qwen3_5",
         "tie_word_embeddings": true,
@@ -46,7 +46,7 @@ fn tiny_config(quantization: &Value) -> Value {
 
 /// Every tensor of the tiny checkpoint, named as mlx-lm stores them: matrices
 /// quantized (4-bit, group 32; the `in_proj_b` override 8-bit), the rest BF16.
-fn tiny_tensors(config: &Value) -> HashMap<String, Array> {
+pub(super) fn tiny_tensors(config: &Value) -> HashMap<String, Array> {
     let parsed = Qwen35Config::parse(&config.to_string()).expect("tiny config");
     let quantization = parsed.quantization().expect("quantized");
     let gpu = StreamOrDevice::gpu();
@@ -95,7 +95,7 @@ fn quantization() -> Value {
 }
 
 /// Writes a checkpoint directory under the system temporary directory.
-fn write(name: &str, config: &Value, tensors: &HashMap<String, Array>) -> PathBuf {
+pub(super) fn write(name: &str, config: &Value, tensors: &HashMap<String, Array>) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qwen35-mlx-affine-{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).expect("temp dir");
     fs::write(dir.join("config.json"), config.to_string()).expect("config");

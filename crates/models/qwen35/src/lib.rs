@@ -92,6 +92,7 @@
 
 #[cfg(test)]
 mod arch_facts;
+pub mod experts;
 #[cfg(feature = "metal")]
 pub mod forward;
 pub mod gguf;
