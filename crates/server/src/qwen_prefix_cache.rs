@@ -185,6 +185,20 @@ pub(super) fn remember(
             }
             continue;
         }
+        // Sized before copying: a boundary the budget cannot hold (a long
+        // prompt's whole conversation) is skipped without materializing it.
+        // An extending snapshot is sized as its whole prefix: `insert` refuses
+        // a child whose parent and own bytes together exceed the budget.
+        let estimate = weights
+            .resident_prefix_kv_bytes(ids.len())
+            .map_err(|error| error.to_string())?;
+        if !cache.admits(
+            request.cache_salt,
+            &ids,
+            usize::try_from(estimate).unwrap_or(usize::MAX),
+        ) {
+            continue;
+        }
         let (snapshot, parent) = match &shared {
             Some((base_ids, base)) if ids.len() > base_ids.len() => (
                 weights.snapshot_resident_extending(executor, Rc::clone(base), ids.len()),
@@ -372,6 +386,13 @@ impl<V> PrefixCache<V> {
             .is_some_and(|entry| Self::matches(entry, salt, tokens))
     }
 
+    /// Whether [`Self::insert`] would cache an entry of `value_bytes` for
+    /// `tokens`, so a caller can skip building one that cannot be kept.
+    pub(crate) fn admits(&self, salt: Option<&str>, tokens: &[i32], value_bytes: usize) -> bool {
+        let bytes = value_bytes.saturating_add(tokens.len().saturating_mul(size_of::<i32>()));
+        !tokens.is_empty() && bytes <= self.budget_bytes && !self.contains(salt, tokens)
+    }
+
     /// Caches `value` for `tokens` under `salt`, evicting least-recently-used
     /// entries of any salt until it fits. Returns false, caching nothing, when
     /// the entry alone exceeds the budget or is already present.
@@ -396,10 +417,10 @@ impl<V> PrefixCache<V> {
         role: PrefixRole,
         parent: Option<&[i32]>,
     ) -> bool {
-        let bytes = value_bytes.saturating_add(tokens.len().saturating_mul(size_of::<i32>()));
-        if tokens.is_empty() || bytes > self.budget_bytes || self.contains(salt, &tokens) {
+        if !self.admits(salt, &tokens, value_bytes) {
             return false;
         }
+        let bytes = value_bytes.saturating_add(tokens.len().saturating_mul(size_of::<i32>()));
         let parent = match parent {
             None => None,
             Some(parent) => {
@@ -604,7 +625,11 @@ mod tests {
         assert!(!cache.contains(None, &[2, 2]));
         assert!(cache.contains(None, &[3, 3]));
         assert_eq!(cache.stats().bytes, 2 * entry);
-        // Larger than the whole budget: nothing is evicted for it.
+        // Larger than the whole budget: refused before building it, and
+        // nothing is evicted for it.
+        assert!(!cache.admits(None, &[4, 4], 2 * entry));
+        assert!(cache.admits(None, &[4, 4], 100));
+        assert!(!cache.admits(None, &[3, 3], 100), "already cached");
         assert!(!cache.insert(None, vec![4, 4], 'd', 2 * entry, PrefixRole::Preamble, None));
         assert_eq!(cache.stats().entries, 2);
         // Duplicates are not stored twice.

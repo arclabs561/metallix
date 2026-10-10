@@ -326,6 +326,24 @@ impl Qwen3MlxWeights {
         ))
     }
 
+    /// Bytes a [`Self::snapshot_resident_prefix`] of `tokens` positions holds,
+    /// known before copying, so a caller can skip a snapshot its budget
+    /// cannot hold without materializing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::forward::Qwen3ForwardError`] when the weights' K/V
+    /// precision cannot be determined or the byte count overflows.
+    pub fn resident_prefix_kv_bytes(
+        &self,
+        tokens: usize,
+    ) -> Result<u64, crate::forward::Qwen3ForwardError> {
+        self.forward_config.cached_kv_bytes_at(
+            tokens,
+            crate::forward::kv_precision(&self.forward_config, &self.tensors)?,
+        )
+    }
+
     /// Detaches the first `tokens` cached positions of a resident executor
     /// borrowed from these weights, for a later
     /// [`Self::resident_chat_executor_from`] on the same weights.

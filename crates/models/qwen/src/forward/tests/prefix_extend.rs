@@ -266,6 +266,13 @@ fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
     // Compact rows, not the 128-row stepped storage: layers x K,V x heads x
     // rows x head width x f32.
     assert_eq!(snapshot.kv_bytes(), 2 * 2 * 30 * 64 * 4);
+    // The pre-copy estimate a prefix cache budgets with is the same number.
+    assert_eq!(
+        config
+            .cached_kv_bytes_at(30, crate::forward::Qwen3FloatPrecision::Float32)
+            .expect("estimate"),
+        u64::try_from(snapshot.kv_bytes()).expect("bytes")
+    );
     let other = (0..20)
         .map(|index| (index * 3 + 1) % 16)
         .collect::<Vec<i32>>();
