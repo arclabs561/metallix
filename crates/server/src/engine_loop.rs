@@ -2541,10 +2541,25 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         // One running row: report one free block, which leaves no headroom.
-        let before = {
+        let capped = {
             let mut observed = harness.observed.lock().expect("observed");
             observed.free_blocks_cap = Some(1);
             observed.events.len()
+        };
+        // An iteration runs its chunks, then its decode step. A chunk whose
+        // headroom check ran before the cap can still land after `capped`,
+        // so count only from the first decode step that ends after the cap:
+        // every later iteration checked headroom under it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let before = loop {
+            let boundary = harness.observed.lock().expect("observed").events[capped..]
+                .iter()
+                .position(|event| matches!(event, Step::Decode(_)));
+            if let Some(offset) = boundary {
+                break capped + offset + 1;
+            }
+            assert!(Instant::now() < deadline, "no decode step after the cap");
+            thread::sleep(Duration::from_millis(1));
         };
         thread::sleep(Duration::from_millis(200));
         let during = {
