@@ -26,10 +26,7 @@ use mlx_rs::{Array, Dtype};
 use serde::Deserialize;
 
 use super::{Qwen3MlxWeights, Qwen3WeightPrecision};
-use crate::{
-    GPU_TEST_LOCK,
-    forward::{Qwen3AffineQuantization, Qwen3FloatPrecision},
-};
+use crate::forward::{Qwen3AffineQuantization, Qwen3FloatPrecision};
 
 /// Logit units, as in the BF16-against-float32 agreement rule.
 const NEAR_TIE_GAP: f32 = 0.5;
@@ -125,7 +122,7 @@ fn bundled_mlx() -> &'static str {
 #[ignore = "requires METALLIX_QWEN_MODEL on Apple-Silicon Metal"]
 fn quantizing_bf16_at_load_reproduces_mlx_quantize() {
     let mlx = bundled_mlx();
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     for bits in [4_u64, 6, 8] {
         let fixture: QuantizeFixture = serde_json::from_str(
             &fs::read_to_string(fixture_path(&format!(
@@ -204,7 +201,7 @@ fn teacher_forced_greedy_agrees_with_mlx_lm_outside_near_ties() {
     );
     let fixture: Fixture =
         serde_json::from_str(&fs::read_to_string(&path).expect("fixture")).expect("fixture JSON");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let weights =
         Qwen3MlxWeights::load(model("METALLIX_QWEN_AFFINE_MODEL")).expect("quantized load");
     assert!(matches!(

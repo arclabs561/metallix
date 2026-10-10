@@ -34,6 +34,34 @@ pub mod quantization;
 #[cfg(all(test, feature = "metal"))]
 pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Takes [`GPU_TEST_LOCK`], recovering it if an earlier test panicked while
+/// holding it: the lock guards no data, so the poison carries no broken
+/// invariant.
+#[cfg(all(test, feature = "metal"))]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod gpu_test_lock_tests {
+    /// A test that panics while holding the lock poisons it for the rest of
+    /// the process; later tests still take it. Every GPU test in this crate
+    /// runs after a poisoned lock whenever this test runs first.
+    #[test]
+    fn a_panic_under_the_gpu_test_lock_does_not_fail_later_tests() {
+        let panicked = std::thread::spawn(|| {
+            let _gpu = super::gpu_test_lock();
+            panic!("a test failed while holding the GPU lock");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(super::GPU_TEST_LOCK.is_poisoned());
+        drop(super::gpu_test_lock());
+    }
+}
+
 use serde::Deserialize;
 use thiserror::Error;
 

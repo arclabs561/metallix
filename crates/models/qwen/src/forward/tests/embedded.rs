@@ -41,7 +41,7 @@ fn plan(config: &Qwen3ForwardConfig) -> Qwen3ResidentChatPlan {
 
 #[test]
 fn spans_of_their_own_token_embeddings_match_the_ids_path_bit_for_bit() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = plan(&config);
@@ -74,7 +74,7 @@ fn spans_of_their_own_token_embeddings_match_the_ids_path_bit_for_bit() {
 
 #[test]
 fn chunks_straddling_a_span_match_one_prefill() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = plan(&config);
@@ -108,7 +108,7 @@ fn chunks_straddling_a_span_match_one_prefill() {
 
 #[test]
 fn other_rows_change_the_logits_and_cast_to_the_embedding_dtype() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = plan(&config);
@@ -132,7 +132,7 @@ fn other_rows_change_the_logits_and_cast_to_the_embedding_dtype() {
 
 #[test]
 fn refuses_image_spans_and_misshapen_rows() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = plan(&config);

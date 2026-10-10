@@ -546,7 +546,7 @@ fn queued_steps_match_synchronous_greedy_steps() {
 
     const LEAVE_AFTER: usize = 3;
     const JOIN_AT: usize = 5;
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = paged_config();
     let weights = paged_weights(&config);
     let prompts = mixed_prompts(5, 4);
@@ -653,7 +653,7 @@ fn queued_steps_match_synchronous_greedy_steps() {
 #[test]
 fn failed_queued_readback_retains_rows_until_caller_retires_them() {
     use crate::forward::StepInput;
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = paged_config();
     let weights = paged_weights(&config);
     let mut session = PagedQwen3Session::new(&config, &weights, pool(2)).expect("paged");

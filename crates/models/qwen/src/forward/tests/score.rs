@@ -23,7 +23,7 @@ fn log_softmax(row: &[f32]) -> Vec<f64> {
 /// chunk size, and chunking changes no gathered value.
 #[test]
 fn scoring_matches_all_position_logits_at_any_chunk_size() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = || {
@@ -98,7 +98,7 @@ fn scoring_matches_all_position_logits_at_any_chunk_size() {
 
 #[test]
 fn a_scoring_range_needs_a_prefix_within_the_sequence() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = config
@@ -120,7 +120,7 @@ fn a_scoring_range_needs_a_prefix_within_the_sequence() {
 /// `token_logprobs[i]` equals `max(top_logprobs[i].values())` exactly.
 #[test]
 fn a_greedy_tokens_logprob_is_bit_equal_to_its_top_alternative() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let config = two_layer_long_config();
     let weights = sensitive_weights();
     let plan = || {

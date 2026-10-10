@@ -194,7 +194,7 @@ fn quantized_greedy_decode_hot_path() {
     let model = env::var_os("METALLIX_QWEN_AFFINE_MODEL")
         .map(PathBuf::from)
         .expect("METALLIX_QWEN_AFFINE_MODEL is required for this ignored checkpoint probe");
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let weights = Qwen3MlxWeights::load(&model).expect("checkpoint load");
     let precision = weights.precision().expect("precision");
     for prompt_tokens in [2_300_usize, 128] {

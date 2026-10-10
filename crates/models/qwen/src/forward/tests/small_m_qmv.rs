@@ -12,7 +12,6 @@
 use mlx_rs::{Array, Dtype, ops, random};
 
 use super::super::small_m::{MAX_ROWS, applies, matmul, matmul_with_source, set_small_m_qmv};
-use crate::GPU_TEST_LOCK;
 use crate::quantization::{Qwen3AffineBits, Qwen3AffineGroupSize, Qwen3AffineQuantization};
 
 /// (K, N): N not a multiple of 8 exercises the clamped last tile.
@@ -99,7 +98,7 @@ fn failures(kernel: Kernel<'_>) -> usize {
 
 #[test]
 fn few_row_kernel_matches_mlx_in_fp32_and_within_its_bf16_error() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let failed = failures(&|x, w, s, b, g| matmul(x, &w.packed, s, b, g).expect("kernel"));
     assert_eq!(failed, 0, "{failed} cases outside the gate");
 }
@@ -114,7 +113,7 @@ fn kernel_without_bias() -> String {
 
 #[test]
 fn a_kernel_that_drops_the_group_bias_fails_the_gate() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let broken = kernel_without_bias();
     let failed = failures(&|x, w, s, b, g| {
         matmul_with_source(&broken, x, &w.packed, s, b, g).expect("kernel")
@@ -124,7 +123,7 @@ fn a_kernel_that_drops_the_group_bias_fails_the_gate() {
 
 #[test]
 fn only_two_to_sixteen_rows_of_four_bit_weights_are_routed() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let four = Qwen3AffineQuantization {
         bits: Qwen3AffineBits::Four,
         group_size: Qwen3AffineGroupSize::G64,
@@ -254,7 +253,7 @@ fn median(values: &[f64]) -> f64 {
 #[test]
 #[ignore = "requires METALLIX_QWEN_4BIT_MODEL and an idle Apple-Silicon GPU"]
 fn verify_cost_curve_with_and_without_the_few_row_kernel() {
-    let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+    let _gpu = crate::gpu_test_lock();
     let model = std::env::var_os("METALLIX_QWEN_4BIT_MODEL")
         .map(std::path::PathBuf::from)
         .expect("METALLIX_QWEN_4BIT_MODEL is required for this ignored test");

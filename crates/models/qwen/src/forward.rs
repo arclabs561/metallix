@@ -3488,7 +3488,7 @@ mod tests {
 
     #[test]
     fn qwen2_layout_reads_its_biases_and_caches_like_its_full_forward() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let config = Qwen3ForwardConfig::parse(
             r#"{
               "model_type":"qwen2",

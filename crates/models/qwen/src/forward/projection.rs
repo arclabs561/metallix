@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn affine_projections_match_their_dequantized_dense_weights() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let packed = quantize(&dense_weights());
         let dense = dequantized(&packed);
         let input = matrix(3, 64, 9).reshape(&[1, 3, 64]).expect("input");
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn packed_and_dense_tensors_only_reach_their_own_matmul() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let dense = dense_weights();
         let packed = quantize(&dense);
         let input = matrix(1, 64, 3).reshape(&[1, 1, 64]).expect("input");
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn a_quantized_decoder_runs_like_its_dequantized_dense_twin() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let packed = quantize(&dense_weights());
         let dense = dequantized(&packed);
         let (quantized_config, dense_config) = (config(true), config(false));
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn qwen2_adds_qkv_biases_after_either_matmul_and_nowhere_else() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let dense = qwen2_weights();
         let input = matrix(3, 64, 9).reshape(&[1, 3, 64]).expect("input");
         let stem = |name: &str| format!("model.layers.0.{name}");
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn a_quantized_qwen2_decoder_runs_like_its_dequantized_dense_twin() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let packed = quantize(&qwen2_weights());
         let dense = dequantized(&packed);
         let (quantized_config, dense_config) = (qwen2_config(true), qwen2_config(false));
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn embedded_rows_preserve_dense_and_affine_qwen_and_qwen2_paths() {
-        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let _gpu = crate::gpu_test_lock();
         let ids = [1, 2, 3, 4];
         for qwen2 in [false, true] {
             for affine in [false, true] {
