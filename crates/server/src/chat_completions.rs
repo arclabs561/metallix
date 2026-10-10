@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use chat_format::TurnDelta;
+use chat_format::{ToolRequirement, TurnDelta};
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Map, Value, json};
 
@@ -144,12 +144,6 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    /// Offered tools whose definition sets `strict: true`.
-    fn strict_tools(&self) -> Vec<String> {
-        crate::responses::strict_tools(&self.tools, &self.request.tools, |tool| {
-            tool["function"]["strict"] == Value::Bool(true)
-        })
-    }
     /// Reuses the validated chat prompt for teacher-forced scoring without
     /// exposing protocol parsing or generation-only controls to that route.
     pub(crate) fn into_prompt(self) -> (Vec<ChatMessage>, Vec<Value>, bool, Option<String>) {
@@ -269,20 +263,40 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         json_schema,
         ignore_eos: request.ignore_eos,
         speculation: request.speculation.into(),
+        tool_requirement: tool_requirement(request)?,
+        strict_tools: crate::responses::strict_tools(has_tools, &request.tools, |tool| {
+            tool["function"]["strict"] == Value::Bool(true)
+        }),
     };
     controls.validate(has_tools)?;
     Ok(controls)
 }
 
-/// Converts function tools to the template's shape. `tool_choice: "none"`
-/// withholds them from the prompt; forcing a call is unsupported because
-/// nothing here can make the model call.
-fn tools(request: &Request) -> Result<Vec<Value>, String> {
+/// `tool_choice`: `auto` and `none` leave the calls to the model (`none`
+/// withholds the tools), `required` demands one, and
+/// `{"type": "function", "function": {"name": ..}}` names the tool.
+fn tool_requirement(request: &Request) -> Result<ToolRequirement, String> {
     match &request.tool_choice {
-        None => {}
-        Some(choice) if choice == "auto" => {}
-        Some(choice) if choice == "none" => return Ok(Vec::new()),
-        Some(_) => return Err("only tool_choice auto or none is supported".into()),
+        None => Ok(ToolRequirement::Auto),
+        Some(choice) if choice == "auto" || choice == "none" => Ok(ToolRequirement::Auto),
+        Some(choice) if choice == "required" => Ok(ToolRequirement::Required),
+        Some(choice) => match (choice["type"].as_str(), choice["function"]["name"].as_str()) {
+            (Some("function"), Some(name)) => Ok(ToolRequirement::Named(name.to_owned())),
+            _ => Err("tool_choice must be auto, none, required or a named function".into()),
+        },
+    }
+}
+
+/// Converts function tools to the template's shape. `tool_choice: "none"`
+/// withholds them from the prompt; any other choice offers them all, and
+/// [`tool_requirement`] maps it onto the turn's tool grammar.
+fn tools(request: &Request) -> Result<Vec<Value>, String> {
+    if request
+        .tool_choice
+        .as_ref()
+        .is_some_and(|choice| choice == "none")
+    {
+        return Ok(Vec::new());
     }
     let mut names = HashSet::new();
     request
@@ -447,7 +461,7 @@ fn completion_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(&prepared.tools, &prepared.strict_tools(), generated)?;
+    let turn = assistant_turn(&prepared.tools, &prepared.controls.strict_tools, generated)?;
     let mut message = json!({"role":"assistant","content":if turn.calls.is_empty() || !turn.text.trim().is_empty() {json!(turn.text)} else {Value::Null},"refusal":null});
     if !turn.calls.is_empty() {
         let calls: Vec<Value> = tool_calls(&turn, id)
@@ -608,7 +622,7 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(&prepared.tools, &prepared.strict_tools(), &generated) {
+    let turn = match assistant_turn(&prepared.tools, &prepared.controls.strict_tools, &generated) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "invalid_model_output", &error),
     };
@@ -688,7 +702,8 @@ mod tests {
             json!({"max_tokens":10,"max_completion_tokens":20}),
             json!({"temperature":3.0}),
             json!({"reasoning_effort":"maximum"}),
-            json!({"tool_choice":"required","tools":[tool.clone()]}),
+            json!({"tool_choice":"required"}),
+            json!({"tool_choice":{"type":"custom"},"tools":[tool.clone()]}),
             json!({"tools":[{"type":"custom","custom":{"name":"x"}}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}),
             json!({"messages":[{"role":"function","name":"f","content":"x"}]}),
@@ -1035,6 +1050,35 @@ mod tests {
         let mut backend = Scripted::new(off_schema);
         let (status, _) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
         assert_eq!(status, "HTTP/1.1 400 Bad Request");
+    }
+
+    /// `required` and a named function map onto the turn's tool requirement,
+    /// and `strict: true` on a function marks it strict.
+    #[test]
+    fn tool_choice_and_strict_reach_the_controls() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        let mapped = |extra: Value| prepare_body(&with(&extra)).unwrap().controls;
+        let required = mapped(json!({"tool_choice":"required","tools":[tool.clone()]}));
+        assert_eq!(required.tool_requirement, ToolRequirement::Required);
+        let named = mapped(
+            json!({"tool_choice":{"type":"function","function":{"name":"read_file"}},"tools":[tool.clone()]}),
+        );
+        assert_eq!(
+            named.tool_requirement,
+            ToolRequirement::Named("read_file".into())
+        );
+        let mut strict = tool.clone();
+        strict["function"]["strict"] = json!(true);
+        assert_eq!(
+            mapped(json!({"tools":[strict.clone()]})).strict_tools,
+            ["read_file"]
+        );
+        // `none` withholds the tools, so nothing is strict.
+        assert!(
+            mapped(json!({"tool_choice":"none","tools":[strict]}))
+                .strict_tools
+                .is_empty()
+        );
     }
 
     #[test]

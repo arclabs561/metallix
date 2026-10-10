@@ -24,7 +24,7 @@ use tracing::field::Empty;
 
 use chat_format::{
     AssistantTurn, ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TokenClass,
-    TokenId, TurnDelta,
+    TokenId, ToolRequirement, TurnDelta,
 };
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
@@ -185,6 +185,23 @@ pub(crate) struct ChatRequest<'a> {
     /// time. Greedy output is the plain greedy output up to floating-point
     /// near-ties; sampled output keeps the sampling distribution.
     pub(crate) speculation: SpeculationRequest,
+    /// What the turn's tool calls must be: any, at least one, or to one tool.
+    pub(crate) tool_requirement: &'a ToolRequirement,
+    /// Offered tools whose calls must match their parameter schema.
+    pub(crate) strict_tools: &'a [String],
+}
+
+/// The default [`ChatRequest::tool_requirement`].
+static ANY_TOOL_CALLS: ToolRequirement = ToolRequirement::Auto;
+
+impl ChatRequest<'_> {
+    /// Whether the turn's tool calls run under a grammar: a strict tool, or
+    /// a `tool_choice` that requires a call.
+    #[must_use]
+    pub(crate) fn constrains_tool_calls(&self) -> bool {
+        !self.tools.is_empty()
+            && (*self.tool_requirement != ToolRequirement::Auto || !self.strict_tools.is_empty())
+    }
 }
 
 impl<'a> ChatRequest<'a> {
@@ -203,6 +220,8 @@ impl<'a> ChatRequest<'a> {
             cache_salt: None,
             ignore_eos: false,
             speculation: SpeculationRequest::Automatic,
+            tool_requirement: &ANY_TOOL_CALLS,
+            strict_tools: &[],
         }
     }
 
@@ -358,6 +377,10 @@ pub(crate) struct GenerationControls {
     pub(crate) ignore_eos: bool,
     /// See [`ChatRequest::speculation`].
     pub(crate) speculation: SpeculationRequest,
+    /// See [`ChatRequest::tool_requirement`].
+    pub(crate) tool_requirement: ToolRequirement,
+    /// See [`ChatRequest::strict_tools`].
+    pub(crate) strict_tools: Vec<String>,
 }
 
 /// The `speculation` request field, a metallix extension shared by every
@@ -394,6 +417,28 @@ impl GenerationControls {
     pub(crate) fn validate(&self, has_tools: bool) -> Result<(), String> {
         if self.max_tokens == Some(0) {
             return Err("the output token limit must be positive".into());
+        }
+        if self.tool_requirement != ToolRequirement::Auto && !has_tools {
+            return Err("a required or named tool choice needs offered tools".into());
+        }
+        let constrained_tools = has_tools
+            && (self.tool_requirement != ToolRequirement::Auto || !self.strict_tools.is_empty());
+        if constrained_tools {
+            if !cfg!(feature = "structured-output") {
+                return Err(
+                    "strict tools and required or named tool choice need a server built with \
+                     the structured-output feature"
+                        .into(),
+                );
+            }
+            // The grammar ends the turn where its calls end; ignoring the
+            // end-of-turn token would leave it nothing valid to continue with.
+            if self.ignore_eos {
+                return Err(
+                    "ignore_eos cannot be combined with strict tools or a required tool choice"
+                        .into(),
+                );
+            }
         }
         if let Some(temperature) = self.sampling.temperature {
             if !(0.0..=2.0).contains(&temperature) {
@@ -466,6 +511,8 @@ impl GenerationControls {
             cache_salt: None,
             ignore_eos: self.ignore_eos,
             speculation: self.speculation,
+            tool_requirement: &self.tool_requirement,
+            strict_tools: &self.strict_tools,
         }
     }
 }
@@ -1682,15 +1729,19 @@ impl TokenPicker {
         )
     }
 
+    /// `tool_grammar` holds the turn's tool calls to a Lark grammar; a JSON
+    /// schema, when set, constrains the whole output instead.
     fn new(
         request: ChatRequest<'_>,
         defaults: SamplingDefaults,
         model: &Path,
         vocabulary_size: usize,
+        tool_grammar: Option<&str>,
     ) -> Result<Self, String> {
-        let applied = request
-            .sampling
-            .resolve(defaults, request.json_schema.is_some());
+        let applied = request.sampling.resolve(
+            defaults,
+            request.json_schema.is_some() || tool_grammar.is_some(),
+        );
         let policy = applied.seed.map(|seed| {
             let configuration = SamplingConfiguration {
                 seed,
@@ -1713,8 +1764,16 @@ impl TokenPicker {
                 .map_err(|error| format!("JSON schema could not be compiled: {error}"))
             })
             .transpose()?;
+        #[cfg(feature = "structured-output")]
+        let constraint = match (constraint, tool_grammar) {
+            (None, Some(grammar)) => Some(
+                crate::qwen_constraints::ConstraintRun::load_grammar(model, grammar)
+                    .map_err(|error| format!("tool grammar could not be compiled: {error}"))?,
+            ),
+            (constraint, _) => constraint,
+        };
         #[cfg(not(feature = "structured-output"))]
-        if request.json_schema.is_some() {
+        if request.json_schema.is_some() || tool_grammar.is_some() {
             let _ = model;
             return Err(
                 "JSON schema output requires a server built with the structured-output feature"
@@ -1855,7 +1914,11 @@ impl TokenPicker {
     )]
     fn check_complete_output(&self) -> Result<(), String> {
         #[cfg(feature = "structured-output")]
-        if let Some(constraint) = self.constraint.as_ref().filter(|run| run.is_complete()) {
+        if let Some(constraint) = self
+            .constraint
+            .as_ref()
+            .filter(|run| run.is_complete() && run.checks_whole_output())
+        {
             constraint
                 .validated_output()
                 .map_err(|error| format!("schema output failed validation: {error}"))?;

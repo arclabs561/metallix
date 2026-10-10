@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use chat_format::TurnDelta;
+use chat_format::{ToolRequirement, TurnDelta};
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
@@ -93,8 +93,7 @@ enum ToolChoice {
         _disable_parallel_tool_use: Option<IgnoredAny>,
     },
     Tool {
-        #[serde(rename = "name")]
-        _name: IgnoredAny,
+        name: String,
         #[serde(default, rename = "disable_parallel_tool_use")]
         _disable_parallel_tool_use: Option<IgnoredAny>,
     },
@@ -139,15 +138,6 @@ pub(crate) struct Prepared {
     messages: Vec<ChatMessage>,
     tools: Vec<Value>,
     controls: GenerationControls,
-}
-
-impl Prepared {
-    /// Offered tools whose definition sets `strict: true`.
-    fn strict_tools(&self) -> Vec<String> {
-        crate::responses::strict_tools(&self.tools, &self.request.tools, |tool| {
-            tool["strict"] == Value::Bool(true)
-        })
-    }
 }
 
 /// An Anthropic-shaped error body.
@@ -230,6 +220,15 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         json_schema,
         ignore_eos: request.ignore_eos,
         speculation: request.speculation.into(),
+        // `any` demands a call and `tool` names it (Anthropic tool_choice).
+        tool_requirement: match &request.tool_choice {
+            Some(ToolChoice::Any { .. }) => ToolRequirement::Required,
+            Some(ToolChoice::Tool { name, .. }) => ToolRequirement::Named(name.clone()),
+            None | Some(ToolChoice::Auto { .. } | ToolChoice::None) => ToolRequirement::Auto,
+        },
+        strict_tools: crate::responses::strict_tools(has_tools, &request.tools, |tool| {
+            tool["strict"] == Value::Bool(true)
+        }),
     };
     controls.validate(has_tools)?;
     Ok(controls)
@@ -241,11 +240,9 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
 /// execution, editors) have no executor here.
 fn tools(request: &Request) -> Result<Vec<Value>, String> {
     match request.tool_choice {
-        None | Some(ToolChoice::Auto { .. }) => {}
-        Some(ToolChoice::None) => return Ok(Vec::new()),
-        Some(ToolChoice::Any { .. } | ToolChoice::Tool { .. }) => {
-            return Err("only tool_choice auto or none is supported".into());
+        None | Some(ToolChoice::Auto { .. } | ToolChoice::Any { .. } | ToolChoice::Tool { .. }) => {
         }
+        Some(ToolChoice::None) => return Ok(Vec::new()),
     }
     let mut names = HashSet::new();
     request
@@ -442,7 +439,7 @@ fn message_value(
     generated: &ChatGeneration,
     id: &str,
 ) -> Result<Value, String> {
-    let turn = assistant_turn(&prepared.tools, &prepared.strict_tools(), generated)?;
+    let turn = assistant_turn(&prepared.tools, &prepared.controls.strict_tools, generated)?;
     Ok(
         json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":blocks(&turn, id),"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":{"sampling":generated.sampling,"metrics":generated.metrics}}),
     )
@@ -611,7 +608,7 @@ fn stream(
         }
     };
     record_usage(&generated);
-    let turn = match assistant_turn(&prepared.tools, &prepared.strict_tools(), &generated) {
+    let turn = match assistant_turn(&prepared.tools, &prepared.controls.strict_tools, &generated) {
         Ok(turn) => turn,
         Err(error) => return failure(&mut sse, "api_error", &error),
     };
@@ -684,7 +681,6 @@ mod tests {
 
     #[test]
     fn rejects_unknown_fields_and_unsupported_semantics() {
-        let tool: Value = serde_json::from_str(TOOL).unwrap();
         for extra in [
             json!({"frobnicate":1}),
             json!({"thinking":{"type":"enabled","budget_tokens":2048,"style":"x"}}),
@@ -694,8 +690,7 @@ mod tests {
             json!({"container":"c1"}),
             json!({"top_k":0}),
             json!({"temperature":2.5}),
-            json!({"tool_choice":{"type":"any"},"tools":[tool.clone()]}),
-            json!({"tool_choice":{"type":"tool","name":"read_file"},"tools":[tool.clone()]}),
+            json!({"tool_choice":{"type":"any"}}),
             json!({"tools":[{"type":"web_search_20250305","name":"web_search"}]}),
             json!({"tools":[{"name":"x"}]}),
             json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"x"}}]}]}),
@@ -1059,6 +1054,29 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         let mut backend = Scripted::new(off_schema);
         let (status, _) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
         assert_eq!(status, "HTTP/1.1 400 Bad Request");
+    }
+
+    /// `any` and a named `tool` map onto the turn's tool requirement, and
+    /// `strict: true` marks a tool strict.
+    #[test]
+    fn tool_choice_and_strict_reach_the_controls() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        let mapped = |extra: Value| prepare_body(&with(&extra)).unwrap().controls;
+        let any = mapped(json!({"tool_choice":{"type":"any"},"tools":[tool.clone()]}));
+        assert_eq!(any.tool_requirement, ToolRequirement::Required);
+        let named = mapped(
+            json!({"tool_choice":{"type":"tool","name":"read_file"},"tools":[tool.clone()]}),
+        );
+        assert_eq!(
+            named.tool_requirement,
+            ToolRequirement::Named("read_file".into())
+        );
+        let mut strict = tool;
+        strict["strict"] = json!(true);
+        assert_eq!(
+            mapped(json!({"tools":[strict]})).strict_tools,
+            ["read_file"]
+        );
     }
 
     #[test]

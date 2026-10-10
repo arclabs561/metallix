@@ -127,6 +127,19 @@ impl TurnStart {
                 PromptReuse::Prefix { ids } => ids,
             },
         );
+        // Strict tools and a required or named tool choice hold by grammar.
+        // An unsupported tool format fails here, before any model work.
+        let tool_grammar = request
+            .constrains_tool_calls()
+            .then(|| {
+                model.format.tool_grammar(
+                    request.tools,
+                    request.strict_tools,
+                    request.tool_requirement,
+                    &prompt.text,
+                )
+            })
+            .transpose()?;
         let input_ids = prompt.ids;
         deadline.check()?;
         let max_tokens = output_budget(model.context_limit, request.max_tokens, input_ids.len())?;
@@ -140,6 +153,7 @@ impl TurnStart {
             model.sampling_defaults,
             model.model,
             model.vocabulary_size,
+            tool_grammar.as_deref(),
         )?;
         Ok((
             Self {

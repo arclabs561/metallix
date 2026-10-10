@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use chat_format::TurnDelta;
+use chat_format::{ToolRequirement, TurnDelta};
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
@@ -178,6 +178,21 @@ pub(crate) fn thinking_for_effort(effort: Option<&str>) -> Result<(bool, Option<
 /// field), greedy if it has none; an explicit temperature of zero is greedy.
 /// The response's `metallix.sampling` records the policy used and which
 /// defaults applied.
+/// `tool_choice`: `auto` leaves the calls to the model, `required` demands
+/// one, and `{"type": "function", "name": ..}` names the tool. `none` is
+/// refused because these tools would still reach the prompt.
+fn tool_requirement(choice: Option<&Value>) -> Result<ToolRequirement, String> {
+    match choice {
+        None => Ok(ToolRequirement::Auto),
+        Some(choice) if choice == "auto" => Ok(ToolRequirement::Auto),
+        Some(choice) if choice == "required" => Ok(ToolRequirement::Required),
+        Some(choice) => match (choice["type"].as_str(), choice["name"].as_str()) {
+            (Some("function"), Some(name)) => Ok(ToolRequirement::Named(name.to_owned())),
+            _ => Err("tool_choice must be auto, required or a named function".into()),
+        },
+    }
+}
+
 pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> {
     if request.background == Some(true) {
         return Err("background responses are unsupported".into());
@@ -231,6 +246,10 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         json_schema,
         ignore_eos: request.ignore_eos,
         speculation: request.speculation.into(),
+        tool_requirement: tool_requirement(request.tool_choice.as_ref())?,
+        strict_tools: strict_tools(!request.tools.is_empty(), &request.tools, |tool| {
+            tool["strict"] == Value::Bool(true)
+        }),
     };
     controls.validate(!request.tools.is_empty())?;
     Ok(controls)
@@ -262,9 +281,6 @@ pub(crate) fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
     }
     if request.previous_response_id.is_some() {
         return Err("send complete input history; previous_response_id is not supported".into());
-    }
-    if request.tool_choice.as_ref().is_some_and(|v| v != "auto") {
-        return Err("only automatic tool choice is supported".into());
     }
     let mut messages = Vec::new();
     let mut pending_calls = HashMap::new();
@@ -727,19 +743,21 @@ pub(crate) fn assistant_turn(
     Ok(turn)
 }
 
-/// Names selected for terminal schema validation by the protocol's policy.
-/// An empty offered set means tools were disabled for this turn.
+/// Names of the declared tools `select` picks, or none when tools are not
+/// offered this turn (`tool_choice: none`). Each protocol passes its own
+/// policy: the tools it constrains by grammar (an explicit `strict: true`),
+/// or the tools whose calls it validates once generated.
 pub(crate) fn strict_tools(
-    offered: &[Value],
+    offered: bool,
     declared: &[Value],
-    validate: impl Fn(&Value) -> bool,
+    select: impl Fn(&Value) -> bool,
 ) -> Vec<String> {
-    if offered.is_empty() {
+    if !offered {
         return Vec::new();
     }
     declared
         .iter()
-        .filter(|tool| validate(tool))
+        .filter(|tool| select(tool))
         .filter_map(|tool| tool.get("name").or_else(|| tool["function"].get("name")))
         .filter_map(Value::as_str)
         .map(str::to_owned)
@@ -822,7 +840,9 @@ fn response_value(
         complete,
     } = {
         let offered = tools(request)?;
-        let strict = strict_tools(&offered, &request.tools, |tool| {
+        // Responses validates every tool not marked `strict: false`; only an
+        // explicit `strict: true` is also constrained by the grammar.
+        let strict = strict_tools(!offered.is_empty(), &request.tools, |tool| {
             tool["strict"] != Value::Bool(false)
         });
         assistant_turn(&offered, &strict, generated)?
@@ -1040,6 +1060,34 @@ mod tests {
         .unwrap();
         assert_eq!(messages(&request).unwrap().len(), 1);
         assert_eq!(controls(&request).unwrap(), GenerationControls::default());
+    }
+
+    /// `required` and a named function map onto the turn's tool requirement;
+    /// `none` is refused because the tools would still reach the prompt.
+    #[test]
+    fn tool_choice_and_strict_reach_the_controls() {
+        let mut tool: Value = serde_json::from_str(TOOL).unwrap();
+        let mapped = |extra: Value| controls(&request_with(&extra).unwrap());
+        let required = mapped(json!({"tool_choice":"required","tools":[tool.clone()]})).unwrap();
+        assert_eq!(required.tool_requirement, ToolRequirement::Required);
+        let named = mapped(
+            json!({"tool_choice":{"type":"function","name":"read_file"},"tools":[tool.clone()]}),
+        )
+        .unwrap();
+        assert_eq!(
+            named.tool_requirement,
+            ToolRequirement::Named("read_file".into())
+        );
+        assert!(mapped(json!({"tool_choice":"none","tools":[tool.clone()]})).is_err());
+        assert!(
+            mapped(json!({"tool_choice":"required"})).is_err(),
+            "required needs tools"
+        );
+        tool["strict"] = json!(true);
+        assert_eq!(
+            mapped(json!({"tools":[tool]})).unwrap().strict_tools,
+            ["read_file"]
+        );
     }
 
     #[test]
@@ -1436,9 +1484,9 @@ mod tests {
             json!({"model":"control","input":"hello","tools":[read_file.clone()]}),
         )
         .unwrap();
-        let controls = GenerationControls::default();
+        // The strict list comes from the request's controls.
         let response_value = |request: &Request, generated: &_, id| {
-            response_value(request, &controls, generated, id)
+            response_value(request, &controls(request).unwrap(), generated, id)
         };
         assert!(response_value(&request, &generation("<tool_call>{"), "test").is_err());
         let undeclared = r#"<tool_call>{"name":"shell","arguments":{}}</tool_call>"#;

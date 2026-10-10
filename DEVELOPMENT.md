@@ -433,7 +433,7 @@ child process and admits one request at a time; a request to a busy model gets
 bodies are limited to 1 MiB. The endpoint accepts text-only input, complete
 history, validated function definitions and function-call outputs, greedy
 sampling, and optional SSE. It rejects response storage, response-ID chaining,
-images, nondefault sampling controls, and forced tool choice. Treat it as a
+images, and nondefault sampling controls. Treat it as a
 small Responses compatibility target, not a complete OpenAI or Codex service.
 Generated calls to declared tools receive terminal schema validation on
 `/v1/responses` when `strict` is omitted, `null`, or `true`; explicit `false`
@@ -442,8 +442,16 @@ explicit `strict: true` tools (nested in `function` for Chat). Parsed malformed
 calls still fail; undeclared tool names pass through for client validation.
 Clients should validate calls before executing them.
 
-These are local response-validation rules, not a generation-time grammar or a
-promise of schema-valid emission. [OpenAI's strict-mode guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)
+An explicit `strict: true` tool, `tool_choice: "required"` (Messages:
+`{"type": "any"}`), or a named tool choice also constrains generation: the turn
+is sampled under a grammar that admits only calls to the offered tools, with a
+strict tool's arguments held to its schema, and requires at least one call when
+the choice does. This applies to checkpoints whose tool-call format has a
+grammar (Qwen3's `<tool_call>` JSON); others answer such a request 400. The
+validation above stays as a check on the grammar.
+
+Without those flags the rules above are response validation only, not a promise
+of schema-valid emission. [OpenAI's strict-mode guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)
 distinguishes Responses' omitted-flag normalization/fallback from Chat's
 non-strict default. This server does not reproduce that hosted normalization
 or fallback negotiation; Responses instead retains local validation against

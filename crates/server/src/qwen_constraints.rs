@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const MAX_SCHEMA_BYTES: usize = 32 * 1024;
+/// A tool grammar embeds every offered tool's schema (at most 64 tools).
+const MAX_GRAMMAR_BYTES: usize = 256 * 1024;
 const MAX_TOKENIZER_BYTES: usize = 64 * 1024 * 1024;
 
 /// Explicit local schema input; both forms share compilation and validation.
@@ -43,6 +45,9 @@ impl SchemaSource<'_> {
 
 pub(crate) struct ConstraintRun {
     session: JsonConstraintSession,
+    /// Built from a JSON schema whose whole output is validated at the end;
+    /// false for a tool-call grammar, whose calls are checked as parsed.
+    whole_output: bool,
     setup_ms: f64,
     sampling_ms: Vec<f64>,
     complete: bool,
@@ -178,12 +183,45 @@ impl ConstraintRun {
         let session = compiler.session(schema, CONSTRAINT_LIMITS)?;
         Ok(Self {
             session,
+            whole_output: true,
             setup_ms: started.elapsed().as_secs_f64() * 1000.0,
             sampling_ms: Vec::new(),
             complete: false,
             schema_json_sha256,
             tokenizer_json_sha256,
         })
+    }
+
+    /// A run for a Lark grammar (tool calls), which has no single schema
+    /// to validate its whole output against. It compiles against the
+    /// model's cached compiler, as a JSON Schema run does.
+    pub(crate) fn load_grammar(
+        model: &Path,
+        grammar: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let started = Instant::now();
+        let (compiler, tokenizer_json_sha256) = compiler_for(model)?;
+        let session = compiler.lark_session(
+            grammar,
+            ConstraintLimits {
+                max_schema_bytes: MAX_GRAMMAR_BYTES,
+                ..CONSTRAINT_LIMITS
+            },
+        )?;
+        Ok(Self {
+            session,
+            whole_output: false,
+            setup_ms: started.elapsed().as_secs_f64() * 1000.0,
+            sampling_ms: Vec::new(),
+            complete: false,
+            schema_json_sha256: format!("{:x}", Sha256::digest(grammar.as_bytes())),
+            tokenizer_json_sha256,
+        })
+    }
+
+    /// Whether completion is validated against a whole-output schema.
+    pub(crate) fn checks_whole_output(&self) -> bool {
+        self.whole_output
     }
 
     pub(crate) fn sample(
@@ -277,7 +315,7 @@ impl ConstraintRun {
         sampled: bool,
     ) -> Result<Value, Box<dyn std::error::Error>> {
         let started = Instant::now();
-        let output = if self.complete {
+        let output = if self.complete && self.whole_output {
             Some(self.session.validate_complete()?)
         } else {
             None
@@ -333,6 +371,7 @@ impl ConstraintRun {
     pub(crate) fn from_session(session: JsonConstraintSession) -> Self {
         Self {
             session,
+            whole_output: true,
             setup_ms: 0.0,
             sampling_ms: Vec::new(),
             complete: false,
@@ -573,5 +612,115 @@ mod source_tests {
         let (first, _) = super::compiler_for(&model).expect("first compiler");
         let (second, _) = super::compiler_for(&model).expect("second compiler");
         assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+}
+
+/// Opt-in: a tool-call grammar built for a real Qwen3 checkpoint, driven a
+/// token at a time with logits that favour one token, as decode would be.
+#[cfg(test)]
+mod tool_grammar_tests {
+    use std::path::PathBuf;
+
+    use chat_format::{ChatFormat, ChatMessage, ChatRole, Conversation, ToolRequirement};
+    use serde_json::{Value, json};
+
+    use super::ConstraintRun;
+
+    fn model() -> PathBuf {
+        std::env::var_os("METALLIX_QWEN_MODEL")
+            .map(PathBuf::from)
+            .expect("METALLIX_QWEN_MODEL names a local Qwen3 checkpoint")
+    }
+
+    fn weather() -> Vec<Value> {
+        vec![
+            json!({"type":"function","function":{"name":"get_weather","description":"Weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}),
+        ]
+    }
+
+    /// Feeds `text` then end-of-turn, favouring each token in turn; returns
+    /// how many were taken as favoured before the grammar chose another.
+    fn drive(
+        run: &mut ConstraintRun,
+        format: &ChatFormat,
+        vocab: usize,
+        text: &str,
+    ) -> (usize, usize) {
+        let mut ids = format.tokenizer().encode_prompt(text).unwrap();
+        ids.push(i32::try_from(format.stops().end_turn().get()).unwrap());
+        for (taken, &id) in ids.iter().enumerate() {
+            let mut logits = vec![0.0_f32; vocab];
+            logits[usize::try_from(id).unwrap()] = 30.0;
+            let (picked, _) = run.sample(&logits, false).unwrap();
+            if picked != id {
+                return (taken, ids.len());
+            }
+        }
+        (ids.len(), ids.len())
+    }
+
+    #[test]
+    #[ignore = "requires METALLIX_QWEN_MODEL pointing to a local Qwen3 checkpoint"]
+    fn qwen3_tool_grammar_holds_calls_to_the_strict_schema_and_requirement() {
+        let model = model();
+        let config: Value =
+            serde_json::from_slice(&std::fs::read(model.join("config.json")).unwrap()).unwrap();
+        let vocab = usize::try_from(config["vocab_size"].as_u64().unwrap()).unwrap();
+        let format = ChatFormat::load(&model, vocab).unwrap();
+        let tools = weather();
+        let messages = [ChatMessage::text(ChatRole::User, "Weather in Paris?")];
+        let prompt = format
+            .prompt(
+                Conversation {
+                    messages: &messages,
+                    tools: &tools,
+                    enable_thinking: false,
+                    reasoning_effort: None,
+                },
+                true,
+            )
+            .unwrap();
+        let grammar = |requirement: &ToolRequirement| {
+            format
+                .tool_grammar(&tools, &["get_weather".into()], requirement, &prompt.text)
+                .unwrap()
+        };
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+        let auto = grammar(&ToolRequirement::Auto);
+        for accepted in [
+            call.to_owned(),
+            format!("Let me check.\n{call}"),
+            "It is sunny.".to_owned(),
+        ] {
+            let mut run = ConstraintRun::load_grammar(&model, &auto).unwrap();
+            let (taken, total) = drive(&mut run, &format, vocab, &accepted);
+            assert_eq!(taken, total, "refused {accepted:?}");
+            let parsed =
+                chat_format::parse_turn(format.turn_format(), &accepted, &tools, false, true)
+                    .unwrap();
+            for parsed in &parsed.calls {
+                chat_format::check_call(&tools, parsed).unwrap();
+            }
+        }
+        for refused in [
+            call.replace("\"Paris\"", "5"),
+            call.replace("get_weather", "shell"),
+        ] {
+            let mut run = ConstraintRun::load_grammar(&model, &auto).unwrap();
+            let (taken, total) = drive(&mut run, &format, vocab, &refused);
+            assert!(taken < total, "accepted {refused:?}");
+        }
+        let mut required =
+            ConstraintRun::load_grammar(&model, &grammar(&ToolRequirement::Required)).unwrap();
+        let (taken, total) = drive(&mut required, &format, vocab, "It is sunny.");
+        assert_eq!(
+            taken + 1,
+            total,
+            "end of turn must be refused before a call"
+        );
+        let named = grammar(&ToolRequirement::Named("get_weather".into()));
+        let mut run = ConstraintRun::load_grammar(&model, &named).unwrap();
+        let (taken, total) = drive(&mut run, &format, vocab, call);
+        assert_eq!(taken, total, "the named tool's call is refused");
     }
 }
