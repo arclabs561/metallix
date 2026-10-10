@@ -43,21 +43,33 @@ fn rows(array: &Array, width: usize) -> Vec<Vec<f64>> {
 
 /// Worst `max |a - b| / rms(b)` over rows, and the relative L2 of the whole.
 fn distances(ours: &[Vec<f64>], reference: &[Vec<f64>]) -> (f64, f64) {
+    let (worst, l2, _) = distances_with_worst(ours, reference);
+    (worst, l2)
+}
+
+/// [`distances`] plus where the worst element sits, for diagnosis:
+/// `(row, channel, ours, reference, row rms)`.
+fn distances_with_worst(
+    ours: &[Vec<f64>],
+    reference: &[Vec<f64>],
+) -> (f64, f64, (usize, usize, f64, f64, f64)) {
     let mut worst = 0.0_f64;
+    let mut at = (0, 0, 0.0, 0.0, 0.0);
     let (mut diff, mut norm) = (0.0, 0.0);
-    for (a, b) in ours.iter().zip(reference) {
+    for (row, (a, b)) in ours.iter().zip(reference).enumerate() {
         #[allow(clippy::cast_precision_loss)]
         let rms = (b.iter().map(|v| v * v).sum::<f64>() / b.len() as f64).sqrt();
-        let max = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f64::max);
-        worst = worst.max(max / rms);
+        for (channel, (x, y)) in a.iter().zip(b).enumerate() {
+            let score = (x - y).abs() / rms;
+            if score > worst {
+                worst = score;
+                at = (row, channel, *x, *y, rms);
+            }
+        }
         diff += a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>();
         norm += b.iter().map(|v| v * v).sum::<f64>();
     }
-    (worst, (diff / norm).sqrt())
+    (worst, (diff / norm).sqrt(), at)
 }
 
 struct Reference {
@@ -113,26 +125,28 @@ fn layer_states_match_diffusers() {
     let states = encoder.layer_states(&reference.real_ids).unwrap();
     let hidden = usize::try_from(states[0].shape()[2]).unwrap();
     let source_bf16 = source_bf16_path.as_deref().map(load);
+    // Every layer is measured and reported before any bar is enforced.
+    let mut failures = Vec::new();
     for (state, layer) in states.iter().zip(TEXT_LAYERS) {
         let key = format!("hidden_states.{layer}");
         let ours = rows(state, hidden);
         let expected = rows(&reference.tensors[&key], hidden);
         let (real_worst, real_l2) = distances(&ours[..real_len], &expected[..real_len]);
-        let (pad_worst, pad_l2) = distances(&ours[real_len..], &expected[real_len..]);
+        let (pad_worst, pad_l2, (row, channel, x, y, rms)) =
+            distances_with_worst(&ours[real_len..], &expected[real_len..]);
         eprintln!(
             "{precision:?} layer {layer}: real max/rms {real_worst:.2e} rel L2 {real_l2:.2e}; \
-             pad max/rms {pad_worst:.2e} rel L2 {pad_l2:.2e}"
+             pad max/rms {pad_worst:.2e} rel L2 {pad_l2:.2e} \
+             (worst at pad row {row}, channel {channel}: ours {x:.6e}, source {y:.6e}, row rms {rms:.3e})"
         );
         match &source_bf16 {
             None => {
-                assert!(
-                    real_worst <= F32_MAX_ABS_OVER_ROW_RMS,
-                    "layer {layer} real rows"
-                );
-                assert!(
-                    pad_worst <= F32_MAX_ABS_OVER_ROW_RMS,
-                    "layer {layer} padding rows"
-                );
+                if real_worst > F32_MAX_ABS_OVER_ROW_RMS {
+                    failures.push(format!("layer {layer} real rows"));
+                }
+                if pad_worst > F32_MAX_ABS_OVER_ROW_RMS {
+                    failures.push(format!("layer {layer} padding rows"));
+                }
             }
             Some(source) => {
                 let source = rows(&source[&key], hidden);
@@ -141,11 +155,19 @@ fn layer_states_match_diffusers() {
                 eprintln!(
                     "  source bf16: real rel L2 {source_real:.2e}, pad rel L2 {source_pad:.2e}"
                 );
-                assert!(real_l2 <= 2.0 * source_real, "layer {layer} real rows");
-                assert!(pad_l2 <= 2.0 * source_pad, "layer {layer} padding rows");
+                if real_l2 > 2.0 * source_real {
+                    failures.push(format!("layer {layer} real rows"));
+                }
+                if pad_l2 > 2.0 * source_pad {
+                    failures.push(format!("layer {layer} padding rows"));
+                }
             }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "{precision:?} bar missed: {failures:?}"
+    );
 }
 
 /// Gate C1: layer 8 compared with the reference's layer 9 must fail the f32
