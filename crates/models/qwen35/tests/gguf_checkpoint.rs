@@ -127,7 +127,7 @@ fn read_oracle(path: &PathBuf) -> Oracle {
         .map(|b| i32::from_le_bytes(b.try_into().expect("4")))
         .collect();
     let info = file.tensor("logits").expect("logits tensor");
-    assert_eq!(info.encoding(), GgufEncoding::F32);
+    assert_eq!(info.encoding().gguf(), Some(GgufEncoding::F32));
     // llama-results declares the tensor with the token count innermost but
     // writes each position's vocabulary contiguously, so take the bytes as
     // `[tokens, vocab]` and derive the width from the element count.
@@ -166,8 +166,8 @@ fn expected_resident(file: &GgufFile) -> (u64, u64) {
         ]
         .iter()
         .any(|norm| name.ends_with(&format!("{norm}.weight")));
-        resident += match info.encoding() {
-            GgufEncoding::Q8_0 if info.shape().len() == 2 => elements * 9 / 8,
+        resident += match info.encoding().gguf() {
+            Some(GgufEncoding::Q8_0) if info.shape().len() == 2 => elements * 9 / 8,
             _ if zero_centered => elements * 2,
             _ => stored,
         };
@@ -388,7 +388,7 @@ fn gguf_q8_0_tensors_dequantize_exactly() {
     let (mut tensors, mut mismatches, mut values) = (0, 0_usize, 0_usize);
     for name in file.names() {
         let info = file.tensor(name).expect("listed");
-        if info.encoding() != GgufEncoding::Q8_0 || info.shape().len() != 2 {
+        if info.encoding().gguf() != Some(GgufEncoding::Q8_0) || info.shape().len() != 2 {
             continue;
         }
         let bytes = file.read(name, 8 << 30).expect("read");

@@ -4,7 +4,9 @@
 //! A [`TensorSource`] answers, for a tensor name, its stored encoding, shape
 //! and byte range, and reads one tensor's bytes on request. Model adapters
 //! map names and decode encodings; this crate knows neither models nor MLX.
-//! GGUF is the first container ([`gguf::GgufFile`]).
+//! GGUF is the first container ([`gguf::GgufFile`]). Encodings are
+//! container-neutral ([`TensorEncoding`]), so one table can describe GGUF
+//! blocks, plain safetensors dtypes and MLX affine codes.
 
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
@@ -16,10 +18,89 @@ use std::{ops::Range, path::PathBuf};
 pub use blockfloat::gguf::GgufEncoding;
 use thiserror::Error;
 
+/// An element type stored one value per element, as safetensors names them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DType {
+    /// 64-bit IEEE float.
+    F64,
+    /// 32-bit IEEE float.
+    F32,
+    /// 16-bit IEEE float.
+    F16,
+    /// bfloat16.
+    BF16,
+    /// 64-bit signed integer.
+    I64,
+    /// 32-bit signed integer.
+    I32,
+    /// 16-bit signed integer.
+    I16,
+    /// 8-bit signed integer.
+    I8,
+    /// 64-bit unsigned integer.
+    U64,
+    /// 32-bit unsigned integer.
+    U32,
+    /// 16-bit unsigned integer.
+    U16,
+    /// 8-bit unsigned integer.
+    U8,
+    /// One byte per boolean.
+    Bool,
+}
+
+impl DType {
+    /// Bytes per element.
+    #[must_use]
+    pub const fn size(self) -> u64 {
+        match self {
+            Self::F64 | Self::I64 | Self::U64 => 8,
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
+            Self::I8 | Self::U8 | Self::Bool => 1,
+        }
+    }
+}
+
+/// How a tensor's elements are stored.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TensorEncoding {
+    /// One value per element.
+    Plain(DType),
+    /// A GGUF type, possibly block-quantized.
+    Gguf(GgufEncoding),
+    /// MLX affine codes: `bits`-wide codes packed in `u32` words, with one
+    /// scale and one bias per `group_size` columns stored as the sibling
+    /// tensors `<stem>.scales` and `<stem>.biases`.
+    Affine {
+        /// Bits per code.
+        bits: u8,
+        /// Columns sharing one scale and bias.
+        group_size: u16,
+    },
+}
+
+impl TensorEncoding {
+    /// The GGUF type, if this is one.
+    #[must_use]
+    pub const fn gguf(self) -> Option<GgufEncoding> {
+        match self {
+            Self::Gguf(encoding) => Some(encoding),
+            Self::Plain(_) | Self::Affine { .. } => None,
+        }
+    }
+}
+
+impl From<GgufEncoding> for TensorEncoding {
+    fn from(encoding: GgufEncoding) -> Self {
+        Self::Gguf(encoding)
+    }
+}
+
 /// One stored tensor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TensorInfo {
-    encoding: GgufEncoding,
+    encoding: TensorEncoding,
     shape: Vec<u64>,
     range: Range<u64>,
 }
@@ -27,7 +108,7 @@ pub struct TensorInfo {
 impl TensorInfo {
     /// A record as a container describes it; `shape` is outermost first.
     #[must_use]
-    pub const fn new(encoding: GgufEncoding, shape: Vec<u64>, range: Range<u64>) -> Self {
+    pub const fn new(encoding: TensorEncoding, shape: Vec<u64>, range: Range<u64>) -> Self {
         Self {
             encoding,
             shape,
@@ -37,7 +118,7 @@ impl TensorInfo {
 
     /// The stored encoding.
     #[must_use]
-    pub const fn encoding(&self) -> GgufEncoding {
+    pub const fn encoding(&self) -> TensorEncoding {
         self.encoding
     }
 

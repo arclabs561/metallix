@@ -20,7 +20,7 @@ use std::{
 };
 
 use blockfloat::gguf::{AffineParameters, GgufDecodeError, GgufEncoding, decode, repack_affine};
-use checkpoint::{CheckpointError, TensorInfo, TensorSource, gguf::GgufFile};
+use checkpoint::{CheckpointError, TensorEncoding, TensorInfo, TensorSource, gguf::GgufFile};
 use mlx_rs::{
     Array, Dtype, StreamOrDevice, fast,
     ops::{
@@ -344,7 +344,7 @@ impl Qwen35Weights {
         shape: &[i32],
     ) -> Result<(), Qwen35Error> {
         let gpu = StreamOrDevice::gpu();
-        let encoding = info.encoding();
+        let encoding = gguf_encoding(name, info)?;
         if encoding == GgufEncoding::Q8_0
             && shape.len() == 2
             && self.precision == Qwen35Precision::Checkpoint
@@ -393,7 +393,7 @@ impl Qwen35Weights {
             other => {
                 return Err(Qwen35Error::Encoding {
                     tensor: name.to_owned(),
-                    encoding: other,
+                    encoding: other.into(),
                 });
             }
         };
@@ -552,6 +552,14 @@ impl Qwen35Weights {
     }
 }
 
+/// A GGUF file's tensor encoding; the GGUF loader decodes nothing else.
+fn gguf_encoding(name: &str, info: &TensorInfo) -> Result<GgufEncoding, Qwen35Error> {
+    info.encoding().gguf().ok_or_else(|| Qwen35Error::Encoding {
+        tensor: name.to_owned(),
+        encoding: info.encoding(),
+    })
+}
+
 /// Puts a GGUF tensor's value heads back in grouped order, in place on its
 /// stored bytes. Rows and whole column blocks move intact, so this is exact
 /// for every encoding.
@@ -562,7 +570,7 @@ fn reorder_value_heads(
     order: &[usize],
     name: &str,
 ) -> Result<(), Qwen35Error> {
-    let encoding = info.encoding();
+    let encoding = gguf_encoding(name, info)?;
     let shape = info.shape();
     let columns = if shape.len() == 2 { shape[1] } else { 1 };
     let size = |elements: u64| -> Result<usize, Qwen35Error> {
@@ -571,7 +579,7 @@ fn reorder_value_heads(
             .and_then(|bytes| usize::try_from(bytes).ok())
             .ok_or_else(|| Qwen35Error::Encoding {
                 tensor: name.to_owned(),
-                encoding,
+                encoding: encoding.into(),
             })
     };
     let row_bytes = size(columns)?;
@@ -1686,7 +1694,7 @@ pub enum Qwen35Error {
         /// The stored tensor's name.
         tensor: String,
         /// Its encoding.
-        encoding: GgufEncoding,
+        encoding: TensorEncoding,
     },
     /// A GGUF tensor's payload could not be decoded.
     #[error(transparent)]

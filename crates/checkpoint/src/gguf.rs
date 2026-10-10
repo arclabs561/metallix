@@ -23,7 +23,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{CheckpointError, GgufEncoding, TensorInfo, TensorSource};
+use crate::{CheckpointError, GgufEncoding, TensorEncoding, TensorInfo, TensorSource};
 
 const MAGIC: &[u8; 4] = b"GGUF";
 const DEFAULT_ALIGNMENT: u64 = 32;
@@ -566,7 +566,7 @@ fn tensor_table(
             .filter(|range| offset.is_multiple_of(alignment) && range.end <= length)
             .ok_or_else(|| CheckpointError::Range(name.clone()))?;
         let info = TensorInfo {
-            encoding,
+            encoding: TensorEncoding::Gguf(encoding),
             shape,
             range,
         };

@@ -369,7 +369,7 @@ mod tests {
     fn embedding_only() -> Table {
         Table(HashMap::from([(
             "token_embd.weight".to_owned(),
-            TensorInfo::new(GgufEncoding::Q8_0, vec![248_320, 1024], 0..1),
+            TensorInfo::new(GgufEncoding::Q8_0.into(), vec![248_320, 1024], 0..1),
         )]))
     }
 

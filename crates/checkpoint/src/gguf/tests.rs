@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::{GgufArray, GgufFile, GgufValue};
-use crate::{CheckpointError, GgufEncoding, TensorSource};
+use crate::{CheckpointError, GgufEncoding, TensorEncoding, TensorSource};
 
 /// A GGUF v3 file built field by field, so each test can break one field.
 #[derive(Clone)]
@@ -179,7 +179,8 @@ fn reads_metadata_shapes_and_payloads() {
     assert_eq!(gguf.names(), ["matrix", "row"]);
     let matrix = gguf.tensor("matrix").expect("matrix");
     assert_eq!(matrix.shape(), [2, 3], "shape is outermost first");
-    assert_eq!(matrix.encoding(), GgufEncoding::F32);
+    assert_eq!(matrix.encoding(), TensorEncoding::Gguf(GgufEncoding::F32));
+    assert_eq!(matrix.encoding().gguf(), Some(GgufEncoding::F32));
     let bytes = gguf.read("matrix", 1024).expect("read");
     let values: Vec<f32> = bytes
         .chunks_exact(4)
@@ -187,7 +188,7 @@ fn reads_metadata_shapes_and_payloads() {
         .collect();
     assert_eq!(values, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
     let row = gguf.tensor("row").expect("row");
-    assert_eq!(row.encoding(), GgufEncoding::Q8_0);
+    assert_eq!(row.encoding(), TensorEncoding::Gguf(GgufEncoding::Q8_0));
     assert_eq!(row.range().end - row.range().start, 34);
     assert!(matches!(
         gguf.read("row", 33),
