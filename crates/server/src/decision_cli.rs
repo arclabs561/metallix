@@ -21,7 +21,7 @@ pub(crate) struct DecisionArgs {
     #[arg(long, default_value_t = 2048, value_parser = crate::cli::parse_context_tokens)]
     context_tokens: u32,
     /// Logical K/V admission budget in MiB, not a physical memory limit.
-    #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
+    #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
     kv_budget_mib: u32,
 }
 

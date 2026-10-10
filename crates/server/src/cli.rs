@@ -150,7 +150,7 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
         context_tokens: u32,
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
-        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
         kv_budget_mib: u32,
         /// Emit a structured receipt for a single prompt.
         #[arg(long, requires = "prompt")]
@@ -174,7 +174,7 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
         context_tokens: u32,
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
-        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=8192))]
+        #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
         kv_budget_mib: u32,
         /// Emit a structured execution receipt. Task success is assessed by the caller.
         #[arg(long)]
@@ -212,15 +212,17 @@ pub(crate) enum Command {
         /// Paged K/V pool per generating model, in MiB, allocated when the
         /// model loads. Defaults to the smaller of 4096 and a quarter of
         /// physical memory.
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=32768))]
+        #[arg(long, value_parser = crate::parse_kv_budget_mib)]
         kv_budget_mib: Option<u32>,
         /// Per-model budget in MiB for prompt-prefix K/V reused across requests
         /// (shared system and tool preambles, earlier turns); separate from
         /// `--kv-budget-mib`. 0 disables reuse.
         #[arg(long, default_value_t = crate::chat_generation::DEFAULT_PREFIX_CACHE_MIB, value_parser = clap::value_parser!(u32).range(0..=65_536))]
         prefix_cache_mib: u32,
-        /// Cooperative generation budget per request, in milliseconds.
-        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=120_000))]
+        /// Cooperative generation budget per request, in milliseconds, up to
+        /// 24 hours; a long-context prefill can take many minutes. The HTTP
+        /// response deadline follows it.
+        #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=86_400_000))]
         generation_timeout_ms: u32,
         /// Requests that may wait, in arrival order, while a model is busy; 0
         /// refuses any overlap. A registry entry's `queue_depth` overrides it.

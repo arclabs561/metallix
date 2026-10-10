@@ -28,7 +28,10 @@ use chat_format::{
 };
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
-use crate::qwen_forward::{SamplerId, SamplingConfiguration, SamplingPolicy};
+use crate::{
+    http_transport::body_bytes_for_context,
+    qwen_forward::{SamplerId, SamplingConfiguration, SamplingPolicy},
+};
 
 #[path = "chat_decoder.rs"]
 pub(crate) mod decoder;
@@ -68,7 +71,6 @@ mod memory_checkpoint;
 #[path = "chat_score_checkpoint_tests.rs"]
 mod score_checkpoint;
 
-const MAX_CHAT_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_MESSAGES: usize = 256;
 const MAX_CHAT_TOOLS: usize = 64;
 const MIB_BYTES: u64 = 1024 * 1024;
@@ -147,7 +149,8 @@ pub(crate) fn render_generation_prompt(
 ) -> Result<GenerationTemplatePrompt, String> {
     let messages = [ChatMessage::text(ChatRole::User, prompt)];
     let request = ChatRequest::new(&messages, 1);
-    validate_request(request)?;
+    // No session context here: the 1 MiB floor applies.
+    validate_request(request, 0)?;
     let (config, ..) = read_config(model)?;
     let format = ChatFormat::load(model, config.vocab_size)?;
     Ok(GenerationTemplatePrompt {
@@ -1010,7 +1013,7 @@ impl ChatSession {
     /// question can contribute K/V state to another question.
     pub(crate) fn prefill_chat(&mut self, messages: &[ChatMessage]) -> Result<ChatPrefill, String> {
         let request = ChatRequest::new(messages, 1);
-        validate_request(request)?;
+        validate_request(request, self.context_limit)?;
         let render = tracing::info_span!("chat.render", render_ms = Empty);
         let (prompt, render_ms) = timed(&render, "render_ms", || self.render(request))?;
         let input_ids = prompt.ids;
@@ -1563,7 +1566,10 @@ fn load_config(
     ))
 }
 
-fn validate_request(request: ChatRequest<'_>) -> Result<(), String> {
+/// Checks a request's shape and size before rendering. `context_tokens`
+/// sizes the byte limit ([`body_bytes_for_context`]), so a long-context
+/// server accepts the prompts its context holds.
+fn validate_request(request: ChatRequest<'_>, context_tokens: usize) -> Result<(), String> {
     if request.messages.is_empty() || request.messages.len() > MAX_CHAT_MESSAGES {
         return Err(format!(
             "chat requires 1 through {MAX_CHAT_MESSAGES} messages; received {}",
@@ -1616,9 +1622,10 @@ fn validate_request(request: ChatRequest<'_>) -> Result<(), String> {
                 .checked_add(encoded.len())
                 .ok_or_else(|| String::from("chat input byte count overflows"))
         })?;
-    if input_bytes > MAX_CHAT_INPUT_BYTES {
+    let limit = body_bytes_for_context(context_tokens);
+    if input_bytes > limit {
         return Err(format!(
-            "chat messages and tools exceed the {MAX_CHAT_INPUT_BYTES}-byte limit"
+            "chat messages and tools exceed the {limit}-byte limit"
         ));
     }
     Ok(())
@@ -2073,8 +2080,8 @@ mod tests {
 
     use super::{
         ChatFinishReason, ChatGenerationError, ChatMessage, ChatRequest, ChatRole, ChatSession,
-        ChatToolCall, ChatToolResult, GenerationDeadline, MAX_CHAT_INPUT_BYTES, ResidentChatLimits,
-        SamplingDefaults, TurnModel, TurnStart, TurnStep, render_generation_prompt,
+        ChatToolCall, ChatToolResult, GenerationDeadline, ResidentChatLimits, SamplingDefaults,
+        TurnModel, TurnStart, TurnStep, render_generation_prompt,
     };
     use chat_format::{
         ChatFormat, ChatTemplate, SpecialTokens,
@@ -2613,10 +2620,26 @@ mod tests {
 
     #[test]
     fn generation_template_rejects_oversize_user_input_before_template_reads() {
-        let prompt = "x".repeat(MAX_CHAT_INPUT_BYTES + 1);
+        let prompt = "x".repeat(super::body_bytes_for_context(0) + 1);
         let error = render_generation_prompt(Path::new("missing-model"), &prompt)
             .expect_err("input boundary must run before template reads");
         assert!(error.contains("byte limit"));
+    }
+
+    /// The input byte limit follows the session's context: a 262K-token
+    /// session accepts a 2 MiB prompt that a 2K-token session refuses, and
+    /// a prompt one byte over the long limit is still refused.
+    #[test]
+    fn chat_input_limit_follows_the_context() {
+        let prompt = "x".repeat(2 * 1024 * 1024);
+        let messages = [ChatMessage::text(ChatRole::User, &prompt)];
+        let request = ChatRequest::new(&messages, 1);
+        assert!(super::validate_request(request, 262_144).is_ok());
+        let short = super::validate_request(request, 2_048).expect_err("2K context");
+        assert!(short.contains("1048576-byte limit"), "{short}");
+        let over = "x".repeat(super::body_bytes_for_context(262_144) + 1);
+        let messages = [ChatMessage::text(ChatRole::User, &over)];
+        assert!(super::validate_request(ChatRequest::new(&messages, 1), 262_144).is_err());
     }
 
     #[test]

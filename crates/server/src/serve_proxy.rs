@@ -336,6 +336,10 @@ fn serve_inner(
             crate::gpu::check_capture_path(&telemetry::child_path(path, &entry.id))?;
         }
     }
+    let transport = TransportLimits::for_context(
+        settings.context_tokens as usize,
+        Duration::from_millis(u64::from(settings.generation_timeout_ms)),
+    );
     let launcher = Launcher {
         executable: std::env::current_exe().map_err(|error| error.to_string())?,
         settings,
@@ -384,7 +388,7 @@ fn serve_inner(
         budget_mib,
         residency: Mutex::new(()),
     });
-    proxy_models(&server, &pool, TransportLimits::default(), None)
+    proxy_models(&server, &pool, transport, None)
 }
 
 type Started = Result<(Child, std::sync::mpsc::Receiver<SocketAddr>), String>;

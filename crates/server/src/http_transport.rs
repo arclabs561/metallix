@@ -27,15 +27,51 @@ pub(crate) struct TransportLimits {
     pub(crate) response_deadline: Duration,
 }
 
+/// Bytes a JSON request for a prompt of `context_tokens` may need: 16 per
+/// token covers multi-byte text plus JSON escaping. Never below the 1 MiB
+/// that bounds a short-context server, so short contexts keep today's limit.
+pub(crate) const fn body_bytes_for_context(context_tokens: usize) -> usize {
+    let bytes = context_tokens.saturating_mul(16);
+    if bytes > DEFAULT_BODY_BYTES {
+        bytes
+    } else {
+        DEFAULT_BODY_BYTES
+    }
+}
+
+const DEFAULT_BODY_BYTES: usize = 1024 * 1024;
+const DEFAULT_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
+/// Room after the generation budget for rendering, framing and the last
+/// write, so a response that uses its whole budget is not cut off.
+const RESPONSE_GRACE: Duration = Duration::from_secs(30);
+
+impl TransportLimits {
+    /// Limits for a server admitting `context_tokens` per request whose
+    /// generation may run `generation_timeout`: the body cap follows the
+    /// context ([`body_bytes_for_context`]) and the response deadline
+    /// covers the generation budget plus a grace period. Defaults are the
+    /// floor for both.
+    pub(crate) fn for_context(context_tokens: usize, generation_timeout: Duration) -> Self {
+        let default = Self::default();
+        Self {
+            body_bytes: body_bytes_for_context(context_tokens),
+            response_deadline: default
+                .response_deadline
+                .max(generation_timeout.saturating_add(RESPONSE_GRACE)),
+            ..default
+        }
+    }
+}
+
 impl Default for TransportLimits {
     fn default() -> Self {
         Self {
             header_bytes: 16 * 1024,
             headers: 64,
-            body_bytes: 1024 * 1024,
+            body_bytes: DEFAULT_BODY_BYTES,
             read_deadline: Duration::from_secs(5),
             write_idle: Duration::from_secs(5),
-            response_deadline: Duration::from_secs(120),
+            response_deadline: DEFAULT_RESPONSE_DEADLINE,
         }
     }
 }
@@ -659,6 +695,19 @@ mod tests {
                 .write_all(&bytes[offset..])
                 .expect("test tail writes");
         }
+    }
+
+    /// Body and deadline limits follow the served context and generation
+    /// budget, with today's defaults as the floor for short contexts.
+    #[test]
+    fn limits_follow_the_context_and_generation_budget() {
+        let short = TransportLimits::for_context(2_048, Duration::from_secs(60));
+        assert_eq!(short.body_bytes, TransportLimits::default().body_bytes);
+        assert_eq!(short.response_deadline, Duration::from_secs(120));
+        let long = TransportLimits::for_context(1_010_000, Duration::from_secs(3_600));
+        assert_eq!(long.body_bytes, 16 * 1_010_000);
+        assert_eq!(long.response_deadline, Duration::from_secs(3_630));
+        assert_eq!(super::body_bytes_for_context(0), 1024 * 1024);
     }
 
     #[test]

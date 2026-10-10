@@ -110,7 +110,7 @@ impl TurnStart {
             },
         );
         deadline.check()?;
-        validate_request(request)?;
+        validate_request(request, model.context_limit)?;
         let started = Instant::now();
         let render = tracing::info_span!(
             "chat.render",

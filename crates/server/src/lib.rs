@@ -160,13 +160,7 @@ use inspect::{
 #[cfg(feature = "metal")]
 fn default_kv_budget_mib() -> u32 {
     const MIB: u64 = 1 << 20;
-    let physical = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok());
-    if let Some(bytes) = physical {
+    if let Some(bytes) = physical_memory_bytes() {
         u32::try_from((bytes / 4 / MIB).min(4096))
             .unwrap_or(4096)
             .max(1)
@@ -174,6 +168,37 @@ fn default_kv_budget_mib() -> u32 {
         tracing::warn!("could not read physical memory; --kv-budget-mib defaults to 512");
         512
     }
+}
+
+/// This Mac's physical memory (`hw.memsize`), if it can be read.
+#[cfg(feature = "metal")]
+fn physical_memory_bytes() -> Option<u64> {
+    std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+}
+
+/// Parses `--kv-budget-mib`: at least 1 MiB and at most this Mac's physical
+/// memory. There is no fixed ceiling, so a long context (Qwen3.5-9B holds
+/// about 31 GiB of K/V at 1M tokens) can be planned; the adapters still
+/// refuse a context whose state does not fit the budget.
+#[cfg(feature = "metal")]
+pub(crate) fn parse_kv_budget_mib(value: &str) -> Result<u32, String> {
+    let mib: u32 = value.parse().map_err(|error| format!("{error}"))?;
+    if mib == 0 {
+        return Err(String::from("the K/V budget must be at least 1 MiB"));
+    }
+    if let Some(physical) = physical_memory_bytes().map(|bytes| bytes >> 20) {
+        if u64::from(mib) > physical {
+            return Err(format!(
+                "{mib} MiB exceeds this Mac's {physical} MiB of physical memory"
+            ));
+        }
+    }
+    Ok(mib)
 }
 
 #[cfg(feature = "metal")]
@@ -986,7 +1011,7 @@ mod tests {
                 ..
             }
         ));
-        for value in ["0", "120001"] {
+        for value in ["0", "86400001"] {
             assert!(
                 Cli::try_parse_from([
                     "mx",
@@ -999,6 +1024,38 @@ mod tests {
                 .is_err()
             );
         }
+        // A long-context prefill may run for many minutes.
+        assert!(
+            Cli::try_parse_from([
+                "mx",
+                "serve",
+                "--model",
+                "model",
+                "--generation-timeout-ms",
+                "3600000",
+            ])
+            .is_ok()
+        );
+    }
+
+    /// The K/V budget has no fixed ceiling below physical memory: a budget
+    /// above the old 8 GiB (chat) and 32 GiB (serve) caps parses when the
+    /// machine has the memory, and zero or more than physical memory is
+    /// refused.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn kv_budget_is_bounded_by_physical_memory_not_a_constant() {
+        assert!(super::parse_kv_budget_mib("0").is_err());
+        assert!(super::parse_kv_budget_mib("x").is_err());
+        let physical = super::physical_memory_bytes().expect("hw.memsize") >> 20;
+        let above_old_caps = 40_000_u64.min(physical);
+        assert_eq!(
+            super::parse_kv_budget_mib(&above_old_caps.to_string()).map(u64::from),
+            Ok(above_old_caps)
+        );
+        let refused = super::parse_kv_budget_mib(&(physical + 1).to_string())
+            .expect_err("above physical memory");
+        assert!(refused.contains("physical memory"), "{refused}");
     }
 
     #[cfg(feature = "metal")]

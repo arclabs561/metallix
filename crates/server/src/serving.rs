@@ -679,7 +679,7 @@ fn serve_inner(
                 &server,
                 &models,
                 generation_timeout,
-                TransportLimits::default(),
+                TransportLimits::for_context(limits.context_tokens(), generation_timeout),
                 None,
             )
         }
