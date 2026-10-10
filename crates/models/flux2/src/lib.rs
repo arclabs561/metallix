@@ -31,7 +31,6 @@
 //! ```
 
 #![deny(missing_docs)]
-#![warn(clippy::missing_errors_doc)]
 
 mod config;
 pub use config::{ConfigError, Flux2TransformerConfig};

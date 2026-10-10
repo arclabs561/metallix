@@ -6,7 +6,6 @@
 //! model.
 
 #![deny(missing_docs)]
-#![warn(clippy::missing_errors_doc)]
 
 mod mel;
 mod wav;

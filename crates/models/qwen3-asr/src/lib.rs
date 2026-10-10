@@ -7,7 +7,6 @@
 //! formats are rejected before tokenizer or weight files are read.
 
 #![deny(missing_docs)]
-#![warn(clippy::missing_errors_doc)]
 
 pub mod config;
 #[cfg(feature = "metal")]

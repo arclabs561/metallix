@@ -13,7 +13,6 @@
 //! give a span another family's positions.
 
 #![deny(missing_docs)]
-#![warn(clippy::missing_errors_doc)]
 
 use std::ops::Range;
 

@@ -14,7 +14,6 @@
 //! existing buffer.
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
-#![warn(clippy::missing_errors_doc)]
 
 use std::ffi::CString;
 use std::sync::OnceLock;

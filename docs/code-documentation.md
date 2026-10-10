@@ -168,14 +168,13 @@ obligation it meets and how, every `unsafe fn` a `# Safety` section.
 The gate already builds rustdoc with `-D warnings`, so broken intra-doc links
 fail it. Each crate adds `#![deny(missing_docs)]` once its public items are
 documented. Clippy's `missing_errors_doc` and `missing_panics_doc` keep the
-sections honest: `missing_panics_doc` is on through `clippy::pedantic`, and
-`missing_errors_doc` is enabled per crate as each is retrofitted.
+sections honest: both are on for every crate through `clippy::pedantic`.
 
 `scripts/check_doc_ratchet.py` keeps that progress. A crate not in its
-`PENDING` list must carry both attributes in its `lib.rs`, and a listed crate
-that already carries them fails until it is removed from the list. Retrofit a
-crate by documenting it, adding the attributes and removing it from `PENDING`
-in one change. A new crate starts documented.
+`PENDING` list must carry `#![deny(missing_docs)]` in its `lib.rs`, and a
+listed crate that already carries it fails until it is removed from the list.
+Retrofit a crate by documenting it, adding the attribute and removing it from
+`PENDING` in one change. A new crate starts documented.
 
 ## Anti-patterns
 

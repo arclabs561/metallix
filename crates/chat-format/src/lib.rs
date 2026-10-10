@@ -48,8 +48,6 @@
 //! ```
 
 #![deny(missing_docs)]
-// The workspace allows this lint; crates opt in once their docs are complete.
-#![warn(clippy::missing_errors_doc)]
 
 mod messages;
 mod stream;

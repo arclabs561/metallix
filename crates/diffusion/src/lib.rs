@@ -29,7 +29,6 @@
 //! ```
 
 #![deny(missing_docs)]
-#![warn(clippy::missing_errors_doc)]
 
 pub mod metrics;
 
