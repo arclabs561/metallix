@@ -354,9 +354,10 @@ fn median(mut values: Vec<f64>) -> f64 {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn prompt_lookup_speculation_matches_greedy_and_reports_speed() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored checkpoint probe");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

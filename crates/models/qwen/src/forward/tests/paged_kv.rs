@@ -486,9 +486,10 @@ type Weights = HashMap<String, Array>;
 fn paged_qwen3_06b_matches_resident_chat_and_writes_in_place() {
     use crate::metal::Qwen3MlxWeights;
 
-    let model = std::env::var_os("METALLIX_QWEN_MODEL")
-        .map(std::path::PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored test");
+    let Some(model) = std::env::var_os("METALLIX_QWEN_MODEL").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

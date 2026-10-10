@@ -1054,23 +1054,27 @@ fn memory_prompt_tokens() -> usize {
     }
 }
 
-fn memory_mode() -> String {
-    let mode = env::var("METALLIX_CAPACITY_MEMORY_MODE")
-        .expect("METALLIX_CAPACITY_MEMORY_MODE must be concat, capacity, fixed, or stepped");
+/// The mode to qualify, or `None` when `METALLIX_CAPACITY_MEMORY_MODE` is unset.
+fn memory_mode() -> Option<String> {
+    let mode = env::var("METALLIX_CAPACITY_MEMORY_MODE").ok()?;
     assert!(
         matches!(mode.as_str(), "concat" | "capacity" | "fixed" | "stepped"),
         "METALLIX_CAPACITY_MEMORY_MODE must be concat, capacity, fixed, or stepped"
     );
-    mode
+    Some(mode)
 }
 
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL and METALLIX_CAPACITY_MEMORY_MODE=concat|capacity|fixed|stepped"]
 fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored memory qualification");
-    let mode = memory_mode();
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
+    let Some(mode) = memory_mode() else {
+        eprintln!("skipping: METALLIX_CAPACITY_MEMORY_MODE is not set");
+        return;
+    };
     let prompt_tokens = memory_prompt_tokens();
     let prompt = fixed_tokens(prompt_tokens, 97);
     let _gpu = GPU_TEST_LOCK
@@ -1145,9 +1149,10 @@ fn fixed_capacity_memory_qualification_uses_one_cache_without_forks() {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn fixed_capacity_slice_update_matches_concat_and_preserves_fork_ancestry() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored feasibility test");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

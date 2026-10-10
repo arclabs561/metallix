@@ -114,9 +114,10 @@ fn bfloat16_teacher_forced(weights: &Qwen3MlxWeights, prompt: &[i32], forced: &[
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to a Qwen3 checkpoint on Apple-Silicon Metal"]
 fn bfloat16_greedy_agrees_with_float32_outside_near_ties() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored checkpoint test");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let tokenizer = Tokenizer::from_file(model.join("tokenizer.json")).expect("tokenizer");
     let prompts: Vec<Vec<i32>> = PROMPTS
         .iter()

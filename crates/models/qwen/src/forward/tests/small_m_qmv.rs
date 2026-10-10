@@ -253,10 +253,12 @@ fn median(values: &[f64]) -> f64 {
 #[test]
 #[ignore = "requires METALLIX_QWEN_4BIT_MODEL and an idle Apple-Silicon GPU"]
 fn verify_cost_curve_with_and_without_the_few_row_kernel() {
+    let Some(model) = std::env::var_os("METALLIX_QWEN_4BIT_MODEL").map(std::path::PathBuf::from)
+    else {
+        eprintln!("skipping: METALLIX_QWEN_4BIT_MODEL is not set");
+        return;
+    };
     let _gpu = crate::gpu_test_lock();
-    let model = std::env::var_os("METALLIX_QWEN_4BIT_MODEL")
-        .map(std::path::PathBuf::from)
-        .expect("METALLIX_QWEN_4BIT_MODEL is required for this ignored test");
     let rounds: usize = std::env::var("METALLIX_VERIFY_ROUNDS")
         .ok()
         .and_then(|value| value.parse().ok())

@@ -96,6 +96,26 @@ Do not run competing Cargo builds or benchmarks in this checkout concurrently.
 Engram integrity gate, use `just check-fixtures`; see the
 [check recipes and custom-lint policy](docs/development.md).
 
+### Opt-in tests
+
+Tests that need a local checkpoint are `#[ignore]` and read its path from a
+`METALLIX_*` variable named in the ignore reason. When the variable is unset,
+the test prints `skipping: <VAR> is not set` and passes; a value that is set
+but wrong still fails it. A skipped test reports `ok`, so a run meant to
+exercise opt-in tests should name them, pass `--nocapture` (the test harness
+hides a passing test's output otherwise) and fail if the output contains
+`skipping:`:
+
+```sh
+METALLIX_QWEN_MODEL=~/models/Qwen3-0.6B \
+  cargo test -p qwen --features metal --lib -- --ignored --nocapture paged_batch_qwen3_06b \
+  2>&1 | tee run.log
+! grep -n 'skipping:' run.log
+```
+
+GPU tests serialize on a test lock that recovers from poisoning, so one
+failing test reports as one failure. Read inputs before taking the lock.
+
 ### Experimental isolated checks
 
 On POSIX, the check runner can capture the current working source and serialize

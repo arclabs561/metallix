@@ -358,9 +358,10 @@ const QWEN_TOLERANCE: f32 = 2e-3;
 fn paged_batch_qwen3_06b_agrees_and_reports_throughput() {
     use crate::metal::Qwen3MlxWeights;
 
-    let model = std::env::var_os("METALLIX_QWEN_MODEL")
-        .map(std::path::PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored test");
+    let Some(model) = std::env::var_os("METALLIX_QWEN_MODEL").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -458,9 +459,10 @@ fn throughput(
 fn paged_batch_qwen3_06b_profile() {
     use crate::{forward::paged::profile, metal::Qwen3MlxWeights};
 
-    let model = std::env::var_os("METALLIX_QWEN_MODEL")
-        .map(std::path::PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored test");
+    let Some(model) = std::env::var_os("METALLIX_QWEN_MODEL").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -701,9 +703,10 @@ fn failed_queued_readback_retains_rows_until_caller_retires_them() {
 fn paged_chunked_prefill_qwen3_06b_agrees_and_profiles() {
     use crate::metal::Qwen3MlxWeights;
 
-    let model = std::env::var_os("METALLIX_QWEN_MODEL")
-        .map(std::path::PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored test");
+    let Some(model) = std::env::var_os("METALLIX_QWEN_MODEL").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

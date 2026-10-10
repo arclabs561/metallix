@@ -127,9 +127,10 @@ fn report_row(prompt_tokens: usize, row: usize, measurement: &DecodeProfileRow) 
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn resident_decode_phase_profile_is_repeatable_for_fixed_teacher_forcing() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for this ignored checkpoint qualification");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let _gpu = GPU_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -45,7 +45,10 @@ fn f32le_hex(value: &Value) -> Vec<f32> {
 #[test]
 #[ignore = "requires METALLIX_QWEN_EMBEDDING_MODEL pointing to Qwen3-Embedding-0.6B@97b0c61 on Apple-Silicon Metal"]
 fn batched_embeddings_match_the_oracle_and_single_passes() {
-    let model = PathBuf::from(env::var_os("METALLIX_QWEN_EMBEDDING_MODEL").expect("model path"));
+    let Some(model) = env::var_os("METALLIX_QWEN_EMBEDDING_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_EMBEDDING_MODEL is not set");
+        return;
+    };
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/qwen3-embedding-0.6b/embedding-reference.json"
     ))
