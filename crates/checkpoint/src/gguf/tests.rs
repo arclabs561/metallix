@@ -187,6 +187,10 @@ fn reads_metadata_shapes_and_payloads() {
         .map(|word| f32::from_le_bytes(word.try_into().expect("4")))
         .collect();
     assert_eq!(values, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    let mut second = [0; 12];
+    gguf.read_range("matrix", matrix.slice_dim0(1).expect("row 1"), &mut second)
+        .expect("read row");
+    assert_eq!(second, bytes[12..]);
     let row = gguf.tensor("row").expect("row");
     assert_eq!(row.encoding(), TensorEncoding::Gguf(GgufEncoding::Q8_0));
     assert_eq!(row.range().end - row.range().start, 34);

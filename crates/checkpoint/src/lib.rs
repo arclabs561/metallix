@@ -12,8 +12,13 @@
 #![warn(clippy::missing_errors_doc)]
 
 pub mod gguf;
+mod nocache;
 
-use std::{ops::Range, path::PathBuf};
+use std::{
+    fs::File,
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 pub use blockfloat::gguf::GgufEncoding;
 use thiserror::Error;
@@ -140,6 +145,22 @@ impl TensorInfo {
     pub fn range(&self) -> Range<u64> {
         self.range.clone()
     }
+
+    /// Absolute byte range of entry `index` along the outermost dimension
+    /// (one expert of a `[experts, rows, columns]` stack), or `None` when
+    /// `index` is out of bounds or the payload does not split into equal
+    /// whole-byte entries.
+    #[must_use]
+    pub fn slice_dim0(&self, index: u64) -> Option<Range<u64>> {
+        let &outer = self.shape.first()?;
+        let bytes = self.range.end - self.range.start;
+        if index >= outer || !bytes.is_multiple_of(outer) {
+            return None;
+        }
+        let entry = bytes / outer;
+        let start = self.range.start + index * entry;
+        Some(start..start + entry)
+    }
 }
 
 /// A container whose tensors can be listed and read one at a time.
@@ -156,6 +177,57 @@ pub trait TensorSource {
     /// # Errors
     /// Returns an error for a missing tensor, exceeded byte budget, changed file, or failed read.
     fn read(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>, CheckpointError>;
+
+    /// Reads the absolute byte `range`, which must lie inside `name`'s
+    /// payload, into `dst`, which must be exactly that long: the caller's
+    /// buffer is the byte budget, checked before any read. Sources holding
+    /// their file open answer with one positional read and no allocation; the
+    /// default reads the whole tensor and copies the range.
+    ///
+    /// # Errors
+    /// Returns an error for a missing tensor, a range outside its payload or
+    /// unequal to `dst`, or a failed read.
+    fn read_range(
+        &self,
+        name: &str,
+        range: Range<u64>,
+        dst: &mut [u8],
+    ) -> Result<(), CheckpointError> {
+        let info = self
+            .tensor(name)
+            .ok_or_else(|| CheckpointError::MissingTensor(name.to_owned()))?;
+        let whole = info.range();
+        check_range(name, info, &range, dst.len())?;
+        let bytes = self.read(name, whole.end - whole.start)?;
+        let offset = usize::try_from(range.start - whole.start).map_err(|_| {
+            CheckpointError::OutsideTensor {
+                tensor: name.to_owned(),
+                range: range.clone(),
+                len: dst.len(),
+            }
+        })?;
+        dst.copy_from_slice(&bytes[offset..offset + dst.len()]);
+        Ok(())
+    }
+}
+
+/// `range` lies inside `info`'s payload and is exactly `len` bytes long.
+pub(crate) fn check_range(
+    name: &str,
+    info: &TensorInfo,
+    range: &Range<u64>,
+    len: usize,
+) -> Result<(), CheckpointError> {
+    let whole = info.range();
+    let inside = whole.start <= range.start && range.start <= range.end && range.end <= whole.end;
+    if !inside || u64::try_from(len).ok() != Some(range.end - range.start) {
+        return Err(CheckpointError::OutsideTensor {
+            tensor: name.to_owned(),
+            range: range.clone(),
+            len,
+        });
+    }
+    Ok(())
 }
 
 /// A container that cannot be read or does not describe valid tensors.
@@ -260,4 +332,116 @@ pub enum CheckpointError {
         /// Required metadata type.
         expected: &'static str,
     },
+    /// A range read lies outside its tensor's payload, or its buffer is not
+    /// the range's length.
+    #[error("range {range:?} into a {len}-byte buffer does not fit tensor {tensor:?}")]
+    OutsideTensor {
+        /// The stored tensor name.
+        tensor: String,
+        /// The requested absolute range.
+        range: Range<u64>,
+        /// The destination buffer length.
+        len: usize,
+    },
+}
+
+/// Whether reads go through the operating system's file cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReadCache {
+    /// Cached reads (the default).
+    #[default]
+    Use,
+    /// Ask the OS not to keep read pages (`F_NOCACHE` on macOS; ignored
+    /// elsewhere), so a byte budget measured above the source is the real
+    /// one and not hidden by the page cache.
+    Bypass,
+}
+
+impl ReadCache {
+    /// Applies this setting to an open `file` (named `path` in errors).
+    ///
+    /// # Errors
+    /// The operating system refuses the setting.
+    pub fn apply(self, file: &File, path: &Path) -> Result<(), CheckpointError> {
+        match self {
+            Self::Use => Ok(()),
+            Self::Bypass => nocache::set(file).map_err(|source| CheckpointError::Io {
+                path: path.to_owned(),
+                source,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{CheckpointError, DType, TensorEncoding, TensorInfo, TensorSource};
+
+    /// Tensors held in memory at made-up offsets, to exercise the provided
+    /// `read_range`.
+    struct Memory(HashMap<String, (TensorInfo, Vec<u8>)>);
+
+    impl TensorSource for Memory {
+        fn names(&self) -> Vec<&str> {
+            self.0.keys().map(String::as_str).collect()
+        }
+
+        fn tensor(&self, name: &str) -> Option<&TensorInfo> {
+            self.0.get(name).map(|(info, _)| info)
+        }
+
+        fn read(&self, name: &str, max_bytes: u64) -> Result<Vec<u8>, CheckpointError> {
+            let (_, bytes) = self
+                .0
+                .get(name)
+                .ok_or_else(|| CheckpointError::MissingTensor(name.to_owned()))?;
+            assert!(bytes.len() as u64 <= max_bytes);
+            Ok(bytes.clone())
+        }
+    }
+
+    #[test]
+    fn the_provided_range_read_copies_out_of_a_whole_read() {
+        let info = TensorInfo::new(TensorEncoding::Plain(DType::U8), vec![4, 2], 100..108);
+        let source = Memory(HashMap::from([(
+            "t".to_owned(),
+            (info.clone(), (0..8).collect()),
+        )]));
+        let mut dst = [0; 2];
+        source
+            .read_range("t", info.slice_dim0(2).expect("entry 2"), &mut dst)
+            .expect("read");
+        assert_eq!(dst, [4, 5]);
+        assert!(matches!(
+            source.read_range("t", 99..101, &mut dst),
+            Err(CheckpointError::OutsideTensor { .. })
+        ));
+    }
+
+    #[test]
+    fn outer_slices_need_equal_whole_byte_entries() {
+        let info = TensorInfo::new(TensorEncoding::Plain(DType::U8), vec![3, 1], 10..14);
+        assert_eq!(info.slice_dim0(0), None, "4 bytes do not split 3 ways");
+        let scalar = TensorInfo::new(TensorEncoding::Plain(DType::F32), vec![], 0..4);
+        assert_eq!(scalar.slice_dim0(0), None);
+    }
+
+    #[test]
+    fn bypassing_the_file_cache_still_reads_the_bytes() {
+        use std::{fs, os::unix::fs::FileExt};
+
+        use super::ReadCache;
+
+        let path = std::env::temp_dir().join(format!("checkpoint-nocache-{}", std::process::id()));
+        fs::write(&path, [1, 2, 3, 4]).expect("write");
+        let file = fs::File::open(&path).expect("open");
+        ReadCache::Bypass.apply(&file, &path).expect("F_NOCACHE");
+        ReadCache::Use.apply(&file, &path).expect("no-op");
+        let mut bytes = [0; 2];
+        file.read_exact_at(&mut bytes, 1).expect("read");
+        assert_eq!(bytes, [2, 3]);
+        fs::remove_file(&path).expect("cleanup");
+    }
 }

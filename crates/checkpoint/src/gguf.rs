@@ -529,6 +529,31 @@ impl TensorSource for GgufFile {
         self.unchanged()?;
         Ok(payload)
     }
+
+    /// The same file checks as [`TensorSource::read`], around one positional
+    /// read of `range`.
+    fn read_range(
+        &self,
+        name: &str,
+        range: std::ops::Range<u64>,
+        dst: &mut [u8],
+    ) -> Result<(), CheckpointError> {
+        let info = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| CheckpointError::MissingTensor(name.to_owned()))?;
+        crate::check_range(name, info, &range, dst.len())?;
+        self.unchanged()?;
+        let io = |source| CheckpointError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        File::open(&self.path)
+            .map_err(io)?
+            .read_exact_at(dst, range.start)
+            .map_err(io)?;
+        self.unchanged()
+    }
 }
 
 /// Tensor records as `(name, shape outermost first, encoding, offset)`.
