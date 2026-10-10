@@ -1090,6 +1090,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-kernels"
+version = "0.1.0"
+dependencies = [
+ "mlx-rs",
+ "mlx-sys",
+ "thiserror",
+]
+
+[[package]]
 name = "mlx-macros"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
