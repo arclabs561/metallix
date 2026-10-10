@@ -14,16 +14,21 @@ qualified path. `mx serve` loads it as the registry kind `gemma4`; see
 | --- | --- | --- | --- |
 | [gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) | `707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7` | 48 layers (40 sliding, 8 full), hidden 3840, GQA 16/8 sliding and 16/1 full | Development checkpoint; parity below |
 | [gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | `842da3794eaa0b77d5f08bae87a17459d91ff475` | 60 layers (50 sliding, 10 full), hidden 5376, GQA 32/16 sliding and 32/4 full | Final qualification |
+| [gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | `3e22461f65e89153144f8adb70e3b8c2cc9845a7` | 35 layers (28 sliding, 7 full), hidden 1536, GQA 8/1, last 20 layers share K/V, 256-wide per-layer input | Parity below |
+| [gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it) | `ee0ef6023621cff504d758262d4e04895a5af4a2` | 42 layers (35 sliding, 7 full), hidden 2560, GQA 8/2, last 18 layers share K/V, 256-wide per-layer input | Parity below |
 
 Both are Apache-2.0 and not gated (live Hub metadata, 2026-10-05). They share
 the layer pattern (five sliding layers, then one full), a 1024-token window,
 K-as-V on full layers, a 512-wide global head and the same tokenizer and chat
 template bytes. The 12B declares `model_type` `gemma4_unified` and the 31B
-`gemma4`; transformers v5.18.0 computes the same text forward for both. The
-adapter refuses the other Gemma 4 variants because they add components it
-does not implement: E2B and E4B have per-layer input embeddings, K/V shared
-across their last 18 to 20 layers and a 512-token window; 26B-A4B has a
-mixture-of-experts block.
+`gemma4`; transformers v5.18.0 computes the same text forward for both.
+E2B and E4B (`gemma4`, also Apache-2.0) add a per-layer input to every layer,
+let their last 20 (E2B) or 18 (E4B) layers attend over an earlier layer's K/V
+instead of their own, use a 512-token window and full layers with their own
+`v_proj`, and on E2B double the MLP width in the sharing layers. They share
+one chat template, which differs from the 12B one only in not pre-filling an
+empty thought channel when thinking is off. The adapter refuses 26B-A4B,
+whose mixture-of-experts block it does not implement yet.
 
 ## Numerics
 
@@ -44,6 +49,8 @@ From `modeling_gemma4.py`, `modeling_gemma4_unified.py` and
 | Sliding mask | query `q` sees keys `q - 1024 < k <= q` | causal |
 | Logits | tied embedding, then `30 * tanh(logits / 30)` | tied, uncapped |
 | MLP | `down(gelu_tanh(gate(x)) * up(x))` | SiLU |
+| Per-layer input (E2B, E4B) | `(rms_norm(embeds @ P / sqrt(H)) + table[ids] * sqrt(256)) / sqrt(2)`, one 256-wide slice per layer; each layer adds `norm(proj(gelu_tanh(gate(x)) * slice))` after its MLP, before `layer_scalar` | none |
+| K/V sharing (E2B, E4B) | a sharing layer projects only Q and attends over the K/V that the last earlier layer of its kind attended over in the same step | none |
 
 Proportional `RoPE` maps onto MLX `fast::rope` over the whole head with
 explicit wavelengths (`theta^(2i/512)` for rotating pairs, infinity for the
@@ -62,6 +69,8 @@ it; for 31B the figures are 800 KiB and 80 KiB.
 | --- | --- | --- |
 | 12B | 448 MiB | 2688 MiB |
 | 31B | 1439 MiB | 7040 MiB |
+| E2B | 54 MiB | 144 MiB |
+| E4B | 148 MiB | 448 MiB |
 
 `Gemma4TextConfig::retained_kv_elements` computes this. A synthetic test checks
 it against the bytes the executor holds, and the 12B f32 parity run held
@@ -120,6 +129,28 @@ transformers 5.18.0 and torch 2.13.0 on the CPU:
 | Metallix f32 | 7.5e-4 | 22 of 22 |
 | Metallix bf16 | 1.65 | 21 of 22 |
 | Source bf16, same tokens | 2.78 | 18 of 21 |
+
+E2B and E4B, same three prompts (the long one, 1514 tokens, crosses their
+512-token window), the same bounds:
+
+| Compared with the float32 source | E2B | E4B |
+| --- | --- | --- |
+| Metallix f32, worst / argmax | 2.1e-4, 22 of 22 | 7.8e-4, 22 of 22 |
+| Metallix bf16, worst / argmax | 0.95, 22 of 22 | 0.98, 22 of 22 |
+| Source bf16, worst / argmax | 1.58, 21 of 21 | 1.36, 21 of 21 |
+
+[`fixtures/gemma-4-e2b/reference.json`](../fixtures/gemma-4-e2b/reference.json)
+is the E2B fixture; pass it as `METALLIX_GEMMA4_REFERENCE` with the E2B
+checkpoint. A 1514-token float32 prefill is one GPU command buffer of about
+0.9 s on an idle machine; under heavy GPU load macOS has killed it
+(`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`), so run the f32
+parity on a quiet machine.
+
+[`fixtures/gemma-4-tiny/ple-reference.json`](../fixtures/gemma-4-tiny/ple-reference.json),
+from `scripts/gemma4-tiny-reference.py`, is a tiny random-weight model with
+every E2B/E4B feature, run through transformers' own `Gemma4ForCausalLM`; the
+always-on test holds Metallix within 1e-4 of its float64 logits. The source's
+own float32 output lands up to 4.1e-5 from float64 on it.
 
 Logits are soft-capped to [-30, 30]. Every argmax flip, Metallix's and the
 source's, sits where the float32 top-2 margin (0.009 to 0.60) is smaller than
