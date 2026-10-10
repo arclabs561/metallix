@@ -350,6 +350,35 @@ impl Qwen3MlxWeights {
         executor.snapshot_prefix(tokens, self.binding)
     }
 
+    /// Detaches the first `tokens` cached positions as a snapshot that copies
+    /// only the positions after `base`'s and shares `base` for the rest.
+    ///
+    /// The caller guarantees that `executor`'s leading positions hold exactly
+    /// `base`'s K/V: it was restored from `base` (or from a snapshot extending
+    /// it), or `base` was taken from this executor. Otherwise a restore would
+    /// join K/V from two computations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KvSnapshotMismatch`](crate::forward::Qwen3ForwardError::KvSnapshotMismatch)
+    /// when `executor` borrows other weights, or `base` comes from another
+    /// load or plan or does not end before `tokens`, and the errors of
+    /// [`Self::snapshot_resident_prefix`] otherwise.
+    pub fn snapshot_resident_extending(
+        &self,
+        executor: &crate::forward::Qwen3ForwardExecutor<
+            '_,
+            std::collections::hash_map::RandomState,
+        >,
+        base: std::rc::Rc<crate::forward::Qwen3KvSnapshot>,
+        tokens: usize,
+    ) -> Result<crate::forward::Qwen3KvSnapshot, crate::forward::Qwen3ForwardError> {
+        if !executor.borrows(&self.tensors) {
+            return Err(crate::forward::Qwen3ForwardError::KvSnapshotMismatch);
+        }
+        executor.snapshot_extending(base, tokens, self.binding)
+    }
+
     /// Starts a resident-chat executor whose cache already holds `snapshot`'s
     /// prefix. The snapshot must come from this load (after any precision
     /// change) and the same context and K/V limits.
@@ -377,11 +406,11 @@ impl Qwen3MlxWeights {
         if snapshot.binding() != self.binding || snapshot.plan() != plan {
             return Err(crate::forward::Qwen3ForwardError::KvSnapshotMismatch);
         }
-        Ok(crate::forward::Qwen3ForwardExecutor::from_snapshot(
+        crate::forward::Qwen3ForwardExecutor::from_snapshot(
             &self.forward_config,
             &self.tensors,
             snapshot,
-        ))
+        )
     }
 
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.

@@ -3674,7 +3674,8 @@ mod tests {
         let snapshot = source.snapshot_prefix(prompt.len(), 7).expect("snapshot");
         // Restored storage holds exactly 100 positions, below the 128 tier
         // that 90 tokens would occupy; truncation must not widen it.
-        let mut restored = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &snapshot);
+        let mut restored =
+            Qwen3ForwardExecutor::from_snapshot(&config, &weights, &snapshot).expect("restore");
         restored.truncate_cached_tokens(90).expect("truncate");
         assert_eq!(restored.cached_tokens(), 90);
         let continued = restored.decode_last_logits(5).expect("append re-tiers");

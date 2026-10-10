@@ -14,7 +14,7 @@
 //! K/V and cannot time each other's prompts through hits. Requests without a
 //! salt share one namespace, which suits a single-tenant deployment.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, rc::Rc};
 
 use qwen::{
     forward::{Qwen3ForwardExecutor, Qwen3KvSnapshot},
@@ -33,7 +33,7 @@ type Executor<'w> = Qwen3ForwardExecutor<'w, std::collections::hash_map::RandomS
 /// final prompt logits and the number of prompt tokens taken from the cache.
 pub(super) fn prefill<'w>(
     weights: &'w Qwen3MlxWeights,
-    cache: &mut PrefixCache<Qwen3KvSnapshot>,
+    cache: &mut PrefixCache<Rc<Qwen3KvSnapshot>>,
     context_limit: usize,
     kv_budget_bytes: u64,
     request: ChatRequest<'_>,
@@ -151,27 +151,63 @@ pub(crate) enum PrefixRole {
 /// own rendering tokenizes to an exact prefix of `input_ids`; one that does
 /// not render or tokenize is skipped. A snapshot error is a defect, since
 /// every boundary lies within the prefilled prompt.
+///
+/// The conversation entry shares the cached preamble's K/V instead of copying
+/// it, but only when `executor` provably holds that preamble's exact values:
+/// it was restored from the preamble entry or from an entry extending it, or
+/// the preamble entry is taken from `executor` here. Otherwise (restored from
+/// an entry stored before its preamble was cached) it stores a full copy, so
+/// a restore never joins K/V from two computations. `input_ids` must be the
+/// prompt [`prefill`] ran, with no cache insert in between.
 pub(super) fn remember(
     weights: &Qwen3MlxWeights,
-    cache: &mut PrefixCache<Qwen3KvSnapshot>,
+    cache: &mut PrefixCache<Rc<Qwen3KvSnapshot>>,
     format: &ChatFormat,
     executor: &Executor<'_>,
     request: ChatRequest<'_>,
     input_ids: &[i32],
     reused: Option<&PromptPrefix>,
 ) -> Result<AcceptedPrefixTokens, String> {
+    // The entry `prefill` restored from: the cache has not changed since.
+    let restored = cache.peek(request.cache_salt, input_ids).map(Rc::clone);
+    let holds = |base: &Rc<Qwen3KvSnapshot>| {
+        restored.as_ref().is_some_and(|restored| {
+            Rc::ptr_eq(restored, base) || restored.base().is_some_and(|of| Rc::ptr_eq(of, base))
+        })
+    };
+    // A cached preamble whose exact values `executor` holds.
+    let mut shared: Option<(Vec<i32>, Rc<Qwen3KvSnapshot>)> = None;
     let mut written = 0;
     for Boundary { ids, role } in boundaries(format, request, input_ids, reused) {
-        if cache.contains(request.cache_salt, &ids) {
+        if let Some(cached) = cache.get(request.cache_salt, &ids) {
+            if role == PrefixRole::Preamble && holds(cached) {
+                shared = Some((ids, Rc::clone(cached)));
+            }
             continue;
         }
-        let snapshot = weights
-            .snapshot_resident_prefix(executor, ids.len())
-            .map_err(|error| error.to_string())?;
+        let (snapshot, parent) = match &shared {
+            Some((base_ids, base)) if ids.len() > base_ids.len() => (
+                weights.snapshot_resident_extending(executor, Rc::clone(base), ids.len()),
+                Some(base_ids.as_slice()),
+            ),
+            _ => (weights.snapshot_resident_prefix(executor, ids.len()), None),
+        };
+        let snapshot = Rc::new(snapshot.map_err(|error| error.to_string())?);
         let bytes = snapshot.kv_bytes();
         let tokens = ids.len();
-        if cache.insert(request.cache_salt, ids, snapshot, bytes, role) {
+        let inserted = cache.insert(
+            request.cache_salt,
+            ids.clone(),
+            Rc::clone(&snapshot),
+            bytes,
+            role,
+            parent,
+        );
+        if inserted {
             written = written.max(tokens);
+            if role == PrefixRole::Preamble {
+                shared = Some((ids, snapshot));
+            }
         }
     }
     Ok(AcceptedPrefixTokens(written))
@@ -184,6 +220,10 @@ struct Entry<V> {
     bytes: usize,
     last_used: u64,
     role: PrefixRole,
+    /// The cached entry whose value this one's value shares.
+    parent: Option<PrefixKey>,
+    /// Entries sharing this one's value; it is not evicted while any remain.
+    children: usize,
 }
 
 /// Counters a metrics endpoint can expose. `queries` counts lookups, so the
@@ -273,6 +313,40 @@ impl<V> PrefixCache<V> {
         prompt: &[i32],
     ) -> Option<PrefixHit<'_, V>> {
         self.queries += 1;
+        let key = self.longest(salt, prompt)?;
+        self.clock += 1;
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = self.clock;
+        let (tokens, parent) = (entry.tokens.len(), entry.parent);
+        // A shared parent stays at least as recent as its children.
+        if let Some(parent) = parent.and_then(|parent| self.entries.get_mut(&parent)) {
+            parent.last_used = self.clock;
+        }
+        self.hits += 1;
+        self.hit_tokens += tokens as u64;
+        let entry = self.entries.get(&key)?;
+        Some(PrefixHit {
+            tokens,
+            value: &entry.value,
+        })
+    }
+
+    /// The value [`Self::lookup`] would return for `prompt`, without counting
+    /// a query or refreshing recency.
+    pub(crate) fn peek(&self, salt: Option<&str>, prompt: &[i32]) -> Option<&V> {
+        let key = self.longest(salt, prompt)?;
+        self.entries.get(&key).map(|entry| &entry.value)
+    }
+
+    /// The value cached for exactly `tokens` under `salt`.
+    pub(crate) fn get(&self, salt: Option<&str>, tokens: &[i32]) -> Option<&V> {
+        self.entries
+            .get(&self.key(salt, tokens))
+            .filter(|entry| Self::matches(entry, salt, tokens))
+            .map(|entry| &entry.value)
+    }
+
+    fn longest(&self, salt: Option<&str>, prompt: &[i32]) -> Option<PrefixKey> {
         let mut lengths = self
             .entries
             .values()
@@ -282,21 +356,12 @@ impl<V> PrefixCache<V> {
             .collect::<Vec<_>>();
         lengths.sort_unstable_by(|left, right| right.cmp(left));
         lengths.dedup();
-        let key = lengths.into_iter().find_map(|length| {
+        lengths.into_iter().find_map(|length| {
             let key = self.key(salt, &prompt[..length]);
             self.entries
                 .get(&key)
                 .is_some_and(|entry| Self::matches(entry, salt, &prompt[..length]))
                 .then_some(key)
-        })?;
-        self.clock += 1;
-        let entry = self.entries.get_mut(&key)?;
-        entry.last_used = self.clock;
-        self.hits += 1;
-        self.hit_tokens += entry.tokens.len() as u64;
-        Some(PrefixHit {
-            tokens: entry.tokens.len(),
-            value: &entry.value,
         })
     }
 
@@ -316,6 +381,12 @@ impl<V> PrefixCache<V> {
     /// own: earlier turns of this conversation, whose only expected reuse has
     /// just happened. A client that retries an older turn then misses and
     /// re-prefills; preambles are never dropped this way.
+    ///
+    /// `parent` names a cached entry (a strict prefix of `tokens`, same salt)
+    /// whose value `value` shares, so `value_bytes` counts only what `value`
+    /// adds. The parent is then kept while this entry is cached, and the
+    /// insert is refused when the parent is not cached or the two do not fit
+    /// the budget together.
     pub(crate) fn insert(
         &mut self,
         salt: Option<&str>,
@@ -323,11 +394,32 @@ impl<V> PrefixCache<V> {
         value: V,
         value_bytes: usize,
         role: PrefixRole,
+        parent: Option<&[i32]>,
     ) -> bool {
         let bytes = value_bytes.saturating_add(tokens.len().saturating_mul(size_of::<i32>()));
         if tokens.is_empty() || bytes > self.budget_bytes || self.contains(salt, &tokens) {
             return false;
         }
+        let parent = match parent {
+            None => None,
+            Some(parent) => {
+                let key = self.key(salt, parent);
+                let Some(entry) = self
+                    .entries
+                    .get(&key)
+                    .filter(|entry| Self::matches(entry, salt, parent))
+                else {
+                    return false;
+                };
+                if parent.len() >= tokens.len()
+                    || !tokens.starts_with(parent)
+                    || entry.bytes.saturating_add(bytes) > self.budget_bytes
+                {
+                    return false;
+                }
+                Some(key)
+            }
+        };
         if role == PrefixRole::Conversation {
             let superseded = self
                 .entries
@@ -341,25 +433,28 @@ impl<V> PrefixCache<V> {
                 .map(|(key, _)| *key)
                 .collect::<Vec<_>>();
             for key in superseded {
-                if let Some(dropped) = self.entries.remove(&key) {
-                    self.used_bytes -= dropped.bytes;
+                if self.remove(&key) {
                     self.superseded += 1;
                 }
             }
         }
         while self.used_bytes + bytes > self.budget_bytes {
+            // Only entries nothing shares, and never the new entry's parent.
             let Some(oldest) = self
                 .entries
                 .iter()
+                .filter(|(key, entry)| entry.children == 0 && Some(**key) != parent)
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
             else {
-                break;
+                return false;
             };
-            if let Some(evicted) = self.entries.remove(&oldest) {
-                self.used_bytes -= evicted.bytes;
+            if self.remove(&oldest) {
                 self.evictions += 1;
             }
+        }
+        if let Some(entry) = parent.and_then(|parent| self.entries.get_mut(&parent)) {
+            entry.children += 1;
         }
         self.clock += 1;
         let key = self.key(salt, &tokens);
@@ -373,8 +468,25 @@ impl<V> PrefixCache<V> {
                 bytes,
                 last_used: self.clock,
                 role,
+                parent,
+                children: 0,
             },
         );
+        true
+    }
+
+    /// Removes one entry and releases its hold on its parent.
+    fn remove(&mut self, key: &PrefixKey) -> bool {
+        let Some(removed) = self.entries.remove(key) else {
+            return false;
+        };
+        self.used_bytes -= removed.bytes;
+        if let Some(parent) = removed
+            .parent
+            .and_then(|parent| self.entries.get_mut(&parent))
+        {
+            parent.children -= 1;
+        }
         true
     }
 
@@ -401,8 +513,8 @@ mod tests {
     #[test]
     fn whole_entry_prefixes_hit_and_leave_one_prompt_token() {
         let mut cache = PrefixCache::new("model", 1_000);
-        assert!(cache.insert(None, vec![1, 2, 3], "abc", 10, PrefixRole::Preamble));
-        assert!(cache.insert(None, vec![1, 2], "ab", 10, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![1, 2, 3], "abc", 10, PrefixRole::Preamble, None));
+        assert!(cache.insert(None, vec![1, 2], "ab", 10, PrefixRole::Preamble, None));
         // The longest whole entry that is a strict prefix wins.
         let hit = cache.lookup(None, &[1, 2, 3, 4]).expect("hit");
         assert_eq!((hit.tokens, *hit.value), (3, "abc"));
@@ -417,7 +529,14 @@ mod tests {
     #[test]
     fn a_changed_prefix_never_hits_even_when_leading_tokens_match() {
         let mut cache = PrefixCache::new("model", 1_000);
-        assert!(cache.insert(None, vec![10, 11, 12, 13], (), 0, PrefixRole::Preamble));
+        assert!(cache.insert(
+            None,
+            vec![10, 11, 12, 13],
+            (),
+            0,
+            PrefixRole::Preamble,
+            None
+        ));
         // Shares three leading tokens but not the whole entry.
         assert!(cache.lookup(None, &[10, 11, 12, 99, 5, 6]).is_none());
         assert!(cache.lookup(None, &[10, 11, 12, 13, 5]).is_some());
@@ -432,7 +551,8 @@ mod tests {
             vec![1, 2, 3],
             'a',
             0,
-            PrefixRole::Preamble
+            PrefixRole::Preamble,
+            None
         ));
         assert!(cache.lookup(Some("tenant-b"), &prompt).is_none());
         assert!(cache.lookup(None, &prompt).is_none());
@@ -443,9 +563,10 @@ mod tests {
             vec![1, 2, 3],
             'b',
             0,
-            PrefixRole::Preamble
+            PrefixRole::Preamble,
+            None
         ));
-        assert!(cache.insert(None, vec![1, 2, 3], 'n', 0, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![1, 2, 3], 'n', 0, PrefixRole::Preamble, None));
         assert_eq!(cache.stats().entries, 3);
         for (salt, value) in [
             (Some("tenant-a"), 'a'),
@@ -472,29 +593,29 @@ mod tests {
     fn budget_evicts_least_recently_used_and_refuses_oversized_entries() {
         let entry = 100 + 2 * TOKEN;
         let mut cache = PrefixCache::new("model", 2 * entry);
-        assert!(cache.insert(None, vec![1, 1], 'a', 100, PrefixRole::Preamble));
-        assert!(cache.insert(None, vec![2, 2], 'b', 100, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![1, 1], 'a', 100, PrefixRole::Preamble, None));
+        assert!(cache.insert(None, vec![2, 2], 'b', 100, PrefixRole::Preamble, None));
         assert_eq!(cache.stats().bytes, 2 * entry);
         // Touch `a`, so `b` is least recently used.
         assert!(cache.lookup(None, &[1, 1, 9]).is_some());
-        assert!(cache.insert(None, vec![3, 3], 'c', 100, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![3, 3], 'c', 100, PrefixRole::Preamble, None));
         assert_eq!((cache.stats().entries, cache.stats().evictions), (2, 1));
         assert!(cache.contains(None, &[1, 1]));
         assert!(!cache.contains(None, &[2, 2]));
         assert!(cache.contains(None, &[3, 3]));
         assert_eq!(cache.stats().bytes, 2 * entry);
         // Larger than the whole budget: nothing is evicted for it.
-        assert!(!cache.insert(None, vec![4, 4], 'd', 2 * entry, PrefixRole::Preamble));
+        assert!(!cache.insert(None, vec![4, 4], 'd', 2 * entry, PrefixRole::Preamble, None));
         assert_eq!(cache.stats().entries, 2);
         // Duplicates are not stored twice.
-        assert!(!cache.insert(None, vec![3, 3], 'e', 100, PrefixRole::Preamble));
+        assert!(!cache.insert(None, vec![3, 3], 'e', 100, PrefixRole::Preamble, None));
         assert_eq!(cache.stats().bytes, 2 * entry);
     }
 
     #[test]
     fn zero_budget_caches_nothing() {
         let mut cache = PrefixCache::new("model", 0);
-        assert!(!cache.insert(None, vec![1], (), 0, PrefixRole::Preamble));
+        assert!(!cache.insert(None, vec![1], (), 0, PrefixRole::Preamble, None));
         assert!(cache.lookup(None, &[1, 2]).is_none());
     }
 
@@ -502,13 +623,13 @@ mod tests {
     fn a_later_turn_supersedes_earlier_turns_of_its_conversation_only() {
         let mut cache = PrefixCache::new("model", 10_000);
         let conversation = PrefixRole::Conversation;
-        assert!(cache.insert(None, vec![1, 2], 'p', 100, PrefixRole::Preamble));
-        assert!(cache.insert(None, vec![1, 2, 3], 'a', 100, conversation));
+        assert!(cache.insert(None, vec![1, 2], 'p', 100, PrefixRole::Preamble, None));
+        assert!(cache.insert(None, vec![1, 2, 3], 'a', 100, conversation, None));
         // Another conversation on the same preamble, and the same tokens
         // under another salt.
-        assert!(cache.insert(None, vec![1, 2, 7], 'b', 100, conversation));
-        assert!(cache.insert(Some("t"), vec![1, 2, 3], 's', 100, conversation));
-        assert!(cache.insert(None, vec![1, 2, 3, 4, 5], 'c', 100, conversation));
+        assert!(cache.insert(None, vec![1, 2, 7], 'b', 100, conversation, None));
+        assert!(cache.insert(Some("t"), vec![1, 2, 3], 's', 100, conversation, None));
+        assert!(cache.insert(None, vec![1, 2, 3, 4, 5], 'c', 100, conversation, None));
         assert!(!cache.contains(None, &[1, 2, 3]), "turn 1 was superseded");
         for (salt, tokens) in [
             (None, &[1, 2][..]),
@@ -525,7 +646,7 @@ mod tests {
         );
         assert_eq!(stats.bytes, 4 * 100 + (2 + 3 + 3 + 5) * TOKEN);
         // A preamble insert never supersedes, even when it extends an entry.
-        assert!(cache.insert(None, vec![1, 2, 7, 8], 'q', 100, PrefixRole::Preamble));
+        assert!(cache.insert(None, vec![1, 2, 7, 8], 'q', 100, PrefixRole::Preamble, None));
         assert!(cache.contains(None, &[1, 2, 7]));
     }
 
@@ -552,12 +673,19 @@ mod tests {
     /// 3-12 turns over three preambles (300, 200 and 450 tokens; 60/30/10
     /// percent of conversations); each turn adds 30-150 user or tool tokens,
     /// and the reply adds 5-40 tokens to the next prompt. Every token costs
-    /// `KV` bytes. Returns the fraction of prompt tokens served from cache.
+    /// `KV` bytes. With `share`, a conversation entry shares its cached
+    /// preamble and is charged only for the tokens after it, as `remember`
+    /// stores it. Returns the fraction of prompt tokens served from cache.
     #[allow(
         clippy::cast_precision_loss,
         reason = "token counts here stay far below 2^52"
     )]
-    fn replay_agent_trace(seed: u64, budget_tokens: usize, conversation: PrefixRole) -> f64 {
+    fn replay_agent_trace(
+        seed: u64,
+        budget_tokens: usize,
+        conversation: PrefixRole,
+        share: bool,
+    ) -> f64 {
         const KV: usize = 1_024;
         struct Agent {
             preamble: usize,
@@ -599,13 +727,17 @@ mod tests {
                 (),
                 preamble.len() * KV,
                 PrefixRole::Preamble,
+                None,
             );
+            let parent = (share && cache.contains(None, preamble)).then_some(preamble.as_slice());
+            let charged = agent.tokens.len() - parent.map_or(0, <[i32]>::len);
             cache.insert(
                 None,
                 agent.tokens.clone(),
                 (),
-                agent.tokens.len() * KV,
+                charged * KV,
                 conversation,
+                parent,
             );
             for _ in 0..5 + rng.below(36) {
                 agent.tokens.push(next_token);
@@ -626,8 +758,10 @@ mod tests {
         for (budget_tokens, minimum_gain) in [(1_870, 0.0), (7_490, 0.08)] {
             let (mut before, mut after) = (0.0, 0.0);
             for seed in 0..5 {
-                before += replay_agent_trace(seed, budget_tokens, PrefixRole::Preamble) / 5.0;
-                after += replay_agent_trace(seed, budget_tokens, PrefixRole::Conversation) / 5.0;
+                before +=
+                    replay_agent_trace(seed, budget_tokens, PrefixRole::Preamble, false) / 5.0;
+                after +=
+                    replay_agent_trace(seed, budget_tokens, PrefixRole::Conversation, false) / 5.0;
             }
             eprintln!("budget {budget_tokens} tokens: LRU {before:.3}, superseding {after:.3}");
             assert!(
@@ -635,6 +769,61 @@ mod tests {
                 "budget {budget_tokens}: {after:.3} vs {before:.3}"
             );
         }
+    }
+
+    #[test]
+    fn sharing_the_preamble_raises_hits_when_the_budget_is_tight() {
+        let budget_tokens = 1_870;
+        let (mut copied, mut shared) = (0.0, 0.0);
+        for seed in 0..5 {
+            copied +=
+                replay_agent_trace(seed, budget_tokens, PrefixRole::Conversation, false) / 5.0;
+            shared += replay_agent_trace(seed, budget_tokens, PrefixRole::Conversation, true) / 5.0;
+        }
+        eprintln!("budget {budget_tokens} tokens: copied {copied:.3}, shared {shared:.3}");
+        assert!(shared >= copied + 0.05, "{shared:.3} vs {copied:.3}");
+    }
+
+    #[test]
+    fn a_shared_parent_is_kept_while_children_remain_and_charged_once() {
+        let conversation = PrefixRole::Conversation;
+        let preamble = PrefixRole::Preamble;
+        // Sizes with token IDs: p 108, c 62, x 116, y 66, z 104 bytes.
+        let mut cache = PrefixCache::new("model", 300);
+        // Refused: no cached parent, a parent that is not a prefix, or a
+        // pair that cannot fit together.
+        assert!(!cache.insert(None, vec![1, 2, 3], 'c', 50, conversation, Some(&[1, 2])));
+        assert!(cache.insert(None, vec![1, 2], 'p', 100, preamble, None));
+        assert!(!cache.insert(None, vec![9, 2, 3], 'c', 50, conversation, Some(&[1, 2])));
+        assert!(!cache.insert(None, vec![1, 2, 3], 'c', 250, conversation, Some(&[1, 2])));
+        assert!(cache.insert(None, vec![1, 2, 3], 'c', 50, conversation, Some(&[1, 2])));
+        assert_eq!(
+            cache.stats().bytes,
+            108 + 62,
+            "the child is charged its own bytes"
+        );
+        assert!(cache.insert(None, vec![5, 5, 5, 5], 'x', 100, preamble, None));
+        // One eviction is needed: the parent is the oldest entry but pinned,
+        // so its child goes instead.
+        assert!(cache.insert(None, vec![6, 6, 6, 6], 'y', 50, preamble, None));
+        assert!(cache.contains(None, &[1, 2]) && !cache.contains(None, &[1, 2, 3]));
+        // Released, the parent is evicted next as the oldest.
+        assert!(cache.insert(None, vec![7], 'z', 100, preamble, None));
+        assert!(!cache.contains(None, &[1, 2]) && cache.contains(None, &[5, 5, 5, 5]));
+        assert_eq!(cache.stats().evictions, 2);
+
+        // A hit on a child refreshes its parent too.
+        let mut cache = PrefixCache::new("model", 300);
+        assert!(cache.insert(None, vec![1, 2], 'p', 100, preamble, None));
+        assert!(cache.insert(None, vec![1, 2, 3], 'c', 50, conversation, Some(&[1, 2])));
+        assert!(cache.insert(None, vec![5, 5, 5, 5], 'x', 100, preamble, None));
+        assert_eq!(
+            cache.lookup(None, &[1, 2, 3, 9]).map(|hit| *hit.value),
+            Some('c')
+        );
+        assert!(cache.insert(None, vec![6, 6, 6, 6], 'y', 50, preamble, None));
+        assert!(cache.contains(None, &[1, 2]) && cache.contains(None, &[1, 2, 3]));
+        assert!(!cache.contains(None, &[5, 5, 5, 5]));
     }
 }
 

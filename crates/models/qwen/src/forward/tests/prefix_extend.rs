@@ -270,7 +270,8 @@ fn restored_snapshot_prefix_matches_fresh_prefill_and_stays_unchanged() {
         .map(|index| (index * 3 + 1) % 16)
         .collect::<Vec<i32>>();
     for _ in 0..2 {
-        let mut restored = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &snapshot);
+        let mut restored =
+            Qwen3ForwardExecutor::from_snapshot(&config, &weights, &snapshot).expect("restore");
         assert_eq!(restored.cached_tokens(), 30);
         let logits = restored.extend_last_logits(&other).expect("suffix");
         let expected_prompt = prompt[..30]
@@ -339,7 +340,8 @@ fn snapshots_pin_only_their_compact_rows() {
     // The serial path's next turn: restore, extend, snapshot the longer
     // prefix, then drop the executor and evict the older snapshot.
     let second = {
-        let mut restored = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &first);
+        let mut restored =
+            Qwen3ForwardExecutor::from_snapshot(&config, &weights, &first).expect("restore");
         restored
             .extend_last_logits(&prompt[200..280])
             .expect("suffix");
@@ -352,6 +354,63 @@ fn snapshots_pin_only_their_compact_rows() {
         "a {}-byte snapshot restored from an evicted one keeps {held} bytes alive",
         second.kv_bytes()
     );
+}
+
+#[test]
+fn extending_snapshot_restores_the_same_cache_as_a_whole_prefix_snapshot() {
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let config = fused_kernel_config();
+    let weights = fused_kernel_weights();
+    let plan = config
+        .resident_chat_plan(600, u64::MAX, crate::forward::Qwen3FloatPrecision::Float32)
+        .expect("tiny resident plan");
+    let prompt = (0..64)
+        .map(|index| (index * 7 + 2) % 16)
+        .collect::<Vec<i32>>();
+    let mut source = Qwen3ForwardExecutor::new_for_resident_chat(&config, &weights, plan);
+    source.prefill_last_logits(&prompt).expect("source prefill");
+    let base = std::rc::Rc::new(source.snapshot_prefix(20, 7).expect("base"));
+    let extending = source
+        .snapshot_extending(base.clone(), 45, 7)
+        .expect("extending snapshot");
+    let whole = source.snapshot_prefix(45, 7).expect("whole prefix");
+    assert_eq!(extending.tokens(), 45);
+    // Only positions 20..45 are owned; the base is counted by its owner.
+    assert_eq!(extending.kv_bytes(), 2 * 2 * 25 * 64 * 4);
+    assert!(std::rc::Rc::ptr_eq(extending.base().expect("base"), &base));
+    let mut joined = Qwen3ForwardExecutor::from_snapshot(&config, &weights, &extending)
+        .expect("restore extending");
+    let mut from_whole =
+        Qwen3ForwardExecutor::from_snapshot(&config, &weights, &whole).expect("restore whole");
+    assert_eq!(joined.cached_tokens(), 45);
+    for (left, right) in joined.cache.iter().zip(&from_whole.cache) {
+        let (left, right) = (
+            left.as_ref().expect("layer"),
+            right.as_ref().expect("layer"),
+        );
+        for (a, b) in [(&left.keys, &right.keys), (&left.values, &right.values)] {
+            assert_eq!(a.shape(), b.shape());
+            assert_eq!(
+                a.as_slice::<f32>(),
+                b.as_slice::<f32>(),
+                "bit-identical rows"
+            );
+        }
+    }
+    let tail = [3, 1, 4, 1, 5];
+    assert_eq!(
+        joined.extend_last_logits(&tail).expect("joined suffix"),
+        from_whole.extend_last_logits(&tail).expect("whole suffix"),
+    );
+    // A base at or past the end, or from another binding, is refused.
+    for (tokens, binding) in [(20, 7), (10, 7), (45, 8)] {
+        assert!(matches!(
+            source.snapshot_extending(base.clone(), tokens, binding),
+            Err(Qwen3ForwardError::KvSnapshotMismatch)
+        ));
+    }
 }
 
 #[test]

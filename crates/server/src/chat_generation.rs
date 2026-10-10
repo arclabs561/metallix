@@ -721,7 +721,7 @@ pub(crate) struct ChatSession {
     model: PathBuf,
     sampling_defaults: SamplingDefaults,
     /// Prompt-prefix K/V kept across turns, bounded by `--prefix-cache-mib`.
-    prefix_cache: prefix_cache::PrefixCache<qwen::forward::Qwen3KvSnapshot>,
+    prefix_cache: prefix_cache::PrefixCache<std::rc::Rc<qwen::forward::Qwen3KvSnapshot>>,
     /// Encoded prompts kept across turns, so a grown conversation encodes
     /// only its new turns.
     prompt_prefixes: prompt_prefixes::PromptPrefixes,

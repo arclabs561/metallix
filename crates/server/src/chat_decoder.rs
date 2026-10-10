@@ -264,7 +264,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
             let snapshot = sequence.snapshot()?;
             let bytes = D::snapshot_bytes(&snapshot);
             let extent = boundary.len();
-            if prefix_cache.insert(request.cache_salt, boundary, snapshot, bytes, role) {
+            if prefix_cache.insert(request.cache_salt, boundary, snapshot, bytes, role, None) {
                 written = written.max(extent);
             }
         }
