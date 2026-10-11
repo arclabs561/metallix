@@ -13,6 +13,7 @@
 )]
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -25,7 +26,7 @@ use mlx_rs::{
     Array, Dtype, StreamOrDevice, fast,
     ops::{
         self,
-        indexing::{IndexMutOp, IndexOp},
+        indexing::{Ellipsis, IndexMutOp, IndexOp},
     },
 };
 use serde::Deserialize;
@@ -37,6 +38,8 @@ use crate::{
 };
 
 mod delta;
+#[cfg(test)]
+mod mlx_affine_tests;
 
 /// Tokens per prefill graph. This bounds graph size even though the delta
 /// rule runs in 64-token chunks; longer prompts use successive graphs.
@@ -50,6 +53,9 @@ const VERIFY_STASH_BYTES: usize = 64 << 20;
 const TEXT_PREFIX: &str = "model.language_model.";
 /// Multi-token-prediction head tensors keep this prefix in the tensor map.
 const MTP_PREFIX: &str = "mtp.";
+/// The text decoder's prefix in mlx-lm's layout, and its untied output head.
+const MLX_TEXT_PREFIX: &str = "language_model.model.";
+const MLX_HEAD_PREFIX: &str = "language_model.lm_head.";
 const L2_NORM_EPS: f32 = 1e-6;
 
 /// Weight and activation precision.
@@ -76,6 +82,7 @@ pub struct Qwen35Weights {
     compute: Dtype,
     /// `YaRN` rotary arrays when the configuration's scaling is in force.
     yarn: Option<YarnArrays>,
+    numerics: Numerics,
 }
 
 /// Precomputed `YaRN` inputs to MLX's rope: the per-pair periods it rotates
@@ -121,6 +128,18 @@ fn yarn_arrays(config: &Qwen35Config, compute: Dtype) -> Result<Option<YarnArray
     }))
 }
 
+/// Which reference's tensor layout and op sequence the forward pass follows
+/// where the two round differently. The two paths deliberately follow
+/// different references: Hugging Face and GGUF checkpoints follow
+/// Transformers; checkpoints in mlx-lm's layout (the MLX affine ones
+/// mlx-community publishes) follow mlx-lm, which produced them and defines
+/// what their values compute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Numerics {
+    Transformers,
+    MlxLm,
+}
+
 /// Whether [`Qwen35Weights::load_with`] keeps the checkpoint's
 /// multi-token-prediction head.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -153,21 +172,46 @@ struct AffineWeight {
     group_size: i32,
 }
 
+impl AffineWeight {
+    /// The dense values in f32: `scale * code + bias` exact, with f32
+    /// parameters.
+    fn dequantize_f32(&self) -> Result<Array, Qwen35Error> {
+        let gpu = StreamOrDevice::gpu();
+        Ok(ops::dequantize_device(
+            &self.codes,
+            self.scales.as_type_device::<f32>(&gpu)?,
+            &self.biases.as_type_device::<f32>(&gpu)?,
+            self.group_size,
+            self.bits,
+            &gpu,
+        )?)
+    }
+}
+
 /// Largest single GGUF tensor this loader reads (a 248k x 8192 F32 matrix
 /// is 8 GiB).
 const MAX_GGUF_TENSOR_BYTES: u64 = 8 << 30;
 
 impl Qwen35Weights {
-    /// Loads and validates the text-decoder tensors of a local checkpoint.
+    /// Loads and validates the text-decoder tensors of a local checkpoint,
+    /// in the Hugging Face layout or in mlx-lm's (`language_model.model.*`,
+    /// experts split into `switch_mlp`, convolution kernels `[C, K, 1]`, norms
+    /// already `1 + weight`).
     ///
     /// Vision-tower and multi-token-prediction tensors are dropped unread.
-    /// Zero-centered RMS norm weights become `1 + weight` in f32 before any
-    /// precision conversion, and convolution kernels are stored `[K, C]`.
+    /// Hugging Face zero-centered RMS norm weights become `1 + weight` in f32
+    /// before any precision conversion, and convolution kernels are stored
+    /// `[K, C]`. A module stored with `scales` and `biases` is MLX affine
+    /// quantized with the configuration's `quantization` for it; at
+    /// [`Qwen35Precision::Checkpoint`] it stays quantized and activations
+    /// take its scales' dtype, at [`Qwen35Precision::Float32`] it is
+    /// dequantized to f32.
     ///
     /// # Errors
     ///
     /// Returns [`Qwen35Error`] for an unsupported configuration, an unsafe or
-    /// missing shard, a missing tensor, or a tensor of the wrong shape.
+    /// missing shard, a missing tensor, a tensor of the wrong shape, or a
+    /// quantized module the configuration does not describe.
     pub fn load(
         model_dir: impl AsRef<Path>,
         precision: Qwen35Precision,
@@ -196,48 +240,29 @@ impl Qwen35Weights {
         if load_mtp {
             check_mtp(&config)?;
         }
-        let mut tensors = HashMap::new();
-        for shard in shard_paths(model_dir)? {
-            for (name, tensor) in Array::load_safetensors_device(&shard, StreamOrDevice::cpu())? {
-                if let Some(name) = name.strip_prefix(TEXT_PREFIX) {
-                    tensors.insert(name.to_owned(), tensor);
-                } else if (name == "lm_head.weight" && !config.tie_word_embeddings())
-                    || (load_mtp && name.starts_with(MTP_PREFIX))
-                {
-                    tensors.insert(name, tensor);
-                }
-            }
-        }
-        let mut expected = expected_shapes(&config)?;
+        let (mut tensors, numerics) = read_text_tensors(model_dir, &config, load_mtp)?;
+        let mut quantized = take_quantized(&config, &mut tensors)?;
+        let mut expected = expected_shapes(&config, numerics)?;
         if load_mtp {
             expected.extend(mtp_shapes(&config)?);
         }
-        for (name, shape) in &expected {
-            let tensor = tensors
-                .get(name)
-                .ok_or_else(|| Qwen35Error::MissingTensor(name.clone()))?;
-            if tensor.shape() != shape.as_slice() {
-                return Err(Qwen35Error::TensorShape {
-                    name: name.clone(),
-                    expected: shape.clone(),
-                    actual: tensor.shape().to_vec(),
-                });
-            }
-        }
-        if tensors.len() != expected.len() {
-            let mut unexpected: Vec<_> = tensors
-                .keys()
-                .filter(|name| !expected.contains_key(*name))
-                .cloned()
-                .collect();
-            unexpected.sort();
-            return Err(Qwen35Error::UnexpectedTensors(unexpected));
-        }
+        check_shapes(&expected, &tensors, &quantized)?;
 
         let gpu = StreamOrDevice::gpu();
-        let compute = tensors["embed_tokens.weight"].dtype();
+        let compute = match quantized.get("embed_tokens.weight") {
+            Some(embedding) => embedding.scales.dtype(),
+            None => tensors["embed_tokens.weight"].dtype(),
+        };
+        if precision == Qwen35Precision::Float32 {
+            check_dequantized_bytes(&quantized)?;
+            for (name, weight) in quantized.drain() {
+                let dense = weight.dequantize_f32()?;
+                dense.eval()?;
+                tensors.insert(name, dense);
+            }
+        }
         for (name, tensor) in &mut tensors {
-            let converted = if is_zero_centered_norm(name) {
+            let converted = if numerics == Numerics::Transformers && is_zero_centered_norm(name) {
                 let shifted = tensor
                     .as_type_device::<f32>(&gpu)?
                     .add_device(Array::from_f32(1.0), &gpu)?;
@@ -246,9 +271,9 @@ impl Qwen35Weights {
                     Qwen35Precision::Checkpoint => shifted.as_dtype_device(compute, &gpu)?,
                 }
             } else if name.ends_with("conv1d.weight") {
-                let shape = tensor.shape().to_vec();
+                // [C, 1, K] (Hugging Face) or [C, K, 1] (mlx-lm) to [K, C].
                 let transposed = tensor
-                    .reshape_device(&[shape[0], shape[2]], &gpu)?
+                    .reshape_device(&[tensor.shape()[0], dim(config.conv_kernel)?], &gpu)?
                     .transpose_device(&gpu)?;
                 match precision {
                     Qwen35Precision::Float32 => transposed.as_type_device::<f32>(&gpu)?,
@@ -285,9 +310,10 @@ impl Qwen35Weights {
             yarn: yarn_arrays(&config, compute)?,
             config,
             tensors,
-            quantized: HashMap::new(),
+            quantized,
             precision,
             compute,
+            numerics,
         })
     }
 
@@ -318,7 +344,7 @@ impl Qwen35Weights {
     ) -> Result<Self, Qwen35Error> {
         let file = GgufFile::open(path)?;
         let config = Qwen35Config::from_gguf(file.metadata(), &file)?;
-        let expected = expected_shapes(&config)?;
+        let expected = expected_shapes(&config, Numerics::Transformers)?;
         let mut names = HashMap::new();
         let mut unexpected = Vec::new();
         for name in file.names() {
@@ -351,6 +377,7 @@ impl Qwen35Weights {
             // GGUF metadata declares no `RoPE` scaling; an operator override
             // goes through `with_rope_scaling`.
             yarn: None,
+            numerics: Numerics::Transformers,
         };
         for canonical in order {
             let stored = names
@@ -574,22 +601,18 @@ impl Qwen35Weights {
             .ok_or_else(|| Qwen35Error::MissingTensor(name.to_owned()))
     }
 
+    /// The matrix (or stack of matrices) `name`, dense or quantized.
+    fn matrix(&self, name: &str) -> Result<Matrix<'_>, Qwen35Error> {
+        match self.quantized.get(name) {
+            Some(weight) => Ok(Matrix::Affine(weight)),
+            None => Ok(Matrix::Dense(self.tensor(name)?)),
+        }
+    }
+
     /// `input` times the transpose of the matrix `name`, in `input`'s dtype.
     fn project(&self, input: &Array, name: &str) -> Result<Array, Qwen35Error> {
         let gpu = StreamOrDevice::gpu();
-        let output = match self.quantized.get(name) {
-            Some(weight) => ops::quantized_matmul_device(
-                input,
-                &weight.codes,
-                &weight.scales,
-                &weight.biases,
-                true,
-                weight.group_size,
-                weight.bits,
-                &gpu,
-            )?,
-            None => linear(input, self.tensor(name)?)?,
-        };
+        let output = self.matrix(name)?.apply(input)?;
         Ok(if output.dtype() == input.dtype() {
             output
         } else {
@@ -1703,129 +1726,320 @@ fn gated_attention(
 }
 
 fn mlp(weights: &Qwen35Weights, base: &str, input: &Array) -> Result<Array, Qwen35Error> {
-    let tensor = |name: &str| weights.tensor(&format!("{base}.mlp.{name}"));
+    let gpu = StreamOrDevice::gpu();
+    let matrix = |name: &str| weights.matrix(&format!("{base}.mlp.{name}"));
     match weights.config.mlp {
         Qwen35Mlp::Dense { .. } => {
-            let gpu = StreamOrDevice::gpu();
             let project = |name: &str, x: &Array| weights.project(x, &format!("{base}.mlp.{name}"));
-            let hidden = silu(&project("gate_proj.weight", input)?)?
-                .multiply_device(project("up_proj.weight", input)?, &gpu)?;
+            let hidden = gated(
+                &project("gate_proj.weight", input)?,
+                &project("up_proj.weight", input)?,
+                weights.numerics,
+            )?;
             project("down_proj.weight", &hidden)
         }
         Qwen35Mlp::Experts { top_k, .. } => {
-            let gpu = StreamOrDevice::gpu();
-            let shape = input.shape().to_vec();
-            let tokens = input.reshape_device(&[-1, shape[shape.len() - 1]], &gpu)?;
-            let block = MoeTensors {
-                router: tensor("gate.weight")?,
-                gate_up: tensor("experts.gate_up_proj")?,
-                down: tensor("experts.down_proj")?,
-                shared_gate: tensor("shared_expert.gate_proj.weight")?,
-                shared_up: tensor("shared_expert.up_proj.weight")?,
-                shared_down: tensor("shared_expert.down_proj.weight")?,
-                shared_scale: tensor("shared_expert_gate.weight")?,
+            let experts = match weights.numerics {
+                Numerics::Transformers => Experts::Fused {
+                    gate_up: weights.tensor(&format!("{base}.mlp.experts.gate_up_proj"))?,
+                    down: weights.tensor(&format!("{base}.mlp.experts.down_proj"))?,
+                },
+                Numerics::MlxLm => Experts::Split {
+                    gate: matrix("switch_mlp.gate_proj.weight")?,
+                    up: matrix("switch_mlp.up_proj.weight")?,
+                    down: matrix("switch_mlp.down_proj.weight")?,
+                },
             };
-            Ok(moe_block(&tokens, &block, top_k)?.reshape_device(&shape, &gpu)?)
+            let block = MoeTensors {
+                router: matrix("gate.weight")?,
+                experts,
+                shared_gate: matrix("shared_expert.gate_proj.weight")?,
+                shared_up: matrix("shared_expert.up_proj.weight")?,
+                shared_down: matrix("shared_expert.down_proj.weight")?,
+                shared_scale: matrix("shared_expert_gate.weight")?,
+            };
+            match weights.numerics {
+                // Transformers flattens the batch and sequence axes.
+                Numerics::Transformers => {
+                    let shape = input.shape().to_vec();
+                    let tokens = input.reshape_device(&[-1, shape[shape.len() - 1]], &gpu)?;
+                    Ok(moe_block(&tokens, &block, top_k)?.reshape_device(&shape, &gpu)?)
+                }
+                Numerics::MlxLm => moe_block(input, &block, top_k),
+            }
         }
     }
+}
+
+/// A stored weight matrix, or a stack of them along leading axes.
+#[derive(Clone, Copy)]
+enum Matrix<'a> {
+    Dense(&'a Array),
+    Affine(&'a AffineWeight),
+}
+
+impl Matrix<'_> {
+    /// `input` times the transpose of the matrix.
+    fn apply(self, input: &Array) -> Result<Array, Qwen35Error> {
+        match self {
+            Self::Dense(weight) => linear(input, weight),
+            Self::Affine(weight) => Ok(ops::quantized_matmul_device(
+                input,
+                &weight.codes,
+                &weight.scales,
+                &weight.biases,
+                true,
+                weight.group_size,
+                weight.bits,
+                StreamOrDevice::gpu(),
+            )?),
+        }
+    }
+
+    /// `input` times the transpose of the stacked matrix each of `indices`
+    /// selects (`gather_mm` or `gather_qmm`).
+    fn gather(self, input: &Array, indices: &Array, sorted: bool) -> Result<Array, Qwen35Error> {
+        let gpu = StreamOrDevice::gpu();
+        match self {
+            Self::Dense(weight) => Ok(ops::gather_mm_device(
+                input,
+                weight.swap_axes_device(-1, -2, &gpu)?,
+                None,
+                indices,
+                sorted,
+                &gpu,
+            )?),
+            Self::Affine(weight) => Ok(ops::gather_qmm_device(
+                input,
+                &weight.codes,
+                &weight.scales,
+                &weight.biases,
+                None,
+                indices,
+                true,
+                weight.group_size,
+                weight.bits,
+                sorted,
+                &gpu,
+            )?),
+        }
+    }
+}
+
+/// One layer's routed experts.
+enum Experts<'a> {
+    /// Hugging Face's dense layout: `gate_up` `[E, 2I, H]` (gate rows, then up
+    /// rows) and `down` `[E, H, I]`.
+    Fused { gate_up: &'a Array, down: &'a Array },
+    /// mlx-lm's layout: `gate` and `up` `[E, I, H]`, `down` `[E, H, I]`.
+    Split {
+        gate: Matrix<'a>,
+        up: Matrix<'a>,
+        down: Matrix<'a>,
+    },
 }
 
 /// One layer's `MoE` weights, as stored.
 struct MoeTensors<'a> {
     /// `[E, H]`.
-    router: &'a Array,
-    /// `[E, 2I, H]`, gate rows then up rows.
-    gate_up: &'a Array,
-    /// `[E, H, I]`.
-    down: &'a Array,
-    shared_gate: &'a Array,
-    shared_up: &'a Array,
-    shared_down: &'a Array,
+    router: Matrix<'a>,
+    experts: Experts<'a>,
+    shared_gate: Matrix<'a>,
+    shared_up: Matrix<'a>,
+    shared_down: Matrix<'a>,
     /// `[1, H]`; `sigmoid` of its product scales the shared expert.
-    shared_scale: &'a Array,
+    shared_scale: Matrix<'a>,
 }
 
-/// The routed experts plus the gated shared expert over `tokens` `[n, H]`.
+/// The experts each token is sent to and their mixing weights, both
+/// `[.., top_k]`.
+struct Routing {
+    chosen: Array,
+    weights: Array,
+}
+
+/// The routed experts plus the gated shared expert over `tokens` `[.., H]`.
+/// Fused experts take Transformers' routing and `[n, H]` tokens; split
+/// experts take mlx-lm's.
 fn moe_block(tokens: &Array, block: &MoeTensors<'_>, top_k: usize) -> Result<Array, Qwen35Error> {
     let gpu = StreamOrDevice::gpu();
-    let routed = routed_experts(tokens, block.router, block.gate_up, block.down, top_k)?;
+    let numerics = match block.experts {
+        Experts::Fused { .. } => Numerics::Transformers,
+        Experts::Split { .. } => Numerics::MlxLm,
+    };
+    let routed = match block.experts {
+        Experts::Fused { gate_up, down } => {
+            let routing = route_f32(tokens, block.router, top_k)?;
+            fused_experts(tokens, gate_up, down, &routing)?
+        }
+        Experts::Split { gate, up, down } => {
+            let routing = route_mlx(tokens, block.router, top_k)?;
+            split_experts(tokens, [gate, up, down], &routing)?
+        }
+    };
     let shared = swiglu(
         tokens,
-        block.shared_gate,
-        block.shared_up,
-        block.shared_down,
+        [block.shared_gate, block.shared_up, block.shared_down],
+        numerics,
     )?
     .multiply_device(
-        ops::sigmoid_device(linear(tokens, block.shared_scale)?, &gpu)?,
+        ops::sigmoid_device(block.shared_scale.apply(tokens)?, &gpu)?,
         &gpu,
     )?;
     Ok(routed.add_device(&shared, &gpu)?)
 }
 
-fn swiglu(input: &Array, gate: &Array, up: &Array, down: &Array) -> Result<Array, Qwen35Error> {
-    let gpu = StreamOrDevice::gpu();
-    linear(
-        &silu(&linear(input, gate)?)?.multiply_device(linear(input, up)?, &gpu)?,
-        down,
-    )
+fn swiglu(
+    input: &Array,
+    [gate, up, down]: [Matrix<'_>; 3],
+    numerics: Numerics,
+) -> Result<Array, Qwen35Error> {
+    down.apply(&gated(&gate.apply(input)?, &up.apply(input)?, numerics)?)
 }
 
-/// The routed half of an `MoE` block over `tokens` `[n, H]`: the router
-/// `[E, H]` picks `top_k` experts per token by softmax probability (in f32),
-/// renormalized to sum to 1; each expert applies `SwiGLU` with its slice of
-/// `gate_up` `[E, 2I, H]` (gate rows, then up rows) and `down` `[E, H, I]`.
-/// Returns the probability-weighted sum, `[n, H]`.
-fn routed_experts(
-    tokens: &Array,
-    router: &Array,
-    gate_up: &Array,
-    down: &Array,
-    top_k: usize,
-) -> Result<Array, Qwen35Error> {
+type CompiledGraph =
+    Box<dyn for<'a> FnMut(&'a [Array]) -> Result<Vec<Array>, mlx_rs::error::Exception>>;
+
+thread_local! {
+    /// mlx-lm's `swiglu`, compiled once per thread (MLX keeps compiled
+    /// functions per thread).
+    static FUSED_SWIGLU: RefCell<Option<CompiledGraph>> = const { RefCell::new(None) };
+}
+
+/// `silu(gate) * up`. mlx-lm computes it as one compiled, fused kernel
+/// (`mx.compile(shapeless=True)`), which rounds differently from the same
+/// ops run one by one: on 16.7M random BF16 inputs, 5,110 outputs differ.
+/// mlx-lm-layout checkpoints therefore use the compiled form, the others
+/// the separate ops Transformers' rounding follows.
+fn gated(gate: &Array, up: &Array, numerics: Numerics) -> Result<Array, Qwen35Error> {
+    match numerics {
+        Numerics::Transformers => Ok(silu(gate)?.multiply_device(up, StreamOrDevice::gpu())?),
+        Numerics::MlxLm => FUSED_SWIGLU.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            let compiled = cell.get_or_insert_with(|| {
+                Box::new(mlx_rs::transforms::compile::compile(
+                    |inputs: &[Array]| {
+                        let (gate, up) = (&inputs[0], &inputs[1]);
+                        // nn.silu is `x * sigmoid(x)`.
+                        Ok(vec![gate.multiply(ops::sigmoid(gate)?)?.multiply(up)?])
+                    },
+                    true,
+                ))
+            });
+            let mut outputs = compiled(&[gate.clone(), up.clone()])?;
+            outputs.pop().ok_or(Qwen35Error::ShapeOverflow)
+        }),
+    }
+}
+
+/// Transformers' routing: softmax over the router logits in f32, the
+/// `top_k` largest renormalized to sum to 1 in f32, then cast to the
+/// activation dtype.
+fn route_f32(tokens: &Array, router: Matrix<'_>, top_k: usize) -> Result<Routing, Qwen35Error> {
     let gpu = StreamOrDevice::gpu();
-    let compute = tokens.dtype();
-    let experts = router.shape()[0];
-    let top_k = dim(top_k)?;
-    let width = down.shape()[2];
     let probabilities = ops::softmax_axis_device(
-        linear(tokens, router)?.as_type_device::<f32>(&gpu)?,
+        router.apply(tokens)?.as_type_device::<f32>(&gpu)?,
         -1,
         true,
         &gpu,
     )?;
-    // After partitioning at `experts - top_k`, the last `top_k` positions
-    // hold the largest probabilities, in no particular order.
-    let kth = experts - top_k;
-    let chosen = ops::argpartition_axis_device(&probabilities, kth, -1, &gpu)?.index((.., kth..));
-    let weights = probabilities.take_along_axis_device(&chosen, -1, &gpu)?;
+    let (chosen, weights) = top(&probabilities, top_k)?;
     let weights = weights
         .divide_device(weights.sum_axis_device(-1, true, &gpu)?, &gpu)?
-        .as_dtype_device(compute, &gpu)?;
+        .as_dtype_device(tokens.dtype(), &gpu)?;
+    Ok(Routing { chosen, weights })
+}
 
+/// mlx-lm's routing: the same steps in the activation dtype (the softmax
+/// accumulates in f32 but returns that dtype).
+fn route_mlx(tokens: &Array, router: Matrix<'_>, top_k: usize) -> Result<Routing, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let probabilities = ops::softmax_axis_device(router.apply(tokens)?, -1, true, &gpu)?;
+    let (chosen, weights) = top(&probabilities, top_k)?;
+    let weights = weights.divide_device(weights.sum_axis_device(-1, true, &gpu)?, &gpu)?;
+    Ok(Routing { chosen, weights })
+}
+
+/// The indices and values of the `top_k` largest `probabilities` on the last
+/// axis, in no particular order.
+fn top(probabilities: &Array, top_k: usize) -> Result<(Array, Array), Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let experts = probabilities.shape()[probabilities.ndim() - 1];
+    // After partitioning at `experts - top_k`, the last `top_k` positions
+    // hold the largest probabilities.
+    let kth = experts - dim(top_k)?;
+    let chosen =
+        ops::argpartition_axis_device(probabilities, kth, -1, &gpu)?.index((Ellipsis, kth..));
+    let weights = probabilities.take_along_axis_device(&chosen, -1, &gpu)?;
+    Ok((chosen, weights))
+}
+
+/// Fused experts over `tokens` `[n, H]`: each chosen expert applies `SwiGLU`
+/// with its slice of `gate_up` and `down`; returns the weighted sum, `[n, H]`.
+fn fused_experts(
+    tokens: &Array,
+    gate_up: &Array,
+    down: &Array,
+    routing: &Routing,
+) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let width = down.shape()[2];
     // [n, 1, 1, H] against [E, H, 2I] gathered by `chosen` [n, k]: [n, k, 1, 2I].
     let rows = tokens.expand_dims_axes_device(&[-2, -3], &gpu)?;
-    let projected = ops::gather_mm_device(
-        &rows,
-        gate_up.swap_axes_device(-1, -2, &gpu)?,
-        None,
-        &chosen,
-        None,
-        &gpu,
-    )?;
+    let projected = Matrix::Dense(gate_up).gather(&rows, &routing.chosen, false)?;
     let halves = ops::split_sections_device(&projected, &[width], -1, &gpu)?;
     let hidden = silu(&halves[0])?.multiply_device(&halves[1], &gpu)?;
-    let outputs = ops::gather_mm_device(
-        &hidden,
-        down.swap_axes_device(-1, -2, &gpu)?,
-        None,
-        &chosen,
-        None,
-        &gpu,
-    )?
-    .squeeze_axes_device(&[-2], &gpu)?;
+    let outputs = Matrix::Dense(down)
+        .gather(&hidden, &routing.chosen, false)?
+        .squeeze_axes_device(&[-2], &gpu)?;
     Ok(outputs
-        .multiply_device(weights.expand_dims_device(-1, &gpu)?, &gpu)?
+        .multiply_device(routing.weights.expand_dims_device(-1, &gpu)?, &gpu)?
         .sum_axis_device(1, false, &gpu)?)
+}
+
+/// Split experts over `tokens` `[.., H]` as mlx-lm's `SwitchGLU` runs them:
+/// with 64 or more selections the rows are sorted by expert first, so each
+/// expert's weights are read once. Returns the weighted sum, `[.., H]`.
+fn split_experts(
+    tokens: &Array,
+    [gate, up, down]: [Matrix<'_>; 3],
+    routing: &Routing,
+) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let rows = tokens.expand_dims_axes_device(&[-2, -3], &gpu)?;
+    let top_k = routing.chosen.shape()[routing.chosen.ndim() - 1];
+    let sorted = routing.chosen.size() >= 64;
+    let (rows, chosen, restore) = if sorted {
+        // Row `i` of the flattened selections belongs to token `i / top_k`.
+        let flat = routing.chosen.reshape_device(&[-1], &gpu)?;
+        let order = ops::argsort_axis_device(&flat, 0, &gpu)?;
+        let restore = ops::argsort_axis_device(&order, 0, &gpu)?;
+        let shape = rows.shape();
+        let rows = rows
+            .reshape_device(&[-1, shape[shape.len() - 2], shape[shape.len() - 1]], &gpu)?
+            .take_axis_device(
+                order.floor_divide_device(Array::from_int(top_k), &gpu)?,
+                0,
+                &gpu,
+            )?;
+        (rows, flat.take_axis_device(&order, 0, &gpu)?, Some(restore))
+    } else {
+        (rows, routing.chosen.clone(), None)
+    };
+    let projected_up = up.gather(&rows, &chosen, sorted)?;
+    let projected_gate = gate.gather(&rows, &chosen, sorted)?;
+    let hidden = gated(&projected_gate, &projected_up, Numerics::MlxLm)?;
+    let mut outputs = down.gather(&hidden, &chosen, sorted)?;
+    if let Some(restore) = restore {
+        let shape = [routing.chosen.shape(), &outputs.shape()[1..]].concat();
+        outputs = outputs
+            .take_axis_device(&restore, 0, &gpu)?
+            .reshape_device(&shape, &gpu)?;
+    }
+    Ok(outputs
+        .squeeze_axes_device(&[-2], &gpu)?
+        .multiply_device(routing.weights.expand_dims_device(-1, &gpu)?, &gpu)?
+        .sum_axis_device(-2, false, &gpu)?)
 }
 
 /// `x / sqrt(sum(x^2) + eps)` over the last axis, matching the source's FLA
@@ -1885,23 +2099,44 @@ fn is_zero_centered_norm(name: &str) -> bool {
 }
 
 /// The stored shapes of one layer's `MoE` tensors under `mlp`, from the
-/// expert count and the routed and shared expert widths.
+/// expert count and the routed and shared expert widths. Hugging Face fuses
+/// the routed gate and up projections; mlx-lm splits them.
 fn expert_shapes(
     put: &mut impl FnMut(String, &[i32]),
     mlp: &str,
     hidden: i32,
     [experts, expert, shared]: [usize; 3],
+    numerics: Numerics,
 ) -> Result<(), Qwen35Error> {
     let (experts, expert, shared) = (dim(experts)?, dim(expert)?, dim(shared)?);
     put(format!("{mlp}.gate.weight"), &[experts, hidden]);
-    put(
-        format!("{mlp}.experts.gate_up_proj"),
-        &[experts, 2 * expert, hidden],
-    );
-    put(
-        format!("{mlp}.experts.down_proj"),
-        &[experts, hidden, expert],
-    );
+    match numerics {
+        Numerics::Transformers => {
+            put(
+                format!("{mlp}.experts.gate_up_proj"),
+                &[experts, 2 * expert, hidden],
+            );
+            put(
+                format!("{mlp}.experts.down_proj"),
+                &[experts, hidden, expert],
+            );
+        }
+        Numerics::MlxLm => {
+            let routed = format!("{mlp}.switch_mlp");
+            put(
+                format!("{routed}.gate_proj.weight"),
+                &[experts, expert, hidden],
+            );
+            put(
+                format!("{routed}.up_proj.weight"),
+                &[experts, expert, hidden],
+            );
+            put(
+                format!("{routed}.down_proj.weight"),
+                &[experts, hidden, expert],
+            );
+        }
+    }
     put(
         format!("{mlp}.shared_expert.gate_proj.weight"),
         &[shared, hidden],
@@ -2005,8 +2240,12 @@ fn mtp_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Qwen35
     Ok(shapes)
 }
 
-/// Every decoder tensor this implementation reads, with its stored shape.
-fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Qwen35Error> {
+/// Every decoder tensor this implementation reads, with its stored (for a
+/// quantized module, its dense) shape in the layout `numerics` implies.
+fn expected_shapes(
+    config: &Qwen35Config,
+    numerics: Numerics,
+) -> Result<HashMap<String, Vec<i32>>, Qwen35Error> {
     let hidden = dim(config.hidden_size)?;
     let vocab = dim(config.vocab_size)?;
     let value_heads = dim(config.linear_value_heads)?;
@@ -2042,6 +2281,7 @@ fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Q
                 &mlp,
                 hidden,
                 [experts, expert_intermediate_size, shared_intermediate_size],
+                numerics,
             )?,
         }
         match kind {
@@ -2051,7 +2291,13 @@ fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Q
                 put(format!("{attn}.in_proj_z.weight"), &[value_width, hidden]);
                 put(format!("{attn}.in_proj_b.weight"), &[value_heads, hidden]);
                 put(format!("{attn}.in_proj_a.weight"), &[value_heads, hidden]);
-                put(format!("{attn}.conv1d.weight"), &[conv, 1, kernel]);
+                put(
+                    format!("{attn}.conv1d.weight"),
+                    &match numerics {
+                        Numerics::Transformers => [conv, 1, kernel],
+                        Numerics::MlxLm => [conv, kernel, 1],
+                    },
+                );
                 put(format!("{attn}.A_log"), &[value_heads]);
                 put(format!("{attn}.dt_bias"), &[value_heads]);
                 put(
@@ -2066,6 +2312,188 @@ fn expected_shapes(config: &Qwen35Config) -> Result<HashMap<String, Vec<i32>>, Q
         }
     }
     Ok(shapes)
+}
+
+/// The text-decoder tensors of a safetensors checkpoint by name without its
+/// prefix, and the layout they were stored in. An untied output head is
+/// `lm_head.*` in both layouts. With `mtp`, the multi-token-prediction head's
+/// `mtp.*` tensors are kept too; they exist only in the Transformers layout.
+fn read_text_tensors(
+    model_dir: &Path,
+    config: &Qwen35Config,
+    mtp: bool,
+) -> Result<(HashMap<String, Array>, Numerics), Qwen35Error> {
+    let mut tensors = HashMap::new();
+    let mut layouts = (false, false);
+    for shard in shard_paths(model_dir)? {
+        for (name, tensor) in Array::load_safetensors_device(&shard, StreamOrDevice::cpu())? {
+            let (name, mlx) = if let Some(name) = name.strip_prefix(TEXT_PREFIX) {
+                (name.to_owned(), false)
+            } else if let Some(name) = name.strip_prefix(MLX_TEXT_PREFIX) {
+                (name.to_owned(), true)
+            } else if let Some(part) = name.strip_prefix(MLX_HEAD_PREFIX) {
+                (format!("lm_head.{part}"), true)
+            } else if name.starts_with("lm_head.") || (mtp && name.starts_with(MTP_PREFIX)) {
+                (name, false)
+            } else {
+                continue;
+            };
+            if name.starts_with("lm_head.") && config.tie_word_embeddings() {
+                continue;
+            }
+            if mlx {
+                layouts.1 = true;
+            } else {
+                layouts.0 = true;
+            }
+            tensors.insert(name, tensor);
+        }
+    }
+    match layouts {
+        (true, true) => Err(Qwen35Error::MixedLayouts),
+        (false, true) => Ok((tensors, Numerics::MlxLm)),
+        _ => Ok((tensors, Numerics::Transformers)),
+    }
+}
+
+/// Moves every module stored with `scales` out of `tensors` as an
+/// [`AffineWeight`] keyed `stem.weight`, with the configuration's bits and
+/// group size for it.
+fn take_quantized(
+    config: &Qwen35Config,
+    tensors: &mut HashMap<String, Array>,
+) -> Result<HashMap<String, AffineWeight>, Qwen35Error> {
+    let stems: Vec<String> = tensors
+        .keys()
+        .filter_map(|name| name.strip_suffix(".scales"))
+        .map(str::to_owned)
+        .collect();
+    let mut quantized = HashMap::new();
+    for stem in stems {
+        let Some(affine) = config
+            .quantization()
+            .and_then(|quantization| quantization.module(&stem))
+        else {
+            return Err(Qwen35Error::UndeclaredQuantization(stem));
+        };
+        let mut take = |part: &str| {
+            let name = format!("{stem}.{part}");
+            tensors
+                .remove(&name)
+                .ok_or(Qwen35Error::MissingTensor(name))
+        };
+        let weight = AffineWeight {
+            codes: take("weight")?,
+            scales: take("scales")?,
+            biases: take("biases")?,
+            bits: i32::from(affine.bits()),
+            group_size: i32::from(affine.group_size()),
+        };
+        quantized.insert(format!("{stem}.weight"), weight);
+    }
+    Ok(quantized)
+}
+
+/// Checks every expected tensor is stored once with its shape: dense as
+/// listed, quantized as `u32` codes `[.., rows, columns * bits / 32]` with
+/// scales and biases `[.., rows, columns / group_size]`.
+fn check_shapes(
+    expected: &HashMap<String, Vec<i32>>,
+    tensors: &HashMap<String, Array>,
+    quantized: &HashMap<String, AffineWeight>,
+) -> Result<(), Qwen35Error> {
+    let mismatch = |name: &str, expected: &[i32], actual: &[i32]| {
+        Err(Qwen35Error::TensorShape {
+            name: name.to_owned(),
+            expected: expected.to_vec(),
+            actual: actual.to_vec(),
+        })
+    };
+    for (name, shape) in expected {
+        if let Some(weight) = quantized.get(name) {
+            let (columns, rows) = shape.split_last().ok_or(Qwen35Error::ShapeOverflow)?;
+            let packed = |width: i32| [rows, &[width]].concat();
+            let codes = packed(columns * weight.bits / 32);
+            let groups = packed(columns / weight.group_size);
+            if weight.codes.dtype() != Dtype::Uint32
+                || columns % weight.group_size != 0
+                || (columns * weight.bits) % 32 != 0
+            {
+                return mismatch(name, &codes, weight.codes.shape());
+            }
+            for (part, stored) in [
+                (name.replace(".weight", ".scales"), &weight.scales),
+                (name.replace(".weight", ".biases"), &weight.biases),
+            ] {
+                if !matches!(
+                    stored.dtype(),
+                    Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+                ) {
+                    return Err(Qwen35Error::QuantizationParameterDtype {
+                        name: part,
+                        dtype: format!("{:?}", stored.dtype()),
+                    });
+                }
+            }
+            for (part, stored, want) in [
+                (name.clone(), &weight.codes, &codes),
+                (name.replace(".weight", ".scales"), &weight.scales, &groups),
+                (name.replace(".weight", ".biases"), &weight.biases, &groups),
+            ] {
+                if stored.shape() != want.as_slice() {
+                    return mismatch(&part, want, stored.shape());
+                }
+            }
+            continue;
+        }
+        let tensor = tensors
+            .get(name)
+            .ok_or_else(|| Qwen35Error::MissingTensor(name.clone()))?;
+        if tensor.shape() != shape.as_slice() {
+            return mismatch(name, shape, tensor.shape());
+        }
+    }
+    if tensors.len() + quantized.len() != expected.len() {
+        let mut unexpected: Vec<_> = tensors
+            .keys()
+            .chain(quantized.keys())
+            .filter(|name| !expected.contains_key(*name))
+            .cloned()
+            .collect();
+        unexpected.sort();
+        return Err(Qwen35Error::UnexpectedTensors(unexpected));
+    }
+    Ok(())
+}
+
+/// Largest f32 footprint [`Qwen35Precision::Float32`] dequantizes a
+/// quantized checkpoint into. f32 exists to compare small checkpoints with an
+/// f32 reference; a 35B checkpoint would need about 140 GB.
+const MAX_DEQUANTIZED_F32_BYTES: u64 = 16 << 30;
+
+/// Refuses an f32 load whose dequantized matrices would exceed
+/// [`MAX_DEQUANTIZED_F32_BYTES`].
+fn check_dequantized_bytes(quantized: &HashMap<String, AffineWeight>) -> Result<(), Qwen35Error> {
+    let bytes = quantized
+        .values()
+        .map(|weight| {
+            // Each scale covers `group_size` values.
+            u64::try_from(weight.scales.size())
+                .ok()
+                .and_then(|groups| groups.checked_mul(u64::try_from(weight.group_size).ok()?))
+                .and_then(|values| values.checked_mul(4))
+                .ok_or(Qwen35Error::ShapeOverflow)
+        })
+        .try_fold(0_u64, |total, bytes| {
+            total.checked_add(bytes?).ok_or(Qwen35Error::ShapeOverflow)
+        })?;
+    if bytes > MAX_DEQUANTIZED_F32_BYTES {
+        return Err(Qwen35Error::DequantizedTooLarge {
+            bytes,
+            limit: MAX_DEQUANTIZED_F32_BYTES,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -2139,6 +2567,30 @@ pub enum Qwen35Error {
     /// The checkpoint holds decoder tensors this layout does not use.
     #[error("checkpoint has unexpected decoder tensors: {0:?}")]
     UnexpectedTensors(Vec<String>),
+    /// A checkpoint stores tensors in both the Hugging Face and the mlx-lm
+    /// layout.
+    #[error("checkpoint mixes Hugging Face and mlx-lm tensor names")]
+    MixedLayouts,
+    /// A module is stored quantized but the configuration declares no
+    /// quantization for it.
+    #[error("{0} is stored quantized, but config.json declares no quantization for it")]
+    UndeclaredQuantization(String),
+    /// A quantized module's scales or biases are not floating point.
+    #[error("{name} is stored as {dtype}, not a floating-point type")]
+    QuantizationParameterDtype {
+        /// The scales or biases tensor.
+        name: String,
+        /// Its stored dtype.
+        dtype: String,
+    },
+    /// An f32 load would dequantize more than the f32 limit.
+    #[error("dequantizing to f32 needs {bytes} bytes, above the {limit}-byte limit for f32 loads")]
+    DequantizedTooLarge {
+        /// Bytes the dequantized f32 matrices would take.
+        bytes: u64,
+        /// The limit.
+        limit: u64,
+    },
     /// A tensor's shape disagrees with the configuration.
     #[error("tensor {name} has shape {actual:?}, expected {expected:?}")]
     TensorShape {
@@ -2242,7 +2694,7 @@ pub enum Qwen35Error {
 mod tests {
     use mlx_rs::Array;
 
-    use super::{MoeTensors, is_zero_centered_norm, moe_block, mtp_shapes};
+    use super::{Experts, Matrix, MoeTensors, is_zero_centered_norm, moe_block, mtp_shapes};
     use crate::Qwen35Config;
 
     /// MLX's rope with the `YaRN` periods and feature scale rotates a head the
@@ -2315,6 +2767,7 @@ mod tests {
             precision: super::Qwen35Precision::Float32,
             compute: mlx_rs::Dtype::Float32,
             yarn: None,
+            numerics: super::Numerics::Transformers,
         };
         let source = weights();
         let other = weights();
@@ -2331,7 +2784,7 @@ mod tests {
     }
 
     /// Deterministic values in [-1, 1) (xorshift64), so failures reproduce.
-    fn values(seed: u64, count: usize) -> Vec<f32> {
+    pub(super) fn values(seed: u64, count: usize) -> Vec<f32> {
         let mut state = seed.max(1);
         (0..count)
             .map(|_| {
@@ -2425,13 +2878,15 @@ mod tests {
                 array(&self.shared_scale, &[1, hidden]),
             );
             let block = MoeTensors {
-                router: &router,
-                gate_up: &gate_up,
-                down: &down,
-                shared_gate: &shared_gate,
-                shared_up: &shared_up,
-                shared_down: &shared_down,
-                shared_scale: &shared_scale,
+                router: Matrix::Dense(&router),
+                experts: Experts::Fused {
+                    gate_up: &gate_up,
+                    down: &down,
+                },
+                shared_gate: Matrix::Dense(&shared_gate),
+                shared_up: Matrix::Dense(&shared_up),
+                shared_down: Matrix::Dense(&shared_down),
+                shared_scale: Matrix::Dense(&shared_scale),
             };
             let out =
                 moe_block(&array(&self.x, &[tokens, hidden]), &block, top_k).expect("moe block");

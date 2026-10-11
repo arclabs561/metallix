@@ -386,6 +386,26 @@ fn qwen_gates_accept_mlx_affine_layouts_and_refuse_other_quantization() {
 
     let unquantized = with_field(QWEN3_06B, r#""quantization_config": null"#);
     assert_classified(&unquantized, Some(Adapter::Qwen3), true);
+
+    // mlx-community/Qwen3.5-0.8B-4bit writes both fields too.
+    let qwen35 = with_field(
+        &with_field(
+            QWEN35_08B,
+            r#""quantization": {"group_size": 64, "bits": 4, "mode": "affine"}"#,
+        ),
+        r#""quantization_config": {"group_size": 64, "bits": 4, "mode": "affine"}"#,
+    );
+    assert_classified(&qwen35, Some(Adapter::Qwen35), true);
+    let qwen35_fp8 = with_field(
+        QWEN35_08B,
+        r#""quantization_config": {"activation_scheme": "dynamic", "quant_method": "fp8", "weight_block_size": [128, 128]}"#,
+    );
+    let verdict = assert_classified(&qwen35_fp8, Some(Adapter::Qwen35), false);
+    assert!(
+        verdict.reason().contains("quantization_config"),
+        "{}",
+        verdict.reason()
+    );
 }
 
 #[test]

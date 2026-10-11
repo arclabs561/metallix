@@ -44,15 +44,16 @@ impl Adapter {
     const fn gate_reads_quantization(self) -> bool {
         match self {
             // V41TextContract requires the official fp8/fp4 block layout;
-            // Qwen3ForwardConfig parses MLX affine `quantization` and refuses
-            // any other `quantization_config`.
+            // Qwen3ForwardConfig and Qwen35Config parse MLX affine
+            // `quantization` and refuse any other `quantization_config`.
             Self::DeepseekV41
             | Self::Qwen3
             | Self::Llama
             | Self::Qwen2
             | Self::PplxQwen3
-            | Self::Qwen3Asr => true,
-            Self::Julia | Self::Qwen35 | Self::Gemma4 => false,
+            | Self::Qwen3Asr
+            | Self::Qwen35 => true,
+            Self::Julia | Self::Gemma4 => false,
         }
     }
 
