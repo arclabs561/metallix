@@ -42,6 +42,11 @@ mod delta;
 /// rule runs in 64-token chunks; longer prompts use successive graphs.
 pub const PREFILL_CHUNK_TOKENS: usize = 128;
 
+/// Bytes a verify may keep to roll back (see [`Qwen35Executor::verify_logits`]).
+/// On Qwen3.5-9B at BF16 each verified token stashes about 400 KB across the
+/// linear layers, so this admits over 128 tokens there.
+const VERIFY_STASH_BYTES: usize = 64 << 20;
+
 const TEXT_PREFIX: &str = "model.language_model.";
 /// Multi-token-prediction head tensors keep this prefix in the tensor map.
 const MTP_PREFIX: &str = "mtp.";
@@ -515,6 +520,7 @@ impl Qwen35Weights {
             weights: self,
             layers: self.config.layers.iter().map(|_| None).collect(),
             tokens: 0,
+            pending: None,
         }
     }
 
@@ -558,6 +564,7 @@ impl Qwen35Weights {
             weights: self,
             layers: snapshot.layers.clone(),
             tokens: snapshot.tokens,
+            pending: None,
         })
     }
 
@@ -722,6 +729,55 @@ pub struct Qwen35Executor<'a> {
     weights: &'a Qwen35Weights,
     layers: Vec<Option<LayerState>>,
     tokens: usize,
+    /// What the last verify kept to roll back, until it is truncated or
+    /// another extend commits it.
+    pending: Option<VerifyStash>,
+}
+
+/// What a verify keeps so [`Qwen35Executor::truncate_to`] can roll back to
+/// any of its prefixes. Recurrent state cannot drop positions, so each linear
+/// layer keeps its state from before the verify (shared arrays, no copy) and
+/// the verified rows' convolution, decay and beta inputs, which a rollback
+/// replays token by token over the kept prefix. Full-attention layers need
+/// nothing: their valid length is the token count.
+struct VerifyStash {
+    start: usize,
+    verified: usize,
+    layers: Vec<Option<LinearStash>>,
+}
+
+/// Hidden rows a forward hands back next to its tokens, for drafters that
+/// read the target's activations. Each choice yields `[rows, width]` in the
+/// compute dtype, one row per consumed position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen35Taps<'a> {
+    /// No rows.
+    None,
+    /// The hidden state after the final norm, the input of the output head
+    /// and of the multi-token-prediction head; `width` is the hidden size.
+    FinalNormed,
+    /// The residual after each listed layer (before the final norm), in list
+    /// order and concatenated; `width` is the hidden size times the count.
+    Layers(&'a [usize]),
+}
+
+/// A verify's per-row result with the taps it was asked for.
+#[derive(Debug)]
+pub struct Qwen35Verified<T> {
+    /// One entry per verified token, as from the method that returned this.
+    pub rows: T,
+    /// `[tokens, width]`, evaluated; `None` for [`Qwen35Taps::None`].
+    pub taps: Option<Array>,
+}
+
+/// One linear layer's part of a [`VerifyStash`].
+struct LinearStash {
+    conv: Array,
+    recurrent: Array,
+    /// `in_proj_qkv`, `in_proj_a` and `in_proj_b` outputs, `[1, seq, _]`.
+    qkv: Array,
+    a: Array,
+    b: Array,
 }
 
 impl Qwen35Executor<'_> {
@@ -782,6 +838,164 @@ impl Qwen35Executor<'_> {
     pub fn reset(&mut self) {
         self.layers.iter_mut().for_each(|layer| *layer = None);
         self.tokens = 0;
+        self.pending = None;
+    }
+
+    /// The most tokens one [`Self::verify_logits`] or [`Self::verify_greedy`]
+    /// accepts: what the rollback stash budget holds, at most one prefill
+    /// graph.
+    #[must_use]
+    pub fn max_verify_tokens(&self) -> usize {
+        let config = &self.weights.config;
+        let linear = config
+            .layers
+            .iter()
+            .filter(|kind| **kind == Qwen35LayerKind::LinearAttention)
+            .count();
+        let element = if self.weights.compute == Dtype::Float32 {
+            4
+        } else {
+            2
+        };
+        let per_token = linear * (config.conv_dim() + 2 * config.linear_value_heads) * element;
+        (VERIFY_STASH_BYTES / per_token.max(1)).min(PREFILL_CHUNK_TOKENS)
+    }
+
+    /// Appends `tokens` and returns the f32 logits after every appended
+    /// position, row-major `[tokens.len(), vocab]`: row `i` is the
+    /// distribution after `tokens[..=i]`. Keeps what [`Self::truncate_to`]
+    /// needs to roll back to any prefix of `tokens`; an earlier verify that was
+    /// not truncated is committed. `taps` selects hidden rows to return
+    /// beside the logits, one per token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35Error::VerifyLength`] for more than
+    /// [`Self::max_verify_tokens`] tokens, [`Qwen35Error::TapLayer`] for a
+    /// bad tap list, or any error of [`Self::extend_last_logits`].
+    pub fn verify_logits(
+        &mut self,
+        tokens: &[i32],
+        taps: Qwen35Taps<'_>,
+    ) -> Result<Qwen35Verified<Vec<f32>>, Qwen35Error> {
+        let (hidden, taps) = self.verify_hidden(tokens, taps)?;
+        let logits = self.row_logits(&hidden)?;
+        mlx_rs::transforms::eval(std::iter::once(&logits).chain(&taps))?;
+        Ok(Qwen35Verified {
+            rows: logits.as_slice::<f32>().to_vec(),
+            taps,
+        })
+    }
+
+    /// [`Self::verify_logits`], returning the greedy token after every
+    /// appended position (lowest ID on ties), picked on the GPU so only the
+    /// IDs cross to the host.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_logits`], plus [`Qwen35Error::NonFiniteLogits`] when
+    /// any logit is NaN or infinite.
+    pub fn verify_greedy(
+        &mut self,
+        tokens: &[i32],
+        taps: Qwen35Taps<'_>,
+    ) -> Result<Qwen35Verified<Vec<i32>>, Qwen35Error> {
+        let (hidden, taps) = self.verify_hidden(tokens, taps)?;
+        let logits = self.row_logits(&hidden)?;
+        let gpu = StreamOrDevice::gpu();
+        let finite = logits.is_finite_device(&gpu)?.all_device(false, &gpu)?;
+        let picks = ops::indexing::argmax_axis_device(&logits, -1, false, &gpu)?;
+        mlx_rs::transforms::eval([&picks, &finite].into_iter().chain(&taps))?;
+        if !finite.item::<bool>() {
+            return Err(Qwen35Error::NonFiniteLogits);
+        }
+        // MLX returns argmax indices as uint32.
+        let rows = picks
+            .as_slice::<u32>()
+            .iter()
+            .map(|&id| i32::try_from(id).map_err(|_| Qwen35Error::ShapeOverflow))
+            .collect::<Result<_, _>>()?;
+        Ok(Qwen35Verified { rows, taps })
+    }
+
+    /// Keeps the first `tokens` positions of the sequence, which must lie
+    /// between the length before the last verify and its end, and drops the
+    /// rest of that verify. Linear layers restore their state from before the
+    /// verify and replay the kept rows token by token (the decode path's
+    /// arithmetic); full-attention layers keep their first `tokens` rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35Error::NoPendingVerify`] when no verify is pending,
+    /// [`Qwen35Error::TruncateRange`] for a length outside it, or
+    /// [`Qwen35Error::Mlx`] if the replay fails.
+    pub fn truncate_to(&mut self, tokens: usize) -> Result<(), Qwen35Error> {
+        let pending = self.pending.take().ok_or(Qwen35Error::NoPendingVerify)?;
+        let maximum = pending.start + pending.verified;
+        if !(pending.start..=maximum).contains(&tokens) {
+            let minimum = pending.start;
+            self.pending = Some(pending);
+            return Err(Qwen35Error::TruncateRange {
+                requested: tokens,
+                minimum,
+                maximum,
+            });
+        }
+        if tokens == maximum {
+            return Ok(());
+        }
+        let keep = dim(tokens - pending.start)?;
+        let weights = self.weights;
+        for (index, stash) in pending.layers.into_iter().enumerate() {
+            let Some(stash) = stash else { continue };
+            let state = if keep == 0 {
+                LayerState::Linear {
+                    conv: stash.conv,
+                    recurrent: stash.recurrent,
+                }
+            } else {
+                let rows = |array: &Array| array.index((.., 0..keep, ..));
+                let (_, conv, recurrent) = linear_recurrence(
+                    weights,
+                    &format!("layers.{index}.linear_attn"),
+                    &stash.conv,
+                    stash.recurrent,
+                    &LinearInputs {
+                        qkv: rows(&stash.qkv),
+                        a: rows(&stash.a),
+                        b: rows(&stash.b),
+                    },
+                    true,
+                )?;
+                LayerState::Linear { conv, recurrent }
+            };
+            self.layers[index] = Some(state);
+        }
+        self.tokens = tokens;
+        mlx_rs::transforms::eval(self.state_arrays())?;
+        Ok(())
+    }
+
+    fn verify_hidden(
+        &mut self,
+        tokens: &[i32],
+        taps: Qwen35Taps<'_>,
+    ) -> Result<(Array, Option<Array>), Qwen35Error> {
+        self.check_input(tokens)?;
+        self.check_taps(taps)?;
+        let maximum = self.max_verify_tokens();
+        if tokens.len() > maximum {
+            return Err(Qwen35Error::VerifyLength {
+                requested: tokens.len(),
+                maximum,
+            });
+        }
+        self.pending = Some(VerifyStash {
+            start: self.tokens,
+            verified: tokens.len(),
+            layers: self.layers.iter().map(|_| None).collect(),
+        });
+        self.forward_chunk_tapped(tokens, taps)
     }
 
     /// Consumes a prompt into an empty sequence and returns the last
@@ -817,7 +1031,25 @@ impl Qwen35Executor<'_> {
     /// Returns [`Qwen35Error`] for empty input, an out-of-vocabulary ID, a
     /// context over the limit, or an MLX failure.
     pub fn extend_last_logits(&mut self, input_ids: &[i32]) -> Result<Vec<f32>, Qwen35Error> {
-        let hidden = self.extend_hidden(input_ids)?;
+        self.extend_last_logits_tapped(input_ids, Qwen35Taps::None, |_, _| Ok(()))
+    }
+
+    /// [`Self::extend_last_logits`], handing each evaluation chunk's `taps`
+    /// rows to `sink` with the chunk's first position, in order. The rows are
+    /// evaluated and dropped after `sink` returns, so a sink that keeps only
+    /// what it needs holds at most one chunk of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::extend_last_logits`], plus [`Qwen35Error::TapLayer`] for a
+    /// bad tap list and any error `sink` returns.
+    pub fn extend_last_logits_tapped(
+        &mut self,
+        input_ids: &[i32],
+        taps: Qwen35Taps<'_>,
+        mut sink: impl FnMut(&Array, usize) -> Result<(), Qwen35Error>,
+    ) -> Result<Vec<f32>, Qwen35Error> {
+        let hidden = self.extend_hidden(input_ids, taps, &mut sink)?;
         let logits = self.last_logits(&hidden)?;
         logits.eval()?;
         Ok(logits.as_slice::<f32>().to_vec())
@@ -843,7 +1075,7 @@ impl Qwen35Executor<'_> {
     ///
     /// As [`Self::decode_greedy`].
     pub fn extend_greedy(&mut self, input_ids: &[i32]) -> Result<i32, Qwen35Error> {
-        let hidden = self.extend_hidden(input_ids)?;
+        let hidden = self.extend_hidden(input_ids, Qwen35Taps::None, &mut |_, _| Ok(()))?;
         let logits = self.last_logits(&hidden)?;
         let gpu = StreamOrDevice::gpu();
         let finite = logits.is_finite_device(&gpu)?.all_device(false, &gpu)?;
@@ -857,8 +1089,109 @@ impl Qwen35Executor<'_> {
     }
 
     /// Runs `input_ids` through the decoder, updating the sequence state, and
-    /// returns the final chunk's hidden states.
-    fn extend_hidden(&mut self, input_ids: &[i32]) -> Result<Array, Qwen35Error> {
+    /// returns the final chunk's hidden states. Each chunk's `taps` rows are
+    /// evaluated and passed to `sink` with the chunk's first position.
+    fn extend_hidden(
+        &mut self,
+        input_ids: &[i32],
+        taps: Qwen35Taps<'_>,
+        sink: &mut dyn FnMut(&Array, usize) -> Result<(), Qwen35Error>,
+    ) -> Result<Array, Qwen35Error> {
+        self.check_input(input_ids)?;
+        self.check_taps(taps)?;
+        // An ordinary extend commits any verify; it can no longer roll back.
+        self.pending = None;
+        let mut chunks = input_ids.chunks(PREFILL_CHUNK_TOKENS).peekable();
+        while let Some(chunk) = chunks.next() {
+            let first = self.tokens;
+            let (hidden, rows) = self.forward_chunk_tapped(chunk, taps)?;
+            let last = chunks.peek().is_none();
+            if let Some(rows) = rows {
+                // Evaluating the state with the rows keeps the rows from
+                // holding the chunk's graph after the sink returns.
+                let mut arrays = self.state_arrays();
+                arrays.push(&rows);
+                mlx_rs::transforms::eval(arrays)?;
+                sink(&rows, first)?;
+            } else if !last {
+                // Evaluate the carried state so the next chunk's graph starts
+                // from materialized arrays instead of growing without bound.
+                mlx_rs::transforms::eval(self.state_arrays())?;
+            }
+            if last {
+                return Ok(hidden);
+            }
+        }
+        unreachable!("input_ids is nonempty")
+    }
+
+    /// Refuses a [`Qwen35Taps::Layers`] list that is empty or names a layer
+    /// the model lacks.
+    fn check_taps(&self, taps: Qwen35Taps<'_>) -> Result<(), Qwen35Error> {
+        let layers = self.weights.config.layers.len();
+        if let Qwen35Taps::Layers(list) = taps {
+            if list.is_empty() {
+                return Err(Qwen35Error::TapLayer {
+                    layer: None,
+                    layers,
+                });
+            }
+            if let Some(&layer) = list.iter().find(|&&layer| layer >= layers) {
+                return Err(Qwen35Error::TapLayer {
+                    layer: Some(layer),
+                    layers,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::forward_chunk`] plus the chunk's `taps` rows `[seq, width]`,
+    /// not yet evaluated. The tap list must have passed [`Self::check_taps`].
+    fn forward_chunk_tapped(
+        &mut self,
+        input_ids: &[i32],
+        taps: Qwen35Taps<'_>,
+    ) -> Result<(Array, Option<Array>), Qwen35Error> {
+        let gpu = StreamOrDevice::gpu();
+        let rows = |array: &Array| -> Result<Array, Qwen35Error> {
+            let shape = array.shape();
+            Ok(array.reshape_device(&[shape[1], shape[2]], &gpu)?)
+        };
+        match taps {
+            Qwen35Taps::None => Ok((self.forward_chunk(input_ids)?, None)),
+            Qwen35Taps::FinalNormed => {
+                let hidden = self.forward_chunk(input_ids)?;
+                let normed = rows(&self.final_norm(&hidden)?)?;
+                Ok((hidden, Some(normed)))
+            }
+            Qwen35Taps::Layers(list) => {
+                let names: Vec<String> = list
+                    .iter()
+                    .map(|layer| format!("layers.{layer}.post_ffn"))
+                    .collect();
+                let mut found: Vec<Option<Array>> = vec![None; list.len()];
+                let hidden = self.forward_chunk_observed(input_ids, &mut |stage, tensor| {
+                    for (slot, name) in found.iter_mut().zip(&names) {
+                        if stage == name {
+                            *slot = Some(tensor.clone());
+                        }
+                    }
+                    Ok(())
+                })?;
+                let found: Vec<Array> = found
+                    .into_iter()
+                    .map(|tap| tap.expect("check_taps admits only layers the forward visits"))
+                    .collect();
+                let joined = ops::concatenate_axis_device(&found, 2, &gpu)?;
+                Ok((hidden, Some(rows(&joined)?)))
+            }
+        }
+    }
+
+    /// Refuses empty input, a context over the limit, and an ID outside the
+    /// vocabulary.
+    fn check_input(&self, input_ids: &[i32]) -> Result<(), Qwen35Error> {
         let config = &self.weights.config;
         if input_ids.is_empty() {
             return Err(Qwen35Error::EmptyInput);
@@ -879,17 +1212,7 @@ impl Qwen35Executor<'_> {
                 });
             }
         }
-        let mut chunks = input_ids.chunks(PREFILL_CHUNK_TOKENS).peekable();
-        while let Some(chunk) = chunks.next() {
-            let hidden = self.forward_chunk(chunk)?;
-            if chunks.peek().is_none() {
-                return Ok(hidden);
-            }
-            // Evaluate the carried state so the next chunk's graph starts from
-            // materialized arrays instead of growing without bound.
-            mlx_rs::transforms::eval(self.state_arrays())?;
-        }
-        unreachable!("input_ids is nonempty")
+        Ok(())
     }
 
     fn forward_chunk(&mut self, input_ids: &[i32]) -> Result<Array, Qwen35Error> {
@@ -916,10 +1239,18 @@ impl Qwen35Executor<'_> {
                 config.rms_norm_eps,
             )?;
             let state = &mut self.layers[index];
+            let record = self
+                .pending
+                .as_mut()
+                .map(|pending| &mut pending.layers[index]);
             let mixed = match kind {
-                Qwen35LayerKind::LinearAttention => {
-                    gated_delta_net(weights, &format!("{base}.linear_attn"), &normed, state)?
-                }
+                Qwen35LayerKind::LinearAttention => gated_delta_net(
+                    weights,
+                    &format!("{base}.linear_attn"),
+                    &normed,
+                    state,
+                    record,
+                )?,
                 Qwen35LayerKind::FullAttention => gated_attention(
                     weights,
                     &format!("{base}.self_attn"),
@@ -940,6 +1271,34 @@ impl Qwen35Executor<'_> {
         }
         self.tokens += input_ids.len();
         Ok(hidden)
+    }
+
+    /// `hidden` after the final norm, not yet evaluated.
+    fn final_norm(&self, hidden: &Array) -> Result<Array, Qwen35Error> {
+        let weights = self.weights;
+        rms_norm(
+            hidden,
+            weights.tensor("norm.weight")?,
+            weights.config.rms_norm_eps,
+        )
+    }
+
+    /// Every position's f32 logits `[seq, vocab]`, not yet evaluated.
+    fn row_logits(&self, hidden: &Array) -> Result<Array, Qwen35Error> {
+        let weights = self.weights;
+        let config = &weights.config;
+        let gpu = StreamOrDevice::gpu();
+        let seq = hidden.shape()[1];
+        let normed = self.final_norm(hidden)?;
+        let head = if config.tie_word_embeddings {
+            "embed_tokens.weight"
+        } else {
+            "lm_head.weight"
+        };
+        Ok(weights
+            .project(&normed, head)?
+            .reshape_device(&[seq, dim(config.vocab_size)?], &gpu)?
+            .as_type_device::<f32>(&gpu)?)
     }
 
     /// The last position's f32 logits `[vocab]`, not yet evaluated.
@@ -967,18 +1326,17 @@ fn gated_delta_net(
     base: &str,
     input: &Array,
     state: &mut Option<LayerState>,
+    record: Option<&mut Option<LinearStash>>,
 ) -> Result<Array, Qwen35Error> {
     let config = &weights.config;
     let gpu = StreamOrDevice::gpu();
     let seq = input.shape()[1];
-    let key_heads = dim(config.linear_key_heads)?;
     let value_heads = dim(config.linear_value_heads)?;
-    let key_dim = dim(config.linear_key_head_dim)?;
     let value_dim = dim(config.linear_value_head_dim)?;
     let compute = input.dtype();
     let project = |name: &str| weights.project(input, &format!("{base}.{name}.weight"));
 
-    let (conv_state, recurrent) = match state.take() {
+    let (conv, recurrent) = match state.take() {
         Some(LayerState::Linear { conv, recurrent }) => (conv, recurrent),
         Some(LayerState::Full { .. }) => return Err(Qwen35Error::StateKind),
         None => (
@@ -987,12 +1345,84 @@ fn gated_delta_net(
                 compute,
                 &gpu,
             )?,
-            ops::zeros_dtype_device(&[value_heads, key_dim, value_dim], Dtype::Float32, &gpu)?,
+            ops::zeros_dtype_device(
+                &[value_heads, dim(config.linear_key_head_dim)?, value_dim],
+                Dtype::Float32,
+                &gpu,
+            )?,
         ),
     };
+    let inputs = LinearInputs {
+        qkv: project("in_proj_qkv")?,
+        a: project("in_proj_a")?,
+        b: project("in_proj_b")?,
+    };
+    if let Some(slot) = record {
+        // Clones share the arrays; the stash keeps them alive for a rollback.
+        *slot = Some(LinearStash {
+            conv: conv.clone(),
+            recurrent: recurrent.clone(),
+            qkv: inputs.qkv.clone(),
+            a: inputs.a.clone(),
+            b: inputs.b.clone(),
+        });
+    }
+    let (output, next_conv, recurrent) =
+        linear_recurrence(weights, base, &conv, recurrent, &inputs, false)?;
+    let normed = fast::rms_norm_device(
+        &output,
+        weights
+            .tensor(&format!("{base}.norm.weight"))?
+            .as_type_device::<f32>(&gpu)?,
+        config.rms_norm_eps,
+        &gpu,
+    )?;
+    let output_gate = project("in_proj_z")?
+        .reshape_device(&[seq, value_heads, value_dim], &gpu)?
+        .as_type_device::<f32>(&gpu)?;
+    let gated = normed
+        .multiply_device(silu(&output_gate)?, &gpu)?
+        .as_dtype_device(compute, &gpu)?
+        .reshape_device(&[1, seq, value_heads * value_dim], &gpu)?;
+    *state = Some(LayerState::Linear {
+        conv: next_conv,
+        recurrent,
+    });
+    weights.project(&gated, &format!("{base}.out_proj.weight"))
+}
+
+/// A linear layer's input projections `[1, seq, _]`: everything its state
+/// update reads, so a rollback can replay the update without the layer input.
+struct LinearInputs {
+    qkv: Array,
+    a: Array,
+    b: Array,
+}
+
+/// The convolution and delta rule of one linear layer from its projections:
+/// returns the per-head output `[seq, Hv, Dv]` before the gated norm, the
+/// next convolution window, and the next recurrent state. `by_token` forces
+/// the decode path's token-by-token recurrence for any length; otherwise a
+/// multi-token input uses the chunked form.
+fn linear_recurrence(
+    weights: &Qwen35Weights,
+    base: &str,
+    window: &Array,
+    recurrent: Array,
+    inputs: &LinearInputs,
+    by_token: bool,
+) -> Result<(Array, Array, Array), Qwen35Error> {
+    let config = &weights.config;
+    let gpu = StreamOrDevice::gpu();
+    let seq = inputs.qkv.shape()[1];
+    let key_heads = dim(config.linear_key_heads)?;
+    let value_heads = dim(config.linear_value_heads)?;
+    let key_dim = dim(config.linear_key_head_dim)?;
+    let value_dim = dim(config.linear_value_head_dim)?;
+
     let (convolved, next_conv) = short_convolution(
-        &conv_state,
-        &project("in_proj_qkv")?,
+        window,
+        &inputs.qkv,
         weights.tensor(&format!("{base}.conv1d.weight"))?,
     )?;
 
@@ -1025,13 +1455,15 @@ fn gated_delta_net(
     };
 
     let beta = ops::sigmoid_device(
-        project("in_proj_b")?
+        inputs
+            .b
             .reshape_device(&[seq, value_heads], &gpu)?
             .as_type_device::<f32>(&gpu)?,
         &gpu,
     )?;
     let decay_rate = weights.tensor(&format!("{base}.decay_rate"))?;
-    let shifted = project("in_proj_a")?
+    let shifted = inputs
+        .a
         .reshape_device(&[seq, value_heads], &gpu)?
         .as_type_device::<f32>(&gpu)?
         .add_device(
@@ -1045,31 +1477,12 @@ fn gated_delta_net(
         .multiply_device(decay_rate, &gpu)?
         .negative_device(&gpu)?;
 
-    let (output, recurrent) = if seq == 1 {
+    let (output, recurrent) = if by_token || seq == 1 {
         delta_rule_by_token(&query, &key, &value, &log_decay, &beta, recurrent)?
     } else {
         delta::chunked(&query, &key, &value, &log_decay, &beta, recurrent)?
     };
-    let normed = fast::rms_norm_device(
-        &output,
-        weights
-            .tensor(&format!("{base}.norm.weight"))?
-            .as_type_device::<f32>(&gpu)?,
-        config.rms_norm_eps,
-        &gpu,
-    )?;
-    let output_gate = project("in_proj_z")?
-        .reshape_device(&[seq, value_heads, value_dim], &gpu)?
-        .as_type_device::<f32>(&gpu)?;
-    let gated = normed
-        .multiply_device(silu(&output_gate)?, &gpu)?
-        .as_dtype_device(compute, &gpu)?
-        .reshape_device(&[1, seq, value_heads * value_dim], &gpu)?;
-    *state = Some(LayerState::Linear {
-        conv: next_conv,
-        recurrent,
-    });
-    weights.project(&gated, &format!("{base}.out_proj.weight"))
+    Ok((output, next_conv, recurrent))
 }
 
 /// Depthwise causal convolution plus `silu` over `[1, seq, channels]`, with
@@ -1761,6 +2174,38 @@ pub enum Qwen35Error {
     /// A logit was NaN or infinite, so no greedy token is defined.
     #[error("logits contain NaN or infinite values")]
     NonFiniteLogits,
+    /// A verify asked for more tokens than its rollback stash holds.
+    #[error("verify of {requested} tokens exceeds the maximum of {maximum}")]
+    VerifyLength {
+        /// Tokens in the verify.
+        requested: usize,
+        /// [`Qwen35Executor::max_verify_tokens`].
+        maximum: usize,
+    },
+    /// A [`Qwen35Taps::Layers`] list was empty (`layer` is `None`) or named
+    /// a layer past the last.
+    #[error("tap layer {layer:?} is not one of the model's {layers} layers")]
+    TapLayer {
+        /// The offending index; `None` for an empty list.
+        layer: Option<usize>,
+        /// Decoder layers in the model.
+        layers: usize,
+    },
+    /// A truncation was requested with no verify to roll back.
+    #[error("no verify is pending, so the sequence cannot be truncated")]
+    NoPendingVerify,
+    /// A truncation length lies outside the pending verify.
+    #[error(
+        "cannot truncate to {requested} tokens; the pending verify allows {minimum} to {maximum}"
+    )]
+    TruncateRange {
+        /// Requested sequence length.
+        requested: usize,
+        /// Length before the verify.
+        minimum: usize,
+        /// Length after the verify.
+        maximum: usize,
+    },
     /// The checkpoint's multi-token-prediction head is a layout this loader
     /// does not implement.
     #[error("unsupported multi-token-prediction head: {0}")]
