@@ -312,22 +312,16 @@ impl Gemma4TextConfig {
         };
 
         let moe = if raw.enable_moe_block {
-            let fields = [
-                ("num_experts", raw.num_experts),
-                ("top_k_experts", raw.top_k_experts),
-                ("moe_intermediate_size", raw.moe_intermediate_size),
-            ];
-            for (name, value) in fields {
-                if value == 0 {
-                    return Err(Gemma4ConfigError::MissingDimension(name));
-                }
-            }
+            let dimension = |name, value: Option<usize>| match value {
+                Some(value) if value > 0 => Ok(value),
+                _ => Err(Gemma4ConfigError::MissingDimension(name)),
+            };
             Some(
                 routing::Gemma4MoeGeometry::new(
                     raw.hidden_size,
-                    raw.num_experts,
-                    raw.top_k_experts,
-                    raw.moe_intermediate_size,
+                    dimension("num_experts", raw.num_experts)?,
+                    dimension("top_k_experts", raw.top_k_experts)?,
+                    dimension("moe_intermediate_size", raw.moe_intermediate_size)?,
                 )
                 .map_err(|error| match error {
                     routing::Gemma4RouterError::InvalidTopK => {
@@ -659,12 +653,10 @@ struct RawTextConfig {
     num_kv_shared_layers: usize,
     #[serde(default)]
     enable_moe_block: bool,
-    #[serde(default)]
-    num_experts: usize,
-    #[serde(default)]
-    top_k_experts: usize,
-    #[serde(default)]
-    moe_intermediate_size: usize,
+    // Dense checkpoints publish these as null.
+    num_experts: Option<usize>,
+    top_k_experts: Option<usize>,
+    moe_intermediate_size: Option<usize>,
     use_bidirectional_attention: Option<String>,
 }
 
@@ -887,6 +879,39 @@ mod tests {
                 .expect("dense")
                 .moe(),
             None
+        );
+    }
+
+    #[test]
+    fn a_dense_config_may_publish_null_expert_fields() {
+        // Published dense configs carry the expert keys as null; with the
+        // block enabled they are missing dimensions.
+        let dense = GEMMA4_12B_CONFIG.replace(
+            r#""enable_moe_block": false"#,
+            r#""enable_moe_block": false, "num_experts": null, "top_k_experts": null, "moe_intermediate_size": null"#,
+        );
+        assert_eq!(Gemma4TextConfig::parse(&dense).expect("dense").moe(), None);
+        let moe = dense.replace(
+            r#""enable_moe_block": false"#,
+            r#""enable_moe_block": true"#,
+        );
+        assert!(matches!(
+            Gemma4TextConfig::parse(&moe),
+            Err(Gemma4ConfigError::MissingDimension("num_experts"))
+        ));
+    }
+
+    #[test]
+    fn the_published_26b_a4b_config_has_its_expert_block() {
+        // google/gemma-4-26B-A4B-it@4d7ae49 config.json, verbatim.
+        let config = Gemma4TextConfig::parse(include_str!(
+            "../../../../fixtures/gemma-4-26b-a4b/config.json"
+        ))
+        .expect("26B-A4B");
+        let moe = config.moe().expect("experts");
+        assert_eq!(
+            (moe.hidden(), moe.experts(), moe.top_k(), moe.intermediate()),
+            (2816, 128, 8, 704)
         );
     }
 
