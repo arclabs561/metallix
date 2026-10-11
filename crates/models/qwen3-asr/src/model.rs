@@ -25,6 +25,10 @@ const DECODER_PREFIX: &str = "thinker.model.";
 const TIED_HEAD: &str = "thinker.lm_head.weight";
 /// The reference refuses longer single inputs and splits them first.
 pub const MAX_AUDIO_SECONDS: f64 = 1_200.0;
+/// Shorter clips are zero-padded at the end to this many samples (0.5 s at
+/// 16 kHz), as qwen-asr's `MIN_ASR_INPUT_SECONDS` and transformers'
+/// `Qwen3ASRFeatureExtractor.min_length` do.
+pub const MIN_SAMPLES: usize = 8_000;
 
 /// Options for one transcription.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,7 +321,17 @@ impl Qwen3Asr {
                 return Err(AsrError::Language(language.clone()));
             }
         }
+        let audio_seconds = audio.duration_seconds();
         let started = Instant::now();
+        let padded;
+        let audio = if audio.samples().len() < MIN_SAMPLES {
+            let mut samples = audio.samples().to_vec();
+            samples.resize(MIN_SAMPLES, 0.0);
+            padded = MonoAudio::new(audio.sample_rate(), samples).map_err(AsrError::Audio)?;
+            &padded
+        } else {
+            audio
+        };
         let mel = self.features.extract(audio)?;
         let features = started.elapsed();
         check()?;
@@ -374,7 +388,7 @@ impl Qwen3Asr {
             raw,
             generated,
             stopped,
-            audio_seconds: audio.duration_seconds(),
+            audio_seconds,
             prompt_tokens: prompt.ids().len(),
             features,
             encode,
@@ -490,6 +504,9 @@ pub enum AsrError {
     /// The audio span does not fit the prompt.
     #[error(transparent)]
     Span(#[from] SpanError),
+    /// The audio could not be prepared.
+    #[error(transparent)]
+    Audio(audio::WavError),
     /// Feature extraction refused the audio.
     #[error(transparent)]
     Features(#[from] audio::LogMelError),
