@@ -363,6 +363,107 @@ fn snapshots_pin_only_their_compact_rows() {
     );
 }
 
+/// An encoded snapshot decodes to the same bits: encoding it again gives
+/// the same bytes, and an executor restored from it extends and decodes with
+/// logits bit-identical to one restored from the original. Malformed bytes
+/// are refused, never silently restored.
+#[test]
+fn encoded_snapshots_restore_bit_identically_and_refuse_malformed_bytes() {
+    use crate::forward::{Qwen3FloatPrecision, Qwen3KvSnapshot};
+
+    let _gpu = GPU_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let config = fused_kernel_config();
+    let float32 = fused_kernel_weights();
+    let bfloat16 = float32
+        .iter()
+        .map(|(name, array)| {
+            let array = array.as_dtype(mlx_rs::Dtype::Bfloat16).expect("bf16");
+            array.eval().expect("bf16 weights");
+            (name.clone(), array)
+        })
+        .collect::<HashMap<_, _>>();
+    let prompt = (0..64)
+        .map(|index| (index * 5 + 3) % 16)
+        .collect::<Vec<i32>>();
+    let other = (0..20)
+        .map(|index| (index * 3 + 1) % 16)
+        .collect::<Vec<i32>>();
+    for (precision, weights) in [
+        (Qwen3FloatPrecision::Float32, &float32),
+        (Qwen3FloatPrecision::BFloat16, &bfloat16),
+    ] {
+        let plan = config
+            .resident_chat_plan(600, u64::MAX, precision)
+            .expect("tiny resident plan");
+        let mut source = Qwen3ForwardExecutor::new_for_resident_chat(&config, weights, plan);
+        source.prefill_last_logits(&prompt).expect("source prefill");
+        let snapshot = source.snapshot_prefix(30, 7).expect("prefix snapshot");
+        let bytes = snapshot.encode().expect("encode");
+        let decoded = Qwen3KvSnapshot::decode(&config, plan, 7, &bytes).expect("decode");
+        assert_eq!(decoded.tokens(), 30);
+        assert_eq!(
+            decoded.encode().expect("encode again"),
+            bytes,
+            "{precision:?}"
+        );
+        let mut original =
+            Qwen3ForwardExecutor::from_snapshot(&config, weights, &snapshot).expect("restore");
+        let mut restored =
+            Qwen3ForwardExecutor::from_snapshot(&config, weights, &decoded).expect("restore");
+        assert_eq!(
+            restored
+                .extend_last_logits(&other)
+                .expect("restored suffix"),
+            original
+                .extend_last_logits(&other)
+                .expect("original suffix"),
+            "{precision:?}"
+        );
+        assert_eq!(
+            restored.decode_last_logits(5).expect("restored decode"),
+            original.decode_last_logits(5).expect("original decode"),
+            "{precision:?}"
+        );
+
+        let refuses = |bytes: &[u8], why: &str| {
+            assert!(
+                matches!(
+                    Qwen3KvSnapshot::decode(&config, plan, 7, bytes),
+                    Err(Qwen3ForwardError::KvSnapshotFormat(_))
+                ),
+                "{precision:?}: accepted {why}"
+            );
+        };
+        let with = |at: usize, value: &[u8]| {
+            let mut changed = bytes.clone();
+            changed[at..at + value.len()].copy_from_slice(value);
+            changed
+        };
+        refuses(&bytes[..bytes.len() - 1], "a truncated payload");
+        refuses(&bytes[..10], "a truncated header");
+        refuses(&with(0, b"X"), "another magic");
+        refuses(&with(8, &2_u32.to_le_bytes()), "another format version");
+        // The header claims one token more or fewer than the arrays hold.
+        refuses(
+            &with(12, &31_u64.to_le_bytes()),
+            "an overstated token count",
+        );
+        refuses(
+            &with(12, &29_u64.to_le_bytes()),
+            "an understated token count",
+        );
+        refuses(&with(20, &3_u32.to_le_bytes()), "another layer count");
+        let other_dtype = if precision == Qwen3FloatPrecision::Float32 {
+            1
+        } else {
+            3
+        };
+        refuses(&with(32, &[other_dtype]), "another dtype");
+    }
+}
+
 #[test]
 fn extending_snapshot_restores_the_same_cache_as_a_whole_prefix_snapshot() {
     let _gpu = GPU_TEST_LOCK
@@ -410,6 +511,12 @@ fn extending_snapshot_restores_the_same_cache_as_a_whole_prefix_snapshot() {
     assert_eq!(
         joined.extend_last_logits(&tail).expect("joined suffix"),
         from_whole.extend_last_logits(&tail).expect("whole suffix"),
+    );
+    // Stored bytes stand alone: an extending snapshot encodes its joined
+    // positions, the same bytes as the whole prefix.
+    assert_eq!(
+        extending.encode().expect("encode extending"),
+        whole.encode().expect("encode whole")
     );
     // A base at or past the end, or from another binding, is refused.
     for (tokens, binding) in [(20, 7), (10, 7), (45, 8)] {

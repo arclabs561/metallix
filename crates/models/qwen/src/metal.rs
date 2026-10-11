@@ -431,6 +431,34 @@ impl Qwen3MlxWeights {
         )
     }
 
+    /// Rebuilds a snapshot stored with
+    /// [`Qwen3KvSnapshot::encode`](crate::forward::Qwen3KvSnapshot::encode)
+    /// for this load and resident plan, so
+    /// [`Self::resident_chat_executor_from`] accepts it. The bytes carry no
+    /// checkpoint identity: pass only bytes stored for these exact weights,
+    /// tokenizer and chat template. This checks shape, dtype and length.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`KvSnapshotFormat`](crate::forward::Qwen3ForwardError::KvSnapshotFormat)
+    /// when the bytes are truncated, of another format version, or describe
+    /// K/V that this checkpoint and plan cannot hold, and the errors of
+    /// planning the resident cache otherwise.
+    pub fn decode_resident_snapshot(
+        &self,
+        bytes: &[u8],
+        maximum_context_tokens: usize,
+        maximum_kv_bytes: u64,
+    ) -> Result<crate::forward::Qwen3KvSnapshot, crate::forward::Qwen3ForwardError> {
+        let plan = self.forward_config.resident_chat_plan(
+            maximum_context_tokens,
+            maximum_kv_bytes,
+            crate::forward::kv_precision(&self.forward_config, &self.tensors)?,
+        )?;
+        crate::forward::Qwen3KvSnapshot::decode(&self.forward_config, plan, self.binding, bytes)
+    }
+
     /// Materializes float32 weights once for comparison with a CPU float32 oracle.
     /// This increases resident weight memory relative to the BF16 checkpoint;
     /// quantized weights are dequantized first.

@@ -2882,6 +2882,11 @@ pub enum Qwen3ForwardError {
     /// The snapshot came from another checkpoint load or resident plan.
     #[error("Qwen3 K/V snapshot does not belong to this checkpoint load and resident plan")]
     KvSnapshotMismatch,
+    /// Stored snapshot bytes are truncated, from another format version, or
+    /// describe K/V of another shape, dtype or length than this checkpoint
+    /// and resident plan hold.
+    #[error("stored Qwen3 K/V snapshot is unusable: {0}")]
+    KvSnapshotFormat(&'static str),
     /// A rollback must keep between one token and the whole cache.
     #[error("cannot truncate a {cached}-token Qwen3 cache to {requested} tokens")]
     TruncateOutOfRange {
