@@ -22,10 +22,10 @@ use super::turn::{Accepted, TurnLoop, TurnStep};
 
 type Executor<'w> = Qwen3ForwardExecutor<'w, std::collections::hash_map::RandomState>;
 
-/// Query rows MLX attention scores with its vector kernel. MLX v0.32.2 uses
+/// Query rows MLX attention scores with its vector kernel. MLX v0.32.3 uses
 /// `sdpa_vector` only while the query has at most 8 positions and the full
 /// kernel above that
-/// (<https://github.com/ml-explore/mlx/blob/v0.32.2/mlx/backend/metal/scaled_dot_product_attention.cpp#L812>);
+/// (<https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/backend/metal/scaled_dot_product_attention.cpp#L952>);
 /// on Qwen3-0.6B a 9-row verify costs ~1.7 decode steps against ~1.2 at 8.
 const MLX_VECTOR_ATTENTION_ROWS: usize = 8;
 
@@ -45,7 +45,7 @@ const _: () = assert!(MAX_DRAFT_TOKENS < MLX_VECTOR_ATTENTION_ROWS);
 /// A quantized target needs its own measured row before it speculates: MLX
 /// runs a 4-bit matmul as a matrix-vector product while the rows stay below
 /// `get_qmv_batch_limit`
-/// (<https://github.com/ml-explore/mlx/blob/v0.32.2/mlx/backend/metal/quantized.cpp#L85>),
+/// (<https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/backend/metal/quantized.cpp#L89>),
 /// and that cost grows with every row, so on 4-bit 8B shapes each extra
 /// verified row measured ~0.2 of a decode step rather than ~0.05.
 pub(super) fn verify_cost(precision: Qwen3FloatPrecision) -> VerifyCost {

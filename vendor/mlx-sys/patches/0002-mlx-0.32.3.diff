@@ -1,0 +1,78 @@
+diff -ru -x p a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml	2026-10-09 08:39:00
++++ b/Cargo.toml	2026-10-09 08:40:55
+@@ -12,7 +12,7 @@
+ [package]
+ edition = "2021"
+ name = "mlx-sys"
+-version = "0.6.0"
++version = "0.6.0+mlx.0.32.3"
+ authors = [
+     "Minghua Wu <michael.wu1107@gmail.com>",
+     "David Chavez <david@dcvz.io>",
+diff -ru -x p a/src/mlx-c/CMakeLists.txt b/src/mlx-c/CMakeLists.txt
+--- a/src/mlx-c/CMakeLists.txt	2026-10-09 08:39:00
++++ b/src/mlx-c/CMakeLists.txt	2026-10-09 08:40:55
+@@ -35,7 +35,7 @@
+   FetchContent_Declare(
+     mlx
+     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
+-    GIT_TAG v0.32.2)
++    GIT_TAG v0.32.3)
+   FetchContent_MakeAvailable(mlx)
+ endif()
+ 
+diff -ru -x p a/src/mlx-c/mlx/c/ops.cpp b/src/mlx-c/mlx/c/ops.cpp
+--- a/src/mlx-c/mlx/c/ops.cpp	2026-10-09 08:39:00
++++ b/src/mlx-c/mlx/c/ops.cpp	2026-10-09 19:33:44
+@@ -7,6 +7,7 @@
+ #include "mlx/c/error.h"
+ #include "mlx/c/private/mlx.h"
+ #include "mlx/einsum.h"
++#include "mlx/version.h"
+ 
+ extern "C" int mlx_abs(mlx_array* res, const mlx_array a, const mlx_stream s) {
+   try {
+@@ -1708,6 +1709,9 @@
+             (bits.has_value ? std::make_optional<int>(bits.value)
+                             : std::nullopt),
+             std::string(mode),
++#if MLX_VERSION_NUMERIC >= 32003
++            std::nullopt,
++#endif
+             sorted_indices,
+             mlx_stream_get_(s)));
+   } catch (std::exception& e) {
+diff -ru -x p a/src/mlx-c/python/c.py b/src/mlx-c/python/c.py
+--- a/src/mlx-c/python/c.py	2026-10-09 08:39:00
++++ b/src/mlx-c/python/c.py	2026-10-09 19:33:44
+@@ -75,6 +75,8 @@
+                 print('#include "' + "/".join(parts[mlx_idx:]) + '"')
+         print('#include "mlx/c/error.h"')
+         print('#include "mlx/c/private/mlx.h"')
++        if headername == "ops":
++            print('#include "mlx/version.h"')
+         print()
+     else:
+         print("#ifndef MLX_" + headername.upper() + "_H")
+@@ -188,7 +190,19 @@
+                 break
+ 
+             c_call.append(pti["c_arg"](pni))
+-            cpp_call.append(pti["c_to_cpp"](pni))
++            cpp_arg = pti["c_to_cpp"](pni)
++            # Preserve the C signature generated from MLX 0.32.2 when using 0.32.3.
++            if (
++                implementation
++                and func_name == "mlx_gather_qmm"
++                and pni == "sorted_indices"
++                and "global_scale" not in pn
++            ):
++                cpp_arg = (
++                    "\n#if MLX_VERSION_NUMERIC >= 32003\nstd::nullopt,\n#endif\n"
++                    + cpp_arg
++                )
++            cpp_call.append(cpp_arg)
+ 
+         if encountered_unsupported_type:
+             print("skipping", f, file=sys.stderr)

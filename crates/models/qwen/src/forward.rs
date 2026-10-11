@@ -1969,7 +1969,7 @@ fn cached_attention<S: BuildHasher>(
     // chunk positions. MLX 0.25's fused kernel under-masked `Causal` when the
     // cached length was not a multiple of its key block, so this used an
     // explicit `[chunk, cached + chunk]` mask (512 MB per call at 262K
-    // cached). The linked MLX (0.32.2) aligns `Causal` to the last key;
+    // cached). The linked MLX (0.32.3) aligns `Causal` to the last key;
     // `fused_causal_mask_matches_the_explicit_chunk_mask` pins that. A single
     // decode token sees every key and keeps the unmasked kernel.
     let attention_keys = attention_keys.as_ref().unwrap_or(&keys);

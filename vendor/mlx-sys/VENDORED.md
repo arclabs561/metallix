@@ -4,7 +4,7 @@ This is mlx-sys 0.6.0 from crates.io
 (checksum `1848b6f1686114039e6e0adcf1578911e2e4d7707b9768ad61da074132319e1c`).
 It was published from https://github.com/oxiglade/mlx-rs, path `mlx-sys`,
 at commit `9c2fd72e172babb1e3719327a723717d98ccbe97`. Its bundled mlx-c
-builds MLX core v0.32.2, pinned by `GIT_TAG` in `src/mlx-c/CMakeLists.txt`.
+built MLX core v0.32.2; this copy builds v0.32.3 (change 5).
 The workspace uses this copy through `[patch.crates-io]` in the root
 `Cargo.toml`.
 
@@ -48,6 +48,26 @@ against the published crate.
    only an override set through the API, so without this a caller cannot
    tell which metallib MLX loaded. `mx doctor` reads it to count the NAX
    kernels in the file actually in use.
+
+5. `src/mlx-c/CMakeLists.txt` raises `GIT_TAG` from v0.32.2 to v0.32.3, and
+   `Cargo.toml` records it as the version `0.6.0+mlx.0.32.3`.
+   - 0.32.3 brings: fused NAX prefill for head-dim 256 (ml-explore/mlx#4416),
+     M5 Ultra matmul tunings (#4447), NAX attention for D72/D80 (#4455), a fix
+     for fp-quantized matmul corruption (#3912), and a fence deadlock fix
+     (#4552).
+   - The build metadata keeps the workspace's `=0.6.0` requirement satisfied
+     and puts the bundled MLX release in `Cargo.lock`, where tests with
+     MLX-specific fingerprints key their fixtures by it.
+   - 0.32.3 inserts a `global_scale` parameter into `gather_qmm` before
+     `sorted_indices`, a source break in a patch release (ml-explore/mlx#4458).
+     The bundled mlx-c then fails to compile (`ops.cpp:1711`). Upstream tracks
+     this as ml-explore/mlx-c#136, with fix PR ml-explore/mlx-c#137 (open, head
+     cfc471f4). This copy applies #137's diff verbatim, in
+     `patches/mlx-c-pr137.diff`. It passes `std::nullopt` for `global_scale`
+     behind `#if MLX_VERSION_NUMERIC >= 32003`, keeping the C API and its
+     behavior those of 0.32.2, and teaches the generator (`python/c.py`) the
+     same guard. Once #137 merges and mlx-sys picks it up, this hunk drops
+     with no conflict. It is the only mlx-c source change.
 
 ## Updating
 

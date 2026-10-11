@@ -93,7 +93,7 @@ struct QuantizeFixture {
 /// The MLX release each `mlx-sys` version builds (the `GIT_TAG` of its
 /// `mlx-c` build). A new `mlx-sys` needs new fingerprints, not a silent
 /// compare.
-const BUNDLED_MLX: [(&str, &str); 1] = [("0.6.0", "0.32.2")];
+const BUNDLED_MLX: [(&str, &str); 1] = [("0.6.0+mlx.0.32.3", "0.32.3")];
 
 /// The MLX release this build links, from the workspace lockfile.
 fn bundled_mlx() -> &'static str {

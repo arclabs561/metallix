@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "mlx==0.32.2",
+#   "mlx==0.32.3",
 #   "numpy==2.5.3",
 # ]
 # ///

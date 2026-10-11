@@ -1,0 +1,56 @@
+diff --git a/mlx/c/ops.cpp b/mlx/c/ops.cpp
+index bf565d1e..7959e397 100644
+--- a/mlx/c/ops.cpp
++++ b/mlx/c/ops.cpp
+@@ -7,6 +7,7 @@
+ #include "mlx/c/error.h"
+ #include "mlx/c/private/mlx.h"
+ #include "mlx/einsum.h"
++#include "mlx/version.h"
+ 
+ extern "C" int mlx_abs(mlx_array* res, const mlx_array a, const mlx_stream s) {
+   try {
+@@ -1708,6 +1709,9 @@ extern "C" int mlx_gather_qmm(
+             (bits.has_value ? std::make_optional<int>(bits.value)
+                             : std::nullopt),
+             std::string(mode),
++#if MLX_VERSION_NUMERIC >= 32003
++            std::nullopt,
++#endif
+             sorted_indices,
+             mlx_stream_get_(s)));
+   } catch (std::exception& e) {
+diff --git a/python/c.py b/python/c.py
+index ece443b2..dbd30c0c 100644
+--- a/python/c.py
++++ b/python/c.py
+@@ -75,6 +75,8 @@ def generate(funcs, enums, header, headername, implementation, docstring):
+                 print('#include "' + "/".join(parts[mlx_idx:]) + '"')
+         print('#include "mlx/c/error.h"')
+         print('#include "mlx/c/private/mlx.h"')
++        if headername == "ops":
++            print('#include "mlx/version.h"')
+         print()
+     else:
+         print("#ifndef MLX_" + headername.upper() + "_H")
+@@ -188,7 +190,19 @@ def generate(funcs, enums, header, headername, implementation, docstring):
+                 break
+ 
+             c_call.append(pti["c_arg"](pni))
+-            cpp_call.append(pti["c_to_cpp"](pni))
++            cpp_arg = pti["c_to_cpp"](pni)
++            # Preserve the C signature generated from MLX 0.32.2 when using 0.32.3.
++            if (
++                implementation
++                and func_name == "mlx_gather_qmm"
++                and pni == "sorted_indices"
++                and "global_scale" not in pn
++            ):
++                cpp_arg = (
++                    "\n#if MLX_VERSION_NUMERIC >= 32003\nstd::nullopt,\n#endif\n"
++                    + cpp_arg
++                )
++            cpp_call.append(cpp_arg)
+ 
+         if encountered_unsupported_type:
+             print("skipping", f, file=sys.stderr)

@@ -1,7 +1,7 @@
 {
  "oracle": "mlx.core.quantize, group_size 64, bits 6",
  "bits": 6,
- "mlx": "0.32.2",
+ "mlx": "0.32.3",
  "fingerprint": "wrapping u64 sums of raw bit patterns: plain, and weighted by 1-based position",
  "tensors": {
   "model.embed_tokens.weight": {
