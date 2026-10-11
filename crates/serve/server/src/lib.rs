@@ -47,6 +47,7 @@ use std::time::Duration;
 #[cfg(feature = "metal")]
 use crate::chat_generation::{ResidentChatLimits, render_generation_prompt};
 
+mod adapter;
 #[cfg(feature = "metal")]
 mod admission_queue;
 #[cfg(feature = "metal")]
