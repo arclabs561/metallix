@@ -18,11 +18,12 @@ const ROWS: usize = 3;
 /// Logprob receipts differ from the host's only by the f32 softmax sum.
 const LOGPROB_TOLERANCE: f64 = 1e-4;
 
-fn load_session() -> ChatSession {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for these ignored checkpoint tests");
-    ChatSession::load(&model, ResidentChatLimits::from_mib(4_096, 2_048)).expect("session load")
+fn load_session() -> Option<ChatSession> {
+    let model = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from)?;
+    Some(
+        ChatSession::load(&model, ResidentChatLimits::from_mib(4_096, 2_048))
+            .expect("session load"),
+    )
 }
 
 fn preamble() -> String {
@@ -62,7 +63,10 @@ fn seeded(temperature: Option<f64>, top_p: Option<f64>, top_k: Option<u32>) -> S
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn gpu_settled_steps_match_the_full_row_host_path() {
-    let session = load_session();
+    let Some(session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = messages();
     let cases = [
         ("greedy_top5", SamplingRequest::GREEDY, Some(5)),
@@ -155,7 +159,10 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn per_token_cost_by_decode_mode() {
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = messages();
     let modes: [(&str, SamplingRequest, Option<u8>); 5] = [
         ("greedy", SamplingRequest::GREEDY, None),
@@ -213,9 +220,10 @@ fn per_token_cost_by_decode_mode() {
 fn pipelined_draws_are_not_rejected_and_forced_rejections_stay_exact() {
     use super::draw_checks;
 
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for these ignored checkpoint tests");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     // No prefix cache, so repeated turns prefill identically.
     let mut session = ChatSession::load(
         &model,

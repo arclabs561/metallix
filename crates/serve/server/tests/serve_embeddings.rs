@@ -93,7 +93,10 @@ fn request_for(text: &str) -> Value {
 #[test]
 #[ignore = "needs METALLIX_QWEN_EMBEDDING_MODEL"]
 fn served_embeddings_match_the_source_oracle() {
-    let model = std::env::var("METALLIX_QWEN_EMBEDDING_MODEL").unwrap();
+    let Ok(model) = std::env::var("METALLIX_QWEN_EMBEDDING_MODEL") else {
+        eprintln!("skipping: METALLIX_QWEN_EMBEDDING_MODEL is not set");
+        return;
+    };
     let fixture: Value = serde_json::from_str(
         &std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))

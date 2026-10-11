@@ -55,11 +55,12 @@ def parse_records(data: bytes) -> list:
     return records
 ```"#;
 
-fn load_session() -> ChatSession {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for these ignored checkpoint tests");
-    ChatSession::load(&model, ResidentChatLimits::from_mib(4_096, 2_048)).expect("session load")
+fn load_session() -> Option<ChatSession> {
+    let model = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from)?;
+    Some(
+        ChatSession::load(&model, ResidentChatLimits::from_mib(4_096, 2_048))
+            .expect("session load"),
+    )
 }
 
 /// Every decode mode the turn loop has (GPU-greedy, host rows for logprobs,
@@ -70,7 +71,10 @@ fn load_session() -> ChatSession {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn speculation_accepts_edit_drafts_in_every_decode_mode() {
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = [ChatMessage::text(ChatRole::User, EDIT)];
     let seeded = |top_k| SamplingRequest {
         temperature: Some(0.7),
@@ -143,7 +147,10 @@ fn speculation_accepts_edit_drafts_in_every_decode_mode() {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn speculation_on_original_writing_reports_its_cost() {
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = [ChatMessage::text(
         ChatRole::User,
         "Write a short original story about a lighthouse keeper who collects lost keys.",
@@ -185,7 +192,10 @@ fn speculation_on_original_writing_reports_its_cost() {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn speculation_runs_to_the_limit_under_ignore_eos() {
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = [ChatMessage::text(ChatRole::User, EDIT)];
     let mut runs = Vec::new();
     for speculation in [SpeculationRequest::Disabled, SpeculationRequest::Automatic] {
@@ -225,7 +235,10 @@ fn sampled_gpu_verify_matches_host_row_verify() {
 
     use super::speculation::test_hooks::{GPU_VERIFIES, HOST_ROW_VERIFY};
 
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = [ChatMessage::text(ChatRole::User, EDIT)];
     for (seed, top_logprobs) in [(3, None), (17, Some(2)), (29, None)] {
         let mut runs = Vec::new();
@@ -296,7 +309,10 @@ fn sampled_gpu_verify_matches_host_row_verify() {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn per_token_cost_by_pick_mode_and_speculation() {
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let story = [ChatMessage::text(
         ChatRole::User,
         "Write a short original story about a lighthouse keeper who collects lost keys.",
@@ -364,7 +380,10 @@ fn verify_rule_has_one_variate_per_row_and_refuses_a_grammar() {
 
     use super::{GenerationDeadline, TurnStart};
 
-    let session = load_session();
+    let Some(session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let messages = [ChatMessage::text(ChatRole::User, EDIT)];
     let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}});
     for constrained in [false, true] {

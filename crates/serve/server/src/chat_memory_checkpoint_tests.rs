@@ -25,9 +25,10 @@ const CACHE_OVERSHOOT_BOUND: u64 = 64 << 20;
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn serial_memory_stays_bounded_across_changing_shapes() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for these ignored checkpoint tests");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let uncapped = env::var_os("METALLIX_SERIAL_TEST_UNCAPPED").is_some();
     let cap = if uncapped {
         None

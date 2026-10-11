@@ -60,11 +60,16 @@ fn typed_requests() -> Vec<(&'static str, String)> {
 #[allow(clippy::cast_possible_truncation, reason = "printed scores are F32")]
 #[ignore = "needs the real Julia-1 checkpoint via JULIA_CHECKPOINT_DIR and JULIA_REAL_REFERENCE"]
 fn decide_julia_matches_source_reference_on_the_published_checkpoint() {
-    let checkpoint = std::env::var("JULIA_CHECKPOINT_DIR").unwrap();
-    let reference: Value = serde_json::from_str(
-        &std::fs::read_to_string(std::env::var("JULIA_REAL_REFERENCE").unwrap()).unwrap(),
-    )
-    .unwrap();
+    let Ok(checkpoint) = std::env::var("JULIA_CHECKPOINT_DIR") else {
+        eprintln!("skipping: JULIA_CHECKPOINT_DIR is not set");
+        return;
+    };
+    let Ok(reference_path) = std::env::var("JULIA_REAL_REFERENCE") else {
+        eprintln!("skipping: JULIA_REAL_REFERENCE is not set");
+        return;
+    };
+    let reference: Value =
+        serde_json::from_str(&std::fs::read_to_string(reference_path).unwrap()).unwrap();
     let gate: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/julia-1/f64-gate-reference.json"
     ))
@@ -183,7 +188,10 @@ impl Drop for Server {
 #[test]
 #[ignore = "needs the real Julia-1 checkpoint via JULIA_CHECKPOINT_DIR"]
 fn serve_decisions_equal_cli_receipts() {
-    let julia = std::env::var("JULIA_CHECKPOINT_DIR").unwrap();
+    let Ok(julia) = std::env::var("JULIA_CHECKPOINT_DIR") else {
+        eprintln!("skipping: JULIA_CHECKPOINT_DIR is not set");
+        return;
+    };
     let qwen = std::env::var("METALLIX_QWEN_MODEL").ok();
     let scratch = std::env::temp_dir().join(format!("julia-serve-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();

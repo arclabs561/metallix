@@ -139,8 +139,14 @@ fn without_timing(mut receipt: Value) -> Value {
 #[test]
 #[ignore = "needs JULIA_CHECKPOINT_DIR and METALLIX_QWEN_MODEL"]
 fn on_demand_models_take_turns_within_the_memory_budget() {
-    let julia = std::env::var("JULIA_CHECKPOINT_DIR").unwrap();
-    let qwen = std::env::var("METALLIX_QWEN_MODEL").unwrap();
+    let Ok(julia) = std::env::var("JULIA_CHECKPOINT_DIR") else {
+        eprintln!("skipping: JULIA_CHECKPOINT_DIR is not set");
+        return;
+    };
+    let Ok(qwen) = std::env::var("METALLIX_QWEN_MODEL") else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let scratch = std::env::temp_dir().join(format!("serve-budget-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let registry = scratch.join("registry.json");

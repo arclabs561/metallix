@@ -68,9 +68,10 @@ fn conversation(system: &str, user: &str) -> Vec<ChatMessage> {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
 fn checkpoint_cache_write_tokens_count_only_accepted_prefixes() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let limits = ResidentChatLimits::from_mib(128, 64).with_prefix_cache_mib(64);
     let mut session = ChatSession::load(&model, limits).expect("load");
     let messages = conversation("Answer briefly.", "Say hello.");
@@ -100,9 +101,10 @@ fn checkpoint_cache_write_tokens_count_only_accepted_prefixes() {
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
 fn checkpoint_cache_creation_counts_only_new_prompt_positions_after_a_hit() {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let limits = ResidentChatLimits::from_mib(256, 64).with_prefix_cache_mib(64);
     let mut session = ChatSession::load(&model, limits).expect("load");
     let first = conversation("Answer briefly and accurately.", "Say hello.");

@@ -1262,14 +1262,16 @@ mod tests {
         }
     }
 
-    fn real_session() -> crate::chat_generation::ChatSession {
+    fn real_session() -> Option<crate::chat_generation::ChatSession> {
         use crate::chat_generation::{ChatSession, ResidentChatLimits};
-        let model = std::env::var_os("METALLIX_QWEN_MODEL").expect("set METALLIX_QWEN_MODEL");
-        ChatSession::load(
-            std::path::Path::new(&model),
-            ResidentChatLimits::from_mib(16_384, 8_192),
+        let model = std::env::var_os("METALLIX_QWEN_MODEL")?;
+        Some(
+            ChatSession::load(
+                std::path::Path::new(&model),
+                ResidentChatLimits::from_mib(16_384, 8_192),
+            )
+            .expect("load local Qwen checkpoint"),
         )
-        .expect("load local Qwen checkpoint")
     }
 
     fn real_run(body: &Value, session: &mut crate::chat_generation::ChatSession) -> String {
@@ -1295,7 +1297,10 @@ mod tests {
     #[test]
     #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
     fn real_qwen_ignore_eos_reaches_max_tokens_on_every_decode_path() {
-        let mut session = real_session();
+        let Some(mut session) = real_session() else {
+            eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+            return;
+        };
         let run = real_run;
         let body = json!({"model":"q","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_completion_tokens":16});
         let (_, plain) = json_body(&run(&body, &mut session));
@@ -1346,7 +1351,10 @@ mod tests {
     #[test]
     #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
     fn real_qwen_answers_streams_and_calls_tools() {
-        let mut session = real_session();
+        let Some(mut session) = real_session() else {
+            eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+            return;
+        };
         let run = real_run;
         let body = json!({"model":"q","messages":[{"role":"user","content":"Say hello."}],"temperature":0,"max_completion_tokens":16});
         let (status, plain) = json_body(&run(&body, &mut session));

@@ -54,11 +54,12 @@ const TOPICS: [&str; TURNS] = [
     "what a Fourier transform does",
 ];
 
-fn load_session() -> ChatSession {
-    let model = env::var_os("METALLIX_QWEN_MODEL")
-        .map(PathBuf::from)
-        .expect("METALLIX_QWEN_MODEL is required for these ignored checkpoint tests");
-    ChatSession::load(&model, ResidentChatLimits::from_mib(4_096, 2_048)).expect("session load")
+fn load_session() -> Option<ChatSession> {
+    let model = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from)?;
+    Some(
+        ChatSession::load(&model, ResidentChatLimits::from_mib(4_096, 2_048))
+            .expect("session load"),
+    )
 }
 
 fn quantile(sorted: &[f64], q: f64) -> f64 {
@@ -183,7 +184,10 @@ fn qualify(d: &[f64], floor: f64, tokens: usize, rank_flips: &[(usize, usize, f6
 #[test]
 #[ignore = "requires METALLIX_QWEN_MODEL pointing to Qwen3-0.6B on Apple-Silicon Metal"]
 fn scored_generated_tokens_match_their_decode_receipts() {
-    let mut session = load_session();
+    let Some(mut session) = load_session() else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
     let out = env::var_os("METALLIX_SCORE_OUT").map(PathBuf::from);
     let mut lines = String::new();
     let (mut d, mut floor) = (Vec::new(), 0.0_f64);

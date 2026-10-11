@@ -1905,14 +1905,15 @@ mod tests {
         use super::*;
         use crate::chat_generation::{ChatSession, ResidentChatLimits};
 
-        fn session() -> ChatSession {
-            let model = std::env::var_os("METALLIX_QWEN_MODEL")
-                .expect("real-checkpoint test requires METALLIX_QWEN_MODEL");
-            ChatSession::load(
-                Path::new(&model),
-                ResidentChatLimits::from_mib(16_384, 8_192),
+        fn session() -> Option<ChatSession> {
+            let model = std::env::var_os("METALLIX_QWEN_MODEL")?;
+            Some(
+                ChatSession::load(
+                    Path::new(&model),
+                    ResidentChatLimits::from_mib(16_384, 8_192),
+                )
+                .expect("load local Qwen checkpoint"),
             )
-            .expect("load local Qwen checkpoint")
         }
 
         fn text(response: &Value) -> &str {
@@ -1929,7 +1930,10 @@ mod tests {
         #[test]
         #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
         fn seeded_sampling_logprobs_and_context_cap() {
-            let mut session = session();
+            let Some(mut session) = session() else {
+                eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+                return;
+            };
             let sampled = |seed: u64, session: &mut ChatSession| {
                 let body = format!(
                     r#"{{"model":"q","input":"Write one sentence about the sea.","temperature":1.0,"top_p":0.95,"seed":{seed},"max_output_tokens":24}}"#
@@ -1953,6 +1957,7 @@ mod tests {
                 json!(["temperature", "top_p", "top_k"]),
                 "{response}"
             );
+            // session() already returned, so the variable is set.
             let model = std::env::var_os("METALLIX_QWEN_MODEL").unwrap();
             let config: Value = serde_json::from_slice(
                 &std::fs::read(Path::new(&model).join("generation_config.json")).unwrap(),
@@ -2023,7 +2028,10 @@ mod tests {
         fn json_schema_output_validates_streamed_and_not() {
             use super::wire::events;
 
-            let mut session = session();
+            let Some(mut session) = session() else {
+                eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+                return;
+            };
             let schema = json!({
                 "type": "object",
                 "properties": {

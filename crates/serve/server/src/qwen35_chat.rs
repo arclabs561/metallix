@@ -381,8 +381,10 @@ mod tests {
     #[ignore = "requires METALLIX_QWEN35_CHAT_MODEL (a qwen3_5 checkpoint) on Apple-Silicon Metal"]
     fn real_qwen35_answers_streams_and_stops_at_end_of_turn() {
         let _cap = GpuCap::start(6);
-        let model =
-            env::var_os("METALLIX_QWEN35_CHAT_MODEL").expect("set METALLIX_QWEN35_CHAT_MODEL");
+        let Some(model) = env::var_os("METALLIX_QWEN35_CHAT_MODEL") else {
+            eprintln!("skipping: METALLIX_QWEN35_CHAT_MODEL is not set");
+            return;
+        };
         let mut session = ChatDecoderSession::<Qwen35Decoder>::load(
             std::path::Path::new(&model),
             ResidentChatLimits::from_mib(2_048, 512),
@@ -430,8 +432,10 @@ mod tests {
     #[ignore = "requires METALLIX_QWEN35_CHAT_MODEL (a qwen3_5 checkpoint) on Apple-Silicon Metal"]
     fn real_qwen35_prefix_cache_resumes_turns_without_changing_output() {
         let _cap = GpuCap::start(8);
-        let model =
-            env::var_os("METALLIX_QWEN35_CHAT_MODEL").expect("set METALLIX_QWEN35_CHAT_MODEL");
+        let Some(model) = env::var_os("METALLIX_QWEN35_CHAT_MODEL") else {
+            eprintln!("skipping: METALLIX_QWEN35_CHAT_MODEL is not set");
+            return;
+        };
         let load = |prefix_cache_mib| {
             ChatDecoderSession::<Qwen35Decoder>::load(
                 std::path::Path::new(&model),

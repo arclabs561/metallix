@@ -2673,9 +2673,10 @@ mod tests {
     #[test]
     #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
     fn checkpoint_callback_cancellation_allows_session_reuse() {
-        let model = env::var_os("METALLIX_QWEN_MODEL")
-            .map(PathBuf::from)
-            .expect("explicit checkpoint test requires METALLIX_QWEN_MODEL");
+        let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+            eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+            return;
+        };
         let limits = ResidentChatLimits::from_mib(2_048, 1_024);
         let mut session = ChatSession::load(&model, limits).expect("checkpoint session load");
         let load_ms = session.load_ms();

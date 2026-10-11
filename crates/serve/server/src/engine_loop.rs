@@ -2925,9 +2925,11 @@ mod tests {
         reason = "one load, serve, measure and assert sequence"
     )]
     fn real_engine_memory_stays_bounded_across_changing_shapes() {
-        let model_dir = std::path::PathBuf::from(
-            std::env::var_os("METALLIX_QWEN_MODEL").expect("METALLIX_QWEN_MODEL is required"),
-        );
+        let Some(model_dir) = std::env::var_os("METALLIX_QWEN_MODEL").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+            return;
+        };
         let uncapped = std::env::var_os("METALLIX_ENGINE_TEST_UNCAPPED").is_some();
         let config: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(model_dir.join("config.json")).expect("config"),

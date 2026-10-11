@@ -146,7 +146,10 @@ fn sixteen_documents(fixture: &Value) -> Vec<String> {
 #[test]
 #[ignore = "needs METALLIX_PPLX_LATE_MODEL"]
 fn served_rerank_matches_the_oracle_and_client_side_maxsim() {
-    let model = std::env::var("METALLIX_PPLX_LATE_MODEL").unwrap();
+    let Ok(model) = std::env::var("METALLIX_PPLX_LATE_MODEL") else {
+        eprintln!("skipping: METALLIX_PPLX_LATE_MODEL is not set");
+        return;
+    };
     let fixture: Value = serde_json::from_str(
         &std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))

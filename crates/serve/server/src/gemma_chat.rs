@@ -246,13 +246,15 @@ mod tests {
 
     /// google/gemma-4-12B-it named by `METALLIX_GEMMA4_MODEL`; take the heavy
     /// lease.
-    fn real_session() -> ChatDecoderSession<GemmaDecoder> {
-        let model = std::env::var_os("METALLIX_GEMMA4_MODEL").expect("set METALLIX_GEMMA4_MODEL");
-        ChatDecoderSession::<GemmaDecoder>::load(
-            std::path::Path::new(&model),
-            ResidentChatLimits::from_mib(16_384, 1_024),
+    fn real_session() -> Option<ChatDecoderSession<GemmaDecoder>> {
+        let model = std::env::var_os("METALLIX_GEMMA4_MODEL")?;
+        Some(
+            ChatDecoderSession::<GemmaDecoder>::load(
+                std::path::Path::new(&model),
+                ResidentChatLimits::from_mib(16_384, 1_024),
+            )
+            .expect("load local Gemma 4 checkpoint"),
         )
-        .expect("load local Gemma 4 checkpoint")
     }
 
     /// The tool and prompt of the `tool_declaration` case in
@@ -281,7 +283,10 @@ mod tests {
         let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":16});
         {
             let _cap = GpuCap::start(40);
-            let mut session = real_session();
+            let Some(mut session) = real_session() else {
+                eprintln!("skipping: METALLIX_GEMMA4_MODEL is not set");
+                return;
+            };
             let (status, _) = json_body(&chat_completion(&body, &mut session));
             assert_eq!(status, "HTTP/1.1 200 OK");
         }
@@ -292,8 +297,10 @@ mod tests {
             "MLX held only {cached} bytes after the 12B"
         );
         let _cap = GpuCap::start(24);
-        let model =
-            std::env::var_os("METALLIX_GEMMA4_E2B_MODEL").expect("set METALLIX_GEMMA4_E2B_MODEL");
+        let Some(model) = std::env::var_os("METALLIX_GEMMA4_E2B_MODEL") else {
+            eprintln!("skipping: METALLIX_GEMMA4_E2B_MODEL is not set");
+            return;
+        };
         let mut session = ChatDecoderSession::<GemmaDecoder>::load(
             std::path::Path::new(&model),
             ResidentChatLimits::from_mib(16_384, 1_024),
@@ -317,8 +324,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cap = GpuCap::start(24);
-        let model =
-            std::env::var_os("METALLIX_GEMMA4_E2B_MODEL").expect("set METALLIX_GEMMA4_E2B_MODEL");
+        let Some(model) = std::env::var_os("METALLIX_GEMMA4_E2B_MODEL") else {
+            eprintln!("skipping: METALLIX_GEMMA4_E2B_MODEL is not set");
+            return;
+        };
         let mut session = ChatDecoderSession::<GemmaDecoder>::load(
             std::path::Path::new(&model),
             ResidentChatLimits::from_mib(16_384, 1_024),
@@ -372,7 +381,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cap = GpuCap::start(40);
-        let mut session = real_session();
+        let Some(mut session) = real_session() else {
+            eprintln!("skipping: METALLIX_GEMMA4_MODEL is not set");
+            return;
+        };
 
         let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":32});
         let (status, plain) = json_body(&chat_completion(&body, &mut session));
@@ -430,7 +442,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cap = GpuCap::start(40);
-        let mut session = real_session();
+        let Some(mut session) = real_session() else {
+            eprintln!("skipping: METALLIX_GEMMA4_MODEL is not set");
+            return;
+        };
 
         // Messages: answer, the same text streamed, a tool call and its result.
         let body = json!({"model":"m","max_tokens":32,"temperature":0,"messages":[{"role":"user","content":"Name three primary colors."}]});
@@ -485,7 +500,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cap = GpuCap::start(40);
-        let mut session = real_session();
+        let Some(mut session) = real_session() else {
+            eprintln!("skipping: METALLIX_GEMMA4_MODEL is not set");
+            return;
+        };
 
         // The chat-completions answer to the same prompt.
         let body = json!({"model":"m","messages":[{"role":"user","content":"Name three primary colors."}],"temperature":0,"max_completion_tokens":32});
@@ -532,7 +550,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _cap = GpuCap::start(40);
-        let mut session = real_session();
+        let Some(mut session) = real_session() else {
+            eprintln!("skipping: METALLIX_GEMMA4_MODEL is not set");
+            return;
+        };
 
         // Thinking: <|think|> in the system turn; the trace streams as
         // reasoning, never as answer text. 91 = 7 x 13.

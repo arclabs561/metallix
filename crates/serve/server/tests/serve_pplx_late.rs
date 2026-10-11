@@ -230,7 +230,10 @@ fn print_latency(address: SocketAddr, label: &str, request: &Value) {
 #[test]
 #[ignore = "needs METALLIX_PPLX_LATE_MODEL"]
 fn served_late_vectors_match_the_source_oracle() {
-    let model = std::env::var("METALLIX_PPLX_LATE_MODEL").unwrap();
+    let Ok(model) = std::env::var("METALLIX_PPLX_LATE_MODEL") else {
+        eprintln!("skipping: METALLIX_PPLX_LATE_MODEL is not set");
+        return;
+    };
     let fixture: Value = serde_json::from_str(
         &std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))

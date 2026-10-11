@@ -1264,7 +1264,10 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
     #[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
     fn real_qwen_answers_streams_and_uses_tools() {
         use crate::chat_generation::{ChatSession, ResidentChatLimits};
-        let model = std::env::var_os("METALLIX_QWEN_MODEL").expect("set METALLIX_QWEN_MODEL");
+        let Some(model) = std::env::var_os("METALLIX_QWEN_MODEL") else {
+            eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+            return;
+        };
         let mut session = ChatSession::load(
             std::path::Path::new(&model),
             ResidentChatLimits::from_mib(16_384, 8_192),
