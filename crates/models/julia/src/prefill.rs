@@ -246,7 +246,10 @@ fn two_block_prefix_then_head_matches_frozen_source_scores() {
 #[test]
 #[ignore = "diagnostic: writes full-encoder error distribution to JULIA_ERROR_OUTPUT"]
 fn write_full_encoder_error_distribution() {
-    let path = std::env::var("JULIA_ERROR_OUTPUT").expect("JULIA_ERROR_OUTPUT");
+    let Ok(path) = std::env::var("JULIA_ERROR_OUTPUT") else {
+        eprintln!("skipping: JULIA_ERROR_OUTPUT is not set");
+        return;
+    };
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/julia-1/full-prefill-reference.json"
     ))
@@ -1001,11 +1004,16 @@ fn full_encoder_rejects_malformed_rows_layers_ids_and_masks() {
 #[test]
 #[ignore = "needs the real Julia-1 checkpoint via JULIA_CHECKPOINT_DIR and JULIA_REAL_REFERENCE"]
 fn real_checkpoint_encoder_then_head_matches_float64_reference() {
-    let dir = std::path::PathBuf::from(std::env::var("JULIA_CHECKPOINT_DIR").unwrap());
-    let reference: Value = serde_json::from_str(
-        &std::fs::read_to_string(std::env::var("JULIA_REAL_REFERENCE").unwrap()).unwrap(),
-    )
-    .unwrap();
+    let Ok(dir) = std::env::var("JULIA_CHECKPOINT_DIR").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: JULIA_CHECKPOINT_DIR is not set");
+        return;
+    };
+    let Ok(reference_path) = std::env::var("JULIA_REAL_REFERENCE") else {
+        eprintln!("skipping: JULIA_REAL_REFERENCE is not set");
+        return;
+    };
+    let reference: Value =
+        serde_json::from_str(&std::fs::read_to_string(reference_path).unwrap()).unwrap();
     let gate: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/julia-1/f64-gate-reference.json"
     ))
