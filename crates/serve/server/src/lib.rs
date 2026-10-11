@@ -89,6 +89,8 @@ mod pplx_context_embeddings;
 #[cfg(feature = "metal")]
 mod pplx_late_embeddings;
 #[cfg(feature = "metal")]
+mod prefix_store;
+#[cfg(feature = "metal")]
 mod qwen_asr;
 #[cfg(feature = "metal")]
 mod qwen_decisions;
@@ -479,7 +481,13 @@ fn dispatch(cli: Cli) -> ExitCode {
             max_num_seqs,
             prefill_chunk_tokens,
             prefill_target_ms,
+            kv_persist_dir,
+            kv_persist_mib,
         } => {
+            let kv_persist = kv_persist_dir.map(|dir| prefix_store::KvPersist {
+                dir,
+                budget_mib: kv_persist_mib,
+            });
             if let Some(entry) = worker_entry {
                 return match serde_json::from_str::<serve_registry::ServedEntry>(&entry) {
                     Ok(entry) => {
@@ -504,6 +512,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                             },
                             Duration::from_millis(u64::from(generation_timeout_ms)),
                             cli.gpu_capture.as_deref(),
+                            kv_persist.as_ref(),
                         )
                     }
                     Err(error) => {
@@ -526,6 +535,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                         prefill_chunk_tokens,
                         prefill_target_ms,
                         generation_timeout_ms,
+                        kv_persist,
                         trace_out: cli.trace_out,
                         gpu_capture: cli.gpu_capture,
                     },
@@ -968,6 +978,40 @@ mod tests {
         // Chunked prefill stays opt-in until its chunk sizing is fixed: these
         // defaults prefill a prompt whole even beside running decodes.
         assert_eq!((prefill_chunk_tokens, prefill_target_ms), (65_536, 10_000));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn serve_keeps_prefixes_on_disk_only_when_given_a_directory() {
+        let cli = Cli::try_parse_from(["mx", "serve", "--model", "model"]).expect("serve defaults");
+        let super::Command::Serve { kv_persist_dir, .. } = cli.command else {
+            panic!("parsed as serve");
+        };
+        assert_eq!(kv_persist_dir, None, "persistence stays opt-in");
+        let cli = Cli::try_parse_from([
+            "mx",
+            "serve",
+            "--model",
+            "model",
+            "--kv-persist-dir",
+            "kv",
+            "--kv-persist-mib",
+            "512",
+        ])
+        .expect("serve with persistence");
+        let super::Command::Serve {
+            kv_persist_dir,
+            kv_persist_mib,
+            ..
+        } = cli.command
+        else {
+            panic!("parsed as serve");
+        };
+        assert_eq!(kv_persist_dir.as_deref(), Some(std::path::Path::new("kv")));
+        assert_eq!(kv_persist_mib, 512);
+        assert!(
+            Cli::try_parse_from(["mx", "serve", "--model", "m", "--kv-persist-mib", "0"]).is_err()
+        );
     }
 
     #[cfg(feature = "metal")]

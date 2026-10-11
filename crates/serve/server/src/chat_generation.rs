@@ -832,6 +832,9 @@ pub(crate) struct ChatSession {
     /// Encoded prompts kept across turns, so a grown conversation encodes
     /// only its new turns.
     prompt_prefixes: prompt_prefixes::PromptPrefixes,
+    /// The prompt-prefix K/V also kept on disk across restarts, when serving
+    /// with `--kv-persist-dir`.
+    prefix_store: Option<crate::prefix_store::PrefixStore>,
 }
 
 /// The parts of a loaded session a batched engine is built from; see
@@ -978,7 +981,37 @@ impl ChatSession {
             sampling_defaults: SamplingDefaults::load(model)?,
             prefix_cache: prefix_cache::PrefixCache::new(prefix_identity, prefix_budget),
             prompt_prefixes: prompt_prefixes::PromptPrefixes::default(),
+            prefix_store: None,
         })
+    }
+
+    /// Also keeps this session's prompt-prefix K/V on disk under `root`,
+    /// within `budget_bytes`, so a restarted server reuses it. Entries are
+    /// filed under an identity that covers the weights fingerprint, config,
+    /// tokenizer, chat template and serving precision, so a change to any
+    /// of them never reads stale K/V.
+    pub(crate) fn with_prefix_store(
+        mut self,
+        root: &Path,
+        budget_bytes: u64,
+    ) -> Result<Self, String> {
+        let weights = crate::prefix_store::weights_fingerprint(&self.model)
+            .map_err(|error| format!("--kv-persist-dir: weights fingerprint: {error}"))?;
+        let precision = self
+            .weights
+            .precision()
+            .map_err(|error| error.to_string())?;
+        let identity = format!(
+            "qwen3-resident-snapshot\0weights={weights}\0config={}\0tokenizer={}\0template={}\0precision={precision:?}\0adapter=none",
+            self.config_sha256,
+            self.tokenizer_sha256,
+            self.format.template().sha256(),
+        );
+        let store = crate::prefix_store::PrefixStore::open(root, identity.as_bytes(), budget_bytes)
+            .map_err(|error| format!("--kv-persist-dir {}: {error}", root.display()))?;
+        tracing::info!(dir = %store.dir().display(), budget_bytes, "prompt prefixes persist on disk");
+        self.prefix_store = Some(store);
+        Ok(self)
     }
 
     /// The one-time checkpoint, tokenizer, and template preparation duration.
@@ -1164,6 +1197,7 @@ impl ChatSession {
                 let prefilled = prefix_cache::prefill(
                     &self.weights,
                     &mut self.prefix_cache,
+                    self.prefix_store.as_ref(),
                     self.context_limit,
                     self.kv_budget_bytes,
                     request,
@@ -1373,6 +1407,7 @@ impl ChatSession {
             prefix_cache::remember(
                 &self.weights,
                 &mut self.prefix_cache,
+                self.prefix_store.as_ref(),
                 &self.format,
                 &executor,
                 request,

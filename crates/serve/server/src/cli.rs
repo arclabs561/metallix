@@ -273,6 +273,17 @@ pub(crate) enum Command {
         /// later in its prompt it starts. `--prefill-chunk-tokens` caps it.
         #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
         prefill_target_ms: u32,
+        /// Directory where Qwen3 models also keep prompt-prefix K/V on disk,
+        /// so a restarted server reuses prefixes it prefilled before instead
+        /// of prefilling them again. Applies with `--max-num-seqs 1`. Each
+        /// model state (weights, config, tokenizer, template, precision)
+        /// gets its own subdirectory.
+        #[arg(long)]
+        kv_persist_dir: Option<PathBuf>,
+        /// Per-model disk budget in MiB under `--kv-persist-dir`; the least
+        /// recently used prefixes are removed past it.
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=1_048_576))]
+        kv_persist_mib: u32,
     },
     /// Compare V4.1 FP32 rotary tails on Metal with pinned upstream fixtures.
     #[cfg(feature = "metal")]

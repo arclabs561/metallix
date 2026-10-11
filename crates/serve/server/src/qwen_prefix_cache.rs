@@ -23,6 +23,7 @@ use qwen::{
 use sha2::{Digest, Sha256};
 
 use super::ChatRequest;
+use crate::prefix_store::PrefixStore;
 use chat_format::{ChatFormat, PromptPrefix};
 
 type PrefixKey = [u8; 32];
@@ -34,11 +35,23 @@ type Executor<'w> = Qwen3ForwardExecutor<'w, std::collections::hash_map::RandomS
 pub(super) fn prefill<'w>(
     weights: &'w Qwen3MlxWeights,
     cache: &mut PrefixCache<Rc<Qwen3KvSnapshot>>,
+    store: Option<&PrefixStore>,
     context_limit: usize,
     kv_budget_bytes: u64,
     request: ChatRequest<'_>,
     input_ids: &[i32],
 ) -> Result<(Executor<'w>, Vec<f32>, usize), String> {
+    if let Some(store) = store {
+        restore(
+            weights,
+            cache,
+            store,
+            context_limit,
+            kv_budget_bytes,
+            request,
+            input_ids,
+        );
+    }
     if let Some(hit) = cache.lookup(request.cache_salt, input_ids) {
         // Entries come only from this session's weights and limits, so a
         // refused snapshot is a defect and fails loudly.
@@ -57,6 +70,49 @@ pub(super) fn prefill<'w>(
         .prefill_last_logits(input_ids)
         .map_err(|error| error.to_string())?;
     Ok((executor, logits, 0))
+}
+
+/// Moves the longest prefix of `input_ids` stored on disk into `cache` when
+/// it is longer than any the cache holds, so the lookup that follows uses it.
+/// A stored entry that does not decode for these weights and limits is
+/// skipped: disk state from another build or plan must not fail a request.
+fn restore(
+    weights: &Qwen3MlxWeights,
+    cache: &mut PrefixCache<Rc<Qwen3KvSnapshot>>,
+    store: &PrefixStore,
+    context_limit: usize,
+    kv_budget_bytes: u64,
+    request: ChatRequest<'_>,
+    input_ids: &[i32],
+) {
+    let salt = request.cache_salt;
+    let in_memory = cache.longest_tokens(salt, input_ids).unwrap_or(0);
+    if store.longest(salt, input_ids).unwrap_or(0) <= in_memory {
+        return;
+    }
+    let Some(stored) = store.lookup(salt, input_ids) else {
+        return;
+    };
+    let Ok(snapshot) =
+        weights.decode_resident_snapshot(&stored.snapshot, context_limit, kv_budget_bytes)
+    else {
+        tracing::warn!(
+            tokens = stored.tokens.len(),
+            "a stored prompt prefix did not decode"
+        );
+        return;
+    };
+    // Stored bytes hold every position, so the restored entry shares
+    // nothing.
+    let bytes = snapshot.kv_bytes();
+    cache.insert(
+        salt,
+        stored.tokens,
+        Rc::new(snapshot),
+        bytes,
+        PrefixRole::from_code(stored.role),
+        None,
+    );
 }
 
 /// Extent of the longest accepted snapshot, including any restored prefix.
@@ -144,6 +200,25 @@ pub(crate) enum PrefixRole {
     Conversation,
 }
 
+impl PrefixRole {
+    /// The role's code in a stored entry.
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Preamble => 0,
+            Self::Conversation => 1,
+        }
+    }
+
+    /// The role a stored code names; an unknown code reads as a
+    /// conversation, the role that is dropped first.
+    pub(crate) const fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Preamble,
+            _ => Self::Conversation,
+        }
+    }
+}
+
 /// Caches the prompt's reusable prefixes from `executor`: the leading system
 /// and tool preamble, which a later request with the same preamble shares,
 /// and the whole conversation before the generation prompt, which the next
@@ -159,9 +234,17 @@ pub(crate) enum PrefixRole {
 /// an entry stored before its preamble was cached) it stores a full copy, so
 /// a restore never joins K/V from two computations. `input_ids` must be the
 /// prompt [`prefill`] ran, with no cache insert in between.
+///
+/// With a `store`, each newly cached entry is also queued for disk as a
+/// standalone copy of all its positions.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one turn's caches, format and prefill state, each borrowed separately"
+)]
 pub(super) fn remember(
     weights: &Qwen3MlxWeights,
     cache: &mut PrefixCache<Rc<Qwen3KvSnapshot>>,
+    store: Option<&PrefixStore>,
     format: &ChatFormat,
     executor: &Executor<'_>,
     request: ChatRequest<'_>,
@@ -219,6 +302,13 @@ pub(super) fn remember(
         );
         if inserted {
             written = written.max(tokens);
+            // Persistence is best effort: an encoding failure only skips the
+            // disk copy, and an entry the store holds is not encoded again.
+            if let Some(store) = store.filter(|store| !store.contains(request.cache_salt, &ids)) {
+                if let Ok(encoded) = snapshot.encode() {
+                    store.save(request.cache_salt, ids.clone(), role.code(), encoded);
+                }
+            }
             if role == PrefixRole::Preamble {
                 shared = Some((ids, snapshot));
             }
@@ -377,6 +467,20 @@ impl<V> PrefixCache<V> {
                 .is_some_and(|entry| Self::matches(entry, salt, &prompt[..length]))
                 .then_some(key)
         })
+    }
+
+    /// Tokens of the longest prefix of `prompt` cached under `salt` that
+    /// leaves at least one prompt token, without counting a query.
+    pub(crate) fn longest_tokens(&self, salt: Option<&str>, prompt: &[i32]) -> Option<usize> {
+        self.entries
+            .values()
+            .filter(|entry| {
+                entry.salt.as_deref() == salt
+                    && entry.tokens.len() < prompt.len()
+                    && prompt.starts_with(&entry.tokens)
+            })
+            .map(|entry| entry.tokens.len())
+            .max()
     }
 
     /// Whether exactly `tokens` is cached under `salt`.
@@ -857,6 +961,13 @@ impl super::ChatSession {
     /// Drops every cached prefix and sets a new byte budget.
     pub(crate) fn reset_prefix_cache(&mut self, budget_bytes: usize) {
         self.prefix_cache = PrefixCache::new(self.prefix_cache.identity.clone(), budget_bytes);
+    }
+
+    /// Waits until queued prefix-store writes are on disk.
+    pub(crate) fn flush_prefix_store(&self) {
+        if let Some(store) = &self.prefix_store {
+            store.flush();
+        }
     }
 }
 

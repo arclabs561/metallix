@@ -296,6 +296,7 @@ fn checkpoint_prefix_snapshot_copy_time() {
         let (executor, _, _) = super::prefill(
             &session.weights,
             &mut session.prefix_cache,
+            None,
             session.context_limit,
             session.kv_budget_bytes,
             request,
@@ -306,6 +307,7 @@ fn checkpoint_prefix_snapshot_copy_time() {
         super::remember(
             &session.weights,
             &mut session.prefix_cache,
+            None,
             &session.format,
             &executor,
             request,
@@ -381,4 +383,67 @@ fn checkpoint_prompt_reuse_keeps_output_and_cuts_render_time() {
         later(&arms[1]),
         later(&arms[3])
     );
+}
+
+/// A fresh session over `model` that keeps prefixes under `store`.
+fn load_persisting(model: &std::path::Path, store: &std::path::Path) -> ChatSession {
+    let limits = ResidentChatLimits::from_mib(8_192, 4_096).with_prefix_cache_mib(8_192);
+    ChatSession::load(model, limits)
+        .expect("load")
+        .with_prefix_store(store, 4 << 30)
+        .expect("open prefix store")
+}
+
+fn generate_greedy(session: &mut ChatSession, messages: &[ChatMessage]) -> ChatGeneration {
+    let mut request = ChatRequest::new(messages, MAX_TOKENS);
+    request.sampling = crate::chat_generation::SamplingRequest::GREEDY;
+    session
+        .generate(request, &mut |_| Ok(()))
+        .expect("generation")
+}
+
+#[test]
+#[ignore = "requires METALLIX_QWEN_MODEL and a local Apple-Silicon Metal checkpoint"]
+fn checkpoint_a_restarted_session_restores_stored_prefixes_from_disk() {
+    let Some(model) = env::var_os("METALLIX_QWEN_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN_MODEL is not set");
+        return;
+    };
+    let store = env::temp_dir().join(format!("metallix-kv-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&store);
+    let system = preamble("Ada");
+    let messages = conversation(&system, "Do you sell ladders?");
+    {
+        let mut first = load_persisting(&model, &store);
+        let seeded = generate_greedy(&mut first, &conversation(&system, "Where are the hammers?"));
+        assert_eq!(seeded.metrics.cached_prompt_tokens, 0, "cold store misses");
+        first.flush_prefix_store();
+    }
+    // A new session stands in for a restarted server: its RAM cache is empty.
+    let mut restarted = load_persisting(&model, &store);
+    let restored = generate_greedy(&mut restarted, &messages);
+    let preamble_tokens = restored.metrics.cached_prompt_tokens;
+    assert!(
+        preamble_tokens > 2_000 && preamble_tokens < restored.metrics.prompt_tokens,
+        "the stored preamble is restored: {preamble_tokens} of {}",
+        restored.metrics.prompt_tokens
+    );
+    drop(restarted);
+    // Oracle: the same request on a session with no cache and no store.
+    let mut fresh = ChatSession::load(
+        &model,
+        ResidentChatLimits::from_mib(8_192, 4_096).with_prefix_cache_mib(0),
+    )
+    .expect("load");
+    let oracle = generate_greedy(&mut fresh, &messages);
+    assert_eq!(oracle.metrics.cached_prompt_tokens, 0);
+    assert_eq!(
+        oracle.generated_token_ids, restored.generated_token_ids,
+        "restored K/V must not change greedy output"
+    );
+    eprintln!(
+        "restored {preamble_tokens} tokens: prefill {:.1} ms vs fresh {:.1} ms",
+        restored.metrics.prefill_ms, oracle.metrics.prefill_ms
+    );
+    let _ = std::fs::remove_dir_all(&store);
 }

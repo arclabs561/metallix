@@ -351,9 +351,16 @@ impl ModelWorker for crate::qwen_asr::QwenAsr {
 pub(crate) fn load(
     entry: &ServedEntry,
     limits: ResidentChatLimits,
+    kv_persist: Option<&crate::prefix_store::KvPersist>,
 ) -> Result<Box<dyn ModelWorker>, String> {
     Ok(match entry.kind {
-        ModelKind::Qwen => Box::new(ChatSession::load(&entry.path, limits)?),
+        ModelKind::Qwen => {
+            let session = ChatSession::load(&entry.path, limits)?;
+            Box::new(match kv_persist {
+                Some(persist) => session.with_prefix_store(&persist.dir, persist.budget_bytes())?,
+                None => session,
+            })
+        }
         ModelKind::Gemma4 => Box::new(ChatDecoderSession::<GemmaDecoder>::load(
             &entry.path,
             limits,

@@ -69,6 +69,8 @@ pub(crate) struct ChildSettings {
     pub(crate) prefill_chunk_tokens: u32,
     pub(crate) prefill_target_ms: u32,
     pub(crate) generation_timeout_ms: u32,
+    /// Passed to each child, which keeps its own subdirectory.
+    pub(crate) kv_persist: Option<crate::prefix_store::KvPersist>,
     /// Each child writes its own timeline beside this path.
     pub(crate) trace_out: Option<PathBuf>,
     /// Each child captures its first request beside this path.
@@ -93,6 +95,7 @@ impl ChildSettings {
             prefill_chunk_tokens: 2048,
             prefill_target_ms: 0,
             generation_timeout_ms: 1000,
+            kv_persist: None,
             trace_out: None,
             gpu_capture: None,
         }
@@ -482,6 +485,14 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
             "--generation-timeout-ms",
             &settings.generation_timeout_ms.to_string(),
         ])
+        .args(settings.kv_persist.iter().flat_map(|persist| {
+            [
+                "--kv-persist-dir".into(),
+                persist.dir.clone().into_os_string(),
+                "--kv-persist-mib".into(),
+                persist.budget_mib.to_string().into(),
+            ]
+        }))
         .args(settings.trace_out.iter().flat_map(|path| {
             [
                 "--trace-out".into(),

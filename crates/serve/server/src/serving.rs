@@ -24,6 +24,7 @@ use crate::{
     generation_routes::{Generation, error_body, error_response},
     gpu,
     http_transport::{Connection, TransportLimits},
+    prefix_store::KvPersist,
     responses::{echo_request_id, json_response},
     serve_registry::{self, ModelWorker, ServedEntry},
     trace_context::RequestContext,
@@ -452,6 +453,7 @@ pub(crate) fn serve_child(
     engine_limits: EngineLimits,
     generation_timeout: Duration,
     capture: Option<&Path>,
+    kv_persist: Option<&KvPersist>,
 ) -> ExitCode {
     if let Err(error) = crate::telemetry::finish_on_signal() {
         tracing::error!("mx serve: {error}");
@@ -475,6 +477,7 @@ pub(crate) fn serve_child(
         engine_limits,
         generation_timeout,
         capture,
+        kv_persist,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -565,6 +568,7 @@ fn serve_inner(
     engine_limits: EngineLimits,
     generation_timeout: Duration,
     capture: Option<&Path>,
+    kv_persist: Option<&KvPersist>,
 ) -> Result<(), String> {
     if !address.ip().is_loopback() {
         return Err("this experimental server binds only to loopback".into());
@@ -581,6 +585,7 @@ fn serve_inner(
         let worker_entry = entry.clone();
         // One model per process today, so the capture goes to its first request.
         let worker_capture = capture.map(Path::to_path_buf);
+        let worker_persist = kv_persist.cloned();
         // This thread owns the model's MLX arrays; its name tags every log line.
         let worker = thread::Builder::new()
             .name(format!("model-{}", entry.id))
@@ -597,14 +602,15 @@ fn serve_inner(
                 );
                 let entered = load.enter();
                 let started = Instant::now();
-                let mut worker = match serve_registry::load(&worker_entry, limits) {
-                    Ok(worker) => worker,
-                    Err(error) => {
-                        load.record("error.type", "load_failed");
-                        let _ = startup_sender.send(Err(error));
-                        return;
-                    }
-                };
+                let mut worker =
+                    match serve_registry::load(&worker_entry, limits, worker_persist.as_ref()) {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            load.record("error.type", "load_failed");
+                            let _ = startup_sender.send(Err(error));
+                            return;
+                        }
+                    };
                 let liveness = WorkerLiveness {
                     alive: worker_liveness,
                 };
