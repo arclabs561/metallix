@@ -71,7 +71,11 @@ mod memory_checkpoint;
 #[path = "chat_score_checkpoint_tests.rs"]
 mod score_checkpoint;
 
-const MAX_CHAT_MESSAGES: usize = 256;
+/// Messages per request. Each tool call and tool result is a message, so a
+/// long agent session needs thousands. Template fuel, not this cap, bounds
+/// the render's CPU: a template whose cost grows faster than linearly (Gemma
+/// 4) runs out of fuel below the cap with its own error.
+const MAX_CHAT_MESSAGES: usize = 4096;
 const MAX_CHAT_TOOLS: usize = 64;
 const MIB_BYTES: u64 = 1024 * 1024;
 
@@ -2730,6 +2734,17 @@ mod tests {
         let over = "x".repeat(super::body_bytes_for_context(262_144) + 1);
         let messages = [ChatMessage::text(ChatRole::User, &over)];
         assert!(super::validate_request(ChatRequest::new(&messages, 1), 262_144).is_err());
+    }
+
+    /// A long agent session counts every tool call and tool result as a
+    /// message, so the cap admits 4096; one more is refused before rendering.
+    #[test]
+    fn message_cap_admits_long_agent_sessions() {
+        let messages = vec![ChatMessage::text(ChatRole::User, "x"); 4097];
+        assert!(super::validate_request(ChatRequest::new(&messages[..4096], 1), 2_048).is_ok());
+        let refused = super::validate_request(ChatRequest::new(&messages, 1), 2_048)
+            .expect_err("4097 messages");
+        assert!(refused.contains("1 through 4096 messages"), "{refused}");
     }
 
     #[test]

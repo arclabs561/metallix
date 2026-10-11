@@ -82,7 +82,13 @@ pub const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
 pub const MAX_GENERATION_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_MODEL_CONFIG_BYTES: usize = 1024 * 1024;
 const DEFAULT_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
-const DEFAULT_TEMPLATE_FUEL: u64 = 100_000;
+/// About 0.2 s of template CPU on an M3 Max: gemma-4-12B's template used
+/// 59.5M fuel in about 2 s per render for a 4096-message agent conversation
+/// (91 s over its fuel bisection). Linear templates (Qwen3, Qwen3.5, Qwen3.8,
+/// `MiniCPM5`) need at most 452K at 4096 messages; Gemma's forward scans make
+/// it quadratic (about 3.6 n^2 fuel), so it stops near 1,300 messages with an
+/// out-of-fuel error instead of 2 s renders.
+const DEFAULT_TEMPLATE_FUEL: u64 = 6_000_000;
 
 /// Limits a [`ChatFormat`] applies to every prompt it renders, set once for a
 /// server's context and message cap so no call site can forget them.
@@ -99,7 +105,7 @@ pub struct ChatLimits {
 }
 
 impl Default for ChatLimits {
-    /// 1 MiB and 100,000 instructions: a short-context server.
+    /// 1 MiB and 6,000,000 instructions.
     fn default() -> Self {
         Self {
             rendered_bytes: DEFAULT_CHAT_RENDERED_BYTES,
@@ -457,7 +463,18 @@ impl ChatTemplate {
             .get_template("chat")
             .map_err(|error| format!("local chat template is unavailable: {error}"))?
             .render(context)
-            .map_err(|error| format!("local chat template could not be rendered: {error}"))?;
+            .map_err(|error| {
+                if error.kind() == minijinja::ErrorKind::OutOfFuel {
+                    format!(
+                        "this model's chat template needs more work than the server allows for {} messages \
+                         (template fuel {}); shorten the conversation",
+                        conversation.messages.len(),
+                        self.limits.template_fuel
+                    )
+                } else {
+                    format!("local chat template could not be rendered: {error}")
+                }
+            })?;
         if rendered.len() > self.limits.rendered_bytes {
             return Err(format!(
                 "rendered chat prompt exceeds the {}-byte limit",
@@ -1518,7 +1535,8 @@ mod tests {
             .template()
             .render(Conversation::new(&messages), false)
             .expect_err("one unit of fuel cannot run the loop");
-        assert!(error.contains("fuel"), "{error}");
+        assert!(error.contains("shorten the conversation"), "{error}");
+        assert!(error.contains("for 3 messages"), "{error}");
     }
 
     fn render(format: &ChatFormat, content: &str) -> String {
@@ -2554,12 +2572,19 @@ mod tests {
                 .expect("vocab_size");
             let mut format = ChatFormat::load(&model, vocabulary)
                 .unwrap_or_else(|error| panic!("{}: {error}", model.display()));
-            for (count, body) in [(256, 8), (256, 2048), (4096, 8)] {
+            for (count, body) in [(256, 8), (256, 2048), (1024, 8), (4096, 8)] {
                 let messages = agent_conversation(count, body);
                 let started = std::time::Instant::now();
                 let (next, fuel) = minimal_fuel(format, &messages, &tools);
                 let seconds = started.elapsed().as_secs_f64();
                 format = next;
+                if count == 256 {
+                    assert!(
+                        fuel.is_some_and(|fuel| fuel <= super::DEFAULT_TEMPLATE_FUEL),
+                        "{}: a 256-message agent conversation must render within the default fuel",
+                        model.display()
+                    );
+                }
                 println!(
                     "{}",
                     json!({"model": model.display().to_string(), "messages": count,
