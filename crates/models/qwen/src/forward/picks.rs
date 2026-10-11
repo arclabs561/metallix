@@ -544,11 +544,11 @@ mod tests {
                 .iter()
                 .map(|&logit| (f64::from(logit) - f64::from(maximum)).exp())
                 .sum();
-            assert_eq!(candidates.max_logit, maximum);
+            assert_eq!(candidates.max_logit.to_bits(), maximum.to_bits());
             for &(id, logit) in &candidates.top {
                 let host = f64::from(logit) - f64::from(maximum) - sum.ln();
                 let index = usize::try_from(id).expect("id");
-                assert_eq!(logit, row[index]);
+                assert_eq!(logit.to_bits(), row[index].to_bits());
                 assert!((candidates.logprob(logit) - host).abs() < 1e-5);
             }
         }
