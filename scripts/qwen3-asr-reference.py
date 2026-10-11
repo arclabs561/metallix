@@ -404,10 +404,17 @@ def wer(args: argparse.Namespace) -> None:
     truth = {
         clip["id"]: clip["text"] for clip in read_manifest(args.clips / "manifest.json")
     }
-    theirs = {clip["id"]: clip["text"] for clip in read_manifest(args.reference)}
+    # Later manifests replace earlier ones clip by clip, so a recapture of
+    # some clips can override a full capture.
+    theirs = {}
+    for manifest in args.reference:
+        theirs.update({clip["id"]: clip["text"] for clip in read_manifest(manifest)})
     ours = {}
     for line in args.ours.read_text().splitlines():
-        record = json.loads(line)
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a line a stopped run cut short; resumed runs redo it
         ours[record["id"]] = record["text"]
     ids = [clip_id for clip_id in truth if clip_id in theirs and clip_id in ours]
     if len(ids) != len(ours) or len(ids) != len(theirs):
@@ -496,7 +503,11 @@ def main() -> None:
         "--clips", type=Path, required=True, help="prepare-clips output directory"
     )
     score.add_argument(
-        "--reference", type=Path, required=True, help="capture manifest.json"
+        "--reference",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="capture manifest.json files; later ones override earlier ones per clip",
     )
     score.add_argument(
         "--ours", type=Path, required=True, help="transcribe_clips JSON lines"

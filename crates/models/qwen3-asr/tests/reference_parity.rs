@@ -1,10 +1,14 @@
 //! Gates G0, G1, G2 and the encoder negative controls (G4 b, c) against a
-//! capture from `scripts/qwen3-asr-reference.py capture`.
+//! capture from `scripts/qwen3-asr-native-reference.py capture`.
 //!
 //! Run with `--features parity-controls -- --ignored --nocapture`, setting
 //! `METALLIX_QWEN3_ASR_MODEL` to the checkpoint and `METALLIX_QWEN3_ASR_REF` to
-//! the capture directory. The capture's dtype selects the bars; the pass bars
-//! were declared before the first run.
+//! the capture directory. The capture's dtype selects the bars. A bf16
+//! capture also needs the f32 capture of the same clips in
+//! `METALLIX_QWEN3_ASR_REF_F32`: the bf16 encoder bar is derived from the
+//! reference's own bf16 error against its f32 output. The f32 bars were
+//! declared before the first run; the bf16 rule was declared, replacing a
+//! guessed bar, before it was first computed.
 #![cfg(feature = "parity-controls")]
 
 use std::path::{Path, PathBuf};
@@ -12,6 +16,7 @@ use std::path::{Path, PathBuf};
 use audio::{LogMel, decode_wav};
 use mlx_rs::{Array, Dtype};
 use qwen3_asr::encoder::EncoderControl;
+use qwen3_asr::tokenizer::STOP_TOKENS;
 use qwen3_asr::{Qwen3Asr, TranscribeOptions};
 use serde::Deserialize;
 
@@ -22,8 +27,11 @@ const MEL_MEAN_ABS: f64 = 1e-5;
 /// per-frame cosine similarity of the encoder output.
 const F32_REL_L2: f64 = 1e-4;
 const F32_MIN_COSINE: f64 = 0.999_99;
-const BF16_REL_L2: f64 = 2e-2;
-const BF16_MIN_COSINE: f64 = 0.999;
+/// G1 for bf16: our error against the f32 reference may exceed the
+/// reference's own bf16 error by this factor plus a floor.
+const BF16_FACTOR: f64 = 1.25;
+const BF16_REL_L2_FLOOR: f64 = 1e-4;
+const BF16_COSINE_FLOOR: f64 = 1e-5;
 /// G2 (f32 only): first-step logits.
 const LOGIT_MAX_ABS: f32 = 1e-2;
 
@@ -104,11 +112,12 @@ fn matches_the_reference_capture() {
         "bfloat16" => false,
         other => panic!("capture dtype {other}"),
     };
-    let (rel_l2_bar, cosine_bar) = if float32 {
-        (F32_REL_L2, F32_MIN_COSINE)
-    } else {
-        (BF16_REL_L2, BF16_MIN_COSINE)
-    };
+    let reference_f32 = (!float32).then(|| {
+        PathBuf::from(
+            std::env::var_os("METALLIX_QWEN3_ASR_REF_F32")
+                .expect("a bf16 capture needs METALLIX_QWEN3_ASR_REF_F32"),
+        )
+    });
 
     let mut model = Qwen3Asr::load(&model_dir).expect("load checkpoint");
     if float32 {
@@ -148,10 +157,30 @@ fn matches_the_reference_capture() {
 
         // G1, fed the reference features.
         let reference_mel = LogMel::from_values(bins, frames, theirs).expect("reference mel");
-        let expected = read_f32(
-            &stem.with_extension("encoder.f32"),
-            clip.encoder_shape[0] * clip.encoder_shape[1],
-        );
+        let rows = clip.encoder_shape[0] * clip.encoder_shape[1];
+        let expected = read_f32(&stem.with_extension("encoder.f32"), rows);
+        // The f32 encoder output every encode is measured against, and the
+        // pass bar: fixed for f32, derived from the reference's bf16 noise
+        // for bf16.
+        let (target, rel_l2_bar, cosine_bar) = match &reference_f32 {
+            None => (expected.clone(), F32_REL_L2, F32_MIN_COSINE),
+            Some(directory) => {
+                let target = read_f32(
+                    &directory.join(&clip.id).with_extension("encoder.f32"),
+                    rows,
+                );
+                let (e_ref, cos_ref) = compare_rows(&expected, &target, width);
+                println!(
+                    "{} G1 reference bf16 vs f32 rel_l2 {e_ref:.3e} min_cosine {cos_ref:.7}",
+                    clip.id
+                );
+                (
+                    target,
+                    BF16_FACTOR * e_ref + BF16_REL_L2_FLOOR,
+                    1.0 - (BF16_FACTOR * (1.0 - cos_ref) + BF16_COSINE_FLOOR),
+                )
+            }
+        };
         let encoded = model.encoder().encode(&reference_mel).expect("encode");
         assert_eq!(
             encoded.shape(),
@@ -162,9 +191,9 @@ fn matches_the_reference_capture() {
             "{}",
             clip.id
         );
-        let (rel_l2, min_cosine) = compare_rows(&host(&encoded), &expected, width);
+        let (rel_l2, min_cosine) = compare_rows(&host(&encoded), &target, width);
         println!(
-            "{} G1 encoder rel_l2 {rel_l2:.3e} min_cosine {min_cosine:.7}",
+            "{} G1 encoder rel_l2 {rel_l2:.3e} min_cosine {min_cosine:.7} (bars {rel_l2_bar:.3e}, {cosine_bar:.7})",
             clip.id
         );
         if rel_l2 > rel_l2_bar || min_cosine < cosine_bar {
@@ -176,7 +205,7 @@ fn matches_the_reference_capture() {
             .encoder()
             .encode_control(&reference_mel, EncoderControl::ContinuousPositions)
             .expect("continuous positions");
-        let (rel_l2, min_cosine) = compare_rows(&host(&continuous), &expected, width);
+        let (rel_l2, min_cosine) = compare_rows(&host(&continuous), &target, width);
         let applies = frames > 100;
         println!(
             "{} G4b continuous positions rel_l2 {rel_l2:.3e} min_cosine {min_cosine:.7}",
@@ -189,7 +218,7 @@ fn matches_the_reference_capture() {
             .encoder()
             .encode_control(&reference_mel, EncoderControl::FullAttention)
             .expect("full attention");
-        let (rel_l2, min_cosine) = compare_rows(&host(&full), &expected, width);
+        let (rel_l2, min_cosine) = compare_rows(&host(&full), &target, width);
         let applies = clip.encoder_shape[0] > model.config().encoder().window_frames();
         println!(
             "{} G4c full attention rel_l2 {rel_l2:.3e} min_cosine {min_cosine:.7}",
@@ -213,26 +242,43 @@ fn matches_the_reference_capture() {
         ours_set.sort_unstable();
         theirs_set.sort_unstable();
         let result = model.transcribe(&audio, &options).expect("transcribe");
+        // `generate` returns the stop token it ended on; transcribe does not.
+        let mut expected_ids = clip.generated_ids.clone();
+        if expected_ids
+            .last()
+            .is_some_and(|token| STOP_TOKENS.contains(token))
+        {
+            expected_ids.pop();
+        }
         println!(
             "{} G2 logits max_abs {logit_max:.3e} argmax {} vs {} top5 equal {} tokens equal {} ({} vs {})",
             clip.id,
             ours_top[0],
             theirs_top[0],
             ours_set == theirs_set,
-            result.generated == clip.generated_ids,
+            result.generated == expected_ids,
             result.generated.len(),
-            clip.generated_ids.len()
+            expected_ids.len()
         );
         println!(
             "{}   ours:   {}\n{}   theirs: {}",
             clip.id, result.transcript.text, clip.id, clip.text
         );
+        let prompt = model
+            .tokenizer()
+            .prompt(
+                &options.context,
+                options.language.as_deref(),
+                clip.encoder_shape[0],
+            )
+            .expect("prompt");
+        assert_eq!(prompt.ids(), clip.prompt_ids, "{}", clip.id);
         assert_eq!(result.prompt_tokens, clip.prompt_ids.len(), "{}", clip.id);
         if float32
             && (ours_top[0] != theirs_top[0]
                 || ours_set != theirs_set
                 || logit_max > LOGIT_MAX_ABS
-                || result.generated != clip.generated_ids)
+                || result.generated != expected_ids)
         {
             failures.push(format!("{} G2", clip.id));
         }
