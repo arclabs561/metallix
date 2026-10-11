@@ -49,7 +49,7 @@ string is a separate policy: either model it in the grammar or return an
 explicit `StoppedBeforeComplete` result, never label a truncated byte stream
 as schema-valid.  Respect the model's EOS ID set rather than assuming the
 single `eos_token_id` currently read by
-[`qwen_forward.rs`](../../crates/server/src/qwen_forward.rs); different
+[`qwen_forward.rs`](../../crates/serve/server/src/qwen_forward.rs); different
 tokenizers and chat modes can have multiple terminal IDs.
 
 ## Two credible backends
@@ -116,7 +116,7 @@ integration prerequisites beyond that diagnostic are:
 - no device-resident masked sampling path.
 
 The first implementation is feature-gated in
-[`llguidance_qwen_tokenizer.rs`](../../crates/engine/tests/llguidance_qwen_tokenizer.rs):
+[`llguidance_qwen_tokenizer.rs`](../../crates/core/engine/tests/llguidance_qwen_tokenizer.rs):
 a deterministic one-byte test covers valid/invalid JSON and EOS; an ignored
 local-Qwen test reads `METALLIX_QWEN_TOKENIZER`, builds LLGuidance's exact
 token-byte table, reconstructs consumed bytes for `serde_json` parsing, and

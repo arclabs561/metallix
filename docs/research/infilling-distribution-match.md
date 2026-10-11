@@ -32,7 +32,7 @@ whose likelihood is the terminal potential
 Table 5 p.15 names this target).
 
 Metallix already computes a weight of this kind, with one qualification.
-`allowed_log_mass` in [`constraint.rs`](../../crates/engine/src/constraint.rs)
+`allowed_log_mass` in [`constraint.rs`](../../crates/core/engine/src/constraint.rs)
 is the model mass of every token the grammar allows next, and fixed JSON keys
 are decoded one token at a time. The constraint uses llguidance's approximate
 (non-canonical) tokenizer environment, so a fixed key admits every

@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-diffusion = { path = "../../diffusion" }
+diffusion = { path = "../../core/diffusion" }
 mlx-rs = { workspace = true, optional = true }
 qwen = { path = "../qwen", optional = true }
 serde.workspace = true

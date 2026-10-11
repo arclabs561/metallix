@@ -21,14 +21,14 @@ coverage recorded in their respective notes.
 
 ## Offline EOS particle accounting
 
-`crates/engine/tests/eos_particle_target.rs` extends the finite target oracle
+`crates/core/engine/tests/eos_particle_target.rs` extends the finite target oracle
 to EOS-terminated paths. It checks incremental log weights, normalization,
 effective sample size, duplicate/discarded ancestors, absorbing EOS and
 population extinction. Multinomial ancestor draws and weighted terminal
 selection exercise the engine's categorical sampler against an independent
 CDF oracle at fixed entropy values.
 
-`crates/engine/tests/smc_finite_oracle.rs` then applies the same finite
+`crates/core/engine/tests/smc_finite_oracle.rs` then applies the same finite
 accounting to the public `engine::smc::ParticleSet` primitive. It distinguishes
 an absorbing EOS particle from a hard-rejected zero-mass particle, checks that
 neither can receive a further transition, and records the pre-resampling log
@@ -51,7 +51,7 @@ cache-fork/reindex parity remains a prerequisite for model-backed particles.
 
 ## Model-backed composition check
 
-The test-only `crates/server/src/qwen_particle_tests.rs` composes real Qwen
+The test-only `crates/serve/server/src/qwen_particle_tests.rs` composes real Qwen
 proposals, production `ParticleSet` resampling, and adapter-owned KV forks.
 The local Qwen3-0.6B checkpoint passed with three particles, two transitions,
 one resampling boundary, and fixed entropy. Its declared target is the deployed
@@ -144,7 +144,7 @@ without a file-cache flush.
 what distribution actually selected the token?
 
 The stateless primitive now has an independent finite-toy `f64` oracle in
-`crates/engine/src/sampling.rs`: direct uncentered exponentials and normalized
+`crates/core/engine/src/sampling.rs`: direct uncentered exponentials and normalized
 probabilities are compared with the production centered implementation at
 fixed entropy values. Cases cover ties, masked/padded rows, temperature, and
 a representable tiny legal mass, checking selected IDs and policy logprob.
@@ -214,7 +214,7 @@ resampling variance, or model quality.
 
 ## Gate 3: cache ownership, then uncertainty calibration
 
-The test-only `crates/engine/tests/particle_ancestry.rs` now exercises a fixed
+The test-only `crates/core/engine/tests/particle_ancestry.rs` now exercises a fixed
 three-particle resampling trace through the production categorical sampler.
 An independent FP64 CDF checks duplicated/discarded ancestors, absorbing EOS,
 post-resampling weight reset, normalization and ESS, and weighted terminal
@@ -357,7 +357,7 @@ Python-like DSL in Metallix's generation API. The full v2 paper reading and
 its finite-particle caveat remain recorded in [GenLM control](genlm-control.md).
 
 **Implemented offline accounting experiment:**
-[`programmed_target.rs`](../../crates/engine/tests/programmed_target.rs)
+[`programmed_target.rs`](../../crates/core/engine/tests/programmed_target.rs)
 enumerates a private two-step program, not an interpreter API. It draws
 `x ∈ {A,B}` then `y ∈ {0,1}`
 from enumerated base probabilities; applies hard

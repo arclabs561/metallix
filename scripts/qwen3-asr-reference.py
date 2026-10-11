@@ -19,7 +19,7 @@ the `qwen-asr` 0.0.6 package (https://github.com/QwenLM/Qwen3-ASR at
 7c6daf77a2421100f5fb066495372c00129d39ff), which pins transformers 4.57.6
 and uses `WhisperFeatureExtractor`'s torch path for log-mel features.
 
-`mel-fixture` writes the compact JSON fixture `crates/audio` tests read:
+`mel-fixture` writes the compact JSON fixture `crates/core/audio` tests read:
 log-mel features of deterministic synthetic signals that the Rust test
 regenerates sample for sample. Each signal records a checksum of its samples
 so a generator mismatch fails loudly instead of looking like a feature
@@ -452,7 +452,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
     mel = commands.add_parser(
-        "mel-fixture", help="write the crates/audio log-mel fixture"
+        "mel-fixture", help="write the crates/core/audio log-mel fixture"
     )
     mel.add_argument(
         "--model", type=Path, required=True, help="Qwen3-ASR checkpoint directory"

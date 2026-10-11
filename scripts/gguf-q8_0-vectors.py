@@ -6,7 +6,7 @@
 
 Random blocks (fixed seed) plus hand-picked scales, each decoded by gguf-py's
 `dequantize`, the Python port of ggml's `dequantize_row_q8_0`.
-Usage: uv run scripts/gguf-q8_0-vectors.py > crates/blockfloat/tests/data/gguf-q8_0-vectors.json
+Usage: uv run scripts/gguf-q8_0-vectors.py > crates/core/blockfloat/tests/data/gguf-q8_0-vectors.json
 """
 
 import json

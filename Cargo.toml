@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/audio",
-    "crates/blockfloat",
-    "crates/chat-format",
-    "crates/checkpoint",
-    "crates/diffusion",
-    "crates/engine",
-    "crates/media",
-    "crates/mlx-kernels",
+    "crates/core/audio",
+    "crates/core/blockfloat",
+    "crates/core/chat-format",
+    "crates/core/checkpoint",
+    "crates/core/diffusion",
+    "crates/core/engine",
+    "crates/core/media",
+    "crates/metal/mlx-kernels",
     "crates/models/deepseek",
     "crates/models/flux2",
     "crates/models/gemma",
@@ -15,7 +15,7 @@ members = [
     "crates/models/qwen",
     "crates/models/qwen3-asr",
     "crates/models/qwen35",
-    "crates/server",
+    "crates/serve/server",
 ]
 resolver = "2"
 
