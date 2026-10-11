@@ -177,9 +177,9 @@ Open goals at this checkpoint:
 - Serving a model larger than RAM, once the expert pager passes its gate.
 - DeepSeek-V4.1 generation: multi-token prefill steps, indexer scoring past
   512 compressed positions, the generate loop and a fully on-device path.
-- Reorganizing the workspace crates into core, Metal, model and serving
-  groups. This moves crate paths, so this page names features rather than
-  crate paths.
+
+The workspace crates are grouped into core, Metal, model and serving tiers.
+The dependency-direction check enforces those boundaries.
 
 ## Position and constraints
 
