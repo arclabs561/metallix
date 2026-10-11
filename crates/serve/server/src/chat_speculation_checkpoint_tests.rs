@@ -81,6 +81,7 @@ fn speculation_accepts_edit_drafts_in_every_decode_mode() {
         top_p: Some(0.95),
         top_k,
         seed: Some(11),
+        sampler: None,
     };
     let cases = [
         ("greedy", SamplingRequest::GREEDY, None),
@@ -251,6 +252,7 @@ fn sampled_gpu_verify_matches_host_row_verify() {
                 top_p: Some(0.95),
                 top_k: Some(20),
                 seed: Some(seed),
+                sampler: None,
             };
             request.top_logprobs = top_logprobs;
             request.speculation = SpeculationRequest::Automatic;
@@ -323,6 +325,7 @@ fn per_token_cost_by_pick_mode_and_speculation() {
         top_p: Some(0.95),
         top_k: Some(20),
         seed: Some(5),
+        sampler: None,
     };
     let arms = [
         (
@@ -393,6 +396,7 @@ fn verify_rule_has_one_variate_per_row_and_refuses_a_grammar() {
             top_p: Some(0.95),
             top_k: Some(20),
             seed: Some(3),
+            sampler: None,
         };
         if constrained {
             request.json_schema = Some(&schema);

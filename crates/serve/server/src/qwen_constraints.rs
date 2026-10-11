@@ -10,8 +10,8 @@ use std::{
 };
 
 use engine::constraint::{
-    ConstraintLimits, ConstraintStep, JsonConstraintCheckpoint, JsonConstraintCompiler,
-    JsonConstraintSession,
+    ConstraintError, ConstraintLimits, ConstraintStep, JsonConstraintCheckpoint,
+    JsonConstraintCompiler, JsonConstraintSession, SamplingTokenLogProbs,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,9 @@ impl SchemaSource<'_> {
         }
     }
 }
+
+/// One sampled grammar step with its probability receipt.
+type SampledStep = Result<(ConstraintStep, SamplingTokenLogProbs), ConstraintError>;
 
 pub(crate) struct ConstraintRun {
     session: JsonConstraintSession,
@@ -322,9 +325,7 @@ impl ConstraintRun {
             .map_err(|_| "model vocabulary cannot be represented by server token IDs")?;
 
         let started = Instant::now();
-        let (step, scores) =
-            self.session
-                .select_categorical_with_logprobs(logits, temperature, uniform)?;
+        let (step, scores) = select(&mut self.session)?;
         self.sampling_ms
             .push(started.elapsed().as_secs_f64() * 1000.0);
         let token_id = match step {

@@ -19,6 +19,7 @@ use crate::{
     },
     generation_routes,
     http_transport::Connection,
+    qwen_forward::SamplerId,
 };
 
 /// One `POST /v1/responses` body. Unknown fields are rejected so a control
@@ -53,6 +54,9 @@ pub(crate) struct Request {
     /// Not part of the `OpenAI` Responses schema; vLLM and llama.cpp accept it.
     #[serde(default)]
     seed: Option<u64>,
+    /// Metallix extension: "icdf-v1" or "race-v2", the seeded sampler.
+    #[serde(default)]
+    metallix_sampler: Option<SamplerId>,
     /// Metallix extension, as in vLLM: generate past end-of-turn up to the
     /// output limit, for equal-length benchmark runs.
     #[serde(default)]
@@ -327,6 +331,7 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
             top_p: request.top_p,
             top_k: None,
             seed: request.seed,
+            sampler: request.metallix_sampler,
         },
         top_logprobs: (logprobs || request.top_logprobs.is_some())
             .then(|| request.top_logprobs.unwrap_or(0)),
@@ -1285,7 +1290,8 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: Some(0.9),
                 top_k: None,
-                seed: Some(7)
+                seed: Some(7),
+                sampler: None,
             }
         );
         assert_eq!(sampled.max_tokens, Some(4096));
@@ -1555,6 +1561,10 @@ mod tests {
             (0.6, 0.95, Some(20), Some(4))
         );
         assert_eq!(all.defaults_applied, ["temperature", "top_p", "top_k"]);
+        let race = resolve(json!({"seed":4,"metallix_sampler":"race-v2"}), qwen, false);
+        assert_eq!(race.sampler, Some(crate::qwen_forward::SamplerId::RaceV2));
+        assert_eq!(serde_json::to_value(&race).unwrap()["sampler"], "race-v2");
+        assert!(request_with(&json!({"metallix_sampler":"race-v3"})).is_err());
         assert_eq!(all.sampler, Some(crate::qwen_forward::SamplerId::IcdfV1));
         assert_eq!(serde_json::to_value(&all).unwrap()["sampler"], "icdf-v1");
         // Explicit fields win; top_k has no request field, so it still applies.
@@ -1895,7 +1905,8 @@ mod tests {
                         temperature: Some(0.5),
                         top_p: Some(0.8),
                         top_k: None,
-                        seed: Some(3)
+                        seed: Some(3),
+                        sampler: None,
                     },
                     Some(2),
                     false,

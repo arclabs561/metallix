@@ -55,6 +55,7 @@ fn seeded(temperature: Option<f64>, top_p: Option<f64>, top_k: Option<u32>) -> S
         top_p,
         top_k,
         seed: Some(7),
+        sampler: None,
     }
 }
 

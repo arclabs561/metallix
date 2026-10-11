@@ -310,6 +310,8 @@ pub(crate) struct SamplingRequest {
     /// Only the Messages protocol has a `top_k` field.
     pub(crate) top_k: Option<u32>,
     pub(crate) seed: Option<u64>,
+    /// Metallix extension; omitted means [`DEFAULT_SAMPLER`].
+    pub(crate) sampler: Option<SamplerId>,
 }
 
 /// Best-scoring rows a constrained `race-v2` GPU pick reads back; the
@@ -380,6 +382,7 @@ impl SamplingRequest {
         top_p: None,
         top_k: None,
         seed: None,
+        sampler: None,
     };
 
     /// Fills omitted fields from `defaults`. Under a grammar mask the default
@@ -424,7 +427,7 @@ impl SamplingRequest {
             top_p,
             top_k,
             seed: Some(self.seed.unwrap_or_else(fresh_seed)),
-            sampler: Some(SamplingConfiguration::SAMPLER),
+            sampler: Some(self.sampler.unwrap_or(DEFAULT_SAMPLER)),
             defaults_applied,
         }
     }
@@ -1900,7 +1903,10 @@ impl TokenPicker {
             top_p = self.applied.top_p,
             top_k = ?self.applied.top_k,
             sampler = self.applied.sampler.map_or("none", SamplerId::as_str),
-            rng_algorithm = if self.policy.is_some() { "ChaCha8Rng" } else { "none" },
+            rng_algorithm = match (&self.policy, self.applied.sampler) {
+                (Some(_), Some(sampler)) => sampler.rng_algorithm(),
+                _ => "none",
+            },
             commit_ordinal = "unavailable",
             legal_mass = "not_collected",
             outcome = Empty,
@@ -1922,13 +1928,13 @@ impl TokenPicker {
             defaults,
             request.json_schema.is_some() || tool_grammar.is_some(),
         );
-        let policy = applied.seed.map(|seed| {
+        let policy = applied.seed.zip(applied.sampler).map(|(seed, sampler)| {
             let configuration = SamplingConfiguration {
                 seed,
                 temperature: applied.temperature,
             };
             (
-                SamplingPolicy::new(configuration, vocabulary_size),
+                SamplingPolicy::with_sampler(configuration, sampler, vocabulary_size),
                 applied.top_p,
                 applied.top_k.and_then(|top_k| usize::try_from(top_k).ok()),
             )
@@ -2060,7 +2066,7 @@ impl TokenPicker {
                         top_k,
                         uniforms: (ahead..ahead + rows)
                             .map(|draw| policy.uniform_ahead(draw))
-                            .collect(),
+                            .collect::<Option<Vec<_>>>()?,
                     },
                     candidates: receipts.max(top_k_window(top_k, vocabulary_size)),
                 }
@@ -2349,7 +2355,7 @@ mod tests {
             },
         };
         let policy = &picker.policy.as_ref().unwrap().0;
-        let before = policy.uniform_ahead(0).to_bits();
+        let before = policy.uniform_ahead(0).map(f64::to_bits);
         let Some(qwen::forward::Qwen3PickRule {
             selection: qwen::forward::Qwen3Selection::TopKNucleus { uniforms, .. },
             ..
@@ -2357,9 +2363,11 @@ mod tests {
         else {
             panic!("a top_k turn has a sampling rule");
         };
-        let expected: Vec<f64> = (1..4).map(|draw| policy.uniform_ahead(draw)).collect();
+        let expected: Vec<f64> = (1..4)
+            .map(|draw| policy.uniform_ahead(draw).expect("icdf-v1 draws uniforms"))
+            .collect();
         assert_eq!(uniforms, expected);
-        assert_eq!(policy.uniform_ahead(0).to_bits(), before);
+        assert_eq!(policy.uniform_ahead(0).map(f64::to_bits), before);
     }
 
     fn sampling_observation_probe() -> (i32, i32, u64) {
@@ -2381,7 +2389,14 @@ mod tests {
                 defaults_applied: Vec::new(),
             },
         };
-        let next = |p: &super::TokenPicker| p.policy.as_ref().unwrap().0.uniform_ahead(0).to_bits();
+        let next = |p: &super::TokenPicker| {
+            p.policy
+                .as_ref()
+                .unwrap()
+                .0
+                .uniform_ahead(0)
+                .map(f64::to_bits)
+        };
         let before = next(&picker);
         assert!(picker.gpu_rule(2, 1, None, 4).is_some());
         assert_eq!(next(&picker), before);
@@ -2400,7 +2415,7 @@ mod tests {
             first,
             control.sample_nucleus(&logits, 0.9, Some(2)).unwrap()
         );
-        assert_eq!(next(&picker), control.uniform_ahead(0).to_bits());
+        assert_eq!(next(&picker), control.uniform_ahead(0).map(f64::to_bits));
         let candidates = qwen::forward::Qwen3RowCandidates {
             top: vec![(0, 2.0), (1, 1.0), (2, 0.0)],
             max_logit: 2.0,
@@ -2414,8 +2429,8 @@ mod tests {
             second,
             control.sample_nucleus(&logits, 0.9, Some(2)).unwrap()
         );
-        assert_eq!(next(&picker), control.uniform_ahead(0).to_bits());
-        let final_rng = next(&picker);
+        assert_eq!(next(&picker), control.uniform_ahead(0).map(f64::to_bits));
+        let final_rng = next(&picker).expect("icdf-v1 draws uniforms");
         picker.policy = None;
         picker.applied.temperature = 0.0;
         picker.applied.seed = None;

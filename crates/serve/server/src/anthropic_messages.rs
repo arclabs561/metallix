@@ -48,6 +48,10 @@ pub(crate) struct Request {
     top_p: Option<f64>,
     #[serde(default)]
     top_k: Option<u32>,
+    /// Metallix extension: "icdf-v1" or "race-v2", the seeded sampler. The
+    /// Messages API has no seed field, so each turn draws one and reports it.
+    #[serde(default)]
+    metallix_sampler: Option<crate::qwen_forward::SamplerId>,
     /// Metallix extension, as in vLLM: generate past end-of-turn up to the
     /// output limit, for equal-length benchmark runs.
     #[serde(default)]
@@ -216,6 +220,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
             top_p: request.top_p,
             top_k: request.top_k,
             seed: None,
+            sampler: request.metallix_sampler,
         },
         top_logprobs: None,
         enable_thinking,
@@ -862,11 +867,22 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: Some(0.9),
                 top_k: Some(40),
-                seed: None
+                seed: None,
+                sampler: None,
             }
         );
 
         let mapped = |extra: Value| prepare_body(&with(&extra)).unwrap().controls;
+        assert_eq!(
+            mapped(json!({"metallix_sampler":"race-v2"}))
+                .sampling
+                .sampler,
+            Some(crate::qwen_forward::SamplerId::RaceV2)
+        );
+        let rejected = prepare_body(&with(&json!({"metallix_sampler":"race-v3"})))
+            .err()
+            .expect("unknown samplers are rejected");
+        assert_eq!(rejected["error"]["type"], "invalid_request_error");
         assert!(!mapped(json!({"thinking":{"type":"disabled"}})).enable_thinking);
         assert!(mapped(json!({"thinking":{"type":"adaptive"}})).enable_thinking);
         // Effort reaches the template only with thinking on.

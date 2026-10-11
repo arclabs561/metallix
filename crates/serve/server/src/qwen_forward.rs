@@ -99,18 +99,31 @@ pub(crate) struct ScheduleVerificationConfig {
 
 /// Which seeded sampler turns a seed into tokens. A seed only reproduces
 /// output under the sampler that produced it, so receipts name it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub(crate) enum SamplerId {
     /// One `ChaCha8Rng` uniform per committed token, inverse CDF over the
     /// legal rows in token-ID order with f64 cumulative weights.
     #[serde(rename = "icdf-v1")]
     IcdfV1,
+    /// Gumbel-max over the legal rows with Philox noise keyed by the seed,
+    /// the generated position and the row (`engine::sampling::race`).
+    #[serde(rename = "race-v2")]
+    RaceV2,
 }
 
 impl SamplerId {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::IcdfV1 => "icdf-v1",
+            Self::RaceV2 => "race-v2",
+        }
+    }
+
+    /// The random generator behind the sampler, for traces.
+    pub(crate) const fn rng_algorithm(self) -> &'static str {
+        match self {
+            Self::IcdfV1 => "ChaCha8Rng",
+            Self::RaceV2 => "Philox4x32-10",
         }
     }
 }
@@ -123,7 +136,7 @@ pub(crate) struct SamplingConfiguration {
 }
 
 impl SamplingConfiguration {
-    /// The only sampler this policy implements.
+    /// The sampler `report` describes, the one the CLI diagnostic uses.
     pub(crate) const SAMPLER: SamplerId = SamplerId::IcdfV1;
 
     fn report(self) -> serde_json::Value {
@@ -141,15 +154,55 @@ impl SamplingConfiguration {
 
 pub(crate) struct SamplingPolicy {
     configuration: SamplingConfiguration,
-    rng: ChaCha8Rng,
+    entropy: Entropy,
     legal_mask: Vec<bool>,
+}
+
+/// Where a policy's randomness comes from; each variant is one sampler.
+#[derive(Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one per request, and a draw clones whichever variant it holds"
+)]
+enum Entropy {
+    /// `icdf-v1`: the stream, advanced once per committed draw.
+    Stream(ChaCha8Rng),
+    /// `race-v2`: the key and the generated position of the next draw.
+    Race { key: RaceKey, position: u32 },
 }
 
 impl SamplingPolicy {
     pub(crate) fn new(configuration: SamplingConfiguration, vocabulary_size: usize) -> Self {
+        Self::with_sampler(configuration, SamplerId::IcdfV1, vocabulary_size)
+    }
+
+    /// The `icdf-v1` stream, for tests that check how it advances.
+    #[cfg(test)]
+    fn stream(&mut self) -> &mut ChaCha8Rng {
+        match &mut self.entropy {
+            Entropy::Stream(rng) => rng,
+            Entropy::Race { .. } => panic!("race-v2 has no stream"),
+        }
+    }
+
+    pub(crate) fn with_sampler(
+        configuration: SamplingConfiguration,
+        sampler: SamplerId,
+        vocabulary_size: usize,
+    ) -> Self {
+        let entropy = match sampler {
+            SamplerId::IcdfV1 => Entropy::Stream(ChaCha8Rng::seed_from_u64(configuration.seed)),
+            SamplerId::RaceV2 => Entropy::Race {
+                key: RaceKey {
+                    seed: configuration.seed,
+                    choice: 0,
+                },
+                position: 0,
+            },
+        };
         Self {
             configuration,
-            rng: ChaCha8Rng::seed_from_u64(configuration.seed),
+            entropy,
             legal_mask: vec![true; vocabulary_size],
         }
     }
@@ -171,13 +224,25 @@ impl SamplingPolicy {
         legal_mask: &[bool],
         logprobs: bool,
     ) -> Result<(i32, Option<serde_json::Value>), String> {
-        // Advance a cloned stream first, committing it only after the sampler
-        // accepts the logits. Invalid model output must not make a replay drift.
-        let mut candidate_rng = self.rng.clone();
-        let uniform = unit_uniform(candidate_rng.next_u64());
-        let sample =
-            sample_categorical(logits, legal_mask, self.configuration.temperature, uniform)
-                .map_err(|error| error.to_string())?;
+        // Advance a copy of the entropy first, committing it only after the
+        // sampler accepts the logits. Invalid model output must not make a
+        // replay drift.
+        let temperature = self.configuration.temperature;
+        let mut entropy = self.entropy.clone();
+        let sample = match &mut entropy {
+            Entropy::Stream(rng) => {
+                let uniform = unit_uniform(rng.next_u64());
+                sample_categorical(logits, legal_mask, temperature, uniform)
+            }
+            Entropy::Race { key, position } => {
+                let sample = sample_race(logits, legal_mask, temperature, *key, *position);
+                *position = position
+                    .checked_add(1)
+                    .ok_or("generated position overflow")?;
+                sample
+            }
+        }
+        .map_err(|error| error.to_string())?;
         let token = i32::try_from(sample.token_id).map_err(|error| error.to_string())?;
         let scores = if logprobs {
             Some(json!({
@@ -187,7 +252,7 @@ impl SamplingPolicy {
         } else {
             None
         };
-        self.rng = candidate_rng;
+        self.entropy = entropy;
         Ok((token, scores))
     }
 
@@ -213,13 +278,17 @@ impl SamplingPolicy {
     }
 
     /// The variate the draw `ahead` draws after the next one will use; zero
-    /// is the next draw's. Every committed draw consumes exactly one.
-    pub(crate) fn uniform_ahead(&self, ahead: usize) -> f64 {
-        let mut rng = self.rng.clone();
+    /// is the next draw's. Every committed draw consumes exactly one. `None`
+    /// for a sampler that draws no uniforms.
+    pub(crate) fn uniform_ahead(&self, ahead: usize) -> Option<f64> {
+        let Entropy::Stream(rng) = &self.entropy else {
+            return None;
+        };
+        let mut rng = rng.clone();
         for _ in 0..ahead {
             rng.next_u64();
         }
-        unit_uniform(rng.next_u64())
+        Some(unit_uniform(rng.next_u64()))
     }
 
     /// The race key and the generated position of the draw `ahead` draws
@@ -338,7 +407,8 @@ impl SamplingPolicy {
         top_p: f64,
         top_k: usize,
     ) -> Result<Option<i32>, String> {
-        if !candidates.settles_head(top_k) {
+        // The compact row renumbers tokens, and race noise is keyed by token.
+        if !matches!(self.entropy, Entropy::Stream(_)) || !candidates.settles_head(top_k) {
             return Ok(None);
         }
         let mut by_id = candidates.top.clone();
@@ -367,17 +437,25 @@ impl SamplingPolicy {
         // `ConstraintRun` owns grammar-state commit. Keep the corresponding
         // entropy transition private until it reports the same successful draw.
         let checkpoint = constraint.checkpoint();
-        let mut candidate_rng = self.rng.clone();
-        let uniform = unit_uniform(candidate_rng.next_u64());
-        let sampled = constraint.sample_categorical(
-            logits,
-            self.configuration.temperature,
-            uniform,
-            logprobs,
-        );
+        let temperature = self.configuration.temperature;
+        let mut entropy = self.entropy.clone();
+        let sampled = match &mut entropy {
+            Entropy::Stream(rng) => {
+                let uniform = unit_uniform(rng.next_u64());
+                constraint.sample_categorical(logits, temperature, uniform, logprobs)
+            }
+            Entropy::Race { key, position } => {
+                let sampled =
+                    constraint.sample_race(logits, temperature, *key, *position, logprobs);
+                *position = position
+                    .checked_add(1)
+                    .ok_or("generated position overflow")?;
+                sampled
+            }
+        };
         match sampled {
             Ok(sampled) => {
-                self.rng = candidate_rng;
+                self.entropy = entropy;
                 Ok(sampled)
             }
             Err(error) => {
@@ -2170,7 +2248,7 @@ mod tests {
 
         let logits = [0.0, 0.0, -20.0];
         let expected_word = expected_rng.next_u64();
-        assert_eq!(policy.rng.clone().next_u64(), expected_word);
+        assert_eq!(policy.stream().clone().next_u64(), expected_word);
         let expected =
             independently_enumerated_draw(&logits, configuration.temperature, expected_word);
         let actual = policy
@@ -2290,7 +2368,7 @@ mod tests {
             assert_eq!(token.0, i32::try_from(token_id).expect("small test token"));
             assert_eq!(constraint.decoded_bytes(), expected.as_bytes());
         }
-        let mut expected_rng = policy.rng.clone();
+        let mut expected_rng = policy.stream().clone();
         assert!(
             policy
                 .sample_constrained(&mut constraint, &forced_constraint_logits(9), false)
@@ -2298,7 +2376,7 @@ mod tests {
         );
         assert_eq!(constraint.decoded_bytes(), b"tru");
         assert!(!constraint.is_complete());
-        assert_eq!(policy.rng.next_u64(), expected_rng.next_u64());
+        assert_eq!(policy.stream().next_u64(), expected_rng.next_u64());
     }
 
     #[test]
@@ -2520,8 +2598,8 @@ mod tests {
             }
             // Both consumed one draw per token.
             assert_eq!(
-                whole.uniform_ahead(0).to_bits(),
-                compact.uniform_ahead(0).to_bits()
+                whole.uniform_ahead(0).map(f64::to_bits),
+                compact.uniform_ahead(0).map(f64::to_bits)
             );
         }
     }
@@ -2589,8 +2667,11 @@ mod tests {
             policy.sample_top_k_candidates(&candidates, 1.0, 3).unwrap(),
             None
         );
-        assert_eq!(policy.uniform_ahead(0).to_bits(), before.to_bits());
-        assert_eq!(policy.uniform_ahead(1).to_bits(), {
+        assert_eq!(
+            policy.uniform_ahead(0).map(f64::to_bits),
+            before.map(f64::to_bits)
+        );
+        assert_eq!(policy.uniform_ahead(1).map(f64::to_bits), {
             let mut probe = super::SamplingPolicy::new(
                 super::SamplingConfiguration {
                     seed: 3,
@@ -2599,7 +2680,7 @@ mod tests {
                 logits.len(),
             );
             probe.sample(&logits, false).unwrap();
-            probe.uniform_ahead(0).to_bits()
+            probe.uniform_ahead(0).map(f64::to_bits)
         });
     }
 }

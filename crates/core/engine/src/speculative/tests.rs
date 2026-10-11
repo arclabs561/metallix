@@ -6,7 +6,10 @@ use super::{
     StepOutcome, Verdict, VerifyCost, accept_or_resample, accept_verified, greedy_speculative_step,
     speculative_step,
 };
-use crate::sampling::sample_categorical;
+use crate::sampling::{
+    race::{RaceKey, sample_race},
+    sample_categorical,
+};
 
 const VOCAB: usize = 3;
 const PROMPT: [i32; 3] = [0, 2, 1];
@@ -315,6 +318,72 @@ fn pre_drawn_row_uniforms_reproduce_plain_sampling() {
             assert!(rejected > 0, "seed 0 rejects mid-draft at least once");
         }
     }
+}
+
+/// A `race-v2` pick at the next generated position, advancing it.
+fn race(logits: &[f32], key: RaceKey, position: &mut u32) -> i32 {
+    let legal = vec![true; logits.len()];
+    let sampled = sample_race(logits, &legal, 0.9, key, *position).expect("valid toy row");
+    *position += 1;
+    i32::try_from(sampled.token_id).expect("small vocabulary")
+}
+
+/// A drafter that samples its own, different model with the target's keyed
+/// noise at the positions it drafts for (Gumbel coupling).
+fn coupled_draft(key: RaceKey) -> impl FnMut(&[i32], usize) -> Vec<i32> {
+    move |history, limit| {
+        let mut context = history.to_vec();
+        let mut position = u32::try_from(history.len() - PROMPT.len()).expect("short output");
+        let mut draft = Vec::new();
+        for _ in 0..limit.min(3) {
+            let logits: Vec<f32> = toy_logits(&context)
+                .iter()
+                .zip([0.3_f32, -0.2, 0.1])
+                .map(|(logit, shift)| logit + shift)
+                .collect();
+            let token = race(&logits, key, &mut position);
+            draft.push(token);
+            context.push(token);
+        }
+        draft
+    }
+}
+
+#[test]
+fn race_sampling_reproduces_plain_sampling_with_any_drafter() {
+    // The token at a position depends only on (seed, position, row), so
+    // neither a point-mass drafter nor a sampling drafter changes the output;
+    // the coupled drafter is accepted on over 80% of drafts (about 95% in a
+    // numpy model of this toy; an independently keyed drafter, about 57%).
+    let (mut coupled_accepted, mut coupled_drafted) = (0, 0);
+    for seed in 0..20 {
+        let key = RaceKey { seed, choice: 0 };
+        let mut plain_position = 0;
+        let expected = decode_plain(24, &mut |row| race(row, key, &mut plain_position));
+
+        let mut position = 0;
+        let mut draft_rng = Rng(seed ^ 0xABCD);
+        let (output, _, _) = decode_speculative(
+            24,
+            &mut |row| race(row, key, &mut position),
+            &mut random_draft(&mut draft_rng),
+        );
+        assert_eq!(output, expected, "random drafts, seed {seed}");
+
+        let mut position = 0;
+        let (output, stats, _) = decode_speculative(
+            24,
+            &mut |row| race(row, key, &mut position),
+            &mut coupled_draft(key),
+        );
+        assert_eq!(output, expected, "coupled drafts, seed {seed}");
+        coupled_accepted += stats.accepted_tokens;
+        coupled_drafted += stats.drafted_tokens;
+    }
+    assert!(
+        coupled_accepted * 5 > coupled_drafted * 4,
+        "coupled drafts accepted {coupled_accepted} of {coupled_drafted}"
+    );
 }
 
 /// Exact probability of `sequence` as the first tokens after `PROMPT`.

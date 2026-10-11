@@ -2256,6 +2256,7 @@ mod tests {
             top_p: Some(1.0),
             top_k: None,
             seed: Some(3),
+            sampler: None,
         };
         let outputs = generate_all(&harness.client, &prompts, sampled);
         let observed = Arc::clone(&harness.observed);

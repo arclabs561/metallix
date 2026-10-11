@@ -17,6 +17,7 @@ use crate::{
         ChatToolCall, GenerationControls, SamplingRequest,
     },
     http_transport::Connection,
+    qwen_forward::SamplerId,
     responses::{
         AssistantTurn, assistant_turn, echo_request_id, json_response, logprobs_value,
         note_ignored_template_kwargs, record_usage, thinking_and_template_kwargs,
@@ -54,6 +55,9 @@ pub(crate) struct Request {
     top_p: Option<f64>,
     #[serde(default)]
     seed: Option<u64>,
+    /// Metallix extension: "icdf-v1" or "race-v2", the seeded sampler.
+    #[serde(default)]
+    metallix_sampler: Option<SamplerId>,
     /// Metallix extension, as in vLLM: generate past end-of-turn up to the
     /// output limit, for equal-length benchmark runs.
     #[serde(default)]
@@ -262,6 +266,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
             top_p: request.top_p,
             top_k: None,
             seed: request.seed,
+            sampler: request.metallix_sampler,
         },
         top_logprobs,
         enable_thinking,
@@ -739,6 +744,18 @@ mod tests {
         ] {
             assert!(prepare_body(&with(&extra)).is_err(), "accepted {extra}");
         }
+        let sampler = prepare_body(&with(&json!({"metallix_sampler":"race-v3"})))
+            .err()
+            .expect("unknown samplers are rejected");
+        assert_eq!(sampler["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            prepare_body(&with(&json!({"metallix_sampler":"race-v2"})))
+                .unwrap()
+                .controls
+                .sampling
+                .sampler,
+            Some(SamplerId::RaceV2)
+        );
         let error = prepare_body(&with(&json!({"frobnicate":1}))).err().unwrap();
         assert_eq!(error["error"]["type"], "invalid_request_error");
         assert!(
@@ -863,7 +880,8 @@ mod tests {
                 temperature: Some(0.7),
                 top_p: Some(0.9),
                 top_k: None,
-                seed: Some(3)
+                seed: Some(3),
+                sampler: None,
             }
         );
         assert_eq!(controls.top_logprobs, None);
