@@ -453,6 +453,14 @@ fn usage(generated: &ChatGeneration) -> Value {
 }
 
 /// The `metallix` block: the sampling policy used and the turn's timings.
+/// `system_fingerprint`: changes whenever a seeded request that names no
+/// sampler would get different tokens, which is what `OpenAI` documents the
+/// field for. The sampler a response actually used is in `metallix.sampling`.
+const SYSTEM_FINGERPRINT: &str = match crate::chat_generation::DEFAULT_SAMPLER {
+    SamplerId::IcdfV1 => "fp_metallix_icdf-v1",
+    SamplerId::RaceV2 => "fp_metallix_race-v2",
+};
+
 fn metallix(generated: &ChatGeneration) -> Value {
     json!({"sampling":generated.sampling,"metrics":generated.metrics})
 }
@@ -495,7 +503,7 @@ fn completion_value(
         Value::Null
     };
     Ok(
-        json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion","created":created(),"model":prepared.request.model,"choices":[{"index":0,"message":message,"logprobs":logprobs,"finish_reason":finish_reason(&turn)}],"usage":usage(generated),"metallix":metallix(generated)}),
+        json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion","created":created(),"model":prepared.request.model,"system_fingerprint":SYSTEM_FINGERPRINT,"choices":[{"index":0,"message":message,"logprobs":logprobs,"finish_reason":finish_reason(&turn)}],"usage":usage(generated),"metallix":metallix(generated)}),
     )
 }
 
@@ -576,7 +584,7 @@ fn stream(
         .is_some_and(|options| options.include_usage);
     let created = created();
     let chunk = |delta: Value, finish_reason: Value, logprobs: Value| {
-        let mut chunk = json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","created":created,"model":prepared.request.model,"choices":[{"index":0,"delta":delta,"logprobs":logprobs,"finish_reason":finish_reason}]});
+        let mut chunk = json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","created":created,"model":prepared.request.model,"system_fingerprint":SYSTEM_FINGERPRINT,"choices":[{"index":0,"delta":delta,"logprobs":logprobs,"finish_reason":finish_reason}]});
         if include_usage {
             chunk["usage"] = Value::Null;
         }
@@ -670,7 +678,7 @@ fn stream(
         &chunk(json!({}), json!(finish_reason(&turn)), logprobs),
     )?;
     if include_usage {
-        let mut last = json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","created":created,"model":prepared.request.model,"choices":[],"usage":usage(&generated),"metallix":metallix(&generated)});
+        let mut last = json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","created":created,"model":prepared.request.model,"system_fingerprint":SYSTEM_FINGERPRINT,"choices":[],"usage":usage(&generated),"metallix":metallix(&generated)});
         note_ignored_template_kwargs(&mut last, &prepared.controls, &*session);
         sse.event(None, &last)?;
     }
@@ -992,6 +1000,7 @@ mod tests {
         let (status, body) = json_body(&run(&with(&json!({"logprobs":true})), &mut backend));
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["system_fingerprint"], "fp_metallix_icdf-v1");
         assert_eq!(body["id"], "chatcmpl-t");
         assert_eq!(body["choices"][0]["message"]["content"], "Hello there");
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
@@ -1028,7 +1037,8 @@ mod tests {
             .collect();
         assert!(
             data.iter()
-                .all(|chunk| chunk["object"] == "chat.completion.chunk")
+                .all(|chunk| chunk["object"] == "chat.completion.chunk"
+                    && chunk["system_fingerprint"] == "fp_metallix_icdf-v1")
         );
         assert_eq!(data[0]["choices"][0]["delta"]["role"], "assistant");
         let call = data
