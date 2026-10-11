@@ -169,11 +169,10 @@ check, not generation or Codex compatibility evidence.
 
 Open goals at this checkpoint:
 
-- 1M-token context. The memory limit seen at 128K tokens was traced to MLX's
-  buffer cache keeping freed buffers; with the cache capped, a 128K-token
-  prompt prefills in about 3 GiB of active memory and matches the reference
-  output. Every `mx` process, served models included, already applies this
-  cap, so the remaining 1M work is speed and the longer needle tests.
+- 1M-token context. `mx` caps MLX's allocator cache, served models included,
+  to bound retention of freed buffers. This does not qualify 1M-token
+  execution: numerical agreement, memory use, speed and longer needle tests
+  remain gates for each model and context length.
 - Serving a model larger than RAM, once the expert pager passes its gate.
 - DeepSeek-V4.1 generation: multi-token prefill steps, indexer scoring past
   512 compressed positions, the generate loop and a fully on-device path.
