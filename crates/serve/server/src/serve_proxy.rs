@@ -58,7 +58,12 @@ const LISTENING: &str = "mx listening on http://";
 pub(crate) struct ChildSettings {
     /// Explicit context, or `None` for each child's largest fitting one.
     pub(crate) context_tokens: Option<u32>,
-    pub(crate) kv_budget_mib: u32,
+    /// Explicit resident K/V ceiling, or `None` for each child's default.
+    pub(crate) kv_budget_mib: Option<u32>,
+    /// Explicit batched pool size, or `None` for each child's default.
+    pub(crate) kv_pool_mib: Option<u32>,
+    /// Explicit wired K/V cap, or `None` for each child's default.
+    pub(crate) wired_kv_mib: Option<u32>,
     pub(crate) prefix_cache_mib: u32,
     pub(crate) max_num_seqs: u32,
     pub(crate) prefill_chunk_tokens: u32,
@@ -80,7 +85,9 @@ impl ChildSettings {
     pub(crate) const fn for_tests() -> Self {
         Self {
             context_tokens: Some(4096),
-            kv_budget_mib: 64,
+            kv_budget_mib: Some(64),
+            kv_pool_mib: None,
+            wired_kv_mib: None,
             prefix_cache_mib: 0,
             max_num_seqs: 1,
             prefill_chunk_tokens: 2048,
@@ -418,7 +425,16 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
                 .into_iter()
                 .flatten(),
         )
-        .args(["--kv-budget-mib", &settings.kv_budget_mib.to_string()])
+        .args(
+            [
+                ("--kv-budget-mib", settings.kv_budget_mib),
+                ("--kv-pool-mib", settings.kv_pool_mib),
+                ("--wired-kv-mib", settings.wired_kv_mib),
+            ]
+            .into_iter()
+            .filter_map(|(flag, mib)| mib.map(|mib| [flag.to_owned(), mib.to_string()]))
+            .flatten(),
+        )
         .args(["--prefix-cache-mib", &settings.prefix_cache_mib.to_string()])
         .args(["--max-num-seqs", &settings.max_num_seqs.to_string()])
         .args([

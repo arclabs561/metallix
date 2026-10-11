@@ -154,7 +154,8 @@ use inspect::{
     inspect_v41_embedding_row, inspect_v41_index, inspect_v41_shard,
 };
 
-/// `mx serve`'s paged K/V pool when `--kv-budget-mib` is omitted: 4096 MiB,
+/// `mx serve`'s batched K/V pool when `--kv-pool-mib` is omitted, and the
+/// floor of the resident K/V ceiling: 4096 MiB,
 /// or a quarter of physical memory when that is smaller. Each generating
 /// child allocates its whole pool at load, so a small Mac must not be handed
 /// a fixed 4 GiB reservation. If physical memory cannot be read, 512 MiB.
@@ -200,6 +201,64 @@ pub(crate) fn parse_kv_budget_mib(value: &str) -> Result<u32, String> {
         }
     }
     Ok(mib)
+}
+
+/// Bytes of a checkpoint's weight files (`*.safetensors`, `*.gguf`), the
+/// resident memory the K/V ceiling leaves room for. Zero if unreadable.
+#[cfg(feature = "metal")]
+fn checkpoint_weight_bytes(model: &std::path::Path) -> u64 {
+    std::fs::read_dir(model).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "safetensors" || extension == "gguf")
+            })
+            // `metadata` follows the Hugging Face cache's symlinks to blobs.
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .map(|metadata| metadata.len())
+            .sum()
+    })
+}
+
+/// The resident K/V ceiling when `--kv-budget-mib` is omitted: half of
+/// physical memory less the checkpoint's weights, never below `floor_mib`
+/// (and `floor_mib` when memory cannot be read). Resident K/V grows in tiers
+/// as a sequence grows, so a high ceiling reserves nothing up front; it only
+/// lets an omitted `--context-tokens` resolve to the model's own limit.
+#[cfg(feature = "metal")]
+fn resident_kv_budget_mib(physical_bytes: Option<u64>, weight_bytes: u64, floor_mib: u32) -> u32 {
+    physical_bytes.map_or(floor_mib, |physical| {
+        u32::try_from((physical / 2).saturating_sub(weight_bytes) >> 20)
+            .unwrap_or(u32::MAX)
+            .max(floor_mib)
+    })
+}
+
+/// The K/V a server keeps wired when `--wired-kv-mib` is omitted: its
+/// resident budget, but never above `floor_mib` (the old 4096-or-RAM/4
+/// default). The larger resident ceiling stays pageable.
+#[cfg(feature = "metal")]
+const fn default_wired_kv_mib(kv_budget_mib: u32, floor_mib: u32) -> u32 {
+    if kv_budget_mib < floor_mib {
+        kv_budget_mib
+    } else {
+        floor_mib
+    }
+}
+
+/// `--kv-budget-mib`, or the resident default for `model`.
+#[cfg(feature = "metal")]
+fn resident_kv_budget_for(model: &std::path::Path, explicit: Option<u32>) -> u32 {
+    explicit.unwrap_or_else(|| {
+        resident_kv_budget_mib(
+            physical_memory_bytes(),
+            checkpoint_weight_bytes(model),
+            default_kv_budget_mib(),
+        )
+    })
 }
 
 #[cfg(feature = "metal")]
@@ -374,7 +433,10 @@ fn dispatch(cli: Cli) -> ExitCode {
             prompt,
             max_tokens,
             json,
-            resident_chat_limits(context_tokens, kv_budget_mib),
+            resident_chat_limits(
+                context_tokens,
+                resident_kv_budget_for(&model, kv_budget_mib),
+            ),
         ),
         #[cfg(feature = "metal")]
         Command::Agent {
@@ -392,7 +454,10 @@ fn dispatch(cli: Cli) -> ExitCode {
             prompt,
             max_tokens,
             max_turns,
-            resident_chat_limits(context_tokens, kv_budget_mib),
+            resident_chat_limits(
+                context_tokens,
+                resident_kv_budget_for(&model, kv_budget_mib),
+            ),
             json,
         ),
         #[cfg(feature = "metal")]
@@ -405,6 +470,8 @@ fn dispatch(cli: Cli) -> ExitCode {
             listen,
             context_tokens,
             kv_budget_mib,
+            kv_pool_mib,
+            wired_kv_mib,
             prefix_cache_mib,
             generation_timeout_ms,
             queue_depth,
@@ -413,22 +480,32 @@ fn dispatch(cli: Cli) -> ExitCode {
             prefill_chunk_tokens,
             prefill_target_ms,
         } => {
-            let kv_budget_mib = kv_budget_mib.unwrap_or_else(default_kv_budget_mib);
             if let Some(entry) = worker_entry {
-                return match serde_json::from_str(&entry) {
-                    Ok(entry) => serving::serve_child(
-                        entry,
-                        listen,
-                        resident_chat_limits(context_tokens, kv_budget_mib)
-                            .with_prefix_cache_mib(prefix_cache_mib),
-                        engine_loop::EngineLimits {
-                            max_num_seqs: max_num_seqs as usize,
-                            prefill_chunk_tokens: prefill_chunk_tokens as usize,
-                            prefill_target_ms,
-                        },
-                        Duration::from_millis(u64::from(generation_timeout_ms)),
-                        cli.gpu_capture.as_deref(),
-                    ),
+                return match serde_json::from_str::<serve_registry::ServedEntry>(&entry) {
+                    Ok(entry) => {
+                        let resident = resident_kv_budget_for(&entry.path, kv_budget_mib);
+                        let limits = resident_chat_limits(context_tokens, resident)
+                            .with_prefix_cache_mib(prefix_cache_mib)
+                            .with_wired_kv_mib(wired_kv_mib.unwrap_or_else(|| {
+                                default_wired_kv_mib(resident, default_kv_budget_mib())
+                            }));
+                        serving::serve_child(
+                            entry,
+                            listen,
+                            limits,
+                            engine_loop::EngineLimits {
+                                max_num_seqs: max_num_seqs as usize,
+                                prefill_chunk_tokens: prefill_chunk_tokens as usize,
+                                prefill_target_ms,
+                                pool_bytes: Some(
+                                    u64::from(kv_pool_mib.unwrap_or_else(default_kv_budget_mib))
+                                        << 20,
+                                ),
+                            },
+                            Duration::from_millis(u64::from(generation_timeout_ms)),
+                            cli.gpu_capture.as_deref(),
+                        )
+                    }
                     Err(error) => {
                         tracing::error!("mx serve: invalid worker entry: {error}");
                         ExitCode::FAILURE
@@ -442,6 +519,8 @@ fn dispatch(cli: Cli) -> ExitCode {
                     serve_proxy::ChildSettings {
                         context_tokens,
                         kv_budget_mib,
+                        kv_pool_mib,
+                        wired_kv_mib,
                         prefix_cache_mib,
                         max_num_seqs,
                         prefill_chunk_tokens,
@@ -1006,6 +1085,68 @@ mod tests {
                 chat_template: true,
                 ..
             } if prompt == "plain prompt"
+        ));
+    }
+
+    /// With the K/V ceiling defaulted from a 128 GB Mac's memory, Qwen3-0.6B
+    /// (BF16 weights, 1,503,300,328 bytes) resolves to its model limit of
+    /// 40,960 tokens; the old 4 GiB default stopped near 37K. Without
+    /// readable memory, or with weights larger than half of it, the floor
+    /// holds.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn resident_default_reaches_the_model_limit_on_a_large_mac() {
+        const QWEN3_06B: &str = r#"{"model_type":"qwen3","num_hidden_layers":28,
+            "hidden_size":1024,"intermediate_size":3072,"vocab_size":151936,
+            "num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,
+            "max_position_embeddings":40960,"rope_theta":1000000,"rms_norm_eps":1e-6,
+            "hidden_act":"silu","tie_word_embeddings":true}"#;
+        let config = qwen::forward::Qwen3ForwardConfig::parse(QWEN3_06B).expect("config");
+        let fit = |mib: u32| {
+            config
+                .resident_chat_capacity(
+                    u64::from(mib) << 20,
+                    qwen::forward::Qwen3FloatPrecision::BFloat16,
+                )
+                .expect("capacity")
+                .map_or(0, std::num::NonZeroUsize::get)
+        };
+        let budget = super::resident_kv_budget_mib(Some(128 << 30), 1_503_300_328, 4_096);
+        assert!(budget > 60_000, "{budget}");
+        assert_eq!(fit(budget), 40_960);
+        assert!(fit(4_096) < 40_960, "the old default stops short");
+        assert_eq!(super::resident_kv_budget_mib(None, 0, 4_096), 4_096);
+        assert_eq!(
+            super::resident_kv_budget_mib(Some(8 << 30), 6 << 30, 4_096),
+            4_096
+        );
+    }
+
+    /// The wired K/V cap stays at the old default however large the
+    /// resident ceiling grows; only `--wired-kv-mib` raises it.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn default_wired_cap_does_not_grow_with_the_kv_budget() {
+        for budget in [4_096, 64_000, 1_000_000] {
+            assert_eq!(super::default_wired_kv_mib(budget, 4_096), 4_096);
+            let limits = crate::chat_generation::ResidentChatLimits::from_mib(2_048, budget)
+                .with_wired_kv_mib(super::default_wired_kv_mib(budget, 4_096));
+            assert_eq!(limits.wired_kv_bytes(), 4_096 << 20);
+            assert_eq!(limits.kv_budget_bytes(), u64::from(budget) << 20);
+        }
+        // A smaller budget is wired whole, and an explicit cap raises it.
+        assert_eq!(super::default_wired_kv_mib(512, 4_096), 512);
+        let dedicated = crate::chat_generation::ResidentChatLimits::from_mib(2_048, 64_000)
+            .with_wired_kv_mib(32_000);
+        assert_eq!(dedicated.wired_kv_bytes(), 32_000 << 20);
+        let cli = Cli::try_parse_from(["mx", "serve", "--model", "m", "--wired-kv-mib", "8192"])
+            .expect("explicit wired cap");
+        assert!(matches!(
+            cli.command,
+            super::Command::Serve {
+                wired_kv_mib: Some(8_192),
+                ..
+            }
         ));
     }
 

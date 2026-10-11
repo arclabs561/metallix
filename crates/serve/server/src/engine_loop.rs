@@ -350,6 +350,9 @@ pub(crate) struct EngineLimits {
     /// each iteration's chunks get what the last decode step left of it, by
     /// [`TextDecoder::prefill_ms`], at least one block.
     pub(crate) prefill_target_ms: u32,
+    /// Bytes of the paged K/V pool, allocated whole at load (`--kv-pool-mib`),
+    /// or `None` for the resident K/V budget.
+    pub(crate) pool_bytes: Option<u64>,
 }
 
 impl EngineLimits {
@@ -377,6 +380,7 @@ impl EngineLimits {
             max_num_seqs: 4,
             prefill_chunk_tokens: 1024,
             prefill_target_ms: 50,
+            pool_bytes: None,
         }
     }
 }

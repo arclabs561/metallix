@@ -149,9 +149,12 @@ pub(crate) enum Command {
         /// Validated against the model and K/V budget before loading weights.
         #[arg(long, value_parser = parse_context_tokens)]
         context_tokens: Option<u32>,
-        /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
-        #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
-        kv_budget_mib: u32,
+        /// Resident K/V ceiling in MiB. K/V grows in tiers as a sequence
+        /// grows, so this bounds rather than reserves memory. Defaults to half
+        /// of physical memory less the checkpoint's weight files, at least
+        /// the smaller of 4096 and a quarter of physical memory.
+        #[arg(long, value_parser = crate::parse_kv_budget_mib)]
+        kv_budget_mib: Option<u32>,
         /// Emit a structured receipt for a single prompt.
         #[arg(long, requires = "prompt")]
         json: bool,
@@ -173,9 +176,12 @@ pub(crate) enum Command {
         /// Validated against the model and K/V budget before loading weights.
         #[arg(long, value_parser = parse_context_tokens)]
         context_tokens: Option<u32>,
-        /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
-        #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
-        kv_budget_mib: u32,
+        /// Resident K/V ceiling in MiB. K/V grows in tiers as a sequence
+        /// grows, so this bounds rather than reserves memory. Defaults to half
+        /// of physical memory less the checkpoint's weight files, at least
+        /// the smaller of 4096 and a quarter of physical memory.
+        #[arg(long, value_parser = crate::parse_kv_budget_mib)]
+        kv_budget_mib: Option<u32>,
         /// Emit a structured execution receipt. Task success is assessed by the caller.
         #[arg(long)]
         json: bool,
@@ -209,11 +215,26 @@ pub(crate) enum Command {
         /// Validated against the model and K/V budget before loading weights.
         #[arg(long, value_parser = parse_context_tokens)]
         context_tokens: Option<u32>,
-        /// Paged K/V pool per generating model, in MiB, allocated when the
-        /// model loads. Defaults to the smaller of 4096 and a quarter of
-        /// physical memory.
+        /// Resident K/V ceiling per model in MiB, which also sizes the
+        /// largest context when `--context-tokens` is omitted. Resident K/V
+        /// grows in tiers, so this bounds rather than reserves memory.
+        /// Defaults to half of physical memory less the model's weight files,
+        /// at least the smaller of 4096 and a quarter of physical memory.
         #[arg(long, value_parser = crate::parse_kv_budget_mib)]
         kv_budget_mib: Option<u32>,
+        /// Paged K/V pool per generating model for batched decoding
+        /// (`--max-num-seqs` above 1), in MiB, allocated whole when the model
+        /// loads. Defaults to the smaller of 4096 and a quarter of physical
+        /// memory.
+        #[arg(long, value_parser = crate::parse_kv_budget_mib)]
+        kv_pool_mib: Option<u32>,
+        /// Resident K/V per model kept wired (unpageable) between requests,
+        /// in MiB. Defaults to the smaller of `--kv-budget-mib` and the
+        /// smaller of 4096 and a quarter of physical memory, since wired
+        /// memory cannot be paged and several servers may share the machine;
+        /// raise it for a dedicated single-server deployment.
+        #[arg(long, value_parser = crate::parse_kv_budget_mib)]
+        wired_kv_mib: Option<u32>,
         /// Per-model budget in MiB for prompt-prefix K/V reused across requests
         /// (shared system and tool preambles, earlier turns); separate from
         /// `--kv-budget-mib`. 0 disables reuse.

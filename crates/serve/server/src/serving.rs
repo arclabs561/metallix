@@ -208,7 +208,10 @@ fn serve_engine(
     let built = seed.and_then(|seed| {
         let pool = seed
             .weights
-            .pool_for_budget(seed.kv_budget_bytes, BlockTokens::DEFAULT)
+            .pool_for_budget(
+                limits.pool_bytes.unwrap_or(seed.kv_budget_bytes),
+                BlockTokens::DEFAULT,
+            )
             .map_err(|error| format!("KV pool: {error}"))?;
         Ok((seed, pool))
     });
@@ -614,7 +617,7 @@ fn serve_inner(
                 drop(entered);
                 drop(load);
                 let planned_bytes = limits
-                    .kv_budget_bytes()
+                    .wired_kv_bytes()
                     .saturating_add(limits.prefix_cache_bytes());
                 serve_loaded(
                     worker.as_mut(),
@@ -2104,6 +2107,7 @@ stream.close()
                     max_num_seqs: 1,
                     prefill_chunk_tokens: 1024,
                     prefill_target_ms: 50,
+                    pool_bytes: None,
                 },
                 0,
             );

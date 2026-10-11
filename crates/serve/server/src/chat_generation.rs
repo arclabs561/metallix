@@ -93,6 +93,9 @@ pub(crate) struct ResidentChatLimits {
     context_tokens: Option<usize>,
     kv_budget_bytes: u64,
     prefix_cache_bytes: u64,
+    /// K/V bytes a server wires (keeps unpageable), or `None` for the whole
+    /// K/V budget. Resident K/V past it stays allocatable but pageable.
+    wired_kv_bytes: Option<u64>,
 }
 
 impl ResidentChatLimits {
@@ -102,6 +105,27 @@ impl ResidentChatLimits {
             context_tokens: Some(context_tokens),
             kv_budget_bytes: (kv_budget_mib as u64) * MIB_BYTES,
             prefix_cache_bytes: (DEFAULT_PREFIX_CACHE_MIB as u64) * MIB_BYTES,
+            wired_kv_bytes: None,
+        }
+    }
+
+    /// Caps the K/V a server wires at `wired_kv_mib`, below a K/V budget
+    /// that may be far larger: wired memory cannot be paged, and several
+    /// model processes often share one machine.
+    #[must_use]
+    pub(crate) const fn with_wired_kv_mib(self, wired_kv_mib: u32) -> Self {
+        Self {
+            wired_kv_bytes: Some((wired_kv_mib as u64) * MIB_BYTES),
+            ..self
+        }
+    }
+
+    /// K/V bytes to wire: the cap, never more than the K/V budget.
+    #[must_use]
+    pub(crate) const fn wired_kv_bytes(self) -> u64 {
+        match self.wired_kv_bytes {
+            Some(bytes) if bytes < self.kv_budget_bytes => bytes,
+            _ => self.kv_budget_bytes,
         }
     }
 
