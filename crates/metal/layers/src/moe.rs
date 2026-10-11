@@ -4,9 +4,9 @@
 //! them (an expert pager reads `chosen` back to the host there) without
 //! paying for an evaluation it does not use:
 //!
-//! 1. [`route`] turns router logits `[.., E]`, which the model computes with
+//! 1. `route` turns router logits `[.., E]`, which the model computes with
 //!    its own input transform, into the chosen experts and their weights.
-//! 2. [`routed_experts`] runs each chosen expert's gated MLP on the expert
+//! 2. `routed_experts` runs each chosen expert's gated MLP on the expert
 //!    input and returns the weighted sum.
 //!
 //! Numerics follow transformers: softmax over all experts in f32, top-k,
@@ -22,7 +22,7 @@ mod graph;
 #[cfg(feature = "metal")]
 pub use graph::{AffineMatrix, Experts, Matrix, Routing, route, routed_experts};
 
-/// Selections (tokens times `top_k`) at which [`routed_experts`] sorts rows
+/// Selections (tokens times `top_k`) at which `routed_experts` sorts rows
 /// by expert, so each expert's weights are read once per call. mlx-lm uses
 /// the same threshold; MLX's sorted gather kernels round differently from
 /// the unsorted ones, so changing it is a measured change, not a tuning knob.
@@ -41,7 +41,7 @@ impl Router {
     ///
     /// `renormalize` divides the chosen probabilities by their sum.
     /// `per_expert_scale` multiplies each weight, after renormalization, by
-    /// a stored `[E]` scale (Gemma 4), which [`route`] then requires.
+    /// a stored `[E]` scale (Gemma 4), which `route` then requires.
     ///
     /// # Errors
     ///
