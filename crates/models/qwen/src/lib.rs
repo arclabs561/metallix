@@ -62,6 +62,8 @@ mod gpu_test_lock_tests {
     }
 }
 
+use std::num::NonZeroU32;
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -149,6 +151,8 @@ pub struct Qwen3TextContract {
     key_value_heads: u32,
     head_dim: u32,
     max_position_embeddings: u32,
+    intermediate_size: Option<NonZeroU32>,
+    tied_output_embedding: bool,
 }
 
 impl Qwen3TextContract {
@@ -208,6 +212,8 @@ impl Qwen3TextContract {
             key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             max_position_embeddings: config.max_position_embeddings,
+            intermediate_size: NonZeroU32::new(config.intermediate_size),
+            tied_output_embedding: config.tie_word_embeddings,
         })
     }
 
@@ -258,6 +264,23 @@ impl Qwen3TextContract {
     pub const fn max_position_embeddings(&self) -> u32 {
         self.max_position_embeddings
     }
+
+    /// Returns the inner width of each layer's gated MLP, or `None` when the
+    /// configuration omits it. This contract accepts such a configuration;
+    /// checkpoint inspection and the forward pass refuse it.
+    #[must_use]
+    pub const fn intermediate_size(&self) -> Option<NonZeroU32> {
+        self.intermediate_size
+    }
+
+    /// Whether logits are projected through the token embedding
+    /// (`tie_word_embeddings`) rather than a separate `lm_head.weight`. An
+    /// omitted flag means untied, the default of transformers' Qwen3, Qwen2 and
+    /// Llama configurations.
+    #[must_use]
+    pub const fn tied_output_embedding(&self) -> bool {
+        self.tied_output_embedding
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +303,10 @@ struct RawConfig {
     head_dim: u32,
     #[serde(default)]
     max_position_embeddings: u32,
+    #[serde(default)]
+    intermediate_size: u32,
+    #[serde(default)]
+    tie_word_embeddings: bool,
 }
 
 /// An invalid or unsupported Qwen3 text-model layout.
@@ -345,6 +372,22 @@ mod tests {
         assert_eq!(contract.max_position_embeddings(), 40_960);
         assert_eq!(contract.family(), DecoderFamily::Qwen3);
         assert!(contract.family().has_qk_norm());
+    }
+
+    #[test]
+    fn reads_the_mlp_width_and_embedding_tying_when_stated() {
+        // CONFIG states neither: no width, and untied as transformers defaults.
+        let bare = Qwen3TextContract::parse(CONFIG).expect("valid Qwen3 config");
+        assert_eq!(bare.intermediate_size(), None);
+        assert!(!bare.tied_output_embedding());
+
+        let stated = CONFIG.replace(
+            r#""head_dim":128,"#,
+            r#""head_dim":128,"intermediate_size":3072,"tie_word_embeddings":true,"#,
+        );
+        let contract = Qwen3TextContract::parse(&stated).expect("valid Qwen3 config");
+        assert_eq!(contract.intermediate_size().map(u32::from), Some(3072));
+        assert!(contract.tied_output_embedding());
     }
 
     #[test]
