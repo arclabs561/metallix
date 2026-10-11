@@ -150,6 +150,156 @@ pub struct Qwen35Config {
     tie_word_embeddings: bool,
     mtp_layers: usize,
     mtp_dedicated_embeddings: bool,
+    rope_scaling: Option<YarnScaling>,
+}
+
+/// An operator's request to extend the context with `RoPE` scaling, parsed
+/// from a closed set (`--rope-scaling yarn:4`), never a free string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RopeScalingRequest {
+    /// Static `YaRN` with this integer factor over the declared positions.
+    Yarn {
+        /// Context multiplier over `original_max_position_embeddings`.
+        factor: u8,
+    },
+}
+
+/// Static `YaRN` (arXiv 2309.00071) for the full-attention layers, in the form
+/// Transformers' `_compute_yarn_parameters` defines: low frequencies divided
+/// by `factor`, high frequencies kept, a linear ramp between the correction
+/// dimensions for `beta_fast` and `beta_slow` (truncated to whole dimensions),
+/// and the rotary features scaled by `0.1 ln(factor) + 1`.
+///
+/// Only pairs in [`QUALIFIED_YARN`] are constructed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct YarnScaling {
+    factor: f64,
+    original_max_positions: usize,
+    beta_fast: f64,
+    beta_slow: f64,
+    pair: &'static QualifiedYarn,
+}
+
+/// A (`YaRN` factor, original positions) pair this crate accepts, with the
+/// context its model card documents and whether the long-context needle gate
+/// has passed for it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QualifiedYarn {
+    /// Context multiplier.
+    pub factor: u8,
+    /// `original_max_position_embeddings` the factor applies to.
+    pub original_max_positions: usize,
+    /// Longest context admitted with this pair.
+    pub context_limit: usize,
+    /// Whether needle retrieval past the original positions has passed
+    /// against the reference; until then callers should warn above
+    /// `original_max_positions`.
+    pub needle_qualified: bool,
+}
+
+/// Qualified `YaRN` pairs for `qwen3_5`. Qwen3.5's model card documents factor
+/// 4 over 262,144 positions for 1,010,000 tokens; its rope numerics match
+/// Transformers' (inverse frequencies within 2 f32 ulp, attention factor
+/// exact), and the 512K and 1M needle gate has not run yet.
+pub const QUALIFIED_YARN: &[QualifiedYarn] = &[QualifiedYarn {
+    factor: 4,
+    original_max_positions: 262_144,
+    context_limit: 1_010_000,
+    needle_qualified: false,
+}];
+
+impl YarnScaling {
+    fn qualified(
+        factor: f64,
+        original_max_positions: usize,
+        beta_fast: f64,
+        beta_slow: f64,
+    ) -> Result<Self, Qwen35ConfigError> {
+        let pair = QUALIFIED_YARN
+            .iter()
+            .find(|pair| {
+                f64::from(pair.factor).to_bits() == factor.to_bits()
+                    && pair.original_max_positions == original_max_positions
+            })
+            .ok_or(Qwen35ConfigError::UnqualifiedRopeScaling {
+                factor,
+                original_max_positions,
+            })?;
+        if beta_fast.to_bits() != 32_f64.to_bits() || beta_slow.to_bits() != 1_f64.to_bits() {
+            return Err(Qwen35ConfigError::Unsupported(
+                "YaRN beta_fast or beta_slow other than 32 and 1",
+            ));
+        }
+        Ok(Self {
+            factor,
+            original_max_positions,
+            beta_fast,
+            beta_slow,
+            pair,
+        })
+    }
+
+    /// The context multiplier.
+    #[must_use]
+    pub const fn factor(&self) -> f64 {
+        self.factor
+    }
+
+    /// The qualified pair this scaling was accepted under.
+    #[must_use]
+    pub const fn pair(&self) -> &'static QualifiedYarn {
+        self.pair
+    }
+
+    /// Scale applied to the rotary features of queries and keys, so rotary
+    /// attention logits scale by its square: `0.1 ln(factor) + 1`, as
+    /// Transformers applies to cos and sin.
+    #[must_use]
+    pub fn attention_factor(&self) -> f64 {
+        if self.factor <= 1.0 {
+            return 1.0;
+        }
+        0.1 * self.factor.ln() + 1.0
+    }
+
+    /// Inverse frequencies for `rotary_dim` rotary features, computed in f32
+    /// in Transformers' order of operations.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::float_cmp,
+        reason = "dimensions, positions and factors are small and exact in f32 and f64, \
+                  and the f32 arithmetic mirrors the reference"
+    )]
+    pub fn inverse_frequencies(&self, rotary_dim: usize, rope_theta: f32) -> Vec<f32> {
+        let dim = rotary_dim as f64;
+        let base = f64::from(rope_theta);
+        let correction = |rotations: f64| {
+            dim * (self.original_max_positions as f64 / (rotations * 2.0 * std::f64::consts::PI))
+                .ln()
+                / (2.0 * base.ln())
+        };
+        let low = correction(self.beta_fast).floor().max(0.0);
+        let mut high = correction(self.beta_slow).ceil().min(dim - 1.0);
+        // Transformers' guard against a zero-width ramp, compared exactly
+        // as it does; both bounds are whole numbers from floor and ceil.
+        if low == high {
+            high += 0.001;
+        }
+        let factor = self.factor as f32;
+        (0..rotary_dim / 2)
+            .map(|index| {
+                let exponent = (2 * index) as f32 / rotary_dim as f32;
+                let position_frequency = rope_theta.powf(exponent);
+                let extrapolation = 1.0 / position_frequency;
+                let interpolation = 1.0 / (factor * position_frequency);
+                let ramp = ((index as f32 - low as f32) / (high - low) as f32).clamp(0.0, 1.0);
+                let extrapolation_weight = 1.0 - ramp;
+                interpolation * (1.0 - extrapolation_weight) + extrapolation * extrapolation_weight
+            })
+            .collect()
+    }
 }
 
 impl Qwen35Config {
@@ -188,6 +338,10 @@ impl Qwen35Config {
         Self::from_text(text, outer_tie, text_type)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one ordered validation of the raw text configuration"
+    )]
     fn from_text(
         raw: RawTextConfig,
         outer_tie: Option<bool>,
@@ -208,9 +362,7 @@ impl Qwen35Config {
         let rope = raw
             .rope_parameters
             .ok_or(Qwen35ConfigError::Missing("rope_parameters"))?;
-        if rope.rope_type != "default" || rope.factor.is_some() {
-            return Err(Qwen35ConfigError::Unsupported("scaled rotary embedding"));
-        }
+        let rope_scaling = declared_rope_scaling(&rope)?;
         let tie_word_embeddings = match (raw.tie_word_embeddings, outer_tie) {
             (Some(inner), Some(outer)) if inner != outer => {
                 return Err(Qwen35ConfigError::ConflictingTiedEmbeddings);
@@ -280,6 +432,7 @@ impl Qwen35Config {
             tie_word_embeddings,
             mtp_layers: raw.mtp_num_hidden_layers.unwrap_or(0),
             mtp_dedicated_embeddings: raw.mtp_use_dedicated_embeddings.unwrap_or(false),
+            rope_scaling,
         })
     }
 
@@ -340,11 +493,47 @@ impl Qwen35Config {
     }
 
     /// The longest sequence an executor admits: the checkpoint's declared
-    /// positions. Parsing refuses `RoPE` scaling, so this never extends past
-    /// what the configuration states; memory is the caller's plan.
+    /// positions, or a qualified `YaRN` pair's documented context when one is
+    /// in force. Never more than the configuration or a qualified override
+    /// states; memory is the caller's plan.
     #[must_use]
     pub const fn context_limit(&self) -> usize {
-        self.max_position_embeddings
+        match &self.rope_scaling {
+            Some(scaling) => scaling.pair.context_limit,
+            None => self.max_position_embeddings,
+        }
+    }
+
+    /// The `RoPE` scaling in force, if any.
+    #[must_use]
+    pub const fn rope_scaling(&self) -> Option<&YarnScaling> {
+        self.rope_scaling.as_ref()
+    }
+
+    /// Applies an operator's `RoPE` scaling request, which counts as declared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35ConfigError::UnqualifiedRopeScaling`] for a pair not in
+    /// [`QUALIFIED_YARN`] (the factor over this checkpoint's declared
+    /// positions), or [`Qwen35ConfigError::Unsupported`] when the
+    /// configuration already declares a different scaling.
+    pub fn with_rope_scaling(
+        mut self,
+        request: RopeScalingRequest,
+    ) -> Result<Self, Qwen35ConfigError> {
+        let RopeScalingRequest::Yarn { factor } = request;
+        let scaling =
+            YarnScaling::qualified(f64::from(factor), self.max_position_embeddings, 32.0, 1.0)?;
+        match &self.rope_scaling {
+            Some(declared) if declared != &scaling => {
+                return Err(Qwen35ConfigError::Unsupported(
+                    "a RoPE scaling override that differs from the declared one",
+                ));
+            }
+            _ => self.rope_scaling = Some(scaling),
+        }
+        Ok(self)
     }
 
     /// Full-attention K/V rows an executor allocates to hold `tokens`
@@ -603,6 +792,41 @@ struct RawRope {
     #[serde(default = "full_rotary")]
     partial_rotary_factor: f64,
     factor: Option<f64>,
+    original_max_position_embeddings: Option<usize>,
+    beta_fast: Option<f64>,
+    beta_slow: Option<f64>,
+    attention_factor: Option<f64>,
+    mscale: Option<f64>,
+    mscale_all_dim: Option<f64>,
+}
+
+/// The `RoPE` scaling a configuration declares: none, or a qualified `YaRN`
+/// pair. Explicit attention factors, `mscale` and other rope types are
+/// refused.
+fn declared_rope_scaling(rope: &RawRope) -> Result<Option<YarnScaling>, Qwen35ConfigError> {
+    match (rope.rope_type.as_str(), rope.factor) {
+        ("default" | "", None) => Ok(None),
+        ("yarn", Some(factor)) => {
+            if rope.attention_factor.is_some()
+                || rope.mscale.is_some()
+                || rope.mscale_all_dim.is_some()
+            {
+                return Err(Qwen35ConfigError::Unsupported(
+                    "YaRN with an explicit attention_factor or mscale",
+                ));
+            }
+            Ok(Some(YarnScaling::qualified(
+                factor,
+                rope.original_max_position_embeddings
+                    .ok_or(Qwen35ConfigError::Missing(
+                        "original_max_position_embeddings",
+                    ))?,
+                rope.beta_fast.unwrap_or(32.0),
+                rope.beta_slow.unwrap_or(1.0),
+            )?))
+        }
+        _ => Err(Qwen35ConfigError::Unsupported("scaled rotary embedding")),
+    }
 }
 
 const fn default_eps() -> f32 {
@@ -634,6 +858,16 @@ pub enum Qwen35ConfigError {
     /// A field holds an unusable value.
     #[error("qwen3_5 configuration has an invalid {0}")]
     Invalid(&'static str),
+    /// A `YaRN` (factor, original positions) pair that is not qualified.
+    #[error(
+        "YaRN factor {factor} over {original_max_positions} positions is not qualified; qualified for qwen3_5: yarn:4 over 262144 positions (1010000 tokens)"
+    )]
+    UnqualifiedRopeScaling {
+        /// Requested or declared factor.
+        factor: f64,
+        /// The positions it would scale.
+        original_max_positions: usize,
+    },
     /// A head count does not divide evenly into its group.
     #[error("{0} is not a multiple of its key head count")]
     HeadGrouping(&'static str),
@@ -661,7 +895,135 @@ pub enum Qwen35ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp};
+    use super::{
+        QUALIFIED_YARN, Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp,
+        RopeScalingRequest,
+    };
+
+    /// Inverse frequencies from Transformers 5.19.0 (torch 2.9.0)
+    /// `ROPE_INIT_FUNCTIONS["yarn"]` on the Qwen3.5-0.8B configuration with
+    /// the model card's `rope_parameters` (`rope_type: yarn`, factor 4,
+    /// original 262,144, theta 1e7, partial rotary 0.25), as f32 bits.
+    const TRANSFORMERS_YARN_INV_FREQ: [u32; 32] = [
+        0x3f80_0000,
+        0x3f1a_b32b,
+        0x3eba_f81b,
+        0x3e61_f835,
+        0x3e08_8d77,
+        0x3da5_0956,
+        0x3d47_763f,
+        0x3cf1_1177,
+        0x3c91_ad39,
+        0x3c30_1052,
+        0x3bd4_ca15,
+        0x3b80_967d,
+        0x3b1b_690d,
+        0x3abb_d3ed,
+        0x3a63_01e2,
+        0x39f8_a364,
+        0x3986_b53e,
+        0x3910_058b,
+        0x3897_5c0d,
+        0x381b_7e06,
+        0x379a_c368,
+        0x3712_f6ed,
+        0x3681_2dab,
+        0x361c_1fc4,
+        0x35bc_b0c1,
+        0x3564_0cc6,
+        0x3509_cf4a,
+        0x34a6_8e4c,
+        0x3449_4c57,
+        0x33f3_499d,
+        0x3393_048e,
+        0x3331_af44,
+    ];
+
+    fn qwen35_08b_yarn() -> String {
+        include_str!("../../../../fixtures/qwen3.5-0.8b/config.json").replace(
+            r#""rope_type": "default""#,
+            r#""rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144"#,
+        )
+    }
+
+    /// The declared `YaRN` pair matches Transformers' numerics: the attention
+    /// factor bit for bit and every inverse frequency within 2 f32 ulp.
+    /// Dropping the ramp, its truncation to whole dimensions, or the factor
+    /// on low frequencies moves some entry by far more.
+    #[test]
+    fn yarn_numerics_match_transformers() {
+        let config = Qwen35Config::parse(&qwen35_08b_yarn()).expect("declared YaRN");
+        let scaling = config.rope_scaling().expect("scaling in force");
+        assert_eq!(
+            scaling.attention_factor().to_bits(),
+            4_607_806_750_276_833_944
+        );
+        let ours = scaling.inverse_frequencies(config.rotary_dim(), config.rope_theta);
+        assert_eq!(ours.len(), TRANSFORMERS_YARN_INV_FREQ.len());
+        for (index, (ours, reference)) in ours.iter().zip(TRANSFORMERS_YARN_INV_FREQ).enumerate() {
+            let ulps = (i64::from(ours.to_bits()) - i64::from(reference)).abs();
+            assert!(
+                ulps <= 2,
+                "inverse frequency {index}: {ulps} ulp from Transformers"
+            );
+        }
+        assert_eq!(config.context_limit(), 1_010_000);
+        assert_eq!(config.max_position_embeddings(), 262_144);
+    }
+
+    /// Only qualified pairs extend the context; everything else is refused
+    /// with a message naming the qualified pair.
+    #[test]
+    fn rope_scaling_accepts_only_qualified_pairs() {
+        let plain = include_str!("../../../../fixtures/qwen3.5-0.8b/config.json");
+        let config = Qwen35Config::parse(plain).expect("plain config");
+        assert_eq!(config.context_limit(), 262_144);
+        let scaled = config
+            .clone()
+            .with_rope_scaling(RopeScalingRequest::Yarn { factor: 4 })
+            .expect("qualified override");
+        assert_eq!(scaled.context_limit(), 1_010_000);
+        assert_eq!(
+            scaled,
+            Qwen35Config::parse(&qwen35_08b_yarn()).expect("declared")
+        );
+        let refused = config
+            .clone()
+            .with_rope_scaling(RopeScalingRequest::Yarn { factor: 2 })
+            .expect_err("factor 2 is not qualified");
+        assert!(matches!(
+            refused,
+            Qwen35ConfigError::UnqualifiedRopeScaling { .. }
+        ));
+        assert!(refused.to_string().contains("yarn:4 over 262144"));
+        let shorter = plain.replace(
+            r#""max_position_embeddings": 262144"#,
+            r#""max_position_embeddings": 32768"#,
+        );
+        assert!(matches!(
+            Qwen35Config::parse(&shorter)
+                .expect("shorter declared context")
+                .with_rope_scaling(RopeScalingRequest::Yarn { factor: 4 }),
+            Err(Qwen35ConfigError::UnqualifiedRopeScaling {
+                original_max_positions: 32_768,
+                ..
+            })
+        ));
+        for declared in [
+            r#""rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144"#,
+            r#""rope_type": "yarn", "factor": 4.0"#,
+            r#""rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144, "attention_factor": 1.2"#,
+            r#""rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144, "beta_fast": 16"#,
+            r#""rope_type": "linear", "factor": 4.0"#,
+        ] {
+            let json = plain.replace(r#""rope_type": "default""#, declared);
+            assert!(
+                Qwen35Config::parse(&json).is_err(),
+                "{declared} must be refused"
+            );
+        }
+        assert!(QUALIFIED_YARN.iter().all(|pair| !pair.needle_qualified));
+    }
 
     /// The text fields of Qwen/Qwen3.8-27B@1d4bf0f2, with its 64-entry
     /// `layer_types` generated from the published 3-linear-then-1-full pattern.

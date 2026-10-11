@@ -14,7 +14,10 @@
 
 use std::{env, fs, path::PathBuf, time::Instant};
 
-use qwen35::forward::{Qwen35Precision, Qwen35Weights};
+use qwen35::{
+    RopeScalingRequest,
+    forward::{Qwen35Precision, Qwen35Weights},
+};
 use serde_json::Value;
 
 /// Largest accepted |logit difference| against the f32 reference. Qwen3.5-0.8B
@@ -255,6 +258,38 @@ fn appends_across_kv_tiers_match_a_single_prefill() {
 /// extended with the rest of the prompt, gives the one-shot prefill's logits;
 /// the executor the snapshot came from keeps going unaffected. Boundaries sit
 /// inside and past the first prefill chunk.
+/// With `YaRN` in force, a snapshot restored into a fresh executor and
+/// extended gives the one-shot prefill's logits: keys are rotated when they
+/// are appended, so their positions survive the restore.
+#[test]
+fn yarn_snapshot_restore_matches_a_single_prefill() {
+    let Some(case) = case() else { return };
+    let weights = Qwen35Weights::load(&case.model, Qwen35Precision::Float32)
+        .expect("load")
+        .with_rope_scaling(RopeScalingRequest::Yarn { factor: 4 })
+        .expect("qualified scaling");
+    let prompt = ids(&case.reference["cases"][3]["steps"][0]["input_ids"]);
+    let whole = weights
+        .executor()
+        .prefill_last_logits(&prompt)
+        .expect("whole");
+    let mut original = weights.executor();
+    original.prefill_last_logits(&prompt[..130]).expect("head");
+    let snapshot = original.snapshot().expect("snapshot");
+    let resumed = weights
+        .executor_from(&snapshot)
+        .expect("restore")
+        .extend_last_logits(&prompt[130..])
+        .expect("tail");
+    let diff = whole
+        .iter()
+        .zip(&resumed)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    eprintln!("YaRN restore at 130: max |dlogit| {diff:.3e}");
+    assert!(diff <= 1e-3, "YaRN restored prefill diverged by {diff}");
+}
+
 #[test]
 fn restored_snapshot_matches_a_single_prefill() {
     let Some(case) = case() else { return };

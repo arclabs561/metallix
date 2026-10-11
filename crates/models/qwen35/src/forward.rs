@@ -32,7 +32,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp,
+    Qwen35Config, Qwen35ConfigError, Qwen35LayerKind, Qwen35Mlp, RopeScalingRequest,
     gguf::{ValueHeadAxis, canonical_name, permute_spans, tiled_positions, value_head_axis},
 };
 
@@ -69,6 +69,51 @@ pub struct Qwen35Weights {
     precision: Qwen35Precision,
     /// The activation dtype.
     compute: Dtype,
+    /// `YaRN` rotary arrays when the configuration's scaling is in force.
+    yarn: Option<YarnArrays>,
+}
+
+/// Precomputed `YaRN` inputs to MLX's rope: the per-pair periods it rotates
+/// by (`1 / inverse frequency`), and a per-feature scale over the head that
+/// multiplies the rotary features by the attention factor and leaves the
+/// rest unchanged, as Transformers' scaled cos and sin do.
+struct YarnArrays {
+    periods: Array,
+    feature_scale: Array,
+}
+
+fn yarn_arrays(config: &Qwen35Config, compute: Dtype) -> Result<Option<YarnArrays>, Qwen35Error> {
+    let Some(scaling) = config.rope_scaling() else {
+        return Ok(None);
+    };
+    let gpu = StreamOrDevice::gpu();
+    let periods: Vec<f32> = scaling
+        .inverse_frequencies(config.rotary_dim, config.rope_theta)
+        .into_iter()
+        .map(|inverse| 1.0 / inverse)
+        .collect();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the attention factor is near 1 and multiplies in the activation dtype"
+    )]
+    let factor = scaling.attention_factor() as f32;
+    let scale: Vec<f32> = (0..config.head_dim)
+        .map(|feature| {
+            if feature < config.rotary_dim {
+                factor
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let periods = Array::from_slice(&periods, &[dim(periods.len())?]);
+    let feature_scale =
+        Array::from_slice(&scale, &[dim(scale.len())?]).as_dtype_device(compute, &gpu)?;
+    mlx_rs::transforms::eval([&periods, &feature_scale])?;
+    Ok(Some(YarnArrays {
+        periods,
+        feature_scale,
+    }))
 }
 
 /// Whether [`Qwen35Weights::load_with`] keeps the checkpoint's
@@ -226,16 +271,18 @@ impl Qwen35Weights {
             rate.eval()?;
             tensors.insert(name.replace(".A_log", ".decay_rate"), rate);
         }
+        let compute = match precision {
+            Qwen35Precision::Checkpoint => compute,
+            Qwen35Precision::Float32 => Dtype::Float32,
+        };
         Ok(Self {
             identity: Arc::new(()),
+            yarn: yarn_arrays(&config, compute)?,
             config,
             tensors,
             quantized: HashMap::new(),
             precision,
-            compute: match precision {
-                Qwen35Precision::Checkpoint => compute,
-                Qwen35Precision::Float32 => Dtype::Float32,
-            },
+            compute,
         })
     }
 
@@ -296,6 +343,9 @@ impl Qwen35Weights {
             quantized: HashMap::new(),
             precision,
             compute,
+            // GGUF metadata declares no `RoPE` scaling; an operator override
+            // goes through `with_rope_scaling`.
+            yarn: None,
         };
         for canonical in order {
             let stored = names
@@ -420,6 +470,23 @@ impl Qwen35Weights {
     #[must_use]
     pub const fn config(&self) -> &Qwen35Config {
         &self.config
+    }
+
+    /// Applies an operator's `RoPE` scaling request (`--rope-scaling yarn:4`),
+    /// which then counts as declared: [`Qwen35Config::context_limit`] becomes
+    /// the qualified pair's context. Snapshots taken before the change are
+    /// refused afterwards, since their keys were rotated differently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Qwen35Error::Config`] for an unqualified pair or one that
+    /// conflicts with the declared scaling, or [`Qwen35Error::Mlx`] if the
+    /// rotary arrays cannot be built.
+    pub fn with_rope_scaling(mut self, request: RopeScalingRequest) -> Result<Self, Qwen35Error> {
+        self.config = self.config.with_rope_scaling(request)?;
+        self.yarn = yarn_arrays(&self.config, self.compute)?;
+        self.identity = Arc::new(());
+        Ok(self)
     }
 
     /// The precision these weights were loaded at.
@@ -1085,6 +1152,40 @@ fn delta_rule_by_token(
     Ok((output, state))
 }
 
+/// Rotary embedding of `[1, heads, seq, head_dim]` at positions starting at
+/// `offset`: the configuration's plain rope, or `YaRN` with its periods and
+/// rotary-feature scale.
+fn rope(
+    x: &Array,
+    config: &Qwen35Config,
+    yarn: Option<&YarnArrays>,
+    offset: i32,
+) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    Ok(match yarn {
+        None => fast::rope_device(
+            x,
+            dim(config.rotary_dim)?,
+            false,
+            Some(config.rope_theta),
+            1.0,
+            offset,
+            Option::<&Array>::None,
+            &gpu,
+        )?,
+        Some(yarn) => fast::rope_device(
+            &x.multiply_device(&yarn.feature_scale, &gpu)?,
+            dim(config.rotary_dim)?,
+            false,
+            None,
+            1.0,
+            offset,
+            Some(&yarn.periods),
+            &gpu,
+        )?,
+    })
+}
+
 fn gated_attention(
     weights: &Qwen35Weights,
     base: &str,
@@ -1114,16 +1215,7 @@ fn gated_attention(
             config.rms_norm_eps,
         )?
         .transpose_axes_device(&[0, 2, 1, 3], &gpu)?;
-        Ok(fast::rope_device(
-            &normed,
-            dim(config.rotary_dim)?,
-            false,
-            Some(config.rope_theta),
-            1.0,
-            offset,
-            Option::<&Array>::None,
-            &gpu,
-        )?)
+        rope(&normed, config, weights.yarn.as_ref(), offset)
     };
     let query = rotate(&halves[0], "q_norm")?;
     let key = rotate(&key, "k_norm")?;
@@ -1708,6 +1800,63 @@ mod tests {
     use super::{MoeTensors, is_zero_centered_norm, moe_block, mtp_shapes};
     use crate::Qwen35Config;
 
+    /// MLX's rope with the `YaRN` periods and feature scale rotates a head the
+    /// way a float64 host rotation by Transformers' recipe does: rotary
+    /// features scaled by the attention factor and rotated by
+    /// `position * inverse_frequency`, the remaining features untouched.
+    /// Tolerances follow the f32 angle error measured for this rotary shape
+    /// (2.3e-2 at 1M, 7.5e-3 at 262K against float64).
+    #[test]
+    fn yarn_rope_matches_a_host_rotation() {
+        let config = crate::Qwen35Config::parse(include_str!(
+            "../../../../fixtures/qwen3.5-0.8b/config.json"
+        ))
+        .expect("fixture config")
+        .with_rope_scaling(crate::RopeScalingRequest::Yarn { factor: 4 })
+        .expect("qualified");
+        let yarn = super::yarn_arrays(&config, mlx_rs::Dtype::Float32)
+            .expect("arrays")
+            .expect("scaling in force");
+        let scaling = config.rope_scaling().expect("scaling");
+        let inverse = scaling.inverse_frequencies(config.rotary_dim(), config.rope_theta);
+        let factor = scaling.attention_factor();
+        let head = config.head_dim;
+        let half = config.rotary_dim() / 2;
+        let input: Vec<f32> = (0..head)
+            .map(|feature| {
+                let mixed = (feature * 2_654_435_761) % 2_001;
+                f32::from(u16::try_from(mixed).expect("bounded")) / 1_000.0 - 1.0
+            })
+            .collect();
+        for (position, tolerance) in [(0_i32, 1e-6), (262_143, 1e-2), (900_000, 3e-2)] {
+            let x = Array::from_slice(&input, &[1, 1, 1, i32::try_from(head).expect("dim")]);
+            let rotated = super::rope(&x, &config, Some(&yarn), position).expect("rope");
+            rotated.eval().expect("evaluates");
+            let rotated = rotated.as_slice::<f32>();
+            for feature in 0..head {
+                let expected = if feature < 2 * half {
+                    let pair = feature % half;
+                    let angle = f64::from(position) * f64::from(inverse[pair]);
+                    let (sin, cos) = angle.sin_cos();
+                    let (first, second) = (f64::from(input[pair]), f64::from(input[pair + half]));
+                    factor
+                        * if feature < half {
+                            first * cos - second * sin
+                        } else {
+                            second * cos + first * sin
+                        }
+                } else {
+                    f64::from(input[feature])
+                };
+                let error = (f64::from(rotated[feature]) - expected).abs();
+                assert!(
+                    error <= tolerance,
+                    "position {position}, feature {feature}: {error} over {tolerance}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn snapshots_are_bound_to_one_weight_load() {
         let weights = || super::Qwen35Weights {
@@ -1720,6 +1869,7 @@ mod tests {
             quantized: std::collections::HashMap::new(),
             precision: super::Qwen35Precision::Float32,
             compute: mlx_rs::Dtype::Float32,
+            yarn: None,
         };
         let source = weights();
         let other = weights();

@@ -125,6 +125,7 @@ impl Qwen35Config {
             // The GGUF loader reads no multi-token-prediction head.
             mtp_layers: 0,
             mtp_dedicated_embeddings: false,
+            rope_scaling: None,
         };
         config.check_gguf()?;
         Ok(config)
