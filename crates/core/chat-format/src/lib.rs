@@ -81,8 +81,32 @@ pub const MAX_CHAT_TEMPLATE_BYTES: usize = 1024 * 1024;
 /// Largest `generation_config.json` read, in bytes.
 pub const MAX_GENERATION_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_MODEL_CONFIG_BYTES: usize = 1024 * 1024;
-const MAX_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
-const TEMPLATE_FUEL: u64 = 100_000;
+const DEFAULT_CHAT_RENDERED_BYTES: usize = 1024 * 1024;
+const DEFAULT_TEMPLATE_FUEL: u64 = 100_000;
+
+/// Limits a [`ChatFormat`] applies to every prompt it renders, set once for a
+/// server's context and message cap so no call site can forget them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatLimits {
+    /// Largest rendered prompt, in bytes. Measured on the rendered text,
+    /// where reserved spellings count as their (longer) placeholders, so a
+    /// prompt full of them can be refused slightly below this bound.
+    pub rendered_bytes: usize,
+    /// Template instructions one render may execute (minijinja fuel), the
+    /// only bound on template CPU time. Templates loop over messages, so a
+    /// server raising its message cap scales this with it.
+    pub template_fuel: u64,
+}
+
+impl Default for ChatLimits {
+    /// 1 MiB and 100,000 instructions: a short-context server.
+    fn default() -> Self {
+        Self {
+            rendered_bytes: DEFAULT_CHAT_RENDERED_BYTES,
+            template_fuel: DEFAULT_TEMPLATE_FUEL,
+        }
+    }
+}
 
 /// One tokenizer vocabulary index. Model and sampler code still pass `i32`;
 /// [`TokenId::from_model`] is the checked crossing.
@@ -362,6 +386,7 @@ pub struct ChatTemplate {
     environment: Environment<'static>,
     sha256: String,
     specials: SpecialTokens,
+    limits: ChatLimits,
 }
 
 impl ChatTemplate {
@@ -378,7 +403,7 @@ impl ChatTemplate {
         environment.set_unknown_method_callback(unknown_method_callback);
         environment.add_filter("tojson", template_json::tojson);
         environment.set_undefined_behavior(UndefinedBehavior::SemiStrict);
-        environment.set_fuel(Some(TEMPLATE_FUEL));
+        environment.set_fuel(Some(DEFAULT_TEMPLATE_FUEL));
         environment
             .add_template_owned("chat", source)
             .map_err(|error| format!("local chat template could not be parsed: {error}"))?;
@@ -386,6 +411,7 @@ impl ChatTemplate {
             environment,
             sha256,
             specials,
+            limits: ChatLimits::default(),
         })
     }
 
@@ -432,9 +458,10 @@ impl ChatTemplate {
             .map_err(|error| format!("local chat template is unavailable: {error}"))?
             .render(context)
             .map_err(|error| format!("local chat template could not be rendered: {error}"))?;
-        if rendered.len() > MAX_CHAT_RENDERED_BYTES {
+        if rendered.len() > self.limits.rendered_bytes {
             return Err(format!(
-                "rendered chat prompt exceeds the {MAX_CHAT_RENDERED_BYTES}-byte limit"
+                "rendered chat prompt exceeds the {}-byte limit",
+                self.limits.rendered_bytes
             ));
         }
         Ok(rendered)
@@ -609,6 +636,23 @@ impl ChatFormat {
     #[must_use]
     pub fn template(&self) -> &ChatTemplate {
         &self.template
+    }
+
+    /// Replaces the rendering limits, for a server whose context or message
+    /// cap needs more than [`ChatLimits::default`] allows.
+    #[must_use]
+    pub fn with_limits(mut self, limits: ChatLimits) -> Self {
+        self.template
+            .environment
+            .set_fuel(Some(limits.template_fuel));
+        self.template.limits = limits;
+        self
+    }
+
+    /// The rendering limits in force.
+    #[must_use]
+    pub const fn limits(&self) -> ChatLimits {
+        self.template.limits
     }
 
     /// The tool and reasoning dialects the template teaches, which
@@ -1410,6 +1454,72 @@ mod tests {
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
     use crate::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation, ToolDialect};
+
+    /// A server for a long context raises the rendered-prompt limit once,
+    /// through [`ChatFormat::with_limits`]: a 3 MiB prompt the default
+    /// refuses then renders, and one byte past the raised limit is still
+    /// refused.
+    #[test]
+    fn rendered_limit_is_set_once_and_still_enforced() {
+        let format = load("{{ messages[0].content }}", &json!(null)).expect("format");
+        assert_eq!(format.limits(), super::ChatLimits::default());
+        let long = "x".repeat(3 * 1024 * 1024);
+        let messages = [ChatMessage::text(ChatRole::User, &long)];
+        let refused = format
+            .template()
+            .render(Conversation::new(&messages), true)
+            .expect_err("over the 1 MiB default");
+        assert!(refused.contains("1048576-byte limit"), "{refused}");
+        let limit = 4 * 1024 * 1024;
+        let raised = format.with_limits(super::ChatLimits {
+            rendered_bytes: limit,
+            ..super::ChatLimits::default()
+        });
+        assert_eq!(render(&raised, &long).len(), long.len());
+        let over = "x".repeat(limit + 1);
+        let messages = [ChatMessage::text(ChatRole::User, &over)];
+        assert!(
+            raised
+                .template()
+                .render(Conversation::new(&messages), true)
+                .expect_err("one byte past the raised limit")
+                .contains("byte limit")
+        );
+    }
+
+    /// [`ChatFormat::with_limits`] sets template fuel on the environment that
+    /// renders: one unit of fuel stops a template that loops over messages,
+    /// and the default renders it. Without this, a fuel measurement that
+    /// bisects through `with_limits` would silently report a minimum of 1.
+    #[test]
+    fn with_limits_sets_template_fuel() {
+        let format = load(
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+            &json!(null),
+        )
+        .expect("format");
+        let messages = [
+            ChatMessage::text(ChatRole::User, "a"),
+            ChatMessage::text(ChatRole::Assistant, "b"),
+            ChatMessage::text(ChatRole::User, "c"),
+        ];
+        assert_eq!(
+            format
+                .template()
+                .render(Conversation::new(&messages), false)
+                .expect("default fuel renders"),
+            "abc"
+        );
+        let starved = format.with_limits(super::ChatLimits {
+            template_fuel: 1,
+            ..super::ChatLimits::default()
+        });
+        let error = starved
+            .template()
+            .render(Conversation::new(&messages), false)
+            .expect_err("one unit of fuel cannot run the loop");
+        assert!(error.contains("fuel"), "{error}");
+    }
 
     fn render(format: &ChatFormat, content: &str) -> String {
         let messages = [ChatMessage::text(ChatRole::User, content)];
@@ -2336,6 +2446,127 @@ mod tests {
             "{}",
             model.display()
         );
+    }
+
+    /// A long agent conversation: system, then rounds of user, assistant
+    /// reasoning plus a tool call, and the tool's result, `count` messages
+    /// in all, with message bodies of `body` bytes.
+    fn agent_conversation(count: usize, body: usize) -> Vec<ChatMessage> {
+        let text = "y".repeat(body);
+        let mut messages = vec![ChatMessage::text(
+            ChatRole::System,
+            "You are a coding agent.",
+        )];
+        let mut round = 0;
+        while messages.len() < count {
+            match messages.len() % 3 {
+                1 => messages.push(ChatMessage::text(ChatRole::User, text.clone())),
+                2 => messages.push(ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: text.clone(),
+                    reasoning_content: Some(text.clone()),
+                    tool_calls: vec![ChatToolCall {
+                        name: "read_file".into(),
+                        arguments: json!({"path": format!("src/{round}.rs"), "limit": 200}),
+                    }],
+                    tool_call_id: None,
+                    name: None,
+                }),
+                _ => {
+                    messages.push(
+                        ChatToolResult {
+                            tool_call_id: format!("call_{round}"),
+                            name: Some("read_file".into()),
+                            content: text.clone(),
+                        }
+                        .into_message(),
+                    );
+                    round += 1;
+                }
+            }
+        }
+        messages
+    }
+
+    /// Smallest fuel that renders `messages` with `tools`, by bisection on
+    /// [`ChatLimits::template_fuel`]; `None` when even the ceiling fails.
+    fn minimal_fuel(
+        format: ChatFormat,
+        messages: &[ChatMessage],
+        tools: &[Value],
+    ) -> (ChatFormat, Option<u64>) {
+        let renders = |format: ChatFormat, fuel: u64| {
+            let format = format.with_limits(super::ChatLimits {
+                rendered_bytes: usize::MAX,
+                template_fuel: fuel,
+            });
+            let conversation = Conversation {
+                tools,
+                ..Conversation::new(messages)
+            };
+            let ok = format.template().render(conversation, true).is_ok();
+            (format, ok)
+        };
+        let (mut format, ceiling_ok) = renders(format, 1 << 40);
+        if !ceiling_ok {
+            return (format, None);
+        }
+        let (mut low, mut high) = (0_u64, 1_u64 << 40);
+        while high - low > 1 {
+            let middle = low + (high - low) / 2;
+            let (next, ok) = renders(format, middle);
+            format = next;
+            if ok {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        (format, Some(high))
+    }
+
+    /// Measures template fuel on the real checkpoints named by
+    /// `METALLIX_CHAT_FORMAT_MODELS` for agent conversations at 256 and 4096
+    /// messages, with short and 2 KiB bodies, and four tools. Prints one
+    /// JSON line per case. A measurement: sizing [`ChatLimits::template_fuel`]
+    /// to a server's message cap reads these numbers.
+    #[test]
+    #[ignore = "measurement over local checkpoints; run with --ignored"]
+    fn template_fuel_at_message_counts() {
+        let Some(models) = std::env::var_os("METALLIX_CHAT_FORMAT_MODELS") else {
+            eprintln!("skipping: METALLIX_CHAT_FORMAT_MODELS is not set");
+            return;
+        };
+        let tools: Vec<Value> = ["read_file", "search", "edit_file", "run"]
+            .iter()
+            .map(|name| {
+                json!({"type": "function", "function": {"name": name, "description": "A tool.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"},
+                    "limit": {"type": "integer"}}, "required": ["path"]}}})
+            })
+            .collect();
+        for model in std::env::split_paths(&models) {
+            let config = read_json(&model, "config.json", 1024 * 1024).expect("config.json");
+            let vocabulary = config["vocab_size"]
+                .as_u64()
+                .or_else(|| config["text_config"]["vocab_size"].as_u64())
+                .and_then(|size| usize::try_from(size).ok())
+                .expect("vocab_size");
+            let mut format = ChatFormat::load(&model, vocabulary)
+                .unwrap_or_else(|error| panic!("{}: {error}", model.display()));
+            for (count, body) in [(256, 8), (256, 2048), (4096, 8)] {
+                let messages = agent_conversation(count, body);
+                let started = std::time::Instant::now();
+                let (next, fuel) = minimal_fuel(format, &messages, &tools);
+                let seconds = started.elapsed().as_secs_f64();
+                format = next;
+                println!(
+                    "{}",
+                    json!({"model": model.display().to_string(), "messages": count,
+                        "body_bytes": body, "minimal_fuel": fuel, "bisection_seconds": seconds})
+                );
+            }
+        }
     }
 
     /// Loads each checkpoint directory in `METALLIX_CHAT_FORMAT_MODELS`
