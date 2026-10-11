@@ -17,7 +17,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [features]
-metal = ["dep:mlx-rs", "dep:engine", "dep:media", "dep:mlx-kernels"]
+metal = ["dep:mlx-rs", "dep:engine", "dep:media", "dep:mlx-kernels", "mlx-kernels/metal"]
 
 [dev-dependencies]
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }

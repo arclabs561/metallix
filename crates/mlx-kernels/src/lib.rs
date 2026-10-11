@@ -12,6 +12,10 @@
 //! `<name>_shape` and friends when the body uses them) and inserts the body.
 //! Outputs are fresh arrays in the lazy graph: a kernel cannot write into an
 //! existing buffer.
+//!
+//! Everything is behind the `metal` feature, like the model crates, so a
+//! workspace build without it never compiles MLX's Metal kernels.
+#![cfg(feature = "metal")]
 #![allow(unsafe_code)]
 #![deny(missing_docs)]
 
