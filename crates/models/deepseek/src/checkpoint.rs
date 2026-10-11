@@ -731,8 +731,14 @@ mod tests {
     #[test]
     #[ignore = "requires pinned shard09 header and index metadata; no tensor payload"]
     fn pinned_v41_shard09_metadata_matches_index_and_expert_shapes() {
-        let header_path = std::env::var("METALLIX_V41_HEADER").expect("set METALLIX_V41_HEADER");
-        let index_path = std::env::var("METALLIX_V41_INDEX").expect("set METALLIX_V41_INDEX");
+        let Ok(header_path) = std::env::var("METALLIX_V41_HEADER") else {
+            eprintln!("skipping: METALLIX_V41_HEADER is not set");
+            return;
+        };
+        let Ok(index_path) = std::env::var("METALLIX_V41_INDEX") else {
+            eprintln!("skipping: METALLIX_V41_INDEX is not set");
+            return;
+        };
         let header = std::fs::read(header_path).expect("read bounded local header");
         assert_eq!(header.len(), 258_136);
         let parsed =
