@@ -7,9 +7,13 @@
     reason = "mlx-rs 0.32 deprecates the *_device ops; the with_stream migration is a separate change"
 )]
 
+use engine::sampling::race::RaceKey;
 use mlx_rs::{Array, StreamOrDevice, ops, ops::indexing::IndexOp};
 
-use super::Qwen3ForwardError;
+use super::{
+    Qwen3ForwardError,
+    race_scores::{CERTIFY_WINDOW, race_scores},
+};
 
 /// How each row's token is chosen on the GPU.
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +36,27 @@ pub enum Qwen3Selection {
         top_k: usize,
         /// One variate in [0, 1) per row.
         uniforms: Vec<f64>,
+    },
+    /// The `race-v2` sampler (`engine::sampling::race`) in f32: the largest
+    /// perturbed score, over the `top_k` nucleus of the candidates when
+    /// `top_k` is set, else over the whole row (`top_p` must then be one).
+    ///
+    /// With `top_k` the host re-derives the token from the candidates, as
+    /// for [`Self::TopKNucleus`]. Without it, the pick also counts how many
+    /// rows score within [`CERTIFY_WINDOW`] of the best; when only the winner
+    /// does, the f32 scores cannot have reordered it against the f64
+    /// reference, so the token is exact.
+    Race {
+        /// Positive, finite.
+        temperature: f64,
+        /// In (0, 1]; exactly one without `top_k`.
+        top_p: f64,
+        /// Below the requested candidates, when set.
+        top_k: Option<usize>,
+        /// The request's noise key.
+        key: RaceKey,
+        /// The generated position of each row's token.
+        positions: Vec<u32>,
     },
 }
 
@@ -97,6 +122,9 @@ pub struct Qwen3TokenPicks {
     /// The executor weights these picks may be appended to.
     pub(super) binding: usize,
     candidates: Option<Candidates>,
+    /// For a whole-row race pick, `[rows]` uint32 counts of rows scoring
+    /// within [`CERTIFY_WINDOW`] of each row's best, the winner included.
+    near: Option<Array>,
     /// The `[rows, vocab]` logits, kept so a caller can still read whole rows.
     logits: Array,
 }
@@ -145,6 +173,34 @@ impl Qwen3PickRule {
             {
                 return Err(Qwen3ForwardError::InvalidPickRule(
                     "one uniform in [0, 1) per row",
+                ));
+            }
+        }
+        if let Qwen3Selection::Race {
+            temperature,
+            top_p,
+            top_k,
+            positions,
+            ..
+        } = &self.selection
+        {
+            if !(temperature.is_finite() && *temperature > 0.0) {
+                return Err(Qwen3ForwardError::InvalidPickRule("temperature"));
+            }
+            let nucleus_ok = match top_k {
+                Some(top_k) => {
+                    *top_p > 0.0 && *top_p <= 1.0 && *top_k > 0 && *top_k < self.candidates
+                }
+                None => (*top_p - 1.0).abs() < f64::EPSILON,
+            };
+            if !nucleus_ok {
+                return Err(Qwen3ForwardError::InvalidPickRule(
+                    "race picks need top_k below the candidates, or no truncation",
+                ));
+            }
+            if positions.len() != usize::try_from(rows).unwrap_or(usize::MAX) {
+                return Err(Qwen3ForwardError::InvalidPickRule(
+                    "one generated position per row",
                 ));
             }
         }
@@ -207,8 +263,44 @@ impl Qwen3TokenPicks {
         } else {
             None
         };
+        let mut near = None;
         let tokens = match &rule.selection {
             Qwen3Selection::Greedy => ops::indexing::argmax_axis_device(rows, -1, false, &stream)?,
+            Qwen3Selection::Race {
+                temperature,
+                top_p,
+                top_k: Some(top_k),
+                key,
+                positions,
+            } => {
+                let candidates = candidates
+                    .as_ref()
+                    .ok_or(Qwen3ForwardError::InvalidPickRule(
+                        "sampling needs candidates",
+                    ))?;
+                race_top_k_nucleus(candidates, *temperature, *top_p, *top_k, *key, positions)?
+            }
+            Qwen3Selection::Race {
+                temperature,
+                top_k: None,
+                key,
+                positions,
+                ..
+            } => {
+                let shift = wide.max_axis_device(-1, false, &stream)?;
+                let scores = race_scores(&wide, None, &shift, *temperature, *key, positions)?;
+                let best = scores.max_axis_device(-1, true, &stream)?;
+                near = Some(
+                    scores
+                        .ge_device(
+                            best.subtract_device(Array::from_f32(CERTIFY_WINDOW), &stream)?,
+                            &stream,
+                        )?
+                        .as_type_device::<u32>(&stream)?
+                        .sum_axis_device(-1, false, &stream)?,
+                );
+                ops::indexing::argmax_axis_device(&scores, -1, false, &stream)?
+            }
             Qwen3Selection::TopKNucleus {
                 temperature,
                 top_p,
@@ -231,6 +323,7 @@ impl Qwen3TokenPicks {
             }
         };
         let mut queued = vec![&tokens, &finite];
+        queued.extend(&near);
         if let Some(candidates) = &candidates {
             queued.extend([
                 &candidates.ids,
@@ -245,6 +338,7 @@ impl Qwen3TokenPicks {
             finite,
             binding,
             candidates,
+            near,
             logits: rows.clone(),
         })
     }
@@ -334,6 +428,22 @@ impl Qwen3TokenPicks {
         Ok((tokens, Some(rows)))
     }
 
+    /// For a whole-row race pick, how many rows scored within
+    /// [`CERTIFY_WINDOW`] of each row's best, the winner included: one means
+    /// the GPU token is the exact `race-v2` token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the counts
+    /// cannot be evaluated or read back.
+    pub fn race_near_counts(&self) -> Result<Option<Vec<u32>>, Qwen3ForwardError> {
+        let Some(near) = &self.near else {
+            return Ok(None);
+        };
+        near.eval()?;
+        Ok(Some(near.as_slice::<u32>().to_vec()))
+    }
+
     /// Reads back the whole `[rows, vocab]` logits as f32 rows, for a caller
     /// whose candidates could not settle its answer.
     ///
@@ -384,6 +494,101 @@ fn to_token(id: u32) -> Result<i32, Qwen3ForwardError> {
     i32::try_from(id).map_err(|_| Qwen3ForwardError::ShapeOverflow)
 }
 
+/// The `top_k` most likely candidates per row, most likely first, with their
+/// temperature weights and an f32 mirror of the host nucleus membership.
+struct NucleusHead {
+    ids: Array,
+    logits: Array,
+    weights: Array,
+    legal: Array,
+}
+
+impl NucleusHead {
+    fn start(
+        ids: &Array,
+        logits: &Array,
+        temperature: f32,
+        top_p: f32,
+        top_k: i32,
+    ) -> Result<Self, Qwen3ForwardError> {
+        let stream = StreamOrDevice::gpu();
+        // Most likely first; the host breaks exact ties by ID, which the
+        // caller's exact re-derivation covers.
+        let descending = ops::argsort_axis_device(logits.negative_device(&stream)?, -1, &stream)?
+            .index((.., 0..top_k));
+        let head_logits = ops::indexing::take_along_axis_device(logits, &descending, -1, &stream)?;
+        let head_ids = ops::indexing::take_along_axis_device(ids, &descending, -1, &stream)?;
+        let weights = ops::exp_device(
+            head_logits
+                .subtract_device(head_logits.index((.., 0..1)), &stream)?
+                .divide_device(Array::from_f32(temperature), &stream)?,
+            &stream,
+        )?;
+        // A token is kept when the mass before it is still short of the target.
+        let kept = weights.sum_axis_device(-1, true, &stream)?;
+        let before = ops::cumsum_device(&weights, -1, false, true, &stream)?
+            .subtract_device(&weights, &stream)?;
+        let legal = before.lt_device(
+            kept.multiply_device(Array::from_f32(top_p), &stream)?,
+            &stream,
+        )?;
+        Ok(Self {
+            ids: head_ids,
+            logits: head_logits,
+            weights,
+            legal,
+        })
+    }
+}
+
+/// The `race-v2` winner over the f32 nucleus of each row's candidates. The
+/// host re-derives the exact token from the candidates; this pick only
+/// decides which step is queued next.
+fn race_top_k_nucleus(
+    candidates: &Candidates,
+    temperature: f64,
+    top_p: f64,
+    top_k: usize,
+    key: RaceKey,
+    positions: &[u32],
+) -> Result<Array, Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let top_k = i32::try_from(top_k).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the GPU mirror runs in f32"
+    )]
+    let (temperature32, top_p) = (temperature as f32, top_p as f32);
+    let head = NucleusHead::start(
+        &candidates.ids,
+        &candidates.logits,
+        temperature32,
+        top_p,
+        top_k,
+    )?;
+    let shift = head.logits.index((.., 0));
+    let scores = race_scores(
+        &head.logits.contiguous()?,
+        Some(&head.ids.contiguous()?),
+        &shift,
+        temperature,
+        key,
+        positions,
+    )?;
+    let masked = ops::which_device(
+        &head.legal,
+        &scores,
+        Array::from_f32(f32::NEG_INFINITY),
+        &stream,
+    )?;
+    let best = ops::indexing::argmax_axis_device(&masked, -1, true, &stream)?;
+    let rows = i32::try_from(positions.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    Ok(
+        ops::indexing::take_along_axis_device(&head.ids, &best, -1, &stream)?
+            .reshape_device(&[rows], &stream)?,
+    )
+}
+
 /// f32 mirror of the host top-k, nucleus and categorical steps over the
 /// unsorted `[rows, candidates]` IDs and logits.
 fn sample_top_k_nucleus(
@@ -408,26 +613,8 @@ fn sample_top_k_nucleus(
     let uniforms: Vec<f32> = uniforms.iter().map(|&u| u as f32).collect();
     let rows = i32::try_from(uniforms.len()).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
 
-    // Most likely first; the host breaks exact ties by ID, which the
-    // caller's exact re-derivation covers.
-    let descending = ops::argsort_axis_device(logits.negative_device(&stream)?, -1, &stream)?
-        .index((.., 0..top_k));
-    let head_logits = ops::indexing::take_along_axis_device(logits, &descending, -1, &stream)?;
-    let head_ids = ops::indexing::take_along_axis_device(ids, &descending, -1, &stream)?;
-    let weights = ops::exp_device(
-        head_logits
-            .subtract_device(head_logits.index((.., 0..1)), &stream)?
-            .divide_device(Array::from_f32(temperature), &stream)?,
-        &stream,
-    )?;
-    // A token is kept when the mass before it is still short of the target.
-    let kept = weights.sum_axis_device(-1, true, &stream)?;
-    let before = ops::cumsum_device(&weights, -1, false, true, &stream)?
-        .subtract_device(&weights, &stream)?;
-    let legal = before.lt_device(
-        kept.multiply_device(Array::from_f32(top_p), &stream)?,
-        &stream,
-    )?;
+    let head = NucleusHead::start(ids, logits, temperature, top_p, top_k)?;
+    let (head_ids, weights, legal) = (head.ids, head.weights, head.legal);
     let legal_weights = ops::which_device(&legal, &weights, Array::from_f32(0.0), &stream)?;
 
     // Draw in token-ID order, as the host sampler walks the vocabulary.
@@ -651,6 +838,138 @@ mod tests {
         assert!(
             checked > 600,
             "only {checked} draws were away from a boundary"
+        );
+    }
+
+    fn race_key(seed: u64) -> engine::sampling::race::RaceKey {
+        engine::sampling::race::RaceKey { seed, choice: 0 }
+    }
+
+    #[test]
+    fn race_scores_stay_within_a_quarter_window_of_the_reference() {
+        // Near each row's winner, where certification looks, the f32 scores
+        // must stay within a quarter of the window of the f64 reference
+        // shifted by the same row maximum.
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let vocab = 151_936;
+        let logits = vec![row(vocab, 3), row(vocab, 4)];
+        let mut worst = 0.0_f64;
+        for (temperature, seed) in [(0.05, 1), (0.7, 2), (1.0, 3), (2.0, 4)] {
+            let positions = [seed * 10, seed * 10 + 1];
+            let positions: Vec<u32> = positions
+                .iter()
+                .map(|&position| u32::try_from(position).expect("small"))
+                .collect();
+            let wide = rows_array(&logits);
+            let shift = wide.max_axis(-1, false).expect("row max");
+            let scores = super::super::race_scores::race_scores(
+                &wide,
+                None,
+                &shift,
+                temperature,
+                race_key(seed),
+                &positions,
+            )
+            .expect("scores");
+            scores.eval().expect("evaluated");
+            let scores = scores.as_slice::<f32>();
+            for (index, (row, &position)) in logits.iter().zip(&positions).enumerate() {
+                let maximum = f64::from(row.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+                let reference: Vec<f64> = (0_u32..)
+                    .zip(row)
+                    .map(|(id, &logit)| {
+                        engine::sampling::race::race_score(
+                            logit,
+                            temperature,
+                            race_key(seed),
+                            position,
+                            id,
+                        ) - maximum / temperature
+                    })
+                    .collect();
+                let best = reference.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                for (column, &expected) in reference.iter().enumerate() {
+                    let actual = scores[index * vocab + column];
+                    let error = (f64::from(actual) - expected).abs();
+                    // The derived bound holds everywhere ...
+                    assert!(
+                        error <= super::super::race_scores::score_error_bound(actual),
+                        "T {temperature} column {column}: error {error} at score {actual}"
+                    );
+                    // ... and near the winner it is a small part of the window.
+                    if expected >= best - 1.0 {
+                        worst = worst.max(error);
+                    }
+                }
+            }
+        }
+        assert!(
+            worst < f64::from(super::CERTIFY_WINDOW) / 4.0,
+            "worst near-winner error {worst}"
+        );
+    }
+
+    #[test]
+    fn certified_race_picks_are_the_reference_token() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let vocab = 20_000;
+        let (mut certified, mut total) = (0, 0);
+        for salt in 0..4 {
+            let logits = row(vocab, salt);
+            for (temperature, position) in [(0.6, 0_u32), (1.0, 1), (1.5, 2)]
+                .into_iter()
+                .cycle()
+                .take(30)
+                .enumerate()
+                .map(|(step, (temperature, base))| {
+                    (temperature, base + 3 * u32::try_from(step).expect("small"))
+                })
+            {
+                let key = race_key(100 + u64::try_from(salt).expect("small"));
+                let rule = Qwen3PickRule {
+                    selection: Qwen3Selection::Race {
+                        temperature,
+                        top_p: 1.0,
+                        top_k: None,
+                        key,
+                        positions: vec![position],
+                    },
+                    candidates: 0,
+                };
+                let picks = Qwen3TokenPicks::start_with(
+                    &rows_array(std::slice::from_ref(&logits)),
+                    0,
+                    &rule,
+                )
+                .expect("queued");
+                let token = picks.wait_one().expect("finite");
+                let near = picks
+                    .race_near_counts()
+                    .expect("read")
+                    .expect("whole-row race counts");
+                total += 1;
+                if near == [1] {
+                    certified += 1;
+                    let expected = engine::sampling::race::sample_race(
+                        &logits,
+                        &vec![true; vocab],
+                        temperature,
+                        key,
+                        position,
+                    )
+                    .expect("reference")
+                    .token_id;
+                    assert_eq!(
+                        u32::try_from(token).expect("token"),
+                        expected,
+                        "salt {salt} position {position}"
+                    );
+                }
+            }
+        }
+        assert!(
+            certified * 20 >= total * 19,
+            "{certified} of {total} certified"
         );
     }
 

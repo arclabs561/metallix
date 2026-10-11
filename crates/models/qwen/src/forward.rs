@@ -32,6 +32,7 @@ mod embedded;
 mod paged;
 mod picks;
 mod projection;
+mod race_scores;
 mod score;
 mod small_m;
 mod snapshot;
@@ -46,6 +47,7 @@ pub use paged::{
 pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
 pub use projection::Qwen3WeightPrecision;
 pub(crate) use projection::{dense_weight, embed_rows, project};
+pub use race_scores::{CERTIFY_WINDOW, score_error_bound};
 pub use score::{Qwen3ScoredToken, Qwen3Scores, SCORE_CHUNK_ROWS};
 pub use small_m::set_small_m_qmv;
 pub use snapshot::Qwen3KvSnapshot;
