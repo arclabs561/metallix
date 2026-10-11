@@ -25,6 +25,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # Crates depend only on their own tier or a lower one (core <- metal
+      # <- models <- serve). Standard library only, so it needs no setup.
+      - name: Check crate tiers
+        run: python3 scripts/check_crate_tiers.py
+
       - name: Verify formatting
         run: cargo fmt --check
 
