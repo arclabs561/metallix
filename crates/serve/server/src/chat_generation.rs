@@ -2443,6 +2443,48 @@ mod tests {
         sampled_picker_with(top_k, vocabulary_size, super::SamplerId::IcdfV1)
     }
 
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn constrained_race_verify_falls_back_without_advancing_the_position() {
+        use engine::constraint::{ConstraintLimits, JsonConstraintSession};
+
+        let tokenizer = json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [{"id": 4, "content": "<eos>", "special": true}],
+            "model": {"vocab": {"t": 0, "r": 1, "u": 2, "e": 3}}
+        });
+        let session = JsonConstraintSession::new(
+            &tokenizer,
+            4,
+            5,
+            json!({"const": true}),
+            ConstraintLimits {
+                max_schema_bytes: 4_096,
+                max_tokenizer_bytes: 4_096,
+                max_output_bytes: 1_024,
+            },
+        )
+        .expect("boolean grammar");
+        let mut picker = sampled_picker_with(1, 5, super::SamplerId::RaceV2);
+        picker.constraint = Some(crate::qwen_constraints::ConstraintRun::from_session(
+            session,
+        ));
+        picker.policy.as_mut().unwrap().1 = 1.0;
+        picker.policy.as_mut().unwrap().2 = None;
+        picker.applied.top_p = 1.0;
+        picker.applied.top_k = None;
+        let before = picker.policy.as_ref().unwrap().0.race_ahead(0);
+        assert!(picker.gpu_rule(0, 1, None, 5).is_some());
+        assert!(picker.gpu_rule(0, 3, None, 5).is_none());
+        assert_eq!(picker.policy.as_ref().unwrap().0.race_ahead(0), before);
+        assert_eq!(picker.pick(&[0.0; 5]).expect("full-row fallback").0, 0);
+        assert_eq!(
+            picker.policy.as_ref().unwrap().0.race_ahead(0),
+            before.map(|(key, position)| (key, position + 1))
+        );
+        assert_eq!(picker.constraint.as_ref().unwrap().decoded_bytes(), b"t");
+    }
+
     fn sampled_picker_with(
         top_k: usize,
         vocabulary_size: usize,
