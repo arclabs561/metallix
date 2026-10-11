@@ -272,6 +272,44 @@ impl SamplingPolicy {
         Ok(Some(token))
     }
 
+    /// `race-v2` under a grammar mask from a GPU pick's best-scoring rows:
+    /// the listed rows are rescored exactly, and the last listed f32 score
+    /// plus the kernel's error bound, shifted back to the reference scale,
+    /// bounds every row not listed. `None`, consuming nothing, when the list
+    /// cannot settle the pick or for `icdf-v1`.
+    #[cfg(feature = "structured-output")]
+    pub(crate) fn settle_race_constrained(
+        &mut self,
+        constraint: &mut ConstraintRun,
+        listed: &qwen::forward::Qwen3RaceListed,
+    ) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+        let temperature = self.configuration.temperature;
+        let Entropy::Race { key, position } = &mut self.entropy else {
+            return Ok(None);
+        };
+        let Some((&(_, _, bound), rows)) = listed.top.split_last() else {
+            return Ok(None);
+        };
+        let rows = rows
+            .iter()
+            .map(|&(id, logit, _)| {
+                let row = u32::try_from(id)?;
+                Ok((row, race_score(logit, temperature, *key, *position, row)))
+            })
+            .collect::<Result<Vec<_>, std::num::TryFromIntError>>()?;
+        let floor = f64::from(bound)
+            + qwen::forward::score_error_bound(bound)
+            + f64::from(listed.shift) / temperature;
+        let candidates = engine::sampling::race::RaceCandidates::new(rows, floor);
+        let token = constraint.race_from_candidates(&candidates)?;
+        if token.is_some() {
+            *position = position
+                .checked_add(1)
+                .ok_or("generated position overflow")?;
+        }
+        Ok(token)
+    }
+
     /// Commits a whole-row `race-v2` pick whose f32 scores the GPU certified;
     /// `None` for `icdf-v1`.
     pub(crate) fn accept_certified_race(&mut self, token: i32) -> Result<Option<i32>, String> {
@@ -1758,6 +1796,235 @@ mod tests {
     const GOLDEN_ICDF_V1: [i32; 24] = [
         1, 0, 4, 6, 3, 4, 1, 6, 4, 7, 1, 4, 3, 1, 4, 3, 1, 1, 3, 1, 4, 6, 0, 1,
     ];
+
+    fn race_policy(seed: u64, vocabulary: usize) -> SamplingPolicy {
+        SamplingPolicy::with_sampler(
+            SamplingConfiguration {
+                seed,
+                temperature: 0.7,
+            },
+            super::SamplerId::RaceV2,
+            vocabulary,
+        )
+    }
+
+    #[test]
+    fn race_policy_draws_the_engine_token_at_each_generated_position() {
+        // The policy's only state is the position: draw n uses position n.
+        let rows: [[f32; 8]; 3] = [
+            [0.0, 0.4, -0.3, 0.9, 0.1, -1.2, 0.6, 0.2],
+            [1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.9, 0.8],
+            [-2.0, 0.5, 0.5, -0.5, 2.0, -1.0, 0.0, 1.0],
+        ];
+        let key = engine::sampling::race::RaceKey { seed: 7, choice: 0 };
+        let mut policy = race_policy(7, 8);
+        for position in 0..24_u32 {
+            let row = &rows[usize::try_from(position).expect("small") % 3];
+            let expected = engine::sampling::race::sample_race(row, &[true; 8], 0.7, key, position)
+                .expect("engine draw")
+                .token_id;
+            let (token, _) = policy.sample(row, false).expect("policy draw");
+            assert_eq!(
+                u32::try_from(token).expect("token id"),
+                expected,
+                "position {position}"
+            );
+        }
+        assert_eq!(policy.uniform_ahead(0), None, "race-v2 draws no uniforms");
+    }
+
+    #[test]
+    fn failed_race_draw_does_not_advance_the_position() {
+        let mut after_failure = race_policy(13, 4);
+        let mut fresh = race_policy(13, 4);
+        assert!(
+            after_failure
+                .sample(&[f32::NAN, 0.0, 0.0, 0.0], true)
+                .is_err()
+        );
+        let row = [0.0, 0.3, 0.1, 0.2];
+        for _ in 0..8 {
+            assert_eq!(
+                after_failure.sample(&row, true).expect("valid draw"),
+                fresh.sample(&row, true).expect("same draw")
+            );
+        }
+    }
+
+    #[test]
+    fn race_policy_never_settles_from_renumbered_candidates() {
+        let logits = [4.0_f32, 3.0, 2.0, 1.5, 1.0, 0.5];
+        let candidates = qwen::forward::Qwen3RowCandidates {
+            top: vec![(0, 4.0), (1, 3.0), (2, 2.0), (3, 1.5)],
+            max_logit: 4.0,
+            shifted_exp_sum: 1.0,
+        };
+        let mut policy = race_policy(3, logits.len());
+        assert_eq!(
+            policy.sample_top_k_candidates(&candidates, 1.0, 2),
+            Ok(None)
+        );
+        // Nothing was drawn: the next whole-row draw is a fresh policy's first.
+        assert_eq!(
+            policy.sample(&logits, false).expect("draw"),
+            race_policy(3, logits.len())
+                .sample(&logits, false)
+                .expect("draw")
+        );
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "f32 device scores and test logits"
+    )]
+    fn constrained_race_from_listed_rows_matches_the_whole_row() {
+        // Listed rows as a device would send them: f32 scores off the shifted
+        // reference by up to the kernel's error bound, the best eight plus a
+        // bound.
+        let temperature = 0.7;
+        let mut state = 0x5eed_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            f64::from(u32::try_from(state >> 40).expect("24 bits")) / f64::from(1_u32 << 24)
+        };
+        let (mut settled, mut deferred) = (0, 0);
+        for seed in 0..400_u64 {
+            let mut listed_policy = race_policy(seed, CONSTRAINT_TEST_VOCABULARY);
+            let mut whole_policy = race_policy(seed, CONSTRAINT_TEST_VOCABULARY);
+            let mut listed_run = constrained_run(1_024);
+            let mut whole_run = constrained_run(1_024);
+            let key = engine::sampling::race::RaceKey { seed, choice: 0 };
+            for position in 0..6_u32 {
+                if whole_run.is_complete() {
+                    break;
+                }
+                let logits: Vec<f32> = (0..CONSTRAINT_TEST_VOCABULARY)
+                    .map(|_| (6.0 * next() - 3.0) as f32)
+                    .collect();
+                let shift = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut scored: Vec<(i32, f32, f32)> = (0_u32..)
+                    .zip(&logits)
+                    .map(|(row, &logit)| {
+                        let exact = engine::sampling::race::race_score(
+                            logit,
+                            temperature,
+                            key,
+                            position,
+                            row,
+                        ) - f64::from(shift) / temperature;
+                        let error = qwen::forward::score_error_bound(exact as f32);
+                        let device = exact + error * (2.0 * next() - 1.0);
+                        (i32::try_from(row).expect("row"), logit, device as f32)
+                    })
+                    .collect();
+                scored.sort_by(|left, right| right.2.total_cmp(&left.2));
+                scored.truncate(9);
+                let listed = qwen::forward::Qwen3RaceListed { top: scored, shift };
+                let (expected, _) = whole_policy
+                    .sample_constrained(&mut whole_run, &logits, false)
+                    .expect("whole-row draw");
+                let token = if let Some(token) = listed_policy
+                    .settle_race_constrained(&mut listed_run, &listed)
+                    .expect("listed draw")
+                {
+                    settled += 1;
+                    token
+                } else {
+                    deferred += 1;
+                    listed_policy
+                        .sample_constrained(&mut listed_run, &logits, false)
+                        .expect("fallback draw")
+                        .0
+                };
+                assert_eq!(token, expected, "seed {seed} position {position}");
+                assert_eq!(listed_run.decoded_bytes(), whole_run.decoded_bytes());
+            }
+        }
+        assert!(
+            settled > 40 && deferred > 0,
+            "settled {settled}, deferred {deferred}"
+        );
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn listed_rows_defer_when_an_unlisted_legal_row_can_win() {
+        // The boolean grammar allows `t` (6) and `f` (10) first. `f` is the
+        // race winner but is left out; the bound is its own device score, so
+        // the listed `t` must not be accepted. Row 0 is illegal and large, so
+        // the shift is large and a floor that dropped it would accept `t`.
+        let temperature = 0.7;
+        let mut logits = vec![-50.0_f32; CONSTRAINT_TEST_VOCABULARY];
+        logits[0] = 20.0;
+        logits[6] = -1.0;
+        logits[10] = 4.0;
+        let shift = 20.0_f32;
+        let key = engine::sampling::race::RaceKey { seed: 5, choice: 0 };
+        let device = |row: u32| {
+            let exact =
+                engine::sampling::race::race_score(logits[row as usize], temperature, key, 0, row)
+                    - f64::from(shift) / temperature;
+            #[allow(clippy::cast_possible_truncation, reason = "device scores are f32")]
+            let device = exact as f32;
+            device
+        };
+        assert!(device(10) > device(6), "this key must let `f` win");
+        let listed = qwen::forward::Qwen3RaceListed {
+            top: vec![
+                (0, 20.0, device(0)),
+                (6, -1.0, device(6)),
+                (10, 4.0, device(10)),
+            ],
+            shift,
+        };
+        let mut policy = race_policy(5, CONSTRAINT_TEST_VOCABULARY);
+        let mut constraint = constrained_run(1_024);
+        assert_eq!(
+            policy
+                .settle_race_constrained(&mut constraint, &listed)
+                .expect("listed settle"),
+            None
+        );
+        // Nothing was consumed: the whole-row draw then picks `f`.
+        let (token, _) = policy
+            .sample_constrained(&mut constraint, &logits, false)
+            .expect("whole-row draw");
+        assert_eq!(token, 10);
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[test]
+    fn constrained_race_policy_matches_the_engine_session() {
+        let key = engine::sampling::race::RaceKey {
+            seed: 21,
+            choice: 0,
+        };
+        let mut policy = race_policy(21, CONSTRAINT_TEST_VOCABULARY);
+        let mut constraint = constrained_run(1_024);
+        let mut reference = constrained_run(1_024);
+        let mut logits = vec![0.0_f32; CONSTRAINT_TEST_VOCABULARY];
+        for position in 0..5_u32 {
+            if constraint.is_complete() {
+                break;
+            }
+            for (row, logit) in logits.iter_mut().enumerate() {
+                *logit =
+                    f32::from(u8::try_from((row * 7 + position as usize * 3) % 11).expect("small"))
+                        * 0.3;
+            }
+            let (token, _) = policy
+                .sample_constrained(&mut constraint, &logits, false)
+                .expect("constrained race draw");
+            let (expected, _) = reference
+                .sample_race(&logits, 0.7, key, position, false)
+                .expect("reference draw");
+            assert_eq!(token, expected, "position {position}");
+        }
+    }
 
     #[test]
     fn uniform_conversion_is_half_open_and_uses_all_top_53_bits() {

@@ -14,7 +14,9 @@ use std::{
 
 use engine::speculative::{SpeculationRequest, SpeculationStats};
 use qwen::{
-    forward::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks},
+    forward::{
+        Qwen3PickRule, Qwen3RaceListed, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks,
+    },
     metal::{Qwen3FloatPrecision, Qwen3MlxWeights, Qwen3WeightPrecision},
 };
 use serde::Serialize;
@@ -309,6 +311,13 @@ pub(crate) struct SamplingRequest {
     pub(crate) top_k: Option<u32>,
     pub(crate) seed: Option<u64>,
 }
+
+/// Best-scoring rows a constrained `race-v2` GPU pick reads back; the
+/// grammar's legal winner is among them on most steps.
+const RACE_LISTED_ROWS: usize = 8;
+
+/// The seeded sampler a request gets when it names none.
+pub(crate) const DEFAULT_SAMPLER: SamplerId = SamplerId::IcdfV1;
 
 /// Sampling defaults a checkpoint ships in `generation_config.json`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1984,8 +1993,30 @@ impl TokenPicker {
         let _entered = span.enter();
         #[cfg(feature = "structured-output")]
         if self.constraint.is_some() {
-            SamplingOutcome::Fallback(SamplingFallback::Constraint).record(&span);
-            return None;
+            // Only race-v2 settles a grammar pick from a few rows: its token
+            // does not depend on which rows the mask was read for. A verify
+            // of several rows reads whole rows, as unconstrained race does.
+            let race = self
+                .policy
+                .as_ref()
+                .and_then(|(policy, ..)| policy.race_ahead(ahead))
+                .filter(|_| top_logprobs.is_none() && rows == 1);
+            let Some((key, position)) = race else {
+                SamplingOutcome::Fallback(SamplingFallback::Constraint).record(&span);
+                return None;
+            };
+            SamplingOutcome::Peek.record(&span);
+            return Some(Qwen3PickRule {
+                selection: Qwen3Selection::Race {
+                    temperature: self.applied.temperature,
+                    top_p: 1.0,
+                    top_k: None,
+                    key,
+                    positions: vec![position],
+                    listed: RACE_LISTED_ROWS,
+                },
+                candidates: 0,
+            });
         }
         let receipts = top_logprobs.map_or(0, |top| usize::from(top) + 9);
         let rule = match &self.policy {
@@ -2011,6 +2042,7 @@ impl TokenPicker {
                         top_k: *top_k,
                         key,
                         positions: vec![position],
+                        listed: 0,
                     },
                     candidates: receipts
                         .max(top_k.map_or(0, |top_k| top_k_window(top_k, vocabulary_size))),
@@ -2052,10 +2084,26 @@ impl TokenPicker {
         gpu_token: i32,
         candidates: Option<&Qwen3RowCandidates>,
         certified: bool,
+        listed: Option<&Qwen3RaceListed>,
     ) -> Result<Option<i32>, String> {
         let span = self.sampling_span(SamplingPath::GpuCandidates);
         let _entered = span.enter();
-        let result = match (self.policy.as_mut(), candidates) {
+        #[cfg(feature = "structured-output")]
+        let constrained =
+            self.constraint
+                .as_mut()
+                .map(|constraint| match (self.policy.as_mut(), listed) {
+                    (Some((policy, ..)), Some(listed)) => policy
+                        .settle_race_constrained(constraint, listed)
+                        .map_err(|error| error.to_string()),
+                    _ => Ok(None),
+                });
+        #[cfg(not(feature = "structured-output"))]
+        let constrained: Option<Result<Option<i32>, String>> = {
+            let _ = listed;
+            None
+        };
+        let result = constrained.unwrap_or_else(|| match (self.policy.as_mut(), candidates) {
             (None, _) => Ok(Some(gpu_token)),
             (Some((policy, top_p, Some(top_k))), Some(candidates)) => {
                 if policy.race_ahead(0).is_some() {
@@ -2066,7 +2114,7 @@ impl TokenPicker {
             }
             (Some((policy, _, None)), _) if certified => policy.accept_certified_race(gpu_token),
             (Some(_), _) => Ok(None),
-        };
+        });
         match &result {
             Ok(Some(_)) => SamplingOutcome::Selected(self.sampling_mode()),
             Ok(None) => SamplingOutcome::Fallback(SamplingFallback::InsufficientCandidates),
@@ -2074,6 +2122,15 @@ impl TokenPicker {
         }
         .record(&span);
         result
+    }
+
+    /// Whether the last consumed token completed the schema grammar.
+    fn grammar_complete(&self) -> bool {
+        #[cfg(feature = "structured-output")]
+        if let Some(constraint) = &self.constraint {
+            return constraint.is_complete();
+        }
+        false
     }
 
     /// Returns the next token and whether it completed the schema grammar.
@@ -2330,7 +2387,7 @@ mod tests {
         assert_eq!(next(&picker), before);
         assert!(
             picker
-                .pick_from_candidates(0, None, false)
+                .pick_from_candidates(0, None, false, None)
                 .unwrap()
                 .is_none()
         );
@@ -2350,7 +2407,7 @@ mod tests {
             shifted_exp_sum: 1.0,
         };
         let second = picker
-            .pick_from_candidates(0, Some(&candidates), false)
+            .pick_from_candidates(0, Some(&candidates), false, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2441,7 +2498,7 @@ mod tests {
         for _ in 0..20 {
             let candidates = top_candidates(&logits, rule.candidates);
             let settled = picker
-                .pick_from_candidates(0, Some(&candidates), false)
+                .pick_from_candidates(0, Some(&candidates), false, None)
                 .expect("valid candidates")
                 .expect("the boundary tie settles");
             assert_eq!(settled, control.pick(&logits).expect("full row").0);
@@ -2473,7 +2530,7 @@ mod tests {
         for _ in 0..20 {
             let candidates = top_candidates(&logits, rule.candidates);
             let settled = picker
-                .pick_from_candidates(0, Some(&candidates), false)
+                .pick_from_candidates(0, Some(&candidates), false, None)
                 .expect("valid candidates")
                 .expect("the boundary tie settles");
             assert_eq!(settled, control.pick(&logits).expect("full row").0);

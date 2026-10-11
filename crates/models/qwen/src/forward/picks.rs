@@ -57,7 +57,22 @@ pub enum Qwen3Selection {
         key: RaceKey,
         /// The generated position of each row's token.
         positions: Vec<u32>,
+        /// Without `top_k`: how many best-scoring rows to read back, plus
+        /// one more that bounds every row not read, so a host can settle the
+        /// pick under a mask it applies itself. Zero reads none.
+        listed: usize,
     },
+}
+
+/// The best-scoring rows of a whole-row race pick, best first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Qwen3RaceListed {
+    /// `(token ID, logit, f32 score)`, descending score; the last entry's
+    /// score bounds every row not listed.
+    pub top: Vec<(i32, f32, f32)>,
+    /// The row maximum the scores were shifted by: an f32 score `s` stands
+    /// for the reference score `s + shift / temperature`.
+    pub shift: f32,
 }
 
 /// A GPU pick and how many of each row's largest logits to read back with it.
@@ -125,6 +140,9 @@ pub struct Qwen3TokenPicks {
     /// For a whole-row race pick, `[rows]` uint32 counts of rows scoring
     /// within [`CERTIFY_WINDOW`] of each row's best, the winner included.
     near: Option<Array>,
+    /// For a whole-row race pick with listed rows: `[rows, listed + 1]`
+    /// uint32 IDs, f32 logits and f32 scores, and the `[rows]` shifts.
+    listed: Option<[Array; 4]>,
     /// The `[rows, vocab]` logits, kept so a caller can still read whole rows.
     logits: Array,
 }
@@ -181,9 +199,18 @@ impl Qwen3PickRule {
             top_p,
             top_k,
             positions,
+            listed,
             ..
         } = &self.selection
         {
+            if *listed > 0
+                && (top_k.is_some()
+                    || i32::try_from(*listed).map_or(true, |listed| listed + 1 >= vocab))
+            {
+                return Err(Qwen3ForwardError::InvalidPickRule(
+                    "listed race rows need no top_k and fewer rows than the vocabulary",
+                ));
+            }
             if !(temperature.is_finite() && *temperature > 0.0) {
                 return Err(Qwen3ForwardError::InvalidPickRule("temperature"));
             }
@@ -264,6 +291,7 @@ impl Qwen3TokenPicks {
             None
         };
         let mut near = None;
+        let mut listed_rows = None;
         let tokens = match &rule.selection {
             Qwen3Selection::Greedy => ops::indexing::argmax_axis_device(rows, -1, false, &stream)?,
             Qwen3Selection::Race {
@@ -272,6 +300,7 @@ impl Qwen3TokenPicks {
                 top_k: Some(top_k),
                 key,
                 positions,
+                ..
             } => {
                 let candidates = candidates
                     .as_ref()
@@ -285,10 +314,14 @@ impl Qwen3TokenPicks {
                 top_k: None,
                 key,
                 positions,
+                listed,
                 ..
             } => {
                 let shift = wide.max_axis_device(-1, false, &stream)?;
                 let scores = race_scores(&wide, None, &shift, *temperature, *key, positions)?;
+                if *listed > 0 {
+                    listed_rows = Some(best_scoring_rows(&wide, &scores, &shift, *listed)?);
+                }
                 let best = scores.max_axis_device(-1, true, &stream)?;
                 near = Some(
                     scores
@@ -324,6 +357,9 @@ impl Qwen3TokenPicks {
         };
         let mut queued = vec![&tokens, &finite];
         queued.extend(&near);
+        if let Some(listed) = &listed_rows {
+            queued.extend(listed);
+        }
         if let Some(candidates) = &candidates {
             queued.extend([
                 &candidates.ids,
@@ -339,6 +375,7 @@ impl Qwen3TokenPicks {
             binding,
             candidates,
             near,
+            listed: listed_rows,
             logits: rows.clone(),
         })
     }
@@ -444,6 +481,41 @@ impl Qwen3TokenPicks {
         Ok(Some(near.as_slice::<u32>().to_vec()))
     }
 
+    /// For a whole-row race pick with listed rows, each row's best-scoring
+    /// rows, best first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShapeOverflow`](crate::forward::Qwen3ForwardError::ShapeOverflow)
+    /// when a listed token ID does not fit, and
+    /// [`Mlx`](crate::forward::Qwen3ForwardError::Mlx) when the rows cannot be
+    /// evaluated or read back.
+    pub fn race_listed(&self) -> Result<Option<Vec<Qwen3RaceListed>>, Qwen3ForwardError> {
+        let Some([logits, scores, ids, shift]) = &self.listed else {
+            return Ok(None);
+        };
+        mlx_rs::transforms::eval([logits, scores, ids, shift])?;
+        let width =
+            usize::try_from(ids.shape()[1]).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+        ids.as_slice::<u32>()
+            .chunks_exact(width)
+            .zip(logits.as_slice::<f32>().chunks_exact(width))
+            .zip(scores.as_slice::<f32>().chunks_exact(width))
+            .zip(shift.as_slice::<f32>())
+            .map(|(((ids, logits), scores), &shift)| {
+                let mut top = ids
+                    .iter()
+                    .zip(logits)
+                    .zip(scores)
+                    .map(|((&id, &logit), &score)| Ok((to_token(id)?, logit, score)))
+                    .collect::<Result<Vec<_>, Qwen3ForwardError>>()?;
+                top.sort_by(|left, right| right.2.total_cmp(&left.2).then(left.0.cmp(&right.0)));
+                Ok(Qwen3RaceListed { top, shift })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     /// Reads back the whole `[rows, vocab]` logits as f32 rows, for a caller
     /// whose candidates could not settle its answer.
     ///
@@ -488,6 +560,28 @@ impl Qwen3TokenPicks {
         wide.eval()?;
         Ok(wide.as_slice::<f32>().to_vec())
     }
+}
+
+/// `[logits, scores, ids, shift]` for each row's `listed + 1` best scores,
+/// as [`Qwen3TokenPicks::race_listed`] reads them back.
+fn best_scoring_rows(
+    wide: &Array,
+    scores: &Array,
+    shift: &Array,
+    listed: usize,
+) -> Result<[Array; 4], Qwen3ForwardError> {
+    let stream = StreamOrDevice::gpu();
+    let count = i32::try_from(listed + 1).map_err(|_| Qwen3ForwardError::ShapeOverflow)?;
+    let ids =
+        ops::argpartition_axis_device(scores.negative_device(&stream)?, count - 1, -1, &stream)?
+            .index((.., 0..count))
+            .contiguous()?;
+    Ok([
+        ops::indexing::take_along_axis_device(wide, &ids, -1, &stream)?,
+        ops::indexing::take_along_axis_device(scores, &ids, -1, &stream)?,
+        ids,
+        shift.clone(),
+    ])
 }
 
 fn to_token(id: u32) -> Result<i32, Qwen3ForwardError> {
@@ -933,6 +1027,7 @@ mod tests {
                         top_k: None,
                         key,
                         positions: vec![position],
+                        listed: 0,
                     },
                     candidates: 0,
                 };
@@ -971,6 +1066,68 @@ mod tests {
             certified * 20 >= total * 19,
             "{certified} of {total} certified"
         );
+    }
+
+    #[test]
+    fn listed_race_rows_are_the_best_scores_and_bound_the_rest() {
+        let _gpu = GPU_TEST_LOCK.lock().expect("GPU test lock");
+        let logits = vec![row(6_000, 7), row(6_000, 8)];
+        let key = race_key(41);
+        let rule = Qwen3PickRule {
+            selection: Qwen3Selection::Race {
+                temperature: 0.8,
+                top_p: 1.0,
+                top_k: None,
+                key,
+                positions: vec![5, 6],
+                listed: 8,
+            },
+            candidates: 0,
+        };
+        let picks = Qwen3TokenPicks::start_with(&rows_array(&logits), 0, &rule).expect("queued");
+        let listed = picks.race_listed().expect("read").expect("listed rows");
+        for ((row, position), listed) in logits.iter().zip([5_u32, 6]).zip(listed) {
+            assert_eq!(listed.top.len(), 9);
+            let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(listed.shift, maximum);
+            let shift = f64::from(maximum) / 0.8;
+            let mut reference: Vec<(u32, f64)> = (0_u32..)
+                .zip(row)
+                .map(|(id, &logit)| {
+                    (
+                        id,
+                        engine::sampling::race::race_score(logit, 0.8, key, position, id) - shift,
+                    )
+                })
+                .collect();
+            reference.sort_by(|left, right| right.1.total_cmp(&left.1));
+            let bound = f64::from(listed.top[8].2);
+            let window = f64::from(super::CERTIFY_WINDOW) / 4.0;
+            for &(id, logit, score) in &listed.top {
+                let index = usize::try_from(id).expect("id");
+                assert_eq!(logit, row[index]);
+                let exact = engine::sampling::race::race_score(
+                    logit,
+                    0.8,
+                    key,
+                    position,
+                    u32::try_from(id).expect("id"),
+                ) - shift;
+                assert!((f64::from(score) - exact).abs() < window, "id {id}");
+            }
+            // Every row left out scores at most the last listed score plus
+            // the f32 error bound.
+            let listed_ids: Vec<u32> = listed
+                .top
+                .iter()
+                .map(|&(id, _, _)| u32::try_from(id).expect("id"))
+                .collect();
+            for &(id, exact) in &reference {
+                if !listed_ids.contains(&id) {
+                    assert!(exact <= bound + window, "unlisted {id} scores {exact}");
+                }
+            }
+        }
     }
 
     #[test]

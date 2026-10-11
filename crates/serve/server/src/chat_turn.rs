@@ -343,9 +343,11 @@ impl TurnLoop {
             .race_near_counts()
             .map_err(|error| error.to_string())?
             .is_some_and(|near| near.get(row) == Some(&1));
+        let listed = picks.race_listed().map_err(|error| error.to_string())?;
+        let listed = listed.as_ref().and_then(|rows| rows.get(row));
         let token = if let Some(token) = self
             .picker
-            .pick_from_candidates(gpu_token, candidates, certified)?
+            .pick_from_candidates(gpu_token, candidates, certified, listed)?
         {
             token
         } else {
@@ -375,7 +377,11 @@ impl TurnLoop {
                 })
             }
         };
-        Ok((self.accept(format, token, false, receipt)?, read_whole))
+        let grammar_complete = self.picker.grammar_complete();
+        Ok((
+            self.accept(format, token, grammar_complete, receipt)?,
+            read_whole,
+        ))
     }
 
     /// Whether a speculative verify may take the GPU's argmax of each
@@ -397,7 +403,7 @@ impl TurnLoop {
     ) -> Result<Accepted, String> {
         let token = self
             .picker
-            .pick_from_candidates(gpu_token, None, false)?
+            .pick_from_candidates(gpu_token, None, false, None)?
             .ok_or("only a greedy turn can accept a GPU pick without candidates")?;
         self.accept(format, token, false, None)
     }

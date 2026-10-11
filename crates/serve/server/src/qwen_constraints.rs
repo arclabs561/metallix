@@ -267,6 +267,53 @@ impl ConstraintRun {
         uniform: f64,
         logprobs: bool,
     ) -> Result<(i32, Option<Value>), Box<dyn std::error::Error>> {
+        self.sample_with(logits, logprobs, |session| {
+            session.select_categorical_with_logprobs(logits, temperature, uniform)
+        })
+    }
+
+    /// [`Self::sample_categorical`] under the `race-v2` sampler at the
+    /// request's generated position.
+    pub(crate) fn sample_race(
+        &mut self,
+        logits: &[f32],
+        temperature: f64,
+        key: engine::sampling::race::RaceKey,
+        position: u32,
+        logprobs: bool,
+    ) -> Result<(i32, Option<Value>), Box<dyn std::error::Error>> {
+        self.sample_with(logits, logprobs, |session| {
+            session.select_race_with_logprobs(logits, temperature, key, position)
+        })
+    }
+
+    /// Consumes the `race-v2` winner from a candidate list when the list
+    /// settles it under the grammar mask; `None` consumes nothing.
+    pub(crate) fn race_from_candidates(
+        &mut self,
+        candidates: &engine::sampling::race::RaceCandidates,
+    ) -> Result<Option<i32>, Box<dyn std::error::Error>> {
+        let started = Instant::now();
+        let step = self.session.select_race_from_candidates(candidates)?;
+        self.sampling_ms
+            .push(started.elapsed().as_secs_f64() * 1000.0);
+        let token_id = match step {
+            None => return Ok(None),
+            Some(ConstraintStep::Token { token_id }) => token_id,
+            Some(ConstraintStep::Complete { token_id }) => {
+                self.complete = true;
+                token_id
+            }
+        };
+        Ok(Some(i32::try_from(token_id)?))
+    }
+
+    fn sample_with(
+        &mut self,
+        logits: &[f32],
+        logprobs: bool,
+        select: impl FnOnce(&mut JsonConstraintSession) -> SampledStep,
+    ) -> Result<(i32, Option<Value>), Box<dyn std::error::Error>> {
         let maximum_token_id = logits
             .len()
             .checked_sub(1)

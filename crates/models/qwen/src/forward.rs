@@ -44,7 +44,9 @@ pub use paged::{
     BatchDecoded, BatchReadback, PagedChunk, PagedPrefill, PagedQwen3Session, QueuedDecode,
     StepInput,
 };
-pub use picks::{Qwen3PickRule, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks};
+pub use picks::{
+    Qwen3PickRule, Qwen3RaceListed, Qwen3RowCandidates, Qwen3Selection, Qwen3TokenPicks,
+};
 pub use projection::Qwen3WeightPrecision;
 pub(crate) use projection::{dense_weight, embed_rows, project};
 pub use race_scores::{CERTIFY_WINDOW, score_error_bound};
