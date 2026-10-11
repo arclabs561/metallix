@@ -158,58 +158,46 @@ impl AudioEncoder {
             match control {
                 EncoderControl::ContinuousPositions => Layout::ContinuousPositions,
                 EncoderControl::FullAttention => Layout::FullAttention,
+                EncoderControl::UnfusedBias => Layout::UnfusedBias,
             },
         )
     }
 
-    fn encode_with(&self, mel: &audio::LogMel, layout: Layout) -> Result<Array, EncoderError> {
-        let stream = StreamOrDevice::gpu();
-        if mel.bins() != MEL_BINS || mel.frames() == 0 {
-            return Err(EncoderError::Input {
-                bins: mel.bins(),
-                frames: mel.frames(),
-            });
-        }
-        let dtype = self.dtype();
-        let chunks = chunk_lengths(mel.frames());
-        let hidden = self.convolve_chunks(mel, &chunks)?;
-        let time = hidden.shape()[1];
+    /// The encoder's input to its first layer, each layer's output and the
+    /// final norm's output, each `[frames, d_model]`, for locating where a
+    /// lower precision drifts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::encode`].
+    #[cfg(feature = "parity-controls")]
+    pub fn encode_stages(&self, mel: &audio::LogMel) -> Result<Vec<Array>, EncoderError> {
+        let mut stages = Vec::with_capacity(self.config.layers + 2);
+        self.encode_into(mel, Layout::Reference, Some(&mut stages))?;
+        Ok(stages)
+    }
 
-        // Keep each chunk's valid frames, in order. Adding positions to the
-        // kept rows equals the reference's add before masking, elementwise.
-        let mut valid = Vec::with_capacity(encoder_frames(mel.frames()));
-        let mut position = Vec::with_capacity(valid.capacity());
-        let time_usize = usize::try_from(time).map_err(|_| EncoderError::Shape)?;
-        for (chunk, &length) in chunks.iter().enumerate() {
-            for frame in 0..encoder_frames(length) {
-                valid.push(as_i32(chunk * time_usize + frame)?);
-                position.push(match layout {
-                    Layout::ContinuousPositions => as_i32(position.len())?,
-                    Layout::Reference | Layout::FullAttention => as_i32(frame)?,
-                });
-            }
-        }
-        let frames = valid.len();
-        if matches!(layout, Layout::ContinuousPositions)
-            && frames > self.config.max_source_positions
-        {
-            return Err(EncoderError::Shape);
-        }
+    fn encode_with(&self, mel: &audio::LogMel, layout: Layout) -> Result<Array, EncoderError> {
+        self.encode_into(mel, layout, None)
+    }
+
+    fn encode_into(
+        &self,
+        mel: &audio::LogMel,
+        layout: Layout,
+        mut stages: Option<&mut Vec<Array>>,
+    ) -> Result<Array, EncoderError> {
+        let stream = StreamOrDevice::gpu();
+        let (flat, frames) = self.embed_frames(mel, layout)?;
         let d_model = as_i32(self.config.d_model)?;
-        let positions = self
-            .positions
-            .take_axis_device(Array::from_slice(&position, &[as_i32(frames)?]), 0, &stream)?
-            .as_dtype_device(dtype, &stream)?;
-        let flat = hidden
-            .reshape_device(&[-1, d_model], &stream)?
-            .take_axis_device(Array::from_slice(&valid, &[as_i32(frames)?]), 0, &stream)?
-            .add_device(&positions, &stream)?;
 
         // Lay the frames out as [windows, window, d_model]; the last window is
         // padded by repeating frame 0, and those keys are masked.
         let window = match layout {
             Layout::FullAttention => frames,
-            Layout::Reference | Layout::ContinuousPositions => self.config.window_frames(),
+            Layout::Reference | Layout::ContinuousPositions | Layout::UnfusedBias => {
+                self.config.window_frames()
+            }
         };
         let windows = frames.div_ceil(window);
         let padded = windows * window;
@@ -232,14 +220,33 @@ impl AudioEncoder {
             ))
         };
 
+        let rows = |hidden: &Array| -> Result<Array, EncoderError> {
+            Ok(hidden
+                .reshape_device(&[as_i32(padded)?, d_model], &stream)?
+                .index_device((0..as_i32(frames)?, ..), &stream))
+        };
+        if let Some(stages) = stages.as_deref_mut() {
+            stages.push(rows(&hidden)?);
+        }
         for layer in 0..self.config.layers {
-            hidden = self.layer(layer, &hidden, key_mask.as_ref())?;
+            hidden = self.layer(
+                layer,
+                &hidden,
+                key_mask.as_ref(),
+                !matches!(layout, Layout::UnfusedBias),
+            )?;
+            if let Some(stages) = stages.as_deref_mut() {
+                stages.push(rows(&hidden)?);
+            }
         }
         hidden = layer_norm(
             &hidden,
             self.tensor("ln_post.weight")?,
             self.tensor("ln_post.bias")?,
         )?;
+        if let Some(stages) = stages {
+            stages.push(rows(&hidden)?);
+        }
         hidden = gelu(&linear(
             &hidden,
             self.tensor("proj1.weight")?,
@@ -253,6 +260,59 @@ impl AudioEncoder {
         Ok(hidden
             .reshape_device(&[as_i32(padded)?, as_i32(self.config.output_dim)?], &stream)?
             .index_device((0..as_i32(frames)?, ..), &stream))
+    }
+
+    /// The convolution front end, the conv-out projection and the positions:
+    /// `[frames, d_model]` rows for the clip's valid encoder frames.
+    fn embed_frames(
+        &self,
+        mel: &audio::LogMel,
+        layout: Layout,
+    ) -> Result<(Array, usize), EncoderError> {
+        let stream = StreamOrDevice::gpu();
+        if mel.bins() != MEL_BINS || mel.frames() == 0 {
+            return Err(EncoderError::Input {
+                bins: mel.bins(),
+                frames: mel.frames(),
+            });
+        }
+        let dtype = self.dtype();
+        let chunks = chunk_lengths(mel.frames());
+        let hidden = self.convolve_chunks(mel, &chunks)?;
+        let time = hidden.shape()[1];
+
+        // Keep each chunk's valid frames, in order. Adding positions to the
+        // kept rows equals the reference's add before masking, elementwise.
+        let mut valid = Vec::with_capacity(encoder_frames(mel.frames()));
+        let mut position = Vec::with_capacity(valid.capacity());
+        let time_usize = usize::try_from(time).map_err(|_| EncoderError::Shape)?;
+        for (chunk, &length) in chunks.iter().enumerate() {
+            for frame in 0..encoder_frames(length) {
+                valid.push(as_i32(chunk * time_usize + frame)?);
+                position.push(match layout {
+                    Layout::ContinuousPositions => as_i32(position.len())?,
+                    Layout::Reference | Layout::FullAttention | Layout::UnfusedBias => {
+                        as_i32(frame)?
+                    }
+                });
+            }
+        }
+        let frames = valid.len();
+        if matches!(layout, Layout::ContinuousPositions)
+            && frames > self.config.max_source_positions
+        {
+            return Err(EncoderError::Shape);
+        }
+        let d_model = as_i32(self.config.d_model)?;
+        let positions = self
+            .positions
+            .take_axis_device(Array::from_slice(&position, &[as_i32(frames)?]), 0, &stream)?
+            .as_dtype_device(dtype, &stream)?;
+        let flat = hidden
+            .reshape_device(&[-1, d_model], &stream)?
+            .take_axis_device(Array::from_slice(&valid, &[as_i32(frames)?]), 0, &stream)?
+            .add_device(&positions, &stream)?;
+        Ok((flat, frames))
     }
 
     /// Zero-pads mel chunks, applies the three convolutions and projects
@@ -315,6 +375,7 @@ impl AudioEncoder {
         layer: usize,
         hidden: &Array,
         key_mask: Option<&Array>,
+        fused_bias: bool,
     ) -> Result<Array, EncoderError> {
         let stream = StreamOrDevice::gpu();
         let base = format!("layers.{layer}");
@@ -329,10 +390,11 @@ impl AudioEncoder {
             self.tensor(&format!("{base}.self_attn_layer_norm.bias"))?,
         )?;
         let project = |name: &str| -> Result<Array, EncoderError> {
-            Ok(linear(
+            Ok(linear_with(
                 &normed,
                 self.tensor(&format!("{base}.self_attn.{name}.weight"))?,
                 Some(self.tensor(&format!("{base}.self_attn.{name}.bias"))?),
+                fused_bias,
             )?
             .reshape_device(&[windows, window, heads, head_dim], &stream)?
             .transpose_axes_device(&[0, 2, 1, 3], &stream)?)
@@ -354,10 +416,11 @@ impl AudioEncoder {
         )?
         .transpose_axes_device(&[0, 2, 1, 3], &stream)?
         .reshape_device(&[windows, window, heads * head_dim], &stream)?;
-        let attended = linear(
+        let attended = linear_with(
             &attended,
             self.tensor(&format!("{base}.self_attn.out_proj.weight"))?,
             Some(self.tensor(&format!("{base}.self_attn.out_proj.bias"))?),
+            fused_bias,
         )?;
         let residual = hidden.add_device(&attended, &stream)?;
 
@@ -366,15 +429,17 @@ impl AudioEncoder {
             self.tensor(&format!("{base}.final_layer_norm.weight"))?,
             self.tensor(&format!("{base}.final_layer_norm.bias"))?,
         )?;
-        let expanded = gelu(&linear(
+        let expanded = gelu(&linear_with(
             &normed,
             self.tensor(&format!("{base}.fc1.weight"))?,
             Some(self.tensor(&format!("{base}.fc1.bias"))?),
+            fused_bias,
         )?)?;
-        let contracted = linear(
+        let contracted = linear_with(
             &expanded,
             self.tensor(&format!("{base}.fc2.weight"))?,
             Some(self.tensor(&format!("{base}.fc2.bias"))?),
+            fused_bias,
         )?;
         Ok(residual.add_device(&contracted, &stream)?)
     }
@@ -400,6 +465,7 @@ enum Layout {
     Reference,
     ContinuousPositions,
     FullAttention,
+    UnfusedBias,
 }
 
 /// Deliberate deviations from the reference encoder, for negative controls.
@@ -410,6 +476,10 @@ pub enum EncoderControl {
     ContinuousPositions,
     /// One attention window over the whole clip instead of 8 s windows.
     FullAttention,
+    /// Linear biases added after the matmul's output is rounded, instead of
+    /// inside it (the ablation behind fusing them; the same as the
+    /// reference layout when the weights are f32).
+    UnfusedBias,
 }
 
 fn required_tensors(config: &AudioEncoderConfig) -> Vec<(String, Vec<i32>)> {
@@ -506,13 +576,36 @@ fn layer_norm(input: &Array, weight: &Array, bias: &Array) -> Result<Array, Enco
     )?)
 }
 
+/// `input @ weight^T + bias`, with the bias added inside the matmul so a
+/// reduced-precision result is rounded once, as torch's `addmm` does.
 fn linear(input: &Array, weight: &Array, bias: Option<&Array>) -> Result<Array, EncoderError> {
+    linear_with(input, weight, bias, true)
+}
+
+fn linear_with(
+    input: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    fused_bias: bool,
+) -> Result<Array, EncoderError> {
     let stream = StreamOrDevice::gpu();
-    let output = input.matmul_device(weight.transpose_device(&stream)?, &stream)?;
-    Ok(match bias {
-        Some(bias) => output.add_device(bias, &stream)?,
-        None => output,
-    })
+    let transposed = weight.transpose_device(&stream)?;
+    match bias {
+        Some(bias) if fused_bias => {
+            let shape = input.shape().to_vec();
+            let rows = input.reshape_device(&[-1, shape[shape.len() - 1]], &stream)?;
+            let mut out_shape = shape;
+            *out_shape.last_mut().ok_or(EncoderError::Shape)? = weight.shape()[0];
+            Ok(
+                ops::addmm_device(bias, &rows, &transposed, 1.0, 1.0, &stream)?
+                    .reshape_device(&out_shape, &stream)?,
+            )
+        }
+        Some(bias) => Ok(input
+            .matmul_device(&transposed, &stream)?
+            .add_device(bias, &stream)?),
+        None => Ok(input.matmul_device(&transposed, &stream)?),
+    }
 }
 
 fn as_i32(value: usize) -> Result<i32, EncoderError> {
