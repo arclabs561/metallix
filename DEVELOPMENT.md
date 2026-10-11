@@ -504,8 +504,8 @@ replies. It cannot be combined with a JSON schema.
 `/v1/chat/completions` and `/v1/responses` accept `chat_template_kwargs`, as
 vLLM and SGLang do: extra variables for the checkpoint's chat template, such as
 Qwen3.6's `preserve_thinking`, which keeps earlier turns' reasoning in the
-prompt. That also keeps the prompt a prefix of the next one, so the prefix
-cache reuses more. At most 16 names; each value a boolean, number, string (up
+prompt. This can preserve more of the prompt prefix for reuse by the prefix
+cache. At most 16 names; each value a boolean, number, string (up
 to 1 KiB) or null. `enable_thinking` and `reasoning_effort` there act as the
 reasoning-effort field does, and must agree with it when both are sent. Names
 the server sets itself (`messages`, `tools`, `add_generation_prompt`,

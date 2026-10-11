@@ -194,6 +194,12 @@ pub(crate) fn thinking_and_template_kwargs(
     let object = kwargs
         .as_object_mut()
         .ok_or("chat_template_kwargs must be an object")?;
+    if object.len() > chat_format::MAX_TEMPLATE_KWARGS {
+        return Err(format!(
+            "chat_template_kwargs has more than {} entries",
+            chat_format::MAX_TEMPLATE_KWARGS
+        ));
+    }
     let kwarg_effort = match object.remove("reasoning_effort") {
         None => None,
         Some(Value::String(effort)) => Some(effort),
@@ -1043,6 +1049,35 @@ mod tests {
     use super::*;
     use crate::chat_generation::ChatFinishReason;
     use proptest::prelude::*;
+
+    #[test]
+    fn chat_template_kwargs_limit_counts_thinking_aliases() {
+        for count in [16, 17, 18] {
+            let mut kwargs = serde_json::Map::new();
+            kwargs.insert("enable_thinking".into(), json!(true));
+            kwargs.insert("reasoning_effort".into(), json!("high"));
+            for index in 2..count {
+                kwargs.insert(format!("variable_{index}"), json!(true));
+            }
+            assert_eq!(kwargs.len(), count);
+            let result = thinking_and_template_kwargs(
+                "reasoning.effort",
+                None,
+                Some(&Value::Object(kwargs)),
+            );
+            if count == 16 {
+                let (thinking, effort, variables) = result.expect("16 names are permitted");
+                assert!(thinking);
+                assert_eq!(effort.as_deref(), Some("high"));
+                assert_eq!(variables.iter().count(), 14);
+            } else {
+                assert_eq!(
+                    result.expect_err("thinking aliases count toward the request limit"),
+                    "chat_template_kwargs has more than 16 entries"
+                );
+            }
+        }
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
