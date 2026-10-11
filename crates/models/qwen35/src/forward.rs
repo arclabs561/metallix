@@ -2036,9 +2036,10 @@ mod gguf_probe {
         })
     }
 
-    fn dialogue_ids() -> Vec<i32> {
-        let oracle =
-            std::env::var_os("METALLIX_QWEN35_GGUF_ORACLE").expect("oracle directory required");
+    /// The oracle dialogue's token IDs, or `None` when
+    /// `METALLIX_QWEN35_GGUF_ORACLE` is unset.
+    fn dialogue_ids() -> Option<Vec<i32>> {
+        let oracle = std::env::var_os("METALLIX_QWEN35_GGUF_ORACLE")?;
         let file =
             GgufFile::open(PathBuf::from(oracle).join("oracle-dialogue.gguf")).expect("oracle");
         let ids: Vec<i32> = file
@@ -2049,14 +2050,17 @@ mod gguf_probe {
             .collect();
         // The failing receipt names zero-based dialogue position 129.
         assert!(ids.len() >= 130, "dialogue must include position 129");
-        ids
+        Some(ids)
     }
 
     #[test]
     #[ignore = "requires the pinned local GGUF, dialogue oracle and an isolated device slot"]
     fn gguf_dialogue_layer_probe() {
-        let model = std::env::var_os("METALLIX_QWEN35_GGUF").expect("GGUF path required");
-        let ids = dialogue_ids();
+        let (Some(model), Some(ids)) = (std::env::var_os("METALLIX_QWEN35_GGUF"), dialogue_ids())
+        else {
+            eprintln!("skipping: METALLIX_QWEN35_GGUF or METALLIX_QWEN35_GGUF_ORACLE is not set");
+            return;
+        };
         let precision = match std::env::var("METALLIX_GGUF_PROBE_PRECISION").as_deref() {
             Ok("f32") => Qwen35Precision::Float32,
             Ok("checkpoint") | Err(_) => Qwen35Precision::Checkpoint,
