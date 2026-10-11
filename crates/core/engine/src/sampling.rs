@@ -1,5 +1,7 @@
 //! Stateless categorical sampling over an explicit legal-token mask.
 
+pub mod race;
+
 use thiserror::Error;
 
 /// A token selected from a temperature-transformed legal distribution.
@@ -57,18 +59,7 @@ pub fn sample_categorical(
     temperature: f64,
     uniform: f64,
 ) -> Result<CategoricalSample, SamplingError> {
-    if logits.is_empty() {
-        return Err(SamplingError::EmptyLogits);
-    }
-    if logits.len() != legal_mask.len() {
-        return Err(SamplingError::MaskLengthMismatch);
-    }
-    if u32::try_from(logits.len()).is_err() {
-        return Err(SamplingError::VocabularyTooLarge);
-    }
-    if !temperature.is_finite() || temperature <= 0.0 {
-        return Err(SamplingError::InvalidTemperature);
-    }
+    check_row(logits, legal_mask, temperature)?;
     if !uniform.is_finite() || !(0.0..1.0).contains(&uniform) {
         return Err(SamplingError::InvalidUniform);
     }
@@ -76,25 +67,7 @@ pub fn sample_categorical(
         return Err(SamplingError::NonFiniteLogit);
     }
 
-    let mut legal_maximum = f64::NEG_INFINITY;
-    let mut has_legal_token = false;
-    for (&logit, &legal) in logits.iter().zip(legal_mask) {
-        if !legal {
-            continue;
-        }
-        legal_maximum = legal_maximum.max(f64::from(logit));
-        has_legal_token = true;
-    }
-    if !has_legal_token {
-        return Err(SamplingError::EmptySupport);
-    }
-
-    let mut shifted_sum = 0.0;
-    for (&logit, &legal) in logits.iter().zip(legal_mask) {
-        if legal {
-            shifted_sum += shifted_logit(logit, legal_maximum, temperature)?.exp();
-        }
-    }
+    let (legal_maximum, shifted_sum) = legal_shifted_sum(logits, legal_mask, temperature)?;
     let log_normalizer = shifted_sum.ln();
 
     let target = uniform * shifted_sum;
@@ -127,6 +100,52 @@ pub fn sample_categorical(
         token_id,
         sampling_logprob: shifted - log_normalizer,
     })
+}
+
+/// The shape and temperature checks every sampler applies, in this order.
+fn check_row(logits: &[f32], legal_mask: &[bool], temperature: f64) -> Result<(), SamplingError> {
+    if logits.is_empty() {
+        return Err(SamplingError::EmptyLogits);
+    }
+    if logits.len() != legal_mask.len() {
+        return Err(SamplingError::MaskLengthMismatch);
+    }
+    if u32::try_from(logits.len()).is_err() {
+        return Err(SamplingError::VocabularyTooLarge);
+    }
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(SamplingError::InvalidTemperature);
+    }
+    Ok(())
+}
+
+/// The largest legal logit and the sum of legal weights shifted by it, in
+/// token-ID order.
+fn legal_shifted_sum(
+    logits: &[f32],
+    legal_mask: &[bool],
+    temperature: f64,
+) -> Result<(f64, f64), SamplingError> {
+    let mut legal_maximum = f64::NEG_INFINITY;
+    let mut has_legal_token = false;
+    for (&logit, &legal) in logits.iter().zip(legal_mask) {
+        if !legal {
+            continue;
+        }
+        legal_maximum = legal_maximum.max(f64::from(logit));
+        has_legal_token = true;
+    }
+    if !has_legal_token {
+        return Err(SamplingError::EmptySupport);
+    }
+
+    let mut shifted_sum = 0.0;
+    for (&logit, &legal) in logits.iter().zip(legal_mask) {
+        if legal {
+            shifted_sum += shifted_logit(logit, legal_maximum, temperature)?.exp();
+        }
+    }
+    Ok((legal_maximum, shifted_sum))
 }
 
 fn shifted_logit(logit: f32, legal_maximum: f64, temperature: f64) -> Result<f64, SamplingError> {
