@@ -193,3 +193,13 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+`vendor/mlx-sys/` is mlx-sys 0.6.0 from crates.io, published from
+[oxiglade/mlx-rs](https://github.com/oxiglade/mlx-rs/tree/9c2fd72e172babb1e3719327a723717d98ccbe97/mlx-sys)
+at commit `9c2fd72e172babb1e3719327a723717d98ccbe97`, with the local changes
+listed in `vendor/mlx-sys/VENDORED.md`. Its authors are Minghua Wu and David
+Chavez, and it is licensed under the MIT License or the Apache License 2.0, at
+your option; copies from that commit are in `vendor/mlx-sys/LICENSE-MIT` and
+`vendor/mlx-sys/LICENSE-APACHE`. The bundled mlx-c sources under
+`vendor/mlx-sys/src/mlx-c/` carry their own MIT license (Copyright (c) 2023
+ml-explore) in `vendor/mlx-sys/src/mlx-c/LICENSE`.
