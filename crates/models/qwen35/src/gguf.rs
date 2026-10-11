@@ -126,6 +126,7 @@ impl Qwen35Config {
             mtp_layers: 0,
             mtp_dedicated_embeddings: false,
             rope_scaling: None,
+            quantization: None,
         };
         config.check_gguf()?;
         Ok(config)

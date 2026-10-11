@@ -95,8 +95,12 @@ mod arch_facts;
 #[cfg(feature = "metal")]
 pub mod forward;
 pub mod gguf;
+mod quantization;
 
 use serde::Deserialize;
+use serde_json::Value;
+
+pub use quantization::{Qwen35Affine, Qwen35Quantization};
 use thiserror::Error;
 
 /// The token mixer of one decoder layer.
@@ -153,6 +157,7 @@ pub struct Qwen35Config {
     mtp_layers: usize,
     mtp_dedicated_embeddings: bool,
     rope_scaling: Option<YarnScaling>,
+    quantization: Option<Qwen35Quantization>,
 }
 
 /// An operator's request to extend the context with `RoPE` scaling, parsed
@@ -325,6 +330,10 @@ impl Qwen35Config {
     ///   [`Qwen35ConfigError::UnknownLayerType`] and
     ///   [`Qwen35ConfigError::ConflictingTiedEmbeddings`] for a layout that
     ///   cannot be built.
+    ///
+    /// MLX affine `quantization` is read (see [`Qwen35Quantization`]); any
+    /// other `quantization_config` is refused as
+    /// [`Qwen35ConfigError::Unsupported`].
     pub fn parse(json: &str) -> Result<Self, Qwen35ConfigError> {
         let outer: RawOuterConfig = serde_json::from_str(json).map_err(Qwen35ConfigError::Json)?;
         let (text, outer_tie, text_type) = match (outer.model_type.as_str(), outer.text_config) {
@@ -337,7 +346,17 @@ impl Qwen35Config {
             ),
             _ => return Err(Qwen35ConfigError::UnexpectedModelType(outer.model_type)),
         };
-        Self::from_text(text, outer_tie, text_type)
+        // The architecture is settled first, so another model's
+        // quantization_config stays that model's to judge.
+        let config = Self::from_text(text, outer_tie, text_type)?;
+        let quantization = Qwen35Quantization::from_config(
+            outer.quantization.as_ref(),
+            outer.quantization_config.as_ref(),
+        )?;
+        Ok(Self {
+            quantization,
+            ..config
+        })
     }
 
     #[allow(
@@ -435,6 +454,7 @@ impl Qwen35Config {
             mtp_layers: raw.mtp_num_hidden_layers.unwrap_or(0),
             mtp_dedicated_embeddings: raw.mtp_use_dedicated_embeddings.unwrap_or(false),
             rope_scaling,
+            quantization: None,
         })
     }
 
@@ -480,6 +500,12 @@ impl Qwen35Config {
     #[must_use]
     pub const fn tie_word_embeddings(&self) -> bool {
         self.tie_word_embeddings
+    }
+
+    /// The checkpoint's MLX affine quantization, if it declares one.
+    #[must_use]
+    pub const fn quantization(&self) -> Option<&Qwen35Quantization> {
+        self.quantization.as_ref()
     }
 
     /// Leading head features that receive rotary embedding.
@@ -650,6 +676,12 @@ fn check_supported(raw: &RawTextConfig, experts: bool) -> Result<(), Qwen35Confi
     if raw.attention_bias {
         return unsupported("attention bias");
     }
+    // Transformers renormalizes the chosen experts' weights unconditionally
+    // and mlx-lm does unless this is false; only renormalization is
+    // implemented.
+    if raw.norm_topk_prob == Some(false) {
+        return unsupported("norm_topk_prob false");
+    }
     if !raw.attn_output_gate {
         return unsupported("full attention without an output gate");
     }
@@ -729,6 +761,8 @@ struct RawOuterConfig {
     model_type: String,
     text_config: Option<RawTextConfig>,
     tie_word_embeddings: Option<bool>,
+    quantization: Option<Value>,
+    quantization_config: Option<Value>,
 }
 
 #[allow(
@@ -783,6 +817,7 @@ struct RawTextConfig {
     mlp_only_layers: Option<Vec<usize>>,
     mtp_num_hidden_layers: Option<usize>,
     mtp_use_dedicated_embeddings: Option<bool>,
+    norm_topk_prob: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1280,6 +1315,10 @@ mod tests {
                 r#""mlp_only_layers": [3],"#,
             ),
             (
+                r#""router_aux_loss_coef": 0.001,"#,
+                r#""norm_topk_prob": false,"#,
+            ),
+            (
                 r#""model_type": "qwen3_5_moe_text""#,
                 r#""model_type": "qwen3_5_text""#,
             ),
@@ -1290,6 +1329,13 @@ mod tests {
                 "accepted {to}"
             );
         }
+        // Renormalizing is the default; saying so explicitly is accepted.
+        let explicit = moe.replacen(
+            r#""router_aux_loss_coef": 0.001,"#,
+            r#""norm_topk_prob": true,"#,
+            1,
+        );
+        assert!(Qwen35Config::parse(&explicit).is_ok());
         // Experts in a dense checkpoint are refused, not ignored.
         let dense = qwen38_27b().replacen(
             r#""head_dim": 256,"#,
