@@ -34,6 +34,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 sha2 = "=0.10.9"
 mlx-rs = { version = "=0.32.0", default-features = false, features = ["metal", "safetensors"] }
+libm = "=0.2.16"
 rand_chacha = "=0.9.0"
 rand_core = "=0.9.3"
 tracing = "=0.1.44"

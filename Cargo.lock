@@ -633,6 +633,7 @@ version = "0.1.0"
 dependencies = [
  "divan",
  "jsonschema",
+ "libm",
  "llguidance",
  "proptest",
  "serde_json",
