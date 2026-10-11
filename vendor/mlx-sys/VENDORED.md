@@ -67,7 +67,8 @@ against the published crate.
      behind `#if MLX_VERSION_NUMERIC >= 32003`, keeping the C API and its
      behavior those of 0.32.2, and teaches the generator (`python/c.py`) the
      same guard. Once #137 merges and mlx-sys picks it up, this hunk drops
-     with no conflict. It is the only mlx-c source change.
+     with no conflict. These compatibility changes accompany the NAX query
+     described above.
 
 ## Updating
 
