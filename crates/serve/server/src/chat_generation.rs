@@ -88,7 +88,9 @@ pub(crate) const DEFAULT_PREFIX_CACHE_MIB: u32 = 2048;
 /// One resident-chat admission contract shared by session loading and turns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResidentChatLimits {
-    context_tokens: usize,
+    /// An explicit context, or `None` for the largest each adapter can hold:
+    /// the smaller of the model's limit and what fits the K/V budget.
+    context_tokens: Option<usize>,
     kv_budget_bytes: u64,
     prefix_cache_bytes: u64,
 }
@@ -97,9 +99,19 @@ impl ResidentChatLimits {
     #[must_use]
     pub(crate) const fn from_mib(context_tokens: usize, kv_budget_mib: u32) -> Self {
         Self {
-            context_tokens,
+            context_tokens: Some(context_tokens),
             kv_budget_bytes: (kv_budget_mib as u64) * MIB_BYTES,
             prefix_cache_bytes: (DEFAULT_PREFIX_CACHE_MIB as u64) * MIB_BYTES,
+        }
+    }
+
+    /// No explicit context: each adapter plans the largest it can hold, the
+    /// smaller of the model's limit and what fits `kv_budget_mib`.
+    #[must_use]
+    pub(crate) const fn fit_mib(kv_budget_mib: u32) -> Self {
+        Self {
+            context_tokens: None,
+            ..Self::from_mib(0, kv_budget_mib)
         }
     }
 
@@ -118,8 +130,19 @@ impl ResidentChatLimits {
         self.prefix_cache_bytes
     }
 
+    /// The same budgets with an explicit context, for an adapter resolving
+    /// [`Self::fit_mib`] to the context it can hold.
     #[must_use]
-    pub(crate) const fn context_tokens(self) -> usize {
+    pub(crate) const fn with_context(self, context_tokens: usize) -> Self {
+        Self {
+            context_tokens: Some(context_tokens),
+            ..self
+        }
+    }
+
+    /// The explicit context, or `None` when each adapter fits its own.
+    #[must_use]
+    pub(crate) const fn requested_context(self) -> Option<usize> {
         self.context_tokens
     }
 
@@ -911,7 +934,7 @@ impl ChatSession {
             weights,
             format,
             vocabulary_size: config.vocab_size,
-            context_limit: limits.context_tokens(),
+            context_limit: plan.maximum_context_tokens(),
             kv_budget_bytes: limits.kv_budget_bytes(),
             planned_kv_bytes: plan.planned_kv_bytes(),
             load_ms: elapsed_ms(started.elapsed()),
@@ -928,6 +951,13 @@ impl ChatSession {
     #[must_use]
     pub(crate) const fn load_ms(&self) -> f64 {
         self.load_ms
+    }
+
+    /// The context each request may use, prompt plus output: the explicit
+    /// `--context-tokens`, or the largest the model and K/V budget allow.
+    #[must_use]
+    pub(crate) const fn context_limit(&self) -> usize {
+        self.context_limit
     }
 
     /// Hash of the exact checkpoint template source selected at session load.
@@ -1519,6 +1549,22 @@ impl ChatBackend for ChatSession {
     }
 }
 
+/// The largest `n` in `0..=upper` with `fits(n)`, for a `fits` that holds
+/// up to some length and fails beyond it (state grows with the context).
+/// Zero when nothing positive fits.
+pub(crate) fn largest_fitting(upper: usize, mut fits: impl FnMut(usize) -> bool) -> usize {
+    let (mut fitting, mut upper) = (0, upper);
+    while fitting < upper {
+        let middle = fitting + (upper - fitting).div_ceil(2);
+        if fits(middle) {
+            fitting = middle;
+        } else {
+            upper = middle - 1;
+        }
+    }
+    fitting
+}
+
 fn read_config(model: &Path) -> Result<(ChatConfig, String), String> {
     let path = model.join("config.json");
     let raw = fs::read_to_string(&path)
@@ -1536,12 +1582,21 @@ fn load_config(
     // Reject context/KV admission before checkpoint payload loading.
     let forward =
         qwen::forward::Qwen3ForwardConfig::parse(&raw).map_err(|error| error.to_string())?;
+    let context = match limits.requested_context() {
+        Some(tokens) => tokens,
+        None => forward
+            .resident_chat_capacity(limits.kv_budget_bytes(), SERVING_ACTIVATIONS)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "no positive logical context fits the {}-byte K/V budget",
+                    limits.kv_budget_bytes()
+                )
+            })?
+            .get(),
+    };
     let plan = forward
-        .resident_chat_plan(
-            limits.context_tokens(),
-            limits.kv_budget_bytes(),
-            SERVING_ACTIVATIONS,
-        )
+        .resident_chat_plan(context, limits.kv_budget_bytes(), SERVING_ACTIVATIONS)
         .map_err(|error| {
             if matches!(
                 error,
@@ -2582,7 +2637,7 @@ mod tests {
     #[test]
     fn resident_limits_preserve_context_and_mib_budget() {
         let limits = ResidentChatLimits::from_mib(16_384, 8_192);
-        assert_eq!(limits.context_tokens(), 16_384);
+        assert_eq!(limits.requested_context(), Some(16_384));
         assert_eq!(limits.kv_budget_bytes(), 8_192 * 1024 * 1024);
         assert_eq!(limits.prefix_cache_bytes(), 2_048 * 1024 * 1024);
         let sized = limits.with_prefix_cache_mib(3);
@@ -2723,7 +2778,10 @@ mod tests {
                 &mut |_| Ok(()),
             )
             .expect("fresh generation after callback cancellation");
-        assert_eq!(recovered.metrics.context_tokens, limits.context_tokens());
+        assert_eq!(
+            Some(recovered.metrics.context_tokens),
+            limits.requested_context()
+        );
         assert_eq!(
             recovered.metrics.session_load_ms.to_bits(),
             load_ms.to_bits()

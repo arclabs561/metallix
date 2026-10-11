@@ -63,8 +63,14 @@ impl FullRowDecoder for Qwen35Decoder {
     /// K/V needs half of its part, so this over-admits nothing.
     fn plan(model: &Path, limits: ResidentChatLimits) -> Result<DecoderPlan, DecoderError> {
         let config = read_config(model)?;
-        let context = limits.context_tokens();
         let ceiling = config.context_limit();
+        let context = match limits.requested_context() {
+            Some(context) => context,
+            // No explicit context: the largest the model and budget hold.
+            None => state_capacity(&config, limits.kv_budget_bytes())
+                .map_err(|error| DecoderError::UnsupportedConfig(error.to_string()))?
+                .map_or(0, std::num::NonZeroUsize::get),
+        };
         if context == 0 || context > ceiling {
             return Err(DecoderError::ContextOutOfRange {
                 requested: context,
@@ -85,6 +91,7 @@ impl FullRowDecoder for Qwen35Decoder {
         let planned_state_bytes = planned_bytes;
         Ok(DecoderPlan {
             vocabulary_size: config.vocab_size(),
+            context_tokens: context,
             planned_state_bytes,
         })
     }
@@ -170,7 +177,9 @@ mod tests {
     /// The text fields of Qwen/Qwen3.5-0.8B@2fc06364: 24 layers, every fourth
     /// full attention (2 K/V heads of 256), the rest `GatedDeltaNet` with 16
     /// key and value heads of 128.
-    fn qwen35_08b_dir() -> PathBuf {
+    /// A Qwen3.5-0.8B `config.json` in a temporary directory named for
+    /// `test`, so tests running in parallel do not remove each other's.
+    fn qwen35_08b_dir(test: &str) -> PathBuf {
         let layer_types: Vec<&str> = (0..24)
             .map(|layer| {
                 if layer % 4 == 3 {
@@ -196,7 +205,7 @@ mod tests {
                 "tie_word_embeddings": true, "vocab_size": 248_320
             }
         });
-        let dir = env::temp_dir().join(format!("qwen35-plan-{}", std::process::id()));
+        let dir = env::temp_dir().join(format!("qwen35-plan-{test}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.json"), config.to_string()).unwrap();
         dir
@@ -291,9 +300,28 @@ mod tests {
         );
     }
 
+    /// With no explicit context the plan admits the largest the budget and
+    /// the model allow, counting K/V at its storage tier: 68 MiB holds the
+    /// 2,048-row tier (67.3 MiB) but not the 4,096-row one, and a roomy
+    /// budget stops at the declared 262,144 positions.
+    #[test]
+    fn omitted_context_plans_the_largest_fitting() {
+        let dir = qwen35_08b_dir("omitted_context_plans_the_largest_fitting");
+        let fit = |kv_mib| Qwen35Decoder::plan(&dir, ResidentChatLimits::fit_mib(kv_mib));
+        let (budget_bound, model_bound) = (fit(68), fit(1_000_000));
+        fs::remove_dir_all(&dir).unwrap();
+        let budget_bound = budget_bound.unwrap();
+        assert_eq!(budget_bound.context_tokens, 2_048);
+        assert_eq!(
+            budget_bound.planned_state_bytes,
+            6 * 2 * 2 * 256 * 2_048 * 4 + 18 * (16 * 128 * 128 + 6_144 * 3) * 4
+        );
+        assert_eq!(model_bound.unwrap().context_tokens, 262_144);
+    }
+
     #[test]
     fn plan_counts_kv_and_the_fixed_recurrent_state() {
-        let dir = qwen35_08b_dir();
+        let dir = qwen35_08b_dir("plan_counts_kv_and_the_fixed_recurrent_state");
         let plan = |context, kv_mib| {
             Qwen35Decoder::plan(&dir, ResidentChatLimits::from_mib(context, kv_mib))
         };

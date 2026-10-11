@@ -36,9 +36,11 @@ impl FullRowDecoder for GemmaDecoder {
         })?;
         let config = Gemma4TextConfig::parse(&raw)
             .map_err(|error| DecoderError::UnsupportedConfig(error.to_string()))?;
+        let limits = fit_context(&config, limits);
         Ok(DecoderPlan {
             vocabulary_size: config.vocab_size(),
             planned_state_bytes: plan_kv_bytes(&config, limits)?,
+            context_tokens: limits.requested_context().unwrap_or(0),
         })
     }
 
@@ -90,6 +92,18 @@ impl FullRowSequence for GemmaSequence<'_> {
     }
 }
 
+/// `limits` with its context resolved: the explicit one, or the largest
+/// whose retained K/V fits the budget, up to the checkpoint's positions.
+fn fit_context(config: &Gemma4TextConfig, limits: ResidentChatLimits) -> ResidentChatLimits {
+    match limits.requested_context() {
+        Some(_) => limits,
+        None => limits.with_context(crate::chat_generation::largest_fitting(
+            config.max_position_embeddings(),
+            |context| plan_kv_bytes(config, limits.with_context(context)).is_ok(),
+        )),
+    }
+}
+
 /// The bf16 K/V a sequence at the context limit retains (sliding layers keep
 /// only their window), refused when it exceeds the K/V budget or the
 /// checkpoint's positions.
@@ -97,7 +111,7 @@ fn plan_kv_bytes(
     config: &Gemma4TextConfig,
     limits: ResidentChatLimits,
 ) -> Result<u64, DecoderError> {
-    let context = limits.context_tokens();
+    let context = limits.requested_context().unwrap_or(0);
     let maximum = config.max_position_embeddings();
     if context == 0 || context > maximum {
         return Err(DecoderError::ContextOutOfRange {
@@ -123,7 +137,9 @@ fn plan_kv_bytes(
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{DecoderError, GemmaDecoder, GemmaSequence, ResidentChatLimits, plan_kv_bytes};
+    use super::{
+        DecoderError, GemmaDecoder, GemmaSequence, ResidentChatLimits, fit_context, plan_kv_bytes,
+    };
     use crate::chat_generation::decoder::FullRowSequence;
     use crate::{
         chat_generation::{
@@ -238,6 +254,27 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// With no explicit context the plan takes the largest that fits: the
+    /// budget bounds it (its K/V fits and one more token's does not), or, with
+    /// room to spare, the checkpoint's 262,144 positions do. An explicit
+    /// context passes through unchanged.
+    #[test]
+    fn omitted_context_resolves_to_the_largest_fitting() {
+        let config = gemma4_12b();
+        let fitted = fit_context(&config, ResidentChatLimits::fit_mib(1_024));
+        let context = fitted.requested_context().expect("resolved");
+        assert!(plan_kv_bytes(&config, fitted).is_ok());
+        assert!(plan_kv_bytes(&config, fitted.with_context(context + 1)).is_err());
+        assert!(
+            context > 16_384,
+            "1 GiB holds more than the old fixed default"
+        );
+        let roomy = fit_context(&config, ResidentChatLimits::fit_mib(65_536));
+        assert_eq!(roomy.requested_context(), Some(262_144));
+        let explicit = ResidentChatLimits::from_mib(2_048, 1_024);
+        assert_eq!(fit_context(&config, explicit), explicit);
     }
 
     /// The real-checkpoint tests load about 22 GiB of bf16 weights each, so

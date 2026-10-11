@@ -59,8 +59,8 @@ mod tests {
             let Command::Decide(args) = parsed.command else {
                 panic!("wrong command")
             };
-            let limits = crate::resident_chat_limits(args.context_tokens, args.kv_budget_mib);
-            assert_eq!(limits.context_tokens(), requested.parse::<usize>().unwrap());
+            let limits = crate::resident_chat_limits(Some(args.context_tokens), args.kv_budget_mib);
+            assert_eq!(limits.requested_context(), requested.parse::<usize>().ok());
             assert_eq!(limits.kv_budget_bytes(), 512 * 1024 * 1024);
         }
     }

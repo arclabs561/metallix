@@ -37,6 +37,9 @@ use super::{
 /// What a decoder learns from the checkpoint's configuration alone.
 pub(crate) struct DecoderPlan {
     pub(crate) vocabulary_size: usize,
+    /// The context sequences admit: the explicit one, or the largest the
+    /// model and the state budget allow when none was given.
+    pub(crate) context_tokens: usize,
     /// Every per-sequence byte at the context limit: K/V plus any fixed
     /// recurrent state.
     pub(crate) planned_state_bytes: u64,
@@ -212,7 +215,7 @@ impl<D: FullRowDecoder> ChatDecoderSession<D> {
             decoder,
             format,
             vocabulary_size: plan.vocabulary_size,
-            context_limit: limits.context_tokens(),
+            context_limit: plan.context_tokens,
             planned_state_bytes: plan.planned_state_bytes,
             load_ms: elapsed_ms(started.elapsed()),
             model: model.to_path_buf(),
@@ -564,9 +567,12 @@ mod prefix_cache_tests {
         type Snapshot = Vec<i32>;
         const SAVES_STATE: bool = true;
 
-        fn plan(_: &Path, _: ResidentChatLimits) -> Result<DecoderPlan, DecoderError> {
+        fn plan(_: &Path, limits: ResidentChatLimits) -> Result<DecoderPlan, DecoderError> {
             Ok(DecoderPlan {
                 vocabulary_size: VOCABULARY_SIZE,
+                context_tokens: limits
+                    .requested_context()
+                    .expect("history tests pass an explicit context"),
                 planned_state_bytes: 0,
             })
         }

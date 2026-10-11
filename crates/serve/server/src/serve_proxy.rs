@@ -56,7 +56,8 @@ const LISTENING: &str = "mx listening on http://";
 /// Command-line settings passed through to every child.
 #[derive(Clone, Debug)]
 pub(crate) struct ChildSettings {
-    pub(crate) context_tokens: u32,
+    /// Explicit context, or `None` for each child's largest fitting one.
+    pub(crate) context_tokens: Option<u32>,
     pub(crate) kv_budget_mib: u32,
     pub(crate) prefix_cache_mib: u32,
     pub(crate) max_num_seqs: u32,
@@ -78,7 +79,7 @@ impl ChildSettings {
     #[cfg(test)]
     pub(crate) const fn for_tests() -> Self {
         Self {
-            context_tokens: 4096,
+            context_tokens: Some(4096),
             kv_budget_mib: 64,
             prefix_cache_mib: 0,
             max_num_seqs: 1,
@@ -337,7 +338,11 @@ fn serve_inner(
         }
     }
     let transport = TransportLimits::for_context(
-        settings.context_tokens as usize,
+        settings
+            .context_tokens
+            .map_or(crate::http_transport::UNRESOLVED_CONTEXT_TOKENS, |tokens| {
+                tokens as usize
+            }),
         Duration::from_millis(u64::from(settings.generation_timeout_ms)),
     );
     let launcher = Launcher {
@@ -406,7 +411,13 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
             "--listen",
             "127.0.0.1:0",
         ])
-        .args(["--context-tokens", &settings.context_tokens.to_string()])
+        .args(
+            settings
+                .context_tokens
+                .map(|tokens| ["--context-tokens".to_owned(), tokens.to_string()])
+                .into_iter()
+                .flatten(),
+        )
         .args(["--kv-budget-mib", &settings.kv_budget_mib.to_string()])
         .args(["--prefix-cache-mib", &settings.prefix_cache_mib.to_string()])
         .args(["--max-num-seqs", &settings.max_num_seqs.to_string()])
@@ -668,10 +679,9 @@ fn forward_span(pool: &Pool, model: &ChildModel) -> tracing::Span {
         "error.type" = Empty,
     );
     if let Some(launcher) = &pool.launcher {
-        span.record(
-            "metallix.context_tokens.requested",
-            launcher.settings.context_tokens,
-        );
+        if let Some(tokens) = launcher.settings.context_tokens {
+            span.record("metallix.context_tokens.requested", tokens);
+        }
     }
     span
 }

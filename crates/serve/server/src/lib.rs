@@ -203,8 +203,17 @@ pub(crate) fn parse_kv_budget_mib(value: &str) -> Result<u32, String> {
 }
 
 #[cfg(feature = "metal")]
-const fn resident_chat_limits(context_tokens: u32, kv_budget_mib: u32) -> ResidentChatLimits {
-    ResidentChatLimits::from_mib(context_tokens as usize, kv_budget_mib)
+/// Explicit `--context-tokens`, or, when it is omitted, the largest context
+/// each model can hold: the smaller of its limit and what fits the K/V
+/// budget.
+const fn resident_chat_limits(
+    context_tokens: Option<u32>,
+    kv_budget_mib: u32,
+) -> ResidentChatLimits {
+    match context_tokens {
+        Some(tokens) => ResidentChatLimits::from_mib(tokens as usize, kv_budget_mib),
+        None => ResidentChatLimits::fit_mib(kv_budget_mib),
+    }
 }
 
 #[cfg(feature = "metal")]
@@ -797,7 +806,7 @@ mod tests {
                     panic!("unexpected consumer");
                 };
                 let limits = super::resident_chat_limits(tokens, 512);
-                assert_eq!(limits.context_tokens(), requested.parse::<usize>().unwrap());
+                assert_eq!(limits.requested_context(), requested.parse::<usize>().ok());
                 assert_eq!(limits.kv_budget_bytes(), 512 * 1024 * 1024);
             }
             for invalid in ["0", "auto", "2147483648", "4294967296"] {
@@ -998,6 +1007,31 @@ mod tests {
                 ..
             } if prompt == "plain prompt"
         ));
+    }
+
+    /// Omitting `--context-tokens` asks each model for the largest context
+    /// it can hold, not a fixed number.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn omitted_context_means_the_largest_fitting() {
+        for command in ["chat", "agent", "serve"] {
+            let mut args = vec!["mx", command, "--model", "local"];
+            if command == "agent" {
+                args.extend_from_slice(&["--workspace", ".", "--prompt", "hi"]);
+            }
+            let cli = Cli::try_parse_from(args).expect("defaults");
+            let (Command::Chat { context_tokens, .. }
+            | Command::Agent { context_tokens, .. }
+            | Command::Serve { context_tokens, .. }) = cli.command
+            else {
+                panic!("unexpected command");
+            };
+            assert_eq!(context_tokens, None, "{command}");
+            assert_eq!(
+                super::resident_chat_limits(context_tokens, 512).requested_context(),
+                None
+            );
+        }
     }
 
     #[cfg(feature = "metal")]

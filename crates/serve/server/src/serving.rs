@@ -672,14 +672,22 @@ fn serve_inner(
             eprintln!(
                 "mx listening on http://{address}; models={}; max_running={max_running}; {} total tokens; kv_budget_bytes={}",
                 entries.len(),
-                limits.context_tokens(),
+                limits.requested_context().map_or_else(
+                    || String::from("largest-fitting"),
+                    |tokens| tokens.to_string()
+                ),
                 limits.kv_budget_bytes(),
             );
             serve_models(
                 &server,
                 &models,
                 generation_timeout,
-                TransportLimits::for_context(limits.context_tokens(), generation_timeout),
+                TransportLimits::for_context(
+                    limits
+                        .requested_context()
+                        .unwrap_or(crate::http_transport::UNRESOLVED_CONTEXT_TOKENS),
+                    generation_timeout,
+                ),
                 None,
             )
         }

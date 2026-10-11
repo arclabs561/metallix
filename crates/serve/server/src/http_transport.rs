@@ -45,6 +45,12 @@ const DEFAULT_RESPONSE_DEADLINE: Duration = Duration::from_secs(120);
 /// write, so a response that uses its whole budget is not cut off.
 const RESPONSE_GRACE: Duration = Duration::from_secs(30);
 
+/// Context the transport sizes requests for when `--context-tokens` is
+/// omitted and each model resolves its own: 1,048,576 tokens covers every
+/// qualified model, and each session still checks its own resolved limit
+/// before rendering.
+pub(crate) const UNRESOLVED_CONTEXT_TOKENS: usize = 1 << 20;
+
 impl TransportLimits {
     /// Limits for a server admitting `context_tokens` per request whose
     /// generation may run `generation_timeout`: the body cap follows the

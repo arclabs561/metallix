@@ -62,7 +62,7 @@ fn chat_inner(
     }
     eprintln!(
         "Native Qwen chat; /reset clears history, /quit exits. Context limit: {} tokens including output budget.",
-        limits.context_tokens()
+        session.context_limit()
     );
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();

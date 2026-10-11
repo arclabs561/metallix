@@ -147,8 +147,8 @@ pub(crate) enum Command {
         max_tokens: u32,
         /// Total prompt plus output budget for this resident session.
         /// Validated against the model and K/V budget before loading weights.
-        #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
-        context_tokens: u32,
+        #[arg(long, value_parser = parse_context_tokens)]
+        context_tokens: Option<u32>,
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
         #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
         kv_budget_mib: u32,
@@ -171,8 +171,8 @@ pub(crate) enum Command {
         max_turns: u32,
         /// Total prompt plus output budget for each agent turn.
         /// Validated against the model and K/V budget before loading weights.
-        #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
-        context_tokens: u32,
+        #[arg(long, value_parser = parse_context_tokens)]
+        context_tokens: Option<u32>,
         /// Logical resident K/V admission budget in MiB; not an MLX allocation limit.
         #[arg(long, default_value_t = 512, value_parser = crate::parse_kv_budget_mib)]
         kv_budget_mib: u32,
@@ -207,8 +207,8 @@ pub(crate) enum Command {
         listen: std::net::SocketAddr,
         /// Total prompt plus output budget for each request.
         /// Validated against the model and K/V budget before loading weights.
-        #[arg(long, default_value_t = 2048, value_parser = parse_context_tokens)]
-        context_tokens: u32,
+        #[arg(long, value_parser = parse_context_tokens)]
+        context_tokens: Option<u32>,
         /// Paged K/V pool per generating model, in MiB, allocated when the
         /// model loads. Defaults to the smaller of 4096 and a quarter of
         /// physical memory.
