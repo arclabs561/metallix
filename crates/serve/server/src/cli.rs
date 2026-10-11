@@ -428,6 +428,10 @@ pub(crate) enum Command {
     /// Prove the optional Qwen MLX substrate can execute one graph on Metal.
     #[cfg(feature = "metal")]
     SmokeQwenMetal,
+    /// Report whether MLX can use the GPU's Neural Accelerators (NAX) here;
+    /// fails when the linked metallib has no NAX kernels.
+    #[cfg(feature = "metal")]
+    Doctor,
     /// Load a validated Qwen3 checkpoint as MLX arrays and evaluate its embedding on Metal.
     #[cfg(feature = "metal")]
     LoadQwenMetal {

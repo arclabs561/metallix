@@ -626,6 +626,10 @@ fn serve_inner(
                     worker.chat().and_then(|chat| chat.context_limit());
                 gpu::Memory::record_on(&load);
                 tracing::info!("model loaded");
+                match crate::doctor::MetalReport::read() {
+                    Ok(report) => tracing::info!(metal = %report, "metal device"),
+                    Err(error) => tracing::warn!(%error, "metal device report unavailable"),
+                }
                 drop(entered);
                 drop(load);
                 let planned_bytes = limits

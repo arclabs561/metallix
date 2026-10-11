@@ -71,6 +71,8 @@ mod decision_cli;
 mod deepseek_reduced_cli;
 mod deepseek_selected_cli;
 #[cfg(feature = "metal")]
+mod doctor;
+#[cfg(feature = "metal")]
 mod engine_loop;
 #[cfg(feature = "metal")]
 mod generation_routes;
@@ -771,6 +773,8 @@ fn dispatch(cli: Cli) -> ExitCode {
         } => inspect_v41_embedding_row(&shard, row, &kind, all_rows, input_shard.as_ref()),
         #[cfg(feature = "metal")]
         Command::SmokeQwenMetal => smoke_qwen_metal(),
+        #[cfg(feature = "metal")]
+        Command::Doctor => doctor::run(),
         #[cfg(feature = "metal")]
         Command::LoadQwenMetal { model } => load_qwen_metal(&model),
         #[cfg(feature = "metal")]

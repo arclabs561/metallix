@@ -184,6 +184,44 @@ fn recommended_working_set() -> Option<u64> {
     (status == 0 && size > 0).then_some(size as u64)
 }
 
+/// MLX's architecture string for the default GPU, such as `applegpu_g15s`.
+pub(crate) fn gpu_architecture() -> Option<String> {
+    // Installs the `mlx-rs` error handler before calling MLX-C directly.
+    mlx_rs::memory::active_memory().ok()?;
+    let mut text: *const std::ffi::c_char = std::ptr::null();
+    // SAFETY: the device and info handles are created, read and freed inside
+    // this block; the string is copied out before `info` is freed, and the
+    // key is a NUL-terminated literal.
+    unsafe {
+        let device = sys::mlx_device_new_type(sys::mlx_device_type__MLX_GPU, 0);
+        let mut info = sys::mlx_device_info_new();
+        let mut copied = None;
+        if sys::mlx_device_info_get(&raw mut info, device) == 0
+            && sys::mlx_device_info_get_string(&raw mut text, info, c"architecture".as_ptr()) == 0
+            && !text.is_null()
+        {
+            copied = Some(
+                std::ffi::CStr::from_ptr(text)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        sys::mlx_device_info_free(info);
+        sys::mlx_device_free(device);
+        copied
+    }
+}
+
+/// Whether MLX will run its Neural Accelerator (NAX) kernels here: the OS,
+/// the GPU generation and the build all allow it.
+pub(crate) fn nax_available() -> Option<bool> {
+    mlx_rs::memory::active_memory().ok()?;
+    let mut available = false;
+    // SAFETY: writes one `bool` through the pointer.
+    let status = unsafe { sys::mlx_metal_is_nax_available(&raw mut available) };
+    (status == 0).then_some(available)
+}
+
 /// Wires the loaded model's memory so it can stay resident between requests:
 /// MLX's active bytes now (the weights) plus `planned_bytes` (K/V and prefix
 /// cache budgets) and the allocator cache cap ([`cache_limit_bytes`], whose
