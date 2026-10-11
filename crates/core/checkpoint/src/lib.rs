@@ -12,7 +12,9 @@
 
 pub mod expert;
 pub mod gguf;
+pub mod mlx;
 mod nocache;
+pub mod safetensors;
 
 use std::{
     fs::File,
@@ -52,6 +54,12 @@ pub enum DType {
     U8,
     /// One byte per boolean.
     Bool,
+    /// 8-bit float with 4 exponent and 3 mantissa bits (OCP FP8 E4M3).
+    /// Described for its byte layout only; this crate does not decode it.
+    F8E4M3,
+    /// 8-bit power-of-two scale (OCP microscaling E8M0). Described for its
+    /// byte layout only; this crate does not decode it.
+    F8E8M0,
 }
 
 impl DType {
@@ -62,7 +70,7 @@ impl DType {
             Self::F64 | Self::I64 | Self::U64 => 8,
             Self::F32 | Self::I32 | Self::U32 => 4,
             Self::F16 | Self::BF16 | Self::I16 | Self::U16 => 2,
-            Self::I8 | Self::U8 | Self::Bool => 1,
+            Self::I8 | Self::U8 | Self::Bool | Self::F8E4M3 | Self::F8E8M0 => 1,
         }
     }
 }
@@ -279,7 +287,7 @@ pub enum CheckpointError {
     #[error("GGUF metadata key {0:?} appears twice")]
     DuplicateKey(String),
     /// A tensor name is repeated.
-    #[error("GGUF tensor {0:?} appears twice")]
+    #[error("tensor {0:?} appears twice")]
     DuplicateTensor(String),
     /// A tensor uses an unknown encoding identifier.
     #[error("GGUF tensor {tensor:?} has unknown type id {id}")]
@@ -303,10 +311,10 @@ pub enum CheckpointError {
     #[error("GGUF general.alignment {0} is not a nonzero power of two")]
     Alignment(u64),
     /// A tensor range is misaligned or outside the file.
-    #[error("GGUF tensor {0:?} is misaligned or extends past the end of the file")]
+    #[error("tensor {0:?} is misaligned, malformed or extends past the end of the file")]
     Range(String),
     /// Two tensor payload ranges overlap.
-    #[error("GGUF tensors {0:?} and {1:?} overlap")]
+    #[error("tensors {0:?} and {1:?} overlap")]
     Overlap(String, String),
     /// The file changed after header inspection.
     #[error("{0} changed after it was inspected")]
@@ -332,6 +340,31 @@ pub enum CheckpointError {
         /// Required metadata type.
         expected: &'static str,
     },
+    /// The quantization is a format, mode or setting this crate does not
+    /// decode.
+    #[error("unsupported quantization: {0}")]
+    UnsupportedQuantization(&'static str),
+    /// The quantization entry is malformed.
+    #[error("invalid {0}")]
+    InvalidQuantization(&'static str),
+    /// The file is not a safetensors file, or its index is malformed.
+    #[error("{0} is not a valid safetensors file or index")]
+    NotSafetensors(PathBuf),
+    /// A safetensors tensor has a dtype this crate does not know.
+    #[error("tensor {tensor:?} has unknown dtype {dtype:?}")]
+    UnknownDType {
+        /// The stored tensor name.
+        tensor: String,
+        /// The stored dtype string.
+        dtype: String,
+    },
+    /// An index names a shard outside the checkpoint directory.
+    #[error("shard {0:?} is not a plain .safetensors file name")]
+    UnsafeShard(String),
+    /// A module is stored with `scales` but the configuration does not
+    /// describe its quantization, or leaves it unquantized.
+    #[error("module {0:?} is stored quantized but the configuration does not quantize it")]
+    UndeclaredQuantization(String),
     /// A range read lies outside its tensor's payload, or its buffer is not
     /// the range's length.
     #[error("range {range:?} into a {len}-byte buffer does not fit tensor {tensor:?}")]
@@ -342,6 +375,25 @@ pub enum CheckpointError {
         range: Range<u64>,
         /// The destination buffer length.
         len: usize,
+    },
+    /// A quantized module's scales or biases are not floating point.
+    #[error("tensor {tensor:?} is stored as {encoding:?}, not a floating-point type")]
+    AffineParameterDtype {
+        /// The scales or biases tensor.
+        tensor: String,
+        /// Its stored encoding.
+        encoding: TensorEncoding,
+    },
+    /// A quantized module's codes, scales and biases disagree in shape or
+    /// type.
+    #[error("module {module:?} has affine codes {codes:?} where its scales imply {expected:?}")]
+    AffineShape {
+        /// The module stem.
+        module: String,
+        /// The `u32` code shape the scales and settings imply.
+        expected: Vec<u64>,
+        /// The stored code shape.
+        codes: Vec<u64>,
     },
 }
 
@@ -427,7 +479,6 @@ mod tests {
         let scalar = TensorInfo::new(TensorEncoding::Plain(DType::F32), vec![], 0..4);
         assert_eq!(scalar.slice_dim0(0), None);
     }
-
     #[test]
     fn bypassing_the_file_cache_still_reads_the_bytes() {
         use std::{fs, os::unix::fs::FileExt};

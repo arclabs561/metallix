@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 blockfloat = { path = "../blockfloat" }
 libc = "0.2"
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]
