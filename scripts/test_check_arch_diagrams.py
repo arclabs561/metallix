@@ -84,6 +84,37 @@ class ArchDiagramTests(unittest.TestCase):
             ["renamed names no model crate under crates/models"],
         )
 
+    def write_adapter_tests(self, source: str) -> None:
+        path = self.root / check.ADAPTER_TESTS
+        path.parent.mkdir(parents=True)
+        path.write_text(source, encoding="utf-8")
+
+    def test_live_undrawn_list_parses(self) -> None:
+        self.assertIsNotNone(check.undrawn(check.ROOT))
+
+    def test_undrawn_entries_parse_with_their_reasons(self) -> None:
+        self.write_adapter_tests(
+            "const UNDRAWN: [(Adapter, &str); 2] = [\n"
+            '    (Adapter::EmbeddingGemma2, "drawn once its parser lands"),\n'
+            '    (\n        Adapter::Julia,\n        "a \\"quoted\\" reason",\n    ),\n'
+            "];\n"
+        )
+        self.assertEqual(
+            check.undrawn(self.root),
+            [
+                ("EmbeddingGemma2", "drawn once its parser lands"),
+                ("Julia", 'a \\"quoted\\" reason'),
+            ],
+        )
+
+    def test_empty_undrawn_list_parses_as_empty(self) -> None:
+        self.write_adapter_tests("const UNDRAWN: [(Adapter, &str); 0] = [];\n")
+        self.assertEqual(check.undrawn(self.root), [])
+
+    def test_missing_undrawn_list_is_reported(self) -> None:
+        self.write_adapter_tests("fn diagram() {}\n")
+        self.assertIsNone(check.undrawn(self.root))
+
     @unittest.skipIf(check.typst_binary()[0] is None, "needs the pinned typst")
     def test_edited_svg_is_stale_until_rendered(self) -> None:
         write_tree(self.root, ["a"], {"a": "a"})

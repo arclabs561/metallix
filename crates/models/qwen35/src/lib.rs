@@ -90,6 +90,8 @@
 
 #![deny(missing_docs)]
 
+#[cfg(test)]
+mod arch_facts;
 #[cfg(feature = "metal")]
 pub mod forward;
 pub mod gguf;

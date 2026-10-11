@@ -6,6 +6,10 @@ numbers <kind>.facts.json. A test in the model's crate writes the facts file
 from the crate's own config parsing and names the crate in its `crate` field;
 that field is how this check knows which crates are drawn.
 
+Adapters the server has no diagram for yet are listed, each with a reason,
+in UNDRAWN in crates/serve/server/src/adapter/tests.rs; this check prints that
+list on every run so an addition shows in every gate log.
+
 Rendering needs typst 0.15.1. Without it the SVG comparison is skipped with a
 notice, unless --require-typst is given (as in CI). --write re-renders every
 SVG instead of comparing.
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -25,11 +30,15 @@ ROOT = Path(__file__).resolve().parent.parent
 TYPST_VERSION = "0.15.1"
 RENDER_TIMEOUT_SECONDS = 120
 
+ADAPTER_TESTS = "crates/serve/server/src/adapter/tests.rs"
+UNDRAWN_LIST = re.compile(
+    r"^const UNDRAWN: [^=]*= \[(.*?)\];", re.MULTILINE | re.DOTALL
+)
+UNDRAWN_ENTRY = re.compile(r'\(\s*Adapter::(\w+),\s*"((?:[^"\\]|\\.)*)",?\s*\)')
+
 # Model crates not yet drawn. Remove a crate in the change that adds its
 # diagram; never add one.
-PENDING: frozenset[str] = frozenset(
-    {"deepseek", "flux2", "gemma", "julia", "qwen3-asr", "qwen35"}
-)
+PENDING: frozenset[str] = frozenset()
 
 
 def diagrams(arch: Path) -> list[Path]:
@@ -76,6 +85,15 @@ def problems(root: Path, pending: frozenset[str]) -> list[str]:
         for name in sorted(crates - drawn - pending)
     ]
     return found
+
+
+def undrawn(root: Path) -> list[tuple[str, str]] | None:
+    """The server test's UNDRAWN entries as (adapter, reason), or None when
+    the list cannot be found."""
+    match = UNDRAWN_LIST.search((root / ADAPTER_TESTS).read_text(encoding="utf-8"))
+    if match is None:
+        return None
+    return UNDRAWN_ENTRY.findall(match.group(1))
 
 
 def typst_binary() -> tuple[str | None, str]:
@@ -155,6 +173,13 @@ def main() -> int:
         ]
     # After --write, so a freshly rendered SVG counts as present.
     found = problems(ROOT, PENDING) + found
+    entries = undrawn(ROOT)
+    if entries is None:
+        found.append(f"{ADAPTER_TESTS} has no UNDRAWN list")
+    else:
+        print(f"arch diagrams: {len(entries)} adapters undrawn")
+        for adapter, reason in entries:
+            print(f"arch diagrams: undrawn {adapter}: {reason}")
     for problem in found:
         print(f"arch diagrams: {problem}", file=sys.stderr)
     if found:

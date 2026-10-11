@@ -18,5 +18,9 @@ tracing.workspace = true
 [features]
 metal = ["dep:mlx-rs", "dep:qwen", "qwen/metal"]
 
+[dev-dependencies]
+# The diagram facts test parses the text encoder config without the metal feature.
+qwen = { path = "../qwen" }
+
 [lints]
 workspace = true

@@ -23,6 +23,10 @@ metal = ["dep:mlx-rs", "dep:qwen", "qwen/metal"]
 # Deliberately wrong encoder variants that the parity tests must reject.
 parity-controls = ["metal"]
 
+[dev-dependencies]
+# The diagram facts test parses the decoder config without the metal feature.
+qwen = { path = "../qwen" }
+
 [lints]
 workspace = true
 

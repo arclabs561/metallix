@@ -29,14 +29,19 @@
   ),
   add((0, 4), name: <add1>),
   rmsnorm((0, 5), name: <norm2>),
-  swiglu((0, 6), name: <mlp>),
+  swiglu((0, 6), width: f.intermediate_size, name: <mlp>),
   add((0, 7), name: <add2>),
   repeated(
     (<norm1>, <attention>, <add1>, <norm2>, <mlp>, <add2>, (-1, 1.6)),
     [#sym.times #f.layers layers],
   ),
   rmsnorm((0, 8), name: <final>),
-  block((0, 9), [*Output projection*\ #f.hidden_size #sym.arrow #f.vocab_size], role: "embed", name: <head>),
+  block(
+    (0, 9),
+    [*Output projection*\ #f.hidden_size #sym.arrow #f.vocab_size#if f.tied_output_embedding [, tied to the embedding]],
+    role: "embed",
+    name: <head>,
+  ),
   block((0, 10), [Logits], name: <logits>),
 
   edge(<tokens>, <embed>, flow),

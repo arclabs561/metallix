@@ -1,0 +1,30 @@
+{
+  "crate": "qwen3-asr",
+  "reference": {
+    "repo": "Qwen/Qwen3-ASR-0.6B",
+    "revision": "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
+    "config": "configs/Qwen3-ASR-0.6B.json"
+  },
+  "encoder": {
+    "mel_bins": 128,
+    "chunk_frames": 100,
+    "frames_per_chunk": 13,
+    "conv_channels": 480,
+    "width": 896,
+    "layers": 18,
+    "heads": 14,
+    "ffn_width": 3584,
+    "window_frames": 104,
+    "output_width": 1024
+  },
+  "decoder": {
+    "layers": 28,
+    "hidden_size": 1024,
+    "vocab_size": 151936,
+    "attention_heads": 16,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "intermediate_size": 3072,
+    "tied_output_embedding": true
+  }
+}

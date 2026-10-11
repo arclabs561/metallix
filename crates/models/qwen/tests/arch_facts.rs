@@ -39,6 +39,8 @@ struct Facts {
     attention_heads: u32,
     kv_heads: u32,
     head_dim: u32,
+    intermediate_size: u32,
+    tied_output_embedding: bool,
     max_position_embeddings: u32,
     kv_bytes_per_token_bf16: u64,
     variants: Vec<Variant>,
@@ -99,6 +101,11 @@ fn facts() -> Facts {
         attention_heads: contract.attention_heads(),
         kv_heads: preflight.key_value_heads(),
         head_dim: preflight.head_dim(),
+        intermediate_size: contract
+            .intermediate_size()
+            .expect("reference config states intermediate_size")
+            .get(),
+        tied_output_embedding: contract.tied_output_embedding(),
         max_position_embeddings: preflight.position_capacity(),
         kv_bytes_per_token_bf16: preflight.kv_bytes_per_token_bf16(),
         variants,

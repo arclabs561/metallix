@@ -46,6 +46,8 @@
 
 #![deny(missing_docs)]
 
+#[cfg(test)]
+mod arch_facts;
 pub mod checkpoint;
 pub mod encoder;
 pub mod head;

@@ -1486,6 +1486,9 @@ pub enum V41CheckpointModelError {
 }
 
 #[cfg(test)]
+mod arch_facts;
+
+#[cfg(test)]
 mod tests {
     use std::{num::NonZeroUsize, path::Path, sync::Mutex};
 

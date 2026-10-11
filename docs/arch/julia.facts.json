@@ -1,0 +1,40 @@
+{
+  "crate": "julia",
+  "reference": {
+    "repo": "SupersonicLabs/Julia-1",
+    "revision": "a85b127321d580d65176c89ced8273f305745d85"
+  },
+  "vocab_size": 256000,
+  "width": 384,
+  "attention_heads": 6,
+  "head_width": 64,
+  "max_positions": 126,
+  "encoder_layers": [
+    "global",
+    "local",
+    "local",
+    "global",
+    "local",
+    "local",
+    "global",
+    "local",
+    "local",
+    "global",
+    "local",
+    "local",
+    "global",
+    "local",
+    "local",
+    "global",
+    "local",
+    "local",
+    "global",
+    "local",
+    "local",
+    "global"
+  ],
+  "local_window": 64,
+  "encoder_ffn_width": 1152,
+  "head_layers": 2,
+  "head_ffn_width": 1536
+}

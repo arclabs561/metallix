@@ -15,6 +15,7 @@
   embed: rgb("#e3ecf7"),
   norm: rgb("#f7f3e3"),
   attention: rgb("#fbe4dc"),
+  linear: rgb("#ece4f7"),
   mlp: rgb("#e2f2e4"),
   layer: rgb("#fafafa"),
 )
@@ -30,13 +31,16 @@
 
 /// A block of the model. `role` picks the fill from `fills`. `loaded: false`
 /// draws the block dashed: the checkpoint has it but metallix does not run
-/// it, and the caption says so.
-#let block(pos, label, role: "io", name: none, loaded: true, width: auto) = node(
+/// it. `optional: true` draws it dotted: only some checkpoints of the
+/// architecture have it. The caption says which.
+#let block(pos, label, role: "io", name: none, loaded: true, optional: false, width: auto) = node(
   pos,
   label,
   name: name,
   fill: fills.at(role),
-  stroke: if loaded { 0.6pt } else { (thickness: 0.6pt, dash: "dashed") },
+  stroke: if not loaded { (thickness: 0.6pt, dash: "dashed") } else if optional {
+    (thickness: 0.6pt, dash: "dotted")
+  } else { 0.6pt },
   corner-radius: 2pt,
   inset: 5pt,
   width: width,
@@ -75,10 +79,19 @@
   name: name,
 )
 
-/// The gated MLP: `down(silu(gate(x)) * up(x))`.
-#let swiglu(pos, name: none) = block(
+/// The gated MLP: `down(silu(gate(x)) * up(x))`, with inner width `width`
+/// when given.
+#let swiglu(pos, width: none, name: none) = block(
   pos,
-  [*SwiGLU MLP*\ down(SiLU(gate _x_) #sym.dot.c up _x_)],
+  {
+    [*SwiGLU MLP*]
+    linebreak()
+    [down(SiLU(gate _x_) #sym.dot.c up _x_)]
+    if width != none {
+      linebreak()
+      [inner width #width]
+    }
+  },
   role: "mlp",
   name: name,
 )
@@ -98,3 +111,71 @@
 
 /// The arrow style shared by every data-flow edge.
 #let flow = "-|>"
+
+/// `GatedDeltaNet` linear attention: a short causal convolution, then the
+/// gated delta rule over a fixed-size state per value head, then a gated
+/// output norm. Its state does not grow with the sequence.
+#let gated-deltanet(pos, name: none) = block(
+  pos,
+  [*Gated DeltaNet*\ causal conv, then the gated delta\ rule on a fixed state per value head;\ output RMSNorm #sym.dot.c SiLU(_z_)],
+  role: "linear",
+  name: name,
+)
+
+/// Full attention with a sigmoid output gate, per-head Q/K RMSNorm and
+/// rotary embedding on part of each head.
+#let gated-attention(pos, name: none) = block(
+  pos,
+  [*Gated full attention*\ grouped-query, K/V cache;\ per-head Q/K RMSNorm, partial rotary;\ output #sym.dot.c sigmoid(gate)],
+  role: "attention",
+  name: name,
+)
+
+/// Routed experts plus one shared expert scaled by a sigmoid gate.
+#let moe(pos, name: none) = block(
+  pos,
+  [*Mixture of experts*\ router softmax, keep top _k_, renormalize;\ #sym.sum _w#sub[e]_ SwiGLU#sub[_e_] + sigmoid(gate) #sym.dot.c shared SwiGLU],
+  role: "mlp",
+  name: name,
+)
+
+/// One square per decoder layer, filled by kind: `kinds` maps each value in
+/// `layers` to a fill.
+#let layer-strip(layers, kinds) = box(
+  stack(
+    dir: ltr,
+    spacing: 1pt,
+    ..layers.map(kind => box(width: 4pt, height: 8pt, fill: kinds.at(kind), stroke: 0.3pt)),
+  ),
+)
+
+/// The gated MLP with tanh-approximated GELU: `down(gelu(gate(x)) * up(x))`.
+#let geglu(pos, name: none) = block(
+  pos,
+  [*GeGLU MLP*\ down(GELU#sub[tanh]\(gate _x_) #sym.dot.c up _x_)],
+  role: "mlp",
+  name: name,
+)
+
+/// Layer normalization (mean and variance), as in Whisper-style encoders.
+#let layernorm(pos, name: none) = block(pos, [LayerNorm], role: "norm", name: name)
+
+/// The ungated two-layer MLP: `fc2(gelu(fc1(x)))`.
+#let gelu-mlp(pos, width: none, name: none) = block(
+  pos,
+  {
+    [*GELU MLP*]
+    linebreak()
+    [fc#sub[2]\(GELU(fc#sub[1] _x_))]
+    if width != none {
+      linebreak()
+      [inner width #width]
+    }
+  },
+  role: "mlp",
+  name: name,
+)
+
+/// A step of a pipeline that is not a network layer: scheduling, packing,
+/// sampling.
+#let step(pos, label, name: none) = block(pos, label, role: "io", name: name)

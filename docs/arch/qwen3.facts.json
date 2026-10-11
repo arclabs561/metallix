@@ -12,6 +12,8 @@
   "attention_heads": 16,
   "kv_heads": 8,
   "head_dim": 128,
+  "intermediate_size": 3072,
+  "tied_output_embedding": true,
   "max_position_embeddings": 40960,
   "kv_bytes_per_token_bf16": 114688,
   "variants": [
