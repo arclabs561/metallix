@@ -13,15 +13,24 @@ const EPSILON: f32 = 1e-5;
 const ROPE_THETA: f32 = 160_000.0;
 const WIDTH_F32: f32 = 384.0;
 const HEAD_WIDTH_F32: f32 = 64.0;
-const MAX_POSITIONS: usize = 126;
+pub(crate) const MAX_POSITIONS: usize = 126;
 const MAX_WORK: usize = 256_000_000;
-const FULL_ENCODER_LAYERS: usize = 22;
+pub(crate) const FULL_ENCODER_LAYERS: usize = 22;
+/// Keys a local layer's query reaches on each side of itself.
+pub(crate) const LOCAL_WINDOW: usize = 64;
+
+/// Whether `layer` attends over every position; the others see
+/// [`LOCAL_WINDOW`] positions on each side.
+pub(crate) const fn attends_globally(layer: usize) -> bool {
+    layer.is_multiple_of(3)
+}
+
 // Matches the per-block bound, so a full prefill admits every sequence a block does.
 const MAX_PREFILL_POSITIONS: usize = MAX_POSITIONS;
 const MAX_SELECTED_ROWS: usize = MAX_PREFILL_POSITIONS;
 // 22 layers at MAX_PREFILL_POSITIONS: 126 * 384 * (4 * 384 + 3 * 1152) + 126^2 * 2 * 384 = 253.7M MACs each.
 const MAX_FULL_ENCODER_WORK: usize = 5_600_000_000;
-const PUBLISHED_VOCAB_SIZE: u64 = 256_000;
+pub(crate) const PUBLISHED_VOCAB_SIZE: u64 = 256_000;
 
 /// Raw parameters in the same row-major layout as `PyTorch` `nn.Linear` weights.
 #[derive(Clone, Debug)]
@@ -536,7 +545,7 @@ fn attention(
     let rotated_query = rotated_part(qkv, positions, 0);
     let rotated_key = rotated_part(qkv, positions, 1);
     let scale = HEAD_WIDTH_F32.sqrt().recip();
-    let local = !layer.is_multiple_of(3);
+    let local = !attends_globally(layer);
     for query in 0..positions {
         for head in 0..ATTENTION_HEADS {
             // Transformers builds its additive mask with `torch.finfo(f32).min`,
@@ -545,7 +554,7 @@ fn attention(
             let mut logits = vec![f32::MIN; positions];
             let mut maximum = f32::MIN;
             for key in 0..positions {
-                if !mask[key] || (local && query.abs_diff(key) > 64) {
+                if !mask[key] || (local && query.abs_diff(key) > LOCAL_WINDOW) {
                     continue;
                 }
                 let mut dot = 0.0;
