@@ -6,7 +6,11 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use crate::sampling::{SamplingError, sample_categorical};
+use crate::sampling::{
+    SamplingError,
+    race::{RaceCandidates, RaceKey, sample_race},
+    sample_categorical,
+};
 use jsonschema::{Draft, Validator};
 use llguidance::{
     Matcher, ParserFactory,
@@ -670,6 +674,71 @@ impl JsonConstraintSession {
         Ok((step, probabilities))
     }
 
+    /// [`Self::select_categorical_with_logprobs`] under the `race-v2` sampler:
+    /// the grammar-allowed row with the largest perturbed score at `position`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::select_categorical_with_logprobs`], with
+    /// [`ConstraintError::InvalidSamplingParameter`] for an invalid
+    /// `temperature`.
+    pub fn select_race_with_logprobs(
+        &mut self,
+        logits: &[f32],
+        temperature: f64,
+        key: RaceKey,
+        position: u32,
+    ) -> Result<(ConstraintStep, SamplingTokenLogProbs), ConstraintError> {
+        let mask = self.prepare_selection(logits)?;
+        self.fill_legal_mask(&mask);
+        let selected = sample_race(logits, &self.legal_mask, temperature, key, position)
+            .map_err(map_sampling_error)?;
+        let selected_index = usize::try_from(selected.token_id)
+            .map_err(|_| ConstraintError::TokenizerCompilation)?;
+        let probabilities = self.logprobs_for(logits, selected_index, selected.sampling_logprob);
+        let step = self.commit_in_place(selected_index)?;
+        Ok((step, probabilities))
+    }
+
+    /// Consumes the `race-v2` winner from a short candidate list, or returns
+    /// `None`, consuming nothing, when the list cannot settle it; the caller
+    /// then selects from the whole row. The legal set is the same grammar
+    /// mask the whole-row path uses, so both give the same token.
+    ///
+    /// The mask is computed in full: under a canonical tokenizer,
+    /// llguidance's single-token validation accepts tokenizations of forced
+    /// bytes that the mask excludes, so it cannot stand in for the mask.
+    ///
+    /// # Errors
+    ///
+    /// * [`ConstraintError::TerminalSession`] after completion or
+    ///   [`Self::finish`].
+    /// * [`ConstraintError::NoAllowedToken`] when the grammar allows no token.
+    /// * [`ConstraintError::OutputTooLarge`] when the token's bytes would pass
+    ///   [`ConstraintLimits::max_output_bytes`].
+    /// * [`ConstraintError::NonAcceptingStop`] when the grammar stops, or would
+    ///   stop after this token, in a non-accepting state.
+    pub fn select_race_from_candidates(
+        &mut self,
+        candidates: &RaceCandidates,
+    ) -> Result<Option<ConstraintStep>, ConstraintError> {
+        if self.state != SessionState::Active {
+            return Err(ConstraintError::TerminalSession);
+        }
+        let mask = self.prepare_mask()?;
+        // Padded model rows past the tokenizer are never selectable.
+        let legal = |row: u32| {
+            usize::try_from(row).is_ok_and(|index| index < self.tokenizer_vocab_size)
+                && mask.is_allowed(row)
+        };
+        let Some(row) = candidates.first_legal(legal) else {
+            return Ok(None);
+        };
+        let selected_index =
+            usize::try_from(row).map_err(|_| ConstraintError::TokenizerCompilation)?;
+        self.commit_in_place(selected_index).map(Some)
+    }
+
     fn select(
         &mut self,
         logits: &[f32],
@@ -700,6 +769,12 @@ impl JsonConstraintSession {
         if !all_finite(logits) {
             return Err(ConstraintError::NonFiniteLogit);
         }
+        self.prepare_mask()
+    }
+
+    /// Computes the grammar mask on the live matcher, as
+    /// [`Self::prepare_selection`] does after checking the logits.
+    fn prepare_mask(&mut self) -> Result<SimpleVob, ConstraintError> {
         if self.matcher.is_stopped() {
             return Err(ConstraintError::NonAcceptingStop);
         }
@@ -1023,6 +1098,7 @@ mod tests {
         ConstraintError, ConstraintFinish, ConstraintLimits, ConstraintStep,
         JsonConstraintCompiler, JsonConstraintSession, SessionState, is_accepting_terminal,
     };
+    use crate::sampling::race::{RaceCandidates, RaceKey, race_score};
     use serde_json::{Value, json};
 
     const EOS: u32 = 14;
@@ -1485,6 +1561,116 @@ mod tests {
         }
     }
 
+    /// A small deterministic generator for test logits and noise.
+    struct Lcg(u64);
+
+    impl Lcg {
+        /// Uniform in [-1, 1).
+        #[allow(clippy::cast_precision_loss, reason = "53-bit test variates")]
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1_u64 << 52) as f64 - 1.0
+        }
+    }
+
+    /// The list a device scoring with error up to `error` would hand over:
+    /// the `count` rows with the best approximate scores, each with its exact
+    /// score, and a floor that bounds every unlisted row's exact score.
+    fn device_candidates(
+        values: &[f32],
+        key: RaceKey,
+        position: u32,
+        count: usize,
+        error: f64,
+        noise: &mut Lcg,
+    ) -> RaceCandidates {
+        let mut scored: Vec<(u32, f64, f64)> = (0_u32..)
+            .zip(values)
+            .map(|(row, &logit)| {
+                let exact = race_score(logit, 0.8, key, position, row);
+                (row, exact, exact + error * noise.next())
+            })
+            .collect();
+        scored.sort_by(|left, right| right.2.total_cmp(&left.2));
+        let floor = scored
+            .get(count)
+            .map_or(f64::NEG_INFINITY, |&(_, _, approximate)| {
+                approximate + error
+            });
+        RaceCandidates::new(
+            scored[..count]
+                .iter()
+                .map(|&(row, exact, _)| (row, exact))
+                .collect(),
+            floor,
+        )
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, reason = "test logits in [-2, 2]")]
+    fn race_candidates_settle_the_whole_row_winner_or_defer() {
+        // Settled picks must equal the whole-row pick under the same mask,
+        // including forced-byte states of the object schema; deferrals then
+        // take the whole-row path. Both outcomes must occur.
+        type MakeSession = fn() -> JsonConstraintSession;
+        let makers: [(&str, MakeSession); 4] = [
+            ("object", session),
+            ("number", number_session),
+            ("canonical forced", canonical_forced_session),
+            ("lark tool call", lark_tool_session),
+        ];
+        let (mut settled, mut deferred) = (0, 0);
+        for (name, make) in makers {
+            for seed in 0..40_u64 {
+                let key = RaceKey { seed, choice: 0 };
+                let mut values_from = Lcg(seed);
+                let mut noise = Lcg(seed ^ 0x5eed);
+                let mut whole = make();
+                let mut listed = make();
+                for position in 0..12_u32 {
+                    if whole.is_complete() {
+                        break;
+                    }
+                    let values: Vec<f32> = (0..MODEL_VOCAB)
+                        .map(|_| (2.0 * values_from.next()) as f32)
+                        .collect();
+                    let Ok((expected, _)) =
+                        whole.select_race_with_logprobs(&values, 0.8, key, position)
+                    else {
+                        break;
+                    };
+                    // Tight and loose device error bounds, short and long lists.
+                    let count = 1 + usize::try_from(position).expect("small") % 8;
+                    let error = if seed % 2 == 0 { 0.02 } else { 0.75 };
+                    let candidates =
+                        device_candidates(&values, key, position, count, error, &mut noise);
+                    let settled_step = listed
+                        .select_race_from_candidates(&candidates)
+                        .expect("candidate selection");
+                    let step = if let Some(step) = settled_step {
+                        settled += 1;
+                        step
+                    } else {
+                        deferred += 1;
+                        listed
+                            .select_race_with_logprobs(&values, 0.8, key, position)
+                            .expect("whole-row fallback")
+                            .0
+                    };
+                    assert_eq!(step, expected, "{name} seed {seed} position {position}");
+                    assert_eq!(listed.decoded_bytes(), whole.decoded_bytes());
+                }
+            }
+        }
+        assert!(
+            settled > 60 && deferred > 20,
+            "settled {settled}, deferred {deferred}"
+        );
+    }
+
     #[test]
     fn padded_rows_and_eos_cannot_win_before_completion() {
         let mut session = session();
@@ -1893,6 +2079,28 @@ mod tests {
         assert!(session.is_complete());
         assert_eq!(session.decoded_bytes(), b"1");
         assert_eq!(session.validate_complete(), Ok(json!(1)));
+    }
+
+    /// A tool-call shaped Lark session, as the server compiles for strict
+    /// tools: a literal, a special marker token named by id, then embedded
+    /// JSON.
+    fn lark_tool_session() -> JsonConstraintSession {
+        let tokenizer = json!({
+            "decoder": {"type": "ByteLevel"},
+            "added_tokens": [
+                {"id": EOS, "content": "<eos>", "special": true},
+                {"id": 15, "content": "<call>", "special": true}
+            ],
+            "model": {"vocab": {
+                "{": 0, "}": 1, "\"": 2, "o": 3, "k": 4, ":": 5,
+                "t": 6, "r": 7, "u": 8, "e": 9, "f": 10, "a": 11,
+                "l": 12, "s": 13
+            }}
+        });
+        JsonConstraintCompiler::new(&tokenizer, EOS, MODEL_VOCAB, limits())
+            .expect("bounded compiler")
+            .lark_session(r#"start: "o" <[15]> %json{"type": "boolean"}"#, limits())
+            .expect("bounded lark session")
     }
 
     /// A Lark grammar names a special token by id and embeds a JSON Schema;

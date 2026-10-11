@@ -150,9 +150,71 @@ pub fn sample_race(
     })
 }
 
+/// Rows that may hold the race winner, each with its reference score, plus
+/// a `floor` that no unlisted row's reference score exceeds.
+///
+/// A device that scores rows approximately can still hand over a short list:
+/// it lists every row whose approximate score is near its maximum and sets the
+/// floor from its error bound. The host recomputes the listed scores exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RaceCandidates {
+    /// Descending score, ascending row on ties.
+    rows: Vec<(u32, f64)>,
+    floor: f64,
+}
+
+impl RaceCandidates {
+    /// `rows` pairs each listed row with [`race_score`] for it; `floor` bounds
+    /// the score of every row not listed.
+    #[must_use]
+    pub fn new(mut rows: Vec<(u32, f64)>, floor: f64) -> Self {
+        rows.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
+        Self { rows, floor }
+    }
+
+    /// The `count` best rows of `logits`, scored exactly, with the floor at
+    /// the best unlisted score (negative infinity when every row is listed).
+    #[must_use]
+    pub fn top(
+        logits: &[f32],
+        temperature: f64,
+        key: RaceKey,
+        position: u32,
+        count: usize,
+    ) -> Self {
+        let mut all = Self::new(
+            (0_u32..)
+                .zip(logits)
+                .map(|(row, &logit)| (row, race_score(logit, temperature, key, position, row)))
+                .collect(),
+            f64::NEG_INFINITY,
+        );
+        if let Some(&(_, floor)) = all.rows.get(count) {
+            all.floor = floor;
+        }
+        all.rows.truncate(count);
+        all
+    }
+
+    /// The race winner among rows satisfying `legal`, or `None` when the list
+    /// cannot settle it: the first legal listed row must score strictly above
+    /// the floor, or an unlisted legal row could beat or tie it.
+    #[must_use]
+    pub fn first_legal(&self, legal: impl Fn(u32) -> bool) -> Option<u32> {
+        self.rows
+            .iter()
+            .find(|&&(row, _)| legal(row))
+            .filter(|&&(_, score)| score > self.floor)
+            .map(|&(row, _)| row)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RaceKey, gumbel_from_bits, philox4x32_10, race_bits, race_score, sample_race};
+    use super::{
+        RaceCandidates, RaceKey, gumbel_from_bits, philox4x32_10, race_bits, race_score,
+        sample_race,
+    };
     use crate::sampling::SamplingError;
 
     #[test]
@@ -287,6 +349,27 @@ mod tests {
                 })
                 .expect("legal rows");
             assert_eq!(best, sample.token_id);
+        }
+    }
+
+    #[test]
+    fn exact_candidate_lists_agree_with_the_whole_row() {
+        let logits = [0.0, 0.4, -0.3, 0.9, 0.1, -1.2, 0.6, 0.2];
+        let key = RaceKey { seed: 5, choice: 0 };
+        for position in 0..64_u32 {
+            let legal: Vec<bool> = (0..8_u32).map(|row| (row + position) % 3 != 0).collect();
+            let expected = sample_race(&logits, &legal, 0.7, key, position)
+                .expect("draw")
+                .token_id;
+            for count in 1..=8 {
+                let candidates = RaceCandidates::top(&logits, 0.7, key, position, count);
+                let settled = candidates.first_legal(|row| legal[row as usize]);
+                if count == 8 {
+                    assert_eq!(settled, Some(expected));
+                } else if let Some(row) = settled {
+                    assert_eq!(row, expected, "position {position}, count {count}");
+                }
+            }
         }
     }
 
