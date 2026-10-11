@@ -514,6 +514,19 @@ refused. A name the template does not read never reaches it and is listed in
 `metallix.ignored_template_kwargs` (on a Chat Completions stream, in the usage
 chunk).
 
+`/v1/chat/completions`, `/v1/responses` and `/v1/messages` also accept
+`"metallix_sampler"`,
+which names the seeded sampler: `"icdf-v1"` (the default) draws one uniform per
+token from a ChaCha8 stream and inverts the cumulative distribution in token-ID
+order; `"race-v2"` takes the largest `logit / temperature` plus Gumbel noise
+keyed by the seed, the token's position in the reply and its token ID
+(Philox4x32-10). Both sample the same distribution, but the same seed gives
+different text under each, so the reply reports the sampler it used in
+`metallix.sampling.sampler`, and chat completions carry a `system_fingerprint`
+that changes when the default sampler does. Under `race-v2` a token depends
+only on the seed, its position, the logits and the allowed tokens, so
+speculative decoding or reading a grammar mask from a few candidates cannot
+change seeded output.
 The serial HTTP transport accepts one request per connection and closes it
 following the response. Header and body intake share a five-second absolute
 deadline, with 16 KiB of headers, at most 64 headers, and at most 1 MiB of body.
