@@ -73,6 +73,11 @@ set(mlxc-src
 add_library(mlxc ${mlxc-src})
 
 target_link_libraries(mlxc PRIVATE mlx)
+# mlx_metal_is_nax_available calls into MLX's Metal backend, which only
+# exists when MLX builds it.
+if(MLX_BUILD_METAL)
+  target_compile_definitions(mlxc PRIVATE MLX_C_HAS_METAL_BACKEND)
+endif()
 target_include_directories(mlxc
                            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>)
 set_property(TARGET mlxc PROPERTY POSITION_INDEPENDENT_CODE ON)

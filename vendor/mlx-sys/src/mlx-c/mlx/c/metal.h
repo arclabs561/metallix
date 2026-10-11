@@ -30,6 +30,12 @@ extern "C" {
 
 int mlx_metal_get_metallib_path(mlx_string* res);
 int mlx_metal_is_available(bool* res);
+/**
+ * Whether MLX will use the Neural Accelerator (NAX) kernels: the OS is at
+ * least 26.2, the GPU is generation 17 or later (18 for phone GPUs), and
+ * the library was built with them (deployment target >= 26.2).
+ */
+int mlx_metal_is_nax_available(bool* res);
 int mlx_metal_set_metallib_path(const char* path);
 int mlx_metal_start_capture(const char* path);
 int mlx_metal_stop_capture(void);

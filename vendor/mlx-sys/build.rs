@@ -93,18 +93,50 @@ fn mlx_c_key(mlx_c_root: &Path) -> String {
     format!("{hash:016x}")[..12].to_owned()
 }
 
+/// The oldest macOS that MLX builds its Neural Accelerator (NAX) kernels
+/// for; a lower deployment target silently drops them.
+const NAX_DEPLOYMENT_TARGET: (u32, u32) = (26, 2);
+
+/// The macOS deployment target for MLX: `MACOSX_DEPLOYMENT_TARGET`, or the
+/// oldest one with NAX kernels. Left unset, MLX would target the build
+/// host's OS, so a binary built on a newer Mac would not run on an older
+/// one.
+fn deployment_target() -> String {
+    env::var("MACOSX_DEPLOYMENT_TARGET")
+        .ok()
+        .filter(|target| !target.trim().is_empty())
+        .unwrap_or_else(|| format!("{}.{}", NAX_DEPLOYMENT_TARGET.0, NAX_DEPLOYMENT_TARGET.1))
+}
+
 #[cfg(feature = "metal")]
-fn metallib_dir(mlx_c_root: &Path) -> PathBuf {
+fn has_nax_kernels(target: &str) -> bool {
+    let mut parts = target.trim().split('.').map(|part| part.parse::<u32>().unwrap_or(0));
+    let version = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    version >= NAX_DEPLOYMENT_TARGET
+}
+
+#[cfg(feature = "metal")]
+fn metallib_dir(mlx_c_root: &Path, target: &str) -> PathBuf {
     if let Some(path) = env::var_os("MLX_RS_METAL_PATH") {
         return PathBuf::from(path);
     }
+    // The shared directory serves every binary built from these sources on
+    // this machine, so a build without NAX kernels must not replace it.
+    assert!(
+        has_nax_kernels(target),
+        "MACOSX_DEPLOYMENT_TARGET={target} builds MLX without its NAX kernels; set \
+         MLX_RS_METAL_PATH to a private directory so this build does not replace \
+         the shared mlx.metallib"
+    );
 
     let home =
         env::var_os("HOME").expect("HOME must be set when MLX_RS_METAL_PATH is not provided");
+    // The deployment target decides which kernels the metallib holds, so it
+    // is part of the key.
     PathBuf::from(home)
         .join(".mlx")
         .join("lib")
-        .join(mlx_c_key(mlx_c_root))
+        .join(format!("{}-macos{target}", mlx_c_key(mlx_c_root)))
 }
 
 fn build_and_link_mlx_c() {
@@ -112,6 +144,8 @@ fn build_and_link_mlx_c() {
     let mut config = Config::new(mlx_c_root);
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
+    let target = deployment_target();
+    config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &target);
 
     // Use Xcode's clang to ensure compatibility with the macOS SDK
     config.define("CMAKE_C_COMPILER", "/usr/bin/cc");
@@ -133,7 +167,7 @@ fn build_and_link_mlx_c() {
     #[cfg(feature = "metal")]
     {
         config.define("MLX_BUILD_METAL", "ON");
-        let metallib_dir = metallib_dir(mlx_c_root);
+        let metallib_dir = metallib_dir(mlx_c_root, &target);
         fs::create_dir_all(&metallib_dir).expect("Unable to create the MLX metallib directory");
         config.define("MLX_METAL_PATH", &metallib_dir);
     }
@@ -164,7 +198,10 @@ fn build_and_link_mlx_c() {
     #[cfg(feature = "metal")]
     {
         println!("cargo:rustc-link-lib=framework=Metal");
-        let metallib = metallib_dir(mlx_c_root).join("mlx.metallib");
+        let metallib = metallib_dir(mlx_c_root, &target).join("mlx.metallib");
+        // MLX loads this file when no override or colocated metallib exists;
+        // `DEFAULT_METALLIB_PATH` lets callers find out which file that is.
+        println!("cargo:rustc-env=MLX_SYS_DEFAULT_METALLIB={}", metallib.display());
         if !metallib.exists() {
             println!(
                 "cargo:warning=mlx.metallib was not created at {}; Metal operations may fail at runtime",
@@ -172,6 +209,9 @@ fn build_and_link_mlx_c() {
             );
         }
     }
+
+    #[cfg(not(feature = "metal"))]
+    println!("cargo:rustc-env=MLX_SYS_DEFAULT_METALLIB=");
 
     #[cfg(feature = "accelerate")]
     {
@@ -189,6 +229,7 @@ fn build_and_link_mlx_c() {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MLX_RS_METAL_PATH");
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
     build_and_link_mlx_c();
 
     let mlx_c_root = PathBuf::from("src/mlx-c");

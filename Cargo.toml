@@ -55,7 +55,7 @@ module_name_repetitions = "allow"
 # annotations and adds no checking over `assert!(x.is_empty())`.
 assert_is_empty = "allow"
 
-# mlx-sys 0.6.0 from crates.io, vendored unchanged so local build fixes can
-# land as reviewable diffs against it.
+# mlx-sys 0.6.0 with a pinned macOS deployment target and a NAX query; see
+# vendor/mlx-sys/VENDORED.md.
 [patch.crates-io]
 mlx-sys = { path = "vendor/mlx-sys" }

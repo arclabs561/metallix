@@ -26,6 +26,27 @@ extern "C" int mlx_metal_is_available(bool* res) {
   }
   return 0;
 }
+#ifdef MLX_C_HAS_METAL_BACKEND
+// Declared in MLX's internal mlx/backend/metal/device.h, which pulls in
+// metal-cpp; the definition is in MLX's Metal backend.
+namespace mlx::core::metal {
+bool is_nax_available();
+} // namespace mlx::core::metal
+#endif
+
+extern "C" int mlx_metal_is_nax_available(bool* res) {
+  try {
+#ifdef MLX_C_HAS_METAL_BACKEND
+    *res = mlx::core::metal::is_nax_available();
+#else
+    *res = false;
+#endif
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_metal_set_metallib_path(const char* path) {
   try {
     mlx::core::metal::set_metallib_path(std::string(path));

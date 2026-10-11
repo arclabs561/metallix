@@ -1,0 +1,179 @@
+diff -ru -x p a/build.rs b/build.rs
+--- a/build.rs	2006-07-23 19:21:28
++++ b/build.rs	2026-10-09 08:39:16
+@@ -93,18 +93,50 @@
+     format!("{hash:016x}")[..12].to_owned()
+ }
+ 
++/// The oldest macOS that MLX builds its Neural Accelerator (NAX) kernels
++/// for; a lower deployment target silently drops them.
++const NAX_DEPLOYMENT_TARGET: (u32, u32) = (26, 2);
++
++/// The macOS deployment target for MLX: `MACOSX_DEPLOYMENT_TARGET`, or the
++/// oldest one with NAX kernels. Left unset, MLX would target the build
++/// host's OS, so a binary built on a newer Mac would not run on an older
++/// one.
++fn deployment_target() -> String {
++    env::var("MACOSX_DEPLOYMENT_TARGET")
++        .ok()
++        .filter(|target| !target.trim().is_empty())
++        .unwrap_or_else(|| format!("{}.{}", NAX_DEPLOYMENT_TARGET.0, NAX_DEPLOYMENT_TARGET.1))
++}
++
+ #[cfg(feature = "metal")]
+-fn metallib_dir(mlx_c_root: &Path) -> PathBuf {
++fn has_nax_kernels(target: &str) -> bool {
++    let mut parts = target.trim().split('.').map(|part| part.parse::<u32>().unwrap_or(0));
++    let version = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
++    version >= NAX_DEPLOYMENT_TARGET
++}
++
++#[cfg(feature = "metal")]
++fn metallib_dir(mlx_c_root: &Path, target: &str) -> PathBuf {
+     if let Some(path) = env::var_os("MLX_RS_METAL_PATH") {
+         return PathBuf::from(path);
+     }
++    // The shared directory serves every binary built from these sources on
++    // this machine, so a build without NAX kernels must not replace it.
++    assert!(
++        has_nax_kernels(target),
++        "MACOSX_DEPLOYMENT_TARGET={target} builds MLX without its NAX kernels; set \
++         MLX_RS_METAL_PATH to a private directory so this build does not replace \
++         the shared mlx.metallib"
++    );
+ 
+     let home =
+         env::var_os("HOME").expect("HOME must be set when MLX_RS_METAL_PATH is not provided");
++    // The deployment target decides which kernels the metallib holds, so it
++    // is part of the key.
+     PathBuf::from(home)
+         .join(".mlx")
+         .join("lib")
+-        .join(mlx_c_key(mlx_c_root))
++        .join(format!("{}-macos{target}", mlx_c_key(mlx_c_root)))
+ }
+ 
+ fn build_and_link_mlx_c() {
+@@ -112,6 +144,8 @@
+     let mut config = Config::new(mlx_c_root);
+     config.very_verbose(true);
+     config.define("CMAKE_INSTALL_PREFIX", ".");
++    let target = deployment_target();
++    config.define("CMAKE_OSX_DEPLOYMENT_TARGET", &target);
+ 
+     // Use Xcode's clang to ensure compatibility with the macOS SDK
+     config.define("CMAKE_C_COMPILER", "/usr/bin/cc");
+@@ -133,7 +167,7 @@
+     #[cfg(feature = "metal")]
+     {
+         config.define("MLX_BUILD_METAL", "ON");
+-        let metallib_dir = metallib_dir(mlx_c_root);
++        let metallib_dir = metallib_dir(mlx_c_root, &target);
+         fs::create_dir_all(&metallib_dir).expect("Unable to create the MLX metallib directory");
+         config.define("MLX_METAL_PATH", &metallib_dir);
+     }
+@@ -164,7 +198,10 @@
+     #[cfg(feature = "metal")]
+     {
+         println!("cargo:rustc-link-lib=framework=Metal");
+-        let metallib = metallib_dir(mlx_c_root).join("mlx.metallib");
++        let metallib = metallib_dir(mlx_c_root, &target).join("mlx.metallib");
++        // MLX loads this file when no override or colocated metallib exists;
++        // `DEFAULT_METALLIB_PATH` lets callers find out which file that is.
++        println!("cargo:rustc-env=MLX_SYS_DEFAULT_METALLIB={}", metallib.display());
+         if !metallib.exists() {
+             println!(
+                 "cargo:warning=mlx.metallib was not created at {}; Metal operations may fail at runtime",
+@@ -173,6 +210,9 @@
+         }
+     }
+ 
++    #[cfg(not(feature = "metal"))]
++    println!("cargo:rustc-env=MLX_SYS_DEFAULT_METALLIB=");
++
+     #[cfg(feature = "accelerate")]
+     {
+         println!("cargo:rustc-link-lib=framework=Accelerate");
+@@ -189,6 +229,7 @@
+ 
+ fn main() {
+     println!("cargo:rerun-if-env-changed=MLX_RS_METAL_PATH");
++    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+     build_and_link_mlx_c();
+ 
+     let mlx_c_root = PathBuf::from("src/mlx-c");
+diff -ru -x p a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2006-07-23 19:21:28
++++ b/src/lib.rs	2026-10-09 08:39:16
+@@ -4,3 +4,9 @@
+ #![allow(clippy::all)]
+ 
+ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
++
++/// The metallib this build installed and compiled in as MLX's last-resort
++/// default (`MLX_METAL_PATH`); empty without the `metal` feature. MLX
++/// prefers a path set with `mlx_metal_set_metallib_path`, then an
++/// `mlx.metallib` next to the executable, before this one.
++pub const DEFAULT_METALLIB_PATH: &str = env!("MLX_SYS_DEFAULT_METALLIB");
+diff -ru -x p a/src/mlx-c/CMakeLists.txt b/src/mlx-c/CMakeLists.txt
+--- a/src/mlx-c/CMakeLists.txt	2006-07-23 19:21:28
++++ b/src/mlx-c/CMakeLists.txt	2026-10-09 08:39:00
+@@ -73,6 +73,11 @@
+ add_library(mlxc ${mlxc-src})
+ 
+ target_link_libraries(mlxc PRIVATE mlx)
++# mlx_metal_is_nax_available calls into MLX's Metal backend, which only
++# exists when MLX builds it.
++if(MLX_BUILD_METAL)
++  target_compile_definitions(mlxc PRIVATE MLX_C_HAS_METAL_BACKEND)
++endif()
+ target_include_directories(mlxc
+                            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}>)
+ set_property(TARGET mlxc PROPERTY POSITION_INDEPENDENT_CODE ON)
+diff -ru -x p a/src/mlx-c/mlx/c/metal.cpp b/src/mlx-c/mlx/c/metal.cpp
+--- a/src/mlx-c/mlx/c/metal.cpp	2006-07-23 19:21:28
++++ b/src/mlx-c/mlx/c/metal.cpp	2026-10-09 08:39:00
+@@ -26,6 +26,27 @@
+   }
+   return 0;
+ }
++#ifdef MLX_C_HAS_METAL_BACKEND
++// Declared in MLX's internal mlx/backend/metal/device.h, which pulls in
++// metal-cpp; the definition is in MLX's Metal backend.
++namespace mlx::core::metal {
++bool is_nax_available();
++} // namespace mlx::core::metal
++#endif
++
++extern "C" int mlx_metal_is_nax_available(bool* res) {
++  try {
++#ifdef MLX_C_HAS_METAL_BACKEND
++    *res = mlx::core::metal::is_nax_available();
++#else
++    *res = false;
++#endif
++  } catch (std::exception& e) {
++    mlx_error(e.what());
++    return 1;
++  }
++  return 0;
++}
+ extern "C" int mlx_metal_set_metallib_path(const char* path) {
+   try {
+     mlx::core::metal::set_metallib_path(std::string(path));
+diff -ru -x p a/src/mlx-c/mlx/c/metal.h b/src/mlx-c/mlx/c/metal.h
+--- a/src/mlx-c/mlx/c/metal.h	2006-07-23 19:21:28
++++ b/src/mlx-c/mlx/c/metal.h	2026-10-09 08:39:00
+@@ -30,6 +30,12 @@
+ 
+ int mlx_metal_get_metallib_path(mlx_string* res);
+ int mlx_metal_is_available(bool* res);
++/**
++ * Whether MLX will use the Neural Accelerator (NAX) kernels: the OS is at
++ * least 26.2, the GPU is generation 17 or later (18 for phone GPUs), and
++ * the library was built with them (deployment target >= 26.2).
++ */
++int mlx_metal_is_nax_available(bool* res);
+ int mlx_metal_set_metallib_path(const char* path);
+ int mlx_metal_start_capture(const char* path);
+ int mlx_metal_stop_capture(void);
