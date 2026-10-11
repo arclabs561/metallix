@@ -1224,10 +1224,11 @@ impl ChatSession {
         deadline.check()?;
         let mut decode_ms = Vec::new();
         let mut finish_reason = ChatFinishReason::Length;
-        // Greedy turns, and sampled turns with top_k, pick each token on the
-        // GPU and queue step t + 1 before reading step t back; the host then
-        // settles the token and any logprobs exactly from a few top
-        // candidates. Other turns read the full logit row each step.
+        // Greedy turns, sampled turns with top_k, and race-v2 turns without
+        // truncation pick each token on the GPU and queue step t + 1 before
+        // reading step t back; the host then settles the token and any
+        // logprobs exactly from a few top candidates or the GPU's race
+        // certificate. Other turns read the full logit row each step.
         let pipelined = turn.gpu_rule(&self.format, 0).is_some();
         let mut pending: Option<Qwen3TokenPicks> = None;
         let mut last_token_at = Instant::now();
@@ -1819,6 +1820,7 @@ enum SamplingFallback {
     UnboundedNucleus,
     CandidateCount,
     InsufficientCandidates,
+    RaceRows,
 }
 
 impl SamplingFallback {
@@ -1829,6 +1831,7 @@ impl SamplingFallback {
             Self::UnboundedNucleus => "unbounded_nucleus_full_row",
             Self::CandidateCount => "candidate_count_full_row",
             Self::InsufficientCandidates => "candidates_insufficient_full_row",
+            Self::RaceRows => "race_rows_full_row",
         }
     }
 }
@@ -1962,11 +1965,14 @@ impl TokenPicker {
     /// How the GPU picks this turn's next `rows` tokens, row `i` with the
     /// variate `ahead + i` draws past the next uncommitted one, or `None`
     /// when every step must read the whole logit row: under a grammar mask,
-    /// or sampling without `top_k`, whose nucleus normalizer spans the whole
-    /// row. Candidates cover the receipts `top_logprobs` asks for and the
-    /// `top_k` draw. A decode step is one row; a speculative verify scores
-    /// several, and row `i`'s variate is used only if the rows before it
-    /// were kept, each consuming one draw.
+    /// sampling with a nucleus but no `top_k` (whose normalizer spans the
+    /// whole row), or a `race-v2` verify of more than one row (its rows
+    /// would need each settle checked against the position it was scored
+    /// at). `icdf-v1` without `top_k` also reads whole rows. Candidates
+    /// cover the receipts `top_logprobs` asks for and the `top_k` draw. A
+    /// decode step is one row; a speculative verify scores several, and row
+    /// `i`'s variate is used only if the rows before it were kept, each
+    /// consuming one draw.
     fn gpu_rule(
         &self,
         ahead: usize,
@@ -1987,6 +1993,29 @@ impl TokenPicker {
                 selection: Qwen3Selection::Greedy,
                 candidates: receipts,
             },
+            Some((policy, top_p, top_k)) if policy.race_ahead(ahead).is_some() => {
+                if rows != 1 {
+                    SamplingOutcome::Fallback(SamplingFallback::RaceRows).record(&span);
+                    return None;
+                }
+                let (key, position) = policy.race_ahead(ahead)?;
+                // The whole-row race pick applies no nucleus.
+                if top_k.is_none() && *top_p < 1.0 {
+                    SamplingOutcome::Fallback(SamplingFallback::UnboundedNucleus).record(&span);
+                    return None;
+                }
+                Qwen3PickRule {
+                    selection: Qwen3Selection::Race {
+                        temperature: self.applied.temperature,
+                        top_p: *top_p,
+                        top_k: *top_k,
+                        key,
+                        positions: vec![position],
+                    },
+                    candidates: receipts
+                        .max(top_k.map_or(0, |top_k| top_k_window(top_k, vocabulary_size))),
+                }
+            }
             Some((policy, top_p, top_k)) => {
                 let Some(top_k) = *top_k else {
                     SamplingOutcome::Fallback(SamplingFallback::UnboundedNucleus).record(&span);
@@ -2016,19 +2045,26 @@ impl TokenPicker {
     /// The exact token for a GPU-picked step, from its candidates, or `None`
     /// when the caller must pick from the whole row. Greedy keeps the GPU
     /// argmax; a `top_k` draw is re-derived on the host and consumes the
-    /// step's variate.
+    /// step's variate or position; a whole-row `race-v2` pick is kept when
+    /// the GPU `certified` that no other row scored within its window.
     fn pick_from_candidates(
         &mut self,
         gpu_token: i32,
         candidates: Option<&Qwen3RowCandidates>,
+        certified: bool,
     ) -> Result<Option<i32>, String> {
         let span = self.sampling_span(SamplingPath::GpuCandidates);
         let _entered = span.enter();
         let result = match (self.policy.as_mut(), candidates) {
             (None, _) => Ok(Some(gpu_token)),
             (Some((policy, top_p, Some(top_k))), Some(candidates)) => {
-                policy.sample_top_k_candidates(candidates, *top_p, *top_k)
+                if policy.race_ahead(0).is_some() {
+                    policy.settle_race_top_k(candidates, *top_p, *top_k)
+                } else {
+                    policy.sample_top_k_candidates(candidates, *top_p, *top_k)
+                }
             }
+            (Some((policy, _, None)), _) if certified => policy.accept_certified_race(gpu_token),
             (Some(_), _) => Ok(None),
         };
         match &result {
@@ -2292,7 +2328,12 @@ mod tests {
         let before = next(&picker);
         assert!(picker.gpu_rule(2, 1, None, 4).is_some());
         assert_eq!(next(&picker), before);
-        assert!(picker.pick_from_candidates(0, None).unwrap().is_none());
+        assert!(
+            picker
+                .pick_from_candidates(0, None, false)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(next(&picker), before);
         assert!(picker.pick(&[f32::NAN, 1.0, 0.0, -1.0]).is_err());
         assert_eq!(next(&picker), before);
@@ -2309,7 +2350,7 @@ mod tests {
             shifted_exp_sum: 1.0,
         };
         let second = picker
-            .pick_from_candidates(0, Some(&candidates))
+            .pick_from_candidates(0, Some(&candidates), false)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -2327,13 +2368,21 @@ mod tests {
     }
 
     fn sampled_picker(top_k: usize, vocabulary_size: usize) -> super::TokenPicker {
+        sampled_picker_with(top_k, vocabulary_size, super::SamplerId::IcdfV1)
+    }
+
+    fn sampled_picker_with(
+        top_k: usize,
+        vocabulary_size: usize,
+        sampler: super::SamplerId,
+    ) -> super::TokenPicker {
         let config = super::SamplingConfiguration {
             seed: 11,
             temperature: 0.7,
         };
         super::TokenPicker {
             policy: Some((
-                super::SamplingPolicy::new(config, vocabulary_size),
+                super::SamplingPolicy::with_sampler(config, sampler, vocabulary_size),
                 0.95,
                 Some(top_k),
             )),
@@ -2344,7 +2393,7 @@ mod tests {
                 top_p: 0.95,
                 top_k: Some(u32::try_from(top_k).expect("small top_k")),
                 seed: Some(11),
-                sampler: Some(super::SamplerId::IcdfV1),
+                sampler: Some(sampler),
                 defaults_applied: Vec::new(),
             },
         }
@@ -2392,7 +2441,39 @@ mod tests {
         for _ in 0..20 {
             let candidates = top_candidates(&logits, rule.candidates);
             let settled = picker
-                .pick_from_candidates(0, Some(&candidates))
+                .pick_from_candidates(0, Some(&candidates), false)
+                .expect("valid candidates")
+                .expect("the boundary tie settles");
+            assert_eq!(settled, control.pick(&logits).expect("full row").0);
+        }
+    }
+
+    /// The race-v2 twin: its candidate settle refuses on the same boundary
+    /// ties, so it reads the same spare candidates.
+    #[test]
+    fn a_race_tie_at_the_top_k_boundary_settles_from_spare_candidates() {
+        let vocabulary = 64;
+        let top_k = 3;
+        let mut logits = vec![-4.0_f32; vocabulary];
+        logits[..6].copy_from_slice(&[5.0, 4.0, 2.0, 2.0, 2.0, 1.0]);
+        let race = super::SamplerId::RaceV2;
+        let mut picker = sampled_picker_with(top_k, vocabulary, race);
+        let rule = picker
+            .gpu_rule(0, 1, None, vocabulary)
+            .expect("a race top_k draw picks on the GPU");
+        assert!(
+            picker.gpu_rule(0, 2, None, vocabulary).is_none(),
+            "a race verify of several rows reads whole rows"
+        );
+        assert!(
+            rule.candidates > top_k + 1,
+            "spare candidates are read back"
+        );
+        let mut control = sampled_picker_with(top_k, vocabulary, race);
+        for _ in 0..20 {
+            let candidates = top_candidates(&logits, rule.candidates);
+            let settled = picker
+                .pick_from_candidates(0, Some(&candidates), false)
                 .expect("valid candidates")
                 .expect("the boundary tie settles");
             assert_eq!(settled, control.pick(&logits).expect("full row").0);

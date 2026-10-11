@@ -4,7 +4,10 @@ use std::{fs, path::Path, process::ExitCode, time::Instant};
 
 #[cfg(feature = "structured-output")]
 use crate::qwen_constraints::{ConstraintRun, SchemaSource};
-use engine::sampling::sample_categorical;
+use engine::sampling::{
+    race::{RaceKey, race_score, sample_race},
+    sample_categorical,
+};
 use qwen::metal::Qwen3MlxWeights;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -217,6 +220,68 @@ impl SamplingPolicy {
             rng.next_u64();
         }
         unit_uniform(rng.next_u64())
+    }
+
+    /// The race key and the generated position of the draw `ahead` draws
+    /// after the next one; `None` for `icdf-v1`.
+    pub(crate) fn race_ahead(&self, ahead: usize) -> Option<(RaceKey, u32)> {
+        let Entropy::Race { key, position } = &self.entropy else {
+            return None;
+        };
+        Some((*key, position.checked_add(u32::try_from(ahead).ok()?)?))
+    }
+
+    /// `race-v2`'s [`Self::sample_nucleus`] from a row's top candidates, the
+    /// same token as the whole row whenever the candidates settle the
+    /// `top_k` head: the nucleus is then the same set, and each member's
+    /// score depends only on its token ID and logit. `None`, drawing
+    /// nothing, otherwise or for `icdf-v1`.
+    pub(crate) fn settle_race_top_k(
+        &mut self,
+        candidates: &qwen::forward::Qwen3RowCandidates,
+        top_p: f64,
+        top_k: usize,
+    ) -> Result<Option<i32>, String> {
+        let temperature = self.configuration.temperature;
+        let Entropy::Race { key, position } = &mut self.entropy else {
+            return Ok(None);
+        };
+        if !candidates.settles_head(top_k) {
+            return Ok(None);
+        }
+        let mut by_id = candidates.top.clone();
+        by_id.sort_unstable_by_key(|&(id, _)| id);
+        let logits: Vec<f32> = by_id.iter().map(|&(_, logit)| logit).collect();
+        let mut legal_mask = vec![false; logits.len()];
+        nucleus_mask(&logits, temperature, top_p, Some(top_k), &mut legal_mask)?;
+        let mut best: Option<(i32, f64)> = None;
+        for (&(id, logit), _) in by_id.iter().zip(&legal_mask).filter(|(_, legal)| **legal) {
+            let row = u32::try_from(id).map_err(|error| error.to_string())?;
+            let score = race_score(logit, temperature, *key, *position, row);
+            if !score.is_finite() {
+                return Err("race score is not finite".into());
+            }
+            if best.is_none_or(|(_, top)| score > top) {
+                best = Some((id, score));
+            }
+        }
+        let (token, _) = best.ok_or("the nucleus is empty")?;
+        *position = position
+            .checked_add(1)
+            .ok_or("generated position overflow")?;
+        Ok(Some(token))
+    }
+
+    /// Commits a whole-row `race-v2` pick whose f32 scores the GPU certified;
+    /// `None` for `icdf-v1`.
+    pub(crate) fn accept_certified_race(&mut self, token: i32) -> Result<Option<i32>, String> {
+        let Entropy::Race { position, .. } = &mut self.entropy else {
+            return Ok(None);
+        };
+        *position = position
+            .checked_add(1)
+            .ok_or("generated position overflow")?;
+        Ok(Some(token))
     }
 
     /// [`Self::sample_nucleus`] from a row's top candidates instead of the
@@ -2192,6 +2257,52 @@ mod tests {
                 compact.uniform_ahead(0).to_bits()
             );
         }
+    }
+
+    #[test]
+    fn race_top_k_candidates_draw_exactly_what_the_whole_row_draws() {
+        let logits: Vec<f32> = (0_u32..3_000)
+            .map(|index| f32::from(u16::try_from(index * 7_919 % 997).unwrap()) / 90.0)
+            .collect();
+        for (temperature, top_p, top_k) in [(0.6, 0.95, 20), (1.0, 0.3, 5), (1.7, 1.0, 64)] {
+            let configuration = super::SamplingConfiguration {
+                seed: 5,
+                temperature,
+            };
+            let race = super::SamplerId::RaceV2;
+            let mut whole = super::SamplingPolicy::with_sampler(configuration, race, logits.len());
+            let mut compact =
+                super::SamplingPolicy::with_sampler(configuration, race, logits.len());
+            let candidates = (top_k + 1..logits.len())
+                .map(|count| host_candidates(&logits, count))
+                .find(|candidates| candidates.settles_head(top_k))
+                .unwrap();
+            for _ in 0..300 {
+                let expected = whole.sample_nucleus(&logits, top_p, Some(top_k)).unwrap();
+                let actual = compact
+                    .settle_race_top_k(&candidates, top_p, top_k)
+                    .unwrap()
+                    .expect("distinct boundary values settle the head");
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(whole.race_ahead(0), compact.race_ahead(0));
+        }
+    }
+
+    #[test]
+    fn certified_race_picks_advance_one_position_and_icdf_has_none() {
+        let configuration = SamplingConfiguration {
+            seed: 9,
+            temperature: 1.0,
+        };
+        let mut race = SamplingPolicy::with_sampler(configuration, super::SamplerId::RaceV2, 4);
+        let (key, start) = race.race_ahead(0).expect("race-v2 has a key");
+        assert_eq!(race.race_ahead(2), Some((key, start + 2)));
+        assert_eq!(race.accept_certified_race(3), Ok(Some(3)));
+        assert_eq!(race.race_ahead(0), Some((key, start + 1)));
+        let mut icdf = SamplingPolicy::new(configuration, 4);
+        assert_eq!(icdf.race_ahead(0), None);
+        assert_eq!(icdf.accept_certified_race(3), Ok(None));
     }
 
     #[test]

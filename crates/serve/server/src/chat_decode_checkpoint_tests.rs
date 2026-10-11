@@ -58,6 +58,13 @@ fn seeded(temperature: Option<f64>, top_p: Option<f64>, top_k: Option<u32>) -> S
     }
 }
 
+fn raced(sampling: SamplingRequest) -> SamplingRequest {
+    SamplingRequest {
+        sampler: Some(crate::qwen_forward::SamplerId::RaceV2),
+        ..sampling
+    }
+}
+
 /// Every GPU-picked step settles the token and receipts that the full-row
 /// host path computes from the same logits.
 #[test]
@@ -73,6 +80,12 @@ fn gpu_settled_steps_match_the_full_row_host_path() {
         ("defaults", seeded(None, None, None), None),
         ("defaults_top3", seeded(None, None, None), Some(3)),
         ("hot_narrow", seeded(Some(1.2), Some(0.9), Some(5)), Some(0)),
+        ("race_defaults", raced(seeded(None, None, None)), None),
+        (
+            "race_hot_narrow_top3",
+            raced(seeded(Some(1.2), Some(0.9), Some(5))),
+            Some(3),
+        ),
     ];
     for (name, sampling, top_logprobs) in cases {
         let mut request = ChatRequest::new(&messages, 64);

@@ -260,9 +260,9 @@ pub(crate) struct TurnOutput {
 impl TurnLoop {
     /// How the GPU picks this turn's tokens, with the variate `ahead` draws
     /// past the next uncommitted one, or `None` when every step must read the
-    /// whole logit row: under a grammar mask, sampling without `top_k`, or a
-    /// checkpoint that suppresses tokens (the GPU pick has no suppression
-    /// mask).
+    /// whole logit row: under a grammar mask, sampling without `top_k` (except
+    /// untruncated `race-v2`), or a checkpoint that suppresses tokens (the GPU
+    /// pick has no suppression mask).
     pub(crate) fn gpu_rule(&self, format: &ChatFormat, ahead: usize) -> Option<Qwen3PickRule> {
         self.gpu_rule_rows(format, ahead, 1)
     }
@@ -339,7 +339,14 @@ impl TurnLoop {
     ) -> Result<(Accepted, bool), String> {
         let read_row = || picks.full_row(row).map_err(|error| error.to_string());
         let mut full = None;
-        let token = if let Some(token) = self.picker.pick_from_candidates(gpu_token, candidates)? {
+        let certified = picks
+            .race_near_counts()
+            .map_err(|error| error.to_string())?
+            .is_some_and(|near| near.get(row) == Some(&1));
+        let token = if let Some(token) = self
+            .picker
+            .pick_from_candidates(gpu_token, candidates, certified)?
+        {
             token
         } else {
             let whole = read_row()?;
@@ -390,7 +397,7 @@ impl TurnLoop {
     ) -> Result<Accepted, String> {
         let token = self
             .picker
-            .pick_from_candidates(gpu_token, None)?
+            .pick_from_candidates(gpu_token, None, false)?
             .ok_or("only a greedy turn can accept a GPU pick without candidates")?;
         self.accept(format, token, false, None)
     }
