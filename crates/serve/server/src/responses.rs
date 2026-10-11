@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use chat_format::{ToolRequirement, TurnDelta};
+use chat_format::{TemplateKwargs, ToolRequirement, TurnDelta};
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
@@ -65,6 +65,10 @@ pub(crate) struct Request {
     include: Option<Vec<String>>,
     #[serde(default)]
     reasoning: Option<Reasoning>,
+    /// Metallix extension, as vLLM accepts it on Responses: extra
+    /// chat-template variables; see [`thinking_and_template_kwargs`].
+    #[serde(default)]
+    chat_template_kwargs: Option<Value>,
     #[serde(default)]
     text: Option<TextConfig>,
     #[serde(default)]
@@ -170,6 +174,84 @@ pub(crate) fn thinking_for_effort(effort: Option<&str>) -> Result<(bool, Option<
     }
 }
 
+/// The thinking switch, reasoning effort and template variables from a
+/// reasoning-effort field (named `effort_field` in errors) and a
+/// `chat_template_kwargs` object. vLLM and `SGLang` clients set
+/// `enable_thinking`, and `SGLang` ones `reasoning_effort`, inside the
+/// kwargs; both map to the same switch as the effort field, and values that
+/// disagree are refused rather than one winning silently.
+pub(crate) fn thinking_and_template_kwargs(
+    effort_field: &str,
+    effort: Option<&str>,
+    kwargs: Option<&Value>,
+) -> Result<(bool, Option<String>, TemplateKwargs), String> {
+    let Some(kwargs) = kwargs else {
+        let (thinking, effort) = thinking_for_effort(effort)
+            .map_err(|effort| format!("unsupported {effort_field} {effort:?}"))?;
+        return Ok((thinking, effort, TemplateKwargs::default()));
+    };
+    let mut kwargs = kwargs.clone();
+    let object = kwargs
+        .as_object_mut()
+        .ok_or("chat_template_kwargs must be an object")?;
+    let kwarg_effort = match object.remove("reasoning_effort") {
+        None => None,
+        Some(Value::String(effort)) => Some(effort),
+        Some(_) => return Err("chat_template_kwargs.reasoning_effort must be a string".into()),
+    };
+    let kwarg_thinking = match object.remove("enable_thinking") {
+        None => None,
+        Some(Value::Bool(thinking)) => Some(thinking),
+        Some(_) => return Err("chat_template_kwargs.enable_thinking must be a boolean".into()),
+    };
+    let effort = match (effort, kwarg_effort.as_deref()) {
+        (Some(field), Some(kwarg)) if field != kwarg => {
+            return Err(format!(
+                "{effort_field} and chat_template_kwargs.reasoning_effort disagree"
+            ));
+        }
+        (field, kwarg) => field.or(kwarg),
+    };
+    let (mut thinking, effort_out) = thinking_for_effort(effort)
+        .map_err(|effort| format!("unsupported {effort_field} {effort:?}"))?;
+    if let Some(kwarg) = kwarg_thinking {
+        if effort.is_some() && kwarg != thinking {
+            return Err(format!(
+                "chat_template_kwargs.enable_thinking disagrees with {effort_field}"
+            ));
+        }
+        thinking = kwarg;
+    }
+    Ok((thinking, effort_out, TemplateKwargs::parse(&kwargs)?))
+}
+
+/// Names `controls` sets that this model's chat template does not read; they
+/// reach no prompt, so the reply lists them as
+/// `metallix.ignored_template_kwargs`. Nothing is added when every name is
+/// read or the backend cannot say.
+pub(crate) fn note_ignored_template_kwargs(
+    value: &mut Value,
+    controls: &GenerationControls,
+    session: &dyn ChatBackend,
+) {
+    let ignored: Vec<&str> = controls
+        .template_kwargs
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| session.template_reads(name) == Some(false))
+        .collect();
+    if ignored.is_empty() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let block = object.entry("metallix").or_insert_with(|| json!({}));
+    if let Some(block) = block.as_object_mut() {
+        block.insert("ignored_template_kwargs".into(), json!(ignored));
+    }
+}
+
 /// Maps the request's generation fields onto the protocol-neutral controls.
 ///
 /// `reasoning.effort` maps through [`thinking_for_effort`]. As in vLLM, an
@@ -214,13 +296,14 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         }
         logprobs |= value == LOGPROBS_INCLUDE;
     }
-    let (enable_thinking, reasoning_effort) = thinking_for_effort(
+    let (enable_thinking, reasoning_effort, template_kwargs) = thinking_and_template_kwargs(
+        "reasoning.effort",
         request
             .reasoning
             .as_ref()
             .and_then(|reasoning| reasoning.effort.as_deref()),
-    )
-    .map_err(|effort| format!("unsupported reasoning.effort {effort:?}"))?;
+        request.chat_template_kwargs.as_ref(),
+    )?;
     let json_schema = match request.text.as_ref().and_then(|text| text.format.as_ref()) {
         None | Some(TextFormat::Text) => None,
         Some(TextFormat::JsonObject) => Some(json!({"type":"object"})),
@@ -250,6 +333,7 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         strict_tools: strict_tools(has_function_tools(request), &request.tools, |tool| {
             tool["strict"] == Value::Bool(true)
         }),
+        template_kwargs,
     };
     controls.validate(has_function_tools(request))?;
     Ok(controls)
@@ -620,7 +704,11 @@ pub(crate) fn respond(
         writer: None,
         sequence: 0,
         id,
-        envelope: envelope(parsed, id, unix_now()),
+        envelope: {
+            let mut envelope = envelope(parsed, id, unix_now());
+            note_ignored_template_kwargs(&mut envelope, &controls, &*session);
+            envelope
+        },
         live_reasoning: false,
         live_message: None,
         keepalive: crate::sse::Keepalive::new(),
@@ -657,6 +745,7 @@ pub(crate) fn respond(
             // One creation time across the stream's events.
             response["created_at"] = stream.envelope["created_at"].clone();
             echo_request_id(&mut response, request_id.as_deref());
+            note_ignored_template_kwargs(&mut response, &controls, &*session);
             response
         }
         Err(error) => {
@@ -755,6 +844,7 @@ fn respond_json(
             let mut response = response_value(parsed, controls, &generated, id)
                 .map_err(ChatGenerationError::Message)?;
             echo_request_id(&mut response, request_id.as_deref());
+            note_ignored_template_kwargs(&mut response, controls, &*session);
             Ok(response)
         });
     match result {
@@ -1728,6 +1818,10 @@ mod tests {
                 0.0
             }
 
+            fn template_reads(&self, name: &str) -> Option<bool> {
+                Some(name == "preserve_thinking")
+            }
+
             fn generate_with_timeout(
                 &mut self,
                 request: ChatRequest<'_>,
@@ -1872,6 +1966,48 @@ mod tests {
                     "{kind}"
                 );
             }
+        }
+
+        /// `chat_template_kwargs` (a metallix extension here, as in vLLM):
+        /// a name the model's template does not read is reported in
+        /// `metallix.ignored_template_kwargs`, streamed (from
+        /// `response.created` on) and not; `enable_thinking` there maps to
+        /// the effort switch and must agree with `reasoning.effort`.
+        #[test]
+        fn chat_template_kwargs_report_unread_names() {
+            let kwargs = r#""chat_template_kwargs":{"preserve_thinking":true,"other":"x"}"#;
+            let mut backend = Recording::default();
+            let body = format!(r#"{{"model":"control","input":"hi",{kwargs}}}"#);
+            let (status, response) = json_body(&exchange(&body, &mut backend));
+            assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+            assert_eq!(
+                response["metallix"]["ignored_template_kwargs"],
+                json!(["other"])
+            );
+            let body = format!(r#"{{"model":"control","input":"hi","stream":true,{kwargs}}}"#);
+            let events = events(&exchange(&body, &mut backend));
+            for kind in ["response.created", "response.completed"] {
+                let event = events.iter().find(|event| event["type"] == kind).unwrap();
+                assert_eq!(
+                    event["response"]["metallix"]["ignored_template_kwargs"],
+                    json!(["other"]),
+                    "{kind}"
+                );
+            }
+            let request: Request = serde_json::from_str(
+                r#"{"model":"control","input":"hi","chat_template_kwargs":{"enable_thinking":true}}"#,
+            )
+            .unwrap();
+            assert!(super::controls(&request).unwrap().enable_thinking);
+            let request: Request = serde_json::from_str(
+                r#"{"model":"control","input":"hi","reasoning":{"effort":"none"},"chat_template_kwargs":{"enable_thinking":true}}"#,
+            )
+            .unwrap();
+            assert!(
+                super::controls(&request)
+                    .unwrap_err()
+                    .contains("disagrees with reasoning.effort")
+            );
         }
 
         #[test]

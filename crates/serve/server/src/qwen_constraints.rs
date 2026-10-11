@@ -674,10 +674,8 @@ mod tool_grammar_tests {
         let prompt = format
             .prompt(
                 Conversation {
-                    messages: &messages,
                     tools: &tools,
-                    enable_thinking: false,
-                    reasoning_effort: None,
+                    ..Conversation::new(&messages)
                 },
                 true,
             )

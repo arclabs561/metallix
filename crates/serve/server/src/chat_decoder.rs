@@ -397,6 +397,10 @@ impl<D: FullRowDecoder> ChatBackend for ChatDecoderSession<D> {
         Some(self.context_limit)
     }
 
+    fn template_reads(&self, name: &str) -> Option<bool> {
+        Some(self.format.template().reads(name))
+    }
+
     fn generate_with_timeout(
         &mut self,
         request: ChatRequest<'_>,

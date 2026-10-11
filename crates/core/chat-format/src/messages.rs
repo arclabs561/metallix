@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use serde_json::Value;
 
+use crate::template_kwargs::{NO_TEMPLATE_KWARGS, TemplateKwargs};
+
 /// A checkpoint-template role with the spellings expected by Qwen's Jinja.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -120,6 +122,8 @@ pub struct Conversation<'a> {
     pub enable_thinking: bool,
     /// Optional model-specific reasoning effort passed through to templates.
     pub reasoning_effort: Option<&'a str>,
+    /// Caller-set template variables, such as Qwen3.6's `preserve_thinking`.
+    pub template_kwargs: &'a TemplateKwargs,
 }
 
 impl<'a> Conversation<'a> {
@@ -131,6 +135,7 @@ impl<'a> Conversation<'a> {
             tools: &[],
             enable_thinking: false,
             reasoning_effort: None,
+            template_kwargs: &NO_TEMPLATE_KWARGS,
         }
     }
 }

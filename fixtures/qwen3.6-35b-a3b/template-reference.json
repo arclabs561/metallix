@@ -1,0 +1,1024 @@
+{
+ "model_id": "Qwen/Qwen3.6-35B-A3B",
+ "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+ "framework": "transformers 5.18.0",
+ "chat_template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+ "cases": [
+  {
+   "name": "tool_history_new_query",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Found it in src/config.rs.",
+     "content": "It is set in src/config.rs, line 12."
+    },
+    {
+     "role": "user",
+     "content": "Change it to 8081."
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is set in src/config.rs, line 12.<|im_end|>\n<|im_start|>user\nChange it to 8081.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tool_history_new_query",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Found it in src/config.rs.",
+     "content": "It is set in src/config.rs, line 12."
+    },
+    {
+     "role": "user",
+     "content": "Change it to 8081."
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nFound it in src/config.rs.\n</think>\n\nIt is set in src/config.rs, line 12.<|im_end|>\n<|im_start|>user\nChange it to 8081.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tool_history_new_query",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Found it in src/config.rs.",
+     "content": "It is set in src/config.rs, line 12."
+    },
+    {
+     "role": "user",
+     "content": "Change it to 8081."
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is set in src/config.rs, line 12.<|im_end|>\n<|im_start|>user\nChange it to 8081.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tool_history_new_query",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Found it in src/config.rs.",
+     "content": "It is set in src/config.rs, line 12."
+    },
+    {
+     "role": "user",
+     "content": "Change it to 8081."
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is set in src/config.rs, line 12.<|im_end|>\n<|im_start|>user\nChange it to 8081.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_history_new_query",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Found it in src/config.rs.",
+     "content": "It is set in src/config.rs, line 12."
+    },
+    {
+     "role": "user",
+     "content": "Change it to 8081."
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nFound it in src/config.rs.\n</think>\n\nIt is set in src/config.rs, line 12.<|im_end|>\n<|im_start|>user\nChange it to 8081.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_history_new_query",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Found it in src/config.rs.",
+     "content": "It is set in src/config.rs, line 12."
+    },
+    {
+     "role": "user",
+     "content": "Change it to 8081."
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is set in src/config.rs, line 12.<|im_end|>\n<|im_start|>user\nChange it to 8081.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_history_mid_task",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tool_history_mid_task",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tool_history_mid_task",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tool_history_mid_task",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_history_mid_task",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool_history_mid_task",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "Where is the HTTP port set?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "The port is likely in a config file. Search for it.",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "exec_command",
+        "arguments": {
+         "cmd": "rg -n port src"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "src/config.rs:12:    pub port: u16,"
+    }
+   ],
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "exec_command",
+      "parameters": {
+       "properties": {
+        "cmd": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cmd"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"function\": {\"description\": \"Run a shell command.\", \"name\": \"exec_command\", \"parameters\": {\"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"], \"type\": \"object\"}}, \"type\": \"function\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nWhere is the HTTP port set?<|im_end|>\n<|im_start|>assistant\n<think>\nThe port is likely in a config file. Search for it.\n</think>\n\n<tool_call>\n<function=exec_command>\n<parameter=cmd>\nrg -n port src\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsrc/config.rs:12:    pub port: u16,\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "plain_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "A greeting.",
+     "content": "Hi!"
+    },
+    {
+     "role": "user",
+     "content": "Again, in French."
+    }
+   ],
+   "tools": [],
+   "enable_thinking": true,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nAgain, in French.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "plain_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "A greeting.",
+     "content": "Hi!"
+    },
+    {
+     "role": "user",
+     "content": "Again, in French."
+    }
+   ],
+   "tools": [],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\nA greeting.\n</think>\n\nHi!<|im_end|>\n<|im_start|>user\nAgain, in French.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "plain_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "A greeting.",
+     "content": "Hi!"
+    },
+    {
+     "role": "user",
+     "content": "Again, in French."
+    }
+   ],
+   "tools": [],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nAgain, in French.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "plain_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "A greeting.",
+     "content": "Hi!"
+    },
+    {
+     "role": "user",
+     "content": "Again, in French."
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nAgain, in French.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "plain_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "A greeting.",
+     "content": "Hi!"
+    },
+    {
+     "role": "user",
+     "content": "Again, in French."
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\nA greeting.\n</think>\n\nHi!<|im_end|>\n<|im_start|>user\nAgain, in French.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "plain_history",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Say hi."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "A greeting.",
+     "content": "Hi!"
+    },
+    {
+     "role": "user",
+     "content": "Again, in French."
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\nHi!<|im_end|>\n<|im_start|>user\nAgain, in French.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "reasoning_inline_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdd them.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": true,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>user\n2 + 2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nTimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "reasoning_inline_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdd them.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>user\n2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\nAdd them.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nTimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "reasoning_inline_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdd them.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>user\n2 + 2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nTimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "reasoning_inline_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdd them.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "chat_template_kwargs": {},
+   "rendered": "<|im_start|>user\n2 + 2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nTimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "reasoning_inline_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdd them.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": true
+   },
+   "rendered": "<|im_start|>user\n2 + 2?<|im_end|>\n<|im_start|>assistant\n<think>\nAdd them.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nTimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "reasoning_inline_in_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2 + 2?"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAdd them.\n</think>\n\n4"
+    },
+    {
+     "role": "user",
+     "content": "Times 3?"
+    }
+   ],
+   "tools": [],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   },
+   "rendered": "<|im_start|>user\n2 + 2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nTimes 3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ ]
+}

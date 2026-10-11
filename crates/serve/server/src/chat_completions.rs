@@ -19,7 +19,7 @@ use crate::{
     http_transport::Connection,
     responses::{
         AssistantTurn, assistant_turn, echo_request_id, json_response, logprobs_value,
-        record_usage, thinking_for_effort,
+        note_ignored_template_kwargs, record_usage, thinking_and_template_kwargs,
     },
     sse::LazySse,
 };
@@ -64,6 +64,10 @@ pub(crate) struct Request {
     top_logprobs: Option<u8>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// Extra chat-template variables, as in vLLM and `SGLang` (Qwen3.6's
+    /// `preserve_thinking`, say); see [`thinking_and_template_kwargs`].
+    #[serde(default)]
+    chat_template_kwargs: Option<Value>,
     #[serde(default)]
     response_format: Option<ResponseFormat>,
     #[serde(default)]
@@ -235,9 +239,11 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         (_, None) => None,
         (_, Some(_)) => return Err("top_logprobs requires logprobs: true".into()),
     };
-    let (enable_thinking, reasoning_effort) =
-        thinking_for_effort(request.reasoning_effort.as_deref())
-            .map_err(|effort| format!("unsupported reasoning_effort {effort:?}"))?;
+    let (enable_thinking, reasoning_effort, template_kwargs) = thinking_and_template_kwargs(
+        "reasoning_effort",
+        request.reasoning_effort.as_deref(),
+        request.chat_template_kwargs.as_ref(),
+    )?;
     let json_schema = match &request.response_format {
         None | Some(ResponseFormat::Text) => None,
         Some(ResponseFormat::JsonObject) => Some(json!({"type":"object"})),
@@ -267,6 +273,7 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         strict_tools: crate::responses::strict_tools(has_tools, &request.tools, |tool| {
             tool["function"]["strict"] == Value::Bool(true)
         }),
+        template_kwargs,
     };
     controls.validate(has_tools)?;
     Ok(controls)
@@ -534,6 +541,7 @@ pub(crate) fn respond(
                 let mut value = completion_value(prepared, &generated, id)
                     .map_err(ChatGenerationError::Message)?;
                 echo_request_id(&mut value, request_id.as_deref());
+                note_ignored_template_kwargs(&mut value, &prepared.controls, &*session);
                 Ok(value)
             });
         match result {
@@ -662,7 +670,8 @@ fn stream(
         &chunk(json!({}), json!(finish_reason(&turn)), logprobs),
     )?;
     if include_usage {
-        let last = json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","created":created,"model":prepared.request.model,"choices":[],"usage":usage(&generated),"metallix":metallix(&generated)});
+        let mut last = json!({"id":format!("chatcmpl-{id}"),"object":"chat.completion.chunk","created":created,"model":prepared.request.model,"choices":[],"usage":usage(&generated),"metallix":metallix(&generated)});
+        note_ignored_template_kwargs(&mut last, &prepared.controls, &*session);
         sse.event(None, &last)?;
     }
     sse.raw(None, "[DONE]")
@@ -882,6 +891,99 @@ mod tests {
                 respond(connection, &prepared, backend, "t", Duration::from_secs(60)).unwrap();
             },
         )
+    }
+
+    /// `chat_template_kwargs` as vLLM and `SGLang` clients send it: the
+    /// thinking switches map to the effort controls (and must agree with
+    /// `reasoning_effort`), the rest reach the template, and names the
+    /// model's template does not read are reported, streamed and not.
+    #[test]
+    fn chat_template_kwargs_map_thinking_and_report_unread_names() {
+        let mapped = |extra: Value| prepare_body(&with(&extra)).map(|prepared| prepared.controls);
+        let controls = mapped(
+            json!({"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":true}}),
+        )
+        .unwrap();
+        assert!(controls.enable_thinking);
+        let names: Vec<&str> = controls
+            .template_kwargs
+            .iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["preserve_thinking"]);
+        // The thinking switch agrees with the effort and leaves no template
+        // variable behind.
+        assert!(
+            mapped(
+                json!({"reasoning_effort":"high","chat_template_kwargs":{"enable_thinking":true}})
+            )
+            .unwrap()
+            .template_kwargs
+            .is_empty()
+        );
+        assert!(
+            mapped(json!({"chat_template_kwargs":{"reasoning_effort":"low"}}))
+                .unwrap()
+                .enable_thinking
+        );
+        for (extra, needle) in [
+            (
+                json!({"chat_template_kwargs":{"enable_thinking":"yes"}}),
+                "must be a boolean",
+            ),
+            (
+                json!({"reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":true}}),
+                "disagrees with reasoning_effort",
+            ),
+            (
+                json!({"reasoning_effort":"low","chat_template_kwargs":{"reasoning_effort":"high"}}),
+                "disagree",
+            ),
+            (
+                json!({"chat_template_kwargs":{"messages":[]}}),
+                "\"messages\"",
+            ),
+            (json!({"chat_template_kwargs":{"tools":[]}}), "\"tools\""),
+            (json!({"chat_template_kwargs":[]}), "must be an object"),
+        ] {
+            let error = mapped(extra.clone())
+                .err()
+                .unwrap_or_else(|| panic!("{extra} was accepted"));
+            let message = error["error"]["message"].as_str().unwrap_or_default();
+            assert!(message.contains(needle), "{extra}: {error}");
+        }
+
+        let body =
+            with(&json!({"chat_template_kwargs":{"preserve_thinking":true,"unknown_switch":1}}));
+        let mut backend = Scripted::new("Hi");
+        let (status, reply) = json_body(&run(&body, &mut backend));
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(
+            backend.template_kwargs,
+            ["preserve_thinking", "unknown_switch"]
+        );
+        assert_eq!(
+            reply["metallix"]["ignored_template_kwargs"],
+            json!(["unknown_switch"])
+        );
+        let mut streamed = body;
+        streamed["stream"] = json!(true);
+        streamed["stream_options"] = json!({"include_usage":true});
+        let chunks = events(&run(&streamed, &mut Scripted::new("Hi")));
+        let last = chunks
+            .iter()
+            .rev()
+            .find_map(|(_, data)| serde_json::from_str::<Value>(data).ok())
+            .expect("final chunk");
+        assert_eq!(
+            last["metallix"]["ignored_template_kwargs"],
+            json!(["unknown_switch"])
+        );
+        let (_, reply) = json_body(&run(
+            &with(&json!({"chat_template_kwargs":{"preserve_thinking":false}})),
+            &mut Scripted::new("Hi"),
+        ));
+        assert!(reply["metallix"].get("ignored_template_kwargs").is_none());
     }
 
     #[test]

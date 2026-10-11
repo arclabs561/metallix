@@ -100,6 +100,13 @@ fn message_keys(salt: Option<&str>, conversation: Conversation<'_>) -> Vec<Key> 
     }
     field(&[u8::from(conversation.enable_thinking)]);
     field(conversation.reasoning_effort.unwrap_or_default().as_bytes());
+    // Every caller variable, read or not: one the template ignores costs a
+    // missed reuse at worst.
+    let kwargs: Vec<_> = conversation.template_kwargs.iter().collect();
+    let Ok(kwargs) = serde_json::to_vec(&kwargs) else {
+        return Vec::new();
+    };
+    field(&kwargs);
     let Ok(tools) = serde_json::to_vec(conversation.tools) else {
         return Vec::new();
     };
@@ -119,7 +126,7 @@ fn message_keys(salt: Option<&str>, conversation: Conversation<'_>) -> Vec<Key> 
 #[cfg(test)]
 mod tests {
     use chat_format::{
-        ChatFormat, ChatMessage, ChatRole, Conversation, PromptReuse,
+        ChatFormat, ChatMessage, ChatRole, Conversation, PromptReuse, TemplateKwargs,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
     use serde_json::json;
@@ -150,6 +157,17 @@ mod tests {
         let mut thinking = Conversation::new(&first);
         thinking.enable_thinking = true;
         assert_ne!(short, message_keys(None, thinking));
+        let preserve = TemplateKwargs::parse(&json!({"preserve_thinking": true})).unwrap();
+        let with = |kwargs| Conversation {
+            template_kwargs: kwargs,
+            ..Conversation::new(&first)
+        };
+        assert_ne!(short, message_keys(None, with(&preserve)));
+        let again = TemplateKwargs::parse(&json!({"preserve_thinking": true})).unwrap();
+        assert_eq!(
+            message_keys(None, with(&preserve)),
+            message_keys(None, with(&again))
+        );
     }
 
     /// A conversation growing by a turn reuses the previous request's

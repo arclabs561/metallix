@@ -52,11 +52,15 @@
 mod messages;
 mod stream;
 mod template_json;
+mod template_kwargs;
 mod tokenizer;
 mod tools;
 mod turn;
 
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use checkpoint::gguf::GgufTokenizer;
 use minijinja::{Environment, UndefinedBehavior};
@@ -68,6 +72,9 @@ use sha2::{Digest, Sha256};
 pub use crate::{
     messages::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation},
     stream::{TurnDelta, TurnStream},
+    template_kwargs::{
+        MAX_TEMPLATE_KWARG_STRING_BYTES, MAX_TEMPLATE_KWARGS, NO_TEMPLATE_KWARGS, TemplateKwargs,
+    },
     tokenizer::{QwenIncrementalDecode, QwenTokenizer, read_regular_file},
     tools::{grammar::ToolRequirement, validator},
     turn::{
@@ -385,6 +392,10 @@ struct TemplateContext<'a> {
     bos_token: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     eos_token: Option<&'a str>,
+    /// Caller variables the template reads; their names never collide with
+    /// the fields above (see [`TemplateKwargs`]).
+    #[serde(flatten)]
+    kwargs: BTreeMap<&'a str, &'a Value>,
 }
 
 /// A parsed checkpoint chat template and the special tokens it renders with.
@@ -393,6 +404,9 @@ pub struct ChatTemplate {
     sha256: String,
     specials: SpecialTokens,
     limits: ChatLimits,
+    /// Top-level names the template reads without defining them, from a
+    /// static scan of its source.
+    variables: BTreeSet<String>,
 }
 
 impl ChatTemplate {
@@ -413,12 +427,27 @@ impl ChatTemplate {
         environment
             .add_template_owned("chat", source)
             .map_err(|error| format!("local chat template could not be parsed: {error}"))?;
+        let variables = environment
+            .get_template("chat")
+            .map_err(|error| format!("local chat template is unavailable: {error}"))?
+            .undeclared_variables(false)
+            .into_iter()
+            .collect();
         Ok(Self {
             environment,
             sha256,
             specials,
             limits: ChatLimits::default(),
+            variables,
         })
+    }
+
+    /// Whether the template reads the top-level variable `name`. Caller
+    /// variables it does not read are left out of the render, so they
+    /// cannot change the prompt; protocols report them as ignored.
+    #[must_use]
+    pub fn reads(&self, name: &str) -> bool {
+        self.variables.contains(name)
     }
 
     /// SHA-256 of the exact template source.
@@ -457,6 +486,11 @@ impl ChatTemplate {
             drop_thinking: !conversation.enable_thinking,
             bos_token: self.specials.bos.as_ref().map(|token| token.text.as_str()),
             eos_token: self.specials.eos.as_ref().map(|token| token.text.as_str()),
+            kwargs: conversation
+                .template_kwargs
+                .iter()
+                .filter(|(name, _)| self.reads(name))
+                .collect(),
         };
         let rendered = self
             .environment
@@ -1470,7 +1504,10 @@ mod tests {
         TokenId, load_template, read_json,
         test_model::{ModelDir, VOCABULARY_SIZE},
     };
-    use crate::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation, ToolDialect};
+    use crate::{
+        ChatMessage, ChatRole, ChatToolCall, ChatToolResult, Conversation, TemplateKwargs,
+        ToolDialect,
+    };
 
     /// A server for a long context raises the rendered-prompt limit once,
     /// through [`ChatFormat::with_limits`]: a 3 MiB prompt the default
@@ -1672,10 +1709,9 @@ mod tests {
         let messages = fixture_messages(case["messages"].as_array().expect("messages"));
         let tools: Vec<Value> = case["tools"].as_array().cloned().unwrap_or_default();
         let conversation = Conversation {
-            messages: &messages,
             tools: &tools,
             enable_thinking: case["enable_thinking"].as_bool().unwrap_or(false),
-            reasoning_effort: None,
+            ..Conversation::new(&messages)
         };
         template.render(conversation, true).expect("renders")
     }
@@ -1728,6 +1764,100 @@ mod tests {
                 case["name"]
             );
         }
+    }
+
+    /// Caller variables reach the template only under names it reads; the
+    /// rest never enter the render, and none can replace a renderer field
+    /// (`TemplateKwargs::parse` refuses those names).
+    #[test]
+    fn template_kwargs_reach_only_variables_the_template_reads() {
+        let template = ChatTemplate::parse(
+            "{% if keep is defined and keep is true %}keep{% else %}drop{% endif %}\
+             |{{ style | default('plain') }}|{{ messages | length }}"
+                .into(),
+            SpecialTokens::spelled(None, None),
+        )
+        .expect("parses");
+        assert!(template.reads("keep") && template.reads("style"));
+        assert!(!template.reads("unrelated"));
+        let messages = [ChatMessage::text(ChatRole::User, "hi")];
+        let render = |kwargs: Value| {
+            let kwargs = TemplateKwargs::parse(&kwargs).expect("kwargs");
+            template
+                .render(
+                    Conversation {
+                        template_kwargs: &kwargs,
+                        ..Conversation::new(&messages)
+                    },
+                    false,
+                )
+                .expect("renders")
+        };
+        assert_eq!(render(json!({})), "drop|plain|1");
+        assert_eq!(
+            render(json!({"keep": true, "style": "terse", "unrelated": 1})),
+            "keep|terse|1"
+        );
+        // Only the boolean passes `is true`, as in Jinja.
+        assert_eq!(render(json!({"keep": "true"})), "drop|plain|1");
+    }
+
+    /// Qwen3.6's template with `preserve_thinking` set, unset and false, in
+    /// thinking and non-thinking mode, equals transformers'
+    /// `apply_chat_template` byte for byte on four agent histories whose
+    /// earlier turns carry reasoning (fixture from
+    /// `scripts/qwen36-template-reference.py`).
+    #[test]
+    fn qwen36_preserve_thinking_matches_transformers_rendering() {
+        let reference: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/qwen3.6-35b-a3b/template-reference.json"
+        ))
+        .expect("fixture JSON");
+        let template = ChatTemplate::parse(
+            include_str!("../../../../fixtures/qwen3.6-35b-a3b/chat-template.jinja").to_owned(),
+            SpecialTokens::spelled(None, Some("<|im_end|>")),
+        )
+        .expect("Qwen3.6 template parses");
+        assert_eq!(
+            template.sha256(),
+            reference["chat_template_sha256"].as_str().expect("hash")
+        );
+        assert!(template.reads("preserve_thinking"));
+        let cases = reference["cases"].as_array().expect("cases");
+        assert_eq!(cases.len(), 24);
+        let mut preserved = 0;
+        for case in cases {
+            let mut messages = fixture_messages(case["messages"].as_array().expect("messages"));
+            for (message, value) in messages
+                .iter_mut()
+                .zip(case["messages"].as_array().expect("messages"))
+            {
+                message.reasoning_content = value["reasoning_content"].as_str().map(str::to_owned);
+            }
+            let tools: Vec<Value> = case["tools"].as_array().cloned().unwrap_or_default();
+            let kwargs = TemplateKwargs::parse(&case["chat_template_kwargs"]).expect("kwargs");
+            preserved += usize::from(case["chat_template_kwargs"]["preserve_thinking"] == true);
+            let rendered = template
+                .render(
+                    Conversation {
+                        tools: &tools,
+                        enable_thinking: case["enable_thinking"].as_bool().expect("thinking"),
+                        template_kwargs: &kwargs,
+                        ..Conversation::new(&messages)
+                    },
+                    true,
+                )
+                .expect("renders");
+            assert_eq!(
+                rendered,
+                case["rendered"].as_str().expect("rendered"),
+                "{} thinking={} kwargs={}",
+                case["name"],
+                case["enable_thinking"],
+                case["chat_template_kwargs"]
+            );
+        }
+        assert_eq!(preserved, 8, "every history renders with preserve_thinking");
     }
 
     /// The `MiniCPM5` template, rendered with its special tokens from typed

@@ -500,6 +500,20 @@ As in vLLM, `/v1/responses`, `/v1/chat/completions` and `/v1/messages` accept
 `"ignore_eos": true`, a metallix extension that keeps generating past
 end-of-turn until the output limit, so benchmark runs produce equal-length
 replies. It cannot be combined with a JSON schema.
+
+`/v1/chat/completions` and `/v1/responses` accept `chat_template_kwargs`, as
+vLLM and SGLang do: extra variables for the checkpoint's chat template, such as
+Qwen3.6's `preserve_thinking`, which keeps earlier turns' reasoning in the
+prompt. That also keeps the prompt a prefix of the next one, so the prefix
+cache reuses more. At most 16 names; each value a boolean, number, string (up
+to 1 KiB) or null. `enable_thinking` and `reasoning_effort` there act as the
+reasoning-effort field does, and must agree with it when both are sent. Names
+the server sets itself (`messages`, `tools`, `add_generation_prompt`,
+`bos_token`, `eos_token`, `chat_template` and the other thinking switches) are
+refused. A name the template does not read never reaches it and is listed in
+`metallix.ignored_template_kwargs` (on a Chat Completions stream, in the usage
+chunk).
+
 The serial HTTP transport accepts one request per connection and closes it
 following the response. Header and body intake share a five-second absolute
 deadline, with 16 KiB of headers, at most 64 headers, and at most 1 MiB of body.

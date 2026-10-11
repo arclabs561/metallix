@@ -270,6 +270,8 @@ pub(crate) mod test_support {
         pub(crate) prefill: Duration,
         /// How many prefill probes were sent.
         pub(crate) probes: usize,
+        /// The last request's chat-template variables, by name.
+        pub(crate) template_kwargs: Vec<String>,
     }
 
     impl Scripted {
@@ -287,6 +289,7 @@ pub(crate) mod test_support {
                 piece_delay: Duration::ZERO,
                 prefill: Duration::ZERO,
                 probes: 0,
+                template_kwargs: Vec::new(),
             }
         }
 
@@ -312,6 +315,11 @@ pub(crate) mod test_support {
             0.0
         }
 
+        /// A template that reads only `preserve_thinking`, as Qwen3.6's.
+        fn template_reads(&self, name: &str) -> Option<bool> {
+            Some(name == "preserve_thinking")
+        }
+
         fn generate_with_timeout(
             &mut self,
             request: ChatRequest<'_>,
@@ -320,6 +328,11 @@ pub(crate) mod test_support {
         ) -> Result<ChatGeneration, ChatGenerationError> {
             self.seen = Some((!request.tools.is_empty(), request.enable_thinking));
             self.salt = request.cache_salt.map(str::to_owned);
+            self.template_kwargs = request
+                .template_kwargs
+                .iter()
+                .map(|(name, _)| name.to_owned())
+                .collect();
             let prefill_end = std::time::Instant::now() + self.prefill;
             while std::time::Instant::now() < prefill_end {
                 std::thread::sleep(Duration::from_millis(100));

@@ -122,6 +122,7 @@ pub(crate) fn respond(
             tools: &prepared.tools,
             enable_thinking: prepared.thinking,
             reasoning_effort: prepared.effort.as_deref(),
+            template_kwargs: &chat_format::NO_TEMPLATE_KWARGS,
         }),
     };
     let (continuation, tokenization) = match &request.continuation {

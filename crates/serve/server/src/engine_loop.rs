@@ -1369,6 +1369,10 @@ impl<J> ChatBackend for EngineClient<J> {
         self.model.load_ms
     }
 
+    fn template_reads(&self, name: &str) -> Option<bool> {
+        Some(self.model.format.template().reads(name))
+    }
+
     fn generate_with_timeout(
         &mut self,
         request: ChatRequest<'_>,

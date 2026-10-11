@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use chat_format::{ToolRequirement, TurnDelta};
+use chat_format::{TemplateKwargs, ToolRequirement, TurnDelta};
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
@@ -232,6 +232,8 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
         strict_tools: crate::responses::strict_tools(has_tools, &request.tools, |tool| {
             tool["strict"] == Value::Bool(true)
         }),
+        // Messages has no chat_template_kwargs field.
+        template_kwargs: TemplateKwargs::default(),
     };
     controls.validate(has_tools)?;
     Ok(controls)

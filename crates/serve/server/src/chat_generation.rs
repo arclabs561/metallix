@@ -23,8 +23,8 @@ use sha2::{Digest, Sha256};
 use tracing::field::Empty;
 
 use chat_format::{
-    AssistantTurn, ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, Prompt, TokenClass,
-    TokenId, ToolRequirement, TurnDelta,
+    AssistantTurn, ChatFormat, Conversation, MAX_GENERATION_CONFIG_BYTES, NO_TEMPLATE_KWARGS,
+    Prompt, TemplateKwargs, TokenClass, TokenId, ToolRequirement, TurnDelta,
 };
 pub(crate) use chat_format::{ChatMessage, ChatRole, ChatToolCall, ChatToolResult};
 
@@ -243,6 +243,8 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) tool_requirement: &'a ToolRequirement,
     /// Offered tools whose calls must match their parameter schema.
     pub(crate) strict_tools: &'a [String],
+    /// Caller-set chat-template variables (`chat_template_kwargs`).
+    pub(crate) template_kwargs: &'a TemplateKwargs,
 }
 
 /// The default [`ChatRequest::tool_requirement`].
@@ -279,6 +281,7 @@ impl<'a> ChatRequest<'a> {
             speculation: SpeculationRequest::Automatic,
             tool_requirement: &ANY_TOOL_CALLS,
             strict_tools: &[],
+            template_kwargs: &NO_TEMPLATE_KWARGS,
         }
     }
 
@@ -290,6 +293,7 @@ impl<'a> ChatRequest<'a> {
             tools: self.tools,
             enable_thinking: self.enable_thinking,
             reasoning_effort: self.reasoning_effort,
+            template_kwargs: self.template_kwargs,
         }
     }
 }
@@ -438,6 +442,8 @@ pub(crate) struct GenerationControls {
     pub(crate) tool_requirement: ToolRequirement,
     /// See [`ChatRequest::strict_tools`].
     pub(crate) strict_tools: Vec<String>,
+    /// See [`ChatRequest::template_kwargs`].
+    pub(crate) template_kwargs: TemplateKwargs,
 }
 
 /// The `speculation` request field, a metallix extension shared by every
@@ -573,6 +579,7 @@ impl GenerationControls {
             speculation: self.speculation,
             tool_requirement: &self.tool_requirement,
             strict_tools: &self.strict_tools,
+            template_kwargs: &self.template_kwargs,
         }
     }
 }
@@ -885,6 +892,13 @@ pub(crate) trait ChatBackend {
         timeout: Duration,
         on_token: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
     ) -> Result<ChatGeneration, ChatGenerationError>;
+
+    /// Whether this model's chat template reads the top-level variable
+    /// `name`; `None` from a backend with no template to ask.
+    fn template_reads(&self, name: &str) -> Option<bool> {
+        let _ = name;
+        None
+    }
 
     /// Scores caller-given tokens teacher-forced; a backend without the
     /// all-position rows it needs refuses.
@@ -1606,6 +1620,10 @@ impl ChatBackend for ChatSession {
 
     fn load_ms(&self) -> f64 {
         self.load_ms()
+    }
+
+    fn template_reads(&self, name: &str) -> Option<bool> {
+        Some(self.format.template().reads(name))
     }
 
     fn score(&self, request: ScoreRequest<'_>) -> Result<ScoreResult, ScoreError> {
