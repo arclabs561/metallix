@@ -3,9 +3,9 @@
 //! The pinned `mlx-rs` does not wrap MLX-C's `mlx_fast_metal_kernel_*`
 //! functions, so this crate calls them directly and is the only workspace
 //! crate allowed `unsafe` for custom kernels. Model crates describe a kernel
-//! with [`KernelSpec`] and launch it with [`Launch`]; every MLX-C handle is
+//! with `KernelSpec` and launch it with `Launch`; every MLX-C handle is
 //! owned by an RAII guard, and MLX's error handler is installed before the
-//! first raw call, so a rejected launch returns [`KernelError::Mlx`] instead
+//! first raw call, so a rejected launch returns `KernelError::Mlx` instead
 //! of ending the process.
 //!
 //! MLX generates the kernel signature from the input and output names (plus
