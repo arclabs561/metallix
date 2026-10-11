@@ -35,9 +35,14 @@ of scope by design: put a router or reverse proxy in front of the server.
 DeepSeek-V4.1-Flash is the main target and is not usable for generation yet. A
 scalar CPU reference path runs all 40 layers from the real checkpoint, reading
 experts and embedding rows on demand, and predicts the source's next token on
-two real prompts (3 and 17 tokens). It is slow: the 17-token prompt takes
-about 32 minutes. Metal versions of individual stages exist but are not yet
-wired into requests. [Progress](docs/progress.md) records the evidence.
+two real prompts (3 and 17 tokens). On that CPU path the 17-token prompt takes
+about 32 minutes. A Metal request backend (b7d8c91) runs the FP8 attention
+linears, the shared and routed experts, Engram's FP8 WKV projection and the
+output head inside a request step; on the 17-token prompt it falls back to the
+CPU for none of them and predicts the same source token; the rest of each step
+(attention core, router, Hyper-Connections, norms) still runs on the CPU. No
+whole-request Metal timing is published yet. [Progress](docs/progress.md)
+records the evidence.
 
 ## Requirements
 

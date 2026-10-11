@@ -152,11 +152,13 @@ Earlier runs did not meet the [benchmark protocol's](benchmarks.md) own gate,
 so the comparison is being re-measured and no result is claimed until it
 passes.
 
-DeepSeek-V4.1's library `RequestSession` interleaves all five blocks and the
-final head per call, and both established synthetic schedules pass final-logit
-source bounds and replay after restart. Downstream weights and source checks
-remain fixture-backed; checkpoint loading and complete Metal execution remain
-open, and V4.1 now has dedicated work toward them. The metadata-only
+DeepSeek-V4.1 runs a real prompt end to end from checkpoint tensors, on the
+scalar CPU path (c95dda3) and with its FP8 linears, experts, Engram FP8 WKV
+projection and head on Metal (b7d8c91), and predicts the source's next token.
+Still open: multi-token steps after the first, indexer scoring past 512
+compressed positions, a generate loop with tokenizer and template, a fully
+on-device path, and a RAM expert cache; V4.1 now has dedicated work toward
+them. The metadata-only
 [DeepSeek traffic sensitivity](research/host-memory.md) does not yet establish a
 feasible checkpoint-serving envelope.
 
@@ -173,7 +175,8 @@ Open goals at this checkpoint:
   output. Every `mx` process, served models included, already applies this
   cap, so the remaining 1M work is speed and the longer needle tests.
 - Serving a model larger than RAM, once the expert pager passes its gate.
-- DeepSeek-V4.1 checkpoint loading and Metal execution.
+- DeepSeek-V4.1 generation: multi-token prefill steps, indexer scoring past
+  512 compressed positions, the generate loop and a fully on-device path.
 - Reorganizing the workspace crates into core, Metal, model and serving
   groups. This moves crate paths, so this page names features rather than
   crate paths.
@@ -181,10 +184,9 @@ Open goals at this checkpoint:
 ## Position and constraints
 
 Qwen is the usable vertical: resident chat, bounded read tools, experimental
-Responses, and qualified 0.6B/4B controls. DeepSeek's library `RequestSession`
-passes source bounds on both synthetic schedules; checkpoint loading and
-complete device execution remain open, and synthetic numerical qualification
-does not establish checkpoint support. Julia's bounded 22-layer path passes its
+Responses, and qualified 0.6B/4B controls. DeepSeek runs a real prompt from
+checkpoint tensors on the CPU and, for its heavy linears, on Metal, but does not
+generate yet. Julia's bounded 22-layer path passes its
 float64 gate on the published checkpoint and serves CPU typed decisions through
 the CLI and over HTTP. Its bounded Metal operators are not a complete GPU
 encoder/decision runtime.
