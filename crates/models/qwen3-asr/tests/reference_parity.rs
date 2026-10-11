@@ -101,8 +101,14 @@ fn top(logits: &[f32], count: usize) -> Vec<usize> {
 #[ignore = "needs METALLIX_QWEN3_ASR_MODEL and a reference capture in METALLIX_QWEN3_ASR_REF"]
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn matches_the_reference_capture() {
-    let model_dir = PathBuf::from(std::env::var_os("METALLIX_QWEN3_ASR_MODEL").expect("model"));
-    let reference = PathBuf::from(std::env::var_os("METALLIX_QWEN3_ASR_REF").expect("capture"));
+    let Some(model_dir) = std::env::var_os("METALLIX_QWEN3_ASR_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN3_ASR_MODEL is not set");
+        return;
+    };
+    let Some(reference) = std::env::var_os("METALLIX_QWEN3_ASR_REF").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN3_ASR_REF is not set");
+        return;
+    };
     let capture: Capture = serde_json::from_str(
         &std::fs::read_to_string(reference.join("manifest.json")).expect("manifest"),
     )

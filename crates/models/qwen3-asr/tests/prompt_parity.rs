@@ -31,10 +31,10 @@ struct Decode {
 #[test]
 #[ignore = "needs a Qwen3-ASR checkpoint in METALLIX_QWEN3_ASR_MODEL"]
 fn prompts_and_decoding_match_the_reference_processor() {
-    let model = PathBuf::from(
-        std::env::var_os("METALLIX_QWEN3_ASR_MODEL")
-            .expect("set METALLIX_QWEN3_ASR_MODEL to a Qwen3-ASR checkpoint"),
-    );
+    let Some(model) = std::env::var_os("METALLIX_QWEN3_ASR_MODEL").map(PathBuf::from) else {
+        eprintln!("skipping: METALLIX_QWEN3_ASR_MODEL is not set");
+        return;
+    };
     let config =
         Qwen3AsrConfig::parse(&std::fs::read_to_string(model.join("config.json")).unwrap())
             .unwrap();
