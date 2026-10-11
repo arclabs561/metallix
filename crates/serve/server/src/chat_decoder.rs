@@ -393,6 +393,10 @@ impl<D: FullRowDecoder> ChatBackend for ChatDecoderSession<D> {
         self.load_ms
     }
 
+    fn context_limit(&self) -> Option<usize> {
+        Some(self.context_limit)
+    }
+
     fn generate_with_timeout(
         &mut self,
         request: ChatRequest<'_>,

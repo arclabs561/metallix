@@ -51,6 +51,7 @@ fn multipart_socket_reaches_transcription_worker_and_releases_admission() {
             occupied,
             alive: Arc::new(AtomicBool::new(true)),
             engine: None,
+            context_tokens: None,
         }];
         serve_models(
             &listener,
@@ -228,6 +229,7 @@ fn transcription_server(
                 occupied,
                 alive: Arc::new(AtomicBool::new(true)),
                 engine: None,
+                context_tokens: None,
             }];
             serve_models(
                 &listener,

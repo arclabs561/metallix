@@ -498,6 +498,8 @@ struct ServedModel {
     /// Set when the model decodes in batches: generation goes through the
     /// engine, up to its capacity, and other work runs between its steps.
     engine: Option<EngineRoute>,
+    /// The context a generating model admits per request, resolved at load.
+    context_tokens: Option<usize>,
 }
 
 /// How the acceptor reaches a batching engine.
@@ -574,6 +576,8 @@ fn serve_inner(
         let (startup_sender, startup_receiver) = sync_channel(1);
         let alive = Arc::new(AtomicBool::new(false));
         let worker_liveness = Arc::clone(&alive);
+        let resolved_context = Arc::new(std::sync::Mutex::new(None));
+        let worker_context = Arc::clone(&resolved_context);
         let worker_entry = entry.clone();
         // One model per process today, so the capture goes to its first request.
         let worker_capture = capture.map(Path::to_path_buf);
@@ -612,6 +616,8 @@ fn serve_inner(
                         chat.load_ms()
                     });
                 load.record("load_ms", load_ms);
+                *worker_context.lock().expect("context lock") =
+                    worker.chat().and_then(|chat| chat.context_limit());
                 gpu::Memory::record_on(&load);
                 tracing::info!("model loaded");
                 drop(entered);
@@ -655,6 +661,7 @@ fn serve_inner(
             occupied: Arc::new(AtomicBool::new(false)),
             alive,
             engine,
+            context_tokens: *resolved_context.lock().expect("context lock"),
         });
     }
     let outcome = match TcpListener::bind(address) {
@@ -673,12 +680,14 @@ fn serve_inner(
                 .max()
                 .unwrap_or(1);
             eprintln!(
-                "mx listening on http://{address}; models={}; max_running={max_running}; {} total tokens; kv_budget_bytes={}",
+                "mx listening on http://{address}; models={}; max_running={max_running}; context_tokens={}; kv_budget_bytes={}",
                 entries.len(),
-                limits.requested_context().map_or_else(
-                    || String::from("largest-fitting"),
-                    |tokens| tokens.to_string()
-                ),
+                // The front process reads this field for `/v1/models`: the
+                // first generating model's resolved context.
+                models
+                    .iter()
+                    .find_map(|model| model.context_tokens)
+                    .map_or_else(|| String::from("none"), |tokens| tokens.to_string()),
                 limits.kv_budget_bytes(),
             );
             serve_models(
@@ -749,6 +758,7 @@ fn serve_listener_with_limits(
         jobs: job_sender.clone(),
         occupied: Arc::clone(occupied),
         engine: None,
+        context_tokens: None,
         alive: Arc::clone(worker_alive),
     }];
     serve_models(
@@ -840,7 +850,13 @@ fn serve_models(
             ("GET", "/v1/models") => {
                 let data: Vec<Value> = models
                     .iter()
-                    .map(|model| json!({"id":model.id,"object":"model","owned_by":"local","capabilities":model.capabilities}))
+                    .map(|model| {
+                        let mut listed = json!({"id":model.id,"object":"model","owned_by":"local","capabilities":model.capabilities});
+                        if let Some(tokens) = model.context_tokens {
+                            listed["context_length"] = json!(tokens);
+                        }
+                        listed
+                    })
                     .collect();
                 json_response(connection, 200, &json!({"object":"list","data":data}));
                 continue;
@@ -2248,6 +2264,7 @@ stream.close()
                 jobs,
                 occupied: Arc::clone(&occupied),
                 engine: None,
+                context_tokens: None,
                 alive: Arc::new(AtomicBool::new(true)),
             }];
             let server = thread::spawn(move || {
@@ -2340,6 +2357,7 @@ stream.close()
             occupied: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
             engine: None,
+            context_tokens: None,
         };
         let models = [
             model("embedder", &["embed", "rerank"], embed_jobs),
@@ -2475,6 +2493,7 @@ stream.close()
             occupied: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
             engine: None,
+            context_tokens: None,
         };
         let models = [
             model("chat", true, &["generate"], chat_jobs),

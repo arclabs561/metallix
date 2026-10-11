@@ -865,6 +865,12 @@ pub(crate) trait ChatBackend {
     /// Returns the one-time backend load duration used in response metadata.
     fn load_ms(&self) -> f64;
 
+    /// The context each request may use (prompt plus output), for startup
+    /// reports and `/v1/models`; `None` for a backend without a fixed one.
+    fn context_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Generates one complete turn under the caller's cooperative deadline.
     fn generate_with_timeout(
         &mut self,
@@ -1555,6 +1561,10 @@ impl ChatSession {
 }
 
 impl ChatBackend for ChatSession {
+    fn context_limit(&self) -> Option<usize> {
+        Some(self.context_limit)
+    }
+
     fn load_ms(&self) -> f64 {
         self.load_ms()
     }

@@ -119,6 +119,10 @@ struct ChildModel {
     last_used: Mutex<Instant>,
     /// Requests waiting for this model; counted in `in_flight` while queued.
     queue: ModelQueue,
+    /// The context the running child announced it admits per request, for
+    /// `/v1/models`; `None` while stopped or for a model that does not
+    /// generate.
+    context_tokens: Mutex<Option<usize>>,
 }
 
 impl ChildModel {
@@ -130,6 +134,7 @@ impl ChildModel {
             last_error: Mutex::new(None),
             in_flight: AtomicUsize::new(0),
             last_used: Mutex::new(Instant::now()),
+            context_tokens: Mutex::new(None),
         }
     }
 
@@ -262,12 +267,14 @@ impl Pool {
             .launcher
             .as_ref()
             .ok_or("this server cannot start children")?;
-        let (child, address) =
+        let (child, announced) =
             start_and_wait(launcher, &model.entry).map_err(|reason| model.record_error(reason))?;
+        let address = announced.address;
         *model.state.lock().expect("state lock") = ChildState::Running {
             child: Some(child),
             address,
         };
+        *model.context_tokens.lock().expect("context lock") = announced.context_tokens;
         *model.last_error.lock().expect("error lock") = None;
         Ok(address)
     }
@@ -370,11 +377,13 @@ fn serve_inner(
             let model = ChildModel::new(entry.clone(), ChildState::Stopped, queue);
             if let Some(started) = started {
                 match wait_for_child(started) {
-                    Ok((child, address)) => {
+                    Ok((child, announced)) => {
                         *model.state.lock().expect("state lock") = ChildState::Running {
                             child: Some(child),
-                            address,
+                            address: announced.address,
                         };
+                        *model.context_tokens.lock().expect("context lock") =
+                            announced.context_tokens;
                     }
                     Err(reason) => {
                         model.record_error(reason);
@@ -403,7 +412,31 @@ fn serve_inner(
     proxy_models(&server, &pool, transport, None)
 }
 
-type Started = Result<(Child, std::sync::mpsc::Receiver<SocketAddr>), String>;
+type Started = Result<(Child, std::sync::mpsc::Receiver<Announced>), String>;
+
+/// What a child's listening line announces: its address and, for a
+/// generating model, the context it resolved (`context_tokens=N`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Announced {
+    address: SocketAddr,
+    context_tokens: Option<usize>,
+}
+
+impl Announced {
+    /// Parses the text after [`LISTENING`]: `ADDRESS; field; ...`, where one
+    /// field may be `context_tokens=N`.
+    fn parse(rest: &str) -> Option<Self> {
+        let mut fields = rest.split(';').map(str::trim);
+        let address = fields.next()?.parse().ok()?;
+        let context_tokens = fields
+            .find_map(|field| field.strip_prefix("context_tokens="))
+            .and_then(|tokens| tokens.parse().ok());
+        Some(Self {
+            address,
+            context_tokens,
+        })
+    }
+}
 
 /// Starts a child on an ephemeral loopback port. Its stdin stays open so the
 /// child can exit when this process does.
@@ -475,19 +508,17 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
 
 /// Copies child log lines to this process's stderr, reporting the address the
 /// child announces once it is listening.
-fn forward_child_log(id: &str, stderr: impl io::Read, address: &Sender<SocketAddr>) {
+fn forward_child_log(id: &str, stderr: impl io::Read, announced: &Sender<Announced>) {
     for line in BufReader::new(stderr).lines() {
         let Ok(line) = line else { return };
-        if let Some(rest) = line.strip_prefix(LISTENING) {
-            if let Some(parsed) = rest.split(';').next().and_then(|a| a.parse().ok()) {
-                let _ = address.send(parsed);
-            }
+        if let Some(parsed) = line.strip_prefix(LISTENING).and_then(Announced::parse) {
+            let _ = announced.send(parsed);
         }
         eprintln!("[{id}] {line}");
     }
 }
 
-fn wait_for_child(started: Started) -> Result<(Child, SocketAddr), String> {
+fn wait_for_child(started: Started) -> Result<(Child, Announced), String> {
     let (mut child, receiver) = started?;
     match receiver.recv_timeout(START_TIMEOUT) {
         Ok(address) => Ok((child, address)),
@@ -509,7 +540,7 @@ fn wait_for_child(started: Started) -> Result<(Child, SocketAddr), String> {
     }
 }
 
-fn start_and_wait(launcher: &Launcher, entry: &ServedEntry) -> Result<(Child, SocketAddr), String> {
+fn start_and_wait(launcher: &Launcher, entry: &ServedEntry) -> Result<(Child, Announced), String> {
     tracing::info!(model = %entry.id, "starting model");
     wait_for_child(start_child(launcher, entry))
 }
@@ -569,7 +600,15 @@ fn proxy_models(
                     .models
                     .iter()
                     .map(|model| {
-                        json!({"id":model.entry.id,"object":"model","owned_by":"local","capabilities":model.entry.kind.capabilities(),"residency":model.entry.residency,"loaded":model.address().is_some(),"queued":model.queue.waiting()})
+                        let loaded = model.address().is_some();
+                        let mut listed = json!({"id":model.entry.id,"object":"model","owned_by":"local","capabilities":model.entry.kind.capabilities(),"residency":model.entry.residency,"loaded":loaded,"queued":model.queue.waiting()});
+                        // The context the running child resolved; unknown until it loads.
+                        if let (true, Some(tokens)) =
+                            (loaded, *model.context_tokens.lock().expect("context lock"))
+                        {
+                            listed["context_length"] = json!(tokens);
+                        }
+                        listed
                     })
                     .collect();
                 json_response(connection, 200, &json!({"object":"list","data":data}));
@@ -1087,6 +1126,28 @@ fn refuse(mut connection: Connection, model: &ChildModel, refused: Refused) {
 mod tests {
     use super::*;
     use crate::serve_registry::ModelKind;
+
+    /// The front process learns a child's address and its resolved context
+    /// from the child's listening line; a model without one reports none.
+    #[test]
+    fn listening_line_announces_address_and_context() {
+        let generating =
+            "127.0.0.1:55568; models=1; max_running=1; context_tokens=40960; kv_budget_bytes=1";
+        assert_eq!(
+            Announced::parse(generating),
+            Some(Announced {
+                address: "127.0.0.1:55568".parse().unwrap(),
+                context_tokens: Some(40_960),
+            })
+        );
+        let embedding =
+            "127.0.0.1:55569; models=1; max_running=1; context_tokens=none; kv_budget_bytes=1";
+        assert_eq!(
+            Announced::parse(embedding).map(|announced| announced.context_tokens),
+            Some(None)
+        );
+        assert_eq!(Announced::parse("not an address; context_tokens=1"), None);
+    }
 
     fn exchange(address: SocketAddr, request: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let mut stream = TcpStream::connect(address).expect("connect");
