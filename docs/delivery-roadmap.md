@@ -103,8 +103,8 @@ application quality and serving integration remain separate gates. Julia has
 source-pinned encoding, complete published-header checks, six real-tokenizer
 source-parity vectors, and a native 22-layer path that passes the float64 gate
 on the published checkpoint. Strict checkpoint loading and CPU typed decisions
-through `mx decide-julia` are delivered for requests up to 126 positions; HTTP
-serving remains open.
+through `mx decide-julia` are delivered for requests up to 126 positions, and
+`mx serve` serves the same path on `/v1/decisions`.
 JevBench-shaped requests already have a qualified Qwen direct-option-scoring
 bridge. That is benchmark-interface support through a decoder adapter, not
 direct Julia checkpoint support. A Julia result must preserve its source
@@ -114,34 +114,49 @@ The stepped-capacity feasibility experiment passed 50 paired whole-logit trace
 rows and isolated memory probes, with 18.16% lower 1983-token decode time and
 about 1% short-prompt regression. Matched real 2048-token requests for Qwen3-
 0.6B and 4B preserved output/token parity, so bounded stepped storage is now
-the resident production path. DeepSeek has fixed, test-private native startup
-through final-head composition for both the canonical 0/5/6 and alternate
-0/4/5/6 schedules. It carries token startup, persistent Engram and L1–L3
-state, the prior L3 publication for L1 partial calls, live L1 owner
-publications into L2, and native L3/L4 tails to the source-qualified final
-head. Failure invalidation and fresh reconstruction remain bounded fixture
-controls. The library `RequestSession` now interleaves all five blocks and the
-head per call; both schedules pass final-logit source bounds and complete replay
-after request restart.
-The final head, HC/FFN block tails and persistent Engram arithmetic/state now
-have fixture-independent runtime components. A stateful first-block session
-now accepts caller token IDs and weights through its complete window-attention
-and HC/FFN path. L1 ratio-two owner publication and L3 candidate projection
-are also runtime components. `LayerThreeSession` joins its owner, selection
-and attention with coordinated invalidation/reset. `LayerOneSession` now does
-the same for ratio-two ownership and direct selection, including the preceding
-L3 score-prefix rule. `LayerFourSession` consumes the actual L3 candidate mask;
-`RequestSession` composes all layers with whole-request invalidation and restart.
-The bounded synthetic-weight/token-input CLI now exports and reads one numerical
-artifact, passes existing final-logit source bounds for both schedules, and has
-focused server integration coverage for byte-hash/output agreement and
-fail-closed inputs. Both canonical checks pass, including the Metal check; focused CLI, strict lint and documentation gates pass. Downstream weights and
-source checks remain fixture-backed; broader partitions, checkpoint loading and
-complete Metal execution remain open. Native
-Responses tool-result replay passed three JSON and three SSE trials, and three
-tool-stream disconnect recoveries passed. See the
-[measurement ledger](experiments/chat-performance.md) and
-[current progress](progress.md) for the evidence and limits. The metadata-only
+the resident production path. Native Responses tool-result replay passed three
+JSON and three SSE trials, and three tool-stream disconnect recoveries passed.
+See the [measurement ledger](experiments/chat-performance.md) and
+[current progress](progress.md) for the evidence and limits.
+
+Landed since the previous checkpoint:
+
+- Models. The Qwen3.5-family loader keeps the multi-token-prediction head on
+  request; no drafter runs it yet. Gemma 4 E2B and E4B load and run with their
+  per-layer inputs and shared K/V. FLUX.2 [klein] text-to-image runs through
+  `mx image generate`. Qwen3-ASR now checks parity against the
+  transformers-native implementation, whose encoder attends within windows,
+  and pads clips shorter than 0.5 s. [GGUF loading](gguf.md) has its own page,
+  including the bounds its first measurement missed.
+  [Architecture diagrams](arch/README.md) take their numbers from a test that
+  regenerates them from the model's own config parsing.
+- Kernels. A separate kernel crate wraps MLX's custom Metal kernel API, and a
+  few-row 4-bit matrix kernel for speculative verify and small batches uses
+  it. Routing to that kernel is off by default until an idle-machine timing
+  confirms the gain.
+- Serving. The proxy holds a model's queue permit until the child has closed a
+  failed or cancelled stream, a client that leaves during prefill releases its
+  turn, and a server whose warmup failed still serves. Request body caps and
+  response deadlines scale with the context size, so fixed caps no longer
+  refuse a 262K-token prompt, and the prefix cache sizes a snapshot before
+  copying it. A JSON schema now combines with offered tools, strict tools and
+  forced tool choices are held by a grammar, and hosted tools are dropped and
+  reported. Speculative verify reads back token picks under a sampled top_k
+  rule, as it already did under greedy decoding.
+- Larger-than-RAM models. The checkpoint layer reads byte ranges of a stored
+  tensor and pages routed experts under a byte budget. These are library
+  pieces; no model serves through them yet.
+
+No valid speed comparison against mlx-lm, llama.cpp or vllm-metal exists yet.
+Earlier runs did not meet the [benchmark protocol's](benchmarks.md) own gate,
+so the comparison is being re-measured and no result is claimed until it
+passes.
+
+DeepSeek-V4.1's library `RequestSession` interleaves all five blocks and the
+final head per call, and both established synthetic schedules pass final-logit
+source bounds and replay after restart. Downstream weights and source checks
+remain fixture-backed; checkpoint loading and complete Metal execution remain
+open, and V4.1 now has dedicated work toward them. The metadata-only
 [DeepSeek traffic sensitivity](research/host-memory.md) does not yet establish a
 feasible checkpoint-serving envelope.
 
@@ -150,18 +165,28 @@ DeepSeek config, tokenizer/template, index, referenced shard containment, and
 shard headers without loading tensor payloads. It is an artifact-admission
 check, not generation or Codex compatibility evidence.
 
+Open goals at this checkpoint:
+
+- 1M-token context. The memory limit seen at 128K tokens was traced to MLX's
+  buffer cache keeping freed buffers; with the cache capped, a 128K-token
+  prompt prefills in about 3 GiB of active memory and matches the reference
+  output. Every `mx` process, served models included, already applies this
+  cap, so the remaining 1M work is speed and the longer needle tests.
+- Serving a model larger than RAM, once the expert pager passes its gate.
+- DeepSeek-V4.1 checkpoint loading and Metal execution.
+- Reorganizing the workspace crates into core, Metal, model and serving
+  groups. This moves crate paths, so this page names features rather than
+  crate paths.
+
 ## Position and constraints
 
 Qwen is the usable vertical: resident chat, bounded read tools, experimental
 Responses, and qualified 0.6B/4B controls. DeepSeek's library `RequestSession`
-now interleaves all five blocks and the final head per call. Both established
-synthetic schedules pass source bounds and replay after restart. The bounded
-artifact loader and scalar-default CLI have focused qualification, including
-explicit mixed Metal scoring and key rotation. Both canonical workspace checks pass; broader partitions and complete DeepSeek device
-execution remain open. Synthetic numerical
-qualification does not establish checkpoint support. Julia's bounded 22-layer
-path passes its float64 gate on the published checkpoint and serves CPU typed
-decisions through the CLI. Its bounded Metal operators are not a complete GPU
+passes source bounds on both synthetic schedules; checkpoint loading and
+complete device execution remain open, and synthetic numerical qualification
+does not establish checkpoint support. Julia's bounded 22-layer path passes its
+float64 gate on the published checkpoint and serves CPU typed decisions through
+the CLI and over HTTP. Its bounded Metal operators are not a complete GPU
 encoder/decision runtime.
 
 The cache work already led to the qualified bounded stepped resident path.
