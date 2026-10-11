@@ -20,7 +20,7 @@ use crate::{GPU_TEST_LOCK, metal::Qwen3MlxWeights};
 
 use super::super::{
     Qwen3ForwardConfig, Qwen3ForwardError, Qwen3ForwardExecutor, as_i32, attention_scale,
-    forward_last_logits, project, read_last_logits, rms_norm, weight,
+    forward_last_logits, project, read_last_logits, rms_norm, stepped_capacity, weight,
 };
 
 const MAXIMUM_CONTEXT_TOKENS: usize = 2_048;
@@ -699,10 +699,15 @@ fn run_row(
     }
     assert_eq!(concat_logits_bits.len(), QWEN3_06B_VOCAB);
     assert_eq!(capacity_logits_bits.len(), QWEN3_06B_VOCAB);
+    // The resident executor stores K/V in stepped tiers (128, 512, then
+    // doubling up to the context), so its arrays hold the tier, not the
+    // logical row count.
+    let concat_tier = stepped_capacity(prompt.len() + DECODE_STEPS, MAXIMUM_CONTEXT_TOKENS)
+        .expect("resident K/V tier");
     let expected_concat_kv_bytes = usize::try_from(
         concat
             .config
-            .cached_kv_bytes(prompt.len() + DECODE_STEPS)
+            .cached_kv_bytes(concat_tier)
             .expect("concat K/V byte estimate"),
     )
     .expect("platform K/V byte count");
