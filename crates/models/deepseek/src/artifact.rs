@@ -77,6 +77,7 @@ impl V41ArtifactInspection {
 
         let index_json = read_regular_utf8(&root, INDEX_FILE)?;
         let index = ParsedIndex::parse(&index_json)?;
+        let mut headers = Vec::new();
         for shard in index.shard_paths() {
             let shard_path = checked_shard_path(&root, shard)?;
             let header = read_shard_header(&shard_path)?;
@@ -84,7 +85,20 @@ impl V41ArtifactInspection {
                 header
                     .validate_index_shard(index, shard)
                     .map_err(V41ArtifactInspectionError::InvalidShardHeader)?;
+                headers.push((shard.as_str(), header));
             }
+        }
+
+        if let ParsedIndex::V41(native) = &index {
+            let table =
+                crate::tensor_table::V41TensorTable::from_config(&config).map_err(|error| {
+                    V41ArtifactInspectionError::NativeTensorAdmission(error.to_string())
+                })?;
+            table
+                .admit(native, headers.iter().map(|(name, header)| (*name, header)))
+                .map_err(|error| {
+                    V41ArtifactInspectionError::NativeTensorAdmission(error.to_string())
+                })?;
         }
 
         Ok(Self {
@@ -124,6 +138,9 @@ impl V41ArtifactInspection {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum V41ArtifactInspectionError {
+    /// Native text or draft tensor geometry disagrees with the configuration.
+    #[error("native tensor admission failed: {0}")]
+    NativeTensorAdmission(String),
     /// The root could not be resolved or is not a directory.
     #[error("artifact root is not a readable directory")]
     InvalidRoot,
@@ -442,17 +459,17 @@ mod tests {
     }
 
     #[test]
-    fn inspects_a_minimal_valid_artifact_without_loading_payloads() {
+    fn inspects_a_minimal_mlx_artifact_without_loading_payloads() {
         let artifact = TempArtifact::new();
         write_valid_shard(artifact.path());
         write_required_files(
             artifact.path(),
             r#"{"chat_template":"{{ messages }}"}"#,
-            r#"{"metadata":{"total_size":4},"weight_map":{"weight":"model-00001.safetensors"}}"#,
+            r#"{"weight_map":{"weight":"model-00001.safetensors"}}"#,
         );
 
         let inspection = V41ArtifactInspection::inspect(artifact.path()).expect("valid artifact");
-        assert_eq!(inspection.index_kind(), V41ArtifactIndexKind::V41);
+        assert_eq!(inspection.index_kind(), V41ArtifactIndexKind::Mlx);
         assert_eq!(inspection.tensor_count(), 1);
         assert_eq!(inspection.shard_count(), 1);
         assert_eq!(inspection.text_contract().total_layers(), 40);
@@ -465,7 +482,7 @@ mod tests {
         write_required_files(
             artifact.path(),
             "{}",
-            r#"{"metadata":{"total_size":4},"weight_map":{"weight":"model-00001.safetensors"}}"#,
+            r#"{"weight_map":{"weight":"model-00001.safetensors"}}"#,
         );
         write(artifact.path(), "chat_template.jinja", b"{{ messages }}");
 

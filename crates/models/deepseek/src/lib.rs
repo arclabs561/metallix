@@ -20,6 +20,7 @@ pub mod rotary;
 pub mod routing;
 pub mod selection;
 pub mod startup;
+mod tensor_table;
 
 pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
