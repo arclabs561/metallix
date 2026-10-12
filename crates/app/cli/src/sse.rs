@@ -249,6 +249,8 @@ pub(crate) mod test_support {
     /// Streams fixed text in two-character deltas, or fails before output.
     pub(crate) struct Scripted {
         text: String,
+        /// Terminal stop reason for fixed text (token scripts use their stop rule).
+        pub(crate) finish_reason: ChatFinishReason,
         /// Token IDs a model would pick, repeated, decoded one per step under
         /// the server's stop rule instead of `text`.
         tokens: Option<Vec<i32>>,
@@ -278,6 +280,7 @@ pub(crate) mod test_support {
         pub(crate) fn new(text: &str) -> Self {
             Self {
                 text: text.into(),
+                finish_reason: ChatFinishReason::Eos,
                 tokens: None,
                 failure: None,
                 deltas: 0,
@@ -387,12 +390,14 @@ pub(crate) mod test_support {
                         on_token(delta).map_err(ChatGenerationError::Message)?;
                     }
                 }
-                if let Ok((_, last)) = stream.finish(request.tools, true) {
+                if let Ok((_, last)) =
+                    stream.finish(request.tools, self.finish_reason == ChatFinishReason::Eos)
+                {
                     for delta in last {
                         on_token(delta).map_err(ChatGenerationError::Message)?;
                     }
                 }
-                (self.text.clone(), vec![1, 2], ChatFinishReason::Eos)
+                (self.text.clone(), vec![1, 2], self.finish_reason)
             };
             let generated_tokens = generated_token_ids.len();
             let mut generated = crate::chat_generation::ChatGeneration::scripted(

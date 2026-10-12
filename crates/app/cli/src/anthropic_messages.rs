@@ -536,22 +536,30 @@ pub(crate) fn respond(
     };
     if !prepared.request.stream {
         let request_id = connection.request_id().map(str::to_owned);
-        let result = session
-            .generate_with_timeout(
-                request,
-                generation_timeout,
-                &mut connection.stop_when_gone(),
-            )
-            .and_then(|generated| {
-                record_usage(&generated);
-                let mut value = message_value(prepared, &generated, id)
-                    .map_err(ChatGenerationError::Message)?;
+        let generation = session.generate_with_timeout(
+            request,
+            generation_timeout,
+            &mut connection.stop_when_gone(),
+        );
+        let generated = match generation {
+            Ok(generated) => generated,
+            Err(error) => {
+                generation_error(connection, &error);
+                return Ok(());
+            }
+        };
+        record_usage(&generated);
+        match message_value(prepared, &generated, id) {
+            Ok(mut value) => {
                 echo_request_id(&mut value, request_id.as_deref());
-                Ok(value)
-            });
-        match result {
-            Ok(value) => json_response(connection, 200, &value),
-            Err(error) => generation_error(connection, &error),
+                json_response(connection, 200, &value);
+            }
+            Err(error) => crate::generation_routes::error_response(
+                connection,
+                500,
+                Some("invalid_model_output"),
+                &error,
+            ),
         }
         return Ok(());
     }
@@ -674,7 +682,18 @@ fn stream(
         &generated,
     ) {
         Ok(turn) => turn,
-        Err(error) => return failure(&mut sse, "api_error", &error),
+        Err(error) => {
+            if let Some(connection) = sse.take_unopened() {
+                crate::generation_routes::error_response(
+                    connection,
+                    500,
+                    Some("invalid_model_output"),
+                    &error,
+                );
+                return Ok(());
+            }
+            return failure(&mut sse, "api_error", &error);
+        }
     };
     if !started {
         event(&mut sse, &start)?;
@@ -1159,8 +1178,9 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         let mut strict = tool;
         strict["strict"] = json!(true);
         let mut backend = Scripted::new(off_schema);
-        let (status, _) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
-        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        let (status, body) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
+        assert!(status.starts_with("HTTP/1.1 500 "), "{status}");
+        assert_eq!(body["error"]["type"], "api_error");
     }
 
     /// `any` and a named `tool` map onto the turn's tool requirement, and
@@ -1353,5 +1373,110 @@ Let me look.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</to
         .unwrap();
         assert!(prepared.controls.json_schema.is_none());
         assert_eq!(prepared.tools.len(), 3);
+    }
+    #[test]
+    fn truncated_tool_turns_preserve_text_without_calls() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        for (output, prefix) in [
+            ("<tool_call>", ""),
+            ("a <", "a <"),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{}}</tool_call><tool_call>{"name":"read_file","arguments":{}}</tool_call><tool_call>{"#,
+                "Before.",
+            ),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{"path":"#,
+                "Before.",
+            ),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>"#,
+                "Before.",
+            ),
+        ] {
+            for choice in [
+                json!({"type":"auto"}),
+                json!({"type":"any"}),
+                json!({"type":"tool","name":"read_file"}),
+            ] {
+                for stream in [false, true] {
+                    let mut backend = Scripted::new(output);
+                    backend.finish_reason = crate::chat_generation::ChatFinishReason::Length;
+                    let body = with(
+                        &json!({"tools":[tool.clone()],"stream":stream,"tool_choice":choice.clone()}),
+                    );
+                    let wire = run(&body, &mut backend);
+                    assert!(
+                        wire.trim_start_matches("HTTP/1.1 100 Continue\r\n\r\n")
+                            .starts_with("HTTP/1.1 200 OK"),
+                        "{wire}"
+                    );
+                    assert!(!wire.contains("tool_use"), "{wire}");
+                    assert!(!wire.contains("<tool_call>"), "{wire}");
+                    if stream {
+                        let frames = events(&wire);
+                        let data: Vec<Value> = frames
+                            .iter()
+                            .filter(|(_, text)| text != "[DONE]")
+                            .map(|(_, text)| serde_json::from_str(text).unwrap())
+                            .collect();
+                        assert!(
+                            data.iter()
+                                .any(|v| v["delta"]["stop_reason"] == "max_tokens")
+                        );
+                        assert_eq!(data.last().unwrap()["type"], "message_stop");
+                        let text: String = data
+                            .iter()
+                            .filter_map(|v| v["delta"]["text"].as_str())
+                            .collect();
+                        assert_eq!(text, prefix);
+                    } else {
+                        let (_, reply) = json_body(&wire);
+                        assert_eq!(reply["stop_reason"], "max_tokens");
+                        let text: String = reply["content"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|v| v["text"].as_str())
+                            .collect();
+                        assert_eq!(text, prefix);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_malformed_tool_turn_is_a_server_failure() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        for (output, has_prefix) in [
+            ("<tool_call>{", false),
+            ("Before.<tool_call>{broken}</tool_call>", true),
+        ] {
+            for stream in [false, true] {
+                let mut backend = Scripted::new(output);
+                let body = with(&json!({"tools":[tool.clone()],"stream":stream}));
+                let wire = run(&body, &mut backend);
+                if stream && has_prefix {
+                    assert!(
+                        wire.trim_start_matches("HTTP/1.1 100 Continue\r\n\r\n")
+                            .starts_with("HTTP/1.1 200 OK"),
+                        "{wire}"
+                    );
+                    let frames = events(&wire);
+                    let data: Vec<Value> = frames
+                        .iter()
+                        .filter(|(_, text)| text != "[DONE]")
+                        .map(|(_, text)| serde_json::from_str(text).unwrap())
+                        .collect();
+                    assert_eq!(data.last().unwrap()["type"], "error");
+                    assert_eq!(data.last().unwrap()["error"]["type"], "api_error");
+                    assert!(data.iter().all(|v| v["type"] != "message_stop"));
+                } else {
+                    let (status, reply) = json_body(&wire);
+                    assert!(status.starts_with("HTTP/1.1 500 "), "{status}");
+                    assert_eq!(reply["error"]["type"], "api_error");
+                }
+            }
+        }
     }
 }

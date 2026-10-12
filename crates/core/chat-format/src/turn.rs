@@ -113,6 +113,17 @@ impl ToolDialect {
         }
     }
 
+    /// Marker that starts a call in this dialect.
+    pub(crate) const fn call_open(self) -> Option<&'static str> {
+        match self {
+            Self::JsonInTags => Some("<tool_call>"),
+            Self::XmlFunctionParams => Some(xml_function_params::OPEN),
+            Self::MiniCpmXml => Some(minicpm_xml::OPEN),
+            Self::GemmaCall => Some(gemma_call::OPEN),
+            Self::PlainText => None,
+        }
+    }
+
     /// `tools` give parameter types to dialects that write every value as
     /// text.
     fn parse(self, answer: &str, tools: &[Value]) -> Result<ParsedTurn, String> {
@@ -182,8 +193,8 @@ pub struct AssistantTurn {
 }
 
 /// Parses one generation. `tools` are template-shaped definitions
-/// (`{"type": "function", "function": {...}}`). A truncated tool turn is an
-/// error, never a partial call.
+/// (`{"type": "function", "function": {...}}`). An output-limited turn keeps
+/// only text before the first call marker and returns no calls.
 ///
 /// # Errors
 ///
@@ -210,7 +221,7 @@ pub fn parse_turn(
 /// # Errors
 ///
 /// Returns a message when the dialect cannot parse the tool-call markup,
-/// or when a turn with tool calls is not `complete`.
+/// on a complete turn. Output-limited turns never return calls.
 pub fn parse_turn_unchecked(
     format: TurnFormat,
     text: &str,
@@ -223,10 +234,21 @@ pub fn parse_turn_unchecked(
     } else {
         ("", format.reasoning.strip_empty(text))
     };
-    let turn = format.tools.parse(answer, tools)?;
-    if !turn.calls.is_empty() && !complete {
-        return Err("truncated tool turn; no function calls returned".into());
-    }
+    let turn = if complete {
+        format.tools.parse(answer, tools)?
+    } else {
+        // A partial opener is still literal text at the output limit. Only
+        // a recognized marker starts a call whose entire tail is withheld.
+        let prefix = format
+            .tools
+            .call_open()
+            .and_then(|open| answer.split_once(open))
+            .map_or(answer, |(prefix, _)| prefix);
+        ParsedTurn {
+            text: prefix.to_owned(),
+            calls: Vec::new(),
+        }
+    };
     Ok(AssistantTurn {
         reasoning: reasoning.to_owned(),
         text: turn.text,
@@ -333,6 +355,28 @@ mod tests {
             TurnFormat::from_template(&format!("{QWEN3_TEMPLATE}{MINICPM5_TEMPLATE}")).tools,
             ToolDialect::PlainText
         );
+    }
+
+    #[test]
+    fn truncated_calls_keep_only_leading_text() {
+        for text in [
+            "<tool_call>",
+            "prefix <tool_call>{",
+            "prefix <tool_call>{\"name\":\"read_file\",\"arguments\":{}}</tool_call>",
+        ] {
+            let turn = parse_turn_unchecked(QWEN3, text, &read_file(), false, false)
+                .expect("output limit is a successful incomplete turn");
+            assert_eq!(
+                turn.text,
+                if text.starts_with("prefix") {
+                    "prefix "
+                } else {
+                    ""
+                }
+            );
+            assert!(turn.calls.is_empty());
+            assert!(!turn.complete);
+        }
     }
 
     /// `MiniCPM5-2B`'s greedy output for the `chat_tool_call` reference
@@ -465,7 +509,12 @@ mod tests {
                 arguments: json!({"path":"a.md"}),
             }]
         );
-        assert!(parse_turn(QWEN3, call, &read_file(), true, false).is_err());
+        assert!(
+            parse_turn(QWEN3, call, &read_file(), true, false)
+                .unwrap()
+                .calls
+                .is_empty()
+        );
         assert!(parse_turn(QWEN3, call, &[], true, true).is_err());
         let wrong =
             "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": 5}}</tool_call>";
@@ -477,7 +526,12 @@ mod tests {
             check_call(&read_file(), &kept.calls[0])
                 .is_err_and(|error| error.contains("declared schema"))
         );
-        assert!(parse_turn_unchecked(QWEN3, call, &read_file(), true, false).is_err());
+        assert!(
+            parse_turn_unchecked(QWEN3, call, &read_file(), true, false)
+                .unwrap()
+                .calls
+                .is_empty()
+        );
         // Plain text keeps any markup the model writes as text.
         let plain = parse_turn(TurnFormat::PLAIN, call, &read_file(), true, true).unwrap();
         assert_eq!((plain.reasoning.as_str(), plain.text.as_str()), ("", call));

@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 
-use crate::turn::{AssistantTurn, ToolDialect, TurnFormat, parse_turn_unchecked};
+use crate::turn::{AssistantTurn, TurnFormat, parse_turn_unchecked};
 
 /// A piece of a turn a protocol may show as it arrives.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -152,7 +152,7 @@ fn settled(format: TurnFormat, enable_thinking: bool, raw: &str) -> (&str, &str)
             None => answer,
         }
     };
-    let text = match call_open(format.tools) {
+    let text = match format.tools.call_open() {
         Some(open) => match answer.find(open) {
             Some(start) => &answer[..start],
             None => &answer[..answer.len() - held_suffix(answer, &[open])],
@@ -182,17 +182,6 @@ fn without_empty_block<'a>(answer: &'a str, open: &str, close: &str) -> Option<&
             None
         }
         _ => Some(answer),
-    }
-}
-
-/// The marker that opens a call in `dialect`.
-const fn call_open(dialect: ToolDialect) -> Option<&'static str> {
-    match dialect {
-        ToolDialect::JsonInTags => Some("<tool_call>"),
-        ToolDialect::XmlFunctionParams => Some(crate::tools::xml_function_params::OPEN),
-        ToolDialect::MiniCpmXml => Some(crate::tools::minicpm_xml::OPEN),
-        ToolDialect::GemmaCall => Some(crate::tools::gemma_call::OPEN),
-        ToolDialect::PlainText => None,
     }
 }
 
@@ -286,6 +275,94 @@ mod tests {
             }
         }
         Ok((reasoning, text, (turn.reasoning, turn.text)))
+    }
+
+    #[test]
+    fn output_limited_calls_never_escape_for_any_dialect_or_marker_cut() {
+        for (dialect, call) in [
+            (
+                ToolDialect::JsonInTags,
+                "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>",
+            ),
+            (
+                ToolDialect::XmlFunctionParams,
+                "<tool_call><function=f></function></tool_call>",
+            ),
+            (ToolDialect::MiniCpmXml, "<function name=\"f\"></function>"),
+            (ToolDialect::GemmaCall, "<|tool_call>call:f{}<tool_call|>"),
+        ] {
+            let format = TurnFormat {
+                tools: dialect,
+                reasoning: ReasoningDialect::ThinkTags,
+            };
+            // Includes a complete call, another call, and trailing prose: none
+            // may escape from an unfinished plan, even if a call is valid.
+            let suffix = format!("{call}{call}after");
+            for end in 1..=suffix.len() {
+                let raw = format!("<think>reason</think>préfix {}", &suffix[..end]);
+                let mut stream = TurnStream::new(format, true);
+                let mut deltas = Vec::new();
+                for character in raw.chars() {
+                    deltas.extend(stream.push(&character.to_string()));
+                }
+                let (turn, last) = stream.finish(&[], false).expect("incomplete turn");
+                deltas.extend(last);
+                let text: String = deltas
+                    .iter()
+                    .filter_map(|delta| match delta {
+                        TurnDelta::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let reasoning: String = deltas
+                    .iter()
+                    .filter_map(|delta| match delta {
+                        TurnDelta::Reasoning(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let expected = if end < format.tools.call_open().unwrap().len() {
+                    format!("préfix {}", &suffix[..end])
+                } else {
+                    "préfix ".to_owned()
+                };
+                assert_eq!(text, expected, "{dialect:?} cut {end}");
+                assert_eq!(turn.text, text);
+                assert_eq!(reasoning, "reason");
+                assert_eq!(turn.reasoning, reasoning);
+                assert!(turn.calls.is_empty());
+                assert!(!turn.complete);
+            }
+        }
+        let qwen = TurnFormat {
+            tools: ToolDialect::JsonInTags,
+            reasoning: ReasoningDialect::None,
+        };
+        let mut literal = TurnStream::new(qwen, false);
+        let mut released = literal.push("a <");
+        let (turn, last) = literal.finish(&[], false).unwrap();
+        released.extend(last);
+        let text: String = released
+            .iter()
+            .filter_map(|delta| match delta {
+                TurnDelta::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "a <");
+        assert_eq!(turn.text, text);
+        assert_eq!(
+            parse_turn_unchecked(qwen, "a <", &[], false, false)
+                .unwrap()
+                .text,
+            text
+        );
+        let mut plain = TurnStream::new(TurnFormat::PLAIN, false);
+        plain.push("literal <tool_call>");
+        assert_eq!(
+            plain.finish(&[], false).unwrap().0.text,
+            "literal <tool_call>"
+        );
     }
 
     proptest! {

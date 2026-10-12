@@ -543,23 +543,31 @@ pub(crate) fn respond(
     };
     let request_id = connection.request_id().map(str::to_owned);
     if !prepared.request.stream {
-        let result = session
-            .generate_with_timeout(
-                request,
-                generation_timeout,
-                &mut connection.stop_when_gone(),
-            )
-            .and_then(|generated| {
-                record_usage(&generated);
-                let mut value = completion_value(prepared, &generated, id)
-                    .map_err(ChatGenerationError::Message)?;
+        let generation = session.generate_with_timeout(
+            request,
+            generation_timeout,
+            &mut connection.stop_when_gone(),
+        );
+        let generated = match generation {
+            Ok(generated) => generated,
+            Err(error) => {
+                generation_error(connection, &error);
+                return Ok(());
+            }
+        };
+        record_usage(&generated);
+        match completion_value(prepared, &generated, id) {
+            Ok(mut value) => {
                 echo_request_id(&mut value, request_id.as_deref());
                 note_ignored_template_kwargs(&mut value, &prepared.controls, &*session);
-                Ok(value)
-            });
-        match result {
-            Ok(value) => json_response(connection, 200, &value),
-            Err(error) => generation_error(connection, &error),
+                json_response(connection, 200, &value);
+            }
+            Err(error) => crate::generation_routes::error_response(
+                connection,
+                500,
+                Some("invalid_model_output"),
+                &error,
+            ),
         }
         return Ok(());
     }
@@ -655,7 +663,18 @@ fn stream(
         &generated,
     ) {
         Ok(turn) => turn,
-        Err(error) => return failure(&mut sse, "invalid_model_output", &error),
+        Err(error) => {
+            if let Some(connection) = sse.take_unopened() {
+                crate::generation_routes::error_response(
+                    connection,
+                    500,
+                    Some("invalid_model_output"),
+                    &error,
+                );
+                return Ok(());
+            }
+            return failure(&mut sse, "invalid_model_output", &error);
+        }
     };
     if !role_sent {
         sse.event(
@@ -1268,8 +1287,9 @@ mod tests {
         let mut strict = tool;
         strict["function"]["strict"] = json!(true);
         let mut backend = Scripted::new(off_schema);
-        let (status, _) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
-        assert_eq!(status, "HTTP/1.1 400 Bad Request");
+        let (status, body) = json_body(&run(&with(&json!({"tools":[strict]})), &mut backend));
+        assert!(status.starts_with("HTTP/1.1 500 "), "{status}");
+        assert_eq!(body["error"]["type"], "server_error");
     }
 
     /// `required` and a named function map onto the turn's tool requirement,
@@ -1534,6 +1554,118 @@ mod tests {
                 chat_format::validator(&schema).unwrap().is_valid(&value),
                 "{value}"
             );
+        }
+    }
+    #[test]
+    fn truncated_tool_turns_preserve_text_without_calls() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        for (output, prefix) in [
+            ("<tool_call>", ""),
+            ("a <", "a <"),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{}}</tool_call><tool_call>{"name":"read_file","arguments":{}}</tool_call><tool_call>{"#,
+                "Before.",
+            ),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{"path":"#,
+                "Before.",
+            ),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>"#,
+                "Before.",
+            ),
+        ] {
+            for choice in [
+                json!("auto"),
+                json!("required"),
+                json!({"type":"function","function":{"name":"read_file"}}),
+            ] {
+                for stream in [false, true] {
+                    let mut backend = Scripted::new(output);
+                    backend.finish_reason = crate::chat_generation::ChatFinishReason::Length;
+                    let body = with(
+                        &json!({"tools":[tool.clone()],"stream":stream,"tool_choice":choice.clone()}),
+                    );
+                    let wire = run(&body, &mut backend);
+                    assert!(
+                        wire.trim_start_matches("HTTP/1.1 100 Continue\r\n\r\n")
+                            .starts_with("HTTP/1.1 200 OK"),
+                        "{wire}"
+                    );
+                    assert!(!wire.contains("tool_calls"), "{wire}");
+                    assert!(!wire.contains("<tool_call>"), "{wire}");
+                    if stream {
+                        let frames = events(&wire);
+                        let data: Vec<Value> = frames
+                            .iter()
+                            .filter(|(_, text)| text != "[DONE]")
+                            .map(|(_, text)| serde_json::from_str(text).unwrap())
+                            .collect();
+                        assert!(
+                            data.iter()
+                                .any(|v| v["choices"][0]["finish_reason"] == "length")
+                        );
+                        assert_eq!(frames.last().unwrap().1, "[DONE]");
+                        let text: String = data
+                            .iter()
+                            .filter_map(|v| v["choices"][0]["delta"]["content"].as_str())
+                            .collect();
+                        assert_eq!(text, prefix);
+                    } else {
+                        let (_, reply) = json_body(&wire);
+                        assert_eq!(reply["choices"][0]["finish_reason"], "length");
+                        assert_eq!(
+                            reply["choices"][0]["message"]["content"]
+                                .as_str()
+                                .unwrap_or(""),
+                            prefix
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_malformed_tool_turn_is_a_server_failure() {
+        let tool: Value = serde_json::from_str(TOOL).unwrap();
+        for (output, has_prefix) in [
+            ("<tool_call>{", false),
+            ("Before.<tool_call>{broken}</tool_call>", true),
+        ] {
+            for stream in [false, true] {
+                let mut backend = Scripted::new(output);
+                let body = with(&json!({"tools":[tool.clone()],"stream":stream}));
+                let wire = run(&body, &mut backend);
+                if stream && has_prefix {
+                    assert!(
+                        wire.trim_start_matches("HTTP/1.1 100 Continue\r\n\r\n")
+                            .starts_with("HTTP/1.1 200 OK"),
+                        "{wire}"
+                    );
+                    let frames = events(&wire);
+                    let data: Vec<Value> = frames
+                        .iter()
+                        .filter(|(_, text)| text != "[DONE]")
+                        .map(|(_, text)| serde_json::from_str(text).unwrap())
+                        .collect();
+                    let error = data
+                        .iter()
+                        .find(|v| v.get("error").is_some())
+                        .expect("terminal server error");
+                    assert_eq!(error["error"]["type"], "server_error");
+                    assert_eq!(error["error"]["code"], "invalid_model_output");
+                    assert_eq!(frames.last().unwrap().1, "[DONE]");
+                    assert!(
+                        data.iter()
+                            .all(|v| v["choices"][0]["finish_reason"].is_null())
+                    );
+                } else {
+                    let (status, reply) = json_body(&wire);
+                    assert!(status.starts_with("HTTP/1.1 500 "), "{status}");
+                    assert_eq!(reply["error"]["type"], "server_error");
+                }
+            }
         }
     }
 }

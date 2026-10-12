@@ -760,6 +760,15 @@ pub(crate) fn respond(
             response
         }
         Err(error) => {
+            if let Some(connection) = stream.pending.take() {
+                generation_routes::error_response(
+                    connection,
+                    500,
+                    Some("invalid_model_output"),
+                    &error,
+                );
+                return Ok(());
+            }
             let failure = failed(&stream.envelope, "invalid_model_output", &error);
             return stream.emit(failure);
         }
@@ -841,26 +850,31 @@ fn respond_json(
 ) {
     let request_id = request.request_id().map(str::to_owned);
     let cache_salt = request.cache_salt().map(str::to_owned);
-    let result = session
-        .generate_with_timeout(
-            ChatRequest {
-                cache_salt: cache_salt.as_deref(),
-                ..controls.request(messages, tools)
-            },
-            generation_timeout,
-            &mut request.stop_when_gone(),
-        )
-        .and_then(|generated| {
-            record_usage(&generated);
-            let mut response = response_value(parsed, controls, &generated, id)
-                .map_err(ChatGenerationError::Message)?;
+    let generation = session.generate_with_timeout(
+        ChatRequest {
+            cache_salt: cache_salt.as_deref(),
+            ..controls.request(messages, tools)
+        },
+        generation_timeout,
+        &mut request.stop_when_gone(),
+    );
+    let generated = match generation {
+        Ok(generated) => generated,
+        Err(error) => {
+            error_response(request, &error);
+            return;
+        }
+    };
+    record_usage(&generated);
+    match response_value(parsed, controls, &generated, id) {
+        Ok(mut response) => {
             echo_request_id(&mut response, request_id.as_deref());
             note_ignored_template_kwargs(&mut response, controls, &*session);
-            Ok(response)
-        });
-    match result {
-        Ok(response) => json_response(request, 200, &response),
-        Err(error) => error_response(request, &error),
+            json_response(request, 200, &response);
+        }
+        Err(error) => {
+            generation_routes::error_response(request, 500, Some("invalid_model_output"), &error);
+        }
     }
 }
 
@@ -1666,8 +1680,8 @@ mod tests {
     }
 
     #[test]
-    /// Explicitly non-strict arguments pass through; malformed or truncated
-    /// calls still fail, and undeclared names remain client-validated.
+    /// Explicitly non-strict arguments pass through; malformed completed calls
+    /// still fail, while truncated calls are withheld and names remain client-validated.
     fn explicitly_non_strict_calls_preserve_parsing_boundaries() {
         let read_file = json!({"type":"function","name":"read_file","strict":false,"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}});
         let request: Request = serde_json::from_value(
@@ -1712,7 +1726,16 @@ mod tests {
         assert_eq!(mixed["output"][0]["content"][0]["text"], "I'll read it. ");
         assert_eq!(mixed["output"][1]["type"], "function_call");
         let truncated = generation_ending(call, ChatFinishReason::Length);
-        assert!(response_value(&request, &truncated, "test").is_err());
+        let response = response_value(&request, &truncated, "test").unwrap();
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(response["output"][0]["type"], "message");
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert_eq!(response["output"][0]["content"][0]["text"], "");
     }
 
     #[test]
@@ -2293,6 +2316,119 @@ mod tests {
             assert_eq!(resolved, Ok(true));
         } else {
             assert!(resolved.is_err());
+        }
+    }
+    #[test]
+    fn truncated_tool_turns_preserve_text_without_calls() {
+        use crate::sse::test_support::{Scripted, events};
+        let tool = json!({"type":"function","name":"read_file","strict":false,"parameters":{"type":"object"}});
+        for (output, prefix) in [
+            ("<tool_call>", ""),
+            ("a <", "a <"),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{}}</tool_call><tool_call>{"name":"read_file","arguments":{}}</tool_call><tool_call>{"#,
+                "Before.",
+            ),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{"path":"#,
+                "Before.",
+            ),
+            (
+                r#"Before.<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>"#,
+                "Before.",
+            ),
+        ] {
+            for choice in [
+                json!("auto"),
+                json!("required"),
+                json!({"type":"function","name":"read_file"}),
+            ] {
+                for stream in [false, true] {
+                    let mut backend = Scripted::new(output);
+                    backend.finish_reason = crate::chat_generation::ChatFinishReason::Length;
+                    let body = json!({"model":"control","input":"hello","tools":[tool.clone()],"stream":stream,"tool_choice":choice.clone()});
+                    let wire = wire::exchange(&body.to_string(), &mut backend);
+                    assert!(
+                        wire.trim_start_matches("HTTP/1.1 100 Continue\r\n\r\n")
+                            .starts_with("HTTP/1.1 200 OK"),
+                        "{wire}"
+                    );
+                    assert!(!wire.contains("function_call"), "{wire}");
+                    assert!(!wire.contains("<tool_call>"), "{wire}");
+                    if stream {
+                        let frames = events(&wire);
+                        let data: Vec<Value> = frames
+                            .iter()
+                            .filter(|(_, text)| text != "[DONE]")
+                            .map(|(_, text)| serde_json::from_str(text).unwrap())
+                            .collect();
+                        let last = data.last().expect("terminal response");
+                        assert_eq!(last["type"], "response.incomplete");
+                        assert_eq!(
+                            last["response"]["incomplete_details"]["reason"],
+                            "max_output_tokens"
+                        );
+                        let text: String = data
+                            .iter()
+                            .filter(|v| v["type"] == "response.output_text.delta")
+                            .filter_map(|v| v["delta"].as_str())
+                            .collect();
+                        assert_eq!(text, prefix);
+                    } else {
+                        let (_, reply) = wire::json_body(&wire);
+                        assert_eq!(reply["status"], "incomplete");
+                        assert_eq!(reply["incomplete_details"]["reason"], "max_output_tokens");
+                        let text: String = reply["output"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+                            .filter_map(|part| part["text"].as_str())
+                            .collect();
+                        assert_eq!(text, prefix);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_malformed_tool_turn_is_a_server_failure() {
+        use crate::sse::test_support::{Scripted, events};
+        let tool = json!({"type":"function","name":"read_file","strict":false,"parameters":{"type":"object"}});
+        for (output, has_prefix) in [
+            ("<tool_call>{", false),
+            ("Before.<tool_call>{broken}</tool_call>", true),
+        ] {
+            for stream in [false, true] {
+                let mut backend = Scripted::new(output);
+                let body = json!({"model":"control","input":"hello","tools":[tool.clone()],"stream":stream});
+                let wire = wire::exchange(&body.to_string(), &mut backend);
+                if stream && has_prefix {
+                    assert!(
+                        wire.trim_start_matches("HTTP/1.1 100 Continue\r\n\r\n")
+                            .starts_with("HTTP/1.1 200 OK"),
+                        "{wire}"
+                    );
+                    let frames = events(&wire);
+                    let data: Vec<Value> = frames
+                        .iter()
+                        .filter(|(_, text)| text != "[DONE]")
+                        .map(|(_, text)| serde_json::from_str(text).unwrap())
+                        .collect();
+                    let last = data.last().unwrap();
+                    assert_eq!(last["type"], "response.failed");
+                    assert_eq!(last["response"]["error"]["code"], "server_error");
+                    assert_eq!(
+                        last["response"]["error"]["metallix_code"],
+                        "invalid_model_output"
+                    );
+                } else {
+                    let (status, reply) = wire::json_body(&wire);
+                    assert!(status.starts_with("HTTP/1.1 500 "), "{status}");
+                    assert_eq!(reply["error"]["type"], "server_error");
+                }
+            }
         }
     }
 }

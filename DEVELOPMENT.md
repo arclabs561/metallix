@@ -476,7 +476,16 @@ Generated calls to declared tools receive terminal schema validation on
 passes the arguments through. Chat Completions and Messages validate only
 explicit `strict: true` tools (nested in `function` for Chat). Parsed malformed
 calls still fail; undeclared tool names pass through for client validation.
-Clients should validate calls before executing them.
+Clients should validate calls before executing them. Completed malformed model
+output returns a server error (HTTP 500 before headers, or the protocol's error
+event once streaming has begun).
+
+An output limit returns a successful incomplete turn, including with required
+or named tool choice: Chat reports `finish_reason: "length"`, Responses reports
+`status: "incomplete"` with `max_output_tokens`, and Messages reports
+`stop_reason: "max_tokens"`. Reasoning and visible text before the first tool
+call are preserved; no calls from the unfinished turn are returned, even if
+some calls had already closed. Increase the output limit to retry the turn.
 
 An explicit `strict: true` tool, `tool_choice: "required"` (Messages:
 `{"type": "any"}`), or a named tool choice also constrains generation: the turn
