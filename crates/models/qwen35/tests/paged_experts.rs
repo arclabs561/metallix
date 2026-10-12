@@ -8,6 +8,11 @@
 //! `METALLIX_QWEN35_PAGED_STEPS` sets the greedy steps per prompt (default
 //! 128). `METALLIX_QWEN35_PAGED_PROMPTS` (comma-separated indices) and
 //! `METALLIX_QWEN35_PAGED_BUDGETS` (`layer`, `half`, `all`) narrow the run.
+//! `METALLIX_QWEN35_PAGED_GPU_GIB` sets the MLX byte cap (default 8 GiB for
+//! the four-layer checkpoint). Both paths use a 2 GiB allocator-cache limit.
+//! Checks after loading, prefill and each decode enforce the observed MLX peak
+//! and active-plus-cache bytes. These are cooperative evaluation-boundary checks,
+//! not a hard allocation limit or a bound on other host/process memory.
 //! Pager reads set `F_NOCACHE`, but pages already in the OS file cache (from
 //! the resident load) may still be served from it.
 
@@ -34,14 +39,32 @@ fn argmax(logits: &[f32]) -> i32 {
 
 /// Prefill `prompt`, then decode the greedy tokens `steps` times; every
 /// step's logits.
-fn run(weights: &Qwen35Weights, prompt: &[i32], steps: usize) -> Vec<Vec<f32>> {
+fn run(weights: &Qwen35Weights, prompt: &[i32], steps: usize, cap: usize) -> Vec<Vec<f32>> {
     let mut executor = weights.executor();
     let mut out = vec![executor.prefill_last_logits(prompt).expect("prefill")];
+    check_memory("prefill", cap, true);
     for _ in 0..steps {
         let token = argmax(out.last().expect("logits"));
         out.push(executor.decode_last_logits(token).expect("decode"));
+        check_memory("decode", cap, false);
     }
+    check_memory("prompt complete", cap, true);
     out
+}
+
+/// MLX counters include device allocations, unlike process RSS. The peak is
+/// reset once per model run; cache bytes are separately included in live use.
+fn check_memory(phase: &str, cap: usize, report: bool) {
+    let active = mlx_rs::memory::active_memory().expect("active memory");
+    let cached = mlx_rs::memory::cache_memory().expect("cached memory");
+    let peak = mlx_rs::memory::peak_memory().expect("peak memory");
+    if report {
+        eprintln!("MLX {phase}: active={active} cached={cached} peak={peak} cap={cap}");
+    }
+    assert!(
+        peak <= cap && active.saturating_add(cached) <= cap,
+        "MLX resource cap exceeded after {phase}: active={active} cached={cached} peak={peak} cap={cap}"
+    );
 }
 
 /// Deterministic token ids below `vocab`.
@@ -60,6 +83,13 @@ fn paged_experts_match_resident_logits() {
         eprintln!("skipping: METALLIX_QWEN35_PAGED_MODEL is not set");
         return;
     };
+    let gib: usize = env::var("METALLIX_QWEN35_PAGED_GPU_GIB")
+        .map_or_else(|_| "8".to_owned(), |value| value)
+        .parse()
+        .expect("GPU cap must be an integer GiB count");
+    assert!(gib > 0, "GPU cap must be positive");
+    let cap = gib.checked_mul(1 << 30).expect("GPU cap overflow");
+    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
     let steps = env::var("METALLIX_QWEN35_PAGED_STEPS")
         .ok()
         .and_then(|steps| steps.parse().ok())
@@ -94,11 +124,13 @@ fn paged_experts_match_resident_logits() {
         },
     );
     let resident_run = || {
+        mlx_rs::memory::reset_peak_memory().expect("reset peak");
         let started = Instant::now();
         let resident = Qwen35Weights::load(&model, Qwen35Precision::Checkpoint).expect("resident");
+        check_memory("resident load", cap, true);
         let logits: Vec<_> = chosen
             .iter()
-            .map(|&index| run(&resident, &prompts[index], steps))
+            .map(|&index| run(&resident, &prompts[index], steps, cap))
             .collect();
         eprintln!(
             "resident: prompts {chosen:?} x {steps} steps in {:.1?}",
@@ -124,6 +156,7 @@ fn paged_experts_match_resident_logits() {
         .collect();
     let mut failures = Vec::new();
     for budget in budgets {
+        mlx_rs::memory::reset_peak_memory().expect("reset peak");
         let started = Instant::now();
         let paged = Qwen35Weights::load_paged(
             &model,
@@ -134,9 +167,10 @@ fn paged_experts_match_resident_logits() {
             },
         )
         .expect("paged load");
+        check_memory("paged load", cap, true);
         let actual: Vec<_> = chosen
             .iter()
-            .map(|&index| run(&paged, &prompts[index], steps))
+            .map(|&index| run(&paged, &prompts[index], steps, cap))
             .collect();
         let differing = differences(&chosen, &actual, &expected);
         let stats = paged.pager_stats().expect("stats");
