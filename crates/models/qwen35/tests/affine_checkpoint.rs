@@ -22,7 +22,7 @@
 
 use std::{env, fs, path::PathBuf};
 
-use qwen35::forward::{Qwen35Precision, Qwen35Weights};
+use qwen35::forward::{Qwen35Precision, Qwen35Taps, Qwen35Weights};
 use serde_json::Value;
 
 /// Below this gap between mlx-lm's two largest logits, a different argmax is
@@ -298,4 +298,129 @@ fn per_step_bound_counts_floor_only_passes_and_rejects_excess() {
         0
     );
     assert_eq!(over.len(), 1);
+}
+
+fn snapshot_fixture() -> Option<(Qwen35Weights, Vec<i32>)> {
+    let (Some(model), Some(reference)) = (
+        env::var_os("METALLIX_QWEN35_AFFINE_MODEL"),
+        env::var_os("METALLIX_QWEN35_AFFINE_REFERENCE"),
+    ) else {
+        eprintln!("skipping: METALLIX_QWEN35_AFFINE_MODEL or _REFERENCE is not set");
+        return None;
+    };
+    let reference: Value =
+        serde_json::from_str(&fs::read_to_string(reference).expect("reference")).expect("JSON");
+    let prompt = ids(&reference["cases"][0]["prompt_ids"]);
+    assert!(prompt.len() >= 8, "nontrivial prefix and tail");
+    let weights = load_reference_weights(&PathBuf::from(model));
+    Some((weights, prompt))
+}
+
+/// Exercise real affine recurrent/KV consumers without comparing different
+/// projection batch schedules. Every equality covers the complete vocabulary.
+#[test]
+#[ignore = "set METALLIX_QWEN35_AFFINE_MODEL and METALLIX_QWEN35_AFFINE_REFERENCE; run with --ignored"]
+fn affine_snapshot_and_partial_verify_preserve_accepted_prefix() {
+    let Some((weights, prompt)) = snapshot_fixture() else {
+        return;
+    };
+    let boundary = prompt.len() - 4;
+    let mut original = weights.executor();
+    original
+        .prefill_last_logits(&prompt[..boundary])
+        .expect("prefix");
+    check_reference_memory("snapshot prefix", false);
+    let snapshot = original.snapshot().expect("snapshot");
+    assert_eq!(snapshot.tokens(), boundary);
+    let state_bytes = snapshot.state_bytes();
+    assert!(state_bytes > 0);
+    let mut restored = weights.executor_from(&snapshot).expect("restore");
+    let expected = original
+        .extend_last_logits(&prompt[boundary..])
+        .expect("original tail");
+    let resumed = restored
+        .extend_last_logits(&prompt[boundary..])
+        .expect("restored tail");
+    assert!(!expected.is_empty());
+    assert!(expected.iter().all(|x| x.is_finite()));
+    assert_eq!(resumed, expected, "full-vocabulary restored continuation");
+    check_reference_memory("snapshot continuation", false);
+    original
+        .decode_last_logits(1)
+        .expect("advance rejected branch");
+    assert_eq!(original.tokens(), prompt.len() + 1);
+    assert_eq!(snapshot.tokens(), boundary);
+    assert_eq!(snapshot.state_bytes(), state_bytes);
+    let replayed = weights
+        .executor_from(&snapshot)
+        .expect("retained snapshot")
+        .extend_last_logits(&prompt[boundary..])
+        .expect("replay tail");
+    assert_eq!(
+        replayed, expected,
+        "origin advancement must not mutate retained snapshot"
+    );
+    check_reference_memory("snapshot replay", false);
+    drop(original);
+    drop(restored);
+
+    // Independent branches have identical batch lengths and accepted tokens,
+    // but distinct rejected tails. Neither branch is an oracle with a different
+    // GEMM schedule. Their causal accepted rows and restored continuations must
+    // be independent of the rejected suffix.
+    let draft_a = [prompt[0], prompt[1], 1, 1];
+    let draft_b = [prompt[0], prompt[1], 2, 2];
+    let mut a = weights.executor_from(&snapshot).expect("branch a");
+    let mut b = weights.executor_from(&snapshot).expect("branch b");
+    let rows_a = a
+        .verify_logits(&draft_a, Qwen35Taps::None)
+        .expect("verify a")
+        .rows;
+    check_reference_memory("verify a", false);
+    let rows_b = b
+        .verify_logits(&draft_b, Qwen35Taps::None)
+        .expect("verify b")
+        .rows;
+    check_reference_memory("verify b", false);
+    let vocab = expected.len();
+    assert_eq!(rows_a.len(), 4 * vocab);
+    assert_eq!(rows_b.len(), 4 * vocab);
+    assert!(rows_a.iter().chain(&rows_b).all(|x| x.is_finite()));
+    assert_eq!(
+        &rows_a[..2 * vocab],
+        &rows_b[..2 * vocab],
+        "causal accepted rows"
+    );
+    assert_eq!(a.tokens(), boundary + 4);
+    assert_eq!(b.tokens(), boundary + 4);
+    a.truncate_to(boundary + 2).expect("accept two from a");
+    b.truncate_to(boundary + 2).expect("accept two from b");
+    assert_eq!(a.tokens(), boundary + 2);
+    assert_eq!(b.tokens(), boundary + 2);
+    assert_eq!(
+        a.snapshot().expect("accepted snapshot a").tokens(),
+        boundary + 2
+    );
+    assert_eq!(
+        b.snapshot().expect("accepted snapshot b").tokens(),
+        boundary + 2
+    );
+    for token in [prompt[2], prompt[3]] {
+        let logits_a = a.decode_last_logits(token).expect("common decode a");
+        let logits_b = b.decode_last_logits(token).expect("common decode b");
+        assert_eq!(logits_a.len(), vocab);
+        assert!(logits_a.iter().chain(&logits_b).all(|x| x.is_finite()));
+        assert_eq!(
+            logits_a, logits_b,
+            "full-vocabulary partial-acceptance continuation"
+        );
+        check_reference_memory("rollback common decode", false);
+    }
+    assert_eq!(a.tokens(), boundary + 4);
+    assert_eq!(b.tokens(), boundary + 4);
+    assert_eq!(snapshot.tokens(), boundary);
+    eprintln!(
+        "affine snapshot/rollback: vocabulary={vocab}, prefix={boundary}, accepted=2, common decode=2, exact full-vocabulary comparisons"
+    );
+    check_reference_memory("snapshot rollback complete", true);
 }
