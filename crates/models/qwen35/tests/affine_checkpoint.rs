@@ -146,6 +146,22 @@ fn check_arms(case_index: usize, case: &Value) {
     );
 }
 
+/// Cooperative materialization-boundary bound for the four-layer qualification.
+/// MLX active plus cache and historical peak exclude other process/driver memory.
+fn check_reference_memory(phase: &str, report: bool) {
+    let active = mlx_rs::memory::active_memory().expect("active memory");
+    let cached = mlx_rs::memory::cache_memory().expect("cached memory");
+    let peak = mlx_rs::memory::peak_memory().expect("peak memory");
+    let cap = 8_usize << 30;
+    if report {
+        eprintln!("MLX {phase}: active={active} cached={cached} peak={peak} cap={cap}");
+    }
+    assert!(
+        peak <= cap && active.saturating_add(cached) <= cap,
+        "MLX resource cap exceeded after {phase}: active={active} cached={cached} peak={peak} cap={cap}"
+    );
+}
+
 #[test]
 fn greedy_steps_agree_with_mlx_lm() {
     let (Some(model), Some(reference)) = (
@@ -167,7 +183,10 @@ fn greedy_steps_agree_with_mlx_lm() {
         assert_eq!(case["steps"].as_array().expect("steps").len(), 32);
         assert_eq!(case["aa"].as_array().expect("floor").len(), 32);
     }
+    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
+    mlx_rs::memory::reset_peak_memory().expect("reset peak");
     let weights = Qwen35Weights::load(&model, Qwen35Precision::Checkpoint).expect("load");
+    check_reference_memory("load", true);
     let (mut steps, mut ties, mut overlap) = (0_usize, 0_usize, 0_usize);
     // (centered, margin, max |d|): ours and mlx-lm's own floor.
     let (mut ours_max, mut floor_max) = ([0.0_f64; 3], [0.0_f64; 3]);
@@ -188,6 +207,7 @@ fn greedy_steps_agree_with_mlx_lm() {
         let mut logits = executor
             .prefill_last_logits(&ids(&case["prompt_ids"]))
             .expect("prefill");
+        check_reference_memory("prefill", true);
         for (step, expected) in case["steps"].as_array().expect("steps").iter().enumerate() {
             let top = ids(&expected["top8_ids"]);
             let want = floats(&expected["top8_logits"]);
@@ -228,6 +248,7 @@ fn greedy_steps_agree_with_mlx_lm() {
             }
             steps += 1;
             logits = executor.decode_last_logits(top[0]).expect("decode");
+            check_reference_memory("decode", false);
         }
     }
     eprintln!(
@@ -240,6 +261,7 @@ fn greedy_steps_agree_with_mlx_lm() {
         ours_max[2],
         floor_max[2],
     );
+    check_reference_memory("heldout complete", true);
     eprintln!("errors within bound only by the BF16-step minimum: {by_step_only}");
     assert!(steps > 0);
     assert!(

@@ -311,6 +311,22 @@ fn component(weights: &Qwen35Weights, key: &str) -> Array {
         .expect("projection")
 }
 
+/// Cooperative materialization-boundary bound for the four-layer qualification.
+/// MLX active plus cache and historical peak exclude other process/driver memory.
+fn check_reference_memory(phase: &str, report: bool) {
+    let active = mlx_rs::memory::active_memory().expect("active memory");
+    let cached = mlx_rs::memory::cache_memory().expect("cached memory");
+    let peak = mlx_rs::memory::peak_memory().expect("peak memory");
+    let cap = 8_usize << 30;
+    if report {
+        eprintln!("MLX {phase}: active={active} cached={cached} peak={peak} cap={cap}");
+    }
+    assert!(
+        peak <= cap && active.saturating_add(cached) <= cap,
+        "MLX resource cap exceeded after {phase}: active={active} cached={cached} peak={peak} cap={cap}"
+    );
+}
+
 /// Every quantized module, the embedding, the output head and every `MoE`
 /// block reproduce mlx-lm's BF16 output bit for bit on the reference
 /// script's synthetic inputs.
@@ -319,6 +335,7 @@ fn component(weights: &Qwen35Weights, key: &str) -> Array {
 /// mixture-of-experts model, its 4-layer truncation from the script's
 /// `truncate`) and `METALLIX_QWEN35_AFFINE_REFERENCE` to the script's
 /// `reference` JSON for it.
+
 #[test]
 fn components_match_mlx_lm_bit_for_bit() {
     let (Some(model), Some(reference)) = (
@@ -330,13 +347,17 @@ fn components_match_mlx_lm_bit_for_bit() {
     };
     let reference: Value =
         serde_json::from_str(&fs::read_to_string(reference).expect("reference")).expect("JSON");
+    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
+    mlx_rs::memory::reset_peak_memory().expect("reset peak");
     let weights =
         Qwen35Weights::load(PathBuf::from(model), Qwen35Precision::Checkpoint).expect("load");
+    check_reference_memory("load", true);
     let components = reference["components"].as_object().expect("components");
     assert!(!components.is_empty());
     let mut mismatched = Vec::new();
     for (key, expected) in components {
         let actual = digest(&component(&weights, key));
+        check_reference_memory("component", false);
         if actual != expected.as_str().expect("digest") {
             mismatched.push(key.clone());
         }
@@ -346,6 +367,7 @@ fn components_match_mlx_lm_bit_for_bit() {
         components.len(),
         mismatched.len()
     );
+    check_reference_memory("components complete", true);
     assert!(mismatched.is_empty(), "mismatched: {mismatched:?}");
 }
 
