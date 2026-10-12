@@ -77,19 +77,24 @@ fn ids(count: usize, seed: u64, vocab: u64) -> Vec<i32> {
         .collect()
 }
 
+fn configure_memory_policy() -> usize {
+    let gib: usize = env::var("METALLIX_QWEN35_PAGED_GPU_GIB")
+        .unwrap_or_else(|_| "8".to_owned())
+        .parse()
+        .expect("GPU cap must be an integer GiB count");
+    assert!(gib > 0, "GPU cap must be positive");
+    let cap = gib.checked_mul(1 << 30).expect("GPU cap overflow");
+    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
+    cap
+}
+
 #[test]
 fn paged_experts_match_resident_logits() {
     let Some(model) = env::var_os("METALLIX_QWEN35_PAGED_MODEL").map(PathBuf::from) else {
         eprintln!("skipping: METALLIX_QWEN35_PAGED_MODEL is not set");
         return;
     };
-    let gib: usize = env::var("METALLIX_QWEN35_PAGED_GPU_GIB")
-        .map_or_else(|_| "8".to_owned(), |value| value)
-        .parse()
-        .expect("GPU cap must be an integer GiB count");
-    assert!(gib > 0, "GPU cap must be positive");
-    let cap = gib.checked_mul(1 << 30).expect("GPU cap overflow");
-    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
+    let cap = configure_memory_policy();
     let steps = env::var("METALLIX_QWEN35_PAGED_STEPS")
         .ok()
         .and_then(|steps| steps.parse().ok())

@@ -162,6 +162,14 @@ fn check_reference_memory(phase: &str, report: bool) {
     );
 }
 
+fn load_reference_weights(model: &std::path::Path) -> Qwen35Weights {
+    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
+    mlx_rs::memory::reset_peak_memory().expect("reset peak");
+    let weights = Qwen35Weights::load(model, Qwen35Precision::Checkpoint).expect("load");
+    check_reference_memory("load", true);
+    weights
+}
+
 #[test]
 fn greedy_steps_agree_with_mlx_lm() {
     let (Some(model), Some(reference)) = (
@@ -183,10 +191,7 @@ fn greedy_steps_agree_with_mlx_lm() {
         assert_eq!(case["steps"].as_array().expect("steps").len(), 32);
         assert_eq!(case["aa"].as_array().expect("floor").len(), 32);
     }
-    mlx_rs::memory::set_cache_limit(2 << 30).expect("allocator cache limit");
-    mlx_rs::memory::reset_peak_memory().expect("reset peak");
-    let weights = Qwen35Weights::load(&model, Qwen35Precision::Checkpoint).expect("load");
-    check_reference_memory("load", true);
+    let weights = load_reference_weights(&model);
     let (mut steps, mut ties, mut overlap) = (0_usize, 0_usize, 0_usize);
     // (centered, margin, max |d|): ours and mlx-lm's own floor.
     let (mut ours_max, mut floor_max) = ([0.0_f64; 3], [0.0_f64; 3]);
