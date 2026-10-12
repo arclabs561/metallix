@@ -33,13 +33,23 @@ so a 35B mixture-of-experts checkpoint can be checked in a few GB.
   call MLX switches to another kernel, so longer calls are not covered.
 * ``cases``: for a few chat prompts (one over 200 tokens), the prompt IDs,
   then mlx-lm's greedy tokens from its prompt cache, with each step's top-8
-  IDs and logits and the gap between the two largest logits.
-* ``aa``: per case and step, how far mlx-lm moves from itself when its
-  gated-delta recurrence runs as ops instead of its Metal kernel
-  (``use_kernel=False``), replaying the same tokens: on that step's top-8
-  IDs, the centered error ``max |d - mean(d)|``, the error of the top-1 minus
-  top-2 margin, and ``max |d|``, with ``d`` the logit differences. A native
-  implementation's distance from mlx-lm is judged against this floor.
+  IDs and logits and the gap between the two largest logits. ``--prompts
+  heldout`` uses a second set of prompts, kept apart so a bound tuned on the
+  first can be checked on cases it never saw.
+* ``aa_arms``: per case, how far mlx-lm moves from itself in each of 23
+  other configurations that compute the same function, replaying the same
+  tokens: its gated-delta recurrence as its Metal kernel or as ops
+  (``use_kernel=False``), times the prompt prefilled whole or in chunks of
+  16, 12, 8, 1, 7, 9, 15, 17, 32, 64 or 128 tokens, minus the configuration that produced ``cases``.
+  Per step, on that step's top-8 IDs: the centered error ``max |d -
+  mean(d)|``, the error of the top-1 minus top-2 margin, and ``max |d|``,
+  with ``d`` the logit differences. An arm whose logits equal an earlier
+  arm's, or the reference's own, at every step is marked ``duplicate``.
+  (On a dense model, chunks of 4 and 8 tokens round identically.)
+* ``aa``: per step, the largest of each error over the arms that are not
+  duplicates. One arm samples only one point of how far rounding alone moves
+  greedy decoding, and expert routing amplifies that unevenly between steps,
+  so a native implementation is judged against the largest of several.
 """
 
 from __future__ import annotations
@@ -48,6 +58,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import re
 import shutil
 from pathlib import Path
@@ -84,6 +95,54 @@ PROMPTS = [
         "what the biologists measured each morning."
     ),
 ]
+HELDOUT_PROMPTS = [
+    "Describe how a bicycle's gears change the effort needed to climb a hill.",
+    "Write a SQL query that returns the five customers with the most orders.",
+    "Why does ice float on water?",
+    (
+        "Read the passage and answer the question after it.\n\n"
+        "The bakery on the village square opened in 1902, when a miller's son "
+        "built a brick oven behind his house and sold bread from the front room. "
+        "For its first decades the oven burned wood cut in the hills above the "
+        "village, and flour arrived twice a week by horse and cart from the mill "
+        "on the river. In 1931 the baker's daughter began a ledger in which she "
+        "wrote down, every evening, how many loaves had been baked and how many "
+        "were left unsold; the ledger has been kept every day since. In 1948 the "
+        "wood oven was rebuilt to burn gas, and a few years later a truck "
+        "replaced the cart. The gas oven served until 1986, when the bakery "
+        "installed an electric deck oven that bakes more evenly and needs no "
+        "night-time firing. The square has changed around it, but the bakery "
+        "still opens at six, and the ledger now fills its fortieth volume.\n\n"
+        "Question: list the three ways the oven was heated, in order, and say "
+        "what the ledger records."
+    ),
+]
+# Retain the original arms; extra sizes straddle routing-sort and chunk/kernel
+# thresholds. They sample reference arithmetic, without observing the candidate.
+PREFILL_CHUNKS = (None, 16, 12, 8, 1, 7, 9, 15, 17, 32, 64, 128)
+GPU_CAP_BYTES: int | None = None
+
+
+def check_gpu_memory() -> dict[str, int]:
+    """Check MLX active/peak allocation bytes after materialization.
+
+    This cooperative bound detects transient peaks too; it is not an allocator
+    hard limit or a measurement of all process/driver memory.
+    """
+    memory = {
+        "active_bytes": mx.get_active_memory(),
+        "peak_bytes": mx.get_peak_memory(),
+        "cache_bytes": mx.get_cache_memory(),
+    }
+    if (
+        GPU_CAP_BYTES is not None
+        and max(memory["peak_bytes"], memory["active_bytes"] + memory["cache_bytes"])
+        > GPU_CAP_BYTES
+    ):
+        raise RuntimeError(f"MLX memory cap exceeded: {memory}, cap={GPU_CAP_BYTES}")
+    return memory
+
+
 COPY = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -155,6 +214,7 @@ def synthetic(shape: tuple[int, ...]) -> mx.array:
 
 def digest(array: mx.array) -> str:
     raw = np.array(mx.view(array.astype(mx.bfloat16), mx.uint16)).astype("<u2")
+    check_gpu_memory()
     return hashlib.sha256(raw.tobytes()).hexdigest()
 
 
@@ -195,6 +255,7 @@ def step_record(logits: mx.array) -> dict:
     order = mx.argsort(-logits)[:8]
     values = logits[order]
     mx.eval(order, values)
+    check_gpu_memory()
     top = [float(v) for v in values.tolist()]
     return {
         "top8_ids": [int(i) for i in order.tolist()],
@@ -216,15 +277,29 @@ def greedy(model, prompt: list[int], steps: int) -> list[dict]:
     return records
 
 
-def replay(model, prompt: list[int], records: list[dict]) -> list[dict]:
-    """``aa`` entries: this model's logits on ``records``' token stream,
+def prefill(model, prompt: list[int], cache, chunk: int | None) -> mx.array:
+    """The last prompt position's logits, prefilling ``chunk`` tokens per
+    call (``None``: the whole prompt in one call)."""
+    step = chunk or len(prompt)
+    for start in range(0, len(prompt), step):
+        logits = model(mx.array(prompt[start : start + step])[None], cache=cache)
+        mx.eval(logits)
+        check_gpu_memory()
+    return logits[0, -1]
+
+
+def replay(
+    model, prompt: list[int], records: list[dict], chunk: int | None
+) -> list[dict]:
+    """``aa_arms`` entries: this model's logits on ``records``' token stream,
     compared on each step's recorded top-8 IDs."""
     cache = make_prompt_cache(model)
-    logits = model(mx.array(prompt)[None], cache=cache)[0, -1]
+    logits = prefill(model, prompt, cache, chunk)
     out = []
     for step, record in enumerate(records):
         values = logits.astype(mx.float32)[mx.array(record["top8_ids"])]
         mx.eval(values)
+        check_gpu_memory()
         got = [float(v) for v in values.tolist()]
         want = record["top8_logits"]
         d = [g - w for g, w in zip(got, want, strict=True)]
@@ -234,6 +309,7 @@ def replay(model, prompt: list[int], records: list[dict]) -> list[dict]:
                 "centered": max(abs(x - mean) for x in d),
                 "margin": abs((got[0] - got[1]) - (want[0] - want[1])),
                 "max_abs": max(abs(x) for x in d),
+                "logits": got,
             }
         )
         if step + 1 < len(records):
@@ -242,24 +318,60 @@ def replay(model, prompt: list[int], records: list[dict]) -> list[dict]:
     return out
 
 
-def reference(model_dir: Path, steps: int) -> None:
+def arms(model, case: dict) -> list[dict]:
+    kernel = qwen3_5.gated_delta_update
+    out = []
+    try:
+        for use_kernel in (True, False):
+            qwen3_5.gated_delta_update = lambda *args, use=use_kernel, **kwargs: kernel(
+                *args, **{**kwargs, "use_kernel": use}
+            )
+            for chunk in PREFILL_CHUNKS:
+                if use_kernel and chunk is None:
+                    continue  # the configuration that produced ``cases``
+                errors = replay(model, case["prompt_ids"], case["steps"], chunk)
+                logits = [e.pop("logits") for e in errors]
+                seen = [arm["_logits"] for arm in out]
+                seen.append([step["top8_logits"] for step in case["steps"]])
+                out.append(
+                    {
+                        "gdn": "kernel" if use_kernel else "ops",
+                        "prefill_chunk": chunk,
+                        "duplicate": logits in seen,
+                        "steps": errors,
+                        "_logits": logits,
+                    }
+                )
+    finally:
+        qwen3_5.gated_delta_update = kernel
+    for arm in out:
+        arm["top8_logits"] = arm.pop("_logits")
+    return out
+
+
+def reference(model_dir: Path, steps: int, prompts: list[str]) -> None:
     model, tokenizer = load(str(model_dir))
+    check_gpu_memory()
     cases = []
-    for user in PROMPTS:
+    for user in prompts:
         prompt = tokenizer.encode(chat_text(user), add_special_tokens=False)
         cases.append(
             {"user": user, "prompt_ids": prompt, "steps": greedy(model, prompt, steps)}
         )
-    kernel = qwen3_5.gated_delta_update
-    qwen3_5.gated_delta_update = lambda *args, **kwargs: kernel(
-        *args, **{**kwargs, "use_kernel": False}
-    )
-    try:
-        for case in cases:
-            case["aa"] = replay(model, case["prompt_ids"], case["steps"])
-    finally:
-        qwen3_5.gated_delta_update = kernel
+    for case in cases:
+        case["aa_arms"] = arms(model, case)
+        distinct = [arm["steps"] for arm in case["aa_arms"] if not arm["duplicate"]]
+        keys = ("centered", "margin", "max_abs")
+        case["aa"] = [
+            {
+                key: max((arm[step][key] for arm in distinct), default=0.0)
+                for key in keys
+            }
+            for step in range(steps)
+        ]
     weights = sorted(model_dir.glob("*.safetensors"))
+    component_digests = components(model)
+    memory = check_gpu_memory()
     print(
         json.dumps(
             {
@@ -268,7 +380,16 @@ def reference(model_dir: Path, steps: int) -> None:
                 "mlx_lm": importlib.metadata.version("mlx-lm"),
                 "config_sha256": file_sha256(model_dir / "config.json"),
                 "weights_sha256": {path.name: file_sha256(path) for path in weights},
-                "components": components(model),
+                "components": component_digests,
+                "qualification": {
+                    "bar": "v2",
+                    "steps": steps,
+                    "min_distinct_arms": 8,
+                    "prefill_chunks": PREFILL_CHUNKS,
+                    "prompts": "heldout" if prompts == HELDOUT_PROMPTS else "dev",
+                    "abort_gpu_bytes": GPU_CAP_BYTES,
+                    "memory": memory,
+                },
                 "cases": cases,
             },
             indent=1,
@@ -286,11 +407,19 @@ def main() -> None:
     ref = commands.add_parser("reference")
     ref.add_argument("--model", type=Path, required=True)
     ref.add_argument("--steps", type=int, default=32)
+    ref.add_argument("--prompts", choices=("dev", "heldout"), default="dev")
+    ref.add_argument("--abort-gpu-gib", type=float, required=True)
     args = parser.parse_args()
     if args.command == "truncate":
         truncate(args.source, args.output, args.layers)
     else:
-        reference(args.model, args.steps)
+        if not math.isfinite(args.abort_gpu_gib) or args.abort_gpu_gib <= 0:
+            parser.error("--abort-gpu-gib must be finite and positive")
+        global GPU_CAP_BYTES
+        GPU_CAP_BYTES = int(args.abort_gpu_gib * 1024**3)
+        mx.reset_peak_memory()
+        prompts = HELDOUT_PROMPTS if args.prompts == "heldout" else PROMPTS
+        reference(args.model, args.steps, prompts)
 
 
 if __name__ == "__main__":

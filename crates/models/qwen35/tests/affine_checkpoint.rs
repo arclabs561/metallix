@@ -8,12 +8,15 @@
 //! requires quantized modules to match mlx-lm bit for bit, but the linear
 //! attention follows Transformers' op order, so logits are not bitwise
 //! equal: the argmax must agree wherever mlx-lm's top two logits are at
-//! least `TIE_GAP` apart, and the logit error on mlx-lm's top 8 must stay
-//! within `FLOOR_FACTOR` times the reference's `aa` floor: how far mlx-lm
-//! moves from itself when its gated-delta recurrence runs as ops instead of
-//! its Metal kernel. Two errors are bounded: the centered error
-//! `max |d - mean(d)|` (a common shift of every logit changes no
-//! probability) and the error of the top-1 minus top-2 margin.
+//! least `TIE_GAP` apart, and at every step the logit error on mlx-lm's top
+//! 8 must stay within `FLOOR_FACTOR` times the reference's `aa` floor for that
+//! step: the largest distance from mlx-lm of its own other configurations
+//! (gated-delta kernel or ops, prompt prefilled whole or in chunks). A single
+//! such configuration is not enough: rounding differences flip near-tied
+//! expert choices, which amplifies them unevenly from step to step. Two
+//! errors are bounded: the centered error `max |d - mean(d)|` (a common
+//! shift of every logit changes no probability) and the error of the top-1
+//! minus top-2 margin.
 
 #![cfg(feature = "metal")]
 
@@ -26,14 +29,35 @@ use serde_json::Value;
 /// counted as a near-tie rather than a failure.
 const TIE_GAP: f32 = 0.5;
 
-/// How far above mlx-lm's own kernel-versus-ops difference the native
+/// How far above mlx-lm's own spread across configurations the native
 /// errors may go.
 const FLOOR_FACTOR: f64 = 1.5;
 
-/// The bound never drops below one BF16 step at the logit scale: logits up
-/// to 64 in magnitude are spaced 0.25 apart in BF16, so a floor of 0 (both
-/// mlx-lm paths agreeing bit for bit) still admits one rounding step.
-const MIN_BOUND: f64 = 0.25;
+/// Fewer distinct configurations than this would make the floor a sample too
+/// small to bound the spread.
+const MIN_ARMS: usize = 8;
+
+/// The spacing of BF16 values at `x`'s magnitude: logits are BF16 on both
+/// sides, so where every mlx-lm configuration agrees bit for bit (a floor of
+/// 0) one rounding step at the step's largest logit is still admitted.
+fn bf16_step(x: f64) -> f64 {
+    // BF16 keeps 8 significant bits, so values in [2^e, 2^(e+1)) are
+    // 2^(e-7) apart.
+    assert!(x.is_finite(), "nonfinite reference logit");
+    (x.abs().log2().floor() - 7.0).max(-133.0).exp2()
+}
+
+/// The bound on one error at one step, given that step's largest mlx-lm
+/// logit, and which term set it.
+fn bound(floor: f64, top_logit: f64) -> (f64, &'static str) {
+    let scaled = FLOOR_FACTOR * floor;
+    let step = bf16_step(top_logit);
+    if scaled >= step {
+        (scaled, "1.5 x floor")
+    } else {
+        (step, "BF16 step")
+    }
+}
 
 /// Centered error, margin error and max |d| of `got` against `want` on the
 /// same ids, `want` sorted descending.
@@ -74,6 +98,54 @@ fn argmax(logits: &[f32]) -> usize {
         .0
 }
 
+/// A step error over its bound: (case, step, error name, value, bound).
+type Over = (usize, usize, &'static str, f64, f64);
+
+/// Checks one step's centered and margin errors against their bounds,
+/// pushing any over its bound to `over`. Returns how many are within bound
+/// only because of the BF16-step minimum.
+fn check_step(
+    (case_index, step): (usize, usize),
+    ours: (f64, f64, f64),
+    floor: [f64; 3],
+    top_logit: f64,
+    over: &mut Vec<Over>,
+) -> usize {
+    let mut by_step_only = 0;
+    for (i, (name, value)) in [("centered", ours.0), ("margin", ours.1)]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(value.is_finite() && floor[i].is_finite() && floor[i] >= 0.0);
+        let (limit, term) = bound(floor[i], top_logit);
+        if value > FLOOR_FACTOR * floor[i] && value <= limit {
+            by_step_only += 1;
+        }
+        if value > limit {
+            eprintln!(
+                "case {case_index} step {step}: {name} {value:.4} > {limit:.4} (bound set by {term})"
+            );
+            over.push((case_index, step, name, value, limit));
+        }
+    }
+    by_step_only
+}
+
+/// Refuses a case whose floor comes from fewer than `MIN_ARMS` distinct
+/// mlx-lm configurations.
+fn check_arms(case_index: usize, case: &Value) {
+    let arms = case["aa_arms"]
+        .as_array()
+        .expect("aa_arms: regenerate the reference")
+        .iter()
+        .filter(|arm| arm["duplicate"] == Value::Bool(false))
+        .count();
+    assert!(
+        arms >= MIN_ARMS,
+        "case {case_index}: {arms} distinct configurations in the floor, need {MIN_ARMS}"
+    );
+}
+
 #[test]
 fn greedy_steps_agree_with_mlx_lm() {
     let (Some(model), Some(reference)) = (
@@ -85,10 +157,23 @@ fn greedy_steps_agree_with_mlx_lm() {
     };
     let reference: Value =
         serde_json::from_str(&fs::read_to_string(reference).expect("reference")).expect("JSON");
+    assert_eq!(reference["mlx"], "0.32.3", "regenerate the reference");
+    assert_eq!(reference["qualification"]["bar"], "v2");
+    assert_eq!(reference["qualification"]["prompts"], "heldout");
+    let cases = reference["cases"].as_array().expect("cases");
+    assert_eq!(cases.len(), 4, "four held-out cases required");
+    for (i, case) in cases.iter().enumerate() {
+        check_arms(i, case);
+        assert_eq!(case["steps"].as_array().expect("steps").len(), 32);
+        assert_eq!(case["aa"].as_array().expect("floor").len(), 32);
+    }
     let weights = Qwen35Weights::load(&model, Qwen35Precision::Checkpoint).expect("load");
     let (mut steps, mut ties, mut overlap) = (0_usize, 0_usize, 0_usize);
     // (centered, margin, max |d|): ours and mlx-lm's own floor.
     let (mut ours_max, mut floor_max) = ([0.0_f64; 3], [0.0_f64; 3]);
+    let mut over: Vec<Over> = Vec::new();
+    // Errors within their bound only because of the BF16-step minimum.
+    let mut by_step_only = 0_usize;
     for (case_index, case) in reference["cases"]
         .as_array()
         .expect("cases")
@@ -98,6 +183,7 @@ fn greedy_steps_agree_with_mlx_lm() {
         let floor = case["aa"]
             .as_array()
             .expect("aa floor: regenerate the reference");
+        check_arms(case_index, case);
         let mut executor = weights.executor();
         let mut logits = executor
             .prefill_last_logits(&ids(&case["prompt_ids"]))
@@ -121,6 +207,7 @@ fn greedy_steps_agree_with_mlx_lm() {
                 "case {case_index} step {step}: centered {:.4} (floor {:.4}), margin {:.4} (floor {:.4}), max |d| {:.4} (floor {:.4})",
                 ours.0, aa[0], ours.1, aa[1], ours.2, aa[2]
             );
+            by_step_only += check_step((case_index, step), ours, aa, want[0], &mut over);
             let mut our_top: Vec<usize> = (0..logits.len()).collect();
             our_top.select_nth_unstable_by(7, |a, b| logits[*b].total_cmp(&logits[*a]));
             overlap += top
@@ -153,23 +240,35 @@ fn greedy_steps_agree_with_mlx_lm() {
         ours_max[2],
         floor_max[2],
     );
+    eprintln!("errors within bound only by the BF16-step minimum: {by_step_only}");
     assert!(steps > 0);
-    for (i, name) in ["centered", "margin"].into_iter().enumerate() {
-        let scaled = FLOOR_FACTOR * floor_max[i];
-        let (bound, term) = if scaled >= MIN_BOUND {
-            (scaled, "1.5 x floor")
-        } else {
-            (MIN_BOUND, "BF16 step")
-        };
-        eprintln!(
-            "{name} error {:.4} <= {bound:.4}? bound set by {term}",
-            ours_max[i]
-        );
-        assert!(
-            ours_max[i] <= bound,
-            "{name} error {} exceeds {bound} ({term}; floor {})",
-            ours_max[i],
-            floor_max[i]
-        );
-    }
+    assert!(
+        over.is_empty(),
+        "{} step errors over their per-step bound (case, step, error, value, bound): {over:?}",
+        over.len()
+    );
+}
+
+#[test]
+fn per_step_bound_counts_floor_only_passes_and_rejects_excess() {
+    let mut over = Vec::new();
+    // At top1=8 BF16 spacing is 1/16, rather than the retired flat 1/4.
+    assert_eq!(bf16_step(8.0), 0.0625);
+    assert_eq!(
+        check_step((0, 0), (0.0625, 0.0, 0.0), [0.0; 3], 8.0, &mut over),
+        1
+    );
+    assert!(over.is_empty());
+    assert_eq!(
+        check_step((0, 1), (0.125, 0.0, 0.0), [0.0; 3], 8.0, &mut over),
+        0
+    );
+    assert_eq!(over.len(), 1);
+    assert_eq!(over[0].1, 1);
+    // A different step's larger A/A floor must not mask that failure.
+    assert_eq!(
+        check_step((0, 2), (0.125, 0.0, 0.0), [0.125; 3], 8.0, &mut over),
+        0
+    );
+    assert_eq!(over.len(), 1);
 }
