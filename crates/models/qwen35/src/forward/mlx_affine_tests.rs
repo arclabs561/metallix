@@ -453,7 +453,7 @@ fn logical_affine_gather_preserves_selected_dot_products() {
             .iter()
             .map(|&id| {
                 array
-                    .take_axis_device(&Array::from_slice(&[id], &[1]), 0, &gpu)
+                    .take_axis_device(Array::from_slice(&[id], &[1]), 0, &gpu)
                     .expect("expert")
             })
             .collect();
