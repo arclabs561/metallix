@@ -452,6 +452,31 @@ were rejected.
 This qualifies Torch CPU arithmetic order, not mathematical accuracy or GPU
 parity. A Metal reduction must be checked against this reference separately.
 
+## Sparse attention execution order
+
+The native model adapter assigns sparse-attention execution blocks by selected
+key order, independently of cache storage slots. For each query it removes only
+the `-1` mask sentinel, preserves selected key order and duplicates, and pads
+the row tail. Invalid indices still fail validation; all-masked rows retain at
+least one masked slot and produce zero output. KV buffers remain in their
+original storage layout.
+
+This is a numerical policy: the BF16 sparse primitive rounds probabilities
+within 64-slot online-normalization blocks. Moving a valid key across a block
+boundary can change the rounded numerator even with identical queries and
+ordered KV values. Unused decode-ring slots must therefore not partition
+selected window and compressed keys differently from prefill. The adapter's
+packing keeps block boundaries tied to valid-key ordinal; the denominator-only
+attention sink and the primitive's arithmetic remain unchanged.
+
+The low-level primitive retains the pinned source's physical-slot order and
+its independent reference tests. Adapter packing can intentionally differ from
+source-shaped BF16 results when removing masks changes the grouping of selected
+keys into 64-slot blocks. Schedule
+equivalence is a separate contract from upstream bitwise parity. Neither this
+policy nor small operator regressions establish whole-model generation quality,
+Metal parity, or long-context state equivalence.
+
 ## Real layer-zero attention
 
 Native window attention now runs on all twelve real layer-zero attention

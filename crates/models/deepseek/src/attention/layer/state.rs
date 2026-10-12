@@ -913,7 +913,8 @@ mod sparse_execution_tests {
         // native layer head width: q=[1,0], KV=[[0,1],[1,0]], sink=-100.
         // The two-key numerator uses BF16(exp(-1)), giving [3f3b,3e89].
         // Putting the second key after mask padding at slot128 instead would
-        // rescale an earlier FP32 numerator, incorrectly giving [3f3b,3e8a].
+        // rescale an earlier FP32 numerator, giving [3f3b,3e8a] instead of
+        // the native packing policy's result.
         let mut query = vec![0; 32];
         query[0] = 0x3f80;
         let mut shared_kv = vec![0; (window_keys + 1) * 32];
