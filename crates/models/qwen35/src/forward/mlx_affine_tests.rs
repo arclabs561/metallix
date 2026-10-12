@@ -478,3 +478,27 @@ fn logical_affine_gather_preserves_selected_dot_products() {
         "logical stack preserves unsorted arithmetic"
     );
 }
+
+#[test]
+fn affine_convolution_rounds_after_accumulation_and_keeps_window() {
+    // Frozen with mlx==0.32.3: nn.silu(mx.conv1d(x, ones([2,3,1]), groups=2))
+    // for x=[[[256,-256],[1,-1],[-256,256]]] in BF16. The two exact sums are
+    // +1 and -1; rounding each tap addition to BF16 loses those unit terms.
+    let window = Array::from_slice(&[256.0_f32, -256.0, 1.0, -1.0], &[1, 2, 2])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let input = Array::from_slice(&[-256.0_f32, 256.0], &[1, 1, 2])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let kernel = Array::from_slice(&[1.0_f32; 6], &[3, 2])
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+    let (output, next) = super::short_convolution(&window, &input, &kernel, Numerics::MlxLm)
+        .expect("affine convolution");
+    let output = output.as_type::<f32>().unwrap().contiguous().unwrap();
+    let next = next.as_type::<f32>().unwrap().contiguous().unwrap();
+    mlx_rs::transforms::eval([&output, &next]).unwrap();
+    assert_eq!(output.as_slice::<f32>(), &[0.730_468_75, -0.269_531_25]);
+    assert_eq!(next.shape(), &[1, 2, 2]);
+    assert_eq!(next.as_slice::<f32>(), &[1.0, -1.0, -256.0, 256.0]);
+}

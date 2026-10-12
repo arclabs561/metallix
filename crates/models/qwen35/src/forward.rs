@@ -1502,6 +1502,7 @@ fn linear_recurrence(
         window,
         &inputs.qkv,
         weights.tensor(&format!("{base}.conv1d.weight"))?,
+        weights.numerics,
     )?;
 
     let parts = ops::split_sections_device(
@@ -1571,11 +1572,27 @@ fn short_convolution(
     window: &Array,
     input: &Array,
     kernel: &Array,
+    numerics: Numerics,
 ) -> Result<(Array, Array), Qwen35Error> {
     let gpu = StreamOrDevice::gpu();
     let seq = input.shape()[1];
     let history = window.shape()[1];
     let padded = ops::concatenate_axis_device(&[window, input], 1, &gpu)?;
+    if numerics == Numerics::MlxLm {
+        // mlx-lm Conv1d stores [channels, K, 1] and accumulates each depthwise
+        // convolution before BF16 rounding. Explicit BF16 tap additions round
+        // at each tap and do not reproduce that checkpoint's reference.
+        let channels = input.shape()[2];
+        let filter = kernel
+            .transpose_device(&gpu)?
+            .reshape_device(&[channels, history + 1, 1], &gpu)?;
+        let convolved = ops::conv1d_device(&padded, &filter, 1, 0, 1, channels, &gpu)?;
+        let total = history + seq;
+        return Ok((
+            mlx_silu(&convolved)?,
+            padded.index((.., total - history..total, ..)),
+        ));
+    }
     let mut convolved = padded
         .index((.., 0..seq, ..))
         .multiply_device(kernel.index(0..1), &gpu)?;
@@ -1976,6 +1993,26 @@ thread_local! {
     /// mlx-lm's `swiglu`, compiled once per thread (MLX keeps compiled
     /// functions per thread).
     static FUSED_SWIGLU: RefCell<Option<CompiledGraph>> = const { RefCell::new(None) };
+    static FUSED_SILU: RefCell<Option<CompiledGraph>> = const { RefCell::new(None) };
+}
+
+/// mlx.nn.silu uses one compiled x * sigmoid(x) graph, preserving its
+/// checkpoint-dtype rounding rather than materializing an intermediate sigmoid.
+fn mlx_silu(input: &Array) -> Result<Array, Qwen35Error> {
+    FUSED_SILU.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let compiled = cell.get_or_insert_with(|| {
+            Box::new(mlx_rs::transforms::compile::compile(
+                |inputs: &[Array]| {
+                    let x = &inputs[0];
+                    Ok(vec![x.multiply(ops::sigmoid(x)?)?])
+                },
+                true,
+            ))
+        });
+        let mut outputs = compiled(std::slice::from_ref(input))?;
+        outputs.pop().ok_or(Qwen35Error::ShapeOverflow)
+    })
 }
 
 /// `silu(gate) * up`. mlx-lm computes it as one compiled, fused kernel
