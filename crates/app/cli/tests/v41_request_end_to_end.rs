@@ -76,7 +76,7 @@ fn argmax(values: &[f32]) -> usize {
 #[test]
 #[ignore = "fetches missing experts and Engram rows from huggingface.co; needs .agents/receipts data and ~10 GB RAM"]
 fn one_real_request_step_matches_the_source_capture() {
-    run_capture("parity-greedy3.json", "capture-parity3");
+    run_capture("parity-greedy3.json", "capture-parity3", Check::Capture);
 }
 
 /// The 17-token capture-shell2 prompt, prefilled in steps of at most the
@@ -84,7 +84,31 @@ fn one_real_request_step_matches_the_source_capture() {
 #[test]
 #[ignore = "fetches missing experts and Engram rows from huggingface.co; needs .agents/receipts data and ~10 GB RAM"]
 fn real_shell_prompt_matches_the_source_greedy_token() {
-    run_capture("parity-shell.json", "capture-shell2");
+    run_capture("parity-shell.json", "capture-shell2", Check::Capture);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Check {
+    Capture,
+    StateEquivalence,
+}
+
+#[test]
+#[ignore = "needs METALLIX_V41_STATE_RECEIPTS with an owned cache copy and an external footprint/time watchdog; no network"]
+fn cached_shell_prefill_and_decode_have_identical_final_state() {
+    if std::env::var_os("METALLIX_V41_STATE_RECEIPTS").is_none() {
+        eprintln!("skipping: METALLIX_V41_STATE_RECEIPTS is not set");
+        return;
+    }
+    assert!(
+        matches!(backend(), V41Backend::Scalar),
+        "state gate is scalar only"
+    );
+    run_capture(
+        "parity-shell.json",
+        "capture-shell2",
+        Check::StateEquivalence,
+    );
 }
 
 /// `METALLIX_V41_BACKEND=metal` selects the Metal Engram WKV and final head
@@ -157,8 +181,40 @@ impl RangeHost for &Host {
     clippy::too_many_lines,
     reason = "one end-to-end request keeps every compared stage visible"
 )]
-fn run_capture(run_file: &str, capture: &str) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts");
+fn run_capture(run_file: &str, capture: &str, check: Check) {
+    let root = if check == Check::StateEquivalence {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("METALLIX_V41_STATE_RECEIPTS")
+                .expect("explicit owned receipts projection is required"),
+        );
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("worktree repository");
+        let projection_base = repository.join(".agents/projections/deepseek-state");
+        assert_no_symlink_components(&projection_base);
+        assert_no_symlink_components(&root);
+        let root = root.canonicalize().expect("existing receipts projection");
+        assert!(
+            root.starts_with(projection_base.canonicalize().unwrap()),
+            "receipts must remain under this worktree's .agents/projections/deepseek-state"
+        );
+        // This marker records intent only. Private-copy provenance and a tested
+        // external resource watchdog remain separate execution prerequisites.
+        let marker = root.join("state-equivalence-owned-cache");
+        assert_no_symlink_components(&marker);
+        assert!(marker.is_file(), "owned projection marker required");
+        let weights = root.join("route-trace/weights");
+        assert_no_symlink_components(&weights);
+        assert!(
+            !weights.join(".rows").exists(),
+            "legacy migration is outside this gate"
+        );
+        assert_unlinked_files(&weights);
+        root
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts")
+    };
     let trace = root.join("route-trace");
     let registry: serde_json::Value =
         serde_json::from_str(include_str!("../../../../config/artifacts/deepseek.json"))
@@ -174,7 +230,11 @@ fn run_capture(run_file: &str, capture: &str) {
         &std::fs::read_to_string(trace.join("inference-config.json")).expect("config"),
     )
     .expect("pinned inference config");
-    let host = Host::from_env();
+    let mut host = Host::from_env();
+    if check == Check::StateEquivalence {
+        host.no_experts = true;
+        host.no_rows = true;
+    }
     let source = FetchingSource::new(
         trace.join("weights"),
         &trace,
@@ -332,4 +392,93 @@ fn run_capture(run_file: &str, capture: &str) {
         "the capture's argmax is the recorded token"
     );
     assert_eq!(native_top, source_top, "next-token argmax");
+    if check == Check::StateEquivalence {
+        assert_eq!(ids.len(), 17, "fixed cached shell workload");
+        let expected_cursor = session.next_start();
+        let expected_logits: Vec<u32> = logits.iter().map(|value| value.to_bits()).collect();
+        let width = output.residual().len() / ids.len();
+        let expected_residual = output.residual()[output.residual().len() - width..].to_vec();
+        drop(output);
+        drop(session);
+        // Reuse the one loaded weight set. Only the first prefix is batched;
+        // every subsequent append is one token, as the current API requires.
+        let sources = StepSources {
+            experts: &expert_refs,
+            engram_rows: &row_refs,
+            embedding_rows: Some(&embedding),
+        };
+        let mut split = RequestSession::new(&model).expect("split request session");
+        let mut actual = split
+            .step_with_sources(&ids[..3], sources)
+            .expect("initial prefix");
+        for id in &ids[3..] {
+            actual = split
+                .step_with_sources(std::slice::from_ref(id), sources)
+                .expect("one-token append");
+        }
+        assert_eq!(split.next_start(), expected_cursor, "request cursor");
+        assert_eq!(actual.residual(), expected_residual, "last residual");
+        let actual_logits: Vec<u32> = actual
+            .heads()
+            .last()
+            .unwrap()
+            .logits()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(actual_logits, expected_logits, "final logit bits");
+        assert_eq!(host.fetches.load(Ordering::Relaxed), 0, "no HTTP requests");
+        assert_eq!(host.bytes.load(Ordering::Relaxed), 0, "no fetched bytes");
+        eprintln!(
+            "scalar state equivalence: 17 tokens, prefix 3 then 14 single-token appends, {:.1} s including baseline",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+// Reject lexical traversal and symlinks before canonicalization can hide them.
+fn assert_no_symlink_components(path: &Path) {
+    use std::path::Component;
+    assert!(path.is_absolute(), "projection paths must be absolute");
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        assert!(
+            matches!(component, Component::RootDir | Component::Normal(_)),
+            "projection paths must not contain traversal components"
+        );
+        prefix.push(component.as_os_str());
+        assert!(
+            !std::fs::symlink_metadata(&prefix)
+                .expect("existing projection path component")
+                .file_type()
+                .is_symlink(),
+            "projection path contains a symlink"
+        );
+    }
+}
+
+// Cache recovery may rewrite row packs. These checks reject shared links;
+// they do not establish private-copy provenance or prevent concurrent mutation.
+#[cfg(unix)]
+fn assert_unlinked_files(root: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "cache projection contains a symlink"
+        );
+        if metadata.is_dir() {
+            assert_unlinked_files(&path);
+        } else {
+            assert!(metadata.is_file());
+            assert_eq!(metadata.nlink(), 1, "cache projection contains a hard link");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn assert_unlinked_files(_root: &Path) {
+    panic!("state gate requires Unix file link-count checks");
 }
