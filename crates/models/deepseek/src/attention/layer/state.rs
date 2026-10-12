@@ -982,6 +982,31 @@ mod sparse_execution_tests {
     }
 
     #[test]
+    fn compact_execution_packs_mixed_rows_across_block_boundaries() {
+        for valid in [63, 64, 65, 127, 128, 129] {
+            let expected: Vec<i32> = (0..valid).rev().collect();
+            let mut storage = Vec::new();
+            for keys in [&expected[..], &expected[..expected.len() - 1]] {
+                let start = storage.len();
+                for &key in keys {
+                    storage.extend([-1, key, -1]);
+                }
+                storage.resize(start + expected.len() * 3, -1);
+            }
+            let original = storage.clone();
+            let (execution, slots) = compact_sparse_indices(&storage, 2).unwrap();
+            assert_eq!(slots.get(), expected.len());
+            assert_eq!(&execution[..expected.len()], expected);
+            assert_eq!(
+                &execution[expected.len()..execution.len() - 1],
+                &expected[..expected.len() - 1]
+            );
+            assert_eq!(execution.last(), Some(&-1));
+            assert_eq!(storage, original);
+        }
+    }
+
+    #[test]
     fn compact_execution_keeps_invalid_indices_visible_and_bounds_empty_geometry() {
         for index in [-2, 129] {
             assert!(matches!(
@@ -999,6 +1024,10 @@ mod sparse_execution_tests {
         ));
         assert!(matches!(
             compact_sparse_indices(&[-1], MAX_LAYER_ATTENTION_ELEMENTS + 1),
+            Err(LayerAttentionError::NoSparseSlots)
+        ));
+        assert!(matches!(
+            compact_sparse_indices(&[0, -1, 1], 2),
             Err(LayerAttentionError::NoSparseSlots)
         ));
     }
