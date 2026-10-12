@@ -1,4 +1,6 @@
 [workspace]
+# The application defaults to mx; use --workspace for all crate targets.
+default-members = ["crates/app/cli"]
 members = [
     "crates/core/audio",
     "crates/core/blockfloat",
@@ -16,7 +18,7 @@ members = [
     "crates/models/qwen",
     "crates/models/qwen3-asr",
     "crates/models/qwen35",
-    "crates/serve/server",
+    "crates/app/cli",
 ]
 # Third-party code patched below; not held to this workspace's lints.
 exclude = ["vendor/mlx-sys"]

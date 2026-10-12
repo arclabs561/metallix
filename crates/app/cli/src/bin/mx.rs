@@ -1,6 +1,6 @@
 //! The `mx` binary. Every subcommand, `mx serve` included, runs through
-//! [`server::run`].
+//! [`metallix_cli::run`].
 
 fn main() -> std::process::ExitCode {
-    server::run()
+    metallix_cli::run()
 }

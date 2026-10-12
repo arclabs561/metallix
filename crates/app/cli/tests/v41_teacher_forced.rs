@@ -1,6 +1,6 @@
 //! Teacher-forced real DeepSeek-V4.1 layers with missing experts fetched over the network.
 //!
-//! Opt-in: `cargo test -p server --release --test v41_teacher_forced -- --ignored --nocapture`.
+//! Opt-in: `cargo test -p metallix-cli --release --test v41_teacher_forced -- --ignored --nocapture`.
 //! Needs the local `.agents/receipts` route-trace metadata and capture-parity3. Routed
 //! experts absent from the local weights store are fetched from the pinned Hub revision
 //! into that store, inside the default envelope (64 GiB stored, 150 GiB free).
@@ -11,7 +11,7 @@ use deepseek::{
     checkpoint::range_cache::{V41CachedRoutedExperts, V41RangeCache},
     reduced::checkpoint_model::{V41CheckpointWeights, V41InferenceConfig, V41TeacherState},
 };
-use server::range_fetch::{CurlHost, Envelope, FetchingSource};
+use metallix_cli::range_fetch::{CurlHost, Envelope, FetchingSource};
 
 const TOKENS: usize = 3;
 

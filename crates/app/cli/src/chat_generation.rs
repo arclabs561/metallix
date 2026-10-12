@@ -872,7 +872,7 @@ pub(crate) struct EngineSeed {
 
 /// The non-generative result of a single independently-prefilled chat prompt.
 ///
-/// The logits are deliberately exposed only inside the server crate: callers
+/// The logits are deliberately exposed only inside the CLI crate: callers
 /// must select a small, validated answer-token set rather than serialize a
 /// complete vocabulary distribution.
 pub(crate) struct ChatPrefill {

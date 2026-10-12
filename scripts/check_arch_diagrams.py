@@ -7,7 +7,7 @@ from the crate's own config parsing and names the crate in its `crate` field;
 that field is how this check knows which crates are drawn.
 
 Adapters the server has no diagram for yet are listed, each with a reason,
-in UNDRAWN in crates/serve/server/src/adapter/tests.rs; this check prints that
+in UNDRAWN in crates/app/cli/src/adapter/tests.rs; this check prints that
 list on every run so an addition shows in every gate log.
 
 Rendering needs typst 0.15.1. Without it the SVG comparison is skipped with a
@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TYPST_VERSION = "0.15.1"
 RENDER_TIMEOUT_SECONDS = 120
 
-ADAPTER_TESTS = "crates/serve/server/src/adapter/tests.rs"
+ADAPTER_TESTS = "crates/app/cli/src/adapter/tests.rs"
 UNDRAWN_LIST = re.compile(
     r"^const UNDRAWN: [^=]*= \[(.*?)\];", re.MULTILINE | re.DOTALL
 )

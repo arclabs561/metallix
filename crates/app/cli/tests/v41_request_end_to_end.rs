@@ -1,6 +1,6 @@
 //! Real DeepSeek-V4.1 prompts, end to end, against the source captures.
 //!
-//! Opt-in: `cargo test -p server --release --test v41_request_end_to_end -- --ignored --nocapture`.
+//! Opt-in: `cargo test -p metallix-cli --release --test v41_request_end_to_end -- --ignored --nocapture`.
 //! Builds the 40-layer `RequestModel` from checkpoint tensors and prefills a
 //! captured prompt (3 tokens, and the 17-token shell prompt) through
 //! `RequestSession::prefill_with_sources`. Routed
@@ -37,7 +37,7 @@ use deepseek::{
         checkpoint_model::{V41Backend, V41CheckpointWeights, V41Engrams, V41InferenceConfig},
     },
 };
-use server::range_fetch::{CurlHost, Envelope, FetchingSource, RangeHost};
+use metallix_cli::range_fetch::{CurlHost, Envelope, FetchingSource, RangeHost};
 
 const ENGRAM_WIDTH: usize = 256;
 

@@ -49,7 +49,7 @@ string is a separate policy: either model it in the grammar or return an
 explicit `StoppedBeforeComplete` result, never label a truncated byte stream
 as schema-valid.  Respect the model's EOS ID set rather than assuming the
 single `eos_token_id` currently read by
-[`qwen_forward.rs`](../../crates/serve/server/src/qwen_forward.rs); different
+[`qwen_forward.rs`](../../crates/app/cli/src/qwen_forward.rs); different
 tokenizers and chat modes can have multiple terminal IDs.
 
 ## Two credible backends
@@ -158,7 +158,7 @@ two implementations is not a claim of support for every JSON Schema keyword.
 Format annotations are not a universal semantic-validation guarantee.
 
 ```sh
-cargo build -p server --release --all-features
+cargo build -p metallix-cli --release --all-features
 target/release/mx gen --model /path/to/Qwen3-0.6B \
   --input-ids 9707,11,1879 --max-tokens 64 --verify-cache \
   --json-schema fixtures/constraints/record.json

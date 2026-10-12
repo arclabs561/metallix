@@ -51,7 +51,7 @@ cache-fork/reindex parity remains a prerequisite for model-backed particles.
 
 ## Model-backed composition check
 
-The test-only `crates/serve/server/src/qwen_particle_tests.rs` composes real Qwen
+The test-only `crates/app/cli/src/qwen_particle_tests.rs` composes real Qwen
 proposals, production `ParticleSet` resampling, and adapter-owned KV forks.
 The local Qwen3-0.6B checkpoint passed with three particles, two transitions,
 one resampling boundary, and fixed entropy. Its declared target is the deployed
@@ -67,7 +67,7 @@ which compose to 3/4 while retaining absorbing EOS. Neither test establishes
 exact conditioning, calibrated confidence, throughput, or a serving API.
 
 ```sh
-METALLIX_QWEN_MODEL=/path/to/local/Qwen3 RUST_TEST_THREADS=1 cargo test -p server --all-features checkpoint_qwen_smc_resampling_composes_weights_and_replays_cache_ancestry -- --ignored --nocapture
+METALLIX_QWEN_MODEL=/path/to/local/Qwen3 RUST_TEST_THREADS=1 cargo test -p metallix-cli --all-features checkpoint_qwen_smc_resampling_composes_weights_and_replays_cache_ancestry -- --ignored --nocapture
 ```
 
 A second ignored checkpoint test,
@@ -158,7 +158,7 @@ rollback after a rejected draw. A separate bit-basis test checks all 64 source
 bits in the 53-bit uniform conversion, including discarded low bits and both
 extrema. These check policy consumption and conversion, not the ChaCha
 algorithm itself, statistical convergence, or cross-device/model parity.
-Run `cargo test -p server --all-features qwen_forward::tests` for this join.
+Run `cargo test -p metallix-cli --all-features qwen_forward::tests` for this join.
 Run `cargo test -p engine independent_f64_oracle` for the new toy checks.
 The engine tests now cover grammar masks analytically, accepting EOS without
 special-token bytes, and rejected draws/output limits without committed state

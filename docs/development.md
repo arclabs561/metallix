@@ -32,6 +32,21 @@ comparisons. Regenerating the source oracles is a separate, explicit operation
 with pinned Torch and Transformers dependencies; see the
 [Julia contract](research/julia-decision-contract.md).
 
+## Workspace layout
+
+Crates are grouped by dependency tier: `core`, `metal`, `models`, then `app`.
+A crate can depend on its own tier or a lower one; the canonical gate checks
+normal, development, build and target-specific path dependencies.
+
+`crates/app/cli` is the `metallix-cli` package. Its `metallix_cli` library
+shares command dispatch between the `mx` and `metallix` binaries; `mx` is the
+default binary. HTTP serving lives behind `mx serve` alongside the other
+commands. The root Cargo manifest stays a virtual workspace and selects the
+CLI as its default member: `cargo run --all-features -- --help` runs `mx`.
+Bare Cargo operations select this package; use `--workspace` for all crates,
+or the canonical checks above. Explicit selection is
+`cargo run -p metallix-cli --all-features -- --help`.
+
 ## Compiler-aware custom lints
 
 [Dylint](https://github.com/trailofbits/dylint) can load custom Rust lint

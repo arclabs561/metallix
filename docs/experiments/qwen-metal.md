@@ -77,7 +77,7 @@ cache-consistency check, not an independent CPU check at every generated step.
 Reproduce the CPU/Metal full-logit suite after building the release binary:
 
 ```sh
-cargo build -p server --release --features metal
+cargo build -p metallix-cli --release --features metal
 uv run scripts/qwen-parity-suite.py \
   --binary target/release/metallix \
   --model /path/to/Qwen3-0.6B
@@ -88,7 +88,7 @@ uv run scripts/qwen-parity-suite.py \
 For new measurements, build the release executable and use the local harness:
 
 ```sh
-cargo build -p server --release --features metal
+cargo build -p metallix-cli --release --features metal
 mkdir -p artifacts
 uv run scripts/benchmark-qwen.py --model /path/to/Qwen3-0.6B \
   --output artifacts/qwen-benchmark.json
@@ -168,7 +168,7 @@ samples.
 The recorded command shape is:
 
 ```sh
-cargo run -p server --release --features metal -- generate-qwen-metal \
+cargo run -p metallix-cli --release --features metal -- generate-qwen-metal \
   --model /path/to/Qwen3-0.6B \
   --input-ids 785,6722,315,9625,374 \
   --max-tokens 32

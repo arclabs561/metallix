@@ -158,7 +158,7 @@ cargo bench -p deepseek --bench selection
 For repeated Qwen decode, use a new output filename on every run:
 
 ```sh
-cargo build -p server --release --features metal
+cargo build -p metallix-cli --release --features metal
 uv run scripts/benchmark-qwen.py --model /path/to/Qwen3-0.6B \
   --output artifacts/qwen-before.json
 ```
@@ -706,7 +706,7 @@ the filter, falling back to `RUST_LOG`, then `warn`; it takes
 
 ```sh
 METALLIX_LOG=info mx serve --registry models.json
-METALLIX_LOG=warn,server=debug mx decide ...
+METALLIX_LOG=warn,metallix_cli=debug mx decide ...
 ```
 
 Each line names its thread. A thread that owns a model's MLX arrays is
@@ -748,7 +748,7 @@ Child log lines reach the front's stderr prefixed with `[<model-id>]`, so one
 A timeline needs the `timeline` feature:
 
 ```sh
-cargo build --release -p server --features metal,timeline
+cargo build --release -p metallix-cli --features metal,timeline
 METALLIX_LOG=info target/release/mx --trace-out run.json generate-qwen-metal --model "$MODEL" --prompt hi
 ```
 

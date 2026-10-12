@@ -239,7 +239,7 @@ times the FP32 source's own score error, the same gate as the library test:
 
 ```sh
 JULIA_CHECKPOINT_DIR=/abs/CHECKPOINT_DIR JULIA_REAL_REFERENCE=/abs/julia-real.json \
-  cargo test --release -p server --features metal --test julia_decide -- --ignored --nocapture
+  cargo test --release -p metallix-cli --features metal --test julia_decide -- --ignored --nocapture
 ```
 
 Both paths must be absolute because cargo runs tests from the crate directory.

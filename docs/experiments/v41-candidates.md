@@ -51,7 +51,7 @@ It compares every result with CPU execution of the two corresponding expressions
 from the same pinned `Indexer.forward` implementation.
 
 ```sh
-cargo run -p server --release --features metal -- check-v41-indexer-metal
+cargo run -p metallix-cli --release --features metal -- check-v41-indexer-metal
 ```
 
 Five synthetic cases include negative head weights, zero weights, negative dot
@@ -111,7 +111,7 @@ or an in-place cache update. Reproduce its qualification and timing with:
 
 ```sh
 cargo test -p deepseek --features metal rotary
-cargo build -p server --release --features metal
+cargo build -p metallix-cli --release --features metal
 target/release/mx check-v41-rotary-metal --repeats 5
 ```
 

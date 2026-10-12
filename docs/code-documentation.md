@@ -63,7 +63,7 @@ build instead of leaving a stale `crates/...` path. Public docs cannot link
 private items, and the CPU gate documents crates without `metal`, so a link
 from always-built docs to a `metal`-only item breaks there; name both kinds
 in backticks. Markdown under `docs/` is not
-checked, so it names the crate and item ("the server crate's `gpu` module")
+checked, so it names the crate and item ("the CLI crate's `gpu` module")
 and links a source file only when a line number matters.
 
 Then these sections, in this order, each only when it applies:
@@ -155,7 +155,7 @@ bytes").
 ## `unsafe`
 
 The workspace denies `unsafe_code`; a module that needs it allows it at the
-module level and says in its `//!` doc why, as the server crate's `gpu`
+module level and says in its `//!` doc why, as the CLI crate's `gpu`
 module does. Every `unsafe` block gets a `// SAFETY:` comment naming the
 obligation it meets and how, every `unsafe fn` a `# Safety` section.
 

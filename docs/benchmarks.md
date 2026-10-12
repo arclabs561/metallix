@@ -106,7 +106,7 @@ runs close to the memory-bandwidth limit in the fastest engines.
 
 Each engine runs with settings that make the comparison fair to it.
 
-- Metallix: `mx serve` built with `cargo build -p server --release
+- Metallix: `mx serve` built with `cargo build -p metallix-cli --release
   --all-features`. The cache-off arm passes `--prefix-cache-mib 0`.
 - vllm-metal: the same maximum model length; prefix caching set explicitly
   with `--enable-prefix-caching` or `--no-enable-prefix-caching`;
@@ -144,7 +144,7 @@ from one virtual environment each (`vllm-metal`, `mlx-lm`, `mtplx`) under the
 directory given by `--envs`.
 
 ```sh
-cargo build -p server --release --all-features
+cargo build -p metallix-cli --release --all-features
 
 # Download the agent split pinned above.
 curl -LO https://raw.githubusercontent.com/WindChimeRan/SiliconBench/616aa51c450383ee9309d2149d6765f9bd117119/prompts/agent_benchmark_prompts.json

@@ -19,7 +19,7 @@ BF16 bytes to FP32 and compares every finite value, bit-for-bit, with the
 existing MLX loader. The CLI landed at `e0c25f4`:
 
 ```sh
-cargo build -p server --release --features metal
+cargo build -p metallix-cli --release --features metal
 target/release/metallix check-qwen-tensor-metal --model /path/to/Qwen3-0.6B
 target/release/metallix check-qwen-tensor-metal --model /path/to/Qwen3-0.6B \
   --tensor model.layers.0.self_attn.q_proj.weight --max-bytes 4194304

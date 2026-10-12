@@ -54,11 +54,15 @@ records the evidence.
 ## Build
 
 ```sh
-cargo build -p server --release --all-features
+cargo build -p metallix-cli --release --all-features
 export PATH="$PWD/target/release:$PATH"
 ```
 
-This builds `mx` (and the identical `metallix`). Without the `metal` feature
+The root manifest is a virtual workspace. The `metallix-cli` package in
+`crates/app/cli` declares both `mx` and the identical `metallix` binary. It is
+the default workspace member and defaults to `mx`, so
+`cargo run --all-features -- --help` runs `mx`.
+`serve` is one CLI subcommand. Without the `metal` feature
 only `inspect`, `fetch` and the reduced DeepSeek runner are available.
 
 A `metal` build also writes MLX's compiled kernels, `mlx.metallib`, to

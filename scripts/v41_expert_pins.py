@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the routed experts the DeepSeek V4.1 test captures use as a pin file.
 
-The route-trace fetcher (crates/serve/server/src/range_fetch.rs) never evicts an
+The route-trace fetcher (crates/app/cli/src/range_fetch.rs) never evicts an
 expert listed in `<trace>/pinned-experts.json`, so the end-to-end capture
 tests never re-download theirs. Each recorded run's `routes[].ids` holds, per
 layer, one row of selected expert ids per token.

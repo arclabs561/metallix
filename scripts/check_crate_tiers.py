@@ -6,11 +6,11 @@ first:
 - core: no MLX; formats, contracts and host-side arithmetic;
 - metal: MLX or Metal infrastructure shared by models;
 - models: one crate per architecture;
-- serve: the server, HTTP and the CLI.
+- app: CLI applications, including the HTTP serving subcommand.
 
 A dependency may point to the same tier or a lower one: core may not depend
-on metal, models or serve; metal may not depend on models or serve; models
-may not depend on serve. Edges within a tier are allowed (flux2 and
+on metal, models or app; metal may not depend on models or app; models
+may not depend on app. Edges within a tier are allowed (flux2 and
 qwen3-asr use qwen; Cargo already rejects cycles). Normal, dev, build and
 target-specific dependencies all count, and so does a path dependency
 inherited from [workspace.dependencies]. A member outside the tier
@@ -25,7 +25,7 @@ from pathlib import Path
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
-TIERS = ("core", "metal", "models", "serve")
+TIERS = ("core", "metal", "models", "app")
 DEPENDENCY_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 
 

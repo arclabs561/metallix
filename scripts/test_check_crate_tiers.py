@@ -48,7 +48,7 @@ class CrateTierTests(unittest.TestCase):
                 "crates/metal/k": '[dependencies]\na = { path = "../../core/a" }\n',
                 "crates/models/q": '[dependencies]\nk = { path = "../../metal/k" }\n',
                 "crates/models/f": '[dependencies]\nq = { path = "../q" }\n',
-                "crates/serve/s": '[dependencies]\nf = { path = "../../models/f" }\n',
+                "crates/app/s": '[dependencies]\nf = { path = "../../models/f" }\n',
             },
         )
         self.assertEqual(tiers.problems(self.root), [])
@@ -80,9 +80,9 @@ class CrateTierTests(unittest.TestCase):
                     "[target.'cfg(target_os = \"macos\")'.dependencies]\n"
                     "s = { workspace = true }\n"
                 ),
-                "crates/serve/s": "",
+                "crates/app/s": "",
             },
-            workspace_dependencies='[workspace.dependencies]\ns = { path = "crates/serve/s" }\n',
+            workspace_dependencies='[workspace.dependencies]\ns = { path = "crates/app/s" }\n',
         )
         found = tiers.problems(self.root)
         self.assertEqual(len(found), 2, found)
@@ -90,14 +90,14 @@ class CrateTierTests(unittest.TestCase):
             "crates/metal/k (metal) depends on q (models) in [dev-dependencies]",
             found[0],
         )
-        self.assertIn("crates/models/q (models) depends on s (serve)", found[1])
+        self.assertIn("crates/models/q (models) depends on s (app)", found[1])
 
     def test_member_outside_a_tier_fails(self) -> None:
         write_workspace(self.root, {"crates/engine": "", "crates/models/q": ""})
         self.assertEqual(
             tiers.problems(self.root),
             [
-                "crates/engine is not under crates/<tier>/ (tiers: core, metal, models, serve)"
+                "crates/engine is not under crates/<tier>/ (tiers: core, metal, models, app)"
             ],
         )
 

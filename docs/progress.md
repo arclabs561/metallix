@@ -82,7 +82,7 @@ choices without expanding current support claims.
   checkpoint tensors by `reduced::checkpoint_model`, with routed experts,
   Engram rows and embedding rows read on demand through `V41RangeCache` and
   missing ranges fetched from the pinned Hub revision inside a 64 GiB / 150
-  GiB-free envelope (`server::range_fetch`). On the captured 3-token prompt it
+  GiB-free envelope (`metallix_cli::range_fetch`). On the captured 3-token prompt it
   predicts the source's greedy token. Teacher-forced, every layer's attention
   input is exact and layer outputs agree at cosine at least 0.99999 (two layers
   at about 0.999989); chained, BF16-level differences compound to cosine about

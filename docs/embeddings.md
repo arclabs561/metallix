@@ -70,7 +70,7 @@ sigmoid was imprecise). Serving stays float32.
 
 ```sh
 METALLIX_QWEN_EMBEDDING_MODEL=/path/to/Qwen3-Embedding-0.6B \
-  cargo test --release -p server --features metal --test serve_embeddings -- --ignored
+  cargo test --release -p metallix-cli --features metal --test serve_embeddings -- --ignored
 ```
 
 Measured on an Apple M3 Max under heavy unrelated load, so upper bounds: a
@@ -137,7 +137,7 @@ binary signs equal except where the pooled value is within 1e-4 of zero.
 
 ```sh
 METALLIX_PPLX_CONTEXT_MODEL=/path/to/pplx-embed-context-v1-0.6b \
-  cargo test --release -p server --features metal --test serve_pplx_context -- --ignored --nocapture
+  cargo test --release -p metallix-cli --features metal --test serve_pplx_context -- --ignored --nocapture
 ```
 
 A 4-chunk, 53-token document takes 23 to 25 ms over HTTP (warm median over two
@@ -213,7 +213,7 @@ policy is cosine at least 1 - 1e-5 per token and MaxSim within 1e-3.
 
 ```sh
 METALLIX_PPLX_LATE_MODEL=/path/to/pplx-embed-v1-late-0.6b \
-  cargo test --release -p server --features metal --test serve_pplx_late -- --ignored --nocapture
+  cargo test --release -p metallix-cli --features metal --test serve_pplx_late -- --ignored --nocapture
 ```
 
 Over HTTP (warm median over two runs), a query takes about 25 ms, a 9-token
@@ -268,7 +268,7 @@ truncates that ranking.
 
 ```sh
 METALLIX_PPLX_LATE_MODEL=/path/to/pplx-embed-v1-late-0.6b \
-  cargo test --release -p server --features metal --test serve_pplx_rerank -- --ignored --nocapture
+  cargo test --release -p metallix-cli --features metal --test serve_pplx_rerank -- --ignored --nocapture
 ```
 
 That request takes about 600 ms over HTTP (warm median), nearly all of it in 17

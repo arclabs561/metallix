@@ -182,6 +182,12 @@ class ServerLog(unittest.TestCase):
         "request finished elapsed_ms=52850.556958"
     )
 
+    def test_cli_module_target_keeps_request_correlation(self):
+        current = self.LINE.replace("server::serving:", "metallix_cli::serving:")
+        self.assertEqual(
+            e2e_agents.server_requests(current), e2e_agents.server_requests(self.LINE)
+        )
+
     def test_request_finished_lines_by_request_id(self):
         noise = "mx listening on http://127.0.0.1:8475; models=1"
         parsed = e2e_agents.server_requests(f"{noise}\n{self.LINE}\n{self.FAILED}")
