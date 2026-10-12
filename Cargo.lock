@@ -506,6 +506,7 @@ name = "deepseek"
 version = "0.1.0"
 dependencies = [
  "blockfloat",
+ "chat-format",
  "divan",
  "mlx-rs",
  "mlx-sys",

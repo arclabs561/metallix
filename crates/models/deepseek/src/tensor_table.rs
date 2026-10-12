@@ -121,6 +121,32 @@ impl V41TensorTable {
         .build()
     }
 
+    /// Upper bound for retained scalar checkpoint weights, excluding streamed tables.
+    /// FP8 `wo_a` becomes BF16; compressor BF16 projections can become FP32.
+    /// Keeping unused `wo_a` scales and doubling ratio-one compressor weights
+    /// makes this conservative. Session copies and scratch are separate.
+    pub(crate) fn resident_weight_bytes(&self) -> Option<u64> {
+        self.text
+            .iter()
+            .filter(|(name, _)| {
+                self.role(name) == Some(V41TensorRole::Text)
+                    && name.as_str() != "embed.weight"
+                    && !name.contains(".ffn.experts.")
+                    && !name.contains(".engram.embed.")
+            })
+            .try_fold(0_u64, |total, (name, tensor)| {
+                let factor = if name.ends_with(".attn.wo_a.weight")
+                    || name.ends_with(".attn.compressor.wkv.weight")
+                    || name.ends_with(".attn.compressor.wgate.weight")
+                {
+                    2
+                } else {
+                    1
+                };
+                total.checked_add(tensor.bytes()?.checked_mul(factor)?)
+            })
+    }
+
     /// Which part of the model `name` belongs to, or `None` for a name no
     /// part of a V4.1 checkpoint should have.
     #[must_use]

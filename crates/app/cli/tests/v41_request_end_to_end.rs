@@ -93,7 +93,7 @@ fn real_shell_prompt_matches_the_source_greedy_token() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Check {
     Capture,
-    StateEquivalence,
+    StateEquivalence { tokens: usize, prefix: usize },
     PrefixDiagnostic,
 }
 
@@ -127,7 +127,31 @@ fn cached_shell_prefill_and_decode_have_identical_final_state() {
     run_capture(
         "parity-shell.json",
         "capture-shell2",
-        Check::StateEquivalence,
+        Check::StateEquivalence {
+            tokens: 17,
+            prefix: 3,
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs METALLIX_V41_STATE_RECEIPTS with an owned cache copy and an external footprint/time watchdog; no network"]
+fn cached_greedy_prefill_and_decode_have_identical_final_state() {
+    if std::env::var_os("METALLIX_V41_STATE_RECEIPTS").is_none() {
+        eprintln!("skipping: METALLIX_V41_STATE_RECEIPTS is not set");
+        return;
+    }
+    assert!(
+        matches!(backend(), V41Backend::Scalar),
+        "state gate is scalar only"
+    );
+    run_capture(
+        "parity-greedy3.json",
+        "capture-parity3",
+        Check::StateEquivalence {
+            tokens: 3,
+            prefix: 2,
+        },
     );
 }
 
@@ -236,6 +260,24 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
         root
     };
     let trace = root.join("route-trace");
+    let run: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(trace.join(run_file)).expect("recorded run"))
+            .expect("recorded run JSON");
+    let ids: Vec<i64> = run["runs"][0]["prompt_ids"]
+        .as_array()
+        .expect("prompt ids")
+        .iter()
+        .map(|id| id.as_i64().expect("id"))
+        .collect();
+    let greedy = run["runs"][0]["generated_ids"][0]
+        .as_u64()
+        .expect("recorded greedy token");
+
+    if let Check::StateEquivalence { tokens, prefix } = check {
+        assert_eq!(ids.len(), tokens, "fixed cached state workload");
+        assert!(prefix >= 2 && prefix < tokens, "nonempty decode tail");
+    }
+
     let registry: serde_json::Value =
         serde_json::from_str(include_str!("../../../../config/artifacts/deepseek.json"))
             .expect("embedded registry");
@@ -294,19 +336,6 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
                 .expect("Engram definitions"),
         ))
         .expect("40-layer request model");
-
-    let run: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(trace.join(run_file)).expect("recorded run"))
-            .expect("recorded run JSON");
-    let ids: Vec<i64> = run["runs"][0]["prompt_ids"]
-        .as_array()
-        .expect("prompt ids")
-        .iter()
-        .map(|id| id.as_i64().expect("id"))
-        .collect();
-    let greedy = run["runs"][0]["generated_ids"][0]
-        .as_u64()
-        .expect("recorded greedy token");
 
     let cache = Mutex::new(cache);
     let experts: Vec<_> = (0..config.layers())
@@ -427,8 +456,7 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
         "the capture's argmax is the recorded token"
     );
     assert_eq!(native_top, source_top, "next-token argmax");
-    if check == Check::StateEquivalence {
-        assert_eq!(ids.len(), 17, "fixed cached shell workload");
+    if let Check::StateEquivalence { tokens, prefix } = check {
         let expected_cursor = session.next_start();
         let expected_logits: Vec<u32> = logits.iter().map(|value| value.to_bits()).collect();
         let width = output.residual().len() / ids.len();
@@ -444,9 +472,9 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
         };
         let mut split = RequestSession::new(&model).expect("split request session");
         let mut actual = split
-            .step_with_sources(&ids[..3], sources)
+            .step_with_sources(&ids[..prefix], sources)
             .expect("initial prefix");
-        for id in &ids[3..] {
+        for id in &ids[prefix..] {
             actual = split
                 .step_with_sources(std::slice::from_ref(id), sources)
                 .expect("one-token append");
@@ -465,7 +493,8 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
         assert_eq!(host.fetches.load(Ordering::Relaxed), 0, "no HTTP requests");
         assert_eq!(host.bytes.load(Ordering::Relaxed), 0, "no fetched bytes");
         eprintln!(
-            "scalar state equivalence: 17 tokens, prefix 3 then 14 single-token appends, {:.1} s including baseline",
+            "scalar state equivalence: {tokens} tokens, prefix {prefix} then {} single-token appends, {:.1} s including baseline",
+            tokens - prefix,
             started.elapsed().as_secs_f64()
         );
     }

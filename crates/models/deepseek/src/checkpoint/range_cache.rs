@@ -358,6 +358,31 @@ pub struct V41RangeCache<S> {
 }
 
 impl<S: V41RangeSource> V41RangeCache<S> {
+    pub(crate) fn admit_native(
+        &self,
+        config: &str,
+    ) -> Result<u64, crate::V41ArtifactInspectionError> {
+        let error = |error: crate::tensor_table::V41TensorTableError| {
+            crate::V41ArtifactInspectionError::NativeTensorAdmission(error.to_string())
+        };
+        let table = crate::tensor_table::V41TensorTable::from_config(config).map_err(error)?;
+        table
+            .admit(
+                &self.index,
+                self.headers
+                    .iter()
+                    .map(|(name, header)| (name.as_str(), header)),
+            )
+            .map_err(|error| {
+                crate::V41ArtifactInspectionError::NativeTensorAdmission(error.to_string())
+            })?;
+        table.resident_weight_bytes().ok_or_else(|| {
+            crate::V41ArtifactInspectionError::NativeTensorAdmission(
+                "resident weight bytes overflow".into(),
+            )
+        })
+    }
+
     /// Builds a cache over `headers`, each checked against `index` for an
     /// exact tensor-name agreement. Shards without a header stay unreadable.
     ///
@@ -421,14 +446,13 @@ impl<S: V41RangeSource> V41RangeCache<S> {
             file_bytes: u64,
         }
         let mismatch = |what: &str| V41RangeCacheError::HeadersManifest(what.to_owned());
-        let manifest: Manifest = serde_json::from_slice(
-            &fs::read(trace_dir.join("headers.json")).map_err(V41RangeCacheError::Io)?,
-        )
-        .map_err(V41RangeCacheError::ReceiptJson)?;
+        let manifest: Manifest =
+            serde_json::from_slice(&read_metadata(&trace_dir.join("headers.json"), 4 << 20)?)
+                .map_err(V41RangeCacheError::ReceiptJson)?;
         if manifest.revision != revision {
             return Err(mismatch("revision"));
         }
-        let index_json = fs::read(index_path).map_err(V41RangeCacheError::Io)?;
+        let index_json = read_metadata(index_path, super::MAX_HEADER_BYTES)?;
         if format!("{:x}", Sha256::digest(&index_json)) != manifest.index_sha256 {
             return Err(mismatch("index sha256"));
         }
@@ -436,12 +460,19 @@ impl<S: V41RangeSource> V41RangeCache<S> {
             std::str::from_utf8(&index_json).map_err(|_| mismatch("index utf-8"))?,
         )?;
         let mut headers = Vec::with_capacity(manifest.shards.len());
+        let mut total_header_bytes = 0_u64;
         for (shard, expected) in manifest.shards {
             if shard.starts_with('.') || shard.contains(['/', '\\']) {
                 return Err(mismatch(&shard));
             }
-            let bytes = fs::read(trace_dir.join(format!("headers/{shard}.header.bin")))
-                .map_err(V41RangeCacheError::Io)?;
+            total_header_bytes = total_header_bytes
+                .checked_add(expected.header_bytes)
+                .filter(|&bytes| bytes <= super::MAX_HEADER_BYTES)
+                .ok_or_else(|| mismatch("aggregate saved headers exceed metadata limit"))?;
+            let bytes = read_metadata(
+                &trace_dir.join(format!("headers/{shard}.header.bin")),
+                super::MAX_HEADER_BYTES + 8,
+            )?;
             if bytes.len() as u64 != expected.header_bytes
                 || format!("{:x}", Sha256::digest(&bytes)) != expected.header_sha256
             {
@@ -738,6 +769,31 @@ impl<S: V41RangeSource> RoutedExpertSource for V41CachedRoutedExperts<'_, S> {
             w3_scale,
         )?)
     }
+}
+
+/// Bounds a metadata read before allocation, including growth during the read.
+pub(crate) fn read_metadata(
+    path: &std::path::Path,
+    limit: u64,
+) -> Result<Vec<u8>, V41RangeCacheError> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(V41RangeCacheError::Io)?;
+    let metadata = file.metadata().map_err(V41RangeCacheError::Io)?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Err(V41RangeCacheError::HeadersManifest(
+            "metadata file exceeds limit or is not regular".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(V41RangeCacheError::Io)?;
+    if bytes.len() as u64 > limit {
+        return Err(V41RangeCacheError::HeadersManifest(
+            "metadata grew beyond limit".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

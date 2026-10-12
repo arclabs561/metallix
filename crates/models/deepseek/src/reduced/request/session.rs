@@ -76,13 +76,36 @@ struct PriorRatioOneKeys {
 
 /// Mutable request state for every scheduled layer, rebuilt as one unit on restart.
 pub struct RequestSession<'a> {
-    model: &'a RequestModel<'a>,
+    model: ModelDefinition<'a>,
     startup: StartupSession<'a>,
     engrams: Vec<Option<EngramSession>>,
     layers: Vec<LayerState>,
     prior_ratio_one: Option<PriorRatioOneKeys>,
     next_start: usize,
     poisoned: bool,
+}
+
+#[derive(Clone)]
+enum ModelDefinition<'a> {
+    Borrowed(&'a RequestModel<'a>),
+    Owned(Box<RequestModel<'a>>),
+}
+
+impl<'a> ModelDefinition<'a> {
+    const fn get(&self) -> &RequestModel<'a> {
+        match self {
+            Self::Borrowed(model) => model,
+            Self::Owned(model) => model,
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for ModelDefinition<'a> {
+    type Target = RequestModel<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
 }
 
 impl<'a> RequestSession<'a> {
@@ -93,10 +116,14 @@ impl<'a> RequestSession<'a> {
     /// Returns the `RequestError` of the first layer session that cannot be
     /// built.
     pub fn new(model: &'a RequestModel<'a>) -> Result<Self, RequestError> {
-        Self::build(model)
+        Self::build(ModelDefinition::Borrowed(model))
     }
 
-    fn build(model: &'a RequestModel<'a>) -> Result<Self, RequestError> {
+    pub(crate) fn from_owned(model: RequestModel<'a>) -> Result<Self, RequestError> {
+        Self::build(ModelDefinition::Owned(Box::new(model)))
+    }
+
+    fn build(model: ModelDefinition<'a>) -> Result<Self, RequestError> {
         let startup = model.startup.session()?;
         let mut engrams = Vec::with_capacity(model.layers.len());
         let mut layers = Vec::with_capacity(model.layers.len());
@@ -134,25 +161,25 @@ impl<'a> RequestSession<'a> {
     /// Returns the score-stage implementation retained across request restart.
     #[must_use]
     pub const fn score_execution(&self) -> IndexScoreExecution {
-        self.model.score_execution()
+        self.model.get().score_execution()
     }
 
     /// Returns the index-key rotary implementation retained across request restart.
     #[must_use]
     pub const fn key_rotary_execution(&self) -> IndexKeyRotaryExecution {
-        self.model.key_rotary_execution()
+        self.model.get().key_rotary_execution()
     }
 
     /// Returns the complete index-key preparation implementation retained across restart.
     #[must_use]
     pub const fn key_preparation_execution(&self) -> IndexKeyPreparationExecution {
-        self.model.key_preparation_execution()
+        self.model.get().key_preparation_execution()
     }
 
     /// Returns the final projection implementation retained across request restart.
     #[must_use]
     pub const fn head_execution(&self) -> FinalHeadExecution {
-        self.model.head_execution()
+        self.model.get().head_execution()
     }
 
     /// Drops every request-local publication and reconstructs pristine inner state.
@@ -162,7 +189,7 @@ impl<'a> RequestSession<'a> {
     /// Returns the `RequestError` of the first layer session that cannot be
     /// rebuilt.
     pub fn restart(&mut self) -> Result<(), RequestError> {
-        let rebuilt = Self::build(self.model)?;
+        let rebuilt = Self::build(self.model.clone())?;
         *self = rebuilt;
         Ok(())
     }
@@ -481,12 +508,12 @@ impl<'a> RequestSession<'a> {
         let (copies, width) = self.model.startup.tail.geometry();
         let heads = match self.model.head_positions {
             HeadPositions::All => {
-                final_heads(self.model, &residual, &pre, ids.len(), (copies, width))?
+                final_heads(&self.model, &residual, &pre, ids.len(), (copies, width))?
             }
             HeadPositions::Last => {
                 let stride = copies * width;
                 final_heads(
-                    self.model,
+                    &self.model,
                     &residual[residual.len() - stride..],
                     &pre[pre.len() - copies..],
                     1,

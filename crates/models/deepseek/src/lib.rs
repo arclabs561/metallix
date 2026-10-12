@@ -9,6 +9,7 @@ pub mod compressor;
 pub mod csa2;
 pub mod engram;
 pub mod ffn;
+mod generation;
 pub mod hc;
 pub mod indexer;
 pub mod manifest;
@@ -24,6 +25,7 @@ mod tensor_table;
 
 pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
 pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
+pub use chat_format::TokenId;
 pub use checkpoint::{
     MAX_SHARED_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,
     V41ExpertI8ScalePairs, V41ExpertI8ScalePayload, V41ExpertPayloadError, V41ExpertProjection,
@@ -33,10 +35,12 @@ pub use checkpoint::{
     V41SharedExpertProjectionPayload, V41StorageDtype, V41TensorRange,
 };
 pub use csa2::{CandidateError, candidate_mask};
+pub use generation::{V41GenerateError, V41Model, V41ModelMetadata, V41ModelOptions, V41Session};
 #[cfg(feature = "metal")]
 pub use indexer::index_scores_f32;
 pub use indexer::{IndexScoreError, index_scores_reference};
 pub use norm::{MAX_RMS_NORM_WIDTH, RmsNormError, rms_norm_bf16_reference};
+pub use reduced::checkpoint_model::V41Backend;
 pub use rotary::{
     RotaryDirection, RotaryError, RotaryFrequency, RotaryFrequencyError, RotaryFrequencyParameters,
     RotaryTailLayout, rotate_tail,

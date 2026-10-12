@@ -724,6 +724,140 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn generation_fixture() -> ReducedArtifact {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let exported = std::process::Command::new("python3")
+            .arg(root.join("scripts/export_v41_reduced_artifact.py"))
+            .arg("--source")
+            .arg(root.join("fixtures/deepseek-v41/reduced-runner-reference.json"))
+            .args(["--output", "-"])
+            .output()
+            .expect("fixture exporter");
+        assert!(exported.status.success());
+        ReducedArtifact::parse(&exported.stdout).unwrap()
+    }
+
+    #[test]
+    fn owning_generation_state_matches_borrowed_request_and_requires_reset() {
+        use crate::reduced::{RequestSession, StepSources};
+        use crate::{TokenId, generation::append_with_sources};
+        let artifact = generation_fixture();
+        model::with_request_model(
+            &artifact.config,
+            &artifact.tensors,
+            IndexScoreExecution::Scalar,
+            IndexKeyPreparationExecution::Scalar,
+            FinalHeadExecution::Scalar,
+            |model| {
+                let mut borrowed = RequestSession::new(model).unwrap();
+                let mut owned = RequestSession::from_owned(model.clone()).unwrap();
+                let mut poisoned = false;
+                let first = [0, 1, 2, 3, 4].map(TokenId::new);
+                let expected = borrowed.step(&[0, 1, 2, 3, 4]).unwrap();
+                let actual = append_with_sources(
+                    &mut owned,
+                    &mut poisoned,
+                    &first,
+                    8,
+                    8,
+                    StepSources::default(),
+                )
+                .unwrap();
+                assert_eq!(actual, last_logits(&expected).unwrap());
+                assert_eq!(
+                    greedy_token(&actual).unwrap(),
+                    6,
+                    "independent source fixture token"
+                );
+                let expected_decode = borrowed.step(&[6]).unwrap();
+                let actual_decode = append_with_sources(
+                    &mut owned,
+                    &mut poisoned,
+                    &[TokenId::new(6)],
+                    8,
+                    8,
+                    StepSources::default(),
+                )
+                .unwrap();
+                assert_eq!(actual_decode, last_logits(&expected_decode).unwrap());
+                assert_eq!(owned.next_start(), 6);
+                check_generation_recovery(&mut owned, &first, &actual);
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    fn check_generation_recovery(
+        owned: &mut crate::reduced::RequestSession<'_>,
+        first: &[crate::TokenId],
+        actual: &[f32],
+    ) {
+        use crate::reduced::StepSources;
+        use crate::{TokenId, V41GenerateError, generation::append_with_sources};
+        let mut poisoned = false;
+        assert!(matches!(
+            append_with_sources(
+                owned,
+                &mut poisoned,
+                &[TokenId::new(8)],
+                8,
+                8,
+                StepSources::default()
+            ),
+            Err(V41GenerateError::TokenOutOfVocabulary(_))
+        ));
+        assert!(poisoned);
+        assert!(matches!(
+            append_with_sources(
+                owned,
+                &mut poisoned,
+                &[TokenId::new(6)],
+                8,
+                8,
+                StepSources::default()
+            ),
+            Err(V41GenerateError::Poisoned)
+        ));
+        owned.restart().unwrap();
+        poisoned = false;
+        let restarted =
+            append_with_sources(owned, &mut poisoned, first, 8, 8, StepSources::default()).unwrap();
+        assert_eq!(restarted, actual);
+        assert!(matches!(
+            append_with_sources(
+                owned,
+                &mut poisoned,
+                &[TokenId::new(0); 4],
+                8,
+                8,
+                StepSources::default()
+            ),
+            Err(V41GenerateError::ContextFull { requested: 9, .. })
+        ));
+        assert_eq!(
+            owned.next_start(),
+            5,
+            "entire append admitted before execution"
+        );
+        assert!(poisoned);
+        owned.restart().unwrap();
+        poisoned = false;
+        assert!(matches!(
+            append_with_sources(
+                owned,
+                &mut poisoned,
+                &[TokenId::new(0)],
+                8,
+                8,
+                StepSources::default()
+            ),
+            Err(V41GenerateError::InitialPromptTooShort)
+        ));
+        assert_eq!(owned.next_start(), 0);
+        assert!(poisoned);
+    }
+
     fn encoded(dtype: &str, shape: &[usize], bytes: &[u8]) -> RawTensor {
         use std::fmt::Write as _;
         let mut hex = String::new();

@@ -16,6 +16,7 @@ use crate::manifest::V41SafetensorsIndex;
 
 pub mod embedding_rows;
 pub mod engram_rows;
+pub mod local_store;
 pub mod mlx;
 pub use mlx::{LayerZeroAttentionActivation, LayerZeroQkvResident};
 pub mod range_cache;

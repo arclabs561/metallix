@@ -401,6 +401,48 @@ and keep/reject decision. A checkout commit does not authenticate an arbitrary
 binary's build provenance. Retain raw receipts locally; publish concise results
 and caveats in `docs/experiments/`.
 
+### Experimental DeepSeek raw-token generation
+
+The local Scalar consumer accepts raw vocabulary IDs and keeps request state
+between appends:
+
+```sh
+cargo build -p metallix-cli --release
+target/release/mx generate deepseek --weights /path/to/receipt-store \
+  --input-ids 1,2,3 --context-tokens 128 --max-tokens 2 --json
+```
+
+This command requires an already acquired receipt store, rather than an ordinary
+Hugging Face shard directory. Its root contains native `config.json`, pinned
+`inference-config.json`, `model.safetensors.index.json`, `headers.json`,
+length-prefixed saved headers in `headers/`, `v41-engram-inputs.bin`, and
+whole-tensor or packed-row receipts in `weights/`. The library validates the
+complete checkpoint metadata before loading weights and verifies each requested
+payload. Missing or corrupt bytes fail locally; generation never acquires or
+repairs data.
+
+At least two initial IDs are required. The initial prefill uses at most 128
+positions; later positions execute singly. Repeated multi-token chunks,
+tokenization, chat templates and Metal generation still need qualification.
+The library returns logits and leaves selection and stopping to its caller;
+`mx` selects greedily, with the lowest ID breaking a tie. An optional
+`--eos-token-id` stops on that selected ID, which is included in the output.
+No EOS is inferred. Without `--json`, stdout contains comma-separated output
+IDs; JSON includes `backend`, `prompt_tokens`, `token_ids` and `stop_reason`.
+Errors produce no partial success output.
+
+`--context-tokens` bounds evaluated positions: prompt length plus at most
+`max-tokens - 1` feedback positions. The final prediction is not fed back.
+`--resident-mib` admits retained scalar weights and `--cache-mib` bounds raw
+range-cache bytes. Neither caps process footprint; request state, activations,
+temporary conversions and allocator overhead require a separate process budget.
+
+The public library entry points are `V41Model::inspect_store`,
+`V41Model::open` and the fallible `session`, `append` and `reset` operations.
+Any append error poisons the session until a successful reset. Experimental
+availability does not establish upstream token parity, generation quality,
+long-context correctness or beyond-RAM performance.
+
 ## Experimental chat, agent, and Responses control
 
 These Metal-only commands are a Qwen3 control path, separate from `gen`'s

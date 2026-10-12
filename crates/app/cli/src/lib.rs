@@ -32,8 +32,8 @@
 //! # Features
 //!
 //! * `metal` builds everything that runs a model on the GPU, including
-//!   `serve`, `gen` and `chat`. Without it only `inspect`, `fetch` and the
-//!   reduced `DeepSeek` runner are available.
+//!   `serve`, `gen` and `chat`. Scalar `generate deepseek`, inspection,
+//!   fetching and the reduced `DeepSeek` runner also work without Metal.
 //! * `structured-output` enables JSON Schema constrained generation.
 //! * `timeline` writes a Chrome/Perfetto JSON timeline to `--trace-out`.
 
@@ -68,6 +68,7 @@ mod commands;
 mod completions;
 #[cfg(feature = "metal")]
 mod decision_cli;
+mod deepseek_generate_cli;
 mod deepseek_reduced_cli;
 mod deepseek_selected_cli;
 #[cfg(feature = "metal")]
@@ -405,6 +406,9 @@ fn with_capture(cli: Cli) -> ExitCode {
 )]
 fn dispatch(cli: Cli) -> ExitCode {
     match cli.command {
+        Command::Generate {
+            command: cli::GenerateCommand::Deepseek(args),
+        } => args.run(),
         Command::RunDeepseekReduced(args) => args.run(),
         Command::RunDeepseekSelected(args) => args.run(),
         #[cfg(feature = "metal")]

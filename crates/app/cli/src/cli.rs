@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 #[cfg(feature = "metal")]
 use crate::{decision_cli, julia_decisions};
-use crate::{deepseek_reduced_cli, deepseek_selected_cli};
+use crate::{deepseek_generate_cli, deepseek_reduced_cli, deepseek_selected_cli};
 
 /// Invalid explicit context input; model-specific admission happens at load.
 #[cfg(feature = "metal")]
@@ -110,6 +110,11 @@ pub(crate) fn parse_temperature(value: &str) -> Result<f64, String> {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Generate raw token IDs using a local model checkpoint.
+    Generate {
+        #[command(subcommand)]
+        command: GenerateCommand,
+    },
     /// Run a fixed five-block reduced `DeepSeek` model from a synthetic artifact.
     RunDeepseekReduced(deepseek_reduced_cli::ReducedArgs),
     /// Compare local pinned V4.1 layer-zero `MoE` weights against source captures.
@@ -581,6 +586,12 @@ pub(crate) enum Command {
         #[arg(long)]
         input_shard: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum GenerateCommand {
+    /// Experimental local-only `DeepSeek` V4.1 greedy generation on the scalar backend.
+    Deepseek(deepseek_generate_cli::DeepseekGenerateArgs),
 }
 
 /// `mx image` subcommands.

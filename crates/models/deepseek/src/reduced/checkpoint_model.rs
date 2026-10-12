@@ -75,7 +75,7 @@ static NO_ROUTED_EXPERTS: [Option<Fp4ExpertWeights<'static>>; MAX_ROUTED_EXPERTS
     [None; MAX_ROUTED_EXPERTS];
 
 /// The text-model fields of the pinned `inference-config.json`.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct V41InferenceConfig {
     vocab_size: usize,
     dim: usize,
@@ -180,6 +180,54 @@ impl V41InferenceConfig {
             return fail("candidate_source_layer must be a ratio-one owner".to_owned());
         }
         Ok(config)
+    }
+
+    /// Converts admitted native configuration fields to the source execution names.
+    pub(crate) fn from_native(json: &str) -> Result<Self, V41CheckpointModelError> {
+        let root: serde_json::Value = serde_json::from_str(json)
+            .map_err(|error| V41CheckpointModelError::Config(error.to_string()))?;
+        let text = root.get("text_config").unwrap_or(&root);
+        let mut native = text.as_object().cloned().ok_or_else(|| {
+            V41CheckpointModelError::Config("native text configuration must be an object".into())
+        })?;
+        for (execution, checkpoint) in [
+            ("dim", "hidden_size"),
+            ("moe_inter_dim", "moe_intermediate_size"),
+            ("n_layers", "num_hidden_layers"),
+            ("n_heads", "num_attention_heads"),
+            ("n_activated_experts", "num_experts_per_tok"),
+            ("score_func", "scoring_func"),
+            ("route_scale", "routed_scaling_factor"),
+            ("rope_head_dim", "qk_rope_head_dim"),
+            ("norm_eps", "rms_norm_eps"),
+            ("window_size", "sliding_window"),
+            ("kv_source_layers", "kv_source_layer_ids"),
+            ("index_source_layers", "index_source_layer_ids"),
+            ("candidate_source_layer", "candidate_source_layer_id"),
+        ] {
+            native.insert(execution.into(), text[checkpoint].clone());
+        }
+        for (execution, checkpoint) in [
+            ("original_seq_len", "original_max_position_embeddings"),
+            ("rope_factor", "factor"),
+            ("beta_fast", "beta_fast"),
+            ("beta_slow", "beta_slow"),
+        ] {
+            native.insert(execution.into(), text["rope_scaling"][checkpoint].clone());
+        }
+        Self::parse(&serde_json::Value::Object(native).to_string())
+    }
+
+    pub(crate) const fn vocabulary(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub(crate) fn engram_layers(&self) -> &[usize] {
+        &self.engram_layer_ids
+    }
+
+    pub(crate) const fn engram_width(&self) -> usize {
+        self.engram_head_dim
     }
 
     /// Number of transformer layers.
