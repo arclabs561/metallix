@@ -116,6 +116,22 @@ METALLIX_QWEN_MODEL=~/models/Qwen3-0.6B \
 GPU tests serialize on a test lock that recovers from poisoning, so one
 failing test reports as one failure. Read inputs before taking the lock.
 
+For MLX-layout Qwen3.5-family checkpoints, the forward path retains checkpoint
+dtype at normalization, gate and recurrent-output boundaries. The scalar,
+unmasked recurrence follows mlx-lm 0.32.0, with FP32 recurrent state kept in
+Metallix's snapshot and rollback layout. Packed, generic and small-width
+operator fixtures cover recurrence outputs, state updates and input immutability.
+Regenerate their reference hashes with the pinned oracle:
+
+```sh
+uv run --no-project --python 3.13 --with mlx==0.32.3 --with mlx-lm==0.32.0 \
+  python crates/models/qwen35/src/forward/mlx_delta/reference.py
+```
+
+This rewrites the adjacent `reference.json`. These small operator fixtures
+have their own scope; real-checkpoint generation, residency and performance
+require separate qualification gates.
+
 ### Experimental isolated checks
 
 On POSIX, the check runner can capture the current working source and serialize
