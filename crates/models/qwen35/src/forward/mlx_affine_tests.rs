@@ -502,3 +502,74 @@ fn affine_convolution_rounds_after_accumulation_and_keeps_window() {
     assert_eq!(next.shape(), &[1, 2, 2]);
     assert_eq!(next.as_slice::<f32>(), &[1.0, -1.0, -256.0, 256.0]);
 }
+
+// Independent BF16 vectors frozen with mlx==0.32.3 / mlx-lm==0.32.0.
+fn affine_bf16(values: &[f32], shape: &[i32]) -> Array {
+    Array::from_slice(values, shape)
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap()
+}
+
+fn affine_bits(array: &Array) -> Vec<u32> {
+    let array = array.as_type::<f32>().unwrap().contiguous().unwrap();
+    array.eval().unwrap();
+    array
+        .as_slice::<f32>()
+        .iter()
+        .map(|x| x.to_bits())
+        .collect()
+}
+
+#[test]
+fn affine_delta_normalization_retains_checkpoint_rounding() {
+    let input = affine_bf16(&[0.75, -1.25, 0.125, 2.5], &[1, 1, 4]);
+    let (q, k) = super::normalize_delta_qk(&input, &input, Numerics::MlxLm).unwrap();
+    assert_eq!(q.dtype(), Dtype::Bfloat16);
+    assert_eq!(k.dtype(), Dtype::Bfloat16);
+    assert_eq!(
+        affine_bits(&q),
+        [1_040_515_072, 3_193_765_888, 1_018_232_832, 1_054_670_848]
+    );
+    assert_eq!(
+        affine_bits(&k),
+        [1_048_903_680, 3_202_154_496, 1_026_621_440, 1_063_059_456]
+    );
+}
+
+#[test]
+fn affine_delta_gates_match_compiled_checkpoint_producer() {
+    let a = affine_bf16(&[1.234_375, -2.125, 0.75, -0.5], &[1, 4]);
+    let b = affine_bf16(&[-2.125, -0.333_984_38, 0.6875, 2.25], &[1, 4]);
+    let bias = affine_bf16(&[-0.03125, 0.125, 0.0625, -0.125], &[4]);
+    // exp(A_log.astype(float32)), for BF16 A_log=[.25,-.5,.75,-.25].
+    let rates = [1_067_735_794, 1_058_751_896, 1_074_232_558, 1_061_642_109].map(f32::from_bits);
+    let (log_decay, beta) = super::delta_gates(
+        &a,
+        &b,
+        &Array::from_slice(&rates, &[4]),
+        &bias,
+        Numerics::MlxLm,
+    )
+    .unwrap();
+    assert_eq!(
+        affine_bits(&beta),
+        [1_037_697_024, 1_054_146_560, 1_059_717_120, 1_063_780_352]
+    );
+    assert_eq!(
+        affine_bits(&log_decay.exp().unwrap()),
+        [1_041_978_569, 1_064_109_839, 1_034_456_136, 1_060_599_967]
+    );
+}
+
+#[test]
+fn affine_delta_output_preserves_norm_and_fused_gate_boundaries() {
+    let output = affine_bf16(&[1.5, -0.875, 0.375, 2.25], &[1, 1, 4]);
+    let weight = affine_bf16(&[0.75, 1.25, 1.0, 0.5], &[4]);
+    let gate = affine_bf16(&[1.375, -0.75, 0.3125, -2.25], &[1, 1, 4]);
+    let result = super::gated_delta_output(&output, &weight, &gate, 1e-6, Numerics::MlxLm).unwrap();
+    assert_eq!(result.dtype(), Dtype::Bfloat16);
+    assert_eq!(
+        affine_bits(&result),
+        [1_063_059_456, 1_044_119_552, 1_027_670_016, 3_190_554_624]
+    );
+}

@@ -1447,21 +1447,17 @@ fn gated_delta_net(
     }
     let (output, next_conv, recurrent) =
         linear_recurrence(weights, base, &conv, recurrent, &inputs, false)?;
-    let normed = fast::rms_norm_device(
+    let norm_weight = weights.tensor(&format!("{base}.norm.weight"))?;
+    let output_gate = project("in_proj_z")?.reshape_device(&[seq, value_heads, value_dim], &gpu)?;
+    let gated = gated_delta_output(
         &output,
-        weights
-            .tensor(&format!("{base}.norm.weight"))?
-            .as_type_device::<f32>(&gpu)?,
+        norm_weight,
+        &output_gate,
         config.rms_norm_eps,
-        &gpu,
-    )?;
-    let output_gate = project("in_proj_z")?
-        .reshape_device(&[seq, value_heads, value_dim], &gpu)?
-        .as_type_device::<f32>(&gpu)?;
-    let gated = normed
-        .multiply_device(silu(&output_gate)?, &gpu)?
-        .as_dtype_device(compute, &gpu)?
-        .reshape_device(&[1, seq, value_heads * value_dim], &gpu)?;
+        weights.numerics,
+    )?
+    .as_dtype_device(compute, &gpu)?
+    .reshape_device(&[1, seq, value_heads * value_dim], &gpu)?;
     *state = Some(LayerState::Linear {
         conv: next_conv,
         recurrent,
@@ -1511,17 +1507,16 @@ fn linear_recurrence(
         2,
         &gpu,
     )?;
-    let heads = |part: &Array, count: i32, width: i32| -> Result<Array, Qwen35Error> {
-        Ok(part
-            .reshape_device(&[seq, count, width], &gpu)?
-            .as_type_device::<f32>(&gpu)?)
-    };
-    let readout_scale =
-        f32::from(u16::try_from(key_dim).map_err(|_| Qwen35Error::ShapeOverflow)?).powf(-0.5);
-    let query = l2_normalize(&heads(&parts[0], key_heads, key_dim)?)?
-        .multiply_device(Array::from_f32(readout_scale), &gpu)?;
-    let key = l2_normalize(&heads(&parts[1], key_heads, key_dim)?)?;
-    let value = heads(&parts[2], value_heads, value_dim)?;
+    let heads =
+        |part: &Array, count: i32, width: i32| part.reshape_device(&[seq, count, width], &gpu);
+    let query = heads(&parts[0], key_heads, key_dim)?;
+    let key = heads(&parts[1], key_heads, key_dim)?;
+    let (query, key) = normalize_delta_qk(&query, &key, weights.numerics)?;
+    // The existing recurrent solver keeps FP32 state/arithmetic. MLX-layout
+    // inputs first pass through the reference's checkpoint-dtype boundaries.
+    let query = query.as_type_device::<f32>(&gpu)?;
+    let key = key.as_type_device::<f32>(&gpu)?;
+    let value = heads(&parts[2], value_heads, value_dim)?.as_type_device::<f32>(&gpu)?;
     // Key head h serves value heads h * repeat .. (h + 1) * repeat.
     let repeat = value_heads / key_heads;
     let (query, key) = if repeat > 1 {
@@ -1533,35 +1528,131 @@ fn linear_recurrence(
         (query, key)
     };
 
-    let beta = ops::sigmoid_device(
-        inputs
-            .b
-            .reshape_device(&[seq, value_heads], &gpu)?
-            .as_type_device::<f32>(&gpu)?,
-        &gpu,
+    let (log_decay, beta) = delta_gates(
+        &inputs.a.reshape_device(&[seq, value_heads], &gpu)?,
+        &inputs.b.reshape_device(&[seq, value_heads], &gpu)?,
+        weights.tensor(&format!("{base}.decay_rate"))?,
+        weights.tensor(&format!("{base}.dt_bias"))?,
+        weights.numerics,
     )?;
-    let decay_rate = weights.tensor(&format!("{base}.decay_rate"))?;
-    let shifted = inputs
-        .a
-        .reshape_device(&[seq, value_heads], &gpu)?
-        .as_type_device::<f32>(&gpu)?
-        .add_device(
-            weights
-                .tensor(&format!("{base}.dt_bias"))?
-                .as_type_device::<f32>(&gpu)?,
-            &gpu,
-        )?;
-    let softplus = ops::logaddexp_device(&shifted, Array::from_f32(0.0), &gpu)?;
-    let log_decay = softplus
-        .multiply_device(decay_rate, &gpu)?
-        .negative_device(&gpu)?;
 
     let (output, recurrent) = if by_token || seq == 1 {
         delta_rule_by_token(&query, &key, &value, &log_decay, &beta, recurrent)?
     } else {
         delta::chunked(&query, &key, &value, &log_decay, &beta, recurrent)?
     };
+    let output = match weights.numerics {
+        Numerics::MlxLm => output.as_dtype_device(inputs.qkv.dtype(), &gpu)?,
+        Numerics::Transformers => output,
+    };
     Ok((output, next_conv, recurrent))
+}
+
+/// Preserve the checkpoint producer's normalization and dtype boundaries.
+fn normalize_delta_qk(
+    query: &Array,
+    key: &Array,
+    numerics: Numerics,
+) -> Result<(Array, Array), Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let width = f32::from(u16::try_from(query.shape()[2]).map_err(|_| Qwen35Error::ShapeOverflow)?);
+    let scale = width.powf(-0.5);
+    match numerics {
+        Numerics::Transformers => Ok((
+            l2_normalize(&query.as_type_device::<f32>(&gpu)?)?
+                .multiply_device(Array::from_f32(scale), &gpu)?,
+            l2_normalize(&key.as_type_device::<f32>(&gpu)?)?,
+        )),
+        Numerics::MlxLm => {
+            // mlx-lm normalize_qk scales rms_norm's mean epsilon to the
+            // original sum-of-squares epsilon, retaining checkpoint dtype.
+            let epsilon = L2_NORM_EPS / width;
+            let normalize = |x: &Array, factor: f32| -> Result<Array, Qwen35Error> {
+                Ok(
+                    mlx_rs::with_stream(gpu.as_ref(), || fast::rms_norm(x, None, epsilon))?
+                        .multiply_device(
+                            Array::from_f32(factor).as_dtype_device(x.dtype(), &gpu)?,
+                            &gpu,
+                        )?,
+                )
+            };
+            Ok((normalize(query, 1.0 / width)?, normalize(key, scale)?))
+        }
+    }
+}
+
+fn delta_gates(
+    a: &Array,
+    b: &Array,
+    decay_rate: &Array,
+    dt_bias: &Array,
+    numerics: Numerics,
+) -> Result<(Array, Array), Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    match numerics {
+        Numerics::Transformers => {
+            let beta = ops::sigmoid_device(b.as_type_device::<f32>(&gpu)?, &gpu)?;
+            let shifted = a
+                .as_type_device::<f32>(&gpu)?
+                .add_device(dt_bias.as_type_device::<f32>(&gpu)?, &gpu)?;
+            let log_decay = ops::logaddexp_device(&shifted, Array::from_f32(0.0), &gpu)?
+                .multiply_device(decay_rate, &gpu)?
+                .negative_device(&gpu)?;
+            Ok((log_decay, beta))
+        }
+        Numerics::MlxLm => {
+            let beta = ops::sigmoid_device(b, &gpu)?.as_type_device::<f32>(&gpu)?;
+            let log_decay = FUSED_LOG_DECAY.with(|cell| {
+                let mut cell = cell.borrow_mut();
+                let compiled = cell.get_or_insert_with(|| {
+                    Box::new(mlx_rs::transforms::compile::compile(
+                        |inputs: &[Array]| {
+                            let shifted = inputs[0].add(&inputs[1])?;
+                            let zero = Array::from_f32(0.0).as_dtype(shifted.dtype())?;
+                            Ok(vec![
+                                ops::logaddexp(&shifted, zero)?
+                                    .multiply(&inputs[2])?
+                                    .negative()?,
+                            ])
+                        },
+                        true,
+                    ))
+                });
+                let mut outputs = compiled(&[a.clone(), dt_bias.clone(), decay_rate.clone()])?;
+                outputs.pop().ok_or(Qwen35Error::ShapeOverflow)
+            })?;
+            Ok((log_decay, beta))
+        }
+    }
+}
+
+fn gated_delta_output(
+    output: &Array,
+    weight: &Array,
+    gate: &Array,
+    epsilon: f32,
+    numerics: Numerics,
+) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    match numerics {
+        Numerics::Transformers => {
+            let normed =
+                fast::rms_norm_device(output, weight.as_type_device::<f32>(&gpu)?, epsilon, &gpu)?;
+            Ok(normed.multiply_device(silu(&gate.as_type_device::<f32>(&gpu)?)?, &gpu)?)
+        }
+        Numerics::MlxLm => {
+            let normed = fast::rms_norm_device(output, weight, epsilon, &gpu)?;
+            // mlx-lm precise_swiglu: FP32 gate activation and product, then
+            // return to the recurrence output dtype after the fused operation.
+            gated(
+                &gate.as_type_device::<f32>(&gpu)?,
+                &normed.as_type_device::<f32>(&gpu)?,
+                Numerics::MlxLm,
+            )?
+            .as_dtype_device(output.dtype(), &gpu)
+            .map_err(Into::into)
+        }
+    }
 }
 
 /// Depthwise causal convolution plus `silu` over `[1, seq, channels]`, with
@@ -1994,6 +2085,7 @@ thread_local! {
     /// functions per thread).
     static FUSED_SWIGLU: RefCell<Option<CompiledGraph>> = const { RefCell::new(None) };
     static FUSED_SILU: RefCell<Option<CompiledGraph>> = const { RefCell::new(None) };
+    static FUSED_LOG_DECAY: RefCell<Option<CompiledGraph>> = const { RefCell::new(None) };
 }
 
 /// mlx.nn.silu uses one compiled x * sigmoid(x) graph, preserving its
