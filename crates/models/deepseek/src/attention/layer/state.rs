@@ -5,8 +5,8 @@ use std::{collections::HashSet, num::NonZeroUsize};
 use crate::{
     RotaryDirection, RotaryFrequency,
     attention::{
-        AttentionOutputLayout, SparseAttentionLayout, attention_output_reference,
-        sparse_attention_bf16_reference,
+        AttentionOutputLayout, SparseAttentionError, SparseAttentionLayout,
+        attention_output_reference, sparse_attention_bf16_reference,
         window::{WindowStep, window_topk_indices, write_window_kv_bf16},
     },
     precision::{ActivationGroup, requantize_bf16_activations_e4m3fn},
@@ -557,9 +557,8 @@ impl LayerAttentionState {
         positions: usize,
         weights: LayerAttentionWeights<'_>,
     ) -> Result<Vec<u16>, LayerAttentionError> {
-        let sparse_slots =
-            NonZeroUsize::new(window.indices.len() / (self.layout.batches.get() * positions))
-                .ok_or(LayerAttentionError::NoSparseSlots)?;
+        let rows = checked_product(&[self.layout.batches.get(), positions], "sparse query rows")?;
+        let (indices, sparse_slots) = compact_sparse_indices(&window.indices, rows)?;
         let key_positions = NonZeroUsize::new(
             window
                 .window_keys
@@ -581,7 +580,7 @@ impl LayerAttentionState {
             query,
             &window.shared_kv,
             weights.attn_sink,
-            &window.indices,
+            &indices,
             self.layout.softmax_scale(),
             sparse_layout,
         )?)
@@ -825,5 +824,182 @@ impl LayerAttentionState {
             &[self.layout.heads.get(), self.layout.head_dimension.get()],
             "query width",
         )?)
+    }
+}
+
+/// Storage slots do not define numerical execution blocks. Keep every selected
+/// key in its original order (including duplicates), then pad only row tails.
+/// In particular, a decode ring's unused slots must not separate its window
+/// keys from compressed keys into a different BF16 online-normalization block.
+fn compact_sparse_indices(
+    indices: &[i32],
+    rows: usize,
+) -> Result<(Vec<i32>, NonZeroUsize), LayerAttentionError> {
+    if rows == 0 || indices.is_empty() || !indices.len().is_multiple_of(rows) {
+        return Err(LayerAttentionError::NoSparseSlots);
+    }
+    if rows > MAX_LAYER_ATTENTION_ELEMENTS {
+        return Err(LayerAttentionError::ElementLimit {
+            field: "sparse query rows",
+            elements: rows,
+        });
+    }
+    if indices.len() > MAX_LAYER_ATTENTION_ELEMENTS {
+        return Err(LayerAttentionError::ElementLimit {
+            field: "sparse indices",
+            elements: indices.len(),
+        });
+    }
+    let storage_slots = indices.len() / rows;
+    let row = |index: usize| &indices[index * storage_slots..(index + 1) * storage_slots];
+    // Remove only the -1 mask sentinel. Invalid indices remain visible to the
+    // primitive's validation, instead of being silently treated as padding.
+    let slots = (0..rows)
+        .map(|index| row(index).iter().filter(|&&key| key != -1).count())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let elements = checked_product(&[rows, slots], "compact sparse indices")?;
+    if elements > MAX_LAYER_ATTENTION_ELEMENTS {
+        return Err(LayerAttentionError::ElementLimit {
+            field: "compact sparse indices",
+            elements,
+        });
+    }
+    let mut compact = Vec::new();
+    compact
+        .try_reserve_exact(elements)
+        .map_err(|_| SparseAttentionError::AllocationFailed { elements })?;
+    for index in 0..rows {
+        compact.extend(row(index).iter().copied().filter(|&key| key != -1));
+        compact.resize((index + 1) * slots, -1);
+    }
+    Ok((
+        compact,
+        NonZeroUsize::new(slots).expect("at least one slot"),
+    ))
+}
+
+#[cfg(test)]
+mod sparse_execution_tests {
+    use super::*;
+
+    fn nz(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
+    fn native_sparse(
+        indices: Vec<i32>,
+        window_keys: usize,
+    ) -> Result<Vec<u16>, LayerAttentionError> {
+        let layout = LayerAttentionLayout::new(
+            nz(1),
+            nz(32),
+            nz(1),
+            nz(32),
+            nz(1),
+            nz(32),
+            nz(128),
+            nz(1),
+            nz(32),
+            7,
+            nz(2),
+            1e-5,
+            1.0,
+        )
+        .unwrap();
+        let state = LayerAttentionState::new(layout);
+        // Independent frozen BF16 primitive counterexample, zero-extended to
+        // native layer head width: q=[1,0], KV=[[0,1],[1,0]], sink=-100.
+        // The two-key numerator uses BF16(exp(-1)), giving [3f3b,3e89].
+        // Putting the second key after mask padding at slot128 instead would
+        // rescale an earlier FP32 numerator, incorrectly giving [3f3b,3e8a].
+        let mut query = vec![0; 32];
+        query[0] = 0x3f80;
+        let mut shared_kv = vec![0; (window_keys + 1) * 32];
+        shared_kv[1] = 0x3f80;
+        shared_kv[window_keys * 32] = 0x3f80;
+        let window = WindowStages {
+            prepared_window: Vec::new(),
+            window_read: Vec::new(),
+            staged_ring: Vec::new(),
+            shared_kv,
+            window_indices: Vec::new(),
+            indices,
+            window_keys,
+            compressed_keys: 1,
+        };
+        // Only the sink participates in this adapter-stage call; projection
+        // operands are deliberately empty rather than invented numerical weights.
+        let unused = Fp8Projection {
+            codes: &[],
+            scales: &[],
+        };
+        state.sparse_output(
+            &query,
+            &window,
+            1,
+            LayerAttentionWeights {
+                wq_a: unused,
+                q_norm: &[],
+                wq_b: unused,
+                wkv: unused,
+                kv_norm: &[],
+                attn_sink: &[-100.0],
+                wo_a: &[],
+                wo_b: unused,
+            },
+        )
+    }
+
+    #[test]
+    fn native_sparse_prefill_and_window128_decode_share_execution_blocks() {
+        let prefill = native_sparse(vec![0, -1, -1, 3], 3).unwrap();
+        let mut decoded = vec![-1; 129];
+        decoded[0] = 0;
+        decoded[128] = 128;
+        let decode = native_sparse(decoded, 128).unwrap();
+        let mut frozen = vec![0; 32];
+        frozen[..2].copy_from_slice(&[0x3f3b, 0x3e89]);
+        assert_eq!(prefill, frozen, "independent one-block BF16 oracle");
+        assert_eq!(decode, frozen, "ring padding must not partition valid keys");
+    }
+
+    #[test]
+    fn compact_execution_preserves_row_order_duplicates_and_masked_rows() {
+        let storage = [2, -1, 0, 2, -1, -1, -1, -1];
+        let (execution, slots) = compact_sparse_indices(&storage, 2).unwrap();
+        assert_eq!(slots.get(), 3);
+        assert_eq!(execution, [2, 0, 2, -1, -1, -1]);
+        assert_eq!(storage, [2, -1, 0, 2, -1, -1, -1, -1]);
+        assert_eq!(native_sparse(vec![-1; 129], 128).unwrap(), [0; 32]);
+        assert!(matches!(
+            native_sparse(Vec::new(), 128),
+            Err(LayerAttentionError::NoSparseSlots)
+        ));
+        let duplicate = native_sparse(vec![0, 128, 0], 128).unwrap();
+        assert_ne!(duplicate, native_sparse(vec![0, 128], 128).unwrap());
+    }
+
+    #[test]
+    fn compact_execution_keeps_invalid_indices_visible_and_bounds_empty_geometry() {
+        for index in [-2, 129] {
+            assert!(matches!(
+                native_sparse(vec![-1, index], 128),
+                Err(LayerAttentionError::Sparse(
+                    crate::attention::SparseAttentionBf16Error::Input(
+                        SparseAttentionError::InvalidIndex { .. }
+                    )
+                ))
+            ));
+        }
+        assert!(matches!(
+            compact_sparse_indices(&[], 0),
+            Err(LayerAttentionError::NoSparseSlots)
+        ));
+        assert!(matches!(
+            compact_sparse_indices(&[-1], MAX_LAYER_ATTENTION_ELEMENTS + 1),
+            Err(LayerAttentionError::NoSparseSlots)
+        ));
     }
 }
