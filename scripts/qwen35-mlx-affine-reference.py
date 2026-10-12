@@ -121,6 +121,7 @@ HELDOUT_PROMPTS = [
 # thresholds. They sample reference arithmetic, without observing the candidate.
 PREFILL_CHUNKS = (None, 16, 12, 8, 1, 7, 9, 15, 17, 32, 64, 128)
 GPU_CAP_BYTES: int | None = None
+CACHE_LIMIT_BYTES = 2 * 1024**3
 
 
 def check_gpu_memory() -> dict[str, int]:
@@ -388,6 +389,7 @@ def reference(model_dir: Path, steps: int, prompts: list[str]) -> None:
                     "prefill_chunks": PREFILL_CHUNKS,
                     "prompts": "heldout" if prompts == HELDOUT_PROMPTS else "dev",
                     "abort_gpu_bytes": GPU_CAP_BYTES,
+                    "cache_limit_bytes": CACHE_LIMIT_BYTES,
                     "memory": memory,
                 },
                 "cases": cases,
@@ -417,6 +419,7 @@ def main() -> None:
             parser.error("--abort-gpu-gib must be finite and positive")
         global GPU_CAP_BYTES
         GPU_CAP_BYTES = int(args.abort_gpu_gib * 1024**3)
+        mx.set_cache_limit(CACHE_LIMIT_BYTES)
         mx.reset_peak_memory()
         prompts = HELDOUT_PROMPTS if args.prompts == "heldout" else PROMPTS
         reference(args.model, args.steps, prompts)
