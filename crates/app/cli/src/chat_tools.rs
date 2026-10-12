@@ -261,10 +261,10 @@ mod tests {
         let result = tools
             .execute(&ChatToolCall {
                 name: "search_file".into(),
-                arguments: json!({"path":"Cargo.toml","query":"name = \"server\""}),
+                arguments: json!({"path":"Cargo.toml","query":"name = \"metallix-cli\""}),
             })
             .unwrap();
-        assert_eq!(result["matches"][0]["text"], "name = \"server\"");
+        assert_eq!(result["matches"][0]["text"], "name = \"metallix-cli\"");
     }
 
     proptest! {
