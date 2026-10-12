@@ -4,8 +4,8 @@
 //! Set `METALLIX_QWEN35_AFFINE_MODEL` to the checkpoint directory and
 //! `METALLIX_QWEN35_AFFINE_REFERENCE` to the script's JSON for it. Each case
 //! prefills the prompt and then decodes mlx-lm's own greedy tokens, so every
-//! step is compared from identical inputs. The quantized modules match
-//! mlx-lm bit for bit (see the crate's component test), but the linear
+//! step is compared from identical inputs. The component test separately
+//! requires quantized modules to match mlx-lm bit for bit, but the linear
 //! attention follows Transformers' op order, so logits are not bitwise
 //! equal: the argmax must agree wherever mlx-lm's top two logits are at
 //! least `TIE_GAP` apart, and the logit error on mlx-lm's top 8 must stay

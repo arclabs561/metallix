@@ -2,15 +2,17 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "mlx==0.32.2",
+#   "mlx==0.32.3",
 #   "mlx-lm==0.32.0",
 #   "numpy==2.5.3",
 # ]
 # ///
 """Reference outputs of mlx-lm for an MLX affine Qwen3.5-family checkpoint.
 
-MLX is pinned to the release mlx-sys bundles for the Rust side, so both run
-the same kernels and a native implementation can match these bit for bit.
+MLX is pinned to the release mlx-sys bundles for the Rust side. This aligns
+the backend version; matching graph shapes, dispatch and arithmetic still
+requires independent comparison. Historical captures from other versions
+must be regenerated for this qualification.
 
 ``truncate`` copies the first ``--layers`` decoder layers of an mlx-lm
 checkpoint (``language_model.model.*``) plus the embedding, final norm and
