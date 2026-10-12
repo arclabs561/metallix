@@ -348,3 +348,83 @@ fn components_match_mlx_lm_bit_for_bit() {
     );
     assert!(mismatched.is_empty(), "mismatched: {mismatched:?}");
 }
+
+/// Compaction must preserve every selected affine dot product, including when
+/// the number of stored experts straddles MLX's sorted-gather dispatch boundary.
+#[test]
+fn compact_affine_gather_preserves_selected_dot_products() {
+    let gpu = StreamOrDevice::gpu();
+    let weights = Array::from_slice(&super::tests::values(91, 32 * 64 * 64), &[32, 64, 64])
+        .as_dtype_device(Dtype::Bfloat16, &gpu)
+        .expect("bf16 weights");
+    let (codes, scales, biases) = ops::quantize_device(&weights, 32, 4, &gpu).expect("quantize");
+    let full = AffineWeight {
+        codes,
+        scales,
+        biases,
+        bits: 4,
+        group_size: 32,
+    };
+    let selected = Array::from_slice(&(0..16_i32).collect::<Vec<_>>(), &[16]);
+    let compact = AffineWeight {
+        codes: full
+            .codes
+            .take_axis_device(&selected, 0, &gpu)
+            .expect("selected codes"),
+        scales: full
+            .scales
+            .take_axis_device(&selected, 0, &gpu)
+            .expect("selected scales"),
+        biases: full
+            .biases
+            .take_axis_device(&selected, 0, &gpu)
+            .expect("selected biases"),
+        bits: 4,
+        group_size: 32,
+    };
+    let input = Array::from_slice(&super::tests::values(73, 64 * 64), &[64, 1, 64])
+        .as_dtype_device(Dtype::Bfloat16, &gpu)
+        .expect("bf16 input");
+    let indices = Array::from_slice(&(0..64_i32).map(|i| i / 4).collect::<Vec<_>>(), &[64]);
+    let run = |weight, sorted| {
+        let out = super::Matrix::Affine(weight)
+            .gather(&input, &indices, sorted)
+            .expect("gather");
+        let bits = out.view_dtype_device(Dtype::Uint16, &gpu).expect("bits");
+        bits.eval().expect("eval");
+        bits.as_slice::<u16>().to_vec()
+    };
+    let unsorted_full = run(&full, false);
+    let unsorted_compact = run(&compact, false);
+    assert_eq!(
+        unsorted_full, unsorted_compact,
+        "common unsorted kernel control"
+    );
+    let sorted_full = run(&full, true);
+    let sorted_compact = run(&compact, true);
+    let different = sorted_full
+        .iter()
+        .zip(&sorted_compact)
+        .filter(|(a, b)| a != b)
+        .count();
+    let max_abs = sorted_full
+        .iter()
+        .zip(&sorted_compact)
+        .map(|(&a, &b)| {
+            (f32::from_bits(u32::from(a) << 16) - f32::from_bits(u32::from(b) << 16)).abs()
+        })
+        .fold(0.0_f32, f32::max);
+    eprintln!(
+        "sorted compaction mismatches: {different}/{}; max_abs={max_abs}; full sorted vs unsorted: {}",
+        sorted_full.len(),
+        sorted_full
+            .iter()
+            .zip(&unsorted_full)
+            .filter(|(a, b)| a != b)
+            .count()
+    );
+    assert_eq!(
+        different, 0,
+        "compacting unused experts changed selected dot products"
+    );
+}
