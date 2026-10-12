@@ -551,6 +551,8 @@ fn affine_delta_gates_match_compiled_checkpoint_producer() {
         Numerics::MlxLm,
     )
     .unwrap();
+    assert_eq!(beta.dtype(), Dtype::Bfloat16);
+    assert_eq!(log_decay.dtype(), Dtype::Float32);
     assert_eq!(
         affine_bits(&beta),
         [1_037_697_024, 1_054_146_560, 1_059_717_120, 1_063_780_352]

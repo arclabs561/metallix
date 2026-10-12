@@ -1605,6 +1605,7 @@ dependencies = [
  "blockfloat",
  "chat-format",
  "checkpoint",
+ "mlx-kernels",
  "mlx-rs",
  "serde",
  "serde_json",

@@ -10,12 +10,13 @@ publish.workspace = true
 blockfloat = { path = "../../core/blockfloat" }
 checkpoint = { path = "../../core/checkpoint" }
 mlx-rs = { workspace = true, optional = true }
+mlx-kernels = { path = "../../metal/mlx-kernels", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [features]
-metal = ["dep:mlx-rs"]
+metal = ["dep:mlx-rs", "dep:mlx-kernels", "mlx-kernels/metal"]
 
 [dev-dependencies]
 chat-format = { path = "../../core/chat-format" }

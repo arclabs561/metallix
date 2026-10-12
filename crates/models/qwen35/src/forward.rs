@@ -40,6 +40,7 @@ use crate::{
 mod delta;
 #[cfg(test)]
 mod mlx_affine_tests;
+mod mlx_delta;
 mod paged;
 #[cfg(test)]
 mod paged_tests;
@@ -1475,9 +1476,9 @@ struct LinearInputs {
 
 /// The convolution and delta rule of one linear layer from its projections:
 /// returns the per-head output `[seq, Hv, Dv]` before the gated norm, the
-/// next convolution window, and the next recurrent state. `by_token` forces
-/// the decode path's token-by-token recurrence for any length; otherwise a
-/// multi-token input uses the chunked form.
+/// next convolution window, and the next recurrent state. MLX-layout inputs use
+/// their producer's recurrence for every length. For Transformers, `by_token`
+/// forces the decode recurrence; otherwise multi-token input uses chunks.
 fn linear_recurrence(
     weights: &Qwen35Weights,
     base: &str,
@@ -1512,11 +1513,30 @@ fn linear_recurrence(
     let query = heads(&parts[0], key_heads, key_dim)?;
     let key = heads(&parts[1], key_heads, key_dim)?;
     let (query, key) = normalize_delta_qk(&query, &key, weights.numerics)?;
-    // The existing recurrent solver keeps FP32 state/arithmetic. MLX-layout
-    // inputs first pass through the reference's checkpoint-dtype boundaries.
+    let value = heads(&parts[2], value_heads, value_dim)?;
+    let (log_decay, beta) = delta_gates(
+        &inputs.a.reshape_device(&[seq, value_heads], &gpu)?,
+        &inputs.b.reshape_device(&[seq, value_heads], &gpu)?,
+        weights.tensor(&format!("{base}.decay_rate"))?,
+        weights.tensor(&format!("{base}.dt_bias"))?,
+        weights.numerics,
+    )?;
+
+    if weights.numerics == Numerics::MlxLm {
+        let (output, recurrent) = mlx_delta::update(
+            &query,
+            &key,
+            &value,
+            &log_decay.exp_device(&gpu)?,
+            &beta,
+            &recurrent,
+        )?;
+        return Ok((output, next_conv, recurrent));
+    }
+
     let query = query.as_type_device::<f32>(&gpu)?;
     let key = key.as_type_device::<f32>(&gpu)?;
-    let value = heads(&parts[2], value_heads, value_dim)?.as_type_device::<f32>(&gpu)?;
+    let value = value.as_type_device::<f32>(&gpu)?;
     // Key head h serves value heads h * repeat .. (h + 1) * repeat.
     let repeat = value_heads / key_heads;
     let (query, key) = if repeat > 1 {
@@ -1528,22 +1548,10 @@ fn linear_recurrence(
         (query, key)
     };
 
-    let (log_decay, beta) = delta_gates(
-        &inputs.a.reshape_device(&[seq, value_heads], &gpu)?,
-        &inputs.b.reshape_device(&[seq, value_heads], &gpu)?,
-        weights.tensor(&format!("{base}.decay_rate"))?,
-        weights.tensor(&format!("{base}.dt_bias"))?,
-        weights.numerics,
-    )?;
-
     let (output, recurrent) = if by_token || seq == 1 {
         delta_rule_by_token(&query, &key, &value, &log_decay, &beta, recurrent)?
     } else {
         delta::chunked(&query, &key, &value, &log_decay, &beta, recurrent)?
-    };
-    let output = match weights.numerics {
-        Numerics::MlxLm => output.as_dtype_device(inputs.qkv.dtype(), &gpu)?,
-        Numerics::Transformers => output,
     };
     Ok((output, next_conv, recurrent))
 }
@@ -1601,7 +1609,7 @@ fn delta_gates(
             Ok((log_decay, beta))
         }
         Numerics::MlxLm => {
-            let beta = ops::sigmoid_device(b, &gpu)?.as_type_device::<f32>(&gpu)?;
+            let beta = ops::sigmoid_device(b, &gpu)?;
             let log_decay = FUSED_LOG_DECAY.with(|cell| {
                 let mut cell = cell.borrow_mut();
                 let compiled = cell.get_or_insert_with(|| {
@@ -2890,6 +2898,9 @@ pub enum Qwen35Error {
     /// MLX failed to construct or evaluate a graph.
     #[error("MLX evaluation failed: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
+    /// A model-owned Metal kernel could not be constructed or applied.
+    #[error(transparent)]
+    Kernel(#[from] mlx_kernels::KernelError),
     /// A GGUF file could not be read or is invalid.
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),

@@ -1,0 +1,64 @@
+{
+  "mlx": "0.32.3",
+  "mlx_lm": "0.32.0",
+  "packed_enabled": "1",
+  "source_sha256": "f69e837ea68641dbb06fdb5dcc024a9a7e1d9353f08ae58c05275253a0c39428",
+  "cases": [
+    {
+      "dk": 128,
+      "dv": 8,
+      "steps": [
+        {
+          "output": "d9e873f7b1b183a129c584cd81ad881ec72e818f2f90b23cd14be1b764ef0fef",
+          "state": "c823d5aef9ef08fcbbd4d9ba0c03197bf293c7fc8ad32a1b6eef8608dc5282ec"
+        },
+        {
+          "output": "8432b0bf6a68bf554173bade16aeb2c9855ff9a041906ad885516059fe070af3",
+          "state": "9544e7044a063c106ccb702c6caeb61a8ee297280aa5ffc34c48011896b691fd"
+        }
+      ]
+    },
+    {
+      "dk": 64,
+      "dv": 7,
+      "steps": [
+        {
+          "output": "51d42a8d0e0124c24595434c24c25ea3bc14d9fef56b0a55138be1e55bf582da",
+          "state": "629f8cc49f5c5508e97a35d009a8df3c583cb4bb8a6b8dd9e0c6c26105ec795d"
+        },
+        {
+          "output": "0b811448b2e9171244b9a959c059d4e053a9db93c1bc160560770c2c0808df39",
+          "state": "d91bd10b5a7db220b485ce588185554f0f073c0a0accd19bce5c30a38435175d"
+        }
+      ]
+    },
+    {
+      "dk": 16,
+      "dv": 7,
+      "steps": [
+        {
+          "output": "f3b7680ae0987a51e0f723141cc96a00a04855229f92bc125d564147d3733622",
+          "state": "1587a9d78cd662fa4a8e623a5c1a93a29ffaa6e3bb73130b6a98d98ec843987d"
+        },
+        {
+          "output": "80fe4cb8793aa0a2256ec59aaf7525f374a08ba205954a730b4baf248b6ebbfc",
+          "state": "8533cd5642d50253aa043181b5327252df0e7f0408ce9e6e27acb56aafb73ebe"
+        }
+      ]
+    },
+    {
+      "dk": 33,
+      "dv": 7,
+      "steps": [
+        {
+          "output": "066ef5286208f143233368855d500ec83c20fcb95f1e3f41316c07821c2c4c51",
+          "state": "e54be31d3ccc6d13bcbc9f6dc0c13c4da5636dd10863bd2a4974de7ac4791b25"
+        },
+        {
+          "output": "f5e7bcae5601bbf3778e17560795fedd556196e0ba211c2618bd235d09427bf9",
+          "state": "3a9de5f8b32301cedebec235dd941da0f885d0f5ebb3085c2b78d9abef382a33"
+        }
+      ]
+    }
+  ]
+}
