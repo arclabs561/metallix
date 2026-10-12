@@ -164,7 +164,10 @@ feasible checkpoint-serving envelope.
 
 The bounded `mx inspect deepseek artifact <directory>` gate now validates the
 DeepSeek config, tokenizer/template, index, referenced shard containment, and
-shard headers without loading tensor payloads. It is an artifact-admission
+shard headers without loading tensor payloads. For native V4.1 artifacts it
+also derives text and draft tensor names, shapes, dtypes and byte totals from
+the configuration and checks them against the index and headers. The MLX
+index branch retains its separate layout contract. It is an artifact-admission
 check, not generation or Codex compatibility evidence.
 
 Open goals at this checkpoint:
