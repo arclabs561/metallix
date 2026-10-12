@@ -11,6 +11,7 @@
 //! final next-token argmax must match the source.
 
 use std::{
+    cell::{Cell, RefCell},
     io,
     num::NonZeroUsize,
     ops::Range,
@@ -22,6 +23,7 @@ use std::{
 };
 
 use deepseek::{
+    attention::layer::LayerAttentionDiagnostic,
     checkpoint::{
         embedding_rows::V41CachedEmbeddingRows,
         engram_rows::V41CachedEngramRows,
@@ -31,9 +33,10 @@ use deepseek::{
         embedding::EngramRowSource,
         inputs::{EngramHashInputs, V41_ENGRAM_INPUTS_IDENTITY},
     },
-    moe::RoutedExpertSource,
+    moe::{Fp4ExpertWeights, MoEError, RoutedExpertSource},
     reduced::{
-        RequestSession, StepSources,
+        BlockTailDiagnostic, RequestModel, RequestSession, RequestStepOutput,
+        ScheduledAttentionOutput, StepSources,
         checkpoint_model::{V41Backend, V41CheckpointWeights, V41Engrams, V41InferenceConfig},
     },
 };
@@ -91,6 +94,23 @@ fn real_shell_prompt_matches_the_source_greedy_token() {
 enum Check {
     Capture,
     StateEquivalence,
+    PrefixDiagnostic,
+}
+
+/// Localizes schedule divergence; it does not qualify the full request.
+#[test]
+#[ignore = "needs an owned METALLIX_V41_STATE_RECEIPTS projection and external footprint/time watchdog; no network"]
+fn cached_three_token_prefix_localizes_schedule_divergence() {
+    if std::env::var_os("METALLIX_V41_STATE_RECEIPTS").is_none() {
+        eprintln!("skipping: METALLIX_V41_STATE_RECEIPTS is not set");
+        return;
+    }
+    assert!(matches!(backend(), V41Backend::Scalar), "scalar diagnostic");
+    run_capture(
+        "parity-shell.json",
+        "capture-shell2",
+        Check::PrefixDiagnostic,
+    );
 }
 
 #[test]
@@ -182,7 +202,9 @@ impl RangeHost for &Host {
     reason = "one end-to-end request keeps every compared stage visible"
 )]
 fn run_capture(run_file: &str, capture: &str, check: Check) {
-    let root = if check == Check::StateEquivalence {
+    let root = if check == Check::Capture {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts")
+    } else {
         let root = std::path::PathBuf::from(
             std::env::var_os("METALLIX_V41_STATE_RECEIPTS")
                 .expect("explicit owned receipts projection is required"),
@@ -212,8 +234,6 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
         );
         assert_unlinked_files(&weights);
         root
-    } else {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.agents/receipts")
     };
     let trace = root.join("route-trace");
     let registry: serde_json::Value =
@@ -231,7 +251,7 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
     )
     .expect("pinned inference config");
     let mut host = Host::from_env();
-    if check == Check::StateEquivalence {
+    if check != Check::Capture {
         host.no_experts = true;
         host.no_rows = true;
     }
@@ -304,6 +324,21 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
         .map(|source| Some(source as &dyn EngramRowSource))
         .collect();
     let embedding = V41CachedEmbeddingRows::new(&cache, config.width());
+    if check == Check::PrefixDiagnostic {
+        assert_eq!(ids.len(), 17, "fixed shell fixture");
+        prefix_diagnostic(
+            &model,
+            &ids[..3],
+            StepSources {
+                experts: &expert_refs,
+                engram_rows: &row_refs,
+                embedding_rows: Some(&embedding),
+            },
+        );
+        assert_eq!(host.fetches.load(Ordering::Relaxed), 0, "no HTTP requests");
+        assert_eq!(host.bytes.load(Ordering::Relaxed), 0, "no fetched bytes");
+        return;
+    }
     let mut session = RequestSession::new(&model).expect("request session");
     let started = std::time::Instant::now();
     let output = session
@@ -433,6 +468,426 @@ fn run_capture(run_file: &str, capture: &str, check: Check) {
             "scalar state equivalence: 17 tokens, prefix 3 then 14 single-token appends, {:.1} s including baseline",
             started.elapsed().as_secs_f64()
         );
+    }
+}
+
+struct ObservedExperts<'a> {
+    source: &'a dyn RoutedExpertSource,
+    phase: &'static str,
+    layer: usize,
+    expected: Option<Vec<(usize, usize)>>,
+    expected_outputs: Option<Vec<Vec<u16>>>,
+    calls: Cell<usize>,
+    observed: RefCell<Vec<usize>>,
+}
+
+impl RoutedExpertSource for ObservedExperts<'_> {
+    fn with_expert(
+        &self,
+        index: usize,
+        run: &mut dyn FnMut(Fp4ExpertWeights<'_>) -> Result<Vec<u16>, MoEError>,
+    ) -> Result<Vec<u16>, MoEError> {
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        self.observed.borrow_mut().push(index);
+        let expected = self.expected.as_ref().and_then(|routes| routes.get(call));
+        eprintln!(
+            "route phase={} layer={} call={call} expected_token_expert={expected:?} actual_expert={index}",
+            self.phase, self.layer
+        );
+        if self.expected.is_some() && expected.is_none_or(|&(_, expert)| expert != index) {
+            return Err(MoEError::ExpertUnavailable {
+                index,
+                reason: format!(
+                    "diagnostic route divergence before delegation: phase={} layer={} call={call} expected_token_expert={expected:?} actual={index}",
+                    self.phase, self.layer
+                ),
+            });
+        }
+        let mut invoked = false;
+        self.source.with_expert(index, &mut |weights| {
+            assert!(!invoked, "source callback must run exactly once");
+            invoked = true;
+            let output = run(weights)?;
+            if let Some(outputs) = &self.expected_outputs {
+                let baseline = &outputs[call];
+                let mismatch = baseline.iter().zip(&output).position(|(a, b)| a != b);
+                if baseline.len() != output.len() || mismatch.is_some() {
+                    return Err(MoEError::ExpertUnavailable {
+                        index,
+                        reason: format!(
+                            "FIRST_DIFFERENCE stage=weighted_expert_output phase={} layer={} expected_token_expert={expected:?} first_element={mismatch:?} expected_len={} actual_len={}",
+                            self.phase, self.layer, baseline.len(), output.len()
+                        ),
+                    });
+                }
+            }
+            Ok(output)
+        })
+    }
+}
+
+fn layer_tails(output: &RequestStepOutput, layer: usize) -> &[BlockTailDiagnostic] {
+    if layer == 0 {
+        output.startup().tails()
+    } else {
+        output.layers()[layer - 1].tails()
+    }
+}
+
+fn observed_step(
+    session: &mut RequestSession<'_>,
+    ids: &[i64],
+    sources: StepSources<'_>,
+    phase: &'static str,
+    baseline: Option<&RequestStepOutput>,
+) -> RequestStepOutput {
+    let start = session.next_start();
+    let observers: Vec<_> = sources
+        .experts
+        .iter()
+        .enumerate()
+        .map(|(layer, source)| ObservedExperts {
+            source: source.expect("real expert source for every layer"),
+            phase,
+            layer,
+            expected: baseline.map(|output| {
+                layer_tails(output, layer)
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(ids.len())
+                    .flat_map(|(token, tail)| {
+                        tail.ffn()
+                            .moe()
+                            .routes()
+                            .iter()
+                            .map(move |route| (token, route.expert_index()))
+                    })
+                    .collect()
+            }),
+            // run_routes retains the exact returned expert vector in route order.
+            expected_outputs: baseline.map(|output| {
+                layer_tails(output, layer)
+                    .iter()
+                    .skip(start)
+                    .take(ids.len())
+                    .flat_map(|tail| tail.ffn().moe().selected_outputs_bf16().iter().cloned())
+                    .collect()
+            }),
+            calls: Cell::new(0),
+            observed: RefCell::new(Vec::new()),
+        })
+        .collect();
+    let refs: Vec<Option<&dyn RoutedExpertSource>> = observers
+        .iter()
+        .map(|observer| Some(observer as &dyn RoutedExpertSource))
+        .collect();
+    let output = session
+        .step_with_sources(
+            ids,
+            StepSources {
+                experts: &refs,
+                ..sources
+            },
+        )
+        .unwrap_or_else(|error| panic!("diagnostic phase={phase} token_start={start}: {error:?}"));
+    for observer in &observers {
+        let routes = layer_tails(&output, observer.layer);
+        let count: usize = routes
+            .iter()
+            .map(|tail| tail.ffn().moe().routes().len())
+            .sum();
+        assert_eq!(observer.calls.get(), count, "one delegated call per route");
+        let returned_routes: Vec<_> = routes
+            .iter()
+            .flat_map(|tail| {
+                tail.ffn()
+                    .moe()
+                    .routes()
+                    .iter()
+                    .map(|route| route.expert_index())
+            })
+            .collect();
+        assert_eq!(
+            *observer.observed.borrow(),
+            returned_routes,
+            "source call order matches returned route order"
+        );
+        if let Some(expected) = &observer.expected {
+            assert_eq!(count, expected.len(), "complete expected route sequence");
+        }
+        for (position, tail) in routes.iter().enumerate() {
+            let token = start + position;
+            for route in tail.ffn().moe().routes() {
+                eprintln!(
+                    "resolved route phase={phase} layer={} token={token} expert={} weight_bits={}",
+                    observer.layer,
+                    route.expert_index(),
+                    route.weight().to_bits()
+                );
+            }
+        }
+    }
+    output
+}
+
+fn prefix_diagnostic(model: &RequestModel<'_>, ids: &[i64], sources: StepSources<'_>) {
+    let mut baseline_session = RequestSession::new(model).expect("baseline session");
+    let baseline = observed_step(&mut baseline_session, ids, sources, "prefill3", None);
+    drop(baseline_session);
+    let mut split = RequestSession::new(model).expect("split session");
+    let initial = observed_step(&mut split, &ids[..2], sources, "prefill2", Some(&baseline));
+    compare_prefix(&baseline, &initial, 0, 2);
+    drop(initial);
+    let appended = observed_step(&mut split, &ids[2..], sources, "append2", Some(&baseline));
+    compare_prefix(&baseline, &appended, 2, 1);
+    assert_eq!(split.next_start(), 3, "diagnostic cursor");
+    let expected: Vec<_> = baseline
+        .heads()
+        .last()
+        .unwrap()
+        .logits()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    let actual: Vec<_> = appended
+        .heads()
+        .last()
+        .unwrap()
+        .logits()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    assert_eq!(expected, actual, "three-token final logit bits");
+    eprintln!("three-token boundaries match; this does not qualify the 17-token request");
+}
+
+struct Boundary {
+    layer: usize,
+    token: usize,
+    actual_position: usize,
+    actual_rows: usize,
+}
+
+impl Boundary {
+    fn compare<T: PartialEq + std::fmt::Debug>(&self, stage: &str, expected: &[T], actual: &[T]) {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "layer={} token={} stage={stage} width",
+            self.layer,
+            self.token
+        );
+        if let Some(index) = expected.iter().zip(actual).position(|(a, b)| a != b) {
+            panic!(
+                "first numerical boundary: layer={} token={} stage={stage} element={index} expected={:?} actual={:?}",
+                self.layer, self.token, expected[index], actual[index]
+            );
+        }
+    }
+
+    fn rows(&self, stage: &str, expected: &[u16], actual: &[u16]) {
+        self.compare(
+            stage,
+            row(expected, 3, self.token),
+            row(actual, self.actual_rows, self.actual_position),
+        );
+    }
+}
+
+fn row<T>(values: &[T], rows: usize, position: usize) -> &[T] {
+    assert_eq!(values.len() % rows, 0, "token row geometry");
+    let width = values.len() / rows;
+    &values[position * width..(position + 1) * width]
+}
+
+fn attention_diagnostic(output: &ScheduledAttentionOutput) -> &LayerAttentionDiagnostic {
+    match output {
+        ScheduledAttentionOutput::WindowOnly(attention)
+        | ScheduledAttentionOutput::RatioTwoConsumer(attention)
+        | ScheduledAttentionOutput::RatioOneConsumer(attention) => attention,
+        ScheduledAttentionOutput::RatioTwoOwner(layer) => layer.attention(),
+        ScheduledAttentionOutput::RatioOneOwner(layer) => layer.attention(),
+        ScheduledAttentionOutput::RatioOneIndexer(layer) => layer.attention(),
+        _ => panic!("unsupported diagnostic attention kind"),
+    }
+}
+
+fn compare_attention(
+    boundary: &Boundary,
+    expected: &LayerAttentionDiagnostic,
+    actual: &LayerAttentionDiagnostic,
+) {
+    for (name, a, b) in [
+        ("wq_a", &expected.wq_a, &actual.wq_a),
+        ("qr", &expected.qr, &actual.qr),
+        ("q_after_rope", &expected.q_after_rope, &actual.q_after_rope),
+        (
+            "prepared_window",
+            &expected.prepared_window,
+            &actual.prepared_window,
+        ),
+        (
+            "sparse_attention",
+            &expected.sparse_output,
+            &actual.sparse_output,
+        ),
+        (
+            "attention_final",
+            &expected.final_output,
+            &actual.final_output,
+        ),
+    ] {
+        boundary.rows(name, a, b);
+    }
+    // At token positions 0..3 no window ring wraps. Ignore unreachable padding;
+    // compare logical window token positions, never the future-filled ring.
+    let a: Vec<_> = row(&expected.window_indices, 3, boundary.token)
+        .iter()
+        .copied()
+        .filter(|&i| i >= 0)
+        .collect();
+    let b: Vec<_> = row(
+        &actual.window_indices,
+        boundary.actual_rows,
+        boundary.actual_position,
+    )
+    .iter()
+    .copied()
+    .filter(|&i| i >= 0)
+    .collect();
+    boundary.compare("window_token_indices", &a, &b);
+}
+
+fn selected_indices(output: &ScheduledAttentionOutput) -> Option<&[i32]> {
+    match output {
+        ScheduledAttentionOutput::RatioTwoOwner(layer) => Some(layer.selected_indices()),
+        ScheduledAttentionOutput::RatioOneOwner(layer) => Some(layer.selected_indices()),
+        ScheduledAttentionOutput::RatioOneIndexer(layer) => Some(&layer.selection().indices),
+        _ => None,
+    }
+}
+
+fn compare_compressed_indices(
+    boundary: &Boundary,
+    expected: &ScheduledAttentionOutput,
+    actual: &ScheduledAttentionOutput,
+) {
+    if let (Some(a), Some(b)) = (selected_indices(expected), selected_indices(actual)) {
+        let expected_attention = attention_diagnostic(expected);
+        let actual_attention = attention_diagnostic(actual);
+        let key_width = expected_attention.prepared_window.len() / 3;
+        let expected_offset =
+            i32::try_from(expected_attention.window_read.len() / key_width).unwrap();
+        let actual_offset = i32::try_from(actual_attention.window_read.len() / key_width).unwrap();
+        let a: Vec<_> = row(a, 3, boundary.token)
+            .iter()
+            .copied()
+            .filter(|&i| i >= 0)
+            .map(|i| i - expected_offset)
+            .collect();
+        let b: Vec<_> = row(b, boundary.actual_rows, boundary.actual_position)
+            .iter()
+            .copied()
+            .filter(|&i| i >= 0)
+            .map(|i| i - actual_offset)
+            .collect();
+        boundary.compare("compressed_logical_indices", &a, &b);
+    }
+}
+
+fn compare_prefix(
+    expected: &RequestStepOutput,
+    actual: &RequestStepOutput,
+    start: usize,
+    positions: usize,
+) {
+    assert_eq!(expected.layers().len(), actual.layers().len());
+    for layer in 0..=expected.layers().len() {
+        for position in 0..positions {
+            let boundary = Boundary {
+                layer,
+                token: start + position,
+                actual_position: position,
+                actual_rows: positions,
+            };
+            if layer == 0 {
+                boundary.rows(
+                    "normalized_attention_input",
+                    expected.startup().attention_input(),
+                    actual.startup().attention_input(),
+                );
+                compare_attention(
+                    &boundary,
+                    expected.startup().attention(),
+                    actual.startup().attention(),
+                );
+            } else {
+                let a = &expected.layers()[layer - 1];
+                let b = &actual.layers()[layer - 1];
+                if let (Some(a), Some(b)) = (a.engram(), b.engram()) {
+                    boundary.rows("engram_output", a.output(), b.output());
+                }
+                boundary.compare(
+                    "collapsed_attention_input",
+                    a.attention_input()[boundary.token].collapsed_bf16(),
+                    b.attention_input()[position].collapsed_bf16(),
+                );
+                boundary.compare(
+                    "normalized_attention_input",
+                    a.attention_input()[boundary.token].normalized_bf16(),
+                    b.attention_input()[position].normalized_bf16(),
+                );
+                compare_attention(
+                    &boundary,
+                    attention_diagnostic(a.attention()),
+                    attention_diagnostic(b.attention()),
+                );
+                compare_compressed_indices(&boundary, a.attention(), b.attention());
+            }
+            let a = &layer_tails(expected, layer)[boundary.token];
+            let b = &layer_tails(actual, layer)[position];
+            boundary.compare(
+                "after_attention",
+                a.after_attention_bf16(),
+                b.after_attention_bf16(),
+            );
+            boundary.compare(
+                "ffn_collapsed",
+                a.ffn().collapsed_bf16(),
+                b.ffn().collapsed_bf16(),
+            );
+            boundary.compare(
+                "ffn_normalized",
+                a.ffn().normalized_bf16(),
+                b.ffn().normalized_bf16(),
+            );
+            let routes = |tail: &BlockTailDiagnostic| {
+                tail.ffn()
+                    .moe()
+                    .routes()
+                    .iter()
+                    .map(|r| (r.expert_index(), r.weight().to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            boundary.compare("routes", &routes(a), &routes(b));
+            boundary.compare("ffn_output", a.ffn().output_bf16(), b.ffn().output_bf16());
+        }
+    }
+    let boundary = Boundary {
+        layer: expected.layers().len(),
+        token: start,
+        actual_position: 0,
+        actual_rows: positions,
+    };
+    for position in 0..positions {
+        Boundary {
+            token: start + position,
+            actual_position: position,
+            ..boundary
+        }
+        .rows("final_residual", expected.residual(), actual.residual());
     }
 }
 
