@@ -3,11 +3,12 @@
 //!
 //! Per `MoE` call the router's choices are read back to the host, the
 //! call's unique experts are made resident (cache hits, or reads through the
-//! pager), and the layer runs on a compact stack of exactly those experts
-//! with `chosen` remapped into it. Each expert's matmul sees the same codes,
-//! scales and biases as with every expert resident. Bit-identical outputs
-//! are the qualification target; identical input bytes alone do not establish
-//! identical floating-point execution for the compact stack.
+//! pager). The execution stack retains the original expert axis and router IDs,
+//! with zeros in unselected positions: MLX uses the stored expert count for
+//! kernel and tile selection, so compacting that axis can change arithmetic.
+//! Bit-identical outputs remain the qualification target. The cache holds only
+//! fetched experts; temporary execution stacks have a full layer's shape and
+//! are outside the cache byte budget.
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -29,8 +30,9 @@ use crate::experts::Qwen35ExpertLocator;
 pub struct Qwen35Paging {
     /// Logical bytes of routed experts retained in the cache. Must hold at
     /// least one layer's full set, since one prefill call can route to every
-    /// expert. Excludes compact stacks, in-flight graphs, other model weights,
-    /// allocator retention and the OS file cache; this is not a process cap.
+    /// expert. Excludes temporary stacks with a full layer's shape, in-flight
+    /// graphs, other model weights, allocator retention and the OS file cache;
+    /// this is not a process cap.
     pub budget_bytes: u64,
     /// Reader threads (requests in flight at the SSD).
     pub readers: usize,
@@ -87,12 +89,12 @@ pub(super) struct PagedExperts {
     state: Mutex<State>,
 }
 
-/// A layer's routed projections over the experts of one call.
-pub(super) struct CompactStack {
+/// A layer's routed projections with the original logical expert axis.
+pub(super) struct ExpertStack {
     projections: [AffineWeight; 3],
 }
 
-impl CompactStack {
+impl ExpertStack {
     pub(super) fn matrices(&self) -> [Matrix<'_>; 3] {
         let [gate, up, down] = &self.projections;
         [
@@ -164,13 +166,13 @@ impl PagedExperts {
         }
     }
 
-    /// The compact stack of the experts `routing` chose at `layer`, and the
-    /// routing remapped into it.
+    /// The chosen experts at their original positions in the logical expert
+    /// axis, and unchanged routing. Unselected positions contain zeros.
     pub(super) fn stack(
         &self,
         layer: usize,
         routing: &Routing,
-    ) -> Result<(CompactStack, Routing), Qwen35Error> {
+    ) -> Result<(ExpertStack, Routing), Qwen35Error> {
         let started = Instant::now();
         // `chosen` is a slice of the partitioned indices, not contiguous.
         let host = routing.chosen.contiguous()?;
@@ -232,10 +234,9 @@ impl PagedExperts {
         counters.route_seconds += route_seconds;
         drop(state);
 
-        let gpu = StreamOrDevice::gpu();
         let part = |index: usize| -> Result<Array, Qwen35Error> {
             let arrays: Vec<&Array> = resident.iter().map(|expert| &expert[index]).collect();
-            Ok(ops::concatenate_axis_device(&arrays, 0, &gpu)?)
+            logical_expert_stack(&unique, &arrays, self.locator.experts())
         };
         let mut projections = Vec::with_capacity(3);
         for (projection, &(bits, group_size)) in self.affine[layer].iter().enumerate() {
@@ -247,26 +248,14 @@ impl PagedExperts {
                 group_size,
             });
         }
-        // `unique` is ascending, so the remap is monotone: sorted selections
-        // keep their order.
-        let remapped: Vec<u32> = chosen
-            .iter()
-            .map(|expert| {
-                let index = unique
-                    .binary_search(expert)
-                    .unwrap_or_else(|_| unreachable!());
-                u32::try_from(index).unwrap_or(u32::MAX)
-            })
-            .collect();
-        let remapped = Array::from_slice(&remapped, routing.chosen.shape());
         Ok((
-            CompactStack {
+            ExpertStack {
                 projections: projections
                     .try_into()
                     .unwrap_or_else(|_| unreachable!("three projections")),
             },
             Routing {
-                chosen: remapped,
+                chosen: routing.chosen.clone(),
                 weights: routing.weights.clone(),
             },
         ))
@@ -335,4 +324,41 @@ fn part_layout(info: &TensorInfo) -> Result<PartLayout, Qwen35Error> {
         shape.push(i32::try_from(dim).map_err(|_| Qwen35Error::ShapeOverflow)?);
     }
     Ok(PartLayout { shape, dtype })
+}
+
+/// Preserve backend dispatch dimensions while materializing only selected
+/// experts. Inputs are ascending unique IDs and matching single-expert arrays.
+/// Zero runs use the part's dtype, including integer affine codes.
+pub(super) fn logical_expert_stack(
+    selected: &[u32],
+    arrays: &[&Array],
+    experts: usize,
+) -> Result<Array, Qwen35Error> {
+    let gpu = StreamOrDevice::gpu();
+    let first = arrays
+        .first()
+        .ok_or_else(|| Qwen35Error::Pager("empty expert selection".into()))?;
+    let mut parts = Vec::with_capacity(2 * arrays.len() + 1);
+    let mut next = 0;
+    let zeros = |count: usize| -> Result<Array, Qwen35Error> {
+        let mut shape = first.shape().to_vec();
+        shape[0] = i32::try_from(count).map_err(|_| Qwen35Error::ShapeOverflow)?;
+        Ok(ops::zeros_dtype_device(&shape, first.dtype(), &gpu)?)
+    };
+    for (&index, &array) in selected.iter().zip(arrays) {
+        let index = usize::try_from(index).map_err(|_| Qwen35Error::ShapeOverflow)?;
+        if index > next {
+            parts.push(zeros(index - next)?);
+        }
+        parts.push(array.clone());
+        next = index + 1;
+    }
+    if next < experts {
+        parts.push(zeros(experts - next)?);
+    }
+    Ok(ops::concatenate_axis_device(
+        &parts.iter().collect::<Vec<_>>(),
+        0,
+        &gpu,
+    )?)
 }

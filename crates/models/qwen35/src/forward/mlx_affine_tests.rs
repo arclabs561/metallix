@@ -352,7 +352,7 @@ fn components_match_mlx_lm_bit_for_bit() {
 /// Compaction must preserve every selected affine dot product, including when
 /// the number of stored experts straddles MLX's sorted-gather dispatch boundary.
 #[test]
-fn compact_affine_gather_preserves_selected_dot_products() {
+fn logical_affine_gather_preserves_selected_dot_products() {
     let gpu = StreamOrDevice::gpu();
     let weights = Array::from_slice(&super::tests::values(91, 32 * 64 * 64), &[32, 64, 64])
         .as_dtype_device(Dtype::Bfloat16, &gpu)
@@ -423,8 +423,36 @@ fn compact_affine_gather_preserves_selected_dot_products() {
             .filter(|(a, b)| a != b)
             .count()
     );
+    // Reconstruct through the same helper as the actual pager. Keep the raw
+    // compact comparison diagnostic: upstream may change its dispatch later.
+    let ids: Vec<u32> = (0..16).collect();
+    let restore = |array: &Array| {
+        let parts: Vec<Array> = ids
+            .iter()
+            .map(|&id| {
+                array
+                    .take_axis_device(&Array::from_slice(&[id], &[1]), 0, &gpu)
+                    .expect("expert")
+            })
+            .collect();
+        super::paged::logical_expert_stack(&ids, &parts.iter().collect::<Vec<_>>(), 32)
+            .expect("logical stack")
+    };
+    let restored = AffineWeight {
+        codes: restore(&full.codes),
+        scales: restore(&full.scales),
+        biases: restore(&full.biases),
+        bits: full.bits,
+        group_size: full.group_size,
+    };
     assert_eq!(
-        different, 0,
-        "compacting unused experts changed selected dot products"
+        run(&restored, true),
+        sorted_full,
+        "logical stack preserves sorted arithmetic"
+    );
+    assert_eq!(
+        run(&restored, false),
+        unsorted_full,
+        "logical stack preserves unsorted arithmetic"
     );
 }
