@@ -738,7 +738,13 @@ mod tests {
     /// Deterministic weights for the two-layer test layout. Norm scales sit
     /// near 1 and `layer_scalar` below 1, so a missing scale changes logits.
     fn weights(silence_full_attention: bool) -> Gemma4MlxWeights {
-        let config = Gemma4TextConfig::parse(TINY_CONFIG).expect("tiny config");
+        weights_with_context(silence_full_attention, 64)
+    }
+
+    fn weights_with_context(silence_full_attention: bool, context: usize) -> Gemma4MlxWeights {
+        let mut config: serde_json::Value = serde_json::from_str(TINY_CONFIG).expect("tiny config");
+        config["text_config"]["max_position_embeddings"] = serde_json::json!(context);
+        let config = Gemma4TextConfig::parse(&config.to_string()).expect("tiny config");
         assert_eq!(config.sliding_window(), WINDOW);
         let mut state = 0x2545_f491_u32;
         let mut next = move || {
@@ -770,6 +776,7 @@ mod tests {
 
     fn assert_close(left: &[f32], right: &[f32]) {
         assert_eq!(left.len(), right.len());
+        assert!(left.iter().chain(right).all(|value| value.is_finite()));
         let worst = left
             .iter()
             .zip(right)
@@ -804,6 +811,61 @@ mod tests {
             &chunked.prefill_last_logits(&IDS).expect("chunks"),
             &expected,
         );
+    }
+
+    /// A bounded synthetic hybrid checks absolute mask positions across many
+    /// windows and uneven graph boundaries. This does not qualify checkpoint
+    /// quality, long-context capacity, or performance.
+    #[test]
+    fn six_hundred_token_chunked_prefill_and_continuation_match_whole_prefixes() {
+        let _gpu = crate::GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let weights = weights_with_context(false, 608);
+        let ids: Vec<i32> = IDS.into_iter().cycle().take(604).collect();
+        let mut reference = weights.executor(608).expect("reference");
+        let expected = reference
+            .prefill_last_logits(&ids[..600])
+            .expect("whole prefill");
+        for chunk in [127, 256] {
+            let mut candidate = weights.executor(608).expect("candidate");
+            candidate.set_prefill_chunk_tokens(chunk);
+            assert_close(
+                &candidate
+                    .prefill_last_logits(&ids[..600])
+                    .expect("chunked prefill"),
+                &expected,
+            );
+            assert_eq!(candidate.cached_tokens(), 600);
+            assert_eq!(
+                candidate.kv_bytes() as u128,
+                weights.config().retained_kv_elements(600) * 4
+            );
+            // Extend after a partial last graph, then decode at a fresh
+            // absolute position; compare each with an independently reset
+            // full-prefix execution.
+            for end in [603, 604] {
+                let actual = if end == 603 {
+                    candidate
+                        .extend_last_logits(&ids[600..end])
+                        .expect("extend")
+                } else {
+                    candidate.decode_last_logits(ids[end - 1]).expect("decode")
+                };
+                reference.reset();
+                assert_close(
+                    &actual,
+                    &reference
+                        .prefill_last_logits(&ids[..end])
+                        .expect("whole prefix"),
+                );
+                assert_eq!(candidate.cached_tokens(), end);
+                assert_eq!(
+                    candidate.kv_bytes() as u128,
+                    weights.config().retained_kv_elements(end) * 4
+                );
+            }
+        }
     }
 
     #[test]
