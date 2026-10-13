@@ -32,6 +32,8 @@ pub struct AudioEncoderConfig {
     pub ffn_dim: usize,
     /// Channels of the three downsampling convolutions.
     pub conv_channels: usize,
+    /// Maximum number of one-second chunks per convolution batch.
+    pub conv_chunksize: usize,
     /// Sinusoid table length; must cover one chunk's frames.
     pub max_source_positions: usize,
     /// Attention window in chunks (`n_window_infer / (2 n_window)`).
@@ -117,6 +119,7 @@ impl Qwen3AsrConfig {
             || audio.encoder_layers == 0
             || audio.encoder_ffn_dim == 0
             || audio.downsample_hidden_size == 0
+            || audio.conv_chunksize == 0
         {
             return Err(Qwen3AsrConfigError::EncoderShape);
         }
@@ -163,6 +166,7 @@ impl Qwen3AsrConfig {
                 heads: audio.encoder_attention_heads,
                 ffn_dim: audio.encoder_ffn_dim,
                 conv_channels: audio.downsample_hidden_size,
+                conv_chunksize: audio.conv_chunksize,
                 max_source_positions: audio.max_source_positions,
                 window_chunks: audio.n_window_infer / CHUNK_FRAMES,
                 output_dim: audio.output_dim,
@@ -328,12 +332,19 @@ struct RawAudio {
     encoder_ffn_dim: usize,
     num_mel_bins: usize,
     downsample_hidden_size: usize,
+    #[serde(default = "default_conv_chunksize")]
+    conv_chunksize: usize,
     max_source_positions: usize,
     n_window: usize,
     n_window_infer: usize,
     output_dim: usize,
     #[serde(default)]
     scale_embedding: bool,
+}
+
+// Qwen3ASRAudioEncoderConfig's upstream default.
+const fn default_conv_chunksize() -> usize {
+    500
 }
 
 #[cfg(test)]
@@ -360,6 +371,28 @@ mod tests {
     const MROPE: &str = r#", "rope_scaling": {"interleaved": true,
         "mrope_interleaved": true, "mrope_section": [24, 20, 20],
         "rope_type": "default", "type": "default"}"#;
+
+    #[test]
+    fn convolution_batch_size_defaults_and_rejects_zero() {
+        assert_eq!(
+            Qwen3AsrConfig::parse(&config("", MROPE))
+                .unwrap()
+                .encoder()
+                .conv_chunksize,
+            500
+        );
+        assert_eq!(
+            Qwen3AsrConfig::parse(&config(", \"conv_chunksize\": 2", MROPE))
+                .unwrap()
+                .encoder()
+                .conv_chunksize,
+            2
+        );
+        assert!(matches!(
+            Qwen3AsrConfig::parse(&config(", \"conv_chunksize\": 0", MROPE)),
+            Err(Qwen3AsrConfigError::EncoderShape)
+        ));
+    }
 
     #[test]
     fn reads_the_released_0_6b_layout() {

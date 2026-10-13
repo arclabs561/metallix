@@ -64,6 +64,9 @@ impl AudioEncoder {
         config: AudioEncoderConfig,
         checkpoint: &mut HashMap<String, Array>,
     ) -> Result<Self, EncoderError> {
+        if config.conv_chunksize == 0 {
+            return Err(EncoderError::Shape);
+        }
         let mut tensors = HashMap::new();
         for (name, shape) in required_tensors(&config) {
             let tensor = checkpoint
@@ -323,8 +326,39 @@ impl AudioEncoder {
         chunks: &[usize],
     ) -> Result<Array, EncoderError> {
         let stream = StreamOrDevice::gpu();
-        let dtype = self.dtype();
         let longest = chunks.iter().copied().max().unwrap_or(0);
+        let chunk_count = chunks.len();
+        let mut outputs = Vec::new();
+        for (batch, lengths) in chunks.chunks(self.config.conv_chunksize).enumerate() {
+            report_convolution_memory("before", batch, lengths.len())?;
+            let output =
+                self.convolve_batch(mel, lengths, batch * self.config.conv_chunksize, longest)?;
+            // Bound lazy convolution/GELU temporaries to this batch. Keeping
+            // unevaluated outputs would retain every batch's large graph.
+            output.eval()?;
+            report_convolution_memory("after", batch, lengths.len())?;
+            outputs.push(output);
+        }
+        let mut hidden = ops::concatenate_axis_device(&outputs, 0, &stream)?;
+        // Keep conv_out after concatenation, as in the source, so only the
+        // independent convolution batch dimension changes.
+        let shape = hidden.shape().to_vec();
+        let (frequency, time, channels) = (shape[1], shape[2], shape[3]);
+        hidden = hidden
+            .transpose_axes_device(&[0, 2, 3, 1], &stream)?
+            .reshape_device(&[as_i32(chunk_count)?, time, channels * frequency], &stream)?;
+        linear(&hidden, self.tensor("conv_out.weight")?, None)
+    }
+
+    fn convolve_batch(
+        &self,
+        mel: &audio::LogMel,
+        chunks: &[usize],
+        chunk_offset: usize,
+        longest: usize,
+    ) -> Result<Array, EncoderError> {
+        let stream = StreamOrDevice::gpu();
+        let dtype = self.dtype();
         let chunk_count = chunks.len();
 
         // [chunks, 128, longest, 1]: NHWC with frequency as height. A short
@@ -336,7 +370,7 @@ impl AudioEncoder {
         let mut host = vec![0.0_f32; chunk_count * MEL_BINS * longest];
         for (chunk, &length) in chunks.iter().enumerate() {
             for bin in 0..MEL_BINS {
-                let source = bin * mel.frames() + chunk * CHUNK_FRAMES;
+                let source = bin * mel.frames() + (chunk_offset + chunk) * CHUNK_FRAMES;
                 let target = (chunk * MEL_BINS + bin) * longest;
                 host[target..target + length]
                     .copy_from_slice(&mel.values()[source..source + length]);
@@ -360,14 +394,7 @@ impl AudioEncoder {
             .add_device(self.tensor(&format!("{conv}.bias"))?, &stream)?;
             hidden = gelu(&convolved)?;
         }
-        // [chunks, 16, time, channels] -> [chunks, time, channels * 16], the
-        // reference's `permute(0, 3, 1, 2).view(b, t, c * f)`.
-        let shape = hidden.shape().to_vec();
-        let (frequency, time, channels) = (shape[1], shape[2], shape[3]);
-        hidden = hidden
-            .transpose_axes_device(&[0, 2, 3, 1], &stream)?
-            .reshape_device(&[as_i32(chunk_count)?, time, channels * frequency], &stream)?;
-        linear(&hidden, self.tensor("conv_out.weight")?, None)
+        Ok(hidden)
     }
 
     fn layer(
@@ -449,6 +476,19 @@ impl AudioEncoder {
             .get(name)
             .ok_or_else(|| EncoderError::MissingTensor(name.to_owned()))
     }
+}
+
+/// Opt-in diagnostics also work in examples without a tracing subscriber.
+fn report_convolution_memory(phase: &str, batch: usize, chunks: usize) -> Result<(), EncoderError> {
+    if std::env::var_os("METALLIX_QWEN3_ASR_CONV_MEMORY").is_some() {
+        eprintln!(
+            "asr convolution {phase}: batch={batch} chunks={chunks} mlx_active_bytes={} mlx_cache_bytes={} mlx_peak_bytes={}",
+            mlx_rs::memory::active_memory()?,
+            mlx_rs::memory::cache_memory()?,
+            mlx_rs::memory::peak_memory()?,
+        );
+    }
+    Ok(())
 }
 
 /// How an encode deviates from the reference; only the reference layout is
@@ -646,4 +686,107 @@ pub enum EncoderError {
     /// MLX reported an error.
     #[error(transparent)]
     Mlx(#[from] mlx_rs::error::Exception),
+}
+
+#[cfg(test)]
+mod convolution_tests {
+    use super::*;
+
+    fn encoder(dtype: Dtype) -> AudioEncoder {
+        let config = AudioEncoderConfig {
+            d_model: 8,
+            layers: 1,
+            heads: 2,
+            ffn_dim: 16,
+            conv_channels: 4,
+            conv_chunksize: 3,
+            max_source_positions: 16,
+            window_chunks: 8,
+            output_dim: 8,
+        };
+        let mut tensors = required_tensors(&config)
+            .into_iter()
+            .map(|(name, shape)| {
+                let count: usize = shape.iter().map(|&n| usize::try_from(n).unwrap()).product();
+                let values: Vec<f32> = (0..count)
+                    .map(|i| f32::from(i16::try_from(i % 17).unwrap() + 1) / 100.0)
+                    .collect();
+                let value = Array::from_slice(&values, &shape).as_dtype(dtype).unwrap();
+                (format!("{TENSOR_PREFIX}{name}"), value)
+            })
+            .collect();
+        AudioEncoder::from_tensors(config, &mut tensors).unwrap()
+    }
+
+    fn mel(frames: usize) -> audio::LogMel {
+        let values = (0..MEL_BINS * frames)
+            .map(|i| f32::from(i16::try_from(i % 97).unwrap()) / 50.0 - 1.0)
+            .collect();
+        audio::LogMel::from_values(MEL_BINS, frames, values).unwrap()
+    }
+
+    fn values(array: &Array) -> Vec<f32> {
+        let wide = array
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .reshape(&[-1])
+            .unwrap();
+        wide.eval().unwrap();
+        wide.as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn convolution_batch_sizes_preserve_full_and_partial_chunks() {
+        // Three chunks puts the final partial chunk in a separate batch for
+        // sizes 1 and 2. It must still be padded to the clip-wide maximum.
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let mut encoder = encoder(dtype);
+            for frames in [36, 236, 300] {
+                let mel = mel(frames);
+                let chunks = chunk_lengths(frames);
+                encoder.config.conv_chunksize = chunks.len();
+                let reference = encoder.convolve_chunks(&mel, &chunks).unwrap();
+                assert_eq!(reference.dtype(), dtype);
+                let expected = values(&reference);
+                for batch_size in [1, 2] {
+                    encoder.config.conv_chunksize = batch_size;
+                    let actual = encoder.convolve_chunks(&mel, &chunks).unwrap();
+                    assert_eq!(actual.shape(), reference.shape());
+                    assert_eq!(actual.dtype(), dtype);
+                    let actual = values(&actual);
+                    let squared_error: f64 = actual
+                        .iter()
+                        .zip(&expected)
+                        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                        .sum();
+                    let norm: f64 = expected.iter().map(|&v| f64::from(v).powi(2)).sum();
+                    let relative = (squared_error / norm).sqrt();
+                    let bound = if dtype == Dtype::Float32 { 1e-5 } else { 2e-3 };
+                    assert!(
+                        relative <= bound,
+                        "{dtype:?} frames={frames} batch={batch_size}: relative L2 {relative}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_chunk_padding_changes_valid_convolution_outputs() {
+        let encoder = encoder(Dtype::Float32);
+        let mel = mel(236);
+        let padded = encoder.convolve_batch(&mel, &[36], 2, 100).unwrap();
+        let unpadded = encoder.convolve_batch(&mel, &[36], 2, 36).unwrap();
+        let valid = padded.index((.., .., 0..5, ..));
+        assert_eq!(valid.shape(), unpadded.shape());
+        let difference: f64 = values(&valid)
+            .iter()
+            .zip(values(&unpadded))
+            .map(|(&a, b)| (f64::from(a) - f64::from(b)).abs())
+            .sum();
+        assert!(
+            difference > 1e-5,
+            "padding control must expose the changed boundary"
+        );
+    }
 }

@@ -13,6 +13,8 @@
 //! Each line records MLX active, cache and peak bytes after its clip, so
 //! allocator growth across requests is visible. The allocator cache is capped
 //! (default 2 GiB), as the server caps it.
+//! Set `METALLIX_QWEN3_ASR_CONV_MEMORY=1` to print MLX active/cache/peak
+//! bytes before and after each evaluated convolution batch.
 //!
 //! Missing clip inputs fail the run rather than reporting a successful gate.
 
