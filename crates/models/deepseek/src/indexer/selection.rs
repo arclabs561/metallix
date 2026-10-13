@@ -46,8 +46,6 @@ impl SelectionGeometry {
     ///   not fit its bound.
     /// * [`SelectionGeometryError::KeyCountMismatch`] unless `key_count` is the
     ///   causal prefix the last position reaches.
-    /// * [`SelectionGeometryError::DecodeMustHaveOnePosition`] for a decode
-    ///   call (nonzero `token_start`) with more than one position.
     /// * [`SelectionGeometryError::OffsetOutOfRange`] when `offset` plus the
     ///   highest reachable key does not fit `i32`.
     pub fn new(
@@ -71,11 +69,6 @@ impl SelectionGeometry {
         let end = token_start
             .checked_add(positions.get())
             .ok_or(SelectionGeometryError::PositionOverflow)?;
-        if token_start != 0 && positions.get() != 1 {
-            return Err(SelectionGeometryError::DecodeMustHaveOnePosition {
-                positions: positions.get(),
-            });
-        }
         let reachable = end / compression_ratio.get();
         if key_count.get() != reachable {
             return Err(SelectionGeometryError::KeyCountMismatch {
@@ -248,7 +241,8 @@ pub enum SelectionGeometryError {
         /// Keys the last position can reach.
         expected: usize,
     },
-    /// Decode source calls must contain exactly one token position.
+    /// Legacy singleton-continuation rejection, retained for compatibility.
+    /// Contiguous multi-position calls no longer produce this variant.
     #[error("selection decode at nonzero token start requires one position, got {positions}")]
     DecodeMustHaveOnePosition {
         /// Positions supplied.
@@ -500,11 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn geometry_rejects_multitoken_decode_and_zero_reachable_prefix() {
-        assert!(matches!(
-            SelectionGeometry::new(1, nz(2), nz(3), nz(1), 0),
-            Err(SelectionGeometryError::DecodeMustHaveOnePosition { positions: 2 })
-        ));
+    fn geometry_accepts_contiguous_chunks_and_rejects_zero_reachable_prefix() {
+        let chunk = SelectionGeometry::new(1, nz(2), nz(3), nz(1), 0).unwrap();
+        assert_eq!(chunk.token_start, 1);
         assert!(matches!(
             SelectionGeometry::new(0, nz(1), nz(1), nz(2), 0),
             Err(SelectionGeometryError::KeyCountMismatch {

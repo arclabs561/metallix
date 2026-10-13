@@ -57,7 +57,7 @@ pub struct V41ModelOptions {
     pub backend: V41Backend,
     /// Total appended positions, at most 32,768.
     pub context_tokens: NonZeroU32,
-    /// Initial prefill chunk, 2 through 128; later positions are singletons.
+    /// Maximum tokens per prefill chunk, 2 through 128.
     pub prefill_step_tokens: NonZeroU32,
     /// Retained raw range-cache budget, default 2 GiB.
     pub cache_bytes: NonZeroU64,
@@ -227,8 +227,8 @@ pub struct V41Session<'m> {
 impl V41Session<'_> {
     /// Appends IDs and returns the last position's logits, without token selection.
     /// Initial input currently needs two tokens: the ratio-two partial-group
-    /// schedule cannot start without prior ratio-one keys. The first chunk uses
-    /// `prefill_step_tokens`; all subsequent positions execute one at a time.
+    /// schedule cannot start without prior ratio-one keys. Consecutive chunks
+    /// contain at most `prefill_step_tokens` positions, including after prefill.
     ///
     /// # Errors
     /// Empty/invalid input, context overflow, missing/corrupt ranges and request

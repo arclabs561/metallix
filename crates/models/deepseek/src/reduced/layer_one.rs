@@ -411,7 +411,16 @@ impl LayerOneSession {
         let offset = if prepared.start == 0 {
             call.positions.get()
         } else {
-            self.config.attention_layout.window().get()
+            self.config
+                .attention_layout
+                .window()
+                .get()
+                .checked_add(if call.positions.get() == 1 {
+                    0
+                } else {
+                    call.positions.get()
+                })
+                .ok_or(LayerOneSessionError::PositionOverflow)?
         };
         let (causal_scores, indices) = causal_select(
             &scored.scores,

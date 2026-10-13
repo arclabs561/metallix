@@ -738,6 +738,105 @@ mod tests {
     }
 
     #[test]
+    fn repeated_chunks_match_full_prefill_and_preserve_following_decode() {
+        let artifact = generation_fixture();
+        model::with_request_model(
+            &artifact.config,
+            &artifact.tensors,
+            IndexScoreExecution::Scalar,
+            IndexKeyPreparationExecution::Scalar,
+            FinalHeadExecution::Scalar,
+            |model| {
+                for lengths in [&[2, 3][..], &[3, 2], &[2, 2, 1]] {
+                    check_repeated_chunks(model, lengths);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    fn check_repeated_chunks(model: &crate::reduced::RequestModel<'_>, lengths: &[usize]) {
+        use crate::reduced::{RequestError, RequestSession, StepSources};
+        let ids = [0, 1, 2, 3, 4];
+        let mut full = RequestSession::new(model).unwrap();
+        let expected = full.step(&ids).unwrap();
+        let expected_decode = full.step(&[6]).unwrap();
+        let stride = expected.residual().len() / ids.len();
+        let mut split = RequestSession::new(model).unwrap();
+        let mut start = 0;
+        for &length in lengths {
+            let end = start + length;
+            let output = split.step(&ids[start..end]).unwrap();
+            assert_eq!(
+                output.heads().len(),
+                length,
+                "one actual multi-position call"
+            );
+            assert_eq!(
+                output.residual(),
+                &expected.residual()[start * stride..end * stride]
+            );
+            for (actual, expected) in output.heads().iter().zip(&expected.heads()[start..end]) {
+                assert_eq!(
+                    actual
+                        .logits()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .logits()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+            assert_eq!(split.next_start(), end);
+            start = end;
+        }
+        let decode = split.step(&[6]).unwrap();
+        assert_eq!(decode.residual(), expected_decode.residual());
+        assert_eq!(
+            last_logits(&decode).unwrap(),
+            last_logits(&expected_decode).unwrap()
+        );
+        assert!(matches!(split.step(&[]), Err(RequestError::EmptyIds)));
+        assert!(
+            !split.is_poisoned(),
+            "pre-admission rejection retains old contract"
+        );
+        assert!(split.step(&[999]).is_err());
+        assert!(
+            split.is_poisoned(),
+            "admitted numerical failure invalidates session"
+        );
+        assert!(matches!(split.step(&[0, 1]), Err(RequestError::Poisoned)));
+        split.restart().unwrap();
+        assert_eq!(split.next_start(), 0);
+        let chunked_model = model
+            .clone()
+            .with_max_step_tokens(std::num::NonZeroUsize::new(2).unwrap());
+        let mut chunked = RequestSession::new(&chunked_model).unwrap();
+        let first = chunked
+            .prefill_with_sources(&ids[..4], StepSources::default())
+            .unwrap();
+        assert_eq!(
+            first.heads().len(),
+            2,
+            "prefill retains multi-token later chunks"
+        );
+        assert_eq!(
+            first.residual(),
+            &expected.residual()[2 * stride..4 * stride]
+        );
+        let last = chunked
+            .prefill_with_sources(&ids[4..], StepSources::default())
+            .unwrap();
+        assert_eq!(last.heads().len(), 1);
+        assert_eq!(last_logits(&last).unwrap(), last_logits(&expected).unwrap());
+    }
+
+    #[test]
     fn owning_generation_state_matches_borrowed_request_and_requires_reset() {
         use crate::reduced::{RequestSession, StepSources};
         use crate::{TokenId, generation::append_with_sources};

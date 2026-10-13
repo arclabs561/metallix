@@ -427,3 +427,49 @@ fn failed_reset_or_late_norm_failure_preserves_prior_continuation() {
     assert_eq!(actual, expected);
     assert_eq!(candidate.next_position(), baseline.next_position());
 }
+
+#[test]
+fn chunk_continuations_match_regrouped_pinned_singleton_outputs() {
+    let fixture = fixture();
+    for case in fixture.cases.iter().filter(|case| case.ratio > 1) {
+        let mut state = CompressorState::new(
+            BATCHES,
+            WIDTH,
+            case.ratio,
+            &fixture.norm_weight_bf16,
+            fixture.epsilon,
+        )
+        .unwrap();
+        let initial = &case.calls[0];
+        assert_eq!(
+            forward_fixture_call(&mut state, case.ratio, initial).unwrap(),
+            initial.output_bf16
+        );
+        let tail = &case.calls[1..];
+        let mut input = Vec::new();
+        let mut expected = Vec::new();
+        for batch in 0..BATCHES {
+            for call in tail {
+                assert_eq!(call.positions, 1);
+                input.extend_from_slice(&call.input_bf16[batch * WIDTH..(batch + 1) * WIDTH]);
+                if let Some(output) = &call.output_bf16 {
+                    expected.extend_from_slice(&output[batch * WIDTH..(batch + 1) * WIDTH]);
+                }
+            }
+        }
+        let combined = Call {
+            start: case.prefix,
+            positions: tail.len(),
+            input_bf16: input,
+            output_bf16: Some(expected),
+        };
+        assert_eq!(
+            forward_fixture_call(&mut state, case.ratio, &combined).unwrap(),
+            combined.output_bf16,
+            "ratio {} prefix {}",
+            case.ratio,
+            case.prefix
+        );
+        assert_eq!(state.next_position(), 9);
+    }
+}

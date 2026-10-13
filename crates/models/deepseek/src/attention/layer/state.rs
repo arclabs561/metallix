@@ -60,6 +60,9 @@ pub struct CompressedAttentionPublication<'a> {
     /// Numerical, already-quantized-and-reconstructed BF16 `[batch, key, head_dim]`.
     pub numerical_bf16: &'a [u16],
     /// Source indices `[batch, query, compressed_slot]`, offset into concatenated KV.
+    /// The window-key offset is the chunk length at start zero, the window
+    /// capacity for a singleton continuation, and window capacity plus chunk
+    /// length for a multi-position continuation.
     pub indices: &'a [i32],
 }
 
@@ -181,7 +184,6 @@ impl LayerAttentionState {
     ///   [`LayerAttentionError::FutureCompressedIndex`] when the publication
     ///   is not the one this call expects.
     /// * [`LayerAttentionError::InputLength`],
-    ///   [`LayerAttentionError::DecodeMustHaveOnePosition`] and
     ///   [`LayerAttentionError::DiscontinuousPosition`] when the input or its
     ///   position does not continue the sequence (a call at position 0 starts
     ///   a new one).
@@ -306,7 +308,6 @@ impl LayerAttentionState {
     /// * [`LayerAttentionError::CompressedLayoutRequiresPublication`] for a
     ///   compressed layout.
     /// * [`LayerAttentionError::InputLength`],
-    ///   [`LayerAttentionError::DecodeMustHaveOnePosition`] and
     ///   [`LayerAttentionError::DiscontinuousPosition`] when the input or its
     ///   position does not continue the sequence (a call at position 0 starts
     ///   a new one).
@@ -510,11 +511,8 @@ impl LayerAttentionState {
             self.layout.head_dimension,
             &mut staged_ring,
         )?;
-        let (window_read, window_keys) = if start_position == 0 {
-            (prepared_window.clone(), positions)
-        } else {
-            (staged_ring.clone(), self.layout.window.get())
-        };
+        let (window_read, window_keys) =
+            self.window_snapshot(start_position, positions, &prepared_window, &staged_ring)?;
         let window_indices = window_topk_indices(step, self.layout.window, self.layout.batches)?;
         let (shared_kv, indices, compressed_keys) = if let Some(publication) = publication {
             let compressed_keys = self.compressed_keys(publication)?;
@@ -547,6 +545,39 @@ impl LayerAttentionState {
             indices,
             window_keys,
             compressed_keys,
+        })
+    }
+
+    fn window_snapshot(
+        &self,
+        start_position: usize,
+        positions: usize,
+        prepared_window: &[u16],
+        staged_ring: &[u16],
+    ) -> Result<(Vec<u16>, usize), LayerAttentionError> {
+        Ok(if start_position == 0 {
+            (prepared_window.to_vec(), positions)
+        } else if positions == 1 {
+            (staged_ring.to_vec(), self.layout.window.get())
+        } else {
+            // Keep pre-call ring values alive for early queries even when the
+            // completed chunk overwrites those slots in the staged final ring.
+            let keys = self.layout.window.get().checked_add(positions).ok_or(
+                LayerAttentionError::ShapeOverflow {
+                    field: "append window keys",
+                },
+            )?;
+            (
+                concatenate_kv(
+                    &self.ring,
+                    self.layout.window.get(),
+                    prepared_window,
+                    positions,
+                    self.layout.batches.get(),
+                    self.layout.head_dimension.get(),
+                )?,
+                keys,
+            )
         })
     }
 
@@ -629,9 +660,6 @@ impl LayerAttentionState {
                 self.next_position.is_some(),
             ));
         }
-        if positions != 1 {
-            return Err(LayerAttentionError::DecodeMustHaveOnePosition { positions });
-        }
         if self.next_position != Some(start) {
             return Err(LayerAttentionError::DiscontinuousPosition {
                 expected: self.next_position,
@@ -639,8 +667,15 @@ impl LayerAttentionState {
             });
         }
         Ok((
-            WindowStep::Decode {
-                position: NonZeroUsize::new(start).expect("nonzero start"),
+            if positions == 1 {
+                WindowStep::Decode {
+                    position: NonZeroUsize::new(start).expect("nonzero start"),
+                }
+            } else {
+                WindowStep::Append {
+                    position: NonZeroUsize::new(start).expect("nonzero start"),
+                    tokens: NonZeroUsize::new(positions).expect("nonempty input"),
+                }
             },
             false,
         ))
@@ -741,6 +776,11 @@ impl LayerAttentionState {
         let window_keys = match step {
             WindowStep::Prefill { .. } => positions,
             WindowStep::Decode { .. } => self.layout.window.get(),
+            WindowStep::Append { .. } => self.layout.window.get().checked_add(positions).ok_or(
+                LayerAttentionError::ShapeOverflow {
+                    field: "append window keys",
+                },
+            )?,
         };
         for row in 0..denominator {
             let query = row % positions;

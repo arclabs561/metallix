@@ -112,7 +112,8 @@ pub enum RequestError {
     /// The caller supplied an empty token chunk.
     #[error("request needs at least one token ID")]
     EmptyIds,
-    /// A post-prefill call included more than one decode token.
+    /// Legacy singleton-continuation rejection, retained for compatibility.
+    /// Contiguous multi-position calls no longer produce this variant.
     #[error("request decode accepts one token, got {actual}")]
     DecodeChunk {
         /// Tokens supplied.

@@ -109,7 +109,8 @@ pub enum CompressorError {
         /// Supplied starting position.
         actual: usize,
     },
-    /// A ratio-greater-than-one continuation must contain exactly one token.
+    /// Legacy singleton-continuation rejection, retained for compatibility.
+    /// Contiguous multi-position calls no longer produce this variant.
     #[error("compressor ratio {ratio} continuation has {positions} positions, expected one")]
     ChunkedContinuation {
         /// Configured compression ratio.
@@ -147,7 +148,7 @@ pub enum CompressorError {
 /// Streaming state for a preprojected V4.1 compressor.
 ///
 /// `start == 0` is an explicit reset.  Otherwise calls must be sequential;
-/// ratio-greater-than-one decoding accepts exactly one position at a time.
+/// complete groups may span calls and each call may complete multiple groups.
 /// Every failing call, including a reset attempt, leaves this state unchanged.
 #[derive(Clone, Debug)]
 pub struct CompressorState {
@@ -333,6 +334,14 @@ impl CompressorState {
                 self.ratio,
                 self.width,
             )?
+        } else if positions > 1 {
+            self.pool_continuation(
+                kv,
+                scores,
+                positions,
+                start,
+                (&mut next_kv, &mut next_scores),
+            )?
         } else {
             store_slot(
                 &mut next_kv,
@@ -359,12 +368,55 @@ impl CompressorState {
         Ok(output)
     }
 
+    // Inputs and output remain batch-major. Stage every write so an error in
+    // any later group leaves the caller's pending group and cursor untouched.
+    fn pool_continuation(
+        &self,
+        kv: &[f32],
+        scores: &[f32],
+        positions: usize,
+        start: usize,
+        state: (&mut [f32], &mut [f32]),
+    ) -> Result<Vec<u16>, CompressorError> {
+        let complete = next_position(start, positions)? / self.ratio - start / self.ratio;
+        let elements = checked_elements(self.batches, complete, self.width, "pooled output")?;
+        let mut pooled = reserve_u16(elements, "pooled output")?;
+        let (next_kv, next_scores) = state;
+        for batch in 0..self.batches {
+            let mut group = 0;
+            for position in 0..positions {
+                let absolute = start + position;
+                let slot = absolute % self.ratio;
+                let source = (batch * positions + position) * self.width;
+                let target = (batch * self.ratio + slot) * self.width;
+                next_kv[target..target + self.width]
+                    .copy_from_slice(&kv[source..source + self.width]);
+                next_scores[target..target + self.width]
+                    .copy_from_slice(&scores[source..source + self.width]);
+                if slot + 1 == self.ratio {
+                    pool_group(
+                        next_kv,
+                        next_scores,
+                        batch * self.ratio * self.width,
+                        self.ratio,
+                        self.width,
+                        batch,
+                        group,
+                        &mut pooled,
+                    )?;
+                    group += 1;
+                }
+            }
+        }
+        Ok(pooled)
+    }
+
     fn validate_call(&self, positions: usize, start: usize) -> Result<usize, CompressorError> {
         if positions == 0 {
             return Err(CompressorError::EmptyDimension { field: "positions" });
         }
         let elements = checked_elements(self.batches, positions, self.width, "input")?;
-        self.validate_stream(start, positions)?;
+        self.validate_stream(start)?;
         Ok(elements)
     }
 
@@ -374,18 +426,12 @@ impl CompressorState {
         self.next_position
     }
 
-    fn validate_stream(&self, start: usize, positions: usize) -> Result<(), CompressorError> {
+    fn validate_stream(&self, start: usize) -> Result<(), CompressorError> {
         if start == 0 {
             return Ok(());
         }
         if self.next_position == 0 {
             return Err(CompressorError::FirstPosition { actual: start });
-        }
-        if self.ratio > 1 && positions != 1 {
-            return Err(CompressorError::ChunkedContinuation {
-                ratio: self.ratio,
-                positions,
-            });
         }
         if start != self.next_position {
             return Err(CompressorError::NonSequentialPosition {

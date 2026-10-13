@@ -294,7 +294,16 @@ impl LayerFourSession {
         let expected_offset = if self.next_start == 0 {
             positions.get()
         } else {
-            self.config.attention_layout.window().get()
+            self.config
+                .attention_layout
+                .window()
+                .get()
+                .checked_add(if positions.get() == 1 {
+                    0
+                } else {
+                    positions.get()
+                })
+                .ok_or(LayerFourSessionError::PositionOverflow)?
         };
         if selection_call.offset() != expected_offset {
             return Err(LayerFourSessionError::CandidateOffset {

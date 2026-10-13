@@ -358,7 +358,17 @@ impl LayerThreeSession {
         let window_offset = if start == 0 {
             call.positions.get()
         } else {
-            self.config.window_size.get()
+            self.config
+                .window_size
+                .get()
+                .checked_add(if call.positions.get() == 1 {
+                    0
+                } else {
+                    call.positions.get()
+                })
+                .ok_or(LayerAttentionError::ShapeOverflow {
+                    field: "append window keys",
+                })?
         };
         let selection_call = SelectionCall::new(
             pending.publication(),

@@ -19,6 +19,11 @@ pub(crate) enum WindowStep {
         /// Number of tokens in the supplied chunk.
         tokens: NonZeroUsize,
     },
+    /// A contiguous multi-token append using old-ring plus chunk key storage.
+    Append {
+        position: NonZeroUsize,
+        tokens: NonZeroUsize,
+    },
     /// One decode token at a strictly positive absolute position.
     ///
     /// Position zero belongs to [`Self::Prefill`], matching the pinned branch.
@@ -31,7 +36,7 @@ pub(crate) enum WindowStep {
 impl WindowStep {
     fn input_positions(self) -> usize {
         match self {
-            Self::Prefill { tokens } => tokens.get(),
+            Self::Prefill { tokens } | Self::Append { tokens, .. } => tokens.get(),
             Self::Decode { .. } => 1,
         }
     }
@@ -125,6 +130,33 @@ pub(crate) fn window_topk_indices(
                 }
             }
         }
+        WindowStep::Append { position, tokens } => {
+            let start = position.get();
+            let count = tokens.get();
+            start.checked_add(count).ok_or(WindowError::ShapeOverflow {
+                field: "append end",
+            })?;
+            for batch in 0..shape.batches {
+                for query in 0..count {
+                    let absolute = start + query;
+                    let first = (absolute + 1).saturating_sub(shape.window);
+                    let destination = (batch * count + query) * shape.slots;
+                    for (slot, key) in (first..=absolute).enumerate() {
+                        let physical = if key < start {
+                            key % shape.window
+                        } else {
+                            shape.window.checked_add(key - start).ok_or(
+                                WindowError::ShapeOverflow {
+                                    field: "append key",
+                                },
+                            )?
+                        };
+                        indices[destination + slot] = i32::try_from(physical)
+                            .map_err(|_| WindowError::IndexOutOfRange { position: physical })?;
+                    }
+                }
+            }
+        }
         WindowStep::Decode { position } => {
             let position = position.get();
             let oldest =
@@ -195,6 +227,24 @@ pub(crate) fn write_window_kv_bf16(
                 }
             }
         }
+        WindowStep::Append { position, tokens } => {
+            let count = tokens.get();
+            position
+                .get()
+                .checked_add(count)
+                .ok_or(WindowError::ShapeOverflow {
+                    field: "append end",
+                })?;
+            for batch in 0..shape.batches {
+                for query in count.saturating_sub(shape.window)..count {
+                    let source = (batch * count + query) * shape.width;
+                    let slot = (position.get() + query) % shape.window;
+                    let destination = (batch * shape.window + slot) * shape.width;
+                    ring[destination..destination + shape.width]
+                        .copy_from_slice(&prepared_kv[source..source + shape.width]);
+                }
+            }
+        }
         WindowStep::Decode { position } => {
             let slot = position.get() % shape.window;
             for batch in 0..shape.batches {
@@ -225,7 +275,7 @@ impl ScheduleShape {
         let window = window.get();
         let slots = match step {
             WindowStep::Prefill { tokens } => tokens.get().min(window),
-            WindowStep::Decode { .. } => window,
+            WindowStep::Decode { .. } | WindowStep::Append { .. } => window,
         };
         let elements = product(&[batches.get(), step.input_positions(), slots], "schedule")?;
         enforce_bound("schedule", elements)?;
@@ -317,6 +367,36 @@ mod tests {
 
     fn nz(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test dimensions are nonzero")
+    }
+
+    #[test]
+    fn append_keeps_old_keys_for_early_queries_across_ring_wrap() {
+        let step = WindowStep::Append {
+            position: nz(3),
+            tokens: nz(5),
+        };
+        let indices = window_topk_indices(step, nz(4), nz(2)).unwrap();
+        // The read buffer is [old ring (4), current chunk (5)] for each batch.
+        // Absolute query3 still needs old tokens0..2, even though final ring
+        // storage is completely overwritten by tokens4..7.
+        let expected = [0, 1, 2, 4, 1, 2, 4, 5, 2, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8];
+        assert_eq!(indices, [expected, expected].concat());
+        let mut ring = [0, 1, 2, 99, 100, 101, 102, 199];
+        let prepared = [3, 4, 5, 6, 7, 103, 104, 105, 106, 107];
+        write_window_kv_bf16(step, &prepared, nz(2), nz(4), nz(1), &mut ring).unwrap();
+        assert_eq!(ring, [4, 5, 6, 7, 104, 105, 106, 107]);
+    }
+
+    #[test]
+    fn append_overflow_rejects_before_ring_mutation() {
+        let step = WindowStep::Append {
+            position: nz(usize::MAX),
+            tokens: nz(2),
+        };
+        let mut ring = [17; 4];
+        assert!(write_window_kv_bf16(step, &[1, 2], nz(1), nz(4), nz(1), &mut ring).is_err());
+        assert_eq!(ring, [17; 4]);
+        assert!(window_topk_indices(step, nz(4), nz(1)).is_err());
     }
 
     #[test]

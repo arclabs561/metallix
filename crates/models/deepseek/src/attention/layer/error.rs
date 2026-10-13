@@ -114,7 +114,8 @@ pub enum LayerAttentionError {
         /// Elements per position.
         stride: usize,
     },
-    /// A decode call supplied other than one position.
+    /// Legacy singleton-continuation rejection, retained for compatibility.
+    /// Contiguous multi-position calls no longer produce this variant.
     #[error("decode requires exactly one position, got {positions}")]
     DecodeMustHaveOnePosition {
         /// Positions supplied.
