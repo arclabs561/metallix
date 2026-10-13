@@ -417,3 +417,199 @@ fn scalar_fixture_distinguishes_swapped_gate_and_up_scales() {
         "the paging oracle must detect a scale-pairing mutation"
     );
 }
+
+struct ReceiptFixture {
+    dir: std::path::PathBuf,
+    index: crate::manifest::V41SafetensorsIndex,
+    header: crate::checkpoint::V41SafetensorsHeader,
+}
+
+impl ReceiptFixture {
+    fn new(missing: Option<&str>) -> Self {
+        use sha2::{Digest, Sha256};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "metallix-paged-receipts-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let source = Source::new();
+        let mut metadata = serde_json::Map::new();
+        let mut placements = serde_json::Map::new();
+        let mut offset = 0_u64;
+        for (name, (info, bytes)) in &source.tensors {
+            let end = offset + u64::try_from(bytes.len()).unwrap();
+            metadata.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": if name.ends_with(".weight") { "I8" } else { "F8_E8M0" },
+                    "shape": info.shape(), "data_offsets": [offset, end]
+                }),
+            );
+            placements.insert(name.clone(), "model.safetensors".into());
+            offset = end;
+        }
+        let json = serde_json::to_vec(&metadata).unwrap();
+        let header = crate::checkpoint::V41SafetensorsHeader::parse(
+            &json,
+            8 + u64::try_from(json.len()).unwrap() + offset,
+        )
+        .unwrap();
+        let index = crate::manifest::V41SafetensorsIndex::parse(
+            &serde_json::json!({
+                "metadata": {"total_size": offset}, "weight_map": placements
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for (name, (info, bytes)) in &source.tensors {
+            let range = header.tensor(name).unwrap().file_range();
+            std::fs::write(dir.join(format!("{name}.bin")), bytes).unwrap();
+            if missing == Some(name.as_str()) {
+                continue;
+            }
+            let receipt = serde_json::json!({
+                "tensor": name, "shard": "model.safetensors", "revision": "pinned",
+                "range": [range.start, range.end], "bytes": bytes.len(),
+                "metadata": {"dtype": if name.ends_with(".weight") { "I8" } else { "F8_E8M0" }, "shape": info.shape()},
+                "sha256": format!("{:x}", Sha256::digest(bytes))
+            });
+            std::fs::write(
+                dir.join(format!("{name}.receipt.json")),
+                receipt.to_string(),
+            )
+            .unwrap();
+        }
+        Self { dir, index, header }
+    }
+
+    fn local(&self) -> crate::checkpoint::local_store::V41LocalStoreSource {
+        crate::checkpoint::local_store::V41LocalStoreSource::new(self.dir.clone(), "pinned".into())
+    }
+
+    fn bridge(&self) -> crate::checkpoint::receipt_experts::V41ReceiptExpertSource {
+        crate::checkpoint::receipt_experts::V41ReceiptExpertSource::new(
+            self.local(),
+            &self.index,
+            [("model.safetensors".into(), self.header.clone())],
+        )
+        .unwrap()
+    }
+
+    fn snapshot(&self) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(&self.dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+}
+
+impl Drop for ReceiptFixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).unwrap();
+    }
+}
+
+#[test]
+fn receipt_pager_matches_existing_provider_across_evictions_without_writes() {
+    use crate::checkpoint::range_cache::{V41CachedRoutedExperts, V41RangeCache};
+    let fixture = ReceiptFixture::new(None);
+    let before = fixture.snapshot();
+    let bridge = Arc::new(fixture.bridge());
+    let locator = V41ExpertLocator::new(
+        bridge,
+        NonZeroU16::new(2).unwrap(),
+        NonZeroU16::new(3).unwrap(),
+        HIDDEN,
+        INTERMEDIATE,
+    )
+    .unwrap();
+    let pager = V41PagedExperts::new(locator, EXPERT_BYTES).unwrap();
+    let old = Mutex::new(
+        V41RangeCache::new(
+            fixture.local(),
+            fixture.index.clone(),
+            [("model.safetensors".into(), fixture.header.clone())],
+            EXPERT_BYTES,
+        )
+        .unwrap(),
+    );
+    for (layer, index) in [(0_u16, 0), (0, 1), (0, 0), (1, 0)] {
+        let expected = V41CachedRoutedExperts::new(&old, usize::from(layer), HIDDEN, INTERMEDIATE)
+            .with_expert(index, &mut |weights| {
+                weights.forward_token(&input(), 0.0, Some(0.7))
+            })
+            .unwrap();
+        let actual = pager
+            .layer(layer)
+            .unwrap()
+            .with_expert(index, &mut |weights| {
+                weights.forward_token(&input(), 0.0, Some(0.7))
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual,
+            Source::new().reference(ExpertKey {
+                layer,
+                expert: u16::try_from(index).unwrap()
+            })
+        );
+    }
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn receipt_failures_do_not_publish_or_run_callbacks_or_write_files() {
+    let name = "layers.0.ffn.experts.0.w3.scale";
+    for corrupt in [false, true] {
+        let fixture = ReceiptFixture::new((!corrupt).then_some(name));
+        if corrupt {
+            // Same length, wrong digest: the receipt must be consulted.
+            std::fs::write(
+                fixture.dir.join(format!("{name}.bin")),
+                vec![127; INTERMEDIATE * HIDDEN / 32],
+            )
+            .unwrap();
+        }
+        let before = fixture.snapshot();
+        let locator = V41ExpertLocator::new(
+            Arc::new(fixture.bridge()),
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU16::new(3).unwrap(),
+            HIDDEN,
+            INTERMEDIATE,
+        )
+        .unwrap();
+        let pager = V41PagedExperts::new(locator, EXPERT_BYTES).unwrap();
+        let mut callbacks = 0;
+        let result = pager.layer(0).unwrap().with_expert(0, &mut |_| {
+            callbacks += 1;
+            Ok(vec![])
+        });
+        assert!(result.is_err());
+        assert_eq!(callbacks, 0);
+        assert!(pager.cache.lock().unwrap().is_empty());
+        assert_eq!(fixture.snapshot(), before);
+    }
+}
+
+#[test]
+fn receipt_bridge_validates_caller_range_and_budget_before_reading() {
+    let fixture = ReceiptFixture::new(Some("layers.0.ffn.experts.0.w1.weight"));
+    let source = fixture.bridge();
+    let name = "layers.0.ffn.experts.0.w1.weight";
+    let range = source.tensor(name).unwrap().range();
+    assert!(source.read(name, range.end - range.start - 1).is_err());
+    let mut sentinel = [42];
+    assert!(
+        source
+            .read_range(name, range.start - 1..range.start, &mut sentinel)
+            .is_err()
+    );
+    assert_eq!(sentinel, [42]);
+}

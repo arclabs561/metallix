@@ -21,6 +21,7 @@ pub mod paged_experts;
 pub mod mlx;
 pub use mlx::{LayerZeroAttentionActivation, LayerZeroQkvResident};
 pub mod range_cache;
+pub mod receipt_experts;
 mod source_fp4;
 mod source_fp8;
 pub use source_fp4::{
