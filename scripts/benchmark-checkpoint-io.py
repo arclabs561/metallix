@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -249,7 +249,7 @@ def main() -> int:
     record: dict[str, object] = {
         "schema_version": 1,
         "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(UTC).isoformat(),
         "scope": "aligned random pread latency curve for one checkpoint artifact; not model inference or a weight load; deadline is cooperative around blocking pread calls",
         "environment": {
             "system": platform.system(),

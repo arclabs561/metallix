@@ -20,9 +20,8 @@ directories fails, so a new crate has to choose its tier.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TIERS = ("core", "metal", "models", "app")
