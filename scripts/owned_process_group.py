@@ -1,8 +1,10 @@
 """Unreaped-child anchored cleanup for trusted children that stay in their session."""
 
+import ctypes
 import os
 import signal
 import subprocess
+import sys
 import time
 
 
@@ -121,3 +123,87 @@ def require_wait_capabilities():
             "unsupported Python: owned-group cleanup requires os."
             + ", os.".join(missing)
         )
+
+
+def footprint(process, sampler, identities):
+    """Sample live group members; None means the unreaped leader exited."""
+    try:
+        group = members(process.pid)
+        if process.pid not in group:
+            if confirm_terminal_after_disappearance(process) is not None:
+                return None
+            raise RuntimeError("owned leader absent from group inventory")
+        total = 0
+        for pid, state in group.items():
+            if "Z" in state:
+                continue
+            try:
+                if os.getpgid(pid) != process.pid:
+                    raise RuntimeError("sampled member changed process group")
+                size, identity = sampler(pid)
+            except ProcessLookupError:
+                if pid == process.pid:
+                    raise
+                current = members(process.pid).get(pid)
+                if current is not None and "Z" not in current:
+                    raise
+                continue
+            if not isinstance(size, int) or size < 0 or not identity:
+                raise RuntimeError("invalid footprint measurement")
+            if identities.setdefault(pid, identity) != identity:
+                raise RuntimeError("process identity changed")
+            total += size
+        return total
+    except ProcessLookupError:
+        if confirm_terminal_after_disappearance(process) is None:
+            raise
+        return None
+
+
+class Usage(ctypes.Structure):
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "user_time",
+            "system_time",
+            "pkg_idle_wkups",
+            "interrupt_wkups",
+            "pageins",
+            "wired_size",
+            "resident_size",
+            "phys_footprint",
+            "proc_start_abstime",
+            "proc_exit_abstime",
+            "child_user_time",
+            "child_system_time",
+            "child_pkg_idle_wkups",
+            "child_interrupt_wkups",
+            "child_pageins",
+            "child_elapsed_abstime",
+            "diskio_bytesread",
+            "diskio_byteswritten",
+        )
+    ]
+
+
+class NativeSampler:
+    def __init__(self):
+        if sys.platform != "darwin":
+            raise RuntimeError("requires macOS physical footprint API")
+        self.lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        self.lib.proc_pid_rusage.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self.lib.proc_pid_rusage.restype = ctypes.c_int
+        if ctypes.sizeof(Usage) != 160 or Usage.phys_footprint.offset != 72:
+            raise RuntimeError("rusage_info_v2 ABI mismatch")
+
+    def __call__(self, pid):
+        usage = Usage()
+        if self.lib.proc_pid_rusage(pid, 2, ctypes.byref(usage)) != 0:
+            raise OSError(ctypes.get_errno(), "proc_pid_rusage failed", pid)
+        if usage.proc_start_abstime == 0:
+            raise RuntimeError("missing process start identity")
+        return usage.phys_footprint, usage.proc_start_abstime

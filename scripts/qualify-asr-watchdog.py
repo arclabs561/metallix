@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = []
 # ///
-"""Run a prebuilt transcribe_clips example on 1200 s of silence with hard caps.
+"""Run a prebuilt transcribe_clips example on 1200 s of silence with sampled caps.
 
 This qualifies completion of one synthetic long input, not speech accuracy or
 an idle-machine performance result. GPU memory is a machine-wide ioreg total.
@@ -22,7 +22,14 @@ import wave
 from pathlib import Path
 
 from bench_system import probe
-from owned_process_group import cleanup, exited, members, require_wait_capabilities
+from owned_process_group import (
+    NativeSampler,
+    cleanup,
+    exited,
+    footprint,
+    members,
+    require_wait_capabilities,
+)
 
 
 def main():
@@ -32,10 +39,19 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--abort-gpu-gib", type=float, required=True)
+    parser.add_argument("--abort-footprint-gib", type=float, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     args = parser.parse_args()
-    if not 0 < args.abort_gpu_gib < float("inf") or args.timeout_seconds <= 0:
+    if (
+        not 0 < args.abort_gpu_gib < float("inf")
+        or not 0 < args.abort_footprint_gib < float("inf")
+        or args.timeout_seconds <= 0
+    ):
         parser.error("memory and timeout caps must be finite and positive")
+    sampler = NativeSampler()
+    footprint_cap = int(args.abort_footprint_gib * 2**30)
+    footprint_peak, footprint_samples = 0, 0
+    identities = {}
     binary, model = args.binary.resolve(strict=True), args.model.resolve(strict=True)
     initial = probe(None).get("gpu_in_use_bytes")
     cap = int(args.abort_gpu_gib * 2**30)
@@ -84,10 +100,19 @@ def main():
             )
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             while True:
+                cycle = time.monotonic()
                 terminal = exited(process)
                 if terminal is not None:
                     if any("Z" not in state for state in members(process.pid).values()):
                         reason = "orphaned descendants"
+                    break
+                physical = footprint(process, sampler, identities)
+                if physical is None:
+                    continue
+                footprint_samples += 1
+                footprint_peak = max(footprint_peak, physical)
+                if physical >= footprint_cap:
+                    reason = "physical footprint cap reached"
                     break
                 reading = probe(None).get("gpu_in_use_bytes")
                 if reading is None:
@@ -98,9 +123,15 @@ def main():
                         reason = "GPU memory cap reached"
                 if time.monotonic() - started >= args.timeout_seconds:
                     reason = "wall timeout reached"
+                if time.monotonic() - cycle > 1:
+                    reason = "memory sampling exceeded one second"
                 if reason:
                     break
-                time.sleep(1)
+                time.sleep(
+                    max(
+                        0, min(0.2, args.timeout_seconds - (time.monotonic() - started))
+                    )
+                )
         except (
             OSError,
             ValueError,
@@ -128,6 +159,7 @@ def main():
     passed = (
         reason is None
         and returncode == 0
+        and footprint_samples > 0
         and len(records) == 1
         and records[0].get("id") == "silence-1200"
         and records[0].get("audio_seconds") == 1200
@@ -142,6 +174,11 @@ def main():
         "seconds": time.monotonic() - started,
         "gpu_peak_bytes": peak,
         "gpu_cap_bytes": cap,
+        "footprint_peak_bytes": footprint_peak,
+        "footprint_cap_bytes": footprint_cap,
+        "footprint_samples": footprint_samples,
+        "footprint_instrument": "proc_pid_rusage.RUSAGE_INFO_V2.ri_phys_footprint",
+        "footprint_scope": "sum of owned process-group live members; sampled",
         "binary_sha256": binary_sha256,
     }
     (args.output / "summary.json").write_text(json.dumps(receipt, indent=2) + "\n")
