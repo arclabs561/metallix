@@ -401,7 +401,7 @@ and keep/reject decision. A checkout commit does not authenticate an arbitrary
 binary's build provenance. Retain raw receipts locally; publish concise results
 and caveats in `docs/experiments/`.
 
-### Experimental DeepSeek raw-token generation
+### Experimental DeepSeek local generation
 
 The local Scalar consumer accepts raw vocabulary IDs and keeps request state
 between appends:
@@ -421,15 +421,25 @@ complete checkpoint metadata before loading weights and verifies each requested
 payload. Missing or corrupt bytes fail locally; generation never acquires or
 repairs data.
 
-At least two initial IDs are required. The initial prefill uses at most 128
-positions; later positions execute singly. Repeated multi-token chunks,
-tokenization, chat templates and Metal generation still need qualification.
+At least two initial IDs are required. Prefill executes contiguous chunks of
+at most 128 positions, preserving pending compressed groups and causal windows
+across chunk boundaries. Reduced source fixtures cover repeated chunks; real
+checkpoint 128-token chunk parity, chat templates and Metal generation still
+need qualification.
 The library returns logits and leaves selection and stopping to its caller;
 `mx` selects greedily, with the lowest ID breaking a tie. An optional
 `--eos-token-id` stops on that selected ID, which is included in the output.
 No EOS is inferred. Without `--json`, stdout contains comma-separated output
 IDs; JSON includes `backend`, `prompt_tokens`, `token_ids` and `stop_reason`.
 Errors produce no partial success output.
+
+Alternatively, `--prompt "plain text"` encodes UTF-8 with `tokenizer.json` in
+that receipt store. It applies no chat template or special-token insertion and
+requires at least two encoded IDs. Text input uses the local configuration's
+EOS tokens unless `--eos-token-id` overrides them. Without `--json`, stdout
+contains decoded generated text; text-mode JSON additionally includes
+`generated_text` and `tokenizer_sha256`. Raw-ID behavior is unchanged. Tokenizer
+checks cover plaintext preparation, not source chat formatting or model quality.
 
 `--context-tokens` bounds evaluated positions: prompt length plus at most
 `max-tokens - 1` feedback positions. The final prediction is not fed back.
@@ -546,14 +556,27 @@ schema. Commentary cannot start with `{` or `<`, which keeps the two apart.
 The final message is also validated against the schema once parsed. Without
 tools, the schema covers the whole reply and cannot be combined with reasoning.
 
-Hosted tools that the provider runs server-side have no executor here. They
-are left out of the prompt and the request is served with the remaining tools;
-the reply names each one in `metallix.dropped_tools` (in `response.created`
-and the final response on a Responses stream, in `message_start` on a Messages
-stream). On Responses these are `web_search` (and its dated and preview
-types), `file_search`, `code_interpreter`, `image_generation` and `mcp`; on
-Messages, the `web_search_*`, `web_fetch_*`, `code_execution_*` and
-`tool_search_tool_*` server tools. Other non-function tool types are refused.
+With the `metal` and `structured-output` features, serial `mx serve` workers can
+execute hosted web searches for Responses and Messages requests. Set
+`--web-search-cmd <executable>` or `METALLIX_WEB_SEARCH_CMD`; the flag takes
+precedence. The executable accepts a JSON query on stdin and implements
+`--health`; example adapters are in `scripts/web-search/`. Searches are off by
+default. Results have domain filters and bounded text, native replay records,
+and citations for literal known URLs in generated text. `metallix.web_content`
+marks replies that use new or replayed search results. Commands have a
+ten-second deadline plus a 500 ms cleanup grace; trusted adapters must not
+detach descendants or change credentials. `/healthz` exposes configured search
+health. Unhealthy backends drop the hosted tool with a reason. Batched serving
+and Chat Completions do not execute hosted searches. Hosted-only schema output
+with thinking is rejected before generation. Opaque replay records are untrusted
+encodings, not authenticated encryption; live provider and model qualification
+is separate from the scripted protocol tests.
+
+Other hosted tool types remain outside the local executor. They are omitted
+from the prompt and reported in `metallix.dropped_tools`: Responses
+`file_search`, `code_interpreter`, `image_generation` and `mcp`; Messages
+`web_fetch_*`, `code_execution_*` and `tool_search_tool_*`. Other non-function
+tool types are refused.
 
 Without those flags the rules above are response validation only, not a promise
 of schema-valid emission. [OpenAI's strict-mode guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode)
