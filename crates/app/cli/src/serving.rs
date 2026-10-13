@@ -854,7 +854,11 @@ fn serve_models(
         let _entered = span.enter();
         let capability = match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
-                json_response(connection, 200, &json!({"status":"ready"}));
+                let mut health = json!({"status":"ready"});
+                if let Some(search) = crate::web_search::health() {
+                    health["web_search"] = search;
+                }
+                json_response(connection, 200, &health);
                 continue;
             }
             ("GET", "/v1/models") => {

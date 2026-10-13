@@ -158,7 +158,18 @@ pub(crate) fn prepare(body: &[u8]) -> Result<(String, Prepared), Value> {
         serde_json::from_slice(body).map_err(|error| invalid(&error.to_string()))?;
     let prepared = (|| {
         let tools = tools(&request)?;
-        let controls = controls(&request, !tools.is_empty())?;
+        let hosted = request.tools.iter().any(is_search_tool);
+        if hosted
+            && tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == "web_search")
+        {
+            return Err("web_search conflicts with a client tool of the same name".into());
+        }
+        let controls = controls(
+            &request,
+            !tools.is_empty() || (hosted && crate::web_search::active().is_some()),
+        )?;
         let messages = messages(&request)?;
         Ok::<_, String>((messages, tools, controls))
     })();
@@ -247,10 +258,24 @@ fn controls(request: &Request, has_tools: bool) -> Result<GenerationControls, St
 /// The reply's `metallix` block: `fields`, plus the server tools left out of
 /// the prompt when there were any.
 fn metallix(prepared: &Prepared, mut fields: Value) -> Value {
+    if replayed_web_content(prepared) {
+        fields["web_content"] = json!(true);
+    }
     if !prepared.dropped_tools.is_empty() {
         fields["dropped_tools"] = json!(prepared.dropped_tools);
     }
+    if prepared.request.tools.iter().any(is_search_tool) {
+        if let Some(reason) = crate::web_search::unavailable() {
+            fields["web_search"] = reason;
+        }
+    }
     fields
+}
+
+fn is_search_tool(tool: &Value) -> bool {
+    tool["type"]
+        .as_str()
+        .is_some_and(|kind| kind.starts_with("web_search_"))
 }
 
 /// Anthropic server tools: Anthropic runs them, and mx has nothing to run
@@ -356,6 +381,30 @@ fn tool_result(block: &Value, pending: &mut HashMap<&str, &str>) -> Result<ChatM
     Ok(result)
 }
 
+fn user_messages<'a>(
+    content: &'a Value,
+    pending: &mut HashMap<&'a str, &'a str>,
+) -> Result<Vec<ChatMessage>, String> {
+    let Some(blocks) = content.as_array() else {
+        return Ok(vec![message(ChatRole::User, text_of(content)?)]);
+    };
+    let mut messages = Vec::new();
+    let mut text = String::new();
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                text.push_str(block["text"].as_str().ok_or("text block requires text")?);
+            }
+            Some("tool_result") => messages.push(tool_result(block, pending)?),
+            _ => return Err("user content supports only text and tool_result blocks".into()),
+        }
+    }
+    if !text.is_empty() {
+        messages.push(message(ChatRole::User, text));
+    }
+    Ok(messages)
+}
+
 /// Rebuilds history. A user turn's `tool_result` blocks become tool
 /// messages, followed by its text; an assistant turn keeps its text and
 /// `tool_use` calls and drops thinking, which the template drops anyway.
@@ -366,48 +415,58 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
     }
     let mut pending: HashMap<&str, &str> = HashMap::new();
     let mut seen = HashSet::new();
+    let mut searches = HashMap::new();
     for item in &request.messages {
         let role = item["role"].as_str().unwrap_or_default();
         let content = &item["content"];
         match role {
             "system" => messages.push(message(ChatRole::System, text_of(content)?)),
-            "user" => {
-                let Some(blocks) = content.as_array() else {
-                    messages.push(message(ChatRole::User, text_of(content)?));
-                    continue;
-                };
-                let mut text = String::new();
-                for block in blocks {
-                    match block["type"].as_str() {
-                        Some("text") => {
-                            text.push_str(
-                                block["text"].as_str().ok_or("text block requires text")?,
-                            );
-                        }
-                        Some("tool_result") => messages.push(tool_result(block, &mut pending)?),
-                        _ => {
-                            return Err(
-                                "user content supports only text and tool_result blocks".into()
-                            );
-                        }
-                    }
-                }
-                if !text.is_empty() {
-                    messages.push(message(ChatRole::User, text));
-                }
-            }
+            "user" => messages.extend(user_messages(content, &mut pending)?),
             "assistant" => {
                 let Some(blocks) = content.as_array() else {
                     messages.push(message(ChatRole::Assistant, text_of(content)?));
                     continue;
                 };
                 let mut turn = message(ChatRole::Assistant, String::new());
+                let mut replayed_search = false;
                 for block in blocks {
                     match block["type"].as_str() {
                         Some("text") => turn
                             .content
                             .push_str(block["text"].as_str().ok_or("text block requires text")?),
                         Some("thinking" | "redacted_thinking") => {}
+                        Some("server_tool_use") => {
+                            let (Some(id), Some(query)) = (
+                                block["id"].as_str().filter(|id| !id.is_empty()),
+                                block["input"]["query"].as_str(),
+                            ) else {
+                                return Err("server_tool_use requires id and query".into());
+                            };
+                            if block["name"] != "web_search" || !seen.insert(id) {
+                                return Err("unsupported or duplicate server_tool_use".into());
+                            }
+                            searches.insert(id, query);
+                            turn.tool_calls.push(ChatToolCall {
+                                name: "web_search".into(),
+                                arguments: block["input"].clone(),
+                            });
+                        }
+                        Some("web_search_tool_result") => {
+                            let id = block["tool_use_id"]
+                                .as_str()
+                                .ok_or("search result requires tool_use_id")?;
+                            let query = searches
+                                .remove(id)
+                                .ok_or("search result has no matching server_tool_use")?;
+                            let text = replay_search_result(block, query)?;
+                            replayed_search = true;
+                            messages.push(turn);
+                            let mut result = message(ChatRole::Tool, text);
+                            result.name = Some("web_search".into());
+                            result.tool_call_id = Some(id.into());
+                            messages.push(result);
+                            turn = message(ChatRole::Assistant, String::new());
+                        }
                         Some("tool_use") => {
                             let (Some(id), Some(name), true) = (
                                 block["id"].as_str().filter(|id| !id.is_empty()),
@@ -432,7 +491,9 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
                         ),
                     }
                 }
-                messages.push(turn);
+                if !replayed_search || !turn.content.is_empty() || !turn.tool_calls.is_empty() {
+                    messages.push(turn);
+                }
             }
             _ => return Err(format!("unsupported message role {role:?}")),
         }
@@ -445,6 +506,120 @@ fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
         _ => return Err("messages must end with a user message".into()),
     }
     Ok(messages)
+}
+
+fn replay_search_result(block: &Value, expected_query: &str) -> Result<String, String> {
+    if block["content"]["type"] == "web_search_tool_result_error" {
+        return Ok("search failed".into());
+    }
+    let results = block["content"]
+        .as_array()
+        .ok_or("search result content must be an array")?;
+    if results.len() > 5 {
+        return Err("search replay exceeds result limit".into());
+    }
+    if results.is_empty() {
+        return Ok(crate::web_search::fenced_results(expected_query, &[]));
+    }
+    let encoded = results[0]["encrypted_content"]
+        .as_str()
+        .ok_or("search result requires encrypted_content")?;
+    if results.iter().any(|result| {
+        result["type"] != "web_search_result"
+            || result["encrypted_content"].as_str() != Some(encoded)
+    }) {
+        return Err("search results must share one aggregate replay payload".into());
+    }
+    let (query, decoded) = crate::web_search::decode_replay_results(encoded)?;
+    if query != expected_query {
+        return Err("search replay query mismatch".into());
+    }
+    if decoded.len() != results.len()
+        || decoded.iter().zip(results).any(|(source, result)| {
+            result["url"].as_str() != Some(source.url.as_str())
+                || result["title"].as_str() != Some(source.title.as_str())
+        })
+    {
+        return Err("search replay result metadata mismatch".into());
+    }
+    Ok(crate::web_search::fenced_results(&query, &decoded))
+}
+
+#[derive(Clone)]
+struct CitationSource {
+    result: crate::web_search::SearchResult,
+    encoded: String,
+}
+
+fn replay_sources(request: &Request) -> Result<Vec<CitationSource>, String> {
+    let mut sources = Vec::new();
+    for message in &request.messages {
+        let Some(blocks) = message["content"].as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block["type"] != "web_search_tool_result" {
+                continue;
+            }
+            let Some(encoded) = block["content"]
+                .get(0)
+                .and_then(|item| item["encrypted_content"].as_str())
+            else {
+                continue;
+            };
+            let (_, results) = crate::web_search::decode_replay_results(encoded)?;
+            for result in results {
+                if !sources
+                    .iter()
+                    .any(|source: &CitationSource| source.result.url == result.url)
+                {
+                    sources.push(CitationSource {
+                        result,
+                        encoded: encoded.into(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(sources)
+}
+
+fn text_citations(text: &str, sources: &[CitationSource]) -> Vec<Value> {
+    let results: Vec<_> = sources.iter().map(|source| source.result.clone()).collect();
+    crate::web_search::citations(text, &results).into_iter().filter_map(|citation| {
+        let source = sources.iter().find(|source| source.result.url == citation.url)?;
+        let cited_text: String = text.chars().skip(citation.start_index).take(citation.end_index - citation.start_index).collect();
+        Some(json!({"type":"web_search_result_location","url":citation.url,"title":citation.title,
+            "cited_text":cited_text,"encrypted_index":source.encoded}))
+    }).collect()
+}
+
+fn annotate_blocks(blocks: &mut [Value], sources: &[CitationSource]) {
+    for block in blocks {
+        if let Some(text) = block["text"].as_str() {
+            let citations = text_citations(text, sources);
+            if !citations.is_empty() {
+                block["citations"] = json!(citations);
+            }
+        }
+    }
+}
+
+fn citation_deltas(sse: &mut LazySse, index: usize, citations: &[Value]) -> Result<(), String> {
+    for citation in citations {
+        event(
+            sse,
+            &json!({"type":"content_block_delta","index":index,
+            "delta":{"type":"citations_delta","citation":citation}}),
+        )?;
+    }
+    Ok(())
+}
+
+fn replayed_web_content(prepared: &Prepared) -> bool {
+    prepared.messages.iter().any(|message| {
+        message.role == ChatRole::Tool && message.name.as_deref() == Some("web_search")
+    })
 }
 
 fn stop_reason(turn: &AssistantTurn) -> &'static str {
@@ -496,8 +671,10 @@ fn message_value(
         prepared.controls.json_schema.as_ref(),
         generated,
     )?;
+    let mut content = blocks(&turn, id);
+    annotate_blocks(&mut content, &replay_sources(&prepared.request)?);
     Ok(
-        json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":blocks(&turn, id),"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":metallix(prepared, json!({"sampling":generated.sampling,"metrics":generated.metrics}))}),
+        json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":content,"stop_reason":stop_reason(&turn),"stop_sequence":null,"usage":usage(generated),"metallix":metallix(prepared, json!({"sampling":generated.sampling,"metrics":generated.metrics}))}),
     )
 }
 
@@ -526,6 +703,37 @@ pub(crate) fn respond(
     id: &str,
     generation_timeout: Duration,
 ) -> Result<(), String> {
+    if !matches!(prepared.request.tool_choice, Some(ToolChoice::None)) {
+        if let (Some(tool), Some(backend)) = (
+            prepared
+                .request
+                .tools
+                .iter()
+                .find(|tool| is_search_tool(tool)),
+            crate::web_search::active(),
+        ) {
+            let policy = match crate::web_search::turn::Policy::parse(tool) {
+                Ok(policy) => policy,
+                Err(error) => {
+                    json_response(
+                        connection,
+                        400,
+                        &error_body("invalid_request_error", &error),
+                    );
+                    return Ok(());
+                }
+            };
+            return respond_search(
+                connection,
+                prepared,
+                session,
+                id,
+                generation_timeout,
+                backend,
+                &policy,
+            );
+        }
+    }
     // The router-owned tenant salt keeps prefix-cache reuse within a tenant.
     let cache_salt = connection.cache_salt().map(str::to_owned);
     let request = ChatRequest {
@@ -571,6 +779,325 @@ pub(crate) fn respond(
         id,
         generation_timeout,
     )
+}
+
+/// Accumulates protocol blocks and prompt-cache partitions across segments.
+#[derive(Default)]
+struct SearchReply {
+    sources: Vec<CitationSource>,
+    content: Vec<Value>,
+    live: LiveBlocks,
+    segment_start: usize,
+    input: u64,
+    output: u64,
+    cached: u64,
+    created: u64,
+    stop: Option<&'static str>,
+}
+
+impl SearchReply {
+    fn push(
+        &mut self,
+        item: crate::web_search::turn::Event<'_>,
+        id: &str,
+        mut sse: Option<&mut LazySse>,
+    ) -> Result<(), String> {
+        use crate::web_search::turn::Event;
+        match item {
+            Event::Delta(delta) => {
+                if let Some(sse) = sse {
+                    self.live.push(sse, &delta)?;
+                }
+            }
+            Event::Segment {
+                generated,
+                turn,
+                searching,
+            } => {
+                let counts = usage(generated);
+                self.input += counts["input_tokens"].as_u64().unwrap_or(0);
+                self.output += counts["output_tokens"].as_u64().unwrap_or(0);
+                self.cached += counts["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                self.created += counts["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let segment = blocks(turn, &format!("{id}_{}", self.content.len()));
+                let mut visible: Vec<_> = segment
+                    .into_iter()
+                    .filter(|block| !searching || block["type"] != "tool_use")
+                    .collect();
+                if !searching {
+                    annotate_blocks(&mut visible, &self.sources);
+                }
+                if let Some(sse) = sse.as_deref_mut() {
+                    if !searching {
+                        if let Some((index, false)) = self.live.open {
+                            citation_deltas(
+                                sse,
+                                index,
+                                &text_citations(&turn.text, &self.sources),
+                            )?;
+                        }
+                    }
+                    let streamed = self.live.close(sse)? - self.segment_start;
+                    for block in visible.iter().skip(streamed) {
+                        self.emit_block(sse, block)?;
+                    }
+                }
+                self.content.extend(visible);
+                self.segment_start = self.live.count;
+                self.stop = Some(if searching {
+                    "max_tokens"
+                } else {
+                    stop_reason(turn)
+                });
+            }
+            Event::SearchStart { index, query } => {
+                let block = json!({"type":"server_tool_use","id":format!("srvtoolu_{id}_{index}"),"name":"web_search","input":{"query":query}});
+                self.add_block(block, sse)?;
+            }
+            Event::SearchEnd {
+                index,
+                query,
+                results,
+            } => {
+                let content = match results {
+                    Ok(results) => {
+                        let encoded = crate::web_search::encode_replay(query, results);
+                        for result in results {
+                            if !self
+                                .sources
+                                .iter()
+                                .any(|source| source.result.url == result.url)
+                            {
+                                self.sources.push(CitationSource {
+                                    result: result.clone(),
+                                    encoded: encoded.clone(),
+                                });
+                            }
+                        }
+                        Value::Array(results.iter().map(|result| json!({
+                            "type":"web_search_result", "url":result.url, "title":result.title,
+                            "page_age":result.page_age, "encrypted_content":encoded
+                        })).collect())
+                    }
+                    Err(_) => {
+                        json!({"type":"web_search_tool_result_error","error_code":"unavailable"})
+                    }
+                };
+                self.add_block(json!({"type":"web_search_tool_result","tool_use_id":format!("srvtoolu_{id}_{index}"),"content":content}), sse)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_block(&mut self, sse: &mut LazySse, block: &Value) -> Result<(), String> {
+        let index = self.live.count;
+        self.live.count += 1;
+        let mut opened = block.clone();
+        if opened.get("citations").is_some() {
+            opened["citations"] = json!([]);
+        }
+        let delta = match block["type"].as_str() {
+            Some("tool_use" | "server_tool_use") => {
+                opened["input"] = json!({});
+                Some(json!({"type":"input_json_delta","partial_json":block["input"].to_string()}))
+            }
+            Some("text") => {
+                opened["text"] = json!("");
+                Some(json!({"type":"text_delta","text":block["text"]}))
+            }
+            Some("thinking") => {
+                opened["thinking"] = json!("");
+                Some(json!({"type":"thinking_delta","thinking":block["thinking"]}))
+            }
+            _ => None,
+        };
+        event(
+            sse,
+            &json!({"type":"content_block_start","index":index,"content_block":opened}),
+        )?;
+        if let Some(delta) = delta {
+            event(
+                sse,
+                &json!({"type":"content_block_delta","index":index,"delta":delta}),
+            )?;
+        }
+        if let Some(citations) = block["citations"].as_array() {
+            citation_deltas(sse, index, citations)?;
+        }
+        event(sse, &json!({"type":"content_block_stop","index":index}))
+    }
+
+    fn add_block(&mut self, block: Value, sse: Option<&mut LazySse>) -> Result<(), String> {
+        if let Some(sse) = sse {
+            self.emit_block(sse, &block)?;
+        }
+        self.content.push(block);
+        self.segment_start = self.live.count;
+        Ok(())
+    }
+
+    fn usage(&self, searches: usize) -> Value {
+        json!({"input_tokens":self.input,"output_tokens":self.output,
+            "cache_read_input_tokens":self.cached,"cache_creation_input_tokens":self.created,
+            "server_tool_use":{"web_search_requests":searches}})
+    }
+}
+
+fn search_metallix(prepared: &Prepared, searches: usize, web_content: bool) -> Value {
+    let dropped: Vec<_> = prepared
+        .request
+        .tools
+        .iter()
+        .filter(|tool| is_server_tool(tool) && !is_search_tool(tool))
+        .filter_map(|tool| tool["name"].as_str().or_else(|| tool["type"].as_str()))
+        .collect();
+    let mut value =
+        json!({"web_search":{"available":true,"requests":searches},"web_content":web_content});
+    if !dropped.is_empty() {
+        value["dropped_tools"] = json!(dropped);
+    }
+    value
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "protocol response and shared hosted-search turn inputs"
+)]
+fn respond_search(
+    mut connection: Connection,
+    prepared: &Prepared,
+    session: &mut dyn ChatBackend,
+    id: &str,
+    timeout: Duration,
+    backend: &crate::web_search::Backend,
+    policy: &crate::web_search::turn::Policy,
+) -> Result<(), String> {
+    let cache_salt = connection.cache_salt().map(str::to_owned);
+    let mut effective = prepared.controls.clone();
+    if policy.max_uses > 0 {
+        effective.strict_tools.push("web_search".into());
+    }
+    let admission = if prepared.tools.is_empty()
+        && effective.json_schema.is_some()
+        && effective.enable_thinking
+    {
+        Err(
+            "hosted-only schema output with thinking is unsupported after search withdrawal"
+                .to_owned(),
+        )
+    } else {
+        effective.validate(!prepared.tools.is_empty() || policy.max_uses > 0)
+    };
+    if let Err(error) = admission {
+        json_response(
+            connection,
+            400,
+            &error_body("invalid_request_error", &error),
+        );
+        return Ok(());
+    }
+    let mut reply = SearchReply {
+        sources: replay_sources(&prepared.request)?,
+        ..SearchReply::default()
+    };
+    if !prepared.request.stream {
+        let request_id = connection.request_id().map(str::to_owned);
+        let outcome = {
+            let mut stop = connection.stop_when_gone();
+            crate::web_search::turn::run(
+                backend,
+                policy,
+                session,
+                &prepared.controls,
+                &prepared.messages,
+                &prepared.tools,
+                cache_salt.as_deref(),
+                timeout,
+                &mut |item| {
+                    if let crate::web_search::turn::Event::Delta(ref delta) = item {
+                        stop(delta.clone())?;
+                    }
+                    reply.push(item, id, None)
+                },
+            )
+        };
+        match outcome {
+            Ok(outcome) => {
+                let mut value = json!({"id":format!("msg_{id}"),"type":"message","role":"assistant",
+                    "model":prepared.request.model,"content":reply.content,
+                    "stop_reason":reply.stop.unwrap_or("max_tokens"),"stop_sequence":null,
+                    "usage":reply.usage(outcome.searches),"metallix":search_metallix(prepared, outcome.searches, outcome.web_content)});
+                echo_request_id(&mut value, request_id.as_deref());
+                json_response(connection, 200, &value);
+            }
+            Err(error) => crate::generation_routes::error_response(
+                connection,
+                500,
+                Some("invalid_model_output"),
+                &error,
+            ),
+        }
+        return Ok(());
+    }
+    let mut sse = LazySse::new(connection);
+    let mut started = false;
+    let outcome = crate::web_search::turn::run(
+        backend,
+        policy,
+        session,
+        &prepared.controls,
+        &prepared.messages,
+        &prepared.tools,
+        cache_salt.as_deref(),
+        timeout,
+        &mut |item| {
+            if matches!(item, crate::web_search::turn::Event::Delta(TurnDelta::Held)) {
+                return sse.keepalive();
+            }
+            if !started {
+                event(
+                    &mut sse,
+                    &json!({"type":"message_start","message":{
+                    "id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,
+                    "content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},
+                    "metallix":search_metallix(prepared, 0, replayed_web_content(prepared))}}),
+                )?;
+                started = true;
+            }
+            reply.push(item, id, Some(&mut sse))
+        },
+    );
+    finish_search_stream(&mut sse, prepared, &reply, outcome)
+}
+
+fn finish_search_stream(
+    sse: &mut LazySse,
+    prepared: &Prepared,
+    reply: &SearchReply,
+    outcome: Result<crate::web_search::turn::Outcome, String>,
+) -> Result<(), String> {
+    match outcome {
+        Ok(outcome) => {
+            event(
+                sse,
+                &json!({"type":"message_delta","delta":{"stop_reason":reply.stop.unwrap_or("max_tokens"),"stop_sequence":null},"usage":reply.usage(outcome.searches),"metallix":search_metallix(prepared, outcome.searches, outcome.web_content)}),
+            )?;
+            event(sse, &json!({"type":"message_stop"}))
+        }
+        Err(error) => {
+            if let Some(connection) = sse.take_unopened() {
+                crate::generation_routes::error_response(
+                    connection,
+                    500,
+                    Some("invalid_model_output"),
+                    &error,
+                );
+                Ok(())
+            } else {
+                event(sse, &error_body("api_error", &error))
+            }
+        }
+    }
 }
 
 fn event(sse: &mut LazySse, data: &Value) -> Result<(), String> {
@@ -639,7 +1166,7 @@ fn stream(
     // The prompt is counted only once generation ends, so the opening usage
     // is zero and `message_delta` carries the real counts.
     let mut start = json!({"type":"message_start","message":{"id":format!("msg_{id}"),"type":"message","role":"assistant","model":prepared.request.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}});
-    if !prepared.dropped_tools.is_empty() {
+    if !prepared.dropped_tools.is_empty() || replayed_web_content(prepared) {
         start["message"]["metallix"] = metallix(prepared, json!({}));
     }
     // Thinking and text stream as blocks while they settle; the session
@@ -700,7 +1227,12 @@ fn stream(
     }
     // The blocks streamed so far are exactly the leading thinking and text
     // blocks of the final message; the rest follow whole.
-    let final_blocks = self::blocks(&turn, id);
+    let sources = replay_sources(&prepared.request)?;
+    let mut final_blocks = self::blocks(&turn, id);
+    annotate_blocks(&mut final_blocks, &sources);
+    if let Some((index, false)) = blocks.open {
+        citation_deltas(&mut sse, index, &text_citations(&turn.text, &sources))?;
+    }
     let streamed = blocks.close(&mut sse)?;
     for (index, block) in final_blocks.into_iter().enumerate().skip(streamed) {
         let (opened, delta) = match block["type"].as_str() {
@@ -725,6 +1257,9 @@ fn stream(
             &mut sse,
             &json!({"type":"content_block_delta","index":index,"delta":delta}),
         )?;
+        if let Some(citations) = block["citations"].as_array() {
+            citation_deltas(&mut sse, index, citations)?;
+        }
         event(
             &mut sse,
             &json!({"type":"content_block_stop","index":index}),
@@ -761,6 +1296,314 @@ mod tests {
     }
 
     const TOOL: &str = r#"{"name":"read_file","description":"Read a file","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}"#;
+
+    struct SearchSegments {
+        calls: usize,
+    }
+
+    impl ChatBackend for SearchSegments {
+        fn load_ms(&self) -> f64 {
+            0.0
+        }
+        fn generate_with_timeout(
+            &mut self,
+            request: ChatRequest<'_>,
+            timeout: Duration,
+            emit: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
+        ) -> Result<ChatGeneration, ChatGenerationError> {
+            let text = if self.calls == 0 {
+                assert!(
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "web_search")
+                );
+                // Mixed client calls must be regenerated after search, never exposed early.
+                r#"<tool_call>{"name":"web_search","arguments":{"query":"weather"}}</tool_call><tool_call>{"name":"read_file","arguments":{"path":"early"}}</tool_call>"#
+            } else {
+                assert!(
+                    !request
+                        .tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "web_search")
+                );
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.role == ChatRole::Tool
+                            && (message.content.contains("Untrusted content")
+                                || message.content == "search failed"))
+                );
+                r#"{"answer":"see https://example.com/weather"}"#
+            };
+            self.calls += 1;
+            Scripted::new(text).generate_with_timeout(request, timeout, emit)
+        }
+    }
+
+    #[test]
+    fn hosted_search_emits_native_blocks_sums_usage_and_replays_without_execution() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = chat_format::test_model::ModelDir::new(&json!({}), &json!({}), None);
+        let command = fixture.path().join("search");
+        std::fs::write(&command, "#!/bin/sh\nif [ \"$1\" = --health ]; then exit 0; fi\ncat >/dev/null\nprintf '[{\"url\":\"https://example.com/weather\",\"title\":\"Weather\",\"snippet\":\"sunny\"}]'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = crate::web_search::Backend::start(command);
+        assert!(backend.healthy());
+        for stream in [false, true] {
+            let body = with(
+                &json!({"stream":stream,"tools":[serde_json::from_str::<Value>(TOOL).unwrap(),
+                {"type":"web_search_20250305","name":"web_search","max_uses":1}],
+                "output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}}}}),
+            );
+            let prepared = prepare_body(&body).unwrap();
+            let policy = crate::web_search::turn::Policy::parse(&body["tools"][1]).unwrap();
+            let mut model = SearchSegments { calls: 0 };
+            let wire = exchange("/v1/messages", &body.to_string(), |connection, _| {
+                respond_search(
+                    connection,
+                    &prepared,
+                    &mut model,
+                    "search-test",
+                    Duration::from_secs(5),
+                    &backend,
+                    &policy,
+                )
+                .unwrap();
+            });
+            assert_eq!(model.calls, 2);
+            let (content, usage) = if stream {
+                let frames: Vec<Value> = events(&wire)
+                    .into_iter()
+                    .map(|(_, data)| serde_json::from_str(&data).unwrap())
+                    .collect();
+                let mut content = Vec::new();
+                for frame in &frames {
+                    if frame["type"] == "content_block_start" {
+                        content.push(frame["content_block"].clone());
+                    } else if frame["delta"]["type"] == "input_json_delta" {
+                        let index = usize::try_from(frame["index"].as_u64().unwrap()).unwrap();
+                        content[index]["input"] =
+                            serde_json::from_str(frame["delta"]["partial_json"].as_str().unwrap())
+                                .unwrap();
+                    }
+                }
+                let usage = frames
+                    .iter()
+                    .find(|frame| frame["type"] == "message_delta")
+                    .unwrap()["usage"]
+                    .clone();
+                assert_eq!(frames.last().unwrap()["type"], "message_stop");
+                (content, usage)
+            } else {
+                let (status, value) = json_body(&wire);
+                assert_eq!(status, "HTTP/1.1 200 OK");
+                (
+                    value["content"].as_array().unwrap().clone(),
+                    value["usage"].clone(),
+                )
+            };
+            assert_search_citations(&wire, stream);
+            assert_eq!(usage["server_tool_use"]["web_search_requests"], 1);
+            assert_eq!(usage["input_tokens"], 2);
+            assert_eq!(usage["output_tokens"], 4);
+            assert!(!content.iter().any(|block| block["type"] == "tool_use"));
+            let call = content
+                .iter()
+                .find(|block| block["type"] == "server_tool_use")
+                .unwrap();
+            let result = content
+                .iter()
+                .find(|block| block["type"] == "web_search_tool_result")
+                .unwrap();
+            assert_eq!(result["tool_use_id"], call["id"]);
+            assert_eq!(result["content"][0]["url"], "https://example.com/weather");
+            assert_search_replay(call, result);
+        }
+    }
+
+    fn assert_search_citations(wire: &str, stream: bool) {
+        if stream {
+            let frames: Vec<Value> = events(wire)
+                .into_iter()
+                .map(|(_, data)| serde_json::from_str(&data).unwrap())
+                .collect();
+            let citation = frames
+                .iter()
+                .find(|frame| frame["delta"]["type"] == "citations_delta")
+                .unwrap();
+            assert_eq!(
+                citation["delta"]["citation"]["cited_text"],
+                "https://example.com/weather"
+            );
+            let final_delta = frames
+                .iter()
+                .find(|frame| frame["type"] == "message_delta")
+                .unwrap();
+            assert_eq!(final_delta["metallix"]["web_content"], true);
+        } else {
+            let (_, value) = json_body(wire);
+            assert_eq!(value["metallix"]["web_content"], true);
+            let text = value["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|block| block["type"] == "text")
+                .unwrap();
+            assert_eq!(
+                text["citations"][0]["cited_text"],
+                "https://example.com/weather"
+            );
+        }
+    }
+
+    fn assert_search_replay(call: &Value, result: &Value) {
+        let history = with(&json!({"messages":[{"role":"user","content":"weather"},
+                {"role":"assistant","content":[call,result]}, {"role":"user","content":"more"}]}));
+        let replay_wire = run(
+            &history,
+            &mut Scripted::new("See https://example.com/weather and https://unknown.example"),
+        );
+        let (_, replay_value) = json_body(&replay_wire);
+        assert_eq!(replay_value["metallix"]["web_content"], true);
+        let citations = replay_value["content"][0]["citations"].as_array().unwrap();
+        assert_eq!(citations.len(), 1);
+        assert_eq!(
+            citations[0]["encrypted_index"],
+            result["content"][0]["encrypted_content"]
+        );
+        let replayed = prepare_body(&history).unwrap();
+        assert!(
+            replayed
+                .messages
+                .iter()
+                .any(|message| message.role == ChatRole::Tool
+                    && message.content.contains("sunny")
+                    && message.content.contains("Untrusted content"))
+        );
+    }
+
+    #[test]
+    fn hosted_search_failure_stays_a_native_result_and_the_turn_continues() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = chat_format::test_model::ModelDir::new(&json!({}), &json!({}), None);
+        let command = fixture.path().join("search-failure");
+        std::fs::write(&command, "#!/bin/sh\nif [ \"$1\" = --health ]; then exit 0; fi\ncat >/dev/null\nprintf 'private-adapter-diagnostic' >&2\nexit 7\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = crate::web_search::Backend::start(command);
+        let tool = json!({"type":"web_search_20250305","name":"web_search","max_uses":1});
+        let body = with(&json!({"tools":[serde_json::from_str::<Value>(TOOL).unwrap(),tool]}));
+        let prepared = prepare_body(&body).unwrap();
+        let policy = crate::web_search::turn::Policy::parse(&tool).unwrap();
+        let mut model = SearchSegments { calls: 0 };
+        let wire = exchange("/v1/messages", &body.to_string(), |connection, _| {
+            respond_search(
+                connection,
+                &prepared,
+                &mut model,
+                "failure",
+                Duration::from_secs(5),
+                &backend,
+                &policy,
+            )
+            .unwrap();
+        });
+        assert!(!wire.contains("private-adapter-diagnostic"));
+        let (status, value) = json_body(&wire);
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(model.calls, 2);
+        let result = value["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|block| block["type"] == "web_search_tool_result")
+            .unwrap();
+        assert_eq!(result["content"]["type"], "web_search_tool_result_error");
+        assert_eq!(
+            replay_search_result(result, "weather").unwrap(),
+            "search failed"
+        );
+        assert_eq!(value["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn hosted_replay_validates_one_aggregate_and_rejects_cap_multiplication() {
+        let sources: Vec<_> = (0..5)
+            .map(|index| crate::web_search::SearchResult {
+                url: format!("https://example.com/{index}"),
+                title: "title".into(),
+                snippet: "x".repeat(2000),
+                page_age: None,
+            })
+            .collect();
+        let encoded = crate::web_search::encode_replay("weather", &sources);
+        let block = json!({"content":sources.iter().map(|source| json!({"type":"web_search_result",
+            "url":source.url,"title":source.title,"encrypted_content":encoded})).collect::<Vec<_>>()});
+        let replay = replay_search_result(&block, "weather").unwrap();
+        assert!(replay.chars().count() <= 8000);
+        let mut different = block.clone();
+        different["content"][1]["encrypted_content"] =
+            json!(crate::web_search::encode_replay("weather", &sources[..1]));
+        assert!(replay_search_result(&different, "weather").is_err());
+        let mut wrong_url = block;
+        wrong_url["content"][0]["url"] = json!("https://unknown.example");
+        assert!(replay_search_result(&wrong_url, "weather").is_err());
+    }
+
+    #[test]
+    fn hosted_effective_controls_are_refused_before_model_or_stream() {
+        let backend = crate::web_search::Backend::start(std::path::PathBuf::from("/usr/bin/true"));
+        let tool = json!({"type":"web_search_20250305","name":"web_search","max_uses":1});
+        let policy = crate::web_search::turn::Policy::parse(&tool).unwrap();
+        for stream in [false, true] {
+            for thinking_schema in [false, true] {
+                let body = with(&json!({"stream":stream,"tools":[tool]}));
+                let mut prepared = prepare_body(&body).unwrap();
+                if thinking_schema {
+                    prepared.controls.enable_thinking = true;
+                    prepared.controls.json_schema = Some(json!({"type":"object"}));
+                } else {
+                    prepared.controls.ignore_eos = true;
+                }
+                let mut model = SearchSegments { calls: 0 };
+                let wire = exchange("/v1/messages", &body.to_string(), |connection, _| {
+                    respond_search(
+                        connection,
+                        &prepared,
+                        &mut model,
+                        "refused",
+                        Duration::from_secs(5),
+                        &backend,
+                        &policy,
+                    )
+                    .unwrap();
+                });
+                assert_eq!(json_body(&wire).0, "HTTP/1.1 400 Bad Request");
+                assert_eq!(model.calls, 0);
+                assert!(!wire.contains("event: message_start"));
+            }
+        }
+    }
+
+    #[test]
+    fn hosted_search_replay_refuses_mismatched_query_and_reserved_client_name() {
+        let result = crate::web_search::SearchResult {
+            url: "https://example.com".into(),
+            title: "x".into(),
+            snippet: "data".into(),
+            page_age: None,
+        };
+        let block = json!({"content":[{"type":"web_search_result","encrypted_content":crate::web_search::encode_replay("other", &[result])}]});
+        assert!(replay_search_result(&block, "expected").is_err());
+        assert!(
+            prepare_body(&with(
+                &json!({"tools":[{"type":"web_search_20250305","name":"web_search"},
+            {"name":"web_search","input_schema":{"type":"object"}}]})
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn rejects_unknown_fields_and_unsupported_semantics() {

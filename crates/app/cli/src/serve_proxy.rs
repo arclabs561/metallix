@@ -69,6 +69,7 @@ pub(crate) struct ChildSettings {
     pub(crate) prefill_chunk_tokens: u32,
     pub(crate) prefill_target_ms: u32,
     pub(crate) generation_timeout_ms: u32,
+    pub(crate) web_search_cmd: Option<PathBuf>,
     /// Passed to each child, which keeps its own subdirectory.
     pub(crate) kv_persist: Option<crate::prefix_store::KvPersist>,
     /// Each child writes its own timeline beside this path.
@@ -95,6 +96,7 @@ impl ChildSettings {
             prefill_chunk_tokens: 2048,
             prefill_target_ms: 0,
             generation_timeout_ms: 1000,
+            web_search_cmd: None,
             kv_persist: None,
             trace_out: None,
             gpu_capture: None,
@@ -485,6 +487,12 @@ fn start_child(launcher: &Launcher, entry: &ServedEntry) -> Started {
             "--generation-timeout-ms",
             &settings.generation_timeout_ms.to_string(),
         ])
+        .args(settings.web_search_cmd.iter().flat_map(|command| {
+            [
+                std::ffi::OsString::from("--web-search-cmd"),
+                command.as_os_str().to_owned(),
+            ]
+        }))
         .args(settings.kv_persist.iter().flat_map(|persist| {
             [
                 "--kv-persist-dir".into(),
@@ -603,7 +611,11 @@ fn proxy_models(
         let _entered = span.enter();
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/healthz") => {
-                json_response(connection, 200, &json!({"status":"ready"}));
+                let mut health = json!({"status":"ready"});
+                if let Some(search) = search_health(pool) {
+                    health["web_search"] = search;
+                }
+                json_response(connection, 200, &health);
                 continue;
             }
             ("GET", "/v1/models") => {
@@ -1131,6 +1143,77 @@ fn refuse(mut connection: Connection, model: &ChildModel, refused: Refused) {
         refused.retry_after_secs,
     )
     .and_then(|()| connection.flush());
+}
+
+/// A bounded observation of loaded workers; no search or model admission.
+fn search_health(pool: &Pool) -> Option<Value> {
+    let configured = pool.launcher.as_ref()?.settings.web_search_cmd.as_ref()?;
+    let _ = configured;
+    let loaded: Vec<_> = pool
+        .models
+        .iter()
+        .filter_map(|model| model.address().map(|address| (&model.entry.id, address)))
+        .collect();
+    if loaded.is_empty() {
+        return crate::web_search::health();
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut children = serde_json::Map::new();
+    let mut healthy = false;
+    for (id, address) in loaded {
+        let observed = child_search_health(address, deadline)
+            .unwrap_or_else(|_| json!({"configured":true,"healthy":false,"last_error":"timeout"}));
+        healthy |= observed["healthy"] == true;
+        children.insert(id.clone(), observed);
+    }
+    Some(json!({"configured":true,"healthy":healthy,"children":children}))
+}
+
+fn child_search_health(address: SocketAddr, deadline: Instant) -> Result<Value, String> {
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| "health deadline".to_owned())
+    };
+    let mut socket =
+        TcpStream::connect_timeout(&address, remaining()?.min(Duration::from_millis(100)))
+            .map_err(|e| e.to_string())?;
+    socket
+        .set_write_timeout(Some(remaining()?))
+        .map_err(|e| e.to_string())?;
+    socket
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        socket
+            .set_read_timeout(Some(remaining()?))
+            .map_err(|e| e.to_string())?;
+        let count = socket.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buffer[..count]);
+        if raw.len() > 65536 {
+            return Err("health response too large".into());
+        }
+    }
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut response = httparse::Response::new(&mut headers);
+    let httparse::Status::Complete(body) = response.parse(&raw).map_err(|e| e.to_string())? else {
+        return Err("incomplete health response".into());
+    };
+    if response.code != Some(200) {
+        return Err("worker health failed".into());
+    }
+    let value: Value = serde_json::from_slice(&raw[body..]).map_err(|e| e.to_string())?;
+    value
+        .get("web_search")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| "worker lacks search health".into())
 }
 
 #[cfg(test)]

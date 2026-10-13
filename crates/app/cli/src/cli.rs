@@ -250,6 +250,10 @@ pub(crate) enum Command {
         /// response deadline follows it.
         #[arg(long, default_value_t = 60_000, value_parser = clap::value_parser!(u32).range(1..=86_400_000))]
         generation_timeout_ms: u32,
+        /// Operator executable for hosted web search; falls back to `METALLIX_WEB_SEARCH_CMD`.
+        /// Receives JSON on stdin. Only used by serial model workers.
+        #[arg(long)]
+        web_search_cmd: Option<PathBuf>,
         /// Requests that may wait, in arrival order, while a model is busy; 0
         /// refuses any overlap. A registry entry's `queue_depth` overrides it.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(0..=1024))]

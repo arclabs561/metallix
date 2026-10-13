@@ -346,7 +346,10 @@ pub(crate) fn controls(request: &Request) -> Result<GenerationControls, String> 
         }),
         template_kwargs,
     };
-    controls.validate(has_function_tools(request))?;
+    controls.validate(
+        has_function_tools(request)
+            || (crate::web_search::active().is_some() && request.tools.iter().any(is_web_search)),
+    )?;
     Ok(controls)
 }
 
@@ -365,6 +368,31 @@ fn input_text(content: &Value) -> Result<String, String> {
         text.push_str(part["text"].as_str().ok_or("text part requires text")?);
     }
     Ok(text)
+}
+
+fn replay_search_message(item: &Value) -> Result<ChatMessage, String> {
+    if item["action"]["type"] != "search" {
+        return Err("unsupported search replay action".into());
+    }
+    let query = item["action"]["query"]
+        .as_str()
+        .or_else(|| item["action"]["queries"][0].as_str())
+        .ok_or("search replay requires query")?;
+    if query.chars().count() > 2000 {
+        return Err("search replay query exceeds limit".into());
+    }
+    let text = if let Some(encoded) = item["encrypted_content"].as_str() {
+        let (saved_query, text) = crate::web_search::replay(encoded)?;
+        if saved_query != query {
+            return Err("search replay query mismatch".into());
+        }
+        text
+    } else {
+        format!("Searched for {query}. Results are unavailable in this replay.")
+    };
+    let mut replay = message(ChatRole::Tool, text);
+    replay.name = Some("web_search".into());
+    Ok(replay)
 }
 
 /// Validates the whole request, including its generation controls, and
@@ -440,6 +468,9 @@ pub(crate) fn messages(request: &Request) -> Result<Vec<ChatMessage>, String> {
                 );
                 output.tool_call_id = Some(call_id.into());
                 messages.push(output);
+            }
+            "web_search_call" => {
+                messages.push(replay_search_message(item)?);
             }
             // Earlier reasoning is not replayed: the Qwen template drops
             // thinking from history, and Codex echoes these items back.
@@ -581,11 +612,12 @@ pub(crate) fn json_response(mut connection: Connection, status: u16, value: &Val
 /// written with the first output, so a failure before any token (context
 /// overflow, schema compilation, an expired budget) still answers with an
 /// ordinary HTTP error status instead of a `200` stream.
-struct EventStream<'a> {
+struct EventStream {
     pending: Option<Connection>,
     writer: Option<BufWriter<Connection>>,
     sequence: u64,
-    id: &'a str,
+    id: String,
+    output_offset: usize,
     /// The in-progress `Response` that `response.created` and a failure carry.
     envelope: Value,
     /// Whether the reasoning item streamed live.
@@ -595,7 +627,7 @@ struct EventStream<'a> {
     keepalive: crate::sse::Keepalive,
 }
 
-impl EventStream<'_> {
+impl EventStream {
     fn open(&mut self) -> Result<&mut BufWriter<Connection>, String> {
         if self.writer.is_none() {
             let mut connection = self
@@ -637,16 +669,16 @@ impl EventStream<'_> {
                 let item_id = format!("rs_{}", self.id);
                 if !self.live_reasoning {
                     self.live_reasoning = true;
-                    self.emit(json!({"type":"response.output_item.added","output_index":0,"item":{"id":item_id,"type":"reasoning","summary":[],"content":[]}}))?;
+                    self.emit(json!({"type":"response.output_item.added","output_index":self.output_offset,"item":{"id":item_id,"type":"reasoning","summary":[],"content":[]}}))?;
                 }
-                self.emit(json!({"type":"response.reasoning_text.delta","item_id":item_id,"output_index":0,"content_index":0,"delta":reasoning}))
+                self.emit(json!({"type":"response.reasoning_text.delta","item_id":item_id,"output_index":self.output_offset,"content_index":0,"delta":reasoning}))
             }
             TurnDelta::Text(text) => {
                 let item_id = format!("msg_{}", self.id);
                 let index = if let Some(index) = self.live_message {
                     index
                 } else {
-                    let index = usize::from(self.live_reasoning);
+                    let index = self.output_offset + usize::from(self.live_reasoning);
                     self.live_message = Some(index);
                     self.emit(json!({"type":"response.output_item.added","output_index":index,"item":{"id":item_id,"type":"message","role":"assistant","status":"in_progress","content":[]}}))?;
                     self.emit(json!({"type":"response.content_part.added","item_id":item_id,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}))?;
@@ -686,6 +718,21 @@ pub(crate) fn respond(
     id: &str,
     generation_timeout: Duration,
 ) -> Result<(), String> {
+    if let Some(backend) = crate::web_search::active() {
+        if let Some(tool) = parsed.tools.iter().find(|tool| is_web_search(tool)) {
+            return respond_hosted(
+                request,
+                parsed,
+                messages,
+                tools,
+                session,
+                id,
+                generation_timeout,
+                backend,
+                tool,
+            );
+        }
+    }
     let controls = match controls(parsed) {
         Ok(controls) => controls,
         Err(error) => {
@@ -714,7 +761,8 @@ pub(crate) fn respond(
         pending: Some(request),
         writer: None,
         sequence: 0,
-        id,
+        id: id.into(),
+        output_offset: 0,
         envelope: {
             let mut envelope = envelope(parsed, id, unix_now());
             note_ignored_template_kwargs(&mut envelope, &controls, &*session);
@@ -773,12 +821,21 @@ pub(crate) fn respond(
             return stream.emit(failure);
         }
     };
-    for (index, item) in response["output"]
-        .as_array()
-        .ok_or("output array")?
-        .iter()
-        .enumerate()
-    {
+    finish_items(
+        &mut stream,
+        response["output"].as_array().ok_or("output array")?,
+    )?;
+    let event_type = if response["status"] == "incomplete" {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    stream.emit(json!({"type":event_type,"response":response}))
+}
+
+fn finish_items(stream: &mut EventStream, output: &[Value]) -> Result<(), String> {
+    for (relative, item) in output.iter().enumerate() {
+        let index = stream.output_offset + relative;
         if item["type"] == "function_call" {
             let mut started = item.clone();
             started["arguments"] = json!("");
@@ -816,6 +873,14 @@ pub(crate) fn respond(
                     json!({"type":"response.output_text.delta","item_id":item["id"],"output_index":index,"content_index":0,"delta":part["text"],"logprobs":[]}),
                 )?;
             }
+            for (annotation_index, annotation) in part["annotations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                stream.emit(json!({"type":"response.output_text.annotation.added", "item_id":item["id"], "output_index":index, "content_index":0, "annotation_index":annotation_index, "annotation":annotation}))?;
+            }
             stream.emit(
                 json!({"type":"response.output_text.done","item_id":item["id"],"output_index":index,"content_index":0,"text":part["text"],"logprobs":logprobs}),
             )?;
@@ -826,12 +891,7 @@ pub(crate) fn respond(
         stream
             .emit(json!({"type":"response.output_item.done","output_index":index,"item":item}))?;
     }
-    let event_type = if response["status"] == "incomplete" {
-        "response.incomplete"
-    } else {
-        "response.completed"
-    };
-    stream.emit(json!({"type":event_type,"response":response}))
+    Ok(())
 }
 
 #[allow(
@@ -976,6 +1036,18 @@ fn envelope(request: &Request, id: &str, created_at: u64) -> Value {
     if !dropped.is_empty() {
         envelope["metallix"] = json!({"dropped_tools": dropped});
     }
+    if request.tools.iter().any(is_web_search) {
+        if let Some(unavailable) = crate::web_search::unavailable() {
+            envelope["metallix"]["web_search"] = unavailable;
+        }
+    }
+    if request.input.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "web_search_call" && item.get("encrypted_content").is_some()
+        })
+    }) {
+        envelope["metallix"]["web_content"] = json!(true);
+    }
     envelope
 }
 
@@ -996,6 +1068,31 @@ fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn replay_sources(request: &Request) -> Vec<crate::web_search::SearchResult> {
+    request
+        .input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "web_search_call")
+        .filter_map(|item| item["encrypted_content"].as_str())
+        .filter_map(|encoded| crate::web_search::decode_replay_results(encoded).ok())
+        .flat_map(|(_, results)| results)
+        .collect()
+}
+
+fn search_annotations(text: &str, sources: &[crate::web_search::SearchResult]) -> Value {
+    json!(
+        crate::web_search::citations(text, sources)
+            .into_iter()
+            .map(|citation| {
+                json!({"type":"url_citation", "url":citation.url, "title":citation.title,
+            "start_index":citation.start_index, "end_index":citation.end_index})
+            })
+            .collect::<Vec<_>>()
+    )
 }
 
 fn response_value(
@@ -1030,7 +1127,9 @@ fn response_value(
         } else {
             json!([])
         };
-        let part = json!({"type":"output_text","text":text,"annotations":[],"logprobs":logprobs});
+        let annotations = search_annotations(&text, &replay_sources(request));
+        let part =
+            json!({"type":"output_text","text":text,"annotations":annotations,"logprobs":logprobs});
         output.push(json!({"id":format!("msg_{id}"),"type":"message","role":"assistant","status":if complete {"completed"} else {"incomplete"},"content":[part]}));
     }
     for (index, call) in calls.into_iter().enumerate() {
@@ -2429,6 +2528,623 @@ mod tests {
                     assert_eq!(reply["error"]["type"], "server_error");
                 }
             }
+        }
+    }
+}
+
+fn is_web_search(tool: &Value) -> bool {
+    tool["type"]
+        .as_str()
+        .is_some_and(|kind| kind == "web_search" || kind.starts_with("web_search_"))
+}
+
+struct HostedReply {
+    stream: EventStream,
+    output: Vec<Value>,
+    segment: usize,
+    search_output: Option<usize>,
+    sampling: Value,
+    metrics: Value,
+    json_deltas: usize,
+    sources: Vec<crate::web_search::SearchResult>,
+}
+
+impl HostedReply {
+    fn new(connection: Connection, parsed: &Request, id: &str) -> Self {
+        let mut initial = envelope(parsed, id, unix_now());
+        let dropped: Vec<_> = dropped_tools(parsed)
+            .into_iter()
+            .filter(|kind| !kind.starts_with("web_search"))
+            .collect();
+        if dropped.is_empty() {
+            if let Some(meta) = initial["metallix"].as_object_mut() {
+                meta.remove("dropped_tools");
+            }
+        } else {
+            initial["metallix"]["dropped_tools"] = json!(dropped);
+        }
+        let stream = EventStream {
+            pending: Some(connection),
+            writer: None,
+            sequence: 0,
+            id: format!("{id}_0"),
+            output_offset: 0,
+            envelope: initial,
+            live_reasoning: false,
+            live_message: None,
+            keepalive: crate::sse::Keepalive::new(),
+        };
+
+        Self {
+            stream,
+            output: Vec::new(),
+            segment: 0,
+            search_output: None,
+            sampling: Value::Null,
+            metrics: Value::Null,
+            json_deltas: 0,
+            sources: replay_sources(parsed),
+        }
+    }
+
+    fn push(
+        &mut self,
+        event: crate::web_search::turn::Event<'_>,
+        parsed: &Request,
+        tools: &[Value],
+        id: &str,
+    ) -> Result<(), String> {
+        use crate::web_search::turn::Event;
+        match event {
+            Event::Delta(delta) => self.delta(delta, parsed),
+            Event::Segment {
+                generated,
+                turn,
+                searching,
+            } => self.segment(generated, turn, searching, parsed, tools, id),
+            Event::SearchStart { index, query } => self.search_start(index, query, parsed, id),
+            Event::SearchEnd { query, results, .. } => self.search_end(query, results, parsed),
+        }
+    }
+
+    fn delta(&mut self, delta: TurnDelta, parsed: &Request) -> Result<(), String> {
+        let Self {
+            stream,
+            json_deltas,
+            ..
+        } = self;
+
+        if parsed.stream {
+            stream.delta(delta)?;
+        } else {
+            *json_deltas += 1;
+            if (delta == TurnDelta::Held
+                || json_deltas.is_multiple_of(crate::http_transport::CLIENT_POLL_DELTAS))
+                && stream
+                    .pending
+                    .as_mut()
+                    .ok_or("connection unavailable")?
+                    .client_gone()
+            {
+                return Err("the client disconnected".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn segment(
+        &mut self,
+        generated: &crate::chat_generation::ChatGeneration,
+        turn: &AssistantTurn,
+        searching: bool,
+        parsed: &Request,
+        tools: &[Value],
+        id: &str,
+    ) -> Result<(), String> {
+        let Self {
+            stream,
+            output,
+            segment,
+            sampling,
+            metrics,
+            sources,
+            ..
+        } = self;
+        let validated_client_tools = strict_tools(!tools.is_empty(), &parsed.tools, |tool| {
+            tool["strict"] != Value::Bool(false)
+        });
+
+        if !searching {
+            for call in turn
+                .calls
+                .iter()
+                .filter(|call| validated_client_tools.contains(&call.name))
+            {
+                chat_format::check_call(tools, call)?;
+            }
+        }
+        let segment_id = format!("{id}_{segment}");
+        let mut items = Vec::new();
+        if !turn.reasoning.is_empty() {
+            items.push(json!({"id":format!("rs_{segment_id}"),"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":turn.reasoning}]}));
+        }
+        if !turn.text.is_empty() || (!searching && turn.calls.is_empty()) {
+            let annotations = search_annotations(&turn.text, sources);
+            items.push(json!({"id":format!("msg_{segment_id}"),"type":"message","role":"assistant","status":if turn.complete {"completed"} else {"incomplete"},"content":[{"type":"output_text","text":turn.text,"annotations":annotations,"logprobs":logprobs_value(&generated.logprobs)}]}));
+        }
+        if !searching {
+            for (index, call) in turn.calls.iter().enumerate() {
+                items.push(json!({"id":format!("fc_{segment_id}_{index}"),"type":"function_call","call_id":format!("call_{segment_id}_{index}"),"name":call.name,"arguments":call.arguments.to_string(),"status":"completed"}));
+            }
+        }
+        if parsed.stream {
+            finish_items(stream, &items)?;
+        }
+        output.extend(items);
+        *sampling = json!(generated.sampling);
+        *metrics = json!(generated.metrics);
+        *segment += 1;
+        stream.id = format!("{id}_{segment}");
+        stream.live_reasoning = false;
+        stream.live_message = None;
+        stream.output_offset = output.len();
+        Ok(())
+    }
+
+    fn search_start(
+        &mut self,
+        index: usize,
+        query: &str,
+        parsed: &Request,
+        id: &str,
+    ) -> Result<(), String> {
+        let Self {
+            stream,
+            output,
+            search_output,
+            ..
+        } = self;
+
+        let item_id = format!("ws_{id}_{index}");
+        let item = json!({"id":item_id,"type":"web_search_call","status":"in_progress","action":{"type":"search","query":query,"queries":[query]}});
+        let position = output.len();
+        if parsed.stream {
+            stream.emit(
+                json!({"type":"response.output_item.added","output_index":position,"item":item}),
+            )?;
+            for kind in ["in_progress", "searching"] {
+                stream.emit(json!({"type":format!("response.web_search_call.{kind}"),"output_index":position,"item_id":item_id}))?;
+            }
+        }
+        output.push(item);
+        *search_output = Some(position);
+        Ok(())
+    }
+
+    fn search_end(
+        &mut self,
+        query: &str,
+        results: &Result<Vec<crate::web_search::SearchResult>, crate::web_search::SearchError>,
+        parsed: &Request,
+    ) -> Result<(), String> {
+        use crate::web_search;
+        let Self {
+            stream,
+            output,
+            search_output,
+            sources,
+            ..
+        } = self;
+
+        let position = search_output.take().ok_or("search result without call")?;
+        let item = &mut output[position];
+        item["status"] = json!(if results.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        });
+        if let Ok(results) = results {
+            sources.extend(results.iter().cloned());
+            item["encrypted_content"] = json!(web_search::encode_replay(query, results));
+            if parsed
+                .include
+                .as_ref()
+                .is_some_and(|i| i.iter().any(|v| v == "web_search_call.action.sources"))
+            {
+                item["action"]["sources"] = json!(
+                    results
+                        .iter()
+                        .map(|r| json!({"type":"url","url":r.url}))
+                        .collect::<Vec<_>>()
+                );
+            }
+            if parsed
+                .include
+                .as_ref()
+                .is_some_and(|i| i.iter().any(|v| v == "web_search_call.results"))
+            {
+                item["results"] = json!(results);
+            }
+        }
+        if parsed.stream {
+            stream.emit(json!({"type":"response.web_search_call.completed","output_index":position,"item_id":item["id"]}))?;
+            stream.emit(
+                json!({"type":"response.output_item.done","output_index":position,"item":item}),
+            )?;
+        }
+        stream.output_offset = output.len();
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        outcome: Result<crate::web_search::turn::Outcome, String>,
+        parsed: &Request,
+        request_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Self {
+            ref mut stream,
+            output,
+            sampling,
+            metrics,
+            ..
+        } = self;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(connection) = stream.pending.take() {
+                    generation_routes::error_response(
+                        connection,
+                        500,
+                        Some("generation_failed"),
+                        &error,
+                    );
+                    return Ok(());
+                }
+                return stream.emit(failed(&stream.envelope, "generation_failed", &error));
+            }
+        };
+        let mut response = stream.envelope.clone();
+        response["status"] = json!(if outcome.complete {
+            "completed"
+        } else {
+            "incomplete"
+        });
+        if !outcome.complete {
+            response["incomplete_details"] = json!({"reason":"max_output_tokens"});
+        }
+        response["output"] = json!(output);
+        response["usage"] = json!({"input_tokens":outcome.input_tokens,"output_tokens":outcome.output_tokens,"total_tokens":outcome.input_tokens+outcome.output_tokens});
+        response["metallix"]["web_search"] = json!({"available":true,"requests":outcome.searches});
+        response["metallix"]["web_content"] = json!(outcome.web_content);
+        response["metallix"]["sampling"] = sampling;
+        response["metrics"] = metrics;
+        echo_request_id(&mut response, request_id);
+        if parsed.stream {
+            stream.emit(json!({"type":if outcome.complete {"response.completed"} else {"response.incomplete"},"response":response}))
+        } else {
+            json_response(
+                stream.pending.take().ok_or("connection unavailable")?,
+                200,
+                &response,
+            );
+            Ok(())
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one admitted hosted Responses turn"
+)]
+fn respond_hosted(
+    connection: Connection,
+    parsed: &Request,
+    messages: &[ChatMessage],
+    tools: &[Value],
+    session: &mut dyn ChatBackend,
+    id: &str,
+    timeout: Duration,
+    backend: &crate::web_search::Backend,
+    declared: &Value,
+) -> Result<(), String> {
+    use crate::web_search::{self, turn::Policy};
+    let policy = match Policy::parse(declared) {
+        Ok(policy) => policy,
+        Err(error) => {
+            generation_routes::error_response(connection, 400, None, &error);
+            return Ok(());
+        }
+    };
+    if tools
+        .iter()
+        .any(|tool| tool["function"]["name"] == "web_search")
+    {
+        generation_routes::error_response(
+            connection,
+            400,
+            None,
+            "web_search conflicts with hosted search",
+        );
+        return Ok(());
+    }
+    let mut controls = match controls(parsed) {
+        Ok(controls) => controls,
+        Err(error) => {
+            generation_routes::error_response(connection, 400, None, &error);
+            return Ok(());
+        }
+    };
+    if tools.is_empty() && controls.json_schema.is_some() && controls.enable_thinking {
+        generation_routes::error_response(
+            connection,
+            400,
+            None,
+            "hosted-only schema output with thinking is unsupported after search withdrawal",
+        );
+        return Ok(());
+    }
+    if policy.max_uses > 0 {
+        controls.strict_tools.push("web_search".into());
+    }
+    if let Err(error) = controls.validate(!tools.is_empty() || policy.max_uses > 0) {
+        generation_routes::error_response(connection, 400, None, &error);
+        return Ok(());
+    }
+    let request_id = connection.request_id().map(str::to_owned);
+    let cache_salt = connection.cache_salt().map(str::to_owned);
+    let mut reply = HostedReply::new(connection, parsed, id);
+    let outcome = web_search::turn::run(
+        backend,
+        &policy,
+        session,
+        &controls,
+        messages,
+        tools,
+        cache_salt.as_deref(),
+        timeout,
+        &mut |event| reply.push(event, parsed, tools, id),
+    );
+    reply.finish(outcome, parsed, request_id.as_deref())
+}
+
+#[cfg(test)]
+mod hosted_search_tests {
+    use super::*;
+    use crate::sse::test_support::{Scripted, events, exchange, json_body};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Segments {
+        count: usize,
+    }
+    impl ChatBackend for Segments {
+        fn load_ms(&self) -> f64 {
+            0.0
+        }
+        fn generate_with_timeout(
+            &mut self,
+            request: ChatRequest<'_>,
+            timeout: Duration,
+            emit: &mut dyn FnMut(TurnDelta) -> Result<(), String>,
+        ) -> Result<crate::chat_generation::ChatGeneration, ChatGenerationError> {
+            let text = if self.count == 0 {
+                assert!(
+                    request
+                        .tools
+                        .iter()
+                        .any(|t| t["function"]["name"] == "web_search")
+                );
+                "Let me check. <tool_call>{\"name\":\"web_search\",\"arguments\":{\"query\":\"weather\"}}</tool_call>"
+            } else {
+                assert!(request.messages.iter().any(|m| m.role == ChatRole::Tool
+                    && (m.content.contains("sunny") || m.content == "search failed")));
+                assert!(
+                    !request
+                        .tools
+                        .iter()
+                        .any(|t| t["function"]["name"] == "web_search")
+                );
+                "{\"answer\":\"界 https://example.com/weather\"}"
+            };
+            self.count += 1;
+            Scripted::new(text).generate_with_timeout(request, timeout, emit)
+        }
+    }
+
+    #[test]
+    fn hosted_search_preserves_responses_default_client_tool_validation() {
+        let fixture = chat_format::test_model::ModelDir::new(&json!({}), &json!({}), None);
+        let command = fixture.path().join("search");
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = crate::web_search::Backend::start(command);
+        let body = json!({"model":"control", "input":"call", "chat_template_kwargs":{"enable_thinking":false},
+            "tools":[{"type":"web_search"},{"type":"function","name":"weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]});
+        let parsed: Request = serde_json::from_value(body.clone()).unwrap();
+        let mut model = Scripted::new(
+            "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":42}}</tool_call>",
+        );
+        let wire = exchange("/v1/responses", &body.to_string(), |connection, _| {
+            respond_hosted(
+                connection,
+                &parsed,
+                &messages(&parsed).unwrap(),
+                &tools(&parsed).unwrap(),
+                &mut model,
+                "bad_client_call",
+                Duration::from_secs(2),
+                &backend,
+                &parsed.tools[0],
+            )
+            .unwrap();
+        });
+        assert_eq!(json_body(&wire).0.split_whitespace().nth(1), Some("500"));
+    }
+
+    #[test]
+    fn hosted_effective_control_errors_precede_model_and_stream() {
+        let fixture = chat_format::test_model::ModelDir::new(&json!({}), &json!({}), None);
+        let command = fixture.path().join("search");
+        std::fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = crate::web_search::Backend::start(command);
+        for extra in [
+            json!({"ignore_eos":true}),
+            json!({"chat_template_kwargs":{"enable_thinking":true},"text":{"format":{"type":"json_schema","schema":{"type":"object"}}}}),
+        ] {
+            let mut body = json!({"model":"control","input":"weather","stream":true,"tools":[{"type":"web_search"}],"chat_template_kwargs":{"enable_thinking":false}});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let parsed: Request = serde_json::from_value(body.clone()).unwrap();
+            let history = match messages(&parsed) {
+                Ok(history) => history,
+                Err(error) => {
+                    assert!(
+                        parsed.text.is_some(),
+                        "only the already unsupported schema/thinking fixture may fail preparation"
+                    );
+                    assert!(error.contains("JSON schema output cannot be combined with reasoning"));
+                    continue;
+                }
+            };
+            let mut model = Segments { count: 0 };
+            let wire = exchange("/v1/responses", &body.to_string(), |connection, _| {
+                respond_hosted(
+                    connection,
+                    &parsed,
+                    &history,
+                    &tools(&parsed).unwrap(),
+                    &mut model,
+                    "reject",
+                    Duration::from_secs(5),
+                    &backend,
+                    &parsed.tools[0],
+                )
+                .unwrap();
+            });
+            assert_eq!(model.count, 0);
+            assert_eq!(json_body(&wire).0, "HTTP/1.1 400 Bad Request");
+            assert!(!wire.contains("response.created"));
+        }
+    }
+
+    fn assert_hosted_response_and_replay(response: &Value, wire: &str, streaming: bool) {
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[1]["type"], "web_search_call");
+        assert_eq!(output[1]["status"], "completed");
+        assert_eq!(output[1]["results"][0]["snippet"], "sunny");
+        assert_eq!(response["metallix"]["web_search"]["requests"], 1);
+        assert_eq!(response["usage"]["output_tokens"], 4);
+        let annotation = &output[2]["content"][0]["annotations"][0];
+        assert_eq!(annotation["url"], "https://example.com/weather");
+        let text = output[2]["content"][0]["text"].as_str().unwrap();
+        let start = usize::try_from(annotation["start_index"].as_u64().unwrap()).unwrap();
+        let end = usize::try_from(annotation["end_index"].as_u64().unwrap()).unwrap();
+        assert_eq!(
+            text.chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>(),
+            "https://example.com/weather"
+        );
+        if streaming {
+            assert!(events(wire).iter().any(|(_, data)| {
+                serde_json::from_str::<Value>(data).unwrap()["type"]
+                    == "response.output_text.annotation.added"
+            }));
+        }
+        let replay: Request = serde_json::from_value(json!({"model":"control","input":[output[1].clone(),{"role":"user","content":"again"}]})).unwrap();
+        assert!(messages(&replay).unwrap()[0].content.contains("sunny"));
+        let controls = controls(&replay).unwrap();
+        let mut scripted = Scripted::new("界 https://example.com/weather");
+        let generated = scripted
+            .generate_with_timeout(
+                controls.request(&messages(&replay).unwrap(), &[]),
+                Duration::from_secs(1),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        let replayed = response_value(&replay, &controls, &generated, "replay").unwrap();
+        assert_eq!(
+            replayed["output"][0]["content"][0]["annotations"][0]["start_index"],
+            2
+        );
+        let mut missing = output[1].clone();
+        missing.as_object_mut().unwrap().remove("encrypted_content");
+        let replay: Request = serde_json::from_value(
+            json!({"model":"control","input":[missing,{"role":"user","content":"again"}]}),
+        )
+        .unwrap();
+        assert!(
+            messages(&replay).unwrap()[0]
+                .content
+                .contains("Results are unavailable")
+        );
+    }
+
+    #[test]
+    fn hosted_responses_stream_and_json_have_ordered_native_calls_and_replay() {
+        let fixture = chat_format::test_model::ModelDir::new(&json!({}), &json!({}), None);
+        let command = fixture.path().join("search");
+        std::fs::write(&command, "#!/bin/sh\nif [ \"$1\" = --health ]; then exit 0; fi\ncat >/dev/null\nprintf '[{\"url\":\"https://example.com/weather\",\"title\":\"Weather\",\"snippet\":\"sunny\"}]'\n").unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let backend = crate::web_search::Backend::start(command);
+        assert!(backend.healthy());
+        for streaming in [false, true] {
+            let body = json!({"model":"control","input":"weather","stream":streaming,
+                "chat_template_kwargs":{"enable_thinking":false},"max_output_tokens":100,
+                "tools":[{"type":"web_search","max_uses":1}],
+                "include":["web_search_call.results","web_search_call.action.sources"],
+                "text":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}}}});
+            let parsed: Request = serde_json::from_value(body.clone()).unwrap();
+            let mut model = Segments { count: 0 };
+            let wire = exchange("/v1/responses", &body.to_string(), |connection, _| {
+                respond_hosted(
+                    connection,
+                    &parsed,
+                    &messages(&parsed).unwrap(),
+                    &tools(&parsed).unwrap(),
+                    &mut model,
+                    "hosted",
+                    Duration::from_secs(5),
+                    &backend,
+                    &parsed.tools[0],
+                )
+                .unwrap();
+            });
+            assert_eq!(model.count, 2);
+            let response = if streaming {
+                let frames: Vec<Value> = events(&wire)
+                    .into_iter()
+                    .map(|(_, data)| serde_json::from_str(&data).unwrap())
+                    .collect();
+                assert_eq!(frames.last().unwrap()["type"], "response.completed");
+                let response = frames.last().unwrap()["response"].clone();
+                let done: Vec<Value> = frames
+                    .iter()
+                    .filter(|v| v["type"] == "response.output_item.done")
+                    .map(|v| v["item"].clone())
+                    .collect();
+                assert_eq!(json!(done), response["output"]);
+                for (index, item) in response["output"].as_array().unwrap().iter().enumerate() {
+                    let added = frames
+                        .iter()
+                        .find(|v| {
+                            v["type"] == "response.output_item.added"
+                                && v["item"]["id"] == item["id"]
+                        })
+                        .unwrap();
+                    assert_eq!(added["output_index"], index);
+                }
+                response
+            } else {
+                let (status, response) = json_body(&wire);
+                assert_eq!(status, "HTTP/1.1 200 OK");
+                response
+            };
+            assert_hosted_response_and_replay(&response, &wire, streaming);
         }
     }
 }

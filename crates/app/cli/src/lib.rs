@@ -116,6 +116,8 @@ mod sse;
 mod supports;
 #[cfg(feature = "metal")]
 mod transcriptions;
+#[cfg(feature = "metal")]
+mod web_search;
 
 #[cfg(feature = "metal")]
 mod generation_preview;
@@ -482,6 +484,7 @@ fn dispatch(cli: Cli) -> ExitCode {
             wired_kv_mib,
             prefix_cache_mib,
             generation_timeout_ms,
+            web_search_cmd,
             queue_depth,
             queue_wait_ms,
             max_num_seqs,
@@ -490,6 +493,17 @@ fn dispatch(cli: Cli) -> ExitCode {
             kv_persist_dir,
             kv_persist_mib,
         } => {
+            let web_search_cmd = web_search_cmd.or_else(|| {
+                std::env::var_os("METALLIX_WEB_SEARCH_CMD").map(std::path::PathBuf::from)
+            });
+            if let Err(error) = web_search::configure(
+                web_search_cmd.clone(),
+                max_num_seqs == 1,
+                worker_entry.is_some(),
+            ) {
+                tracing::error!("mx serve: {error}");
+                return ExitCode::FAILURE;
+            }
             let kv_persist = kv_persist_dir.map(|dir| prefix_store::KvPersist {
                 dir,
                 budget_mib: kv_persist_mib,
@@ -541,6 +555,7 @@ fn dispatch(cli: Cli) -> ExitCode {
                         prefill_chunk_tokens,
                         prefill_target_ms,
                         generation_timeout_ms,
+                        web_search_cmd,
                         kv_persist,
                         trace_out: cli.trace_out,
                         gpu_capture: cli.gpu_capture,
