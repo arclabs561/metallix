@@ -193,7 +193,13 @@ fn generated_image_matches_diffusers() {
         Flux2Precision::Bf16 => {
             let source = reference_rgb8(&load(source_bf16.as_deref().expect("resolved above")));
             let source_psnr = psnr_rgb8(&source, &reference);
-            eprintln!("source bf16 vs source f32: PSNR {source_psnr:.2} dB");
+            let source_ssim = ssim_rgb8(&source, &reference, width, height);
+            eprintln!("source bf16 vs source f32: PSNR {source_psnr:.2} dB, SSIM {source_ssim:.4}");
+            let same_precision_psnr = psnr_rgb8(&ours, &source);
+            let same_precision_ssim = ssim_rgb8(&ours, &source, width, height);
+            eprintln!(
+                "Bf16 vs source bf16 (diagnostic): PSNR {same_precision_psnr:.2} dB, SSIM {same_precision_ssim:.4}"
+            );
             assert!(
                 psnr >= source_psnr - BF16_PSNR_MARGIN_DB,
                 "PSNR {psnr:.2} < {source_psnr:.2} - {BF16_PSNR_MARGIN_DB}"
@@ -201,6 +207,32 @@ fn generated_image_matches_diffusers() {
             assert!(ssim >= BF16_MIN_SSIM, "SSIM {ssim:.4} < {BF16_MIN_SSIM}");
         }
     }
+}
+
+/// Check whether the source's own precision change meets the absolute image
+/// bar, using exactly the generated-image gate's conversion and metric.
+/// This loads only the two references, not a model or text encoder.
+#[test]
+#[ignore = "needs METALLIX_FLUX2_PIPE_REF and METALLIX_FLUX2_PIPE_REF_BF16 CPU references"]
+fn source_bf16_image_meets_ssim_floor() {
+    let reference = require(gate_inputs::file(&process_env, "METALLIX_FLUX2_PIPE_REF"));
+    let source = require(gate_inputs::cpu_reference(
+        &process_env,
+        "METALLIX_FLUX2_PIPE_REF_BF16",
+    ));
+    require(gate_inputs::matching_pipeline(&reference, &source));
+    let meta = require(gate_inputs::sidecar(&reference));
+    let width = usize::try_from(require(gate_inputs::field(&meta, "width"))).expect("width");
+    let height = usize::try_from(require(gate_inputs::field(&meta, "height"))).expect("height");
+    let reference = reference_rgb8(&load(&reference));
+    let source = reference_rgb8(&load(&source));
+    let psnr = psnr_rgb8(&source, &reference);
+    let ssim = ssim_rgb8(&source, &reference, width, height);
+    eprintln!("source bf16 vs source f32: PSNR {psnr:.2} dB, SSIM {ssim:.4}");
+    assert!(
+        ssim >= BF16_MIN_SSIM,
+        "source SSIM {ssim:.4} < {BF16_MIN_SSIM}"
+    );
 }
 
 /// Gate C2: the same noise under another prompt must fail the f32 bar, or the
