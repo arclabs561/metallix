@@ -507,6 +507,7 @@ version = "0.1.0"
 dependencies = [
  "blockfloat",
  "chat-format",
+ "checkpoint",
  "divan",
  "mlx-rs",
  "mlx-sys",
