@@ -16,8 +16,9 @@
 //!    width.
 //!
 //! Windows are run as a batch, so attention never spans a window boundary
-//! and no mask over the whole clip is built. The final window is padded and
-//! its padded keys are masked.
+//! and no mask over the whole clip is built. A clip fitting one window uses
+//! its actual length. For multiple windows, the final window is padded and
+//! its extra keys are masked.
 
 #![allow(
     deprecated,
@@ -194,12 +195,13 @@ impl AudioEncoder {
         let (flat, frames) = self.embed_frames(mel, layout)?;
         let d_model = as_i32(self.config.d_model)?;
 
-        // Lay the frames out as [windows, window, d_model]; the last window is
-        // padded by repeating frame 0, and those keys are masked.
+        // A single window uses its actual length, as the source does. Extra
+        // masked rows can change reduced-precision kernel rounding. For
+        // multiple windows the last is padded and its extra keys are masked.
         let window = match layout {
             Layout::FullAttention => frames,
             Layout::Reference | Layout::ContinuousPositions | Layout::UnfusedBias => {
-                self.config.window_frames()
+                self.config.window_frames().min(frames)
             }
         };
         let windows = frames.div_ceil(window);
@@ -693,16 +695,20 @@ mod convolution_tests {
     use super::*;
 
     fn encoder(dtype: Dtype) -> AudioEncoder {
+        encoder_with_width(dtype, 8)
+    }
+
+    fn encoder_with_width(dtype: Dtype, width: usize) -> AudioEncoder {
         let config = AudioEncoderConfig {
-            d_model: 8,
+            d_model: width,
             layers: 1,
             heads: 2,
-            ffn_dim: 16,
+            ffn_dim: 2 * width,
             conv_channels: 4,
             conv_chunksize: 3,
             max_source_positions: 16,
             window_chunks: 8,
-            output_dim: 8,
+            output_dim: width,
         };
         let mut tensors = required_tensors(&config)
             .into_iter()
@@ -733,6 +739,49 @@ mod convolution_tests {
             .unwrap();
         wide.eval().unwrap();
         wide.as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn single_window_matches_unpadded_control_in_both_precisions() {
+        // Head dimension 64 exercises the actual attention operator. The
+        // inputs include partial convolution chunks, 53 encoder rows and
+        // exactly one complete 104-row attention window.
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let encoder = encoder_with_width(dtype, 128);
+            for frames in [36, 401, 800] {
+                let mel = mel(frames);
+                let mut actual_stages = Vec::new();
+                let actual = encoder
+                    .encode_into(&mel, Layout::Reference, Some(&mut actual_stages))
+                    .unwrap();
+                let mut expected_stages = Vec::new();
+                // Full attention is the unpadded equivalent only while the
+                // entire clip fits one window; it changes no weights/ops.
+                let expected = encoder
+                    .encode_into(&mel, Layout::FullAttention, Some(&mut expected_stages))
+                    .unwrap();
+                assert_eq!(actual.dtype(), dtype);
+                assert_eq!(actual_stages.len(), expected_stages.len());
+                actual_stages.push(actual);
+                expected_stages.push(expected);
+                for (index, (actual, expected)) in
+                    actual_stages.iter().zip(&expected_stages).enumerate()
+                {
+                    assert_eq!(actual.shape(), expected.shape());
+                    let bits = |array: &Array| {
+                        values(array)
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        bits(actual),
+                        bits(expected),
+                        "{dtype:?} mel_frames={frames} stage={index}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
