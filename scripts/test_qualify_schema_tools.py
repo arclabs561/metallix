@@ -25,7 +25,13 @@ def response(payload, text='{"answer":"blue"}'):
         "status": "completed",
         "usage": {"input_tokens": 10, "output_tokens": 8, "total_tokens": 18},
         "metallix": {
-            "sampling": {key: payload[key] for key in ("seed", "temperature", "top_p")}
+            "sampling": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "seed": None,
+                "top_k": None,
+                "sampler": None,
+            }
         },
         "output": [
             {
@@ -84,6 +90,9 @@ class QualificationTests(unittest.TestCase):
 
     def test_pair_changes_only_format_and_baseline_has_no_grammar(self):
         self.assertEqual(len(self.pairs), 16)
+        self.assertEqual(
+            len({p["baseline"]["input"][0]["content"] for p in self.pairs}), 16
+        )
         for pair in self.pairs:
             constrained = copy.deepcopy(pair["constrained"])
             self.assertEqual(constrained.pop("text")["format"]["schema"], module.SCHEMA)
@@ -137,7 +146,7 @@ class QualificationTests(unittest.TestCase):
         value["status"] = "incomplete"
         value["incomplete_details"] = {"reason": "max_output_tokens"}
         self.assertEqual(module.classify_response(value, self.payload, True), "limit")
-        value["metallix"]["sampling"]["seed"] += 1
+        value["metallix"]["sampling"]["seed"] = 99
         with self.assertRaises(module.ProtocolError):
             module.classify_response(value, self.payload, True)
 

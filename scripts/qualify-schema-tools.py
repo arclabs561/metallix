@@ -6,7 +6,8 @@
 """Paired schema-with-tools qualification against an existing loopback mx server.
 
 Dry run by default. Sixteen paired samples hold prompts, seeds and sampling
-fixed, changing only text.format. This measures output validity, call-choice
+fixed, changing only text.format. Sampling is explicitly greedy: the server
+ignores the paired seed and disables checkpoint top-k defaults in both arms. This measures output validity, call-choice
 preservation and completion. It does not prove constraint-span coverage or
 server/checkpoint identity; retain the server launch and tracing receipts too.
 """
@@ -61,6 +62,14 @@ PROMPTS = [
     "Retrieve the current incident count using read_fact, key incident_count.",
     "The provided answer is blue. Return that answer without a tool call.",
     "The provided answer is seven. Return that answer without a tool call.",
+    "Read the current database health with read_fact, key database_health.",
+    "Retrieve today's active branch with read_fact, key active_branch.",
+    "What is the current disk alert? Use read_fact with key disk_alert.",
+    "Look up the latest test suite result with read_fact, key test_result.",
+    "Fetch the current dependency version with read_fact, key dependency_version.",
+    "Find the current review state with read_fact, key review_state.",
+    "The provided answer is ready. Return that answer without a tool call.",
+    "The provided answer is green. Return that answer without a tool call.",
 ]
 
 
@@ -123,43 +132,43 @@ def wall_deadline(seconds: int):
 def paired_requests(model: str, max_tokens: int) -> list[dict]:
     pairs = []
     for index, prompt in enumerate(PROMPTS):
-        for seed in (17, 83):
-            baseline = {
-                "model": model,
-                "input": [
-                    {
-                        "role": "user",
-                        "content": prompt
-                        + ' If you answer directly, use JSON {"answer": "your answer"}.',
-                    }
-                ],
-                "tools": [copy.deepcopy(TOOL)],
-                "tool_choice": "auto",
-                "metallix_sampler": "icdf-v1",
-                "speculation": "off",
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "seed": seed,
-                "max_output_tokens": max_tokens,
-                "stream": False,
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
-            constrained = copy.deepcopy(baseline)
-            constrained["text"] = {
-                "format": {
-                    "type": "json_schema",
-                    "name": "answer",
-                    "strict": True,
-                    "schema": copy.deepcopy(SCHEMA),
-                }
-            }
-            pairs.append(
+        seed = 17
+        baseline = {
+            "model": model,
+            "input": [
                 {
-                    "id": f"prompt-{index}-seed-{seed}",
-                    "baseline": baseline,
-                    "constrained": constrained,
+                    "role": "user",
+                    "content": prompt
+                    + ' If you answer directly, use JSON {"answer": "your answer"}.',
                 }
-            )
+            ],
+            "tools": [copy.deepcopy(TOOL)],
+            "tool_choice": "auto",
+            "metallix_sampler": "icdf-v1",
+            "speculation": "off",
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "seed": seed,
+            "max_output_tokens": max_tokens,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        constrained = copy.deepcopy(baseline)
+        constrained["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "strict": True,
+                "schema": copy.deepcopy(SCHEMA),
+            }
+        }
+        pairs.append(
+            {
+                "id": f"prompt-{index}-seed-{seed}",
+                "baseline": baseline,
+                "constrained": constrained,
+            }
+        )
     return pairs
 
 
@@ -210,7 +219,14 @@ def classify_response(value, payload, constrained):
         raise ProtocolError("missing sampling receipt")
     sampling = metadata["sampling"]
     if any(
-        sampling.get(key) != payload[key] for key in ("seed", "temperature", "top_p")
+        sampling.get(key) != expected
+        for key, expected in {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "seed": None,
+            "sampler": None,
+        }.items()
     ):
         raise ProtocolError("server sampling does not match paired request")
     if value.get("status") == "incomplete":
