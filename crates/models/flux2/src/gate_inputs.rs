@@ -117,6 +117,38 @@ pub(crate) fn cpu_reference(lookup: Lookup<'_>, var: &str) -> Result<PathBuf, In
     }
 }
 
+/// Reject unrelated images as the source noise floor for the bf16 gate.
+pub(crate) fn matching_pipeline(reference: &Path, bf16: &Path) -> Result<(), InputError> {
+    let baseline = sidecar(reference)?;
+    let source = sidecar(bf16)?;
+    validate_pipeline_pair(&baseline, &source).map_err(|message| InputError::Sidecar {
+        path: bf16.with_extension("json"),
+        message,
+    })
+}
+
+fn validate_pipeline_pair(
+    baseline: &serde_json::Value,
+    source: &serde_json::Value,
+) -> Result<(), String> {
+    for (meta, dtype) in [(baseline, "f32"), (source, "bf16")] {
+        if meta["kind"] != "pipeline"
+            || meta["dtype"] != dtype
+            || meta["device"] != "cpu"
+            || meta["decoded"] != true
+        {
+            return Err(format!("requires a decoded CPU {dtype} pipeline reference"));
+        }
+    }
+    for key in ["prompt", "seed", "width", "height", "steps"] {
+        if baseline.get(key).is_none_or(serde_json::Value::is_null) || baseline[key] != source[key]
+        {
+            return Err(format!("pipeline reference mismatch or missing {key}"));
+        }
+    }
+    Ok(())
+}
+
 /// A non-negative integer field of a sidecar.
 pub(crate) fn field(meta: &serde_json::Value, key: &str) -> Result<u64, InputError> {
     meta[key]
@@ -145,6 +177,28 @@ pub(crate) fn require<T>(resolved: Result<T, InputError>) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_noise_floor_requires_the_same_completed_workload() {
+        let baseline = serde_json::json!({
+            "kind": "pipeline", "dtype": "f32", "device": "cpu", "decoded": true,
+            "prompt": "a lake", "seed": 3, "width": 1024, "height": 1024, "steps": 4
+        });
+        let mut source = baseline.clone();
+        source["dtype"] = "bf16".into();
+        assert!(validate_pipeline_pair(&baseline, &source).is_ok());
+        for (key, value) in [
+            ("prompt", serde_json::json!("another prompt")),
+            ("seed", serde_json::json!(4)),
+            ("decoded", serde_json::json!(false)),
+            ("device", serde_json::json!("mps")),
+            ("kind", serde_json::json!("vae")),
+        ] {
+            let mut wrong = source.clone();
+            wrong[key] = value;
+            assert!(validate_pipeline_pair(&baseline, &wrong).is_err(), "{key}");
+        }
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("flux2-gate-inputs-{}", std::process::id()));

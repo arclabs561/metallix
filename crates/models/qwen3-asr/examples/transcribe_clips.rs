@@ -14,7 +14,7 @@
 //! allocator growth across requests is visible. The allocator cache is capped
 //! (default 2 GiB), as the server caps it.
 //!
-//! With no clips directory present it prints a note and exits 0.
+//! Missing clip inputs fail the run rather than reporting a successful gate.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -67,11 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let manifest_path = clips.join("manifest.json");
     if !manifest_path.exists() {
-        println!(
+        return Err(format!(
             "no {}; run scripts/qwen3-asr-reference.py prepare-clips first",
             manifest_path.display()
-        );
-        return Ok(());
+        )
+        .into());
     }
     let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(manifest_path)?)?;
 

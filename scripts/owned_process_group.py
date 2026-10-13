@@ -1,0 +1,123 @@
+"""Unreaped-child anchored cleanup for trusted children that stay in their session."""
+
+import os
+import signal
+import subprocess
+import time
+
+
+def members(pgid):
+    """Bounded metadata-only process-group inventory, including zombies."""
+    result = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,pgid=,stat="],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=0.25,
+    )
+    found = {}
+    for line in result.stdout.splitlines():
+        pid, group, state = line.split()
+        if int(group) == pgid:
+            found[int(pid)] = state
+    return found
+
+
+def exited(process):
+    # WNOWAIT keeps the owned child's PID reserved until all group signals end.
+    # Do not use Popen.poll()/wait() before cleanup: those reap the anchor.
+    return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
+def confirm_terminal_after_disappearance(process, timeout=0.25):
+    """Wait boundedly for a still-owned child to become waitable, without reaping.
+
+    macOS may stop resolving process metadata before WNOWAIT exposes terminal
+    status. ECHILD propagates: a reaped/recycled PID is never an ownership proof.
+    A live child or observation failure remains fatal after the short bound.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        terminal = exited(process)
+        if terminal is not None:
+            return terminal
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.005, remaining))
+
+
+def cleanup(process, event, grace=0.25):
+    """Signal only the anchored group; telemetry cannot interrupt cleanup."""
+    telemetry_errors = []
+
+    def note(kind, **fields):
+        try:
+            event(kind, **fields)
+        except (OSError, ValueError, TypeError) as exc:
+            telemetry_errors.append(str(exc))
+
+    terminal = exited(process)
+    # An unreaped zombie has no getpgid result on macOS. WNOWAIT still
+    # proves our child owns the reserved PID, until we reap after signaling.
+    if terminal is None:
+        try:
+            group = os.getpgid(process.pid)
+        except ProcessLookupError:
+            # The child can exit between WNOWAIT and getpgid. Only a second
+            # WNOWAIT confirming our still-unreaped child preserves the anchor.
+            # ECHILD (already reaped), or a still-live child, must fail closed.
+            if confirm_terminal_after_disappearance(process) is None:
+                raise
+        else:
+            if group != process.pid:
+                raise RuntimeError(
+                    "owned process-group identity lost; refusing group signal"
+                )
+    if process.pid == os.getpgrp():
+        raise RuntimeError("refusing to signal watchdog process group")
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(process.pid, sig)
+            note("signal", signal=sig.name, pgid=process.pid)
+        except (ProcessLookupError, PermissionError) as exc:
+            # A zombie-only group may report EPERM. Defer its disposition
+            # to fresh confirmation; never let it skip reaping.
+            note("signal_result", signal=sig.name, detail=str(exc))
+        deadline = time.monotonic() + wait
+        empty = False
+        while time.monotonic() < deadline:
+            try:
+                empty = not any(
+                    "Z" not in state for state in members(process.pid).values()
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                note("cleanup_observation_failed", detail=str(exc))
+                break  # escalate even when observation is unavailable
+            if empty:
+                break
+            time.sleep(0.02)
+        if empty:
+            break
+    process.wait(timeout=2.0)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        remaining = members(process.pid)
+        if not remaining:
+            note("cleanup", group_empty=True)
+            return telemetry_errors
+        time.sleep(0.02)
+    raise RuntimeError(f"group cleanup unconfirmed: {remaining}")
+
+
+def require_wait_capabilities():
+    """Reject interpreters lacking unreaped-child observation before any launch."""
+    required = ("waitid", "P_PID", "WNOWAIT", "WEXITED", "WNOHANG")
+    missing = [name for name in required if not hasattr(os, name)]
+    if not missing and not callable(os.waitid):
+        missing.append("waitid")
+    if missing:
+        raise RuntimeError(
+            "unsupported Python: owned-group cleanup requires os."
+            + ", os.".join(missing)
+        )

@@ -172,6 +172,9 @@ fn generated_image_matches_diffusers() {
             "METALLIX_FLUX2_PIPE_REF_BF16",
         ))
     });
+    if let Some(source) = source_bf16.as_deref() {
+        require(gate_inputs::matching_pipeline(&paths.reference, source));
+    }
     let setup = setup(&paths, precision);
     let ours = generate(&setup, &text);
     let reference = reference_rgb8(&setup.reference);

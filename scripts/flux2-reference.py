@@ -220,11 +220,42 @@ def transformer(args: argparse.Namespace) -> None:
 
 def vae(args: argparse.Namespace) -> None:
     dtype = DTYPES[args.dtype]
+    tensors = load_file(str(args.latents))
+    meta = None
+    if args.complete_pipeline:
+        meta = json.loads(args.latents.with_suffix(".json").read_text())
+        if (
+            args.key != "vae_input"
+            or meta.get("kind") != "pipeline"
+            or meta.get("device") != "cpu"
+            or meta.get("dtype") != args.dtype
+            or meta.get("decoded") is not False
+            or "image" in tensors
+            or "vae_input" not in tensors
+            or tensors["vae_input"].dtype != dtype
+        ):
+            raise SystemExit(
+                "complete-pipeline requires an undecoded matching CPU pipeline and vae_input"
+            )
+        if args.out.resolve() == args.latents.resolve():
+            raise SystemExit(
+                "complete-pipeline output must preserve the input artifact"
+            )
+        if args.out.exists() or args.out.with_suffix(".json").exists():
+            raise SystemExit("complete-pipeline output must be new")
     model = AutoencoderKLFlux2.from_pretrained(args.model / "vae", torch_dtype=dtype)
     model.eval()
-    latents = load_file(str(args.latents))[args.key].to(dtype)
+    latents = tensors[args.key].to(dtype)
     with torch.no_grad():
         image = model.decode(latents, return_dict=False)[0]
+    if meta is not None:
+        tensors["image"] = (image / 2 + 0.5).clamp(0, 1)
+        meta["decoded"] = True
+        meta["decode_source"] = args.latents.name
+        meta["decode_versions"] = versions()
+        meta["decode_torch_threads"] = torch.get_num_threads()
+        write(args.out, tensors, meta)
+        return
     write(
         args.out,
         {"latents": latents, "decoded": image, "image": (image / 2 + 0.5).clamp(0, 1)},
@@ -350,6 +381,11 @@ def main() -> None:
     dec = sub.add_parser("vae")
     dec.add_argument("--latents", type=Path, required=True)
     dec.add_argument("--key", default="latents")
+    dec.add_argument(
+        "--complete-pipeline",
+        action="store_true",
+        help="decode vae_input and preserve the pipeline tensors and workload sidecar for gate B",
+    )
     dec.set_defaults(run=vae)
 
     full = sub.add_parser("pipeline")

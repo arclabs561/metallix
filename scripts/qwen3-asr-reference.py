@@ -399,23 +399,45 @@ def leaderboard_normalizer(cache: Path):
 
 def wer(args: argparse.Namespace) -> None:
     import jiwer
+    from qwen_asr_gate import coverage, passes, transcripts
 
     normalize = leaderboard_normalizer(args.normalizer_cache)
-    truth = {
-        clip["id"]: clip["text"] for clip in read_manifest(args.clips / "manifest.json")
-    }
+    truth = transcripts(read_manifest(args.clips / "manifest.json"))
     # Later manifests replace earlier ones clip by clip, so a recapture of
     # some clips can override a full capture.
     theirs = {}
     for manifest in args.reference:
-        theirs.update({clip["id"]: clip["text"] for clip in read_manifest(manifest)})
+        theirs.update(transcripts(read_manifest(manifest)))
     ours = {}
+    records = []
     for line in args.ours.read_text().splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
+            if args.gate:
+                raise SystemExit("G3 refuses malformed candidate JSON lines") from None
             continue  # a line a stopped run cut short; resumed runs redo it
+        records.append(record)
         ours[record["id"]] = record["text"]
+    if args.gate:
+        import wave
+
+        split = "clean" if args.gate == "clean-44100" else args.gate
+        manifest = json.loads((args.clips / "manifest.json").read_text())
+        if (
+            manifest.get("dataset") != "openslr/librispeech_asr"
+            or manifest.get("config") != split
+            or manifest.get("split") != "test"
+            or manifest.get("order") != "first by sorted id"
+            or len(manifest["clips"]) != len(truth)
+        ):
+            raise SystemExit("G3 requires the declared LibriSpeech test manifest")
+        rate = 44100 if args.gate == "clean-44100" else 16000
+        for clip in manifest["clips"]:
+            with wave.open(str(args.clips / clip["wav"]), "rb") as wav:
+                if wav.getframerate() != rate or wav.getnchannels() != 1:
+                    raise SystemExit(f"G3 requires mono {rate} Hz inputs")
+        ours = coverage(split, truth, theirs, records)
     ids = [clip_id for clip_id in truth if clip_id in theirs and clip_id in ours]
     if len(ids) != len(ours) or len(ids) != len(theirs):
         print(
@@ -437,15 +459,23 @@ def wer(args: argparse.Namespace) -> None:
         for clip_id in ids
         if normalize(ours[clip_id]) == normalize(theirs[clip_id])
     ]
+    ours_wer, reference_wer = score(ours), score(theirs)
+    agreement = len(same) / len(ids)
     result = {
         "clips": len(ids),
-        "wer_ours": round(score(ours), 3),
-        "wer_reference": round(score(theirs), 3),
+        "wer_ours": round(ours_wer, 3),
+        "wer_reference": round(reference_wer, 3),
         "identical_normalized": len(same),
-        "identical_fraction": round(len(same) / len(ids), 4),
+        "identical_fraction": round(agreement, 4),
         "differing_ids": [clip_id for clip_id in ids if clip_id not in same],
     }
+    if args.gate:
+        result["passed"] = passes(
+            ours_wer, reference_wer, agreement, resampled=args.gate == "clean-44100"
+        )
     print(json.dumps(result, indent=1))
+    if args.gate and not result["passed"]:
+        raise SystemExit(1)
 
 
 def main() -> None:
@@ -513,6 +543,11 @@ def main() -> None:
         "--ours", type=Path, required=True, help="transcribe_clips JSON lines"
     )
     score.add_argument("--normalizer-cache", type=Path, required=True)
+    score.add_argument(
+        "--gate",
+        choices=["clean", "other", "clean-44100"],
+        help="enforce complete G3 split coverage and predeclared WER/agreement bars",
+    )
     score.set_defaults(run=wer)
     args = parser.parse_args()
     args.run(args)
