@@ -135,6 +135,8 @@ def paired_requests(model: str, max_tokens: int) -> list[dict]:
                 ],
                 "tools": [copy.deepcopy(TOOL)],
                 "tool_choice": "auto",
+                "metallix_sampler": "icdf-v1",
+                "speculation": "off",
                 "temperature": 0.6,
                 "top_p": 0.95,
                 "seed": seed,
@@ -323,6 +325,7 @@ def main():
     rows = []
     for pair in pairs:
         row = {"id": pair["id"]}
+        comparable = None
         for arm in ("baseline", "constrained"):
             try:
                 response = fetch(
@@ -335,6 +338,13 @@ def main():
                     f"{pair['id']}-{arm}",
                 )
                 row[arm] = classify_response(response, pair[arm], arm == "constrained")
+                observed = {
+                    "sampling": response["metallix"]["sampling"],
+                    "input_tokens": response["usage"]["input_tokens"],
+                }
+                if comparable is not None and observed != comparable:
+                    raise ProtocolError("paired prompt token count or sampling changed")
+                comparable = observed
             except (ProtocolError, TransportError) as error:
                 row["error"] = f"{arm}: {error}"
                 break
