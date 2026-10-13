@@ -19,7 +19,7 @@ name = "mx"
 path = "src/bin/mx.rs"
 
 [features]
-metal = ["dep:audio", "dep:qwen3-asr", "qwen3-asr/metal", "qwen/metal", "deepseek/metal", "dep:chat-format", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:tokenizers", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook", "dep:flux2", "flux2/metal", "dep:png"]
+metal = ["dep:audio", "dep:qwen3-asr", "qwen3-asr/metal", "qwen/metal", "deepseek/metal", "dep:engine", "dep:rand_chacha", "dep:rand_core", "dep:httparse", "dep:jsonschema", "dep:rustix", "dep:mlx-rs", "dep:mlx-sys", "dep:gemma", "gemma/metal", "dep:qwen35", "qwen35/metal", "dep:signal-hook", "dep:flux2", "flux2/metal", "dep:png"]
 structured-output = ["dep:engine", "engine/structured-output"]
 # Chrome/Perfetto JSON timeline behind `--trace-out`.
 timeline = ["dep:tracing-chrome"]
@@ -38,11 +38,11 @@ gemma = { path = "../../models/gemma", optional = true }
 qwen35 = { path = "../../models/qwen35", optional = true }
 qwen = { path = "../../models/qwen" }
 flux2 = { path = "../../models/flux2", optional = true }
-chat-format = { path = "../../core/chat-format", optional = true }
+chat-format = { path = "../../core/chat-format" }
 engine = { path = "../../core/engine", optional = true }
 rand_chacha = { workspace = true, optional = true }
 rand_core = { workspace = true, optional = true }
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 httparse = { version = "=1.10.1", optional = true }
 jsonschema = { version = "=0.56.0", default-features = false, optional = true }
 rustix = { version = "=1.1.4", features = ["fs"], optional = true }

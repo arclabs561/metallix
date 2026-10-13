@@ -77,3 +77,53 @@ fn both_binary_names_expose_scalar_generation() {
         assert!(help.contains("--eos-token-id"));
     }
 }
+
+#[test]
+fn raw_ids_and_plaintext_conflict_before_loading_assets() {
+    assert_refusal(
+        &invoke("1,2", "1", "2", &["--prompt", "Hello"]),
+        2,
+        "cannot be used with",
+    );
+}
+
+#[test]
+fn plaintext_admission_uses_encoded_ids_before_checkpoint_loading() {
+    use chat_format::test_model::ModelDir;
+    use serde_json::json;
+    let model = ModelDir::new(
+        &json!({"eos_token":"</s>"}),
+        &json!({"eos_token_id":2}),
+        None,
+    );
+    let run = |prompt: &str, max_tokens: &str| {
+        Command::new(env!("CARGO_BIN_EXE_mx"))
+            .args(["generate", "deepseek", "--weights"])
+            .arg(model.path())
+            .args([
+                "--prompt",
+                prompt,
+                "--max-tokens",
+                max_tokens,
+                "--context-tokens",
+                "2",
+                "--json",
+            ])
+            .output()
+            .expect("text CLI launches")
+    };
+    assert_refusal(&run("", "1"), 1, "UTF-8 bytes");
+    assert_refusal(&run("hi", "1"), 1, "at least two input IDs");
+    assert_refusal(&run("Hello hi", "2"), 1, "exceeds context-tokens");
+    assert_refusal(
+        &run("Hello hi", "1"),
+        1,
+        "local store metadata admission failed",
+    );
+    std::fs::write(model.path().join("tokenizer.json"), b"{}").expect("corrupt tokenizer");
+    assert_refusal(
+        &run("Hello hi", "1"),
+        1,
+        "tokenizer.json could not be parsed",
+    );
+}

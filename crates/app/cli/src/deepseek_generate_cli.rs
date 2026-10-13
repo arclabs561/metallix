@@ -1,4 +1,6 @@
-//! Local-only raw-token generation for the scalar V4.1 model facade.
+//! Local-only raw-token or plaintext generation for the scalar V4.1 model facade.
+
+mod text;
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
@@ -23,8 +25,16 @@ pub(crate) struct DeepseekGenerateArgs {
     #[arg(long, value_name = "DIR")]
     weights: PathBuf,
     /// At least two comma-separated vocabulary IDs; no tokenizer or template is applied.
-    #[arg(long, value_delimiter = ',', required = true)]
-    input_ids: Vec<u32>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required_unless_present = "prompt",
+        conflicts_with = "prompt"
+    )]
+    input_ids: Option<Vec<u32>>,
+    /// Plain UTF-8 text encoded by local tokenizer.json, without special-token insertion or a chat template.
+    #[arg(long, conflicts_with = "input_ids")]
+    prompt: Option<String>,
     /// Maximum number of greedy output IDs, including a selected EOS.
     #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u32).range(1..=256))]
     max_tokens: u32,
@@ -38,7 +48,7 @@ pub(crate) struct DeepseekGenerateArgs {
     /// Local range-cache capacity in MiB.
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(1..))]
     cache_mib: u32,
-    /// Stop when this ID is selected; no EOS is inferred from configuration.
+    /// Stop on this ID. Overrides checkpoint EOS for text input; raw IDs infer no EOS.
     #[arg(long)]
     eos_token_id: Option<u32>,
     /// Execution backend; only scalar generation is currently supported.
@@ -62,6 +72,10 @@ struct Generation {
     prompt_tokens: usize,
     token_ids: Vec<u32>,
     stop_reason: StopReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generated_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokenizer_sha256: Option<String>,
 }
 
 impl DeepseekGenerateArgs {
@@ -76,6 +90,8 @@ impl DeepseekGenerateArgs {
                             return ExitCode::FAILURE;
                         }
                     }
+                } else if let Some(text) = &result.generated_text {
+                    println!("{text}");
                 } else {
                     println!(
                         "{}",
@@ -97,11 +113,11 @@ impl DeepseekGenerateArgs {
     }
 }
 
-fn validate_request(args: &DeepseekGenerateArgs) -> Result<(), String> {
-    if args.input_ids.len() < 2 {
+fn validate_request(args: &DeepseekGenerateArgs, ids: &[u32]) -> Result<(), String> {
+    if ids.len() < 2 {
         return Err("initial prompt requires at least two input IDs".to_owned());
     }
-    let prompt = u32::try_from(args.input_ids.len()).map_err(|_| "too many input IDs")?;
+    let prompt = u32::try_from(ids.len()).map_err(|_| "too many input IDs")?;
     let decode_positions = args
         .max_tokens
         .checked_sub(1)
@@ -116,7 +132,23 @@ fn validate_request(args: &DeepseekGenerateArgs) -> Result<(), String> {
 }
 
 fn generate(args: &DeepseekGenerateArgs) -> Result<Generation, String> {
-    validate_request(args)?;
+    let text = args
+        .prompt
+        .as_deref()
+        .map(|prompt| text::TextInput::load(&args.weights, prompt))
+        .transpose()?;
+    let ids = text.as_ref().map_or_else(
+        || args.input_ids.as_deref().unwrap_or_default(),
+        |text| text.ids.as_slice(),
+    );
+    validate_request(args, ids)?;
+    let stops = args.eos_token_id.map_or_else(
+        || {
+            text.as_ref()
+                .map_or_else(Vec::new, |text| text.stops.clone())
+        },
+        |id| vec![id],
+    );
     let mut options = V41ModelOptions::default();
     options.context_tokens =
         NonZeroU32::new(args.context_tokens).ok_or("context-tokens must be positive")?;
@@ -129,29 +161,26 @@ fn generate(args: &DeepseekGenerateArgs) -> Result<Generation, String> {
     }
     let metadata = V41Model::inspect_store(&args.weights, &options)
         .map_err(|error| format!("local store metadata admission failed: {error}"))?;
-    if args
-        .input_ids
+    if ids
         .iter()
-        .chain(args.eos_token_id.iter())
+        .chain(stops.iter())
         .any(|id| u64::from(*id) >= metadata.vocab_size() as u64)
     {
         return Err("input or EOS token ID is outside the checkpoint vocabulary".to_owned());
     }
+    if let Some(text) = &text {
+        text.validate_vocabulary(metadata.vocab_size(), &stops)?;
+    }
     let model = V41Model::open(&args.weights, options).map_err(|error| error.to_string())?;
     let mut session = model.session().map_err(|error| error.to_string())?;
-    let prompt = args
-        .input_ids
-        .iter()
-        .copied()
-        .map(TokenId::new)
-        .collect::<Vec<_>>();
+    let prompt = ids.iter().copied().map(TokenId::new).collect::<Vec<_>>();
     let mut logits = session.append(&prompt).map_err(|error| error.to_string())?;
     let mut token_ids = Vec::with_capacity(args.max_tokens as usize);
     let mut stop_reason = StopReason::MaxTokens;
     for index in 0..args.max_tokens {
         let next = greedy_token(&logits)?;
         token_ids.push(next);
-        if Some(next) == args.eos_token_id {
+        if stops.contains(&next) {
             stop_reason = StopReason::Eos;
             break;
         }
@@ -161,7 +190,14 @@ fn generate(args: &DeepseekGenerateArgs) -> Result<Generation, String> {
                 .map_err(|error| error.to_string())?;
         }
     }
+    let generated_text = text
+        .as_ref()
+        .map(|text| text.decode(&token_ids))
+        .transpose()?;
+    let tokenizer_sha256 = text.as_ref().map(|text| text.sha256().to_owned());
     Ok(Generation {
+        generated_text,
+        tokenizer_sha256,
         backend: "scalar",
         prompt_tokens: prompt.len(),
         token_ids,
