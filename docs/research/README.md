@@ -156,7 +156,10 @@ one bounds a different result:
   inside that call. The consumer still slices the cache to completed groups
   (`index_k = …[:end_pos // ratio]`), so an indexer layer must read the current
   owner cache and never a stale publication, and a step with no completed group
-  has an empty view.
+  has an empty view. This project keeps its fail-closed policy for that empty
+  case: such a step is rejected rather than scored against an empty view, and
+  schedule construction guarantees at least one completed group per admitted
+  indexer step.
 - **Attention-output quantization, prefill and decode.** `act_quant(o, …)` now
   rounds the grouped attention output through FP8 before the BF16 `wo_a`
   einsum; the earlier revision fed unrounded BF16 into that projection.
