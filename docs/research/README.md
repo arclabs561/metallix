@@ -116,8 +116,22 @@ Do not publish private paths, prompts, credentials, or checkpoint payloads.
 
 ## V4.1 source identity
 
-The report, configuration, and executable reference use Hub revision
-`dba1be0a40aa45a94ad051997016db3960a90277`:
+The primary target, decided 2026-10-22, is the 1017 update of
+`DeepSeek-V4.1-Flash`: repository `deepseek-ai/DeepSeek-V4.1-Flash-1017`, Hub
+revision `1bae0e1088993b9b82de08f59de5be5a34e42170`. Its `config.json`,
+`tokenizer.json`, `inference/engram.py` and `inference/kernel.py` are
+byte-identical to the revision below, so the hashes in that table identify both.
+Only the executable reference moved, in the two behaviors described
+[below](#what-changed-in-the-1017-update):
+
+| Artifact | SHA-256 |
+|---|---|
+| [1017 inference source](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/resolve/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py) | `e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d` |
+
+Every capture that names the earlier revision keeps that attribution; 1017
+re-uploads the weight shards and ships no report, assets or evaluation
+directory. The report, configuration, and executable reference that earlier
+work used are Hub revision `dba1be0a40aa45a94ad051997016db3960a90277`:
 
 | Artifact | SHA-256 |
 |---|---|
@@ -131,6 +145,36 @@ are not included in that coverage. Source-code qualification executes only
 selected hash-checked expressions, not the whole model. On 2026-09-11, the
 older local config capture matched a fresh pinned download byte-for-byte.
 This establishes its identity, not successful inference.
+
+### What changed in the 1017 update
+
+The executable reference moved in two behaviors this project tests, and each
+one bounds a different result:
+
+- **Index-key publication.** `shared_attn.index_k = self.k_cache` now runs
+  whenever a layer owns K, rather than only when a compression group completes
+  inside that call. The consumer still slices the cache to completed groups
+  (`index_k = …[:end_pos // ratio]`), so an indexer layer must read the current
+  owner cache and never a stale publication, and a step with no completed group
+  has an empty view.
+- **Attention-output quantization, prefill and decode.** `act_quant(o, …)` now
+  rounds the grouped attention output through FP8 before the BF16 `wo_a`
+  einsum; the earlier revision fed unrounded BF16 into that projection.
+
+Consequences:
+
+- Captures under `artifacts/` and `fixtures/` keep the revision and source hash
+  that produced them. They are not relabelled; a 1017 parity claim needs a 1017
+  capture. The checked-in `wo_a` fixture still applies because it pins the
+  einsum expression, which 1017 did not change.
+- Fixtures derived from configuration alone stay valid, because the
+  configuration is unchanged. So do the pinned plaintext tokenization vectors:
+  `tokenizer.json` is byte-identical.
+- The chat template is unaffected: `config/artifacts/deepseek.json` sources it
+  from `DeepSeek-V4-Flash-0731`, not from this model repository.
+- `config/artifacts/deepseek.json` names the weights that `mx` fetches ranges
+  from, and it now names the 1017 revision. Changing it does not relabel
+  recorded evidence; it changes what new execution reads.
 
 ## From source to implementation
 

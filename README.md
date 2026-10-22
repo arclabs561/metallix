@@ -32,7 +32,9 @@ of scope by design: put a router or reverse proxy in front of the server.
   (`metallix.continuation_tokenization: "separate"`); callers that need
   lm-eval's joint encoding pass token IDs.
 
-DeepSeek-V4.1-Flash is the main target and is not usable for generation yet. A
+DeepSeek-V4.1-Flash is the main target and is not usable for generation yet. The
+primary target is its [1017 update](docs/research/README.md#v41-source-identity);
+the measurements below are from the earlier revision. A
 scalar CPU reference path runs all 40 layers from the real checkpoint, reading
 experts and embedding rows on demand, and predicts the source's next token on
 two real prompts (3 and 17 tokens). On that CPU path the 17-token prompt takes

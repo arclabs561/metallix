@@ -155,6 +155,12 @@ passes.
 DeepSeek-V4.1 runs a real prompt end to end from checkpoint tensors, on the
 scalar CPU path (c95dda3) and with its FP8 linears, experts, Engram FP8 WKV
 projection and head on Metal (b7d8c91), and predicts the source's next token.
+That evidence is against `DeepSeek-V4.1-Flash@dba1be0a`. The primary target is
+now the [1017 update](research/README.md#v41-source-identity), whose
+reference changes index-key publication and the attention-output quantization.
+The scalar reference now applies the output rounding; index-key publication and
+a 1017 capture remain open, so neither establishes a parity claim or reopens
+speed work.
 Still open: multi-token steps after the first, indexer scoring past 512
 compressed positions, a generate loop with tokenizer and template, a fully
 on-device path, and a RAM expert cache; V4.1 now has dedicated work toward
@@ -427,7 +433,7 @@ existing product boundary.
 | Decision / governing surface | Options and tradeoff | Recommended next move |
 | --- | --- | --- |
 | KV storage, Qwen decoder/cache | Exact-length concat is simple; fixed capacity stabilizes shapes but may copy unused storage; stepped capacity limits waste but adds growth transitions. | Stepped growth, failure-parity, and matched 0.6B/4B resident requests passed with exact output/token parity. Keep the bounded stepped path and retain the concatenation measurements as a regression control. |
-| DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Reproduce the pinned source for the parity baseline. Never silently substitute owner keys. Decide before claiming complete model parity. |
+| DeepSeek partial shared index state, model execution | Reproduce pinned source publication order; or intentionally correct it and qualify against a separately identified reference. | Resolved by the source: 1017 publishes the index cache whenever the layer owns K, and the consumer slices it to completed groups (`index_k = …[:end_pos // ratio]`). So an indexer layer must always read the current owner cache, never a stale publication, and a step with no completed group yields an empty view. Reproduce that order; publish-on-complete is the divergence. Open before implementation: the zero-key publication rule (the repo currently rejects empty prefixes), and the surfaces that encode the old order in `reduced/` (prior-owner keys, the `next_call_id - 2` identity, `MissingPriorLayerThree`, the `prior_ratio_one` snapshot). Never silently substitute owner keys. |
 | DeepSeek next connected device stage, `src/indexer/**` and `src/reduced/**` | Continue key/query preparation, or choose a larger connected attention/tail boundary based on the remaining CPU/transfer inventory. | Model-local immutable score/key-preparation choices and the FP32 final projection are implemented. Preserve those defaults and state rules; measure the complete mixed request before choosing the next replacement stage. No engine-wide backend trait or additional standalone diagnostic product. |
 | Qwen concurrent admission, Responses/chat serving | Reject while busy; or queue a bounded number of requests with deadlines and cancellation. | Explicit busy rejection is the selected first policy: one model worker and no application queue. Actual overlapping-client rejection and recovery pass; add a bounded queue only for a demonstrated waiting-client requirement. Backpressure and physical memory recovery remain separate gates. |
 | DeepSeek request failure lifecycle | Roll back every owner; or invalidate a failed request and reconstruct all state. | `RequestSession` now implements invalidation and full reconstruction from immutable operands. Both schedules replay through source-qualified logits; malformed L4 execution blocks retries and restart reconstructs the earlier owners. This does not promise component rollback or checkpoint-serving recovery. |

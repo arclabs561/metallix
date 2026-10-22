@@ -11,6 +11,23 @@ choices without expanding current support claims.
 
 ## Delivered in this lane
 
+DeepSeek evidence in this section was captured against
+`DeepSeek-V4.1-Flash@dba1be0a`; the primary target is now the
+[1017 update](research/README.md#v41-source-identity), so an
+expectation that depends on those weight values needs a 1017 capture before it
+supports a parity claim.
+
+- The attention output now rounds each group through FP8 before the BF16 `wo_a`
+  einsum, which is the 1017 order; the earlier revision fed unrounded BF16 into
+  that projection. The change uses the existing bounded
+  `requantize_bf16_activations_e4m3fn` primitive and shows up decisively on a
+  synthetic group at the FP8 midpoint: 30.0 summed where the earlier order gives
+  31.875. `cargo test -p deepseek --lib attention::output` passes 7/7, `cargo
+  fmt --check` and `cargo clippy -p deepseek --lib` are clean. The canonical
+  checks have not been rerun since this change, the index-key publication
+  change in the same revision is not implemented, and no real-weight capture
+  backs either against 1017 yet.
+
 - The real 17-token held-shell prompt now prefills end to end and predicts
   the source's greedy token (id 1; native logit 20.07 against the source's
   18.09), through bounded steps: the first step takes up to 128 tokens and

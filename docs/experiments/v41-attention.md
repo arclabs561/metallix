@@ -24,7 +24,7 @@ pair, leaving the other components unchanged. These are deliberately small
 synthetic dimensions, not checkpoint dimensions.
 
 Window KV follows `wkv → kv_norm → tail RoPE → FP8 round trip`. The new
-[`requantize_bf16_activations_e4m3fn`](../../crates/models/deepseek/src/precision/roundtrip.rs)
+[`requantize_bf16_activations_e4m3fn`](../../crates/core/blockfloat/src/roundtrip.rs)
 models that final G32 E4M3FN/E8M0 quantize/dequantize operation: the resulting
 cache values are still BF16, not physically packed FP8. It bounds allocation,
 preserves signed zero, and leaves output untouched on error. Unlike the source
