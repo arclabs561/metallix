@@ -30,6 +30,14 @@ jobs:
       - name: Check crate tiers
         run: python3 scripts/check_crate_tiers.py
 
+      # mlx-sys builds MLX's Metal kernels from source and needs a newer Xcode
+      # SDK than this image provides, so the default workspace must stay
+      # featureless. Without this guard, a new unconditional dependency fails
+      # inside MLX's own headers instead of naming the cause.
+      # `cargo tree -i` exits nonzero when the package is absent, so invert it.
+      - name: Keep MLX out of the default workspace
+        run: '! cargo tree --workspace -e normal -i mlx-sys'
+
       - name: Verify formatting
         run: cargo fmt --check
 

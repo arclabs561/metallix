@@ -90,6 +90,16 @@ uv run scripts/check.py --metal
 
 The runner stops at the first failure. Each command has a timeout and owned
 child processes are terminated if it expires. It runs no model downloads.
+
+Continuous integration runs `cargo test --workspace`, strict Clippy, the docs
+build and the diagram check on a macOS runner, and it deliberately builds no
+MLX. `mlx-sys` compiles MLX's Metal kernels from source and needs a newer Xcode
+SDK than the runner image provides; when a crate pulled MLX into the default
+feature set, CI failed inside MLX's own headers (`no template named
+'remove_addrspace_t'`) rather than where the dependency was introduced. A guard
+step now fails on that dependency directly, so the message names the cause.
+Metal-feature builds and test runs are a local check; do not add them to CI
+without first moving the runner to a toolchain that compiles MLX.
 Do not run competing Cargo builds or benchmarks in this checkout concurrently.
 
 `just check` and `just check-metal` call the same runner. For the focused
