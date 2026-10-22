@@ -680,7 +680,7 @@ mod tests {
         // order sums 31.875 where the rounded order sums 30.0.
         let layout = AttentionOutputLayout::new(1, 1, 2, 32, 1, 2, 16, 32).unwrap();
         let mut attention = vec![0_u16; 64];
-        for bits in attention[..32].iter_mut() {
+        for bits in &mut attention[..32] {
             *bits = 0x3f88; // 1.0625
         }
         let mut wo_a = vec![0_u16; 2 * 16 * 32];
