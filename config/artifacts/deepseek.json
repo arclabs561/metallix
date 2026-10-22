@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "model_repo": "deepseek-ai/DeepSeek-V4.1-Flash",
-  "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "model_repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
   "template_repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
   "template_revision": "e13c04e3988264a54c7dd0e947ae5f0bae8f200d",
   "weight_bytes": 510300000000,
