@@ -113,6 +113,22 @@ class WorkspaceTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertTrue(path.exists(), f"missing child marker: {path}")
 
+    def wait_for_text(self, path):
+        """Wait until a marker holds content, not merely exists.
+
+        A child writes a marker with write_text, which creates the file before
+        writing it, so waiting on existence can read an empty file and fail on
+        an int('') parse. Readers wait for the content they are about to use.
+        """
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if path.exists():
+                text = path.read_text().strip()
+                if text:
+                    return text
+            time.sleep(0.02)
+        self.fail(f"missing child marker content: {path}")
+
     def test_two_real_import_and_cache_runs_preserve_target_and_source_mtime(self):
         self.finish(self.launch())
         source = self.state / "lane/src/helper.py"
@@ -215,8 +231,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_term_and_command_timeout_stop_running_command_before_lane_reuse(self):
         marker = self.sleeping_job()
         first = self.launch(timeout=1)
-        self.wait_for(marker)
-        pid = int(marker.read_text())
+        pid = int(self.wait_for_text(marker))
         self.finish(first, 124)
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
@@ -305,8 +320,7 @@ class WorkspaceTests(unittest.TestCase):
         )
         first = self.launch()
         marker = self.state / "lane/target/child"
-        self.wait_for(marker)
-        child_pid = int(marker.read_text())
+        child_pid = int(self.wait_for_text(marker))
         first.terminate()
         self.finish(first, 143)
         with self.assertRaises(ProcessLookupError):
