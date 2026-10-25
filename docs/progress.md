@@ -19,14 +19,28 @@ supports a parity claim.
 
 - The attention output now rounds each group through FP8 before the BF16 `wo_a`
   einsum, which is the 1017 order; the earlier revision fed unrounded BF16 into
-  that projection. The change uses the existing bounded
-  `requantize_bf16_activations_e4m3fn` primitive and shows up decisively on a
-  synthetic group at the FP8 midpoint: 30.0 summed where the earlier order gives
-  31.875. `cargo test -p deepseek --lib attention::output` passes 7/7, `cargo
-  fmt --check` and `cargo clippy -p deepseek --lib` are clean. The canonical
-  checks have not been rerun since this change, the index-key publication
-  change in the same revision is not implemented, and no real-weight capture
-  backs either against 1017 yet.
+  that projection. The order travels with the capture instead of being a global
+  switch: `AttentionOutputOrder` defaults to the 1017 rounding, while pre-1017
+  artifacts and the capture-backed integration tests declare the unrounded
+  order. The reduced-artifact exporter derives it from the bundle's pinned
+  `model_sha256` and `revision` and rejects an unknown or mismatched pair. Both
+  orders are pinned at the FP8 midpoint: the rounded order reconstructs 30.0
+  where the unrounded one reconstructs 32.0. Forcing the 1017 order onto the
+  pre-1017 bundle is what produced the candidate-cutoff ties, so those six
+  composition tests keep their recorded order and pass again. The pinned 1017
+  payload has been acquired in full and its identity checked against the
+  research index: `config.json` and `model.safetensors.index.json` match their
+  recorded hashes, the index declares 96,085 tensors across 48 shards and
+  510,286,023,000 bytes, and all 48 shard headers parse (the two Engram shards
+  are 101.5 GB each with six tensors). No tensor payload was read, so loading
+  and execution remain open, and no real-weight capture backs either order yet.
+
+- The 1017 index-key publication change is already the shape of this
+  implementation: a consumer is bound to a named producer publication and its
+  expected source layer, and a call that completes no compression group appends
+  an empty publication that preserves the prefix. That excludes the earlier
+  revision's stale-publication read, where a consumer could observe another
+  layer's cache. This is a structural argument, not a 1017 numerical check.
 
 - The real 17-token held-shell prompt now prefills end to end and predicts
   the source's greedy token (id 1; native logit 20.07 against the source's
