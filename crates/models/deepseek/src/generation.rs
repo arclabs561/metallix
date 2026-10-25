@@ -31,7 +31,7 @@ use crate::{
     },
     engram::{
         embedding::EngramRowSource,
-        inputs::{EngramHashInputs, EngramInputsError, V41_ENGRAM_INPUTS_IDENTITY},
+        inputs::{EngramHashInputs, EngramInputsError, V41_ENGRAM_INPUTS_IDENTITIES},
     },
     moe::RoutedExpertSource,
     reduced::{
@@ -372,9 +372,10 @@ fn admit_store(root: &Path, options: &V41ModelOptions) -> Result<AdmittedStore, 
     let native = std::str::from_utf8(&native).map_err(V41GenerateError::Utf8)?;
     let manifest: Manifest =
         serde_json::from_slice(&read_metadata(&root.join("headers.json"), 4 << 20)?)?;
-    if manifest.revision != V41_ENGRAM_INPUTS_IDENTITY.revision {
-        return Err(V41GenerateError::Revision);
-    }
+    let identity = V41_ENGRAM_INPUTS_IDENTITIES
+        .iter()
+        .find(|identity| identity.revision == manifest.revision)
+        .ok_or(V41GenerateError::Revision)?;
     let weights = root.join("weights");
     let shards = root.join("shards");
     let source = if shards.is_dir() {
@@ -398,9 +399,7 @@ fn admit_store(root: &Path, options: &V41ModelOptions) -> Result<AdmittedStore, 
     }
     let config = V41InferenceConfig::from_native(native)?;
     let inference = read_metadata(&root.join("inference-config.json"), 4 << 20)?;
-    if format!("{:x}", Sha256::digest(&inference))
-        != V41_ENGRAM_INPUTS_IDENTITY.inference_config_sha256
-    {
+    if format!("{:x}", Sha256::digest(&inference)) != identity.inference_config_sha256 {
         return Err(V41GenerateError::ConfigurationMismatch);
     }
     let pinned = V41InferenceConfig::parse(
@@ -411,7 +410,7 @@ fn admit_store(root: &Path, options: &V41ModelOptions) -> Result<AdmittedStore, 
     }
     let inputs = EngramHashInputs::parse(
         &read_metadata(&root.join("v41-engram-inputs.bin"), 8 << 20)?,
-        &V41_ENGRAM_INPUTS_IDENTITY,
+        identity,
     )?;
     let metadata = V41ModelMetadata {
         vocabulary: config.vocabulary(),

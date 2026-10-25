@@ -69,7 +69,9 @@ class Tok:
         return self.backend_tokenizer.get_vocab_size(with_added_tokens=True)
 
 
-def export(source: Path, tokenizer: Path, config: Path) -> bytes:
+def export(
+    source: Path, tokenizer: Path, config: Path, revision: str = REVISION
+) -> bytes:
     engram = load_source(source)
     cfg = json.loads(config.read_text())
     args = SimpleNamespace(**cfg, max_batch_size=1, max_seq_len=1)
@@ -84,7 +86,7 @@ def export(source: Path, tokenizer: Path, config: Path) -> bytes:
         "format": FORMAT,
         "schema_version": 1,
         "identity": {
-            "revision": REVISION,
+            "revision": revision,
             "engram_source_sha256": sha256(source),
             "tokenizer_sha256": sha256(tokenizer),
             "inference_config_sha256": sha256(config),
@@ -117,9 +119,14 @@ def main() -> None:
         "--tokenizer", type=Path, default=TRACE / "tokenizer/tokenizer.json"
     )
     parser.add_argument("--config", type=Path, default=TRACE / "inference-config.json")
+    parser.add_argument(
+        "--revision",
+        default=REVISION,
+        help="checkpoint revision the Engram inputs are exported for",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    data = export(args.source, args.tokenizer, args.config)
+    data = export(args.source, args.tokenizer, args.config, args.revision)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(data)
     print(
