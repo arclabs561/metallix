@@ -1,6 +1,6 @@
 //! L4 consumes committed candidate identity and requires reset after failure.
 use deepseek::{
-    RotaryFrequency,
+    AttentionOutputOrder, RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionLayout, LayerAttentionWeights},
     indexer::{
         cache::IndexKeyPublicationId,
@@ -65,7 +65,8 @@ fn failed_attention_poisons_and_reset_rejects_old_publication() {
         1.0e-6,
         0.125,
     )
-    .unwrap();
+    .unwrap()
+    .with_output_order(AttentionOutputOrder::Unrounded);
     let query_layout = CandidateQueryLayout::new(
         IndexQueryLayout::new(nz(1), nz(32), nz(32), nz(1), nz(32), nz(1)).unwrap(),
         1.0e-6,

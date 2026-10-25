@@ -270,10 +270,32 @@ def validate_models(
         raise ExportError("head norm epsilon differs from model norm epsilon")
 
 
+# Pinned `inference/model.py` identities and the grouped-output order each one
+# uses before `wo_a`. The 1017 revision rounds each group through FP8 first.
+MODEL_ORDERS = {
+    "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65": "unrounded",
+    "e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d": "round_before_wo_a",
+}
+
+
+def source_order(provenance: dict[str, Any]) -> str:
+    digest = provenance.get("model_sha256")
+    if not isinstance(digest, str) or digest not in MODEL_ORDERS:
+        raise ExportError("source provenance names an unknown pinned model.py")
+    revision = provenance.get("revision")
+    if digest == "e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d":
+        if revision != "1bae0e1088993b9b82de08f59de5be5a34e42170":
+            raise ExportError("1017 model source requires the 1017 revision")
+    elif revision != "dba1be0a40aa45a94ad051997016db3960a90277":
+        raise ExportError("pre-1017 model source requires its recorded revision")
+    return MODEL_ORDERS[digest]
+
+
 def export(root: object) -> dict[str, object]:
     source = obj(root, "source bundle")
     if source.get("schema_version") != 1:
         raise ExportError("source bundle schema must be 1")
+    provenance = obj(source.get("source"), "source provenance")
     projections = obj(source.get("projections"), "source projections")
     required = [
         "layer0_to_layer1",
@@ -337,6 +359,7 @@ def export(root: object) -> dict[str, object]:
         "engram_heads": layout.get("n_heads"),
         "engram_pad_id": state.get("pad_id"),
         "engram_gate_clamp": engram_model.get("gate_clamp"),
+        "source_order": source_order(provenance),
     }
     if any(
         value is None or isinstance(value, bool) and key != "normalize_topk"

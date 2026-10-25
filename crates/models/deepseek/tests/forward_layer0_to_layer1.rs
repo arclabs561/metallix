@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, fmt::Write as _, num::NonZeroUsize};
 
 use deepseek::{
-    RotaryFrequency, StartupLayout,
+    AttentionOutputOrder, RotaryFrequency, StartupLayout,
     attention::layer::{
         Fp8Projection, LayerAttentionDiagnostic, LayerAttentionError, LayerAttentionLayout,
         LayerAttentionState, LayerAttentionWeights,
@@ -231,6 +231,7 @@ fn window_only_layout(root: &Value) -> LayerAttentionLayout {
         0.125,
     )
     .expect("layer-zero window-only layout")
+    .with_output_order(AttentionOutputOrder::Unrounded)
 }
 
 fn assert_attention_diagnostic(case: &Value, diagnostic: &LayerAttentionDiagnostic) {

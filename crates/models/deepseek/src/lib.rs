@@ -24,7 +24,9 @@ pub mod startup;
 mod tensor_table;
 
 pub use artifact::{V41ArtifactIndexKind, V41ArtifactInspection, V41ArtifactInspectionError};
-pub use attention::{SparseAttentionError, SparseAttentionLayout, sparse_attention_reference};
+pub use attention::{
+    AttentionOutputOrder, SparseAttentionError, SparseAttentionLayout, sparse_attention_reference,
+};
 pub use chat_format::TokenId;
 pub use checkpoint::{
     MAX_SHARED_EXPERT_PAYLOAD_BYTES, V41ExpertI8ScalePair, V41ExpertI8ScalePairError,

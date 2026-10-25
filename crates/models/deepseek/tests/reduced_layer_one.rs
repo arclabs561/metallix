@@ -1,7 +1,7 @@
 //! L1 lifecycle and preceding-publication policy with ordinary runtime operands.
 
 use deepseek::{
-    RotaryFrequency,
+    AttentionOutputOrder, RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionLayout, LayerAttentionWeights},
     indexer::{
         cache::IndexKeyPublicationId,
@@ -65,7 +65,8 @@ impl Operands {
             1.0e-6,
             0.125,
         )
-        .unwrap();
+        .unwrap()
+        .with_output_order(AttentionOutputOrder::Unrounded);
         LayerOneSession::new(
             configure(LayerOneConfig::new(owner, attention, nz(2)).unwrap()),
             &self.norm,

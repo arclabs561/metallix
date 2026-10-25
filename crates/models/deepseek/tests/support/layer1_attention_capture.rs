@@ -13,7 +13,7 @@ use super::layer1_owner_capture;
 use std::num::NonZeroUsize;
 
 use deepseek::{
-    RotaryFrequency,
+    AttentionOutputOrder, RotaryFrequency,
     attention::layer::{
         CompressedAttentionPublication, Fp8Projection, LayerAttentionDiagnostic,
         LayerAttentionError, LayerAttentionLayout, LayerAttentionState, LayerAttentionWeights,
@@ -293,6 +293,7 @@ pub(super) fn layout(root: &Value) -> LayerAttentionLayout {
         0.125,
     )
     .expect("layer-one layout")
+    .with_output_order(AttentionOutputOrder::Unrounded)
 }
 
 fn assert_exact(start: usize, stage: &str, native: &[u16], source: &[u16]) {

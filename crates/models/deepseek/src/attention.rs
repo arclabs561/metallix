@@ -14,7 +14,7 @@ pub mod layer;
 pub mod window;
 
 mod output;
-pub use output::{AttentionOutputError, AttentionOutputLayoutError};
+pub use output::{AttentionOutputError, AttentionOutputLayoutError, AttentionOutputOrder};
 pub(crate) use output::{AttentionOutputLayout, attention_output_reference};
 
 mod bf16;

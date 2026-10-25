@@ -664,7 +664,7 @@ fn attention_layout(
         nonzero(config.output_groups)?,
         nonzero(config.output_rank)?,
     );
-    match compression {
+    let layout = match compression {
         Some((source, ratio)) => LayerAttentionLayout::new(
             common.0,
             common.1,
@@ -694,7 +694,8 @@ fn attention_layout(
             scale,
         ),
     }
-    .map_err(invalid)
+    .map_err(invalid)?;
+    Ok(layout.with_output_order(config.source_order))
 }
 
 fn query_layout(config: &ArtifactConfig) -> Result<CandidateQueryLayout, ArtifactError> {

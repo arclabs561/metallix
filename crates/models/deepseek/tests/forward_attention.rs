@@ -1,4 +1,5 @@
 //! Native layer-four attention against source-captured attention boundaries.
+use deepseek::AttentionOutputOrder;
 
 #[path = "support/attention_capture.rs"]
 mod attention_capture;
@@ -268,7 +269,8 @@ fn zero_compressed_prefix_is_a_window_only_attention_call() {
         fixture.model.norm_eps,
         0.125,
     )
-    .expect("window-only ratio layout");
+    .expect("window-only ratio layout")
+    .with_output_order(AttentionOutputOrder::Unrounded);
     let mut state = LayerAttentionState::new(layout);
     let case = &fixture.cases[0];
     let call_frequencies = call_frequencies(&frequencies, case);
