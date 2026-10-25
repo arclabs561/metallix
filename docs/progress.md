@@ -17,6 +17,19 @@ DeepSeek evidence in this section was captured against
 expectation that depends on those weight values needs a 1017 capture before it
 supports a parity claim.
 
+- The pinned 1017 checkpoint now executes end to end on the scalar CPU path
+  directly from the acquired payload. Text input runs through the checkpoint
+  tokenizer: `The capital of France is` produces ` Paris.` and stops at EOS,
+  while a nine-token coding prompt generated six tokens in 129.6 s of wall time
+  (about 8.6 s per generated token including prefill). Repeated runs return the
+  same greedy IDs, and the store's tensor directory stays empty because each
+  range is read from the shard files instead of a second materialized copy. This
+  needs the re-exported 1017 Engram-input identity, because the 1017 update
+  re-uploads weights only; re-exporting the earlier revision still reproduces
+  its pinned artifact byte for byte. Loading, admission, tokenizer round-trip
+  and a connected forward on 1017 bytes are established. Source parity, Metal
+  execution and any speed claim are not.
+
 - The attention output now rounds each group through FP8 before the BF16 `wo_a`
   einsum, which is the 1017 order; the earlier revision fed unrounded BF16 into
   that projection. The order travels with the capture instead of being a global
