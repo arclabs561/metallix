@@ -375,7 +375,13 @@ fn admit_store(root: &Path, options: &V41ModelOptions) -> Result<AdmittedStore, 
     if manifest.revision != V41_ENGRAM_INPUTS_IDENTITY.revision {
         return Err(V41GenerateError::Revision);
     }
-    let source = V41LocalStoreSource::new(root.join("weights"), manifest.revision.clone());
+    let weights = root.join("weights");
+    let shards = root.join("shards");
+    let source = if shards.is_dir() {
+        V41LocalStoreSource::with_shards(weights, manifest.revision.clone(), shards)
+    } else {
+        V41LocalStoreSource::new(weights, manifest.revision.clone())
+    };
     let cache = V41RangeCache::load(
         source,
         &root.join("model.safetensors.index.json"),

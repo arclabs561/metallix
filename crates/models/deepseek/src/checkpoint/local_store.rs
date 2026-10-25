@@ -66,6 +66,18 @@ impl V41LocalStoreSource {
         }
     }
 
+    /// Same as [`Self::new`], but falls back to `shards` for tensors with no
+    /// local payload.
+    #[must_use]
+    pub fn with_shards(weights: PathBuf, revision: String, shards: PathBuf) -> Self {
+        let dir = weights.join(".row-packs");
+        Self {
+            local: V41LocalWeightsSource::new(weights, &revision).with_shards(shards),
+            dir,
+            revision,
+        }
+    }
+
     fn read_rows(&self, request: &V41RangeRequest<'_>) -> Result<Vec<u8>, V41RangeCacheError> {
         let (row_bytes, rows) = whole_rows(request)
             .ok_or_else(|| invalid("packed reads require complete nonempty rows"))?;
