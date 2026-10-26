@@ -1,6 +1,7 @@
 //! Runtime L3 construction rejects incompatible producer/consumer geometry.
 
 use deepseek::{
+    AttentionOutputOrder,
     attention::layer::LayerAttentionLayout,
     indexer::key::IndexKeyLayout,
     reduced::{LayerThreeConfig, LayerThreeSession, LayerThreeSessionError},
@@ -31,6 +32,7 @@ fn rejects_incompatible_publication_geometry_before_allocating_state() {
             0.125,
         )
         .unwrap()
+        .with_output_order(AttentionOutputOrder::Unrounded)
     };
     assert!(LayerThreeConfig::new(keys, nz(128), nz(16), attention(3, 1), nz(6), nz(1)).is_ok());
     // Any compressed source layer is accepted; the session checks it against its owner.
@@ -67,7 +69,8 @@ fn session_source_layer_must_match_its_attention_layout() {
         1.0e-20,
         0.125,
     )
-    .unwrap();
+    .unwrap()
+    .with_output_order(AttentionOutputOrder::Unrounded);
     let config = LayerThreeConfig::new(keys, nz(128), nz(16), attention, nz(6), nz(1)).unwrap();
     let norm = [0x3f80; 64];
     assert!(LayerThreeSession::new(config, 20, &norm, 1.0e-20).is_ok());

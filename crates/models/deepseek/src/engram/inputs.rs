@@ -48,6 +48,25 @@ pub const V41_ENGRAM_INPUTS_IDENTITY: EngramInputsIdentity = EngramInputsIdentit
     artifact_sha256: Some("1ec590ff51b508663fcc28af589d970b767c25c49832453b60b152aeb3fac6b6"),
 };
 
+/// The 1017 update's Engram inputs.
+///
+/// The 1017 revision re-uploads weights only: `config.json`, `tokenizer.json`
+/// and the Engram source are byte-identical to the revision above, so the
+/// exported values repeat and only the declared revision changes. The artifact
+/// is re-exported rather than relabelled in place, so its bytes and pinned
+/// digest belong to that revision.
+pub const V41_1017_ENGRAM_INPUTS_IDENTITY: EngramInputsIdentity = EngramInputsIdentity {
+    revision: "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    engram_source_sha256: "11f35ecbead8150c35aa002b3d180ef290b05a25afe883a11884f94d476d3897",
+    tokenizer_sha256: "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+    inference_config_sha256: "2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809",
+    artifact_sha256: Some("a399ded04b4fff503be7347720340a56cf10f09ccb020d718d876a1530e1fac2"),
+};
+
+/// Every admitted revision's Engram-input identity, newest last.
+pub const V41_ENGRAM_INPUTS_IDENTITIES: [EngramInputsIdentity; 2] =
+    [V41_ENGRAM_INPUTS_IDENTITY, V41_1017_ENGRAM_INPUTS_IDENTITY];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Header {

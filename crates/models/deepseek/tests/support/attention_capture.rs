@@ -12,7 +12,7 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 use deepseek::{
-    RotaryFrequency,
+    AttentionOutputOrder, RotaryFrequency,
     attention::layer::{
         CompressedAttentionPublication, Fp8Projection, LayerAttentionDiagnostic,
         LayerAttentionError, LayerAttentionLayout, LayerAttentionState, LayerAttentionWeights,
@@ -349,6 +349,7 @@ pub(crate) fn layout(model: &Model) -> LayerAttentionLayout {
         0.125,
     )
     .expect("source-shaped layer attention layout")
+    .with_output_order(AttentionOutputOrder::Unrounded)
 }
 
 pub(crate) fn nonzero(value: usize) -> NonZeroUsize {

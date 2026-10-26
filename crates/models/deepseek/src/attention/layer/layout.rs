@@ -3,6 +3,7 @@
 use std::num::NonZeroUsize;
 
 use super::{LayerAttentionLayoutError, MAX_LAYER_ATTENTION_ELEMENTS, ops::checked_product};
+use crate::attention::AttentionOutputOrder;
 
 /// The model-local dimensions and provenance contract for one layer attention.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,6 +21,7 @@ pub struct LayerAttentionLayout {
     pub(super) compressed_ratio: Option<NonZeroUsize>,
     norm_epsilon_bits: u32,
     softmax_scale_bits: u32,
+    output_order: AttentionOutputOrder,
 }
 
 impl LayerAttentionLayout {
@@ -266,7 +268,26 @@ impl LayerAttentionLayout {
             compressed_ratio: compression.map(|(_, ratio)| ratio),
             norm_epsilon_bits: norm_epsilon.to_bits(),
             softmax_scale_bits: softmax_scale.to_bits(),
+            output_order: AttentionOutputOrder::RoundBeforeWoA,
         })
+    }
+
+    /// Selects the source revision's grouped-output order before `wo_a`.
+    ///
+    /// The default is the 1017 order. Captures produced by the earlier
+    /// revision pass [`AttentionOutputOrder::Unrounded`].
+    #[must_use]
+    pub const fn with_output_order(self, output_order: AttentionOutputOrder) -> Self {
+        Self {
+            output_order,
+            ..self
+        }
+    }
+
+    /// The grouped-output order preceding `wo_a` for this capture's revision.
+    #[must_use]
+    pub(crate) const fn output_order(self) -> AttentionOutputOrder {
+        self.output_order
     }
 
     /// The producer layer accepted for compressed numerical publications.

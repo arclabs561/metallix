@@ -255,7 +255,8 @@ impl LayerAttentionState {
             self.layout.groups.get(),
             self.layout.output_rank.get(),
             self.layout.hidden_dimension.get(),
-        )?;
+        )?
+        .with_order(self.layout.output_order());
         let final_output = attention_output_reference(
             &sparse_output,
             frequencies,
@@ -353,7 +354,8 @@ impl LayerAttentionState {
             self.layout.groups.get(),
             self.layout.output_rank.get(),
             self.layout.hidden_dimension.get(),
-        )?;
+        )?
+        .with_order(self.layout.output_order());
         let final_output = attention_output_reference(
             &sparse_output,
             frequencies,

@@ -1,17 +1,21 @@
 //! Bounded scalar V4.1 attention-output staging reference.
 //!
 //! This composes the pinned order after sparse attention: inverse rotary tail,
-//! group-local BF16 `wo_a`, then activation quantization and FP8 `wo_b`. It
-//! models explicit scalar precision boundaries, not a GPU GEMM, checkpoint
-//! reader, cache, or complete attention layer.
+//! optional FP8 rounding of each group's output, group-local BF16 `wo_a`, then
+//! activation quantization and FP8 `wo_b`. It models explicit scalar precision
+//! boundaries, not a GPU GEMM, checkpoint reader, cache, or complete attention
+//! layer. The rounding step follows the 1017 reference revision; the earlier
+//! revision fed unrounded BF16 into `wo_a`, so captures keep the order of the
+//! revision that produced them.
 
 use thiserror::Error;
 
 use crate::{
     RotaryDirection, RotaryError, RotaryFrequency, RotaryTailLayout,
     precision::{
-        ActivationGroup, ActivationQuantError, Bf16LinearError, Fp8ForwardError, Fp8LinearError,
-        bf16_linear_reference, fp8_linear_f32, quantize_bf16_activations_e4m3fn,
+        ActivationGroup, ActivationQuantError, ActivationRoundtripError, Bf16LinearError,
+        Fp8ForwardError, Fp8LinearError, bf16_linear_reference, fp8_linear_f32,
+        quantize_bf16_activations_e4m3fn, requantize_bf16_activations_e4m3fn,
     },
     rotate_tail,
 };
@@ -20,6 +24,22 @@ use crate::{
 // a three-token prefill needs about 2.3e8 multiply-adds.
 const MAX_ATTENTION_OUTPUT_ELEMENTS: usize = 1 << 26;
 const MAX_ATTENTION_OUTPUT_WORK: usize = 1 << 34;
+
+/// Which source revision's grouped-output order precedes `wo_a`.
+///
+/// The 1017 reference revision rounds each group's attention output through
+/// FP8 before the BF16 `wo_a` einsum. Earlier captures were produced without
+/// that step, so the order travels with the capture rather than being a
+/// global runtime switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionOutputOrder {
+    /// 1017: round each group's output to FP8 and back before `wo_a`.
+    #[default]
+    RoundBeforeWoA,
+    /// Pre-1017: feed unrounded BF16 group output into `wo_a`.
+    Unrounded,
+}
 
 /// Explicit layout for attention's inverse-RoPE and output projections.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +52,7 @@ pub(crate) struct AttentionOutputLayout {
     groups: usize,
     output_rank: usize,
     hidden_dimension: usize,
+    order: AttentionOutputOrder,
 }
 
 impl AttentionOutputLayout {
@@ -101,6 +122,7 @@ impl AttentionOutputLayout {
             groups,
             output_rank,
             hidden_dimension,
+            order: AttentionOutputOrder::RoundBeforeWoA,
         };
         for (field, elements) in [
             ("attention", layout.attention_elements()?),
@@ -119,6 +141,15 @@ impl AttentionOutputLayout {
             return Err(AttentionOutputLayoutError::WorkLimit { elements: work });
         }
         Ok(layout)
+    }
+
+    /// Selects the source revision's grouped-output order before `wo_a`.
+    ///
+    /// The default is the 1017 order, which rounds through FP8. Captures from
+    /// the earlier revision pass [`AttentionOutputOrder::Unrounded`].
+    #[must_use]
+    pub(crate) const fn with_order(self, order: AttentionOutputOrder) -> Self {
+        Self { order, ..self }
     }
 
     fn rows(self) -> Result<usize, AttentionOutputLayoutError> {
@@ -300,6 +331,9 @@ pub enum AttentionOutputError {
     /// Group-local BF16 output projection staging failed.
     #[error(transparent)]
     WoA(#[from] Bf16LinearError),
+    /// FP8 rounding of the group-local output before `wo_a` failed.
+    #[error(transparent)]
+    WoAActivation(#[from] ActivationRoundtripError),
     /// FP8 activation preparation for `wo_b` failed.
     #[error(transparent)]
     WoBActivation(#[from] ActivationQuantError),
@@ -377,8 +411,22 @@ pub(crate) fn attention_output_reference(
         }
         let mut one_group_output = vec![0_u16; rows * layout.output_rank];
         let weight_start = group * layout.output_rank * group_reduction;
+        let rounded_input = match layout.order {
+            AttentionOutputOrder::RoundBeforeWoA => {
+                let mut rounded = vec![0_u16; rows * group_reduction];
+                requantize_bf16_activations_e4m3fn(
+                    &one_group_input,
+                    rows,
+                    group_reduction,
+                    ActivationGroup::Elements32,
+                    &mut rounded,
+                )?;
+                rounded
+            }
+            AttentionOutputOrder::Unrounded => one_group_input,
+        };
         bf16_linear_reference(
-            &one_group_input,
+            &rounded_input,
             &wo_a[weight_start..weight_start + layout.output_rank * group_reduction],
             rows,
             group_reduction,
@@ -526,8 +574,8 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        AttentionOutputLayout, AttentionOutputLayoutError, attention_output_reference,
-        inverse_rotate_and_narrow,
+        AttentionOutputLayout, AttentionOutputLayoutError, AttentionOutputOrder,
+        attention_output_reference, inverse_rotate_and_narrow,
     };
     use crate::{RotaryFrequency, precision::bf16_linear_reference};
 
@@ -656,6 +704,63 @@ mod tests {
             }
             assert_eq!(actual, case.expected_output_bf16_bits, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn group_output_rounds_through_fp8_before_wo_a() {
+        // The 1017 reference rounds each group's attention output to FP8 before
+        // the BF16 `wo_a` einsum. Every input here is BF16 1.0625, which is the
+        // midpoint between two FP8 codes at this group's scale, so the earlier
+        // order reconstructs 32.0 where the rounded order reconstructs 30.0.
+        let layout = AttentionOutputLayout::new(1, 1, 2, 32, 1, 2, 16, 32).unwrap();
+        let mut attention = vec![0_u16; 64];
+        for bits in &mut attention[..32] {
+            *bits = 0x3f88; // 1.0625
+        }
+        let mut wo_a = vec![0_u16; 2 * 16 * 32];
+        wo_a[..32].fill(0x3f80); // group 0 rank 0 sums the whole group
+        let mut wo_b = vec![0_u8; 32 * 32];
+        wo_b[0] = 0x38; // hidden 0 reads group 0 rank 0
+        let output = attention_output_reference(
+            &attention,
+            &[RotaryFrequency::new(0.0, 1.0).unwrap()],
+            &wo_a,
+            &wo_b,
+            &[127],
+            layout,
+        )
+        .unwrap();
+        assert_eq!(output[0], 0x41f0, "rounded group sum is 30.0, not 31.875");
+        assert!(output[1..].iter().all(|&bits| bits == 0));
+    }
+
+    #[test]
+    fn pre_1017_order_feeds_unrounded_group_output_into_wo_a() {
+        // Same midpoint operands as the 1017 test above. A capture produced by
+        // the earlier revision keeps its unrounded BF16 group sum, so the order
+        // travels with the capture instead of being a global switch.
+        let layout = AttentionOutputLayout::new(1, 1, 2, 32, 1, 2, 16, 32)
+            .unwrap()
+            .with_order(AttentionOutputOrder::Unrounded);
+        let mut attention = vec![0_u16; 64];
+        for bits in &mut attention[..32] {
+            *bits = 0x3f88; // 1.0625
+        }
+        let mut wo_a = vec![0_u16; 2 * 16 * 32];
+        wo_a[..32].fill(0x3f80);
+        let mut wo_b = vec![0_u8; 32 * 32];
+        wo_b[0] = 0x38;
+        let output = attention_output_reference(
+            &attention,
+            &[RotaryFrequency::new(0.0, 1.0).unwrap()],
+            &wo_a,
+            &wo_b,
+            &[127],
+            layout,
+        )
+        .unwrap();
+        assert_eq!(output[0], 0x4200, "unrounded order reconstructs 32.0");
+        assert!(output[1..].iter().all(|&bits| bits == 0));
     }
 
     #[test]

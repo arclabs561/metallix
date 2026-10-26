@@ -41,6 +41,26 @@ class ReducedArtifactExportTests(unittest.TestCase):
             raw = bytes.fromhex(record["storage_hex"])
             self.assertEqual(hashlib.sha256(raw).hexdigest(), record["storage_sha256"])
 
+    def test_source_order_follows_the_pinned_model_revision(self) -> None:
+        source = json.loads(SOURCE.read_text())
+        self.assertEqual(MODULE.export(source)["config"]["source_order"], "unrounded")
+        current = copy.deepcopy(source)
+        current["source"]["model_sha256"] = (
+            "e5decd76fe70fd56ef2f10124d245c6f64fb6a0003cc9068a1d3182a168b8d2d"
+        )
+        current["source"]["revision"] = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+        self.assertEqual(
+            MODULE.export(current)["config"]["source_order"], "round_before_wo_a"
+        )
+        mixed = copy.deepcopy(current)
+        mixed["source"]["revision"] = "dba1be0a40aa45a94ad051997016db3960a90277"
+        with self.assertRaises(MODULE.ExportError):
+            MODULE.export(mixed)
+        unknown = copy.deepcopy(source)
+        unknown["source"]["model_sha256"] = "0" * 64
+        with self.assertRaises(MODULE.ExportError):
+            MODULE.export(unknown)
+
     def test_stdout_is_only_the_artifact_json(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(EXPORTER), "--source", str(SOURCE), "--output", "-"],

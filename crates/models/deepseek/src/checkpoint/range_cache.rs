@@ -100,6 +100,7 @@ pub trait V41RangeSource {
 #[derive(Clone, Debug)]
 pub struct V41LocalWeightsSource {
     dir: PathBuf,
+    shards: Option<PathBuf>,
     revision: String,
     verified: Arc<Mutex<HashMap<String, FileIdentity>>>,
     hashing: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -146,12 +147,47 @@ impl V41LocalWeightsSource {
     pub fn new(dir: impl Into<PathBuf>, revision: impl Into<String>) -> Self {
         Self {
             dir: dir.into(),
+            shards: None,
             revision: revision.into(),
             verified: Arc::default(),
             hashing: Arc::default(),
             #[cfg(test)]
             hashes: Arc::default(),
         }
+    }
+
+    /// Reads tensors with no local receipt directly from a shard directory.
+    ///
+    /// The tensor store is still preferred: a receipt plus payload is served
+    /// from `dir`. With no receipt, the exact indexed range is read from
+    /// `shards/<shard>` instead, so a checkpoint can be executed in place
+    /// without a second copy of its payloads. Ranges are the same ones the
+    /// index and validated shard headers describe; the cache still checks the
+    /// returned length before storing it.
+    #[must_use]
+    pub fn with_shards(self, shards: impl Into<PathBuf>) -> Self {
+        Self {
+            shards: Some(shards.into()),
+            ..self
+        }
+    }
+
+    /// Reads one tensor range from the shard directory when no receipt exists.
+    fn read_from_shards(
+        &self,
+        request: &V41RangeRequest<'_>,
+    ) -> Result<Vec<u8>, V41RangeCacheError> {
+        let Some(dir) = self.shards.as_deref() else {
+            return Err(V41RangeCacheError::NotLocal(request.tensor.to_owned()));
+        };
+        let shard = request.shard;
+        if shard.is_empty() || shard.starts_with('.') || shard.contains(['/', '\\']) {
+            return Err(V41RangeCacheError::UnknownTensor(shard.to_owned()));
+        }
+        let mut file = fs::File::open(dir.join(shard)).map_err(V41RangeCacheError::Io)?;
+        // The request range is absolute and already checked against the
+        // tensor's validated header interval by the caller.
+        read_exact_range(&mut file, request.range.start, request.range.end)
     }
 
     /// The lock one tensor's whole-file hash holds, shared by its concurrent readers.
@@ -224,7 +260,7 @@ impl V41RangeSource for V41LocalWeightsSource {
         let receipt: Receipt = match fs::read(&receipt_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(V41RangeCacheError::ReceiptJson)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(V41RangeCacheError::NotLocal(tensor.to_owned()));
+                return self.read_from_shards(request);
             }
             Err(error) => return Err(V41RangeCacheError::Io(error)),
         };
@@ -1123,6 +1159,59 @@ mod tests {
         }
         assert_eq!(source.hashes.load(Ordering::Relaxed), 1);
         std::fs::remove_dir_all(dir).expect("cleanup own temp dir");
+    }
+
+    #[test]
+    fn shard_source_serves_tensor_ranges_without_a_local_receipt() {
+        // A store root that keeps the checkpoint shards in place: no receipt
+        // and no payload exist locally, so the exact indexed range comes from
+        // the shard file rather than a second copy of the tensor.
+        let shard_dir = weights_dir(&[], None).join("shards");
+        std::fs::create_dir_all(&shard_dir).expect("shard dir");
+        let length = payload_start() + 60;
+        let bytes: Vec<u8> = (0..length)
+            .map(|offset| u8::try_from(offset % 251).expect("small"))
+            .collect();
+        std::fs::write(shard_dir.join(SHARD), &bytes).expect("shard");
+        let weights = std::env::temp_dir().join(format!(
+            "metallix-shard-source-{}-{}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&weights).expect("weights dir");
+        let header = header();
+        let tensor_range = header.tensor("e0").expect("fixture tensor");
+        let range = tensor_range.file_range();
+        let source = V41LocalWeightsSource::new(&weights, REV).with_shards(shard_dir.clone());
+        let request = |range: std::ops::Range<u64>| V41RangeRequest {
+            tensor: "e0",
+            shard: SHARD,
+            tensor_range,
+            range,
+        };
+        let whole = source
+            .read_range(&request(range.clone()))
+            .expect("shard-backed whole tensor");
+        assert_eq!(
+            whole,
+            bytes[usize::try_from(range.start).expect("small")
+                ..usize::try_from(range.end).expect("small")]
+        );
+        let slice = source
+            .read_range(&request(range.start + 2..range.start + 4))
+            .expect("shard-backed subrange");
+        assert_eq!(
+            slice,
+            bytes[usize::try_from(range.start + 2).expect("small")
+                ..usize::try_from(range.start + 4).expect("small")]
+        );
+        // Without the shard directory the same request reports a miss instead.
+        assert!(matches!(
+            V41LocalWeightsSource::new(&weights, REV).read_range(&request(range)),
+            Err(V41RangeCacheError::NotLocal(_))
+        ));
+        std::fs::remove_dir_all(&shard_dir).expect("cleanup shards");
+        std::fs::remove_dir_all(&weights).expect("cleanup weights");
     }
 
     #[test]

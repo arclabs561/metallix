@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{FinalHeadExecution, RequestError, RequestStepOutput};
+use crate::attention::AttentionOutputOrder;
 use crate::indexer::{
     key::{IndexKeyPreparationExecution, IndexKeyRotaryExecution},
     query::IndexScoreExecution,
@@ -446,6 +447,10 @@ fn unique_tensors<'de, D: Deserializer<'de>>(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactConfig {
+    /// Source revision's grouped-output order before `wo_a`; omitted artifacts
+    /// are the current 1017 target.
+    #[serde(default)]
+    source_order: AttentionOutputOrder,
     max_tokens: usize,
     width: usize,
     copies: usize,

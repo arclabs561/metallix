@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 
 use deepseek::{
-    RotaryFrequency,
+    AttentionOutputOrder, RotaryFrequency,
     attention::layer::{Fp8Projection, LayerAttentionLayout, LayerAttentionWeights},
     indexer::{
         cache::IndexKeyPublicationId,
@@ -37,6 +37,7 @@ fn attention_layout(ratio: usize) -> LayerAttentionLayout {
         0.125,
     )
     .expect("bounded attention layout")
+    .with_output_order(AttentionOutputOrder::Unrounded)
 }
 
 fn query_layout() -> CandidateQueryLayout {
