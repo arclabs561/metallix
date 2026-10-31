@@ -159,6 +159,25 @@ impl QwenTokenizer {
     ///
     /// Returns a message when the tokenizer cannot encode `text`.
     pub fn added_token_spans(&self, text: &str) -> Result<Vec<Range<usize>>, String> {
+        self.spans_where(text, |_| true)
+    }
+
+    /// Byte ranges of `text` that encode as added tokens marked special,
+    /// the control tokens a template writes. Qwen3's `</think>` and
+    /// `<tool_response>` are added but not special, so they are not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the tokenizer cannot encode `text`.
+    pub fn special_token_spans(&self, text: &str) -> Result<Vec<Range<usize>>, String> {
+        self.spans_where(text, |token| token.special)
+    }
+
+    fn spans_where(
+        &self,
+        text: &str,
+        keep: impl Fn(&tokenizers::AddedToken) -> bool,
+    ) -> Result<Vec<Range<usize>>, String> {
         // Encoding a whole conversation costs as much as the prompt; most
         // text spells no added token, which a byte scan shows.
         if let Some(literal) = &self.literal_added {
@@ -183,7 +202,7 @@ impl QwenTokenizer {
             .get_ids()
             .iter()
             .zip(encoding.get_offsets())
-            .filter(|(id, _)| added.contains_key(id))
+            .filter(|(id, _)| added.get(id).is_some_and(&keep))
             .map(|(_, &(start, end))| start..end)
             .collect())
     }
