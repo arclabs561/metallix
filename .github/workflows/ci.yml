@@ -16,7 +16,7 @@ concurrency:
 jobs:
   rust:
     name: Rust checks
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       # Pin third-party actions to an immutable commit. Update deliberately.
