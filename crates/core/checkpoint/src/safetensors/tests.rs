@@ -161,6 +161,29 @@ fn refuses_malformed_files() {
     ));
 }
 
+/// The safetensors format disallows duplicate keys; a JSON map would keep
+/// only the last entry and silently drop the first tensor.
+#[test]
+fn refuses_duplicate_tensor_names() {
+    let dir = TempDir::new();
+    let path = dir.path().join("x.safetensors");
+    // Raw JSON: serializing a map would erase the duplicate. The second
+    // spelling escapes the same name.
+    for header in [
+        r#"{"w":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"w":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}}"#,
+        r#"{"w":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"\u0077":{"dtype":"U8","shape":[4],"data_offsets":[4,8]}}"#,
+    ] {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend(header.as_bytes());
+        bytes.extend([0; 8]);
+        fs::write(&path, bytes).expect("write");
+        assert!(matches!(
+            SafetensorsFile::open(&path, ReadCache::Use),
+            Err(CheckpointError::DuplicateTensor(name)) if name == "w"
+        ));
+    }
+}
+
 /// A two-shard checkpoint holding one 4-bit module `m` (`[4, 64]` logical,
 /// group 64) and a plain `norm`, with `config` as its `config.json`.
 fn sharded(dir: &Path, config: &Value, scale_columns: u64) {
