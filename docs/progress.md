@@ -491,7 +491,7 @@ supports a parity claim.
   Independent boundary tests exercise non-128 widths, changed supplied inputs
   and weights, malformed/nonfinite inputs and bounded allocation geometry.
   The stateful token-to-logits runner is now extracted; see the
-  [extraction decision](design/deepseek-reduced-executor.md).
+  [extraction decision](deepseek-reduced-executor.md).
 
 - A frozen four-task/two-seed schedule comparison now separates non-overlap
   validity from requested count/duration/window adherence. Verified retries

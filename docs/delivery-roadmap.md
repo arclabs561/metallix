@@ -293,7 +293,7 @@ gate; another broad model survey is not on the critical path.
 ### Dependency order and stopping gates
 
 Revised delivery sequence, grounded in `9506015`, the
-[reduced-executor decision](design/deepseek-reduced-executor.md), and the
+[reduced-executor decision](deepseek-reduced-executor.md), and the
 [architecture gates and pivot conditions](architecture.md#pivot-conditions).
 Scoring qualification, request dispatch, key rotation, final vocabulary projection
 and artifact/CLI selection are delivered for both fixed schedules. Do not requeue them as new milestones.

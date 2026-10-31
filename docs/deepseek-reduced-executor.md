@@ -1,7 +1,7 @@
 # DeepSeek reduced executor extraction
 
 Status: implementing in bounded slices. Governing sequence:
-[delivery roadmap](../delivery-roadmap.md). Consumer: a runnable scalar reduced
+[delivery roadmap](delivery-roadmap.md). Consumer: a runnable scalar reduced
 DeepSeek request accepting token IDs and supplied synthetic weights.
 
 The canonical and alternate startup-to-head tests establish numerical evidence.
