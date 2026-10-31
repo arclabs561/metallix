@@ -354,6 +354,14 @@ published release; reference operators do not imply full-model support.
 
 ### Fixed
 
+- Chat prompts defuse only special added tokens in conversation text. Qwen3's
+  `</think>` and `<tool_response>` are added but not special, and were
+  replaced by placeholders, so its template kept reasoning it strips from
+  history and miscounted tool-response turns as user queries.
+- XML tool-call parameters stay text when the schema allows a string through
+  `anyOf`, `oneOf` or a local `$ref`, as Pydantic writes `Optional[str]`.
+  Digits in such a parameter were decoded as a number and then failed schema
+  validation. Untyped parameters are still decoded as JSON.
 - The Engram source exporter checks numeric storage for NaN and infinity,
   including receipts with a consistent checksum and an incorrect finite flag.
 - The owner transaction benchmark accepts Cargo's injected `--bench` flag,
