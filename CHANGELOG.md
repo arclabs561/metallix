@@ -367,6 +367,10 @@ published release; reference operators do not imply full-model support.
   resolve to regular files, while rejecting broken and non-file targets.
 - Generation tokenization disables saved tokenizer padding and truncation,
   and checks tokenizer IDs against the model's vocabulary width.
+- The shared safetensors reader rejects a header that names a tensor twice
+  (`CheckpointError::DuplicateTensor`), as the format requires and the Qwen
+  reader already did. Before, the JSON map kept the last entry and the first
+  tensor silently vanished.
 
 ### Current limits
 

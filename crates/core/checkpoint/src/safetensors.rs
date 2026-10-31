@@ -62,7 +62,7 @@ impl SafetensorsFile {
         }
         let mut header = vec![0; usize::try_from(header_bytes).map_err(|_| not())?];
         file.read_exact(&mut header).map_err(io)?;
-        let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&header) else {
+        let Ok(HeaderEntries(entries)) = serde_json::from_slice::<HeaderEntries>(&header) else {
             return Err(not());
         };
         let data_start = 8 + header_bytes;
@@ -74,7 +74,14 @@ impl SafetensorsFile {
             }
             let info = tensor_info(&name, &entry, data_start, length)?;
             spans.push((info.range(), name.clone()));
-            tensors.insert(name, info);
+            match tensors.entry(name) {
+                Entry::Occupied(slot) => {
+                    return Err(CheckpointError::DuplicateTensor(slot.key().clone()));
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(info);
+                }
+            }
         }
         spans.sort_by_key(|(range, _)| (range.start, range.end));
         for pair in spans.windows(2) {
@@ -98,6 +105,38 @@ impl SafetensorsFile {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// The header's top-level entries in file order, duplicates included. The
+/// format disallows duplicate keys, and a JSON map would silently keep only
+/// the last, so [`SafetensorsFile::open`] checks the decoded names itself.
+struct HeaderEntries(Vec<(String, Value)>);
+
+impl<'de> serde::Deserialize<'de> for HeaderEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries;
+
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = HeaderEntries;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(HeaderEntries(entries))
+            }
+        }
+
+        deserializer.deserialize_map(Entries)
     }
 }
 
