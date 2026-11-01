@@ -15,9 +15,12 @@ of scope by design: put a router or reverse proxy in front of the server.
   model runs in its own child process, so stopping it returns its memory.
   Models start with the server or on first request, and idle on-demand models
   are stopped, least recently used first, to stay within `--memory-budget-mib`.
-- Generation with Qwen3-0.6B and Qwen3-4B-Instruct-2507 through a subset of the
-  Responses API (`POST /v1/responses`), and from the CLI with `mx gen`,
-  including JSON Schema constrained output.
+- Generation through subsets of the Responses (`POST /v1/responses`), Chat
+  Completions (`POST /v1/chat/completions`) and Anthropic Messages
+  (`POST /v1/messages`) APIs, and from the CLI with `mx gen`. The Responses
+  API and `mx gen` support JSON Schema constrained output. Qwen3-0.6B and Qwen3-4B-Instruct-2507 are the
+  measured checkpoints; the registry also accepts Gemma 4 dense text
+  checkpoints and Qwen3.5-family checkpoints for generation.
 - [Typed decisions](docs/typed-decisions.md) (`POST /v1/decisions`, `mx decide`):
   choice, score and Boolean questions scored from option logits with Qwen3, or on
   the CPU with Julia-1. Probabilities are uncalibrated.
@@ -31,6 +34,8 @@ of scope by design: put a router or reverse proxy in front of the server.
   text continuation is encoded alone and appended to the prompt's tokens
   (`metallix.continuation_tokenization: "separate"`); callers that need
   lm-eval's joint encoding pass token IDs.
+- Experimental WAV transcription with Qwen3-ASR
+  (`POST /v1/audio/transcriptions`).
 
 DeepSeek-V4.1-Flash is the main target and is not usable for generation yet. The
 primary target is its [1017 update](docs/research/README.md#v41-source-identity);
@@ -65,7 +70,8 @@ The root manifest is a virtual workspace. The `metallix-cli` package in
 the default workspace member and defaults to `mx`, so
 `cargo run --all-features -- --help` runs `mx`.
 `serve` is one CLI subcommand. Without the `metal` feature
-only `inspect`, `fetch` and the reduced DeepSeek runner are available.
+only the inspection commands, `fetch`, `generate` (raw token IDs) and the
+DeepSeek CPU runners are available.
 
 A `metal` build also writes MLX's compiled kernels, `mlx.metallib`, to
 `~/.mlx/lib/<key>/`, or to `$MLX_RS_METAL_PATH` if that is set at build time.
@@ -86,8 +92,8 @@ Write a registry, `models.json`:
 ]}
 ```
 
-`kind` is one of `qwen`, `gemma4`, `julia`, `qwen_embedding`, `pplx_context`
-or `pplx_late`. `residency` defaults to `resident`. Under `--memory-budget-mib`
+`kind` is one of `qwen`, `gemma4`, `qwen35`, `qwen3_asr`, `julia`,
+`qwen_embedding`, `pplx_context` or `pplx_late`. `residency` defaults to `resident`. Under `--memory-budget-mib`
 every entry must declare `memory_mib`. `mx serve --model PATH` is shorthand for
 a one-entry Qwen registry.
 
@@ -115,8 +121,10 @@ curl -s localhost:8321/v1/rerank -d '{"model": "late",
 ```
 
 `GET /healthz` reports readiness. A route sent to a model without that
-capability returns 400 `unsupported_capability`; a busy model returns 503
-`server_busy`.
+capability returns 400 `unsupported_capability`. While a model is busy,
+requests wait in its queue (`--queue-depth`, default 8; `--queue-wait-ms`,
+default 60000); a full queue returns 503 `server_busy` and an expired wait 503
+`queue_timeout`.
 
 Without the server (`decision.json` holds the `state` and `questions` from the
 decisions request above):
@@ -146,14 +154,13 @@ tests). They do not download model weights.
 
 ## Limitations
 
-- The server currently binds only to loopback. Each model handles one request
-  at a time; there is no batching across requests and no request queue.
-- The Responses endpoint is a subset: text input, function calls and SSE are
-  supported; stored responses, `previous_response_id`, images, nonzero
-  temperature, `top_p` other than 1 and seeds are rejected. Output is greedy.
-- Qwen context is at most 16,384 tokens (default 2048) with at most 256 output
-  tokens per request.
-- Served weights are float32. There is no quantization conversion, LoRA or
+- The server binds only to loopback. A generating model decodes one request
+  at a time unless `--max-num-seqs` is above 1, which enables batched decoding.
+- The Responses endpoint is a subset: text input, function calls, SSE and
+  sampling (`temperature`, `top_p`, `seed`) are supported; stored responses,
+  `previous_response_id` and images are rejected.
+- Qwen3 serves in the checkpoint's float dtype (BF16 by default) or from
+  affine-quantized checkpoints. There is no quantization conversion, LoRA or
   training workflow.
 - Rerank encodes documents one at a time.
 - DeepSeek-V4.1-Flash cannot generate text yet (see above). Running models
