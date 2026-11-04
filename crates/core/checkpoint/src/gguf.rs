@@ -246,10 +246,16 @@ impl GgufMetadata {
             .ok_or_else(|| missing("general.architecture", "a string"))
     }
 
-    /// The `general.base_model.N.*` entries, in order.
+    /// The `general.base_model.N.*` entries, in order. A declared count
+    /// beyond the number of metadata keys is capped there, since the file
+    /// cannot describe more entries than it has keys.
     #[must_use]
     pub fn base_models(&self) -> Vec<BaseModel> {
-        let count = self.unsigned("general.base_model.count").unwrap_or(0);
+        let keys = u64::try_from(self.values.len()).unwrap_or(u64::MAX);
+        let count = self
+            .unsigned("general.base_model.count")
+            .unwrap_or(0)
+            .min(keys);
         (0..count)
             .map(|index| {
                 let field = |name: &str| {

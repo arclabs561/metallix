@@ -354,6 +354,22 @@ published release; reference operators do not imply full-model support.
 
 ### Fixed
 
+- `f32_to_bf16_rne` keeps a NaN a quiet NaN with its sign. Rounding a NaN
+  whose payload lay only in the dropped low bits produced infinity, and an
+  all-ones payload carried into zero or negative zero.
+- String `chat_template_kwargs` values are defused like conversation text, so
+  a special-token spelling in one is encoded as ordinary text instead of
+  forging a control token when the template prints it.
+- The chat-template `tojson` filter spells floats as Python's `json.dumps`
+  does (`1e-05`, `1e+16`, `1.5e-07`), so tool schemas holding such numbers
+  render as transformers renders them.
+- Safetensors files whose payload area has bytes no tensor indexes (before,
+  between or after the tensors) are rejected with `CheckpointError::Unindexed`,
+  as the format and the reference loader require.
+- `GgufMetadata::base_models` caps `general.base_model.count` at the number of
+  metadata keys. A huge declared count panicked with a capacity overflow.
+- `LateProjection::read` reports a huge header length or a shape whose byte
+  size overflows as `LateError::Dense` instead of panicking on overflow.
 - Chat prompts defuse only special added tokens in conversation text. Qwen3's
   `</think>` and `<tool_response>` are added but not special, and were
   replaced by placeholders, so its template kept reasoning it strips from

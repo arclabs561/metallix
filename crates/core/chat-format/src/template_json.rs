@@ -6,7 +6,8 @@
 //! escapes HTML characters and refuses `ensure_ascii`, so a template such as
 //! `MiniCPM5`'s `tool | tojson(ensure_ascii=False)` fails to render, and others
 //! render tool schemas the model never saw in training. Keyword arguments
-//! other than `ensure_ascii`, `indent` and `sort_keys` are refused.
+//! other than `ensure_ascii`, `indent` and `sort_keys` are refused. Floats
+//! are spelled as Python's `repr` spells them (`1e-05`, `1e+16`).
 //!
 //! Neither `serde_json` nor minijinja is built with `preserve_order` here, so
 //! every map a template sees, from request JSON or a template literal, is
@@ -132,6 +133,10 @@ impl Formatter for PythonJson {
         Ok(())
     }
 
+    fn write_f64<W: ?Sized + io::Write>(&mut self, writer: &mut W, value: f64) -> io::Result<()> {
+        writer.write_all(python_float_repr(value).as_bytes())
+    }
+
     fn write_string_fragment<W: ?Sized + io::Write>(
         &mut self,
         writer: &mut W,
@@ -152,6 +157,40 @@ impl Formatter for PythonJson {
         }
         Ok(())
     }
+}
+
+/// Python's `float.__repr__` for a finite value: the shortest digits that
+/// round-trip (as Rust's `{:e}` writes them), positional with at least one
+/// fractional digit when the decimal exponent is in `-4..16`, otherwise
+/// `d.ddde+XX` with a signed exponent of at least two digits.
+fn python_float_repr(value: f64) -> String {
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` always writes an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` writes a decimal exponent");
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
+    };
+    if !(-4..16).contains(&exponent) {
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        return format!(
+            "{sign}{mantissa}e{exponent_sign}{:02}",
+            exponent.unsigned_abs()
+        );
+    }
+    let digits = mantissa.replace('.', "");
+    let point = usize::try_from(exponent + 1).unwrap_or(0);
+    if point == 0 {
+        let zeros = "0".repeat(usize::try_from(-exponent - 1).unwrap_or(0));
+        return format!("{sign}0.{zeros}{digits}");
+    }
+    if digits.len() <= point {
+        let zeros = "0".repeat(point - digits.len());
+        return format!("{sign}{digits}{zeros}.0");
+    }
+    format!("{sign}{}.{}", &digits[..point], &digits[point..])
 }
 
 #[cfg(test)]
@@ -190,6 +229,32 @@ mod tests {
         assert_eq!(
             render("{{ value | tojson(ensure_ascii=True) }}", &json!("😀")).unwrap(),
             r#""\ud83d\ude00""#
+        );
+    }
+
+    #[test]
+    fn floats_use_python_repr_spelling() {
+        let value = json!([
+            1e-05,
+            1e16,
+            1.5e-7,
+            0.0001,
+            2.5,
+            1e15,
+            123_456_789_012_345_680.0,
+            -0.0,
+            1.0,
+            -12.5,
+            5e-324,
+            1.797_693_134_862_315_7e308
+        ]);
+        // python3 -c 'import json;print(json.dumps([1e-05, 1e16, 1.5e-7, 0.0001,
+        //   2.5, 1e15, 123456789012345680.0, -0.0, 1.0, -12.5, 5e-324,
+        //   1.7976931348623157e308]))'
+        assert_eq!(
+            render("{{ value | tojson }}", &value).unwrap(),
+            "[1e-05, 1e+16, 1.5e-07, 0.0001, 2.5, 1000000000000000.0, \
+             1.2345678901234568e+17, -0.0, 1.0, -12.5, 5e-324, 1.7976931348623157e+308]"
         );
     }
 
