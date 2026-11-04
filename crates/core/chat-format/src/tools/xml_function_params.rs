@@ -3,14 +3,14 @@
 
 use serde_json::Value;
 
-use super::{MAX_CALLS, ParsedTurn, ToolCall, typed_parameter};
+use super::{MAX_CALLS, ParsedTurn, ToolCall, typed_qwen_parameter};
 
 pub(crate) const OPEN: &str = "<tool_call>";
 const CLOSE: &str = "</tool_call>";
 
 /// Parses complete calls while preserving surrounding text. The template
 /// writes each value between newlines, which are not part of it; values are
-/// typed by the tool schema as in [`typed_parameter`].
+/// typed by the tool schema as in [`typed_qwen_parameter`].
 pub(crate) fn parse(input: &str, tools: &[Value]) -> Result<ParsedTurn, String> {
     let mut remaining = input;
     let mut text = String::new();
@@ -75,7 +75,7 @@ fn call<'a>(input: &'a str, tools: &[Value]) -> Result<(ToolCall, &'a str), Stri
         }
         arguments.insert(
             key.to_owned(),
-            typed_parameter(tools, name, key, raw.to_owned()),
+            typed_qwen_parameter(tools, name, key, raw.to_owned()),
         );
         remaining = rest;
     }

@@ -354,6 +354,10 @@ published release; reference operators do not imply full-model support.
 
 ### Fixed
 
+- Qwen3-Coder tool calls keep a parameter the tool declares without a type,
+  or does not declare, as text, and read `null` as null, as `SGLang`'s
+  `qwen3_coder` parser does. They were decoded as JSON, so an untyped `true`
+  or `7` became a boolean or number. MiniCPM calls keep decoding them.
 - `f32_to_bf16_rne` keeps a NaN a quiet NaN with its sign. Rounding a NaN
   whose payload lay only in the dropped low bits produced infinity, and an
   all-ones payload carried into zero or negative zero.
