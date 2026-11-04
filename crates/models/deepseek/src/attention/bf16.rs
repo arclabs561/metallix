@@ -8,6 +8,7 @@
 use thiserror::Error;
 
 use super::{SparseAttentionError, SparseAttentionLayout, validate_inputs};
+use blockfloat::f32_to_bf16_rne;
 
 /// Largest one-buffer BF16 sparse-attention input or output accepted here.
 pub(crate) const MAX_BF16_ATTENTION_ELEMENTS: usize = 1 << 23;
@@ -509,13 +510,6 @@ fn checked_finite(
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
-}
-
-fn f32_to_bf16_rne(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    let bytes = rounded.to_be_bytes();
-    u16::from_be_bytes([bytes[0], bytes[1]])
 }
 
 #[cfg(test)]

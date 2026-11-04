@@ -4,6 +4,7 @@
 //! tensor equations. They do not derive Sinkhorn coefficients, run a block,
 //! normalize a sublayer, or project a checkpoint.
 
+use blockfloat::f32_to_bf16_rne;
 use thiserror::Error;
 
 /// Maximum Hyper-Connections copies accepted by one scalar mixing call.
@@ -358,12 +359,6 @@ fn round_finite_bf16(
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
-}
-
-fn f32_to_bf16_rne(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    u16::try_from(rounded >> 16).expect("an FP32 high half always fits BF16 storage")
 }
 
 #[cfg(test)]
