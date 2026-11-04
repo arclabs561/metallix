@@ -5,6 +5,7 @@
 //! normalized input by the learned weight, then round back to BF16. It is not
 //! a checkpoint reader, GPU kernel, or reduction-order parity claim.
 
+use blockfloat::f32_to_bf16_rne;
 use thiserror::Error;
 
 mod cascade;
@@ -200,12 +201,6 @@ fn validate_shape(
 
 fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
-}
-
-fn f32_to_bf16_rne(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    u16::try_from(rounded >> 16).expect("an FP32 high half always fits BF16 storage")
 }
 
 #[cfg(test)]

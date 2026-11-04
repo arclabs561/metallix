@@ -28,9 +28,7 @@ struct Trace {
 }
 
 fn bf16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-    u16::try_from(rounded >> 16).expect("an FP32 high half always fits BF16 storage")
+    blockfloat::f32_to_bf16_rne(value)
 }
 
 fn bf16_value(value: f32) -> f32 {
