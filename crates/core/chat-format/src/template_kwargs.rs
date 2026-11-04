@@ -102,6 +102,11 @@ impl TemplateKwargs {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
         self.0.iter().map(|(name, value)| (name.as_str(), value))
     }
+
+    /// The values, for rewriting caller text before rendering.
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.0.values_mut()
+    }
 }
 
 fn is_identifier(name: &str) -> bool {

@@ -316,6 +316,10 @@ pub enum CheckpointError {
     /// Two tensor payload ranges overlap.
     #[error("tensors {0:?} and {1:?} overlap")]
     Overlap(String, String),
+    /// A safetensors payload area has bytes no tensor indexes. The format
+    /// requires the byte buffer to be entirely indexed, without holes.
+    #[error("bytes {1}..{2} of {0} belong to no tensor")]
+    Unindexed(PathBuf, u64, u64),
     /// The file changed after header inspection.
     #[error("{0} changed after it was inspected")]
     Changed(PathBuf),

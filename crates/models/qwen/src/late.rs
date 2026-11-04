@@ -134,8 +134,11 @@ impl LateProjection {
             .map(u64::from_le_bytes)
             .and_then(|len| usize::try_from(len).ok())
             .ok_or_else(|| invalid("truncated header length"))?;
+        let data_start = header_len
+            .checked_add(8)
+            .ok_or_else(|| invalid("header length overflows"))?;
         let header: serde_json::Value = bytes
-            .get(8..8 + header_len)
+            .get(8..data_start)
             .and_then(|header| serde_json::from_slice(header).ok())
             .ok_or_else(|| invalid("unreadable header"))?;
         let tensor = &header["linear.weight"];
@@ -159,13 +162,21 @@ impl LateProjection {
         let (&[outputs, inputs], &[start, end]) = (shape.as_slice(), offsets.as_slice()) else {
             return Err(invalid("linear.weight needs a 2-D shape and two offsets"));
         };
-        if tensor["dtype"] != "F32" || end.checked_sub(start) != Some(outputs * inputs * 4) {
+        let weight_bytes = outputs
+            .checked_mul(inputs)
+            .and_then(|elements| elements.checked_mul(4));
+        if tensor["dtype"] != "F32"
+            || weight_bytes.is_none()
+            || end.checked_sub(start) != weight_bytes
+        {
             return Err(invalid(
                 "linear.weight must be F32 with a matching byte range",
             ));
         }
-        let payload = bytes
-            .get(8 + header_len + start..8 + header_len + end)
+        let payload = data_start
+            .checked_add(start)
+            .zip(data_start.checked_add(end))
+            .and_then(|(start, end)| bytes.get(start..end))
             .ok_or_else(|| invalid("payload shorter than its header"))?;
         Ok(Self {
             weight: payload

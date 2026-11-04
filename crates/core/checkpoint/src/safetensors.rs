@@ -92,6 +92,21 @@ impl SafetensorsFile {
                 ));
             }
         }
+        // Payloads must tile the area after the header exactly, as the
+        // reference loader requires: no gap before, between or after them.
+        let unindexed = |from: u64, to: u64| {
+            CheckpointError::Unindexed(path.clone(), from - data_start, to - data_start)
+        };
+        let mut indexed = data_start;
+        for (range, _) in &spans {
+            if range.start != indexed {
+                return Err(unindexed(indexed, range.start));
+            }
+            indexed = range.end;
+        }
+        if indexed != length {
+            return Err(unindexed(indexed, length));
+        }
         cache.apply(&file, &path)?;
         Ok(Self {
             path,

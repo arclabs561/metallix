@@ -780,8 +780,9 @@ impl ChatFormat {
     }
 
     /// Renders `conversation` and encodes it so that only the template can
-    /// produce control tokens. Text from the conversation that spells a
-    /// special added token (`<|im_end|>`, `<|"|>`) is swapped for a random
+    /// produce control tokens. Text from the conversation, template kwargs
+    /// included, that spells a special added token (`<|im_end|>`, `<|"|>`)
+    /// is swapped for a random
     /// placeholder before rendering and encoded afterwards as ordinary text,
     /// so a user cannot forge a turn boundary or a string quote. A
     /// conversation with no such spelling renders and encodes exactly as
@@ -866,6 +867,10 @@ impl ChatFormat {
         for tool in &mut tools {
             self.defuse_value(tool, &mut literals)?;
         }
+        let mut template_kwargs = conversation.template_kwargs.clone();
+        for value in template_kwargs.values_mut() {
+            self.defuse_value(value, &mut literals)?;
+        }
         if literals.spellings.is_empty() {
             let text = self.template.render(conversation, add_generation_prompt)?;
             let pieces = vec![Piece {
@@ -878,6 +883,7 @@ impl ChatFormat {
             Conversation {
                 messages: &messages,
                 tools: &tools,
+                template_kwargs: &template_kwargs,
                 ..conversation
             },
             add_generation_prompt,
