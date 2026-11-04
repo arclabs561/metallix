@@ -32,19 +32,14 @@ pub(crate) struct ParsedTurn {
 /// text. A value is a JSON string when the tool schema lets the parameter be
 /// a `string` (its `type`, an `anyOf` or `oneOf` branch, or a local `$ref`
 /// target, as Pydantic writes `Optional[str]`), and is otherwise decoded as
-/// JSON when it parses, as `SGLang`'s `minicpm5` and vLLM's `qwen3_coder`
-/// parsers do; schema validation follows. Templates print non-string
-/// history values with Python's `str`, so the bare literals `True`, `False`
-/// and `None` are accepted too.
+/// JSON when it parses, as `SGLang`'s `minicpm5` parser does; schema
+/// validation follows. Templates print non-string history values with
+/// Python's `str`, so the bare literals `True`, `False` and `None` are
+/// accepted too. Qwen calls use [`typed_qwen_parameter`] instead.
 fn typed_parameter(tools: &[Value], function: &str, key: &str, raw: String) -> Value {
-    let is_string = tools
-        .iter()
-        .find(|tool| tool["function"]["name"] == function)
-        .is_some_and(|tool| {
-            let parameters = &tool["function"]["parameters"];
-            allows_string(parameters, &parameters["properties"][key], 0)
-        });
-    if is_string {
+    if parameter_schema(tools, function, key)
+        .is_some_and(|(root, schema)| allows_string(root, schema, 0))
+    {
         return Value::String(raw);
     }
     if let Ok(value) = serde_json::from_str(&raw) {
@@ -56,6 +51,40 @@ fn typed_parameter(tools: &[Value], function: &str, key: &str, raw: String) -> V
         "None" => Value::Null,
         _ => Value::String(raw),
     }
+}
+
+/// Types a Qwen3-Coder parameter as `SGLang`'s `qwen3_coder` parser
+/// (`convert_param_value`) does: `null` in any case is null; a parameter the
+/// tool does not declare, or declares without a type, stays text; otherwise
+/// the value is typed as in [`typed_parameter`].
+fn typed_qwen_parameter(tools: &[Value], function: &str, key: &str, raw: String) -> Value {
+    if raw.eq_ignore_ascii_case("null") {
+        return Value::Null;
+    }
+    let typed = parameter_schema(tools, function, key).is_some_and(|(_, schema)| {
+        ["type", "anyOf", "oneOf", "$ref"]
+            .iter()
+            .any(|keyword| schema.get(*keyword).is_some())
+    });
+    if !typed {
+        return Value::String(raw);
+    }
+    typed_parameter(tools, function, key, raw)
+}
+
+/// The tool's parameters schema and the schema of `key` in it, when `key` is
+/// declared.
+fn parameter_schema<'a>(
+    tools: &'a [Value],
+    function: &str,
+    key: &str,
+) -> Option<(&'a Value, &'a Value)> {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == function)?;
+    let parameters = &tool["function"]["parameters"];
+    let schema = parameters["properties"].get(key)?;
+    Some((parameters, schema))
 }
 
 /// Whether `schema` admits a JSON string through its `type`, an `anyOf` or
@@ -135,10 +164,11 @@ mod tests {
     use super::{typed_parameter, validator};
 
     /// Pydantic writes `Optional[str]` as `anyOf` with a string branch, with
-    /// no top-level `type`; its digits stay text. vLLM's `qwen3_coder` parser
-    /// keeps them as a string too.
+    /// no top-level `type`; its digits stay text. A parameter declared
+    /// without a type also stays text, as `SGLang`'s `qwen3_coder` parser
+    /// keeps it.
     #[test]
-    fn qwen_xml_optional_string_parameter_is_decoded_as_number() {
+    fn qwen_xml_optional_and_untyped_parameters_stay_text() {
         use crate::{ReasoningDialect, ToolDialect, TurnFormat, parse_turn};
         let tools = [json!({"type": "function", "function": {
             "name": "lookup",
@@ -155,12 +185,30 @@ mod tests {
                     <parameter=note>\ntrue\n</parameter>\n</function>\n</tool_call>";
         let turn = parse_turn(format, text, &tools, false, true);
         let arguments = turn.as_ref().map(|turn| turn.calls[0].arguments.clone());
-        // An untyped parameter is still decoded as JSON.
         assert_eq!(
             arguments,
-            Ok(json!({"zip": "21701", "note": true})),
+            Ok(json!({"zip": "21701", "note": "true"})),
             "observed: {turn:?}"
         );
+    }
+
+    #[test]
+    fn qwen_parameters_follow_sglang_qwen3_coder_typing() {
+        use super::typed_qwen_parameter;
+        let tools = [
+            json!({"function": {"name": "f", "parameters": {"properties": {
+                "count": {"type": "integer"},
+                "free": {"description": "no type"}
+            }}}}),
+        ];
+        let typed = |key: &str, raw: &str| typed_qwen_parameter(&tools, "f", key, raw.into());
+        assert_eq!(typed("count", "7"), json!(7));
+        assert_eq!(typed("free", "7"), json!("7"));
+        assert_eq!(typed("undeclared", "[1, 2]"), json!("[1, 2]"));
+        assert_eq!(typed("count", "NULL"), json!(null));
+        assert_eq!(typed("free", "null"), json!(null));
+        // Other dialects keep decoding untyped values as JSON.
+        assert_eq!(typed_parameter(&tools, "f", "free", "7".into()), json!(7));
     }
 
     #[test]
