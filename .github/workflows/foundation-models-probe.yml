@@ -1,0 +1,26 @@
+name: Compile the Foundation Models extraction probe
+
+on:
+  push:
+    branches: [experiment/foundation-models-extraction-sdk]
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Show compiler and SDK
+        run: |
+          xcodebuild -version
+          xcrun swiftc --version
+          xcrun --sdk macosx --show-sdk-version
+      - name: Compile and link the arm64 probe
+        run: |
+          xcrun --sdk macosx swiftc -parse-as-library -O -target arm64-apple-macos26.0 scripts/experiments/foundation_models_extraction.swift -o "$RUNNER_TEMP/extraction"
+          file "$RUNNER_TEMP/extraction"
