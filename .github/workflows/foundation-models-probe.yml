@@ -24,3 +24,13 @@ jobs:
         run: |
           xcrun --sdk macosx swiftc -parse-as-library -O -target arm64-apple-macos26.0 scripts/experiments/foundation_models_extraction.swift -o "$RUNNER_TEMP/extraction"
           file "$RUNNER_TEMP/extraction"
+      - name: Report local inference capabilities
+        run: |
+          cat > "$RUNNER_TEMP/capabilities.swift" <<'SWIFT'
+          import FoundationModels
+          import Metal
+          print("System language model: \(SystemLanguageModel.default.availability)")
+          print("Metal device present: \(MTLCreateSystemDefaultDevice() != nil)")
+          SWIFT
+          xcrun --sdk macosx swiftc -target arm64-apple-macos26.0 "$RUNNER_TEMP/capabilities.swift" -o "$RUNNER_TEMP/capabilities"
+          "$RUNNER_TEMP/capabilities"
